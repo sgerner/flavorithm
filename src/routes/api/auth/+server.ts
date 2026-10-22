@@ -8,12 +8,15 @@ import {
 	deleteUserAccount,
 	deleteSession,
 	errorResponse,
+	issueEmailVerification,
 	issuePasswordReset,
 	loginUser,
 	readJson,
 	registerUser,
 	resetUserPassword,
-	sendPasswordResetEmail
+	sendEmailVerificationEmail,
+	sendPasswordResetEmail,
+	verifyEmailToken
 } from '#lib/server/db.ts';
 
 const authActionSchema = z.discriminatedUnion('action', [
@@ -39,7 +42,9 @@ const authActionSchema = z.discriminatedUnion('action', [
 		action: z.literal('resetPassword'),
 		token: z.string().min(20).max(200),
 		password: z.string().min(10).max(128)
-	})
+	}),
+	z.object({ action: z.literal('requestEmailVerification') }),
+	z.object({ action: z.literal('verifyEmail'), token: z.string().min(20).max(200) })
 ]);
 
 function passwordResetOrigin(request: Request): string {
@@ -79,7 +84,13 @@ function setSessionCookie(
 }
 
 export const GET: RequestHandler = async ({ locals }) => {
-	return json({ user: locals.user });
+	return json({
+		user: locals.user,
+		capabilities: {
+			emailDelivery: Boolean(process.env.RESEND_API_KEY?.trim() && process.env.EMAIL_FROM?.trim()),
+			recipeSearch: Boolean(process.env.BRAVE_SEARCH_API_KEY?.trim())
+		}
+	});
 };
 
 export const POST: RequestHandler = async (event) => {
@@ -125,6 +136,37 @@ export const POST: RequestHandler = async (event) => {
 				if (!sent) console.warn('Password reset email delivery failed.');
 			}
 			return json({ message: 'If an account exists, a password reset link will be sent.' });
+		}
+		if (payload.action === 'requestEmailVerification') {
+			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
+			const apiKey = process.env.RESEND_API_KEY?.trim();
+			const from = process.env.EMAIL_FROM?.trim();
+			if (!apiKey || !from) {
+				throw new ApiError(
+					503,
+					'Email verification is not configured. Set RESEND_API_KEY and EMAIL_FROM to enable it.'
+				);
+			}
+			consumeRateLimit(`email-verify-ip:${ip}`, 5, 60 * 60 * 1000);
+			consumeRateLimit(`email-verify-user:${event.locals.user.id}`, 3, 60 * 60 * 1000);
+			const origin = passwordResetOrigin(event.request);
+			const verification = issueEmailVerification(event.locals.user.id);
+			if (verification) {
+				const verificationUrl = new URL('/', origin);
+				verificationUrl.searchParams.set('verify', verification.token);
+				const sent = await sendEmailVerificationEmail(
+					verification.email,
+					verificationUrl.toString(),
+					apiKey,
+					from
+				);
+				if (!sent) console.warn('Email verification delivery failed.');
+			}
+			return json({ message: 'If your email needs verification, a link will be sent.' });
+		}
+		if (payload.action === 'verifyEmail') {
+			consumeRateLimit(`email-verify-complete-ip:${ip}`, 10, 15 * 60 * 1000);
+			return json({ user: verifyEmailToken(payload.token) });
 		}
 		if (payload.action === 'resetPassword') {
 			consumeRateLimit(`password-reset-complete-ip:${ip}`, 10, 15 * 60 * 1000);

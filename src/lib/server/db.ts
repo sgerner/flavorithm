@@ -10,6 +10,7 @@ import type { AppState, Preferences, User } from '#lib/types.ts';
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const INVITE_TTL_MS = 48 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
+const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_BODY_BYTES = 1_000_000;
 const RESEND_ENDPOINT = 'https://api.resend.com/emails';
 const DEFAULT_PREFERENCES: Preferences = {
@@ -48,6 +49,7 @@ db.exec(`
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password_hash TEXT NOT NULL,
     household_id TEXT NOT NULL REFERENCES households(id) ON DELETE RESTRICT,
+    email_verified_at INTEGER,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS users_household_idx ON users(household_id);
@@ -79,12 +81,20 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS password_reset_expiry_idx ON password_reset_tokens(expires_at);
   CREATE TABLE IF NOT EXISTS household_invites (
     code_hash TEXT PRIMARY KEY,
+    invite_id TEXT,
     household_id TEXT NOT NULL REFERENCES households(id) ON DELETE CASCADE,
     created_by TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     expires_at INTEGER NOT NULL,
     uses_remaining INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS household_invites_expiry_idx ON household_invites(expires_at);
+  CREATE TABLE IF NOT EXISTS email_verification_tokens (
+    token_hash TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS email_verification_expiry_idx ON email_verification_tokens(expires_at);
 `);
 
 function ensureVersionColumn(table: 'household_state' | 'user_preferences'): void {
@@ -95,6 +105,20 @@ function ensureVersionColumn(table: 'household_state' | 'user_preferences'): voi
 }
 ensureVersionColumn('household_state');
 ensureVersionColumn('user_preferences');
+const userColumns = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
+if (!userColumns.some((column) => column.name === 'email_verified_at')) {
+	db.exec('ALTER TABLE users ADD COLUMN email_verified_at INTEGER');
+}
+const inviteColumns = db.prepare('PRAGMA table_info(household_invites)').all() as Array<{
+	name: string;
+}>;
+if (!inviteColumns.some((column) => column.name === 'invite_id')) {
+	db.exec('ALTER TABLE household_invites ADD COLUMN invite_id TEXT');
+}
+db.exec(`
+  UPDATE household_invites SET invite_id = code_hash WHERE invite_id IS NULL;
+  CREATE UNIQUE INDEX IF NOT EXISTS household_invites_id_idx ON household_invites(invite_id);
+`);
 db.prepare('UPDATE household_invites SET uses_remaining = 1 WHERE uses_remaining > 1').run();
 
 const id = () => randomBytes(16).toString('hex');
@@ -266,9 +290,35 @@ export function assertSameOrigin(request: Request): void {
 		throw new ApiError(403, 'Cross-origin request rejected');
 }
 
-type DbUserRow = { id: string; name: string; email: string; household_id: string };
+type DbUserRow = {
+	id: string;
+	name: string;
+	email: string;
+	household_id: string;
+	email_verified_at?: number | null;
+};
 function toUser(row: DbUserRow): User {
-	return { id: row.id, name: row.name, email: row.email, householdId: row.household_id };
+	return {
+		id: row.id,
+		name: row.name,
+		email: row.email,
+		householdId: row.household_id,
+		emailVerified: row.email_verified_at != null
+	};
+}
+
+function getCurrentUser(userId: string): DbUserRow | undefined {
+	return db
+		.prepare('SELECT id, name, email, household_id, email_verified_at FROM users WHERE id = ?')
+		.get(userId) as DbUserRow | undefined;
+}
+
+function assertCurrentHousehold(user: User): DbUserRow {
+	const current = getCurrentUser(user.id);
+	if (!current) throw new ApiError(401, 'Authentication required');
+	if (current.household_id !== user.householdId)
+		throw new ApiError(409, 'Your household changed. Reload the latest kitchen and try again.');
+	return current;
 }
 
 export function getUserFromSession(token: string | undefined): User | null {
@@ -278,7 +328,7 @@ export function getUserFromSession(token: string | undefined): User | null {
 	const row = db
 		.prepare(
 			`
-    SELECT users.id, users.name, users.email, users.household_id
+			SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
     FROM sessions JOIN users ON users.id = sessions.user_id
     WHERE sessions.token_hash = ? AND sessions.expires_at > ?
   `
@@ -350,7 +400,13 @@ export async function registerUser(
 	const userId = id();
 	const householdId = id();
 	const now = Date.now();
-	const user = toUser({ id: userId, name: name.trim(), email, household_id: householdId });
+	const user = toUser({
+		id: userId,
+		name: name.trim(),
+		email,
+		household_id: householdId,
+		email_verified_at: null
+	});
 	const { preferences, ...initialSharedState } = createNewUserState();
 	db.exec('BEGIN IMMEDIATE');
 	try {
@@ -386,7 +442,9 @@ export async function loginUser(
 ): Promise<{ user: User; token: string; expiresAt: number }> {
 	const email = rawEmail.trim().toLowerCase();
 	const row = db
-		.prepare('SELECT id, name, email, household_id, password_hash FROM users WHERE email = ?')
+		.prepare(
+			'SELECT id, name, email, household_id, email_verified_at, password_hash FROM users WHERE email = ?'
+		)
 		.get(email) as (DbUserRow & { password_hash: string }) | undefined;
 	// Use a fixed dummy digest for unknown accounts to reduce account-enumeration timing differences.
 	const valid = await verifyPassword(
@@ -534,6 +592,98 @@ export async function sendPasswordResetEmail(
 	}
 }
 
+export function issueEmailVerification(userId: string): { email: string; token: string } | null {
+	const token = randomBytes(32).toString('base64url');
+	const now = Date.now();
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		db.prepare('DELETE FROM email_verification_tokens WHERE expires_at <= ?').run(now);
+		const user = db
+			.prepare('SELECT email, email_verified_at FROM users WHERE id = ?')
+			.get(userId) as { email: string; email_verified_at: number | null } | undefined;
+		if (!user) throw new ApiError(401, 'Authentication required');
+		if (user.email_verified_at != null) {
+			db.exec('COMMIT');
+			return null;
+		}
+		db.prepare('DELETE FROM email_verification_tokens WHERE user_id = ?').run(userId);
+		db.prepare(
+			'INSERT INTO email_verification_tokens(token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+		).run(hashToken(token), userId, now + EMAIL_VERIFICATION_TTL_MS, now);
+		db.exec('COMMIT');
+		return { email: user.email, token };
+	} catch (error) {
+		db.exec('ROLLBACK');
+		throw error;
+	}
+}
+
+export function verifyEmailToken(token: string): User {
+	if (token.length < 20 || token.length > 200)
+		throw new ApiError(400, 'Verification link is invalid or expired. Request a new one.');
+	const tokenHash = hashToken(token);
+	const now = Date.now();
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		db.prepare('DELETE FROM email_verification_tokens WHERE expires_at <= ?').run(now);
+		const row = db
+			.prepare(
+				`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
+				 FROM email_verification_tokens
+				 JOIN users ON users.id = email_verification_tokens.user_id
+				 WHERE email_verification_tokens.token_hash = ?
+				   AND email_verification_tokens.expires_at > ?`
+			)
+			.get(tokenHash, now) as DbUserRow | undefined;
+		if (!row)
+			throw new ApiError(400, 'Verification link is invalid or expired. Request a new one.');
+		db.prepare(
+			'UPDATE users SET email_verified_at = COALESCE(email_verified_at, ?) WHERE id = ?'
+		).run(now, row.id);
+		db.prepare('DELETE FROM email_verification_tokens WHERE user_id = ?').run(row.id);
+		db.exec('COMMIT');
+		return toUser({ ...row, email_verified_at: row.email_verified_at ?? now });
+	} catch (error) {
+		db.exec('ROLLBACK');
+		throw error;
+	}
+}
+
+export async function sendEmailVerificationEmail(
+	email: string,
+	verificationUrl: string,
+	apiKey: string,
+	from: string,
+	fetcher: typeof fetch = fetch
+): Promise<boolean> {
+	const safeUrl = verificationUrl
+		.replaceAll('&', '&amp;')
+		.replaceAll('"', '&quot;')
+		.replaceAll('<', '&lt;')
+		.replaceAll('>', '&gt;');
+	try {
+		const response = await fetcher(RESEND_ENDPOINT, {
+			method: 'POST',
+			redirect: 'error',
+			headers: {
+				Authorization: `Bearer ${apiKey}`,
+				'Content-Type': 'application/json'
+			},
+			body: JSON.stringify({
+				from,
+				to: [email],
+				subject: 'Verify your Flavorithm email',
+				text: `Use this link to verify your email address. It expires in 24 hours.\n\n${verificationUrl}\n\nIf you did not request this, you can ignore this message.`,
+				html: `<p>Use this link to verify your Flavorithm email address. It expires in 24 hours.</p><p><a href="${safeUrl}">Verify email</a></p><p>If you did not request this, you can ignore this message.</p>`
+			}),
+			signal: AbortSignal.timeout(10_000)
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
 type RateBucket = { count: number; resetAt: number };
 const rateBuckets = new Map<string, RateBucket>();
 export function consumeRateLimit(key: string, limit: number, windowMs: number): void {
@@ -552,6 +702,7 @@ export function consumeRateLimit(key: string, limit: number, windowMs: number): 
 }
 
 export function getState(user: User): AppState | null {
+	assertCurrentHousehold(user);
 	const row = db
 		.prepare('SELECT state_json FROM household_state WHERE household_id = ?')
 		.get(user.householdId) as { state_json: string } | undefined;
@@ -580,6 +731,7 @@ export function getState(user: User): AppState | null {
 }
 
 export function getStateEtag(user: User): string {
+	assertCurrentHousehold(user);
 	const household = db
 		.prepare('SELECT version FROM household_state WHERE household_id = ?')
 		.get(user.householdId) as { version: number } | undefined;
@@ -606,6 +758,7 @@ export function saveState(
 	const now = Date.now();
 	db.exec('BEGIN IMMEDIATE');
 	try {
+		assertCurrentHousehold(user);
 		const existing = db
 			.prepare('SELECT 1 FROM household_state WHERE household_id = ?')
 			.get(user.householdId);
@@ -649,23 +802,65 @@ export function saveState(
 	}
 }
 
-export type HouseholdMember = Pick<User, 'id' | 'name' | 'email'>;
+export type HouseholdMember = Pick<User, 'id' | 'name' | 'email'> & { role: 'owner' | 'member' };
 export function listHouseholdMembers(user: User): HouseholdMember[] {
 	return db
-		.prepare('SELECT id, name, email FROM users WHERE household_id = ? ORDER BY created_at, id')
+		.prepare(
+			`SELECT users.id, users.name, users.email,
+			  CASE WHEN households.owner_id = users.id THEN 'owner' ELSE 'member' END AS role
+			 FROM users JOIN households ON households.id = users.household_id
+			 WHERE users.household_id = ? ORDER BY users.created_at, users.id`
+		)
 		.all(user.householdId) as HouseholdMember[];
 }
 
-export function createHouseholdInvite(user: User): { inviteCode: string; expiresAt: number } {
+export type HouseholdInvite = { inviteId: string; expiresAt: number };
+export function listHouseholdInvites(user: User): HouseholdInvite[] {
+	const now = Date.now();
+	db.prepare('DELETE FROM household_invites WHERE expires_at <= ? OR uses_remaining <= 0').run(now);
+	return db
+		.prepare(
+			`SELECT invite_id AS inviteId, expires_at AS expiresAt
+			 FROM household_invites
+			 WHERE household_id = ? AND expires_at > ? AND uses_remaining > 0
+			 ORDER BY expires_at`
+		)
+		.all(user.householdId, now) as HouseholdInvite[];
+}
+
+function assertHouseholdOwner(user: User): void {
+	assertCurrentHousehold(user);
+	const household = db
+		.prepare('SELECT owner_id FROM households WHERE id = ?')
+		.get(user.householdId) as { owner_id: string | null } | undefined;
+	if (!household || household.owner_id !== user.id)
+		throw new ApiError(403, 'Only the household owner can manage members and invitations');
+}
+
+export function createHouseholdInvite(user: User): {
+	inviteCode: string;
+	inviteId: string;
+	expiresAt: number;
+} {
+	assertHouseholdOwner(user);
 	const inviteCode = randomBytes(12).toString('base64url');
+	const inviteId = hashToken(inviteCode);
 	const expiresAt = Date.now() + INVITE_TTL_MS;
 	db.prepare('DELETE FROM household_invites WHERE expires_at <= ? OR uses_remaining <= 0').run(
 		Date.now()
 	);
 	db.prepare(
-		'INSERT INTO household_invites(code_hash, household_id, created_by, expires_at, uses_remaining) VALUES (?, ?, ?, ?, ?)'
-	).run(hashToken(inviteCode), user.householdId, user.id, expiresAt, 1);
-	return { inviteCode, expiresAt };
+		'INSERT INTO household_invites(code_hash, invite_id, household_id, created_by, expires_at, uses_remaining) VALUES (?, ?, ?, ?, ?, ?)'
+	).run(hashToken(inviteCode), inviteId, user.householdId, user.id, expiresAt, 1);
+	return { inviteCode, inviteId, expiresAt };
+}
+
+export function revokeHouseholdInvite(user: User, inviteId: string): void {
+	assertHouseholdOwner(user);
+	const result = db
+		.prepare('DELETE FROM household_invites WHERE invite_id = ? AND household_id = ?')
+		.run(inviteId, user.householdId);
+	if (Number(result.changes) === 0) throw new ApiError(404, 'Invitation not found');
 }
 
 function makePersonalHousehold(user: User): string {
@@ -700,6 +895,7 @@ export function joinHousehold(user: User, rawCode: string): User {
 		throw new ApiError(400, 'Invalid or expired invite code');
 	db.exec('BEGIN IMMEDIATE');
 	try {
+		assertCurrentHousehold(user);
 		const now = Date.now();
 		const invite = db
 			.prepare(
@@ -729,6 +925,7 @@ export function leaveHousehold(user: User): User {
 	const oldHouseholdId = user.householdId;
 	db.exec('BEGIN IMMEDIATE');
 	try {
+		assertCurrentHousehold(user);
 		makePersonalHousehold(user);
 		removeUserFromOldHousehold(user, oldHouseholdId);
 		db.exec('COMMIT');
@@ -740,4 +937,43 @@ export function leaveHousehold(user: User): User {
 		{ household_id: string } | undefined;
 	if (!row) throw new ApiError(401, 'Authentication required');
 	return { ...user, householdId: row.household_id };
+}
+
+export function removeHouseholdMember(owner: User, memberId: string): User {
+	if (memberId === owner.id)
+		throw new ApiError(400, 'The household owner cannot remove themselves');
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		assertHouseholdOwner(owner);
+		const member = db
+			.prepare('SELECT id, name, household_id FROM users WHERE id = ?')
+			.get(memberId) as { id: string; name: string; household_id: string } | undefined;
+		if (!member) throw new ApiError(404, 'Household member not found');
+		if (member.household_id !== owner.householdId)
+			throw new ApiError(403, 'That user is not a member of your household');
+
+		const personalHouseholdId = id();
+		const now = Date.now();
+		const { preferences: _preferences, ...initialSharedState } = createNewUserState();
+		db.prepare('INSERT INTO households(id, name, owner_id, created_at) VALUES (?, ?, ?, ?)').run(
+			personalHouseholdId,
+			`${member.name}’s household`,
+			member.id,
+			now
+		);
+		db.prepare('UPDATE users SET household_id = ? WHERE id = ?').run(
+			personalHouseholdId,
+			member.id
+		);
+		db.prepare(
+			'INSERT INTO household_state(household_id, state_json, version, updated_at) VALUES (?, ?, 1, ?)'
+		).run(personalHouseholdId, JSON.stringify(initialSharedState), now);
+		const currentMember = getCurrentUser(member.id);
+		if (!currentMember) throw new ApiError(404, 'Household member not found');
+		db.exec('COMMIT');
+		return toUser(currentMember);
+	} catch (error) {
+		db.exec('ROLLBACK');
+		throw error;
+	}
 }
