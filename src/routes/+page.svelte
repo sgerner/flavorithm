@@ -120,6 +120,9 @@
 	let password = $state('');
 	let error = $state('');
 	let apiKey = $state('');
+	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
+	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
+	let verificationBusy = $state(false);
 	type ChatGPTAccount = {
 		id: string;
 		label: string;
@@ -152,8 +155,15 @@
 	let importSession = $state<ImportSession>(emptyImportSession());
 	let resumeImport = $state(false);
 	let searchResults = $state<{ title: string; url: string; description: string }[]>([]);
-	let members = $state<{ name: string; email: string }[]>([]);
+	type HouseholdMember = { id: string; name: string; email: string; role: string };
+	type HouseholdInvite = { inviteId: string; expiresAt: number };
+	let members = $state<HouseholdMember[]>([]);
+	let householdInvites = $state<HouseholdInvite[]>([]);
+	let canManageHousehold = $state(false);
+	let householdBusy = $state(false);
+	let memberToRemove = $state<HouseholdMember | null>(null);
 	let inviteCode = $state('');
+	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
 	let mealDate = $state('');
@@ -170,6 +180,15 @@
 	let showStarter = $state(true);
 	let imageInput: HTMLInputElement;
 	let deferredInstall = $state<any>(null);
+	async function refreshAuth() {
+		const data = await request('/api/auth');
+		user = data.user ?? null;
+		capabilities = {
+			emailDelivery: Boolean(data.capabilities?.emailDelivery),
+			recipeSearch: Boolean(data.capabilities?.recipeSearch)
+		};
+		return data;
+	}
 	const nav = [
 		{ id: 'discover', name: 'Discover', icon: LayoutGrid },
 		{ id: 'pantry', name: 'My pantry', icon: Carrot },
@@ -318,19 +337,33 @@
 		} catch {}
 		showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
 		ready = true;
-		const returnFromChatGPT = new URL(window.location.href).searchParams.has('chatgpt');
-		const reset = new URL(window.location.href).searchParams.get('reset');
+		const pageUrl = new URL(window.location.href);
+		const returnFromChatGPT = pageUrl.searchParams.has('chatgpt');
+		const reset = pageUrl.searchParams.get('reset');
+		const verificationToken = pageUrl.searchParams.get('verify');
 		if (returnFromChatGPT) {
 			modal = 'settings';
-			window.history.replaceState({}, '', window.location.pathname);
 		}
 		if (reset) {
 			resetToken = reset;
 			modal = 'reset';
-			window.history.replaceState({}, '', window.location.pathname);
+		}
+		if (returnFromChatGPT || reset || verificationToken) {
+			pageUrl.searchParams.delete('chatgpt');
+			pageUrl.searchParams.delete('reset');
+			pageUrl.searchParams.delete('verify');
+			window.history.replaceState(
+				{},
+				'',
+				`${pageUrl.pathname}${pageUrl.search}${pageUrl.hash}`
+			);
 		}
 		request('/api/auth')
 			.then(async (data) => {
+				capabilities = {
+					emailDelivery: Boolean(data.capabilities?.emailDelivery),
+					recipeSearch: Boolean(data.capabilities?.recipeSearch)
+				};
 				syncing = true;
 				if (data.user) {
 					const saved = await request('/api/state');
@@ -344,6 +377,22 @@
 					await refreshConnections().catch(() =>
 						notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 					);
+				if (verificationToken) {
+					try {
+						const verified = await request('/api/auth', {
+							action: 'verifyEmail',
+							token: verificationToken
+						});
+						const refreshed = await refreshAuth();
+						notify(
+							refreshed.user?.id === verified.user?.id && refreshed.user?.emailVerified
+								? 'Your email is verified.'
+								: 'Email verified. Sign in to access that account.'
+						);
+					} catch {
+						notify('That verification link is invalid or expired. Sign in and request a new one.');
+					}
+				}
 			})
 			.catch(() => notify('Working locally. Account sync is unavailable.'));
 		if ('serviceWorker' in navigator)
@@ -474,6 +523,12 @@
 			await flushKitchen();
 			await request('/api/auth', { action: 'logout' });
 			user = null;
+			inviteCode = '';
+			currentInviteId = '';
+			joinCode = '';
+			members = [];
+			householdInvites = [];
+			canManageHousehold = false;
 			importSession = emptyImportSession();
 			resumeImport = false;
 			kitchen = createInitialState();
@@ -521,6 +576,11 @@
 		mobileNav = false;
 		modal = 'settings';
 		error = '';
+		try {
+			await refreshAuth();
+		} catch {
+			// Keep the last known account state while showing Settings offline.
+		}
 		if (focusAI) {
 			await tick();
 			document.getElementById('ai-connection-heading')?.focus();
@@ -974,6 +1034,17 @@
 		page = 'planner';
 		notify('Meal scheduled.');
 	}
+	async function refreshHousehold() {
+		const data = await request('/api/household');
+		members = data.members ?? [];
+		householdInvites = data.invites ?? [];
+		canManageHousehold = Boolean(data.canManage);
+		if (currentInviteId && !householdInvites.some((invite) => invite.inviteId === currentInviteId)) {
+			currentInviteId = '';
+			inviteCode = '';
+		}
+		return data;
+	}
 	async function household() {
 		mobileNav = false;
 		if (!user) {
@@ -982,35 +1053,96 @@
 		}
 		modal = 'household';
 		error = '';
+		householdBusy = true;
 		try {
-			members = (await request('/api/household')).members;
+			await refreshHousehold();
 		} catch (e) {
 			error = (e as Error).message;
+		} finally {
+			householdBusy = false;
 		}
 	}
 	async function invite() {
+		if (!canManageHousehold) return;
+		householdBusy = true;
+		error = '';
 		try {
-			inviteCode = (await request('/api/household', { action: 'createInvite' })).inviteCode;
+			const result = await request('/api/household', { action: 'createInvite' });
+			inviteCode = result.inviteCode;
+			currentInviteId = result.inviteId;
+			await refreshHousehold();
 			notify('Invite ready. Share it with someone you cook with.');
 		} catch (e) {
 			error = (e as Error).message;
+		} finally {
+			householdBusy = false;
+		}
+	}
+	async function revokeInvite(inviteId: string) {
+		if (!canManageHousehold) return;
+		householdBusy = true;
+		error = '';
+		try {
+			await request('/api/household', { action: 'revokeInvite', inviteId });
+			if (currentInviteId === inviteId) {
+				currentInviteId = '';
+				inviteCode = '';
+			}
+			await refreshHousehold();
+			notify('Invitation revoked.');
+		} catch (e) {
+			error = (e as Error).message;
+		} finally {
+			householdBusy = false;
+		}
+	}
+	function askRemoveMember(member: HouseholdMember) {
+		if (!canManageHousehold || member.role === 'owner' || member.id === user?.id) return;
+		memberToRemove = member;
+		modal = 'removeMember';
+		error = '';
+	}
+	async function confirmRemoveMember() {
+		if (!canManageHousehold || !memberToRemove) return;
+		householdBusy = true;
+		error = '';
+		try {
+			await request('/api/household', {
+				action: 'removeMember',
+				memberId: memberToRemove.id
+			});
+			await refreshHousehold();
+			modal = 'household';
+			memberToRemove = null;
+			notify('Member removed from the household.');
+		} catch (e) {
+			error = (e as Error).message;
+		} finally {
+			householdBusy = false;
 		}
 	}
 	async function join() {
+		householdBusy = true;
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
-			const result = await request('/api/household', { action: 'join', code: joinCode });
-			members = result.members;
+			await request('/api/household', { action: 'join', code: joinCode.trim() });
+			joinCode = '';
+			inviteCode = '';
+			currentInviteId = '';
+			await refreshAuth();
 			const data = await request('/api/state');
 			kitchen = data.state || createNewUserState();
-			joinCode = '';
+			await refreshHousehold();
 			syncing = false;
 			notify('Welcome to your shared kitchen.');
 		} catch (e) {
 			syncing = false;
 			error = (e as Error).message;
+		} finally {
+			syncing = false;
+			householdBusy = false;
 		}
 	}
 	async function refreshNutrition() {
@@ -1033,6 +1165,11 @@
 		if (modal === 'editMeal') editingMealId = '';
 		if (modal === 'cookMeal') cookingMealId = '';
 		if (modal === 'deleteRecipe') recipeToDelete = null;
+		if (modal === 'removeMember') memberToRemove = null;
+		if (modal === 'household') {
+			inviteCode = '';
+			currentInviteId = '';
+		}
 		if (modal === 'onboarding') dismissOnboarding();
 		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
 			resumeImport = false;
@@ -1095,6 +1232,12 @@
 			await writeChain;
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
 			user = null;
+			inviteCode = '';
+			currentInviteId = '';
+			joinCode = '';
+			members = [];
+			householdInvites = [];
+			canManageHousehold = false;
 			importSession = emptyImportSession();
 			resumeImport = false;
 			apiKey = '';
@@ -1110,6 +1253,20 @@
 			syncing = false;
 		} finally {
 			busy = false;
+		}
+	}
+	async function sendEmailVerification() {
+		if (!user || user.emailVerified || !capabilities.emailDelivery) return;
+		verificationBusy = true;
+		error = '';
+		try {
+			await request('/api/auth', { action: 'requestEmailVerification' });
+			await refreshAuth();
+			notify('If your email needs verification, a link is on its way.');
+		} catch (e) {
+			error = (e as Error).message;
+		} finally {
+			verificationBusy = false;
 		}
 	}
 	async function recover(event: SubmitEvent) {
@@ -1138,14 +1295,21 @@
 	}
 	async function leaveHousehold() {
 		busy = true;
+		householdBusy = true;
 		error = '';
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
 			await request('/api/household', { action: 'leave' });
+			joinCode = '';
+			inviteCode = '';
+			currentInviteId = '';
+			memberToRemove = null;
+			await refreshAuth();
 			const data = await request('/api/state');
 			kitchen = data.state || createNewUserState();
+			await refreshHousehold();
 			syncing = false;
 			modal = '';
 			notify('You now have your own kitchen.');
@@ -1154,6 +1318,7 @@
 			error = (e as Error).message;
 		} finally {
 			busy = false;
+			householdBusy = false;
 		}
 	}
 
@@ -1169,6 +1334,10 @@
 		URL.revokeObjectURL(url);
 	}
 	async function internetSearch() {
+		if (!capabilities.recipeSearch) {
+			error = 'Web recipe search is not configured for this kitchen.';
+			return;
+		}
 		if (!user) {
 			modal = 'auth';
 			return;
@@ -2000,6 +2169,65 @@
 			justify-content: flex-start;
 		}
 	}
+	.household-members {
+		margin-top: 10px;
+	}
+	.household-members .member-row {
+		gap: 9px;
+		flex-wrap: wrap;
+		padding: 12px 0;
+	}
+	.member-copy {
+		min-width: 0;
+		flex: 1 1 125px;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.member-copy span {
+		font-size: 13px;
+		color: var(--muted);
+		overflow-wrap: anywhere;
+	}
+	.member-role {
+		padding: 4px 7px;
+		background: var(--wash);
+		color: var(--muted);
+		font-size: 12px;
+	}
+	.member-role.owner-role {
+		background: var(--accent);
+		color: var(--ink);
+	}
+	.member-remove {
+		min-height: 40px;
+		padding-inline: 6px;
+		font-size: 13px;
+	}
+	.household-invites {
+		margin-top: 22px;
+		padding: 18px 0 4px;
+		border-top: 1px solid var(--line);
+	}
+	.household-invites h3 {
+		margin-bottom: 6px;
+	}
+	.invite-list {
+		margin: 8px 0 14px;
+	}
+	.invite-row {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		min-height: 44px;
+		border-bottom: 1px solid var(--line);
+		font-size: 14px;
+	}
+	.invite-row button {
+		min-height: 40px;
+		padding-inline: 6px;
+	}
 </style>
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
@@ -2285,6 +2513,15 @@
 							>Edit my taste preferences <SlidersHorizontal size={16} /></button
 						>
 					</div>
+					{#if user}<div class="settings-section">
+						<h3>Account email</h3>
+						<p class="muted">{user.email} · {user.emailVerified ? 'Verified' : 'Not verified'}</p>
+						{#if user.emailVerified}<p class="field-help">Email verification is optional for using your kitchen.</p>{:else}<button class="secondary" disabled={!capabilities.emailDelivery || verificationBusy} onclick={sendEmailVerification}>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button>{#if !capabilities.emailDelivery}<p class="field-help">Email delivery is unavailable. Set RESEND_API_KEY and EMAIL_FROM to enable it.</p>{/if}{/if}
+					</div>{/if}
+					<div class="settings-section">
+						<h3>Web recipe search</h3>
+						{#if capabilities.recipeSearch}<p class="muted">Available for this installation.</p>{:else}<p class="muted">Unavailable. Set BRAVE_SEARCH_API_KEY on this installation to enable search.</p>{/if}
+					</div>
 					<div class="settings-section intelligence-settings">
 						<h3 id="ai-connection-heading" tabindex="-1">AI connection</h3>
 						<p class="muted">Connect a model for recipe generation, photos, and nutrition.</p>
@@ -2478,49 +2715,35 @@
 					</div>
 				{:else if modal === 'household'}<span class="dialog-spark">✳</span>
 					<h2>Your household</h2>
-					<p class="muted">
-						A shared pantry, recipe collection, meal plan, and shopping list for the people you cook
-						with.
-					</p>
-					{#each members as member}<div class="member-row">
-							<span class="profile-avatar">{member.name[0]}</span>
-							<div>
-								<b>{member.name}</b>
-								<p class="muted">{member.email}</p>
-							</div>
-						</div>{/each}<button class="primary full" onclick={invite}
-						><Plus size={17} /> Invite someone to your kitchen</button
-					>{#if inviteCode}<div class="invite-code">
-							<code>{inviteCode}</code><button
-								class="icon-button"
-								aria-label="Copy invitation"
-								onclick={() =>
-									navigator.clipboard
-										.writeText(inviteCode)
-										.then(() => notify('Invite code copied.'))
-										.catch(() => notify('Select and copy the code manually.'))}
-								><Copy size={17} /></button
-							>
-						</div>
-						<p class="field-help">Share privately. Invitations expire and can be used once.</p>{/if}
+					<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
+					{#if householdBusy}<p class="field-help" role="status">Updating household…</p>{/if}
+					<div class="household-members">
+						{#each members as member (member.id)}<div class="member-row">
+							<span class="profile-avatar">{member.name.trim().charAt(0).toUpperCase() || '•'}</span>
+							<div class="member-copy"><b>{member.name}{member.id === user?.id ? ' · You' : ''}</b><span>{member.email}</span></div>
+							<span class="member-role" class:owner-role={member.role === 'owner'}>{member.role === 'owner' ? 'Owner' : 'Member'}</span>
+							{#if canManageHousehold && member.role !== 'owner' && member.id !== user?.id}<button class="text-button danger member-remove" disabled={householdBusy} onclick={() => askRemoveMember(member)}>Remove</button>{/if}
+						</div>{/each}
+					</div>
+					{#if canManageHousehold}<section class="household-invites">
+						<h3>Invitations</h3>
+						{#if householdInvites.length}<div class="invite-list">
+							{#each householdInvites as invite (invite.inviteId)}<div class="invite-row"><span>Expires {new Date(invite.expiresAt).toLocaleDateString('en', { month: 'short', day: 'numeric' })}</span><button class="text-button danger" disabled={householdBusy} onclick={() => revokeInvite(invite.inviteId)}>Revoke</button></div>{/each}
+						</div>{:else}<p class="field-help">No active invitations.</p>{/if}
+						<button class="primary full" disabled={householdBusy} onclick={invite}><Plus size={17} /> Create invitation</button>
+						{#if inviteCode}<div class="invite-code"><code>{inviteCode}</code><button class="icon-button" aria-label="Copy invitation" onclick={() => navigator.clipboard.writeText(inviteCode).then(() => notify('Invite code copied.')).catch(() => notify('Select and copy the code manually.'))}><Copy size={17} /></button></div><p class="field-help">Share privately. This code works once.</p>{/if}
+					</section>{:else}<p class="field-help">Only the household owner can manage invitations or remove members.</p>{/if}
 					<hr />
 					<h3>Have an invitation?</h3>
-					<p class="field-help">Joining switches you to the invited household’s shared kitchen.</p>
-					<label class="field"
-						>Invite code<input
-							bind:value={joinCode}
-							placeholder="Paste your invitation code"
-						/></label
-					><button class="secondary full" disabled={!joinCode.trim()} onclick={join}
-						>Join household <ArrowRight size={17} /></button
-					>{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<button
-						class="text-button danger full"
-						onclick={() => {
-							modal = 'leave';
-							error = '';
-						}}>Leave this household</button
-					>
+					<label class="field">Invite code<input bind:value={joinCode} placeholder="Paste invitation code" autocomplete="off" /></label>
+					<button class="secondary full" disabled={householdBusy || !joinCode.trim()} onclick={join}>Join household <ArrowRight size={17} /></button>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<button class="text-button danger full" disabled={householdBusy} onclick={() => { modal = 'leave'; error = ''; }}>Leave this household</button>
+				{:else if modal === 'removeMember'}
+					<h2>Remove household member?</h2>
+					<p class="muted">{memberToRemove?.name} will lose access to this shared kitchen. Their account will remain active.</p>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="dialog-actions"><button class="secondary" disabled={householdBusy} onclick={() => { memberToRemove = null; modal = 'household'; }}>Keep member</button><button class="primary danger-action" disabled={householdBusy} onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button></div>
 				{:else if modal === 'leave'}
 					<h2>Leave this household?</h2>
 					<p class="muted">
@@ -2654,12 +2877,13 @@
 					<p class="muted">
 						Search real recipes across the web, with links to the original creators.
 					</p>
+					{#if !capabilities.recipeSearch}<p class="field-help">Web search is unavailable. Set BRAVE_SEARCH_API_KEY on this installation.</p>{/if}
 					<label class="field"
 						>What are you craving?<input
 							bind:value={prompt}
 							placeholder="Lemony weeknight pasta…"
 						/></label
-					><button class="primary full" disabled={busy} onclick={internetSearch}
+					><button class="primary full" disabled={busy || !capabilities.recipeSearch} onclick={internetSearch}
 						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 					>{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<button class="secondary full" onclick={() => openImport()}
