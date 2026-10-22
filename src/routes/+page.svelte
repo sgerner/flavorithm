@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import {
 		backdropMotion,
@@ -46,6 +46,10 @@
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
+	import RecipeImport, {
+		emptyImportSession,
+		type ImportSession
+	} from '#lib/components/RecipeImport.svelte';
 	let kitchen = $state<AppState>(createInitialState());
 	let user = $state<User | null>(null);
 	let ready = $state(false);
@@ -121,6 +125,7 @@
 		accounts: ChatGPTAccount[];
 	}>({ configured: false, mode: 'unavailable', accounts: [] });
 	let connectionBusy = $state(false);
+	let chatGPTAuthorizationUrl = $state('');
 	let connectionPoll: ReturnType<typeof setInterval> | undefined;
 	let connectionPopup: Window | null = null;
 	let connectionPollCount = 0;
@@ -133,7 +138,8 @@
 		{ id: string; name: string; models: { id: string; name: string; vision: boolean }[] }[]
 	>([]);
 	let prompt = $state('');
-	let recipeUrl = $state('');
+	let importSession = $state<ImportSession>(emptyImportSession());
+	let resumeImport = $state(false);
 	let searchResults = $state<{ title: string; url: string; description: string }[]>([]);
 	let members = $state<{ name: string; email: string }[]>([]);
 	let inviteCode = $state('');
@@ -227,7 +233,7 @@
 			if (toast === message) toast = '';
 		}, 4200);
 	}
-	async function request(url: string, body?: unknown, method = 'POST') {
+	async function request(url: string, body?: unknown, method = 'POST', signal?: AbortSignal) {
 		const headers: Record<string, string> =
 			body === undefined ? {} : { 'Content-Type': 'application/json' };
 		if (url === '/api/state' && method === 'PUT') {
@@ -235,6 +241,7 @@
 			else headers['If-None-Match'] = '*';
 		}
 		const response = await fetch(url, {
+			signal,
 			method: body === undefined ? 'GET' : method,
 			headers,
 			body: body === undefined ? undefined : JSON.stringify(body)
@@ -425,9 +432,14 @@
 				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 			);
 			password = '';
-			modal = '';
+			if (resumeImport) {
+				resumeImport = false;
+				modal = 'import';
+			} else {
+				modal = '';
+				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
+			}
 			notify(`Welcome to your kitchen, ${user?.name.split(' ')[0]}.`);
-			if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
 		} catch (e) {
 			error = (e as Error).message;
 		} finally {
@@ -442,11 +454,14 @@
 			await flushKitchen();
 			await request('/api/auth', { action: 'logout' });
 			user = null;
+			importSession = emptyImportSession();
+			resumeImport = false;
 			kitchen = createInitialState();
 			localStorage.removeItem('flavorithm-kitchen');
 			apiKey = '';
 			clearInterval(connectionPoll);
 			connectionBusy = false;
+			chatGPTAuthorizationUrl = '';
 			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 			stateEtag = null;
 			syncing = false;
@@ -482,10 +497,14 @@
 			kitchen.preferences.chatgptAccountId =
 				chatGPT.accounts.find((a) => a.connected && a.planEnabled)?.id || chatGPT.accounts[0]?.id;
 	}
-	async function openSettings() {
+	async function openSettings(focusAI = false) {
 		mobileNav = false;
 		modal = 'settings';
 		error = '';
+		if (focusAI) {
+			await tick();
+			document.getElementById('ai-connection-heading')?.focus();
+		}
 		try {
 			if (user) {
 				await refreshConnections();
@@ -513,6 +532,7 @@
 			return;
 		}
 		connectionBusy = true;
+		chatGPTAuthorizationUrl = '';
 		error = '';
 		connectionPopup = window.open(
 			'about:blank',
@@ -528,7 +548,9 @@
 				reconsent
 			});
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else {
+			else if (importSession.text || importSession.photo || importSession.draft) {
+				chatGPTAuthorizationUrl = result.authorizationUrl;
+			} else {
 				window.location.assign(result.authorizationUrl);
 				return;
 			}
@@ -545,6 +567,7 @@
 					if (connectionChanged || connectionPopup?.closed) {
 						clearInterval(connectionPoll);
 						connectionBusy = false;
+						chatGPTAuthorizationUrl = '';
 						const account = chatGPT.accounts.find(
 							(a) =>
 								a.connected &&
@@ -570,11 +593,13 @@
 					if (connectionPollCount >= 400) {
 						clearInterval(connectionPoll);
 						connectionBusy = false;
+						chatGPTAuthorizationUrl = '';
 						error = 'The connection window timed out. Try connecting again.';
 					}
 				} catch (e) {
 					clearInterval(connectionPoll);
 					connectionBusy = false;
+					chatGPTAuthorizationUrl = '';
 					error = (e as Error).message;
 				} finally {
 					polling = false;
@@ -583,6 +608,7 @@
 		} catch (e) {
 			connectionPopup?.close();
 			connectionBusy = false;
+			chatGPTAuthorizationUrl = '';
 			error = (e as Error).message;
 		}
 	}
@@ -607,6 +633,7 @@
 			error = (e as Error).message;
 		} finally {
 			connectionBusy = false;
+			chatGPTAuthorizationUrl = '';
 		}
 	}
 	function needAI() {
@@ -620,7 +647,7 @@
 			(isPlan ? !activeChatGPTAccount?.connected || !activeChatGPTAccount.planEnabled : !apiKey) ||
 			!kitchen.preferences.model
 		) {
-			openSettings();
+			openSettings(true);
 			notify(
 				isPlan
 					? 'Connect your ChatGPT plan and choose an available model.'
@@ -630,20 +657,29 @@
 		}
 		return true;
 	}
-	async function ai(action: string, extra: Record<string, unknown> = {}) {
-		return request('/api/ai', {
-			action,
-			...(kitchen.preferences.provider === 'chatgpt'
-				? { connectionId: kitchen.preferences.chatgptAccountId }
-				: { apiKey }),
-			provider: kitchen.preferences.provider,
-			model: kitchen.preferences.model,
-			pantry: kitchen.pantry,
-			preferences: kitchen.preferences,
-			recipes: kitchen.recipes.filter((r) => r.rating),
-			prompt,
-			...extra
-		});
+	async function ai(action: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) {
+		return request(
+			'/api/ai',
+			{
+				action,
+				...(kitchen.preferences.provider === 'chatgpt'
+					? { connectionId: kitchen.preferences.chatgptAccountId }
+					: { apiKey }),
+				provider: kitchen.preferences.provider,
+				model: kitchen.preferences.model,
+				...(action === 'capture'
+					? {}
+					: {
+							pantry: kitchen.pantry,
+							preferences: kitchen.preferences,
+							recipes: kitchen.recipes.filter((r) => r.rating),
+							prompt
+						}),
+				...extra
+			},
+			'POST',
+			signal
+		);
 	}
 	async function generate() {
 		if (!needAI()) return;
@@ -692,6 +728,12 @@
 		}
 	}
 	function dictate() {
+		startDictation(false);
+	}
+	function dictateRecipe() {
+		startDictation(true);
+	}
+	function startDictation(forRecipe: boolean) {
 		const Recognition =
 			(window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 		if (!Recognition) {
@@ -699,16 +741,33 @@
 			return;
 		}
 		const recognition = new Recognition();
+		const inputSession = importSession;
 		recognition.lang = navigator.language;
 		recognition.interimResults = false;
 		recognition.onresult = (e: any) => {
-			pantryInput += (pantryInput ? ', ' : '') + e.results[0][0].transcript;
-			modal = 'pantry';
-			notify('Review your ingredients, then add them.');
+			if (forRecipe) {
+				if (modal !== 'import' || importSession !== inputSession || importSession.draft) return;
+				importSession.text = [importSession.text, e.results[0][0].transcript]
+					.filter(Boolean)
+					.join('\n')
+					.slice(0, 20000);
+			} else {
+				pantryInput += (pantryInput ? ', ' : '') + e.results[0][0].transcript;
+				modal = 'pantry';
+				notify('Review your ingredients, then add them.');
+			}
 		};
 		recognition.onerror = () => notify('Microphone access failed. Check browser permissions.');
-		recognition.start();
-		notify('Listening… tell us what’s in your kitchen.');
+		try {
+			recognition.start();
+			notify(
+				forRecipe
+					? 'Listening… describe your recipe.'
+					: 'Listening… tell us what’s in your kitchen.'
+			);
+		} catch {
+			notify('Voice input could not start. Try again or paste text.');
+		}
 	}
 	function saveRecipe(r: Recipe) {
 		r.saved = !r.saved;
@@ -805,21 +864,43 @@
 			busy = false;
 		}
 	}
-	async function importRecipe(url: string) {
-		if (!needAI()) return;
-		busy = true;
+	function closeDialog() {
+		if (modal === 'plan') selected = null;
+		if (modal === 'onboarding') dismissOnboarding();
+		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
+			resumeImport = false;
+			modal = 'import';
+		} else modal = '';
 		error = '';
-		try {
-			const result = await ai('import', { url });
-			kitchen.recipes = [...result.recipes, ...kitchen.recipes];
-			modal = '';
-			selected = result.recipes[0];
-			notify('Recipe imported, with credit to its original creator.');
-		} catch (e) {
-			error = (e as Error).message;
-		} finally {
-			busy = false;
+	}
+	function openImport(text?: string) {
+		resumeImport = false;
+		if (text !== undefined) importSession = { ...emptyImportSession(), text };
+		error = '';
+		mobileNav = false;
+		modal = 'import';
+	}
+	function importRecipe(url: string) {
+		openImport(url);
+	}
+	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
+		if (!needAI()) {
+			resumeImport = true;
+			return null;
 		}
+		return ai('capture', input, signal);
+	}
+	function saveImportedRecipe(recipe: Recipe) {
+		const saved = { ...recipe, saved: true };
+		kitchen.recipes = [saved, ...kitchen.recipes.filter((r) => r.id !== saved.id)];
+		importSession = emptyImportSession();
+		resumeImport = false;
+		modal = '';
+		selected = saved;
+		page = 'saved';
+		query = '';
+		filter = 'For you';
+		notify('Recipe saved to your collection.');
 	}
 	async function exportKitchen() {
 		try {
@@ -847,6 +928,8 @@
 			await writeChain;
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
 			user = null;
+			importSession = emptyImportSession();
+			resumeImport = false;
 			apiKey = '';
 			deletePassword = '';
 			stateEtag = null;
@@ -941,8 +1024,7 @@
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
 			mobileNav = false;
-			if (modal === 'onboarding') dismissOnboarding();
-			else modal = '';
+			closeDialog();
 			selected = null;
 		}
 	}}
@@ -983,7 +1065,8 @@
 		</nav>
 		<div class="bottom-nav">
 			<button onclick={household}><Users size={18} /> My household <Plus size={15} /></button
-			><button onclick={openSettings}><Settings size={18} /> Settings & themes</button><button
+			><button onclick={() => openSettings()}><Settings size={18} /> Settings & themes</button
+			><button
 				onclick={() => {
 					kitchen.preferences.dark = !kitchen.preferences.dark;
 				}}
@@ -1120,13 +1203,18 @@
 								>
 							</h2>
 						</div>
-						<button
-							class="primary"
-							onclick={() => {
-								modal = 'generate';
-								error = '';
-							}}><Sparkles size={17} /> Generate recipes</button
-						>
+						<div class="recipe-actions">
+							<button class="secondary" onclick={() => openImport()}
+								><Plus size={17} />Import</button
+							>
+							<button
+								class="primary"
+								onclick={() => {
+									modal = 'generate';
+									error = '';
+								}}><Sparkles size={17} /> Generate</button
+							>
+						</div>
 					</div>
 					<div class="recipe-toolbar">
 						<div class="filter-tabs">
@@ -1497,24 +1585,32 @@
 				class="flavor-dialog"
 				class:onboarding-dialog={modal === 'onboarding'}
 				use:focusTrap
-				class:wide={modal === 'settings' || modal === 'pickRecipe'}
+				class:wide={modal === 'settings' || modal === 'pickRecipe' || modal === 'import'}
+				class:capture-dialog={modal === 'import'}
 				role="dialog"
+				aria-labelledby={modal === 'import' ? 'recipe-import-title' : undefined}
 				aria-modal="true"
-				aria-label={modal === 'onboarding' ? 'Recipe preferences' : modal}
+				aria-label={modal === 'onboarding'
+					? 'Recipe preferences'
+					: modal === 'import'
+						? 'Import recipe'
+						: modal}
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
 				<button
 					class="icon-button dialog-close"
 					onclick={() => {
-						if (modal === 'plan') selected = null;
-						if (modal === 'onboarding') dismissOnboarding();
-						else modal = '';
-						error = '';
+						closeDialog();
 					}}
 					aria-label="Close dialog"><X size={21} /></button
 				>
-				{#if modal === 'onboarding'}
+				{#if modal === 'import'}<RecipeImport
+						bind:session={importSession}
+						capture={captureImport}
+						save={saveImportedRecipe}
+						dictate={dictateRecipe}
+					/>{:else if modal === 'onboarding'}
 					<span class="dialog-spark">✷</span>
 					<h2>Recipe preferences</h2>
 					<p class="muted onboarding-intro">
@@ -1653,8 +1749,8 @@
 							>{busy
 								? 'Opening your kitchen…'
 								: authMode === 'register'
-									? 'Sign in'
-									: 'Come on in'}<ArrowRight size={17} /></button
+									? 'Create account'
+									: 'Sign in'}<ArrowRight size={17} /></button
 						>
 					</form>
 					<button
@@ -1741,7 +1837,7 @@
 						>
 					</div>
 					<div class="settings-section intelligence-settings">
-						<h3>AI connection</h3>
+						<h3 id="ai-connection-heading" tabindex="-1">AI connection</h3>
 						<p class="muted">Connect a model for recipe generation, photos, and nutrition.</p>
 						{#if !user}<p class="field-help">
 								Sign in to link your ChatGPT plan or use your own API key.
@@ -1822,6 +1918,16 @@
 										{chatGPT.safeReason ||
 											'Sign in to see the connection options for this installation.'}
 									</p>{/if}
+								{#if chatGPTAuthorizationUrl}<div class="connection-actions">
+										<a
+											class="secondary"
+											href={chatGPTAuthorizationUrl}
+											target="_blank"
+											rel="noreferrer noopener"
+											>Continue ChatGPT sign-in <ArrowUpRight size={16} /></a
+										>
+									</div>
+									<p class="field-help">Opens a new tab so your recipe draft stays here.</p>{/if}
 								{#if chatGPT.mode === 'local'}<p class="field-help">
 										Connect from a browser on the computer running Flavorithm. OpenAI’s local-app
 										flow returns to a temporary 127.0.0.1 callback.
@@ -1916,9 +2022,9 @@
 							>{/if}<button
 							class="primary"
 							onclick={() => {
-								modal = '';
+								closeDialog();
 								notify('Preferences saved.');
-							}}>Looking good <Check size={17} /></button
+							}}>Done <Check size={17} /></button
 						>
 					</div>
 				{:else if modal === 'household'}<span class="dialog-spark">✳</span>
@@ -2085,25 +2191,8 @@
 					><button class="primary full" disabled={busy} onclick={internetSearch}
 						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 					>{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<hr />
-					<h3>A recipe caught your eye?</h3>
-					<label class="field"
-						>Import its link<input
-							type="url"
-							bind:value={recipeUrl}
-							placeholder="https://www.bbcgoodfood.com/recipes/…"
-						/></label
-					>
-					<p class="field-help">
-						Supports BBC Good Food, Serious Eats, Simply Recipes, Allrecipes, EatingWell, Love &
-						Lemons, and Cookie + Kate when structured recipe data is available. Import uses your
-						connected model.
-					</p>
-					<button
-						class="secondary full"
-						disabled={busy || !recipeUrl.trim()}
-						onclick={() => importRecipe(recipeUrl)}
-						><Plus size={16} /> Import from a recipe link</button
+					<button class="secondary full" onclick={() => openImport()}
+						><Plus size={17} />Import text, a link, or a photo</button
 					>
 					<div class="web-results">
 						{#each searchResults as result}<div class="web-result">

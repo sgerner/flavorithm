@@ -63,6 +63,12 @@
 			<div class="eyebrow">{recipe.cuisine} · {recipe.difficulty}</div>
 			<h2>{recipe.title}</h2>
 			<p class="muted">{recipe.description}</p>
+			{#if recipe.importNotes?.length}<details class="import-notes">
+					<summary>Import notes ({recipe.importNotes.length})</summary>
+					<ul>
+						{#each recipe.importNotes as note}<li>{note}</li>{/each}
+					</ul>
+				</details>{/if}
 			<div class="detail-meta">
 				<span><Clock size={16} />{recipe.time} min</span><span
 					><Users size={16} />{recipe.servings} servings</span
