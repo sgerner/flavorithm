@@ -23,6 +23,8 @@
 		plan,
 		rate,
 		nutrition,
+		edit,
+		remove,
 		busy
 	}: {
 		recipe: Recipe;
@@ -32,6 +34,8 @@
 		plan: (servings: number) => void;
 		rate: (n: number) => void;
 		nutrition: () => void;
+		edit: () => void;
+		remove: () => void;
 		busy: boolean;
 	} = $props();
 	let nutritionMode = $state('serving');
@@ -86,6 +90,8 @@
 					aria-label="Save recipe"
 					><Bookmark size={19} fill={recipe.saved ? 'currentColor' : 'none'} /></button
 				>
+				{#if recipe.saved}<button class="secondary recipe-manage-button" onclick={edit}>Edit</button
+					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
 			<div class="tabs">
 				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
@@ -139,6 +145,7 @@
 					</div>
 				</div>
 			{:else}<div class="nutrition-panel" transition:revealMotion|global>
+					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">Ingredients or servings changed. Refresh this estimate before relying on it.</p>{/if}
 					<label class="servings nutrition-selector"
 						>Show nutrition for<select bind:value={nutritionMode}
 							><option value="serving">One serving</option><option value="recipe"
@@ -222,3 +229,18 @@
 		</div>
 	</div>
 </div>
+
+<style>
+	.recipe-manage-button {
+		min-height: 44px;
+		padding-inline: 12px;
+		white-space: nowrap;
+	}
+	.nutrition-stale {
+		padding: 10px 12px;
+		margin-bottom: 14px;
+		background: var(--wash);
+		color: var(--muted);
+		font-size: 14px;
+	}
+</style>

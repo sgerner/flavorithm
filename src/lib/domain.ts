@@ -1,6 +1,6 @@
 import type { Ingredient, Meal, Recipe, ShoppingItem } from './types';
 
-type UnitInfo = { dimension: string; factor: number; display: string };
+export type UnitInfo = { dimension: string; factor: number; display: string };
 
 const unitAliases: Record<string, UnitInfo> = {};
 
@@ -90,12 +90,12 @@ function cleanText(value: string): string {
 		.replace(/[.,;:]$/, '');
 }
 
-function normalizeName(name: string): string {
+export function normalizeName(name: string): string {
 	const cleaned = cleanText(name);
 	return ingredientAliases[cleaned] ?? singulars[cleaned] ?? cleaned;
 }
 
-function unitInfo(unit: string): UnitInfo {
+export function unitInfo(unit: string): UnitInfo {
 	const cleaned = cleanText(unit);
 	return (
 		unitAliases[cleaned] ?? { dimension: `unit:${cleaned}`, factor: 1, display: cleaned || 'each' }
