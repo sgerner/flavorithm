@@ -42,6 +42,15 @@ function generatedShoppingId(sourceKey: string, key: string): string {
 	return `generated-${stableHash(`${sourceKey}\u0000${key}`)}`;
 }
 
+function nextFreeGeneratedId(sourceKey: string, key: string, usedIds: Set<string>): string {
+	const baseId = generatedShoppingId(sourceKey, key);
+	let candidate = baseId;
+	let suffix = 2;
+	while (usedIds.has(candidate)) candidate = `${baseId}-${suffix++}`;
+	usedIds.add(candidate);
+	return candidate;
+}
+
 export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
 
 function calendarDate(value: Date): { year: number; month: number; day: number } | undefined {
@@ -111,6 +120,7 @@ export function reconcileShoppingList(
 	}
 
 	const retained = existing.filter((item) => item.sourceKey !== sourceKey || item.checked);
+	const usedIds = new Set(retained.map((item) => item.id));
 	const additionBuckets = new Map<
 		string,
 		{ item: ShoppingItem; unit: ReturnType<typeof unitInfo>; quantityBase: number }
@@ -130,9 +140,17 @@ export function reconcileShoppingList(
 		const remainingBase = Math.max(0, bucket.quantityBase - alreadyPurchased);
 		const remainingQuantity = roundQuantity(remainingBase / bucket.unit.factor);
 		if (remainingQuantity <= 0) continue;
+		const reusableId = existingUncheckedIds.get(key);
+		let id: string;
+		if (reusableId && !usedIds.has(reusableId)) {
+			id = reusableId;
+			usedIds.add(id);
+		} else {
+			id = nextFreeGeneratedId(sourceKey, key, usedIds);
+		}
 		generated.push({
 			...bucket.item,
-			id: existingUncheckedIds.get(key) ?? generatedShoppingId(sourceKey, key),
+			id,
 			quantity: remainingQuantity,
 			unit: bucket.unit.display,
 			checked: false,

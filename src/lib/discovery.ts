@@ -72,14 +72,12 @@ function pantryScores(
 
 function learnedTimeSignal(recipe: Recipe, rated: RatedRecipe[]): number {
 	let weighted = 0;
-	let weights = 0;
 	for (const entry of rated) {
 		const distance = Math.abs(recipe.time - entry.recipe.time);
 		const weight = 1 / (1 + distance / 20);
 		weighted += entry.signal * weight;
-		weights += weight;
 	}
-	return weights ? weighted / weights : 0;
+	return rated.length ? weighted / rated.length : 0;
 }
 
 function scoreRecipe(

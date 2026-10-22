@@ -12,9 +12,16 @@ import {
 } from '#lib/server/db.ts';
 
 export const GET: RequestHandler = async ({ locals }) => {
-	if (!locals.user) return json({ error: 'Authentication required' }, { status: 401 });
-	const state = getState(locals.user);
-	return json({ state }, { headers: state ? { ETag: getStateEtag(locals.user) } : {} });
+	try {
+		if (!locals.user) return json({ error: 'Authentication required' }, { status: 401 });
+		const state = getState(locals.user);
+		return json(
+			{ state, userId: locals.user.id, householdId: locals.user.householdId },
+			{ headers: state ? { ETag: getStateEtag(locals.user) } : {} }
+		);
+	} catch (error) {
+		return errorResponse(error);
+	}
 };
 
 export const PUT: RequestHandler = async ({ request, locals }) => {
@@ -24,6 +31,11 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
 		const body = await readJson(request);
 		if (typeof body !== 'object' || body === null || !('state' in body))
 			throw new ApiError(400, 'A state object is required');
+		if (
+			('expectedUserId' in body && body.expectedUserId !== locals.user.id) ||
+			('expectedHouseholdId' in body && body.expectedHouseholdId !== locals.user.householdId)
+		)
+			throw new ApiError(409, 'Your account or household changed. Reload before syncing.');
 		const state = validateAppState(body.state);
 		if (!state) throw new ApiError(400, 'State data is invalid or too large');
 		const saved = saveState(locals.user, state, {
