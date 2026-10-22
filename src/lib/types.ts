@@ -32,16 +32,26 @@ export type Recipe = {
 	source?: string;
 	provenance?: 'web-import' | 'ai-generated';
 	importNotes?: string[];
+	nutritionStale?: boolean;
 	rating?: number;
 	saved?: boolean;
 };
-export type Meal = { id: string; date: string; slot: string; recipeId: string; servings: number };
+export type Meal = {
+	id: string;
+	date: string;
+	slot: string;
+	recipeId: string;
+	servings: number;
+	completedAt?: string;
+	leftoverServings?: number;
+};
 export type ShoppingItem = {
 	id: string;
 	name: string;
 	quantity: number;
 	unit: string;
 	checked: boolean;
+	sourceKey?: string;
 };
 export type Preferences = {
 	diet: string;
@@ -64,4 +74,10 @@ export type AppState = {
 	shopping: ShoppingItem[];
 	preferences: Preferences;
 };
-export type User = { id: string; name: string; email: string; householdId: string };
+export type User = {
+	id: string;
+	name: string;
+	email: string;
+	householdId: string;
+	emailVerified?: boolean;
+};

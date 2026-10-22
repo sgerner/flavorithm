@@ -39,14 +39,22 @@
 		SlidersHorizontal,
 		Flame,
 		ChefHat,
+		Star,
 		Menu,
 		RefreshCw
 	} from '@lucide/svelte';
-	import type { AppState, Recipe, User } from '#lib/types.ts';
+	import type { AppState, Meal, Recipe, User } from '#lib/types.ts';
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
+	import {
+		completeMeal,
+		expiryStatus,
+		reconcileShoppingList
+	} from '#lib/kitchen-workflows.ts';
+	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
+	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import RecipeImport, {
 		emptyImportSession,
 		type ImportSession
@@ -103,6 +111,8 @@
 	}
 
 	let selected = $state<Recipe | null>(null);
+	let editingRecipe = $state<Recipe | null>(null);
+	let recipeToDelete = $state<Recipe | null>(null);
 	let pantryInput = $state('');
 	let authMode = $state('register');
 	let name = $state('');
@@ -149,6 +159,11 @@
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
 	let plannedServings = $state(2);
+	let editingMealId = $state('');
+	let cookingMealId = $state('');
+	let deductPantry = $state(false);
+	let leftoverServings = $state(0);
+	let pantryFilter = $state('all');
 	let shoppingText = $state('');
 	let deletePassword = $state('');
 	let resetToken = $state('');
@@ -188,21 +203,25 @@
 		'vox',
 		'wintry'
 	];
-	let recipes = $derived(
-		kitchen.recipes
-			.filter(
-				(r) =>
-					(page !== 'saved' || r.saved) &&
-					(!query ||
-						`${r.title} ${r.cuisine} ${r.tags.join(' ')}`
-							.toLowerCase()
-							.includes(query.toLowerCase())) &&
-					(filter !== 'Quick & easy' || r.time <= 30) &&
-					(filter !== 'Plant-powered' || r.tags.some((t) => /vegetarian|vegan|plant/i.test(t))) &&
-					(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
-					(filter !== 'High protein' || r.nutrition.protein >= 25)
-			)
-			.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0))
+	let recipes = $derived.by(() => {
+		const matches = kitchen.recipes.filter(
+			(r) =>
+				(page !== 'saved' || r.saved) &&
+				(!query ||
+					`${r.title} ${r.cuisine} ${r.tags.join(' ')}`
+						.toLowerCase()
+						.includes(query.toLowerCase())) &&
+				(filter !== 'Quick & easy' || r.time <= 30) &&
+				(filter !== 'Plant-powered' || r.tags.some((t) => /vegetarian|vegan|plant/i.test(t))) &&
+				(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
+				(filter !== 'High protein' || r.nutrition.protein >= 25)
+		);
+		return filter === 'For you'
+			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
+			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+	});
+	let visiblePantry = $derived(
+		kitchen.pantry.filter((item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter)
 	);
 	let week = $derived.by(() => {
 		const d = new Date();
@@ -775,15 +794,95 @@
 		kitchen.recipes = [...kitchen.recipes];
 		notify(r.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
-	function shoppingFor(items: Recipe[], meals?: AppState['meals']) {
-		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		for (const item of additions) {
-			const existing = kitchen.shopping.find(
-				(i) => i.name.toLowerCase() === item.name.toLowerCase() && i.unit === item.unit
-			);
-			if (existing) existing.quantity += item.quantity;
-			else kitchen.shopping.push(item);
+	function editSavedRecipe(recipe: Recipe) {
+		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
+		if (!saved) return;
+		selected = null;
+		editingRecipe = {
+			...saved,
+			tags: [...saved.tags],
+			ingredients: saved.ingredients.map((item) => ({ ...item })),
+			steps: [...saved.steps],
+			nutrition: { ...saved.nutrition }
+		};
+	}
+	function saveEditedRecipe(updated: Recipe) {
+		const previous = kitchen.recipes.find((item) => item.id === updated.id);
+		if (!previous || !previous.saved) {
+			editingRecipe = null;
+			return;
 		}
+		const nutritionNeedsRefresh =
+			previous.servings !== updated.servings ||
+			JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
+		const saved = {
+			...updated,
+			saved: true,
+			nutritionStale: nutritionNeedsRefresh ? true : previous.nutritionStale
+		};
+		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
+		editingRecipe = null;
+		notify(nutritionNeedsRefresh ? 'Recipe updated. Refresh its nutrition estimate.' : 'Recipe updated.');
+	}
+	function askDeleteRecipe(recipe: Recipe) {
+		if (!recipe.saved) return;
+		recipeToDelete = recipe;
+		selected = null;
+		modal = 'deleteRecipe';
+	}
+	function weekStartForDate(value: string) {
+		const date = new Date(`${value}T12:00:00`);
+		if (Number.isNaN(date.getTime())) return value;
+		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+		return dateKey(date);
+	}
+	function refreshWeekShopping(startDate: string) {
+		const start = new Date(`${startDate}T12:00:00`);
+		if (Number.isNaN(start.getTime())) return;
+		const dates = Array.from({ length: 7 }, (_, index) => {
+			const day = new Date(start);
+			day.setDate(day.getDate() + index);
+			return dateKey(day);
+		});
+		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
+		const recipes = kitchen.recipes.filter((recipe) => meals.some((meal) => meal.recipeId === recipe.id));
+		const usablePantry = kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired');
+		const additions = buildShoppingList(recipes, usablePantry, meals);
+		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+	}
+	function confirmDeleteRecipe() {
+		const recipe = recipeToDelete;
+		if (!recipe) return;
+		const impactedMeals = kitchen.meals.filter((meal) => meal.recipeId === recipe.id);
+		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
+		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
+		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
+		kitchen.shopping = kitchen.shopping.filter((item) => item.sourceKey !== `recipe:${recipe.id}`);
+		if (kitchen.preferences.ratings) {
+			const ratings = { ...kitchen.preferences.ratings };
+			delete ratings[recipe.id];
+			kitchen.preferences.ratings = ratings;
+		}
+		for (const startDate of affectedWeeks) refreshWeekShopping(startDate);
+		recipeToDelete = null;
+		modal = '';
+		notify(`${recipe.title} deleted, along with ${impactedMeals.length} planned meal${impactedMeals.length === 1 ? '' : 's'}.`);
+	}
+	function shoppingSourceLabel(sourceKey?: string) {
+		if (sourceKey?.startsWith('recipe:')) return 'Recipe';
+		if (sourceKey?.startsWith('week:')) return 'Meal plan';
+		return 'Added by you';
+	}
+	function normalizeShoppingItem(item: AppState['shopping'][number]) {
+		item.name = item.name.trim().slice(0, 100) || 'Shopping item';
+		item.unit = item.unit.trim().slice(0, 40) || 'piece';
+		const quantity = Number(item.quantity);
+		item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1000000)) : 1;
+	}
+	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
+		const usablePantry = kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired');
+		const additions = buildShoppingList(items, usablePantry, meals);
+		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
 		page = 'shopping';
 		notify(
@@ -798,8 +897,71 @@
 		mealDate = dateKey(new Date());
 		modal = 'plan';
 	}
+	function editPlannedMeal(meal: Meal) {
+		if (meal.completedAt) return;
+		editingMealId = meal.id;
+		mealDate = meal.date;
+		mealSlot = meal.slot;
+		plannedServings = meal.servings;
+		modal = 'editMeal';
+	}
+	function saveMealChanges() {
+		const meal = kitchen.meals.find((item) => item.id === editingMealId);
+		if (!meal || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
+		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
+			notify('Choose between 1 and 24 whole servings.');
+			return;
+		}
+		const previousWeek = weekStartForDate(meal.date);
+		meal.date = mealDate;
+		meal.slot = mealSlot;
+		meal.servings = Math.round(plannedServings);
+		refreshWeekShopping(previousWeek);
+		refreshWeekShopping(weekStartForDate(meal.date));
+		editingMealId = '';
+		modal = '';
+		notify('Meal plan updated.');
+	}
+	function openCookDialog(meal: Meal) {
+		if (meal.completedAt) return;
+		cookingMealId = meal.id;
+		deductPantry = false;
+		leftoverServings = 0;
+		modal = 'cookMeal';
+	}
+	function markMealCooked() {
+		const meal = kitchen.meals.find((item) => item.id === cookingMealId);
+		if (!meal) return;
+		if (!Number.isInteger(leftoverServings) || leftoverServings < 0 || leftoverServings > meal.servings) {
+			notify(`Enter whole leftovers between 0 and ${meal.servings} servings.`);
+			return;
+		}
+		const recipeId = meal.recipeId;
+		const startDate = weekStartForDate(meal.date);
+		kitchen = completeMeal(kitchen, meal.id, {
+			deductPantry,
+			leftoverServings: Math.round(leftoverServings)
+		});
+		refreshWeekShopping(startDate);
+		cookingMealId = '';
+		modal = '';
+		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
+		if (recipe) selected = recipe;
+		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
+	}
+	async function useFirstIngredients(items: AppState['pantry']) {
+		const names = items.map((item) => item.name.trim()).filter(Boolean);
+		if (!names.length) return;
+		prompt = `Use these ingredients first, prioritizing them because they are expiring: ${names.join(', ')}. Build a practical recipe that uses as much of them as possible while following my preferences.`;
+		modal = 'generate';
+		await generate();
+	}
 	function addMeal() {
 		if (!selected || !mealDate) return;
+		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
+			notify('Choose between 1 and 24 whole servings.');
+			return;
+		}
 		kitchen.meals.push({
 			id: crypto.randomUUID(),
 			date: mealDate,
@@ -857,6 +1019,7 @@
 		try {
 			const result = await ai('nutrition', { recipe: selected });
 			selected.nutrition = result.nutrition;
+			selected.nutritionStale = false;
 			kitchen.recipes = [...kitchen.recipes];
 			notify('Nutrition estimate refreshed, per serving.');
 		} catch (e) {
@@ -867,6 +1030,9 @@
 	}
 	function closeDialog() {
 		if (modal === 'plan') selected = null;
+		if (modal === 'editMeal') editingMealId = '';
+		if (modal === 'cookMeal') cookingMealId = '';
+		if (modal === 'deleteRecipe') recipeToDelete = null;
 		if (modal === 'onboarding') dismissOnboarding();
 		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
 			resumeImport = false;
@@ -1037,7 +1203,7 @@
 	bind:this={imageInput}
 	onchange={scan}
 />
-<div class="app-shell" inert={!!modal || !!selected}>
+<div class="app-shell" inert={!!modal || !!selected || !!editingRecipe}>
 	{#if mobileNav}<button
 			class="nav-backdrop"
 			aria-label="Dismiss navigation"
@@ -1322,20 +1488,26 @@
 						>
 					</div>
 				</div>
+				<div class="expiry-filters" aria-label="Filter pantry by expiry">
+					{#each [
+						{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length },
+						{ id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length },
+						{ id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }
+					] as option}<button class:active={pantryFilter === option.id} aria-pressed={pantryFilter === option.id} onclick={() => (pantryFilter = option.id)}>{option.label}<span>{option.count}</span></button>{/each}
+				</div>
 				<div class="pantry-table">
 					<div class="table-head">
 						<span>INGREDIENT</span><span>AMOUNT</span><span>BEST BEFORE</span><span></span>
 					</div>
-					{#each kitchen.pantry as item (item.id)}<div
+					{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(item.expires)}<div
 							class="pantry-row"
 							animate:flip={{ duration: motionDuration(200) }}
 							in:revealMotion|global={{ y: 8, duration: 200 }}
 							out:fadeMotion={{ duration: 120 }}
 						>
-							<span
-								><span class="ingredient-symbol">{ingredientEmoji(item.name)}</span><b
-									>{item.name}</b
-								></span
+							<span class="pantry-ingredient">
+								<span class="ingredient-symbol">{ingredientEmoji(item.name)}</span><span class="ingredient-meta"><b>{item.name}</b><small class="expiry-badge" class:expired={expiry === 'expired'} class:soon={expiry === 'soon'}>{expiry === 'expired' ? 'Expired' : expiry === 'soon' ? 'Use soon' : expiry === 'fresh' ? 'In date' : 'No date'}</small>{#if expiry === 'expired' || expiry === 'soon'}<button class="text-button use-first" onclick={() => useFirstIngredients([item])}><Sparkles size={14} />Use first</button>{/if}</span>
+							</span
 							><label
 								><input
 									aria-label={`Quantity of ${item.name}`}
@@ -1364,7 +1536,7 @@
 						<Carrot size={40} />
 						<h3>No ingredients yet</h3>
 						<p>Add a few things from your fridge to get started.</p>
-					</div>{/if}
+					</div>{:else if !visiblePantry.length}<div class="empty-state filtered-pantry-empty"><Carrot size={34} /><h3>No matching ingredients</h3><p>Try another expiry filter or update a best-before date.</p></div>{/if}
 				<div class="pantry-footer">
 					<button class="primary" onclick={() => (modal = 'generate')}
 						><Sparkles size={17} /> Cook from my pantry</button
@@ -1405,14 +1577,15 @@
 					<button
 						class="secondary"
 						onclick={() => {
-							const meals = kitchen.meals.filter((m) => week.some((d) => dateKey(d) === m.date));
+							const meals = kitchen.meals.filter((m) => !m.completedAt && week.some((d) => dateKey(d) === m.date));
 							if (!meals.length) {
 								notify('Plan a meal first to build your weekly shopping list.');
 								return;
 							}
 							shoppingFor(
 								kitchen.recipes.filter((r) => meals.some((m) => m.recipeId === r.id)),
-								meals
+								meals,
+								`week:${dateKey(week[0])}`
 							);
 						}}><ShoppingBasket size={17} /> Shop this week</button
 					>
@@ -1432,21 +1605,18 @@
 								</div>
 								{#each ['Breakfast', 'Lunch', 'Dinner'] as slot}<div class="meal-slot">
 										<span class="meal-label">{slot}</span
-										>{#each kitchen.meals.filter((m) => m.date === dateKey(day) && m.slot === slot) as meal}{@const recipe =
+								>{#each kitchen.meals.filter((m) => m.date === dateKey(day) && m.slot === slot) as meal}{@const recipe =
 												kitchen.recipes.find((r) => r.id === meal.recipeId)}{#if recipe}<div
 													class="calendar-meal"
 												>
-													<button onclick={() => (selected = recipe)}
+													<button class="meal-open" onclick={() => (selected = recipe)}
 														><img src={recipe.image || '/recipe-placeholder.svg'} alt="" /><b
 															>{recipe.title}</b
-														><small>{recipe.time} min · {meal.servings} servings</small></button
-													><button
-														class="remove-meal"
-														aria-label="Remove planned meal"
-														onclick={() =>
-															(kitchen.meals = kitchen.meals.filter((m) => m.id !== meal.id))}
-														><X size={13} /></button
-													>
+													><small>{recipe.time} min · {meal.servings} servings</small></button>
+													<div class="calendar-meal-actions">
+														{#if meal.completedAt}<small class="cooked-badge">Cooked {new Date(meal.completedAt).toLocaleDateString('en', { month: 'short', day: 'numeric' })}</small>{:else}<button class="text-button" onclick={() => editPlannedMeal(meal)}>Edit</button><button class="text-button" onclick={() => openCookDialog(meal)}>Cooked</button>{/if}
+														<button class="remove-meal" aria-label="Remove planned meal" onclick={() => { const startDate = weekStartForDate(meal.date); kitchen.meals = kitchen.meals.filter((m) => m.id !== meal.id); refreshWeekShopping(startDate); }}><X size={13} /></button>
+													</div>
 												</div>{/if}{/each}<button
 											class="add-meal"
 											onclick={() => {
@@ -1460,11 +1630,19 @@
 									</div>{/each}
 							</div>{/each}
 					</div>{/key}
+				<section class="cooked-history">
+					<div class="section-line"><h2>Cooked history</h2><span class="muted">{kitchen.meals.filter((meal) => meal.completedAt).length} meals</span></div>
+					{#if kitchen.meals.some((meal) => meal.completedAt)}<div class="cooked-history-list">
+						{#each kitchen.meals.filter((meal) => meal.completedAt).sort((a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? '')) as meal (meal.id)}{@const recipe = kitchen.recipes.find((item) => item.id === meal.recipeId)}{#if recipe}<article class="cooked-history-row">
+							<img src={recipe.image || '/recipe-placeholder.svg'} alt="" /><div><b>{recipe.title}</b><span>{new Date(meal.completedAt!).toLocaleDateString('en', { weekday: 'short', month: 'short', day: 'numeric' })} · {meal.servings} servings{meal.leftoverServings ? ` · ${meal.leftoverServings} leftover` : ''}</span></div><div class="cooked-history-actions">{#if meal.leftoverServings}<button class="text-button" onclick={() => { meal.leftoverServings = 0; notify('Leftovers marked used.'); }}>Use leftovers <Check size={15} /></button>{/if}<button class="text-button" onclick={() => (selected = recipe)}>{recipe.rating ? 'View rating' : 'Rate recipe'} <Star size={15} /></button></div>
+						</article>{/if}{/each}
+					</div>{:else}<p class="muted history-empty">Meals marked cooked will appear here. You can add leftovers and update pantry stock when you finish a meal.</p>{/if}
+				</section>
 			{:else if page === 'shopping'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
 						<h1>Shopping list<span class="heading-spark">✴</span></h1>
-						<p>Pantry quantities are deducted from recipe shopping lists.</p>
+						<p>Generated rows show their recipe or meal-plan source. Editing a row keeps your changes visible until that source is refreshed.</p>
 					</div>
 					<button class="secondary" onclick={exportList}><Download size={17} /> Export list</button>
 				</section>
@@ -1494,7 +1672,7 @@
 									aria-label={`Mark ${item.name} ${item.checked ? 'needed' : 'purchased'}`}
 									onclick={() => (item.checked = !item.checked)}
 									>{#if item.checked}<Check size={16} />{/if}</button
-								><b>{item.name}</b><span>{+item.quantity.toFixed(2)} {item.unit}</span><button
+				><div class="shopping-item-edit"><input class="shopping-name" aria-label="Shopping item name" bind:value={item.name} maxlength="100" onblur={() => normalizeShoppingItem(item)} /><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small></div><span class="shopping-quantity"><input aria-label={`Quantity of ${item.name}`} type="number" min="0.01" max="1000000" step="0.01" bind:value={item.quantity} onblur={() => normalizeShoppingItem(item)} /><input aria-label={`Unit for ${item.name}`} bind:value={item.unit} maxlength="40" onblur={() => normalizeShoppingItem(item)} /></span><button
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
 									onclick={() =>
@@ -1541,7 +1719,7 @@
 									);
 									if (found) found.quantity += item.quantity;
 									else
-										kitchen.pantry.push({ ...item, id: crypto.randomUUID(), category: 'Pantry' });
+										kitchen.pantry.push({ id: crypto.randomUUID(), name: item.name, quantity: item.quantity, unit: item.unit, category: 'Pantry' });
 								}
 								kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
 								notify(`${checked.length} purchased items moved to your pantry.`);
@@ -1562,6 +1740,267 @@
 			><X size={16} /></button
 		>
 	</div>{/if}
+
+<style>
+	.expiry-filters {
+		display: flex;
+		gap: 8px;
+		flex-wrap: wrap;
+		margin: 20px 0 10px;
+	}
+	.expiry-filters button {
+		min-height: 44px;
+		display: inline-flex;
+		align-items: center;
+		gap: 9px;
+		padding: 8px 12px;
+		border: 1px solid var(--line);
+		background: var(--surface);
+		font-size: 14px;
+	}
+	.expiry-filters button.active {
+		background: var(--green);
+		color: var(--paper);
+		border-color: var(--green);
+	}
+	.expiry-filters button span {
+		min-width: 22px;
+		padding: 2px 5px;
+		background: color-mix(in srgb, currentColor 12%, transparent);
+		text-align: center;
+	}
+	.pantry-ingredient {
+		min-width: 0;
+	}
+	.ingredient-meta {
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 4px;
+	}
+	.expiry-badge {
+		font-size: 12px;
+		color: var(--muted);
+	}
+	.expiry-badge.expired {
+		color: #a43f36;
+		font-weight: 600;
+	}
+	.expiry-badge.soon {
+		color: #926b17;
+		font-weight: 600;
+	}
+	.use-first {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		min-height: 34px;
+		padding: 3px 0;
+		font-size: 13px;
+	}
+	.filtered-pantry-empty {
+		padding: 32px 12px;
+	}
+	.shopping-item-edit {
+		min-width: 100px;
+		flex: 1 1 180px;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.shopping-name {
+		width: 100%;
+		min-width: 0;
+		padding: 8px 5px;
+		border-color: transparent;
+		background: transparent;
+		font-weight: 500;
+	}
+	.shopping-name:focus {
+		border-color: var(--line);
+	}
+	.shopping-source {
+		padding-left: 5px;
+		color: var(--muted);
+		font-size: 12px;
+	}
+	.shopping-row .shopping-quantity {
+		margin-left: auto;
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		white-space: nowrap;
+	}
+	.shopping-quantity input {
+		min-width: 0;
+		width: 72px;
+		padding: 8px 5px;
+		border-color: transparent;
+		background: transparent;
+		text-align: right;
+		font-size: 14px;
+	}
+	.shopping-quantity input:last-child {
+		width: 70px;
+		text-align: left;
+	}
+	.shopping-quantity input:focus {
+		border-color: var(--line);
+	}
+	.calendar-meal-actions {
+		min-height: 34px;
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 2px;
+		padding: 2px 6px 0;
+	}
+	.calendar-meal-actions .text-button {
+		min-height: 32px;
+		padding: 3px 2px;
+		font-size: 12px;
+	}
+	.calendar-meal-actions .remove-meal {
+		position: static;
+		min-width: 30px;
+		min-height: 30px;
+		display: grid;
+		place-items: center;
+	}
+	.cooked-badge {
+		color: var(--green);
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.cooked-history {
+		margin: 38px 0 12px;
+	}
+	.cooked-history .section-line {
+		padding-bottom: 12px;
+		border-bottom: 1px solid var(--line);
+	}
+	.cooked-history .section-line h2 {
+		font-size: 20px;
+	}
+	.cooked-history-list {
+		display: flex;
+		flex-direction: column;
+	}
+	.cooked-history-row {
+		display: grid;
+		grid-template-columns: 54px minmax(0, 1fr) auto;
+		align-items: center;
+		gap: 12px;
+		padding: 12px 0;
+		border-bottom: 1px solid var(--line);
+	}
+	.cooked-history-row img {
+		width: 54px;
+		height: 48px;
+		object-fit: cover;
+	}
+	.cooked-history-row > div {
+		min-width: 0;
+		display: flex;
+		flex-direction: column;
+		gap: 3px;
+	}
+	.cooked-history-row b {
+		font-weight: 600;
+	}
+	.cooked-history-row span,
+	.history-empty {
+		color: var(--muted);
+		font-size: 14px;
+	}
+	.cooked-history-actions {
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		flex-wrap: wrap;
+		gap: 8px;
+	}
+	.cooked-history-actions button {
+		display: inline-flex;
+		align-items: center;
+		gap: 5px;
+		min-height: 44px;
+	}
+	.history-empty {
+		margin-top: 12px;
+	}
+	.cook-option {
+		display: flex;
+		align-items: flex-start;
+		gap: 12px;
+		margin: 22px 0;
+		font-size: 14px;
+	}
+	.cook-option input {
+		width: 20px;
+		height: 20px;
+		flex: 0 0 20px;
+		margin-top: 2px;
+		accent-color: var(--green);
+	}
+	.cook-option span {
+		display: flex;
+		flex-direction: column;
+		gap: 4px;
+	}
+	.cook-option small {
+		color: var(--muted);
+		line-height: 1.5;
+	}
+	.danger-action {
+		background: #a43f36;
+		color: white;
+	}
+	.dialog-actions .danger-action:hover {
+		background: #87332c;
+	}
+	@media (max-width: 650px) {
+		.expiry-filters {
+			display: grid;
+			grid-template-columns: repeat(3, minmax(0, 1fr));
+		}
+		.expiry-filters button {
+			justify-content: center;
+			gap: 5px;
+			padding-inline: 6px;
+			font-size: 12px;
+		}
+		.shopping-row {
+			flex-wrap: wrap;
+			align-items: center;
+		}
+		.shopping-item-edit {
+			flex-basis: calc(100% - 66px);
+			order: 2;
+		}
+		.shopping-quantity {
+			order: 3;
+			flex: 1 1 auto;
+			margin-left: 44px !important;
+		}
+		.shopping-row > .icon-button {
+			order: 4;
+		}
+		.cooked-history-row {
+			grid-template-columns: 46px minmax(0, 1fr);
+			gap: 8px 10px;
+		}
+		.cooked-history-row img {
+			width: 46px;
+			height: 44px;
+		}
+		.cooked-history-actions {
+			grid-column: 2;
+			justify-content: flex-start;
+		}
+	}
+</style>
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
 		close={() => (selected = null)}
@@ -1569,16 +2008,25 @@
 		shop={(servings) =>
 			shoppingFor(
 				[selected!],
-				[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }]
+				[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }],
+				`recipe:${selected!.id}`
 			)}
 		plan={(servings) => planRecipe(selected!, servings)}
 		nutrition={refreshNutrition}
+		edit={() => editSavedRecipe(selected!)}
+		remove={() => askDeleteRecipe(selected!)}
 		{busy}
 		rate={(n) => {
 			selected!.rating = n;
+			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
 			kitchen.recipes = [...kitchen.recipes];
 			notify('Rating saved. Future recipes will use your feedback.');
 		}}
+	/>{/if}
+{#if editingRecipe}<RecipeEditor
+		recipe={editingRecipe}
+		cancel={() => (editingRecipe = null)}
+		save={saveEditedRecipe}
 	/>{/if}
 {#if modal}<div class="modal-backdrop" transition:backdropMotion|global>
 		{#key modal}
@@ -1586,7 +2034,7 @@
 				class="flavor-dialog"
 				class:onboarding-dialog={modal === 'onboarding'}
 				use:focusTrap
-				class:wide={modal === 'settings' || modal === 'pickRecipe' || modal === 'import'}
+				class:wide={modal === 'settings' || modal === 'pickRecipe' || modal === 'import' || modal === 'editMeal' || modal === 'cookMeal'}
 				class:capture-dialog={modal === 'import'}
 				role="dialog"
 				aria-labelledby={modal === 'import' ? 'recipe-import-title' : undefined}
@@ -2138,6 +2586,28 @@
 									: 'Send reset link'}<ArrowRight size={17} /></button
 						>
 					</form>
+				{:else if modal === 'deleteRecipe'}<span class="dialog-spark">✳</span>
+					<h2>Delete saved recipe?</h2>
+					<p class="muted">{recipeToDelete?.title} will be removed from your collection. This also removes {kitchen.meals.filter((meal) => meal.recipeId === recipeToDelete?.id).length} planned or cooked meal entries and your personal rating.</p>
+					<div class="dialog-actions">
+						<button class="secondary" onclick={closeDialog}>Keep recipe</button>
+						<button class="primary danger-action" onclick={confirmDeleteRecipe}>Delete recipe</button>
+					</div>
+				{:else if modal === 'editMeal'}
+					<h2>Edit planned meal</h2>
+					<p class="muted">Update this meal in place. Its calendar entry keeps the same identity.</p>
+					<label class="field">When are we cooking?<input type="date" required bind:value={mealDate} /></label>
+					<label class="field">Meal<select bind:value={mealSlot}><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select></label>
+					<label class="field">Servings<input type="number" min="1" max="24" step="1" required bind:value={plannedServings} /></label>
+					<div class="dialog-actions"><button class="secondary" onclick={closeDialog}>Cancel</button><button class="primary" disabled={!mealDate || !plannedServings || plannedServings < 1} onclick={saveMealChanges}>Save meal</button></div>
+				{:else if modal === 'cookMeal'}
+					{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
+					{@const cookingRecipe = kitchen.recipes.find((recipe) => recipe.id === cookingMeal?.recipeId)}
+					<h2>Mark meal cooked</h2>
+					<p class="muted">{cookingRecipe?.title}</p>
+					<label class="cook-option"><input type="checkbox" bind:checked={deductPantry} /><span><b>Deduct ingredients from pantry</b><small>Uses the planned serving amount and available matching stock.</small></span></label>
+					<label class="field">Leftover servings<input type="number" min="0" max={cookingMeal?.servings ?? 24} step="1" bind:value={leftoverServings} /><small class="field-help">Enter 0 if there are no leftovers.</small></label>
+					<div class="dialog-actions"><button class="secondary" onclick={closeDialog}>Cancel</button><button class="primary" onclick={markMealCooked}><Check size={17} /> Mark cooked</button></div>
 				{:else if modal === 'plan'}
 					<h2>Schedule a recipe</h2>
 					<p class="muted">{selected?.title}</p>

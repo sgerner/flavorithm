@@ -161,6 +161,7 @@ const recipeSchema = z.object({
 	source: publicUrlSchema.optional(),
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
+	nutritionStale: z.boolean().optional(),
 	rating: z.number().finite().min(0).max(5).optional(),
 	saved: z.boolean().optional()
 });
@@ -201,7 +202,9 @@ const appStateSchema = z.object({
 				date: z.string().max(50),
 				slot: z.string().max(100),
 				recipeId: z.string().max(100),
-				servings: z.number().finite().min(1).max(10_000)
+				servings: z.number().finite().min(1).max(10_000),
+				completedAt: z.string().max(50).optional(),
+				leftoverServings: z.number().finite().min(0).max(10_000).optional()
 			})
 		)
 		.max(1_000),
@@ -212,7 +215,8 @@ const appStateSchema = z.object({
 				name: z.string().trim().min(1).max(200),
 				quantity: z.number().finite().min(0).max(1_000_000),
 				unit: z.string().max(40),
-				checked: z.boolean()
+				checked: z.boolean(),
+				sourceKey: z.string().max(200).optional()
 			})
 		)
 		.max(1_000),
