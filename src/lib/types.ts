@@ -30,6 +30,7 @@ export type Recipe = {
 		protein: number;
 	};
 	source?: string;
+	importNotes?: string[];
 	rating?: number;
 	saved?: boolean;
 };

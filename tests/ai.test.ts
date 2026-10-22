@@ -1,11 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { ChatGPTInferenceError } from '../src/lib/server/chatgpt-inference.ts';
 import {
 	AIRequestError,
+	fetchCaptureRecipePage,
 	fetchRecipePage,
 	getSupportedModels,
 	runAIRequest,
 	transformModelCatalog,
+	validateCaptureRecipeUrl,
 	validateRecipeUrl
 } from '../src/lib/server/ai.ts';
 
@@ -35,6 +38,12 @@ const generatedRecipe = {
 	],
 	steps: ['Simmer the chickpeas and tomatoes until tender.'],
 	nutrition
+};
+
+const capturedRecipe = {
+	...generatedRecipe,
+	image: '',
+	assumptions: ['Estimated 1 can of chickpeas from the listed quantity.']
 };
 
 const preferences = {
@@ -156,6 +165,424 @@ test('vision sends image bytes to Anthropic as a base64 image block and validate
 	assert.deepEqual(result, {
 		ingredients: [{ name: 'apple', quantity: 3, unit: 'items', category: 'Produce' }]
 	});
+});
+
+test('capture turns recipe text into an unsaved validated draft and never fetches embedded links', async () => {
+	let observedBody: any;
+	let pageFetches = 0;
+	const fetcher: typeof fetch = async (_input, init) => {
+		observedBody = JSON.parse(String(init?.body));
+		return jsonResponse({
+			choices: [{ message: { content: JSON.stringify(capturedRecipe) } }]
+		});
+	};
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'temporary-capture-key',
+			prompt:
+				'Grandma’s chickpea skillet: chickpeas, tomatoes, simmer until tender. See https://www.allrecipes.com/recipe/example'
+		},
+		fetcher,
+		async () => {
+			pageFetches += 1;
+			throw new Error('embedded links should never be fetched');
+		}
+	)) as any;
+
+	assert.equal(pageFetches, 0);
+	assert.equal(observedBody.response_format.type, 'json_object');
+	assert.match(observedBody.messages[0].content, /assumptions/);
+	assert.match(observedBody.messages[1].content, /Preserve the source title/);
+	assert.match(
+		observedBody.messages[1].content,
+		/If steps are missing, create complete, practical, ordered steps/
+	);
+	assert.match(
+		observedBody.messages[1].content,
+		/Record generated or materially clarified steps in assumptions/
+	);
+	assert.match(observedBody.messages[1].content, /Grandma’s chickpea skillet/);
+	assert.match(result.recipe.id, /^[0-9a-f-]{36}$/i);
+	assert.equal(result.recipe.saved, false);
+	assert.equal(result.recipe.image, '');
+	assert.equal(result.recipe.source, undefined);
+	assert.deepEqual(result.assumptions, capturedRecipe.assumptions);
+	assert.equal(JSON.stringify(result).includes('temporary-capture-key'), false);
+});
+
+test('capture sends photo bytes to Anthropic and includes assumptions in its response schema', async () => {
+	let observedBody: any;
+	const fetcher: typeof fetch = async (_input, init) => {
+		observedBody = JSON.parse(String(init?.body));
+		return jsonResponse({
+			content: [{ type: 'text', text: JSON.stringify({ ...capturedRecipe, assumptions: [] }) }]
+		});
+	};
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'anthropic',
+			model: 'claude-sonnet-4-6',
+			apiKey: 'anthropic-capture-key',
+			image: 'data:image/png;base64,aGVsbG8='
+		},
+		fetcher
+	)) as any;
+
+	assert.equal(observedBody.messages[0].content[0].type, 'image');
+	assert.equal(observedBody.output_config.format.type, 'json_schema');
+	assert.deepEqual(observedBody.output_config.format.schema.properties.assumptions, {
+		type: 'array',
+		maxItems: 30,
+		items: { type: 'string', maxLength: 300 }
+	});
+	assert.equal(result.recipe.saved, false);
+	assert.deepEqual(result.assumptions, []);
+});
+
+test('capture sends ChatGPT plan photos through the public Responses API', async () => {
+	let observedUrl = '';
+	let observedHeaders: Headers | undefined;
+	let observedBody: any;
+	const responseText = JSON.stringify({ ...capturedRecipe, assumptions: [] });
+	const fetcher: typeof fetch = async (input, init) => {
+		observedUrl = String(input);
+		observedHeaders = new Headers(init?.headers);
+		observedBody = JSON.parse(String(init?.body));
+		return new Response(
+			`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: responseText })}\n\n` +
+				`data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed' } })}\n\n`,
+			{ headers: { 'content-type': 'text/event-stream' } }
+		);
+	};
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'chatgpt',
+			model: 'gpt-4.1',
+			image: 'data:image/jpeg;base64,aGVsbG8='
+		},
+		fetcher,
+		undefined,
+		{ accessToken: 'chatgpt-plan-token' }
+	)) as any;
+
+	assert.equal(observedUrl, 'https://api.openai.com/v1/responses');
+	assert.equal(observedHeaders?.get('authorization'), 'Bearer chatgpt-plan-token');
+	assert.equal(observedBody.store, false);
+	assert.equal(observedBody.input[0].content[1].type, 'input_image');
+	assert.match(observedBody.instructions, /assumptions/);
+	assert.deepEqual(result.assumptions, []);
+});
+
+test('capture abort signal cancels a pending provider request', async () => {
+	const controller = new AbortController();
+	let markStarted!: () => void;
+	const started = new Promise<void>((resolve) => (markStarted = resolve));
+	let abortObserved = false;
+	const fetcher: typeof fetch = async (_input, init) => {
+		markStarted();
+		return new Promise((_resolve, reject) => {
+			init?.signal?.addEventListener(
+				'abort',
+				() => {
+					abortObserved = true;
+					reject(new DOMException('Request aborted.', 'AbortError'));
+				},
+				{ once: true }
+			);
+		});
+	};
+
+	const request = runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			prompt: 'Recipe notes'
+		},
+		fetcher,
+		undefined,
+		undefined,
+		controller.signal
+	);
+	await started;
+	controller.abort();
+	await assert.rejects(request, (error: unknown) => error instanceof AIRequestError);
+	assert.equal(abortObserved, true);
+});
+
+test('capture abort signal reaches the ChatGPT Responses adapter without dropping its timeout', async () => {
+	const controller = new AbortController();
+	let markStarted!: () => void;
+	const started = new Promise<void>((resolve) => (markStarted = resolve));
+	let abortObserved = false;
+	const fetcher: typeof fetch = async (_input, init) => {
+		assert.ok(init?.signal);
+		assert.notEqual(init.signal, controller.signal);
+		markStarted();
+		return new Promise((_resolve, reject) => {
+			init?.signal?.addEventListener(
+				'abort',
+				() => {
+					abortObserved = true;
+					reject(new DOMException('Request aborted.', 'AbortError'));
+				},
+				{ once: true }
+			);
+		});
+	};
+
+	const request = runAIRequest(
+		{ action: 'capture', provider: 'chatgpt', model: 'gpt-4.1', prompt: 'Recipe notes' },
+		fetcher,
+		undefined,
+		{ accessToken: 'chatgpt-plan-token' },
+		controller.signal
+	);
+	await started;
+	controller.abort();
+	await assert.rejects(request, (error: unknown) => error instanceof ChatGPTInferenceError);
+	assert.equal(abortObserved, true);
+});
+
+test('capture abort signal cancels an in-progress recipe page fetch before provider work', async () => {
+	const controller = new AbortController();
+	let markStarted!: () => void;
+	const started = new Promise<void>((resolve) => (markStarted = resolve));
+	let abortObserved = false;
+	let providerCalls = 0;
+	const request = runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/recipe'
+		},
+		async () => {
+			providerCalls += 1;
+			throw new Error('provider should not be called');
+		},
+		async (_url, _policy, signal) =>
+			new Promise((_resolve, reject) => {
+				markStarted();
+				signal?.addEventListener(
+					'abort',
+					() => {
+						abortObserved = true;
+						reject(new DOMException('Page request aborted.', 'AbortError'));
+					},
+					{ once: true }
+				);
+			}),
+		undefined,
+		controller.signal
+	);
+
+	await started;
+	controller.abort();
+	await assert.rejects(request);
+	assert.equal(abortObserved, true);
+	assert.equal(providerCalls, 0);
+});
+
+test('capture autodetects a standalone recipe URL and falls back to bounded readable page text', async () => {
+	let observedUrl = '';
+	let observedPolicy = '';
+	let observedPrompt = '';
+	const pageHtml = `
+		<html><head><title>Page title</title><script>private script text</script></head>
+		<body><h1>Grandma's Noodles</h1><p>Ingredients: 2 cups flour, 1 egg.</p>
+		<p>Mix and roll the dough, then boil it.</p></body></html>`;
+	const fetcher: typeof fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body));
+		observedPrompt = body.messages[1].content;
+		return jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] });
+	};
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			prompt: '  https://recipes.example.test/no-structured-data/#ingredients  '
+		},
+		fetcher,
+		async (url, policy) => {
+			observedUrl = url;
+			observedPolicy = policy ?? '';
+			return new Response(pageHtml, { headers: { 'content-type': 'text/html' } });
+		}
+	)) as any;
+
+	assert.equal(observedUrl, 'https://recipes.example.test/no-structured-data/');
+	assert.equal(observedPolicy, 'capture');
+	assert.match(observedPrompt, /Grandma's Noodles/);
+	assert.match(observedPrompt, /2 cups flour, 1 egg/);
+	assert.doesNotMatch(observedPrompt, /private script text|Page title/);
+	assert.equal(result.recipe.source, 'https://recipes.example.test/no-structured-data/');
+	assert.equal(result.recipe.provenance, 'web-import');
+});
+
+test('capture only returns HTTPS source images from fetched recipe metadata', async () => {
+	for (const unsafeImage of [
+		'javascript:alert(1)',
+		'data:image/png;base64,aGVsbG8=',
+		'file:///etc/passwd'
+	]) {
+		const html = `<script type="application/ld+json">${JSON.stringify({
+			'@type': 'Recipe',
+			name: 'Rice',
+			image: unsafeImage,
+			recipeYield: '2 servings',
+			totalTime: 'PT20M',
+			recipeIngredient: ['1 cup rice'],
+			recipeInstructions: ['Cook the rice.']
+		})}</script>`;
+		const result = (await runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				url: 'https://www.allrecipes.com/recipe/rice'
+			},
+			async () =>
+				jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] }),
+			async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+		)) as any;
+
+		assert.equal(result.recipe.image, '');
+	}
+});
+
+test('capture accepts prompts up to 20,000 characters and rejects longer prompts', async () => {
+	const maxPrompt = 'recipe notes '.repeat(1_539).slice(0, 20_000);
+	const fetcher: typeof fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body));
+		assert.ok(body.messages[1].content.includes(maxPrompt));
+		return jsonResponse({
+			choices: [{ message: { content: JSON.stringify({ ...capturedRecipe, assumptions: [] }) } }]
+		});
+	};
+	await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			prompt: maxPrompt
+		},
+		fetcher
+	);
+	await assert.rejects(
+		runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				prompt: `${maxPrompt}x`
+			},
+			async () => {
+				throw new Error('provider should not be called');
+			}
+		),
+		(error: unknown) => error instanceof AIRequestError && error.status === 400
+	);
+});
+
+test('capture rejects empty input, unsafe URLs, malformed provider results, and oversized photos', async () => {
+	let fetches = 0;
+	const noFetch: typeof fetch = async () => {
+		fetches += 1;
+		throw new Error('provider should not be called');
+	};
+	await assert.rejects(
+		runAIRequest({ action: 'capture' }, noFetch),
+		(error: unknown) => error instanceof AIRequestError && error.status === 400
+	);
+	await assert.rejects(
+		runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				url: 'https://127.0.0.1/recipe'
+			},
+			noFetch,
+			async () => {
+				throw new Error('page should not be fetched');
+			}
+		),
+		(error: unknown) => error instanceof AIRequestError && error.status === 400
+	);
+	assert.equal(fetches, 0);
+
+	await assert.rejects(
+		runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				prompt: 'some recipe text',
+				image: 'data:image/png;base64,not valid'
+			},
+			noFetch
+		),
+		(error: unknown) => error instanceof AIRequestError && error.status === 400
+	);
+	const oversizedImage = `data:image/png;base64,${Buffer.alloc(5 * 1024 * 1024 + 1).toString('base64')}`;
+	await assert.rejects(
+		runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				image: oversizedImage
+			},
+			noFetch
+		),
+		(error: unknown) => error instanceof AIRequestError && error.status === 413
+	);
+
+	await assert.rejects(
+		runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				prompt: 'some recipe text'
+			},
+			async () =>
+				jsonResponse({
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({
+									...capturedRecipe,
+									assumptions: Array(31).fill('Extra assumption')
+								})
+							}
+						}
+					]
+				})
+		),
+		(error: unknown) => error instanceof AIRequestError && error.status === 502
+	);
 });
 
 test('search fails with a clear configuration error when Brave is not configured', async () => {
@@ -393,6 +820,127 @@ test('recipe import URL validation allows HTTPS pages on approved domains only',
 			(error: unknown) => error instanceof AIRequestError && error.status === 400
 		);
 	}
+});
+
+test('capture URL validation allows arbitrary public HTTPS hosts while blocking unsafe targets', () => {
+	assert.equal(validateCaptureRecipeUrl('https://recipes.example.test/path#section').hash, '');
+	assert.equal(validateCaptureRecipeUrl('https://8.8.8.8/recipe').hostname, '8.8.8.8');
+	assert.equal(
+		validateCaptureRecipeUrl('https://[2606:4700:4700::1111]/recipe').protocol,
+		'https:'
+	);
+	for (const url of [
+		'http://recipes.example.test/recipe',
+		'https://user:pass@recipes.example.test/recipe',
+		'https://recipes.example.test:8443/recipe',
+		'https://127.0.0.1/recipe',
+		'https://10.2.3.4/recipe',
+		'https://169.254.169.254/latest/meta-data',
+		'https://192.168.1.3/recipe',
+		'https://[::1]/recipe',
+		'https://[fc00::1]/recipe',
+		'https://localhost/recipe',
+		'https://private.local/recipe'
+	]) {
+		assert.throws(
+			() => validateCaptureRecipeUrl(url),
+			(error: unknown) => error instanceof AIRequestError && error.status === 400,
+			url
+		);
+	}
+});
+
+test('capture page transport rejects private DNS answers and unsafe redirects', async () => {
+	let requests = 0;
+	await assert.rejects(
+		fetchCaptureRecipePage('https://recipes.example.test/recipe', {
+			resolveAddresses: async () => ['127.0.0.1'],
+			requestPinned: async () => {
+				requests += 1;
+				return new Response('<html></html>', { headers: { 'content-type': 'text/html' } });
+			}
+		}),
+		(error: unknown) => error instanceof AIRequestError && error.status === 400
+	);
+	assert.equal(requests, 0);
+
+	await assert.rejects(
+		fetchCaptureRecipePage('https://recipes.example.test/recipe', {
+			resolveAddresses: async () => ['93.184.216.34'],
+			requestPinned: async () => {
+				requests += 1;
+				return new Response(null, {
+					status: 302,
+					headers: { location: 'https://169.254.169.254/latest/meta-data' }
+				});
+			}
+		}),
+		(error: unknown) => error instanceof AIRequestError && error.status === 400
+	);
+	assert.equal(requests, 1);
+});
+
+test('capture page transport aborts a pending pinned request when its caller disconnects', async () => {
+	const controller = new AbortController();
+	let markStarted!: () => void;
+	const started = new Promise<void>((resolve) => (markStarted = resolve));
+	let abortObserved = false;
+	const request = fetchCaptureRecipePage('https://recipes.example.test/recipe', {
+		signal: controller.signal,
+		resolveAddresses: async () => ['93.184.216.34'],
+		requestPinned: async (_url, _address, signal) =>
+			new Promise((_resolve, reject) => {
+				markStarted();
+				signal.addEventListener(
+					'abort',
+					() => {
+						abortObserved = true;
+						reject(new DOMException('Page request aborted.', 'AbortError'));
+					},
+					{ once: true }
+				);
+			})
+	});
+
+	await started;
+	controller.abort();
+	await assert.rejects(request);
+	assert.equal(abortObserved, true);
+});
+
+test('capture page transport pins an arbitrary public host before requesting it', async () => {
+	let observedHost = '';
+	let observedAddress = '';
+	const response = await fetchCaptureRecipePage('https://recipes.example.test/recipe', {
+		resolveAddresses: async (hostname) => {
+			assert.equal(hostname, 'recipes.example.test');
+			return ['93.184.216.34'];
+		},
+		requestPinned: async (url, address) => {
+			observedHost = url.hostname;
+			observedAddress = address;
+			return new Response('<html><body>recipe</body></html>', {
+				headers: { 'content-type': 'text/html' }
+			});
+		}
+	});
+
+	assert.equal(observedHost, 'recipes.example.test');
+	assert.equal(observedAddress, '93.184.216.34');
+	assert.match(await response.text(), /recipe/);
+});
+
+test('capture page transport caps arbitrary-host pages at one megabyte', async () => {
+	await assert.rejects(
+		fetchCaptureRecipePage('https://recipes.example.test/recipe', {
+			resolveAddresses: async () => ['93.184.216.34'],
+			requestPinned: async () =>
+				new Response(new Uint8Array(1_000_001), {
+					headers: { 'content-type': 'text/html' }
+				})
+		}),
+		(error: unknown) => error instanceof AIRequestError && error.status === 413
+	);
 });
 
 test('models catalog only exposes the supported providers and marks image input models', () => {

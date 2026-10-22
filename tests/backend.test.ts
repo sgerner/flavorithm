@@ -285,3 +285,27 @@ test('shared recipes reject executable links and non-positive serving counts', (
 	initial.recipes[0].servings = 0;
 	assert.equal(backend.validateAppState(initial), null);
 });
+
+test('import estimates survive household storage, with bounded notes', async () => {
+	const account = await backend.registerUser(
+		'Importer',
+		'importer@example.com',
+		'correct horse battery'
+	);
+	const state = backend.getState(account.user)!;
+	state.recipes[0].importNotes = [
+		'Servings estimated at two.',
+		'Missing cooking steps were generated.'
+	];
+	backend.saveState(account.user, state, {
+		ifMatch: backend.getStateEtag(account.user),
+		ifNoneMatch: null
+	});
+	assert.deepEqual(
+		backend.getState(account.user)?.recipes[0].importNotes,
+		state.recipes[0].importNotes
+	);
+	const invalid = structuredClone(state);
+	invalid.recipes[0].importNotes = Array.from({ length: 31 }, () => 'Estimate');
+	assert.equal(backend.validateAppState(invalid), null);
+});

@@ -41,9 +41,12 @@ export const POST: RequestHandler = async (event) => {
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
 			connection = { accessToken: await getChatGPTAccessToken(user.id, accountId) };
 		}
-		return json(await runAIRequest(body, event.fetch, undefined, connection), {
-			headers: { 'cache-control': 'no-store' }
-		});
+		return json(
+			await runAIRequest(body, event.fetch, undefined, connection, event.request.signal),
+			{
+				headers: { 'cache-control': 'no-store' }
+			}
+		);
 	} catch (error) {
 		if (error instanceof ChatGPTInferenceError)
 			return json({ error: error.message, code: error.code }, { status: error.status });

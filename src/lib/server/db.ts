@@ -158,6 +158,7 @@ const recipeSchema = z.object({
 	steps: z.array(z.string().max(10_000)).max(200),
 	nutrition: nutritionSchema,
 	source: publicUrlSchema.optional(),
+	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	rating: z.number().finite().min(0).max(5).optional(),
 	saved: z.boolean().optional()
 });
