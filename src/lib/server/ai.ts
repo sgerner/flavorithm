@@ -776,7 +776,8 @@ export function validateCaptureRecipeUrl(value: string): URL {
 	}
 	const hostname = unbracketHostname(url.hostname.toLowerCase());
 	const ipVersion = isIP(hostname);
-	if (url.protocol !== 'https:' || url.username || url.password || url.port) {
+	const hasCredentials = Boolean(url.username) || Boolean(url.password);
+	if (url.protocol !== 'https:' || hasCredentials || url.port) {
 		throw new AIRequestError(
 			'Recipe capture only supports public HTTPS pages on the standard port, without embedded credentials.',
 			400
