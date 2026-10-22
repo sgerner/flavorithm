@@ -123,6 +123,25 @@ test('shopping refresh is idempotent, accounts for checked purchases, and preser
 	assert.equal(fullyCovered.length, 1);
 });
 
+test('a checked generated row keeps its id when a larger requirement creates a remaining row', () => {
+	const key = 'recipe:rice';
+	const oneCup = [shopping('request-one', 'rice', 1, 'cup', false)];
+	const initial = reconcileShoppingList([], oneCup, key);
+	const purchased = { ...initial[0], checked: true };
+	const twoCups = [shopping('request-two', 'rice', 2, 'cups', false)];
+	const refreshed = reconcileShoppingList([purchased], twoCups, key);
+	assert.equal(refreshed.length, 2);
+	assert.equal(new Set(refreshed.map((item) => item.id)).size, refreshed.length);
+	assert.equal(refreshed.find((item) => item.checked)?.id, purchased.id);
+	assert.equal(refreshed.find((item) => !item.checked)?.quantity, 1);
+	assert.notEqual(refreshed.find((item) => !item.checked)?.id, purchased.id);
+
+	const repeated = reconcileShoppingList(refreshed, twoCups, key);
+	assert.deepEqual(repeated, refreshed);
+	assert.equal(new Set(repeated.map((item) => item.id)).size, repeated.length);
+	assert.equal(repeated.find((item) => !item.checked)?.quantity, 1);
+});
+
 test('completing a meal deducts compatible pantry quantities once and never goes below zero', () => {
 	const plannedRecipe = recipe({
 		id: 'soup',
@@ -284,4 +303,19 @@ test('recipe ranking keeps the original order for equal scores', () => {
 	const first = recipe({ id: 'first' });
 	const second = recipe({ id: 'second' });
 	assert.deepEqual(rankRecipes([first, second], [], preferences()), [first, second]);
+});
+
+test('learned time affinity favors candidates near a single rated favorite', () => {
+	const far = recipe({ id: 'far', time: 120 });
+	const near = recipe({ id: 'near', time: 20 });
+	const favorite = recipe({ id: 'favorite-time', time: 20, rating: 5 });
+	const ranked = rankRecipes(
+		[far, near, favorite],
+		[],
+		preferences({ maxTime: 1000 }),
+		new Date(2026, 9, 22)
+	);
+	assert.ok(
+		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
+	);
 });

@@ -2936,7 +2936,13 @@ html.dark[data-theme='nosh'] {
 	}
 
 	.pantry-row input[type='number'] {
-		width: 55px;
+		width: 88px;
+		appearance: textfield;
+	}
+
+	.pantry-row input[type='number']::-webkit-inner-spin-button,
+	.pantry-row input[type='number']::-webkit-outer-spin-button {
+		appearance: none;
 	}
 
 	.pantry-row .unit-input {

@@ -1,7 +1,7 @@
 {
 	"name": "flavorithm",
 	"version": "1.0.0",
-	"description": "Flavorithm — Where flavor meets algorithms. Your thoughtful kitchen companion.",
+	"description": "Flavorithm \u2014 Where flavor meets algorithms. Your thoughtful kitchen companion.",
 	"scripts": {
 		"dev": "node --env-file-if-exists=.env node_modules/vite/bin/vite.js dev",
 		"build": "vite build",
@@ -11,7 +11,8 @@
 		"test": "node --experimental-strip-types --test tests/*.test.ts",
 		"seed:dev": "node --experimental-strip-types scripts/seed-dev.mjs",
 		"format": "prettier --write .",
-		"test:smoke": "node scripts/smoke-test.mjs"
+		"test:smoke": "node scripts/smoke-test.mjs",
+		"readiness": "node --env-file-if-exists=.env scripts/readiness.mjs"
 	},
 	"keywords": [],
 	"type": "module",
