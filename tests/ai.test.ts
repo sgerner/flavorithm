@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
 import { ChatGPTInferenceError } from '../src/lib/server/chatgpt-inference.ts';
 import {
@@ -65,6 +66,19 @@ function jsonResponse(body: unknown, status = 200) {
 	});
 }
 
+function structuredRecipeHtml(nutrition: unknown) {
+	return `<script type="application/ld+json">${JSON.stringify({
+		'@context': 'https://schema.org',
+		'@type': 'Recipe',
+		name: 'Source Rice',
+		recipeYield: '2 servings',
+		totalTime: 'PT20M',
+		recipeIngredient: ['1 cup rice'],
+		recipeInstructions: ['Cook the rice.'],
+		nutrition
+	})}</script>`;
+}
+
 test('generate uses the fixed provider host and returns validated recipes with server IDs', async () => {
 	let observedUrl = '';
 	let observedHeaders: Headers | undefined;
@@ -122,6 +136,62 @@ test('generate uses the fixed provider host and returns validated recipes with s
 	assert.equal((result as any).recipes[0].source, undefined);
 	assert.equal((result as any).recipes[1].image, '');
 	assert.equal(JSON.stringify(result).includes('temporary-test-key'), false);
+});
+
+test('AI accepts persisted edited recipes with long descriptions and steps', async () => {
+	const longDescription = 'A'.repeat(5_000);
+	const longStep = 'S'.repeat(5_000);
+	const editedRatedRecipe = {
+		...generatedRecipe,
+		id: 'edited-recipe',
+		description: longDescription,
+		steps: [longStep],
+		tags: Array.from({ length: 50 }, (_, index) => `tag-${index}`),
+		ingredients: Array.from({ length: 101 }, (_, index) => ({
+			name: `ingredient-${index}`,
+			quantity: 1,
+			unit: 'piece'
+		})),
+		source: `https://recipes.example.test/${'x'.repeat(2_500)}`,
+		rating: 5
+	};
+	let nutritionPrompt = '';
+	const nutritionResult = await runAIRequest(
+		{
+			action: 'nutrition',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'temporary-test-key',
+			recipe: editedRatedRecipe
+		},
+		async (_input, init) => {
+			nutritionPrompt = JSON.parse(String(init?.body)).messages[1].content;
+			return jsonResponse({ choices: [{ message: { content: JSON.stringify(nutrition) } }] });
+		}
+	);
+	assert.deepEqual(nutritionResult, nutrition);
+	assert.ok(nutritionPrompt.includes(longDescription));
+	assert.ok(nutritionPrompt.includes(longStep));
+
+	let generationPrompt = '';
+	await runAIRequest(
+		{
+			action: 'generate',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'temporary-test-key',
+			preferences,
+			recipes: [editedRatedRecipe]
+		},
+		async (_input, init) => {
+			generationPrompt = JSON.parse(String(init?.body)).messages[1].content;
+			return jsonResponse({
+				choices: [{ message: { content: JSON.stringify({ recipes: [generatedRecipe] }) } }]
+			});
+		}
+	);
+	assert.match(generationPrompt, /"rating":5/);
+	assert.match(generationPrompt, /Chickpea Tomato Skillet/);
 });
 
 test('vision sends image bytes to Anthropic as a base64 image block and validates ingredients', async () => {
@@ -433,6 +503,206 @@ test('capture autodetects a standalone recipe URL and falls back to bounded read
 	assert.equal(result.recipe.provenance, 'web-import');
 });
 
+test('capture fallback preserves unknown named HTML entities in recipe text', async () => {
+	let observedPrompt = '';
+	const pageHtml = `<main><h1>Cr&egrave;me pasta</h1>
+		<p>Ingredients: &frac12; cup flour and Cr&egrave;me fra&icirc;che.</p>
+		<p>Stir the ingredients together.</p></main>`;
+	const fetcher: typeof fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body));
+		observedPrompt = body.messages[1].content;
+		return jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] });
+	};
+
+	await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/entities'
+		},
+		fetcher,
+		async () => new Response(pageHtml, { headers: { 'content-type': 'text/html' } })
+	);
+
+	assert.match(observedPrompt, /Cr&egrave;me pasta/);
+	assert.match(observedPrompt, /&frac12; cup flour/);
+	assert.match(observedPrompt, /Cr&egrave;me fra&icirc;che/);
+});
+
+test('capture prioritizes main recipe content over oversized page navigation', async () => {
+	let observedPrompt = '';
+	const boilerplate = 'Navigation category link. '.repeat(1_000);
+	const pageHtml = `
+		<html><head><title>Unrelated title</title></head><body>
+		<nav>${boilerplate}</nav>
+		<header>${boilerplate}</header>
+		<main><h1>Late page recipe</h1>
+		<p>Ingredients: 2 cups flour and 1 egg.</p>
+		<p>Mix the flour and egg, then boil the noodles.</p></main>
+		<footer>${boilerplate}</footer>
+		</body></html>`;
+	const fetcher: typeof fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body));
+		observedPrompt = body.messages[1].content;
+		return jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] });
+	};
+
+	await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/long-page'
+		},
+		fetcher,
+		async () => new Response(pageHtml, { headers: { 'content-type': 'text/html' } })
+	);
+
+	assert.ok(pageHtml.indexOf('<main>') > 20_000, 'boilerplate should exceed the text cap');
+	assert.match(observedPrompt, /Late page recipe/);
+	assert.match(observedPrompt, /2 cups flour and 1 egg/);
+	assert.match(observedPrompt, /Mix the flour and egg, then boil the noodles/);
+	assert.doesNotMatch(observedPrompt, /Navigation category link|Unrelated title/);
+});
+
+test('capture uses article content when the page has no main element', async () => {
+	let observedPrompt = '';
+	const pageHtml = `
+		<nav>Site navigation.</nav><article>
+		<h1>Article recipe</h1><p>Ingredients: 3 potatoes.</p>
+		<p>Roast the potatoes until tender.</p></article><footer>Legal links.</footer>`;
+	const fetcher: typeof fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body));
+		observedPrompt = body.messages[1].content;
+		return jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] });
+	};
+
+	await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/article'
+		},
+		fetcher,
+		async () => new Response(pageHtml, { headers: { 'content-type': 'text/html' } })
+	);
+
+	assert.match(observedPrompt, /Article recipe/);
+	assert.match(observedPrompt, /3 potatoes/);
+	assert.match(observedPrompt, /Roast the potatoes until tender/);
+	assert.doesNotMatch(observedPrompt, /Site navigation|Legal links/);
+});
+
+test('malformed HTML token scans stay linear for repeated unclosed tags and angle brackets', () => {
+	const childScript = `
+		import { AIRequestError, runAIRequest } from './src/lib/server/ai.ts';
+		const recipe = ${JSON.stringify(capturedRecipe)};
+		async function capture(html, shouldSucceed = false) {
+			let providerCalls = 0;
+			try {
+				const result = await runAIRequest(
+					{ action: 'capture', provider: 'openai', model: 'gpt-4.1-mini', apiKey: 'capture-key', prompt: 'https://recipes.example.test/path' },
+					async () => {
+						providerCalls += 1;
+						return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(recipe) } }] }), { headers: { 'content-type': 'application/json' } });
+					},
+					async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+				);
+				if (!shouldSucceed || providerCalls !== 1 || result.recipe.title !== recipe.title) throw new Error('unexpected capture result');
+			} catch (error) {
+				if (shouldSucceed || !(error instanceof AIRequestError) || error.status !== 422 || providerCalls !== 0) throw error;
+			}
+		}
+		for (const malformed of [
+			'<script>'.repeat(100_000) + '<main>Tomato pasta</main>',
+			'<!--'.repeat(100_000),
+			'<link'.repeat(100_000)
+		]) await capture(malformed);
+		await capture('<'.repeat(100_000) + '<main><h1>Tomato pasta</h1><p>Ingredients: tomatoes.</p><p>Simmer the sauce.</p></main>', true);
+	`;
+	const child = spawnSync(
+		process.execPath,
+		['--experimental-strip-types', '--input-type=module', '-e', childScript],
+		{ cwd: process.cwd(), encoding: 'utf8', timeout: 4_000, maxBuffer: 2_000_000 }
+	);
+
+	assert.equal(
+		child.status,
+		0,
+		`child parser regression failed or timed out: ${child.error?.message ?? child.stderr}`
+	);
+});
+
+test('deeply nested JSON-LD scalar values are bounded and fall back safely', async () => {
+	let observedPrompt = '';
+	const deeplyNestedName = '['.repeat(10_000) + '"Malformed title"' + ']'.repeat(10_000);
+	const nestedNamePage = `<script type="application/ld+json">{"@type":"Recipe","name":${deeplyNestedName},"recipeYield":"2 servings","recipeIngredient":["1 cup rice"],"recipeInstructions":["Cook the rice."]}</script><main><h1>Fallback noodles</h1><p>Ingredients: 1 cup rice.</p><p>Cook the rice until tender.</p></main>`;
+	const deeplyNestedCalories = '['.repeat(10_000) + '"350 kcal"' + ']'.repeat(10_000);
+	const nestedNutritionPage = `<script type="application/ld+json">{"@type":"Recipe","name":"Rice","recipeYield":"2 servings","recipeIngredient":["1 cup rice"],"recipeInstructions":["Cook the rice."],"nutrition":{"calories":${deeplyNestedCalories}}}</script>`;
+	const fetcher: typeof fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body));
+		observedPrompt = body.messages[1].content;
+		return jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] });
+	};
+	const input = {
+		action: 'capture' as const,
+		provider: 'openai' as const,
+		model: 'gpt-4.1-mini',
+		apiKey: 'capture-key',
+		url: 'https://recipes.example.test/deep-jsonld'
+	};
+
+	await runAIRequest(
+		input,
+		fetcher,
+		async () => new Response(nestedNamePage, { headers: { 'content-type': 'text/html' } })
+	);
+	assert.match(observedPrompt, /Fallback noodles/);
+	assert.doesNotMatch(observedPrompt, /Malformed title/);
+
+	const result = (await runAIRequest(
+		input,
+		fetcher,
+		async () => new Response(nestedNutritionPage, { headers: { 'content-type': 'text/html' } })
+	)) as any;
+	assert.deepEqual(result.recipe.nutrition, nutrition);
+});
+
+test('structured JSON-LD scalar arrays preserve their source order', async () => {
+	let observedPrompt = '';
+	const html = `<script type="application/ld+json">${JSON.stringify({
+		'@type': 'Recipe',
+		name: ['Rice', ['Bowl', 'Soup'], { name: 'Stew' }],
+		recipeYield: '2 servings',
+		recipeIngredient: ['1 cup rice'],
+		recipeInstructions: ['Cook the rice.']
+	})}</script>`;
+	const fetcher: typeof fetch = async (_input, init) => {
+		const body = JSON.parse(String(init?.body));
+		observedPrompt = body.messages[1].content;
+		return jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] });
+	};
+
+	await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/array-name'
+		},
+		fetcher,
+		async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+	);
+
+	assert.match(observedPrompt, /"title":"Rice, Bowl, Soup, Stew"/);
+});
+
 test('capture only returns HTTPS source images from fetched recipe metadata', async () => {
 	for (const unsafeImage of [
 		'javascript:alert(1)',
@@ -462,6 +732,246 @@ test('capture only returns HTTPS source images from fetched recipe metadata', as
 		)) as any;
 
 		assert.equal(result.recipe.image, '');
+	}
+});
+
+test('capture canonicals stay on the fetched origin while import keeps its site allowlist', async () => {
+	const cases = [
+		{
+			action: 'capture' as const,
+			url: 'https://recipes.example.test/selected',
+			canonical: 'https://recipes.example.test/normalized',
+			expected: 'https://recipes.example.test/normalized'
+		},
+		{
+			action: 'capture' as const,
+			url: 'https://recipes.example.test/selected',
+			canonical: 'https://publisher.example/normalized',
+			expected: 'https://recipes.example.test/selected'
+		},
+		{
+			action: 'capture' as const,
+			url: 'https://recipes.example.test/selected',
+			canonical: 'https://127.0.0.1/private',
+			expected: 'https://recipes.example.test/selected'
+		},
+		{
+			action: 'import' as const,
+			url: 'https://www.allrecipes.com/recipe/selected',
+			canonical: 'https://publisher.example/normalized',
+			expected: 'https://www.allrecipes.com/recipe/selected'
+		}
+	];
+
+	for (const { action, url, canonical, expected } of cases) {
+		const html = `<link rel="canonical" href="${canonical}">${structuredRecipeHtml(undefined)}`;
+		const modelRecipe = action === 'capture' ? capturedRecipe : generatedRecipe;
+		const result = (await runAIRequest(
+			{ action, provider: 'openai', model: 'gpt-4.1-mini', apiKey: 'capture-key', url },
+			async () =>
+				jsonResponse({ choices: [{ message: { content: JSON.stringify(modelRecipe) } }] }),
+			async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+		)) as any;
+		const recipe = action === 'capture' ? result.recipe : result.recipes[0];
+		assert.equal(recipe.source, expected, `${action}: ${canonical}`);
+	}
+});
+
+test('capture converts structured nutrition into the units shown by the recipe editor', async () => {
+	const html = structuredRecipeHtml({
+		calories: '1,500 kJ',
+		fatContent: '2,000 mg',
+		saturatedFatContent: { value: '3', unitCode: 'GRM' },
+		sodiumContent: '0.6 g',
+		carbohydrateContent: '45,000 mg',
+		fiberContent: { value: '4,000', unitCode: 'MGM' },
+		sugarContent: '0,6 g',
+		proteinContent: { value: '18,000', unitCode: 'MGM' }
+	});
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/rice'
+		},
+		async () =>
+			jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] }),
+		async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+	)) as any;
+
+	assert.deepEqual(result.recipe.nutrition, {
+		calories: 1_500 / 4.184,
+		fat: 2,
+		saturatedFat: 3,
+		sodium: 600,
+		carbs: 45,
+		fiber: 4,
+		sugar: 0.6,
+		protein: 18
+	});
+});
+
+test('capture parses leading decimals and does not turn negative decimals positive', async () => {
+	const html = structuredRecipeHtml({
+		calories: '-.5 kcal',
+		fatContent: '.5 g',
+		saturatedFatContent: '-,5 g',
+		sodiumContent: '-.5 mg',
+		carbohydrateContent: ',5 g',
+		fiberContent: '-0,5 g',
+		sugarContent: '.25 g',
+		proteinContent: '-.25 g'
+	});
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/rice'
+		},
+		async () =>
+			jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] }),
+		async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+	)) as any;
+
+	assert.deepEqual(result.recipe.nutrition, {
+		calories: nutrition.calories,
+		fat: 0.5,
+		saturatedFat: nutrition.saturatedFat,
+		sodium: nutrition.sodium,
+		carbs: 0.5,
+		fiber: nutrition.fiber,
+		sugar: 0.25,
+		protein: nutrition.protein
+	});
+});
+
+test('capture keeps model nutrition when source values use per-volume or recipe-total bases', async () => {
+	const sources = [
+		{
+			servingSize: '100 g',
+			calories: '350 kcal',
+			proteinContent: '12 g',
+			sodiumContent: '600 mg'
+		},
+		{
+			servingSize: '100 mL',
+			calories: '350 kcal',
+			proteinContent: '12 g',
+			sodiumContent: '600 mg'
+		},
+		{
+			servingSize: { value: '100', unitCode: 'MLT' },
+			calories: '350 kcal',
+			proteinContent: '12 g',
+			sodiumContent: '600 mg'
+		},
+		{
+			servingSize: '1 serving',
+			calories: '350 kcal per 100 mL',
+			proteinContent: '12 g',
+			sodiumContent: '600 mg'
+		},
+		{
+			servingSize: '1 serving',
+			calories: '350 kcal',
+			proteinContent: '3 g/100 g',
+			sodiumContent: '600 mg'
+		},
+		{
+			servingSize: '1 serving',
+			calories: '350 kcal',
+			proteinContent: '12 g',
+			sodiumContent: '2 mg / 100 ml'
+		},
+		{
+			servingSize: '1 serving',
+			calories: '1,200 kcal for the whole recipe',
+			proteinContent: '48 g per recipe',
+			sodiumContent: '2,400 mg'
+		},
+		{
+			servingSize: 'entire batch',
+			calories: '1,200 kcal',
+			proteinContent: '48 g',
+			sodiumContent: '2,400 mg'
+		}
+	];
+
+	for (const source of sources) {
+		const result = (await runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				url: 'https://recipes.example.test/rice'
+			},
+			async () =>
+				jsonResponse({ choices: [{ message: { content: JSON.stringify(capturedRecipe) } }] }),
+			async () =>
+				new Response(structuredRecipeHtml(source), {
+					headers: { 'content-type': 'text/html' }
+				})
+		)) as any;
+
+		assert.deepEqual(result.recipe.nutrition, nutrition, JSON.stringify(source));
+	}
+});
+
+test('capture and import ignore source nutrition outside finite persistence bounds', async () => {
+	const html = structuredRecipeHtml({
+		calories: `${'9'.repeat(400)} kcal`,
+		sodiumContent: '1,000,001 mg'
+	});
+	for (const action of ['capture', 'import'] as const) {
+		const modelRecipe = action === 'capture' ? capturedRecipe : generatedRecipe;
+		const input = {
+			action,
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url:
+				action === 'capture'
+					? 'https://recipes.example.test/rice'
+					: 'https://www.allrecipes.com/recipe/rice'
+		};
+		const result = (await runAIRequest(
+			input,
+			async () =>
+				jsonResponse({ choices: [{ message: { content: JSON.stringify(modelRecipe) } }] }),
+			async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+		)) as any;
+		const recipe = action === 'capture' ? result.recipe : result.recipes[0];
+		assert.deepEqual(recipe.nutrition, nutrition, `${action} should retain the model estimate`);
+	}
+});
+
+test('capture rejects model nutrition and ingredient values above persistence bounds', async () => {
+	for (const modelRecipe of [
+		{ ...capturedRecipe, nutrition: { ...nutrition, calories: 1_000_001 } },
+		{
+			...capturedRecipe,
+			ingredients: [{ ...capturedRecipe.ingredients[0], quantity: 1_000_001 }]
+		}
+	]) {
+		await assert.rejects(
+			runAIRequest(
+				{
+					action: 'capture',
+					provider: 'openai',
+					model: 'gpt-4.1-mini',
+					apiKey: 'capture-key',
+					prompt: 'A rice recipe'
+				},
+				async () =>
+					jsonResponse({ choices: [{ message: { content: JSON.stringify(modelRecipe) } }] })
+			),
+			(error: unknown) => error instanceof AIRequestError && error.status === 502
+		);
 	}
 });
 
@@ -676,7 +1186,12 @@ test('import normalizes a real allowlisted JSON-LD recipe and preserves server-v
 				{ '@type': 'HowToStep', text: 'Warm the oil.' },
 				{ '@type': 'HowToStep', text: 'Simmer the chickpeas and tomatoes.' }
 			],
-			nutrition: { '@type': 'NutritionInformation', calories: '390 kcal', proteinContent: '18 g' }
+			nutrition: {
+				'@type': 'NutritionInformation',
+				calories: '390 kcal',
+				proteinContent: '18 g',
+				sodiumContent: '0.6 g'
+			}
 		})}</script>
 	`;
 	let observedPrompt = '';
@@ -727,6 +1242,7 @@ test('import normalizes a real allowlisted JSON-LD recipe and preserves server-v
 	assert.equal(result.recipes[0].provenance, 'web-import');
 	assert.equal(result.recipes[0].nutrition.calories, 390);
 	assert.equal(result.recipes[0].nutrition.protein, 18);
+	assert.equal(result.recipes[0].nutrition.sodium, 600);
 	assert.match(result.recipes[0].id, /^[0-9a-f-]{36}$/i);
 	assert.equal(JSON.stringify(result).includes('temporary-import-key'), false);
 });

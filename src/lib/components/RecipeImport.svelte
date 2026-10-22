@@ -99,6 +99,7 @@
 	function drop(event: DragEvent) {
 		event.preventDefault();
 		dragging = false;
+		if (busy || reading) return;
 		const file = event.dataTransfer?.files[0];
 		if (file) {
 			void attachPhoto(file);
@@ -112,6 +113,7 @@
 	}
 	async function prepare(event: SubmitEvent) {
 		event.preventDefault();
+		if (busy || reading || !alive || (!session.text.trim() && !session.photo)) return;
 		error = '';
 		busy = true;
 		controller = new AbortController();
@@ -158,14 +160,18 @@
 				'Add a title, time, servings, at least one ingredient with a quantity and unit, and a cooking step.';
 			return;
 		}
-		save({
-			...draft,
-			title: draft.title.trim(),
-			ingredients,
-			steps,
-			importNotes: [...session.assumptions],
-			saved: true
-		});
+		try {
+			save({
+				...draft,
+				title: draft.title.trim(),
+				ingredients,
+				steps,
+				importNotes: [...session.assumptions],
+				saved: true
+			});
+		} catch (e) {
+			error = (e as Error).message;
+		}
 	}
 </script>
 

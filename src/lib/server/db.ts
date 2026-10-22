@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
 import { createNewUserState } from '#lib/data.ts';
+import { MAX_RECIPES } from '#lib/recipe-collection.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
 
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -158,6 +159,7 @@ const recipeSchema = z.object({
 	steps: z.array(z.string().max(10_000)).max(200),
 	nutrition: nutritionSchema,
 	source: publicUrlSchema.optional(),
+	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	rating: z.number().finite().min(0).max(5).optional(),
 	saved: z.boolean().optional()
@@ -191,7 +193,7 @@ const appStateSchema = z.object({
 			})
 		)
 		.max(1_000),
-	recipes: z.array(recipeSchema).max(250),
+	recipes: z.array(recipeSchema).max(MAX_RECIPES),
 	meals: z
 		.array(
 			z.object({
