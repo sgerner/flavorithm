@@ -6,6 +6,8 @@ const backendModulePath: string = '../src/lib/server/db.ts';
 const backend = await import(backendModulePath);
 const dataModulePath: string = '../src/lib/data.ts';
 const data = await import(dataModulePath);
+const exportRouteModulePath: string = '../src/routes/api/export/+server.ts';
+const exportRoute = await import(exportRouteModulePath);
 
 test('accounts, shared household state, invites and owner-safe leave', async () => {
 	const alice = await backend.registerUser(
@@ -297,15 +299,27 @@ test('import estimates survive household storage, with bounded notes', async () 
 		'Servings estimated at two.',
 		'Missing cooking steps were generated.'
 	];
+	state.recipes[0].provenance = 'web-import';
+	state.recipes[1].provenance = 'ai-generated';
 	backend.saveState(account.user, state, {
 		ifMatch: backend.getStateEtag(account.user),
 		ifNoneMatch: null
 	});
-	assert.deepEqual(
-		backend.getState(account.user)?.recipes[0].importNotes,
-		state.recipes[0].importNotes
-	);
+	const saved = backend.getState(account.user)!;
+	assert.deepEqual(saved.recipes[0].importNotes, state.recipes[0].importNotes);
+	assert.equal(saved.recipes[0].provenance, 'web-import');
+	assert.equal(saved.recipes[1].provenance, 'ai-generated');
+
+	const exportedResponse = await exportRoute.GET({ locals: { user: account.user } } as never);
+	const exported = (await exportedResponse.json()) as { state: typeof state };
+	assert.equal(exported.state.recipes[0].provenance, 'web-import');
+	assert.equal(exported.state.recipes[1].provenance, 'ai-generated');
+	assert.deepEqual(exported.state.recipes[0].importNotes, state.recipes[0].importNotes);
+
 	const invalid = structuredClone(state);
 	invalid.recipes[0].importNotes = Array.from({ length: 31 }, () => 'Estimate');
 	assert.equal(backend.validateAppState(invalid), null);
+	const invalidProvenance = structuredClone(state);
+	invalidProvenance.recipes[0].provenance = 'unknown';
+	assert.equal(backend.validateAppState(invalidProvenance), null);
 });

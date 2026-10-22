@@ -30,6 +30,7 @@ export type Recipe = {
 		protein: number;
 	};
 	source?: string;
+	provenance?: 'web-import' | 'ai-generated';
 	importNotes?: string[];
 	rating?: number;
 	saved?: boolean;

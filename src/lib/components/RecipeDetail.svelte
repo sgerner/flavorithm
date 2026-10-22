@@ -53,7 +53,7 @@
 	>
 		<div
 			class="detail-photo"
-			style={`background-image:url('${recipe.image || '/recipe-placeholder.svg'}')`}
+			style:background-image={`url(${JSON.stringify(recipe.image || '/recipe-placeholder.svg')})`}
 		>
 			<button class="icon-button close-detail" onclick={close} aria-label="Close recipe"
 				><X size={22} /></button

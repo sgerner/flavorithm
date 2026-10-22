@@ -45,6 +45,7 @@
 	import type { AppState, Recipe, User } from '#lib/types.ts';
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
+	import { insertRecipes } from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import RecipeImport, {
 		emptyImportSession,
@@ -672,7 +673,7 @@
 					: {
 							pantry: kitchen.pantry,
 							preferences: kitchen.preferences,
-							recipes: kitchen.recipes.filter((r) => r.rating),
+							recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
 							prompt
 						}),
 				...extra
@@ -687,7 +688,7 @@
 		error = '';
 		try {
 			const result = await ai('generate');
-			kitchen.recipes = [...result.recipes, ...kitchen.recipes];
+			kitchen.recipes = insertRecipes(kitchen.recipes, result.recipes);
 			modal = '';
 			page = 'discover';
 			filter = 'For you';
@@ -892,7 +893,7 @@
 	}
 	function saveImportedRecipe(recipe: Recipe) {
 		const saved = { ...recipe, saved: true };
-		kitchen.recipes = [saved, ...kitchen.recipes.filter((r) => r.id !== saved.id)];
+		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
 		importSession = emptyImportSession();
 		resumeImport = false;
 		modal = '';

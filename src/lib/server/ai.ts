@@ -46,37 +46,37 @@ const PreferencesInputSchema = z.object({
 });
 
 const RecipeInputSchema = z.object({
-	id: z.string().max(100),
-	title: z.string().min(1).max(200),
-	description: z.string().max(1_000),
-	image: z.string().max(2_000).optional().default(''),
-	time: z.number().finite().nonnegative(),
-	servings: z.number().finite().positive(),
+	id: z.string().min(1).max(100),
+	title: z.string().trim().min(1).max(200),
+	description: z.string().max(10_000),
+	image: z.string().max(4_000).optional().default(''),
+	time: z.number().finite().nonnegative().max(100_000),
+	servings: z.number().finite().min(1).max(10_000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
-	tags: z.array(z.string().max(80)).max(40),
+	tags: z.array(z.string().max(100)).max(100),
 	ingredients: z
 		.array(
 			z.object({
-				name: z.string().min(1).max(120),
-				quantity: z.number().finite().nonnegative(),
-				unit: z.string().max(60)
+				name: z.string().trim().min(1).max(200),
+				quantity: z.number().finite().nonnegative().max(1_000_000),
+				unit: z.string().max(40)
 			})
 		)
-		.max(100),
-	steps: z.array(z.string().max(2_000)).max(100),
+		.max(250),
+	steps: z.array(z.string().max(10_000)).max(200),
 	nutrition: z.object({
-		calories: z.number().finite().nonnegative(),
-		fat: z.number().finite().nonnegative(),
-		saturatedFat: z.number().finite().nonnegative(),
-		sodium: z.number().finite().nonnegative(),
-		carbs: z.number().finite().nonnegative(),
-		fiber: z.number().finite().nonnegative(),
-		sugar: z.number().finite().nonnegative(),
-		protein: z.number().finite().nonnegative()
+		calories: z.number().finite().nonnegative().max(1_000_000),
+		fat: z.number().finite().nonnegative().max(1_000_000),
+		saturatedFat: z.number().finite().nonnegative().max(1_000_000),
+		sodium: z.number().finite().nonnegative().max(1_000_000),
+		carbs: z.number().finite().nonnegative().max(1_000_000),
+		fiber: z.number().finite().nonnegative().max(1_000_000),
+		sugar: z.number().finite().nonnegative().max(1_000_000),
+		protein: z.number().finite().nonnegative().max(1_000_000)
 	}),
-	source: z.string().max(2_000).optional(),
-	rating: z.number().finite().optional(),
+	source: z.string().max(4_000).optional(),
+	rating: z.number().finite().min(0).max(5).optional(),
 	saved: z.boolean().optional()
 });
 
@@ -89,7 +89,7 @@ const AIRequestSchema = z
 		connectionId: z.string().max(100).optional(),
 		pantry: z.array(IngredientInputSchema).max(300).optional().default([]),
 		preferences: PreferencesInputSchema.optional(),
-		recipes: z.array(RecipeInputSchema).max(100).optional().default([]),
+		recipes: z.array(RecipeInputSchema).max(250).optional().default([]),
 		prompt: z.string().trim().max(20_000).optional(),
 		image: z.string().max(MAX_IMAGE_DATA_LENGTH).optional(),
 		recipe: RecipeInputSchema.optional(),
@@ -102,14 +102,14 @@ const AIRequestSchema = z
 	});
 
 const NutritionSchema = z.object({
-	calories: z.number().finite().nonnegative(),
-	fat: z.number().finite().nonnegative(),
-	saturatedFat: z.number().finite().nonnegative(),
-	sodium: z.number().finite().nonnegative(),
-	carbs: z.number().finite().nonnegative(),
-	fiber: z.number().finite().nonnegative(),
-	sugar: z.number().finite().nonnegative(),
-	protein: z.number().finite().nonnegative()
+	calories: z.number().finite().nonnegative().max(1_000_000),
+	fat: z.number().finite().nonnegative().max(1_000_000),
+	saturatedFat: z.number().finite().nonnegative().max(1_000_000),
+	sodium: z.number().finite().nonnegative().max(1_000_000),
+	carbs: z.number().finite().nonnegative().max(1_000_000),
+	fiber: z.number().finite().nonnegative().max(1_000_000),
+	sugar: z.number().finite().nonnegative().max(1_000_000),
+	protein: z.number().finite().nonnegative().max(1_000_000)
 });
 
 const RecipeDraftSchema = z.object({
@@ -125,7 +125,7 @@ const RecipeDraftSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().positive(),
+				quantity: z.number().finite().positive().max(1_000_000),
 				unit: z.string().trim().min(1).max(40)
 			})
 		)
@@ -141,7 +141,7 @@ const ImportedRecipeDraftSchema = RecipeDraftSchema.extend({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().nonnegative(),
+				quantity: z.number().finite().nonnegative().max(1_000_000),
 				unit: z.string().trim().min(1).max(40)
 			})
 		)
@@ -1123,7 +1123,7 @@ async function captureRecipe(
 			throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
 		}
 		sourceRecipe = extractJsonLdRecipe(html);
-		sourceUrl = canonicalRecipeUrl(html, selectedUrl);
+		sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
 		if (!sourceRecipe) {
 			pageText = htmlToRecipeText(html);
 			if (!pageText) {
@@ -1153,7 +1153,7 @@ async function captureRecipe(
 		recipe: {
 			id: crypto.randomUUID(),
 			...draft,
-			nutrition: { ...draft.nutrition, ...sourceRecipe?.nutrition },
+			nutrition: mergeRecipeNutrition(draft.nutrition, sourceRecipe?.nutrition),
 			image: safeHttpsUrl(sourceRecipe?.image ?? '') ?? '',
 			...(sourceUrl ? { source: sourceUrl } : {}),
 			saved: false,
@@ -1193,37 +1193,310 @@ function buildCapturePrompt(input: {
 		.join('\n');
 }
 
+type HtmlToken =
+	| { kind: 'text'; text: string }
+	| { kind: 'raw-text'; tag: string; text: string }
+	| { kind: 'tag'; name: string; closing: boolean; selfClosing: boolean; attributes: string };
+
+const RAW_TEXT_ELEMENTS = new Set(['script', 'style', 'title', 'textarea']);
+const HIDDEN_TEXT_ELEMENTS = new Set([
+	'head',
+	'script',
+	'style',
+	'title',
+	'textarea',
+	'template',
+	'noscript',
+	'svg',
+	'nav',
+	'header',
+	'footer'
+]);
+const HTML_BLOCK_ELEMENTS = new Set([
+	'p',
+	'div',
+	'li',
+	'h1',
+	'h2',
+	'h3',
+	'h4',
+	'h5',
+	'h6',
+	'section',
+	'article',
+	'br',
+	'tr'
+]);
+
 function htmlToRecipeText(html: string): string {
-	return html
-		.replace(/<!--[\s\S]*?-->/g, ' ')
-		.replace(/<(script|style|template|noscript|svg|head)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, ' ')
-		.replace(/<\/(?:p|div|li|h[1-6]|section|article|br|tr)\s*>/gi, '\n')
-		.replace(/<br\b[^>]*>/gi, '\n')
-		.replace(/<[^>]*>/g, ' ')
-		.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (entity, code: string) => {
-			const normalized = code.toLowerCase();
-			if (normalized === 'amp') return '&';
-			if (normalized === 'lt') return '<';
-			if (normalized === 'gt') return '>';
-			if (normalized === 'quot') return '"';
-			if (normalized === 'apos') return "'";
-			if (normalized === 'nbsp') return ' ';
-			const numeric = normalized.startsWith('#x')
-				? Number.parseInt(normalized.slice(2), 16)
-				: Number.parseInt(normalized.slice(1), 10);
-			try {
-				return Number.isInteger(numeric) && numeric >= 0 && numeric <= 0x10ffff
-					? String.fromCodePoint(numeric)
-					: ' ';
-			} catch {
-				return ' ';
+	const documentText = createHtmlTextBuffer();
+	const mainText = createHtmlTextBuffer();
+	const articleText = createHtmlTextBuffer();
+	const hiddenDepth = new Map<string, number>();
+	let mainDepth = 0;
+	let articleDepth = 0;
+
+	const append = (text: string) => {
+		if (hasHiddenHtmlAncestor(hiddenDepth)) return;
+		appendHtmlText(documentText, text);
+		if (mainDepth > 0) appendHtmlText(mainText, text);
+		if (articleDepth > 0) appendHtmlText(articleText, text);
+	};
+	const boundary = () => append('\n');
+
+	for (const token of scanHtmlTokens(html)) {
+		if (token.kind === 'raw-text') continue;
+		if (token.kind === 'text') {
+			append(decodeHtmlEntities(token.text));
+			continue;
+		}
+
+		if (token.closing) {
+			if (HTML_BLOCK_ELEMENTS.has(token.name)) boundary();
+			if (token.name === 'main' && mainDepth > 0) mainDepth -= 1;
+			if (token.name === 'article' && articleDepth > 0) articleDepth -= 1;
+			if (HIDDEN_TEXT_ELEMENTS.has(token.name)) {
+				const depth = hiddenDepth.get(token.name) ?? 0;
+				if (depth <= 1) hiddenDepth.delete(token.name);
+				else hiddenDepth.set(token.name, depth - 1);
 			}
-		})
-		.replace(/[\t\r ]+/g, ' ')
-		.replace(/ *\n */g, '\n')
-		.replace(/\n{3,}/g, '\n\n')
-		.trim()
-		.slice(0, 20_000);
+			continue;
+		}
+
+		if (!token.selfClosing) {
+			if (token.name === 'main') mainDepth += 1;
+			if (token.name === 'article') articleDepth += 1;
+			if (HIDDEN_TEXT_ELEMENTS.has(token.name)) {
+				hiddenDepth.set(token.name, (hiddenDepth.get(token.name) ?? 0) + 1);
+			}
+		}
+		if (HTML_BLOCK_ELEMENTS.has(token.name)) boundary();
+	}
+
+	return (
+		normalizeHtmlText(mainText) ||
+		normalizeHtmlText(articleText) ||
+		normalizeHtmlText(documentText)
+	).slice(0, 20_000);
+}
+
+function createHtmlTextBuffer() {
+	return { parts: [] as string[], length: 0, lastCharacter: '' };
+}
+
+function appendHtmlText(buffer: ReturnType<typeof createHtmlTextBuffer>, text: string) {
+	const available = 20_000 - buffer.length;
+	if (available <= 0 || !text) return;
+	let addition = text.slice(0, available);
+	if (addition === '\n' && buffer.lastCharacter === '\n') return;
+	if (addition.length > 1 && buffer.lastCharacter === '\n') {
+		addition = addition.replace(/^\n+/, '\n');
+	}
+	if (!addition) return;
+	buffer.parts.push(addition);
+	buffer.length += addition.length;
+	buffer.lastCharacter = addition[addition.length - 1];
+}
+
+function normalizeHtmlText(buffer: ReturnType<typeof createHtmlTextBuffer>) {
+	const input = buffer.parts.join('');
+	const output: string[] = [];
+	let pendingSpace = false;
+	let newlineCount = 0;
+	for (let index = 0; index < input.length; index += 1) {
+		const character = input[index];
+		if (character === '\r') continue;
+		if (character === '\n') {
+			while (output.at(-1) === ' ') output.pop();
+			if (output && newlineCount < 2) {
+				output.push('\n');
+				newlineCount += 1;
+			}
+			pendingSpace = false;
+			continue;
+		}
+		if (character === ' ' || character === '\t' || character === '\f') {
+			pendingSpace = output.length > 0 && newlineCount === 0;
+			continue;
+		}
+		if (pendingSpace) output.push(' ');
+		output.push(character);
+		pendingSpace = false;
+		newlineCount = 0;
+	}
+	return output.join('').trim();
+}
+
+function hasHiddenHtmlAncestor(hiddenDepth: Map<string, number>) {
+	for (const depth of hiddenDepth.values()) if (depth > 0) return true;
+	return false;
+}
+
+function* scanHtmlTokens(html: string): Generator<HtmlToken> {
+	let cursor = 0;
+	let rawTextTag = '';
+
+	while (cursor < html.length) {
+		if (rawTextTag) {
+			const closingStart = findRawTextClose(html, rawTextTag, cursor);
+			if (closingStart < 0) {
+				yield { kind: 'raw-text', tag: rawTextTag, text: html.slice(cursor) };
+				return;
+			}
+			if (closingStart > cursor) {
+				yield { kind: 'raw-text', tag: rawTextTag, text: html.slice(cursor, closingStart) };
+			}
+			cursor = closingStart;
+			rawTextTag = '';
+			continue;
+		}
+
+		const tagStart = html.indexOf('<', cursor);
+		if (tagStart < 0) {
+			yield { kind: 'text', text: html.slice(cursor) };
+			return;
+		}
+		if (tagStart > cursor) yield { kind: 'text', text: html.slice(cursor, tagStart) };
+		if (html.startsWith('<!--', tagStart)) {
+			const commentEnd = html.indexOf('-->', tagStart + 4);
+			if (commentEnd < 0) return;
+			cursor = commentEnd + 3;
+			continue;
+		}
+		if (html[tagStart + 1] === '!' || html[tagStart + 1] === '?') {
+			const declarationEnd = findHtmlTagEnd(html, tagStart + 2);
+			if (declarationEnd < 0) return;
+			cursor = declarationEnd + 1;
+			continue;
+		}
+
+		let nameStart = tagStart + 1;
+		let closing = false;
+		if (html[nameStart] === '/') {
+			closing = true;
+			nameStart += 1;
+			while (isHtmlWhitespace(html.charCodeAt(nameStart))) nameStart += 1;
+		}
+		if (!isAsciiLetter(html.charCodeAt(nameStart))) {
+			yield { kind: 'text', text: '<' };
+			cursor = tagStart + 1;
+			continue;
+		}
+		let nameEnd = nameStart + 1;
+		while (isHtmlNameCharacter(html.charCodeAt(nameEnd))) nameEnd += 1;
+		const tagEnd = findHtmlTagEnd(html, nameEnd);
+		if (tagEnd < 0) return;
+		let tail = tagEnd - 1;
+		while (tail >= nameEnd && isHtmlWhitespace(html.charCodeAt(tail))) tail -= 1;
+		const selfClosing = !closing && html[tail] === '/';
+		const name = html.slice(nameStart, nameEnd).toLowerCase();
+		const attributes = closing ? '' : html.slice(nameEnd, tagEnd);
+		yield { kind: 'tag', name, closing, selfClosing, attributes };
+		cursor = tagEnd + 1;
+		if (!closing && !selfClosing && RAW_TEXT_ELEMENTS.has(name)) rawTextTag = name;
+	}
+}
+
+function findHtmlTagEnd(html: string, start: number) {
+	let quote = 0;
+	for (let index = start; index < html.length; index += 1) {
+		const code = html.charCodeAt(index);
+		if (quote) {
+			if (code === quote) quote = 0;
+		} else if (code === 34 || code === 39) quote = code;
+		else if (code === 62) return index;
+	}
+	return -1;
+}
+
+function findRawTextClose(html: string, tag: string, start: number) {
+	for (let index = start; index + tag.length + 2 < html.length; index += 1) {
+		if (html.charCodeAt(index) !== 60 || html.charCodeAt(index + 1) !== 47) continue;
+		if (!asciiEqualsIgnoreCaseAt(html, index + 2, tag)) continue;
+		const afterName = html.charCodeAt(index + tag.length + 2);
+		if (afterName === 62 || afterName === 47 || isHtmlWhitespace(afterName)) {
+			return index;
+		}
+	}
+	return -1;
+}
+
+function asciiEqualsIgnoreCaseAt(text: string, offset: number, expected: string) {
+	if (offset + expected.length > text.length) return false;
+	for (let index = 0; index < expected.length; index += 1) {
+		let code = text.charCodeAt(offset + index);
+		if (code >= 65 && code <= 90) code += 32;
+		if (code !== expected.charCodeAt(index)) return false;
+	}
+	return true;
+}
+
+function isAsciiLetter(code: number) {
+	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isHtmlNameCharacter(code: number) {
+	return isAsciiLetter(code) || (code >= 48 && code <= 57) || code === 45 || code === 58;
+}
+
+function isHtmlWhitespace(code: number) {
+	return code === 9 || code === 10 || code === 12 || code === 13 || code === 32;
+}
+
+function decodeHtmlEntities(text: string) {
+	const parts: string[] = [];
+	let buffer = '';
+	const append = (value: string) => {
+		let offset = 0;
+		while (offset < value.length) {
+			const capacity = 4096 - buffer.length;
+			buffer += value.slice(offset, offset + capacity);
+			offset += capacity;
+			if (buffer.length === 4096) {
+				parts.push(buffer);
+				buffer = '';
+			}
+		}
+	};
+
+	let plainStart = 0;
+	for (let index = 0; index < text.length; index += 1) {
+		if (text[index] !== '&') continue;
+		let semicolon = index + 1;
+		const limit = Math.min(text.length, index + 34);
+		while (semicolon < limit && text[semicolon] !== ';') semicolon += 1;
+		if (semicolon >= limit || text[semicolon] !== ';') continue;
+		const entity = text.slice(index + 1, semicolon).toLowerCase();
+		let decoded: string | undefined;
+		if (entity === 'amp') decoded = '&';
+		else if (entity === 'lt') decoded = '<';
+		else if (entity === 'gt') decoded = '>';
+		else if (entity === 'quot') decoded = '"';
+		else if (entity === 'apos') decoded = "'";
+		else if (entity === 'nbsp') decoded = ' ';
+		else if (/^#x[\da-f]+$/i.test(entity)) {
+			decoded = decodeHtmlCodePoint(Number.parseInt(entity.slice(2), 16));
+		} else if (/^#\d+$/.test(entity)) {
+			decoded = decodeHtmlCodePoint(Number.parseInt(entity.slice(1), 10));
+		}
+		append(text.slice(plainStart, index));
+		append(decoded ?? text.slice(index, semicolon + 1));
+		plainStart = semicolon + 1;
+		index = semicolon;
+	}
+	append(text.slice(plainStart));
+	if (buffer) parts.push(buffer);
+	return parts.join('');
+}
+
+function decodeHtmlCodePoint(codePoint: number): string | undefined {
+	try {
+		return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff
+			? String.fromCodePoint(codePoint)
+			: undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 async function importRecipe(
@@ -1265,7 +1538,7 @@ async function importRecipe(
 			{
 				id: crypto.randomUUID(),
 				...parsed.data,
-				nutrition: { ...parsed.data.nutrition, ...sourceRecipe.nutrition },
+				nutrition: mergeRecipeNutrition(parsed.data.nutrition, sourceRecipe.nutrition),
 				image: safeHttpsUrl(sourceRecipe.image) ?? '',
 				source: sourceUrl,
 				provenance: 'web-import' as const
@@ -1286,17 +1559,24 @@ function buildImportPrompt(sourceRecipe: ImportedRecipeData, sourceUrl: string) 
 
 function extractJsonLdRecipe(html: string): ImportedRecipeData | undefined {
 	const candidates: unknown[] = [];
-	const scriptPattern = /<script\b([^>]*)>([\s\S]*?)<\/script\s*>/gi;
-	let match: RegExpExecArray | null;
 	let scripts = 0;
-	while ((match = scriptPattern.exec(html)) && scripts < 50) {
-		scripts += 1;
-		const type = readHtmlAttribute(match[1], 'type')?.split(';')[0].trim().toLowerCase();
-		if (type !== 'application/ld+json') continue;
-		const source = match[2]
-			.trim()
-			.replace(/^<!--\s*/, '')
-			.replace(/\s*-->$/, '');
+	let jsonLdScript = false;
+	for (const token of scanHtmlTokens(html)) {
+		if (token.kind === 'tag' && token.name === 'script') {
+			if (token.closing) {
+				jsonLdScript = false;
+			} else if (!token.selfClosing) {
+				scripts += 1;
+				const type = readHtmlAttribute(token.attributes, 'type')
+					?.split(';')[0]
+					.trim()
+					.toLowerCase();
+				jsonLdScript = scripts <= 50 && type === 'application/ld+json';
+			}
+			continue;
+		}
+		if (token.kind !== 'raw-text' || token.tag !== 'script' || !jsonLdScript) continue;
+		const source = trimJsonLdSource(token.text);
 		try {
 			candidates.push(JSON.parse(source));
 		} catch {
@@ -1306,12 +1586,15 @@ function extractJsonLdRecipe(html: string): ImportedRecipeData | undefined {
 
 	const stack = [...candidates];
 	let visited = 0;
+	let enqueued = stack.length;
 	while (stack.length && visited < 10_000) {
 		const value = stack.pop();
 		visited += 1;
 		if (Array.isArray(value)) {
-			for (let index = Math.min(value.length, 10_000) - 1; index >= 0; index -= 1)
+			for (let index = Math.min(value.length, 10_000 - enqueued) - 1; index >= 0; index -= 1) {
 				stack.push(value[index]);
+				enqueued += 1;
+			}
 			continue;
 		}
 		if (!value || typeof value !== 'object') continue;
@@ -1321,10 +1604,29 @@ function extractJsonLdRecipe(html: string): ImportedRecipeData | undefined {
 			if (parsed) return parsed;
 		}
 		for (const child of Object.values(record).slice(0, 100)) {
-			if (child && typeof child === 'object') stack.push(child);
+			if (child && typeof child === 'object' && enqueued < 10_000) {
+				stack.push(child);
+				enqueued += 1;
+			}
 		}
 	}
 	return undefined;
+}
+
+function trimJsonLdSource(source: string) {
+	let start = 0;
+	let end = source.length;
+	while (start < end && isHtmlWhitespace(source.charCodeAt(start))) start += 1;
+	while (end > start && isHtmlWhitespace(source.charCodeAt(end - 1))) end -= 1;
+	if (source.startsWith('<!--', start)) {
+		start += 4;
+		while (start < end && isHtmlWhitespace(source.charCodeAt(start))) start += 1;
+	}
+	if (source.slice(Math.max(start, end - 3), end) === '-->') {
+		end -= 3;
+		while (end > start && isHtmlWhitespace(source.charCodeAt(end - 1))) end -= 1;
+	}
+	return source.slice(start, end);
 }
 
 function isRecipeNode(value: Record<string, unknown>) {
@@ -1387,13 +1689,59 @@ function flattenInstructionText(value: unknown): string[] {
 }
 
 function scalarText(value: unknown): string {
-	if (typeof value === 'string' || typeof value === 'number') return String(value).trim();
-	if (Array.isArray(value)) return value.slice(0, 50).map(scalarText).filter(Boolean).join(', ');
-	if (value && typeof value === 'object') {
-		const record = value as Record<string, unknown>;
-		return scalarText(record.value ?? record.name ?? record.text ?? '');
+	const maxDepth = 32;
+	const maxNodes = 1_000;
+	const maxOutputLength = 20_000;
+	type Task = { kind: 'value'; value: unknown; depth: number } | { kind: 'join'; count: number };
+	const tasks: Task[] = [{ kind: 'value', value, depth: 0 }];
+	const results: string[] = [];
+	let visited = 0;
+	let scheduledValues = 1;
+
+	while (tasks.length) {
+		const task = tasks.pop()!;
+		if (task.kind === 'join') {
+			const values = results.splice(results.length - task.count, task.count);
+			const parts: string[] = [];
+			let length = 0;
+			for (const item of values) {
+				if (!item) continue;
+				const separatorLength = parts.length ? 2 : 0;
+				if (length + separatorLength + item.length > maxOutputLength) return '';
+				length += separatorLength + item.length;
+				parts.push(item);
+			}
+			results.push(parts.join(', '));
+			continue;
+		}
+
+		scheduledValues -= 1;
+		visited += 1;
+		if (visited > maxNodes || task.depth > maxDepth) return '';
+		if (typeof task.value === 'string' || typeof task.value === 'number') {
+			results.push(String(task.value).trim().slice(0, maxOutputLength));
+		} else if (Array.isArray(task.value)) {
+			const values = task.value.slice(0, 50);
+			if (visited + scheduledValues + values.length > maxNodes) return '';
+			tasks.push({ kind: 'join', count: values.length });
+			for (let index = values.length - 1; index >= 0; index -= 1) {
+				tasks.push({ kind: 'value', value: values[index], depth: task.depth + 1 });
+				scheduledValues += 1;
+			}
+		} else if (task.value && typeof task.value === 'object') {
+			const record = task.value as Record<string, unknown>;
+			if (visited + scheduledValues + 1 > maxNodes) return '';
+			tasks.push({
+				kind: 'value',
+				value: record.value ?? record.name ?? record.text ?? '',
+				depth: task.depth + 1
+			});
+			scheduledValues += 1;
+		} else {
+			results.push('');
+		}
 	}
-	return '';
+	return results.length === 1 ? results[0] : '';
 }
 
 function parseRecipeDuration(value: unknown): number | undefined {
@@ -1429,6 +1777,7 @@ function extractImageUrl(value: unknown): string {
 function parseStructuredNutrition(value: unknown): Partial<Recipe['nutrition']> | undefined {
 	if (!value || typeof value !== 'object') return undefined;
 	const source = value as Record<string, unknown>;
+	if (hasUnsupportedNutritionBasis(source)) return undefined;
 	const fieldNames: Record<keyof Recipe['nutrition'], string[]> = {
 		calories: ['calories'],
 		fat: ['fatContent'],
@@ -1444,21 +1793,132 @@ function parseStructuredNutrition(value: unknown): Partial<Recipe['nutrition']> 
 		[keyof Recipe['nutrition'], string[]]
 	>) {
 		const raw = names.map((name) => source[name]).find((item) => item !== undefined);
-		const match = /-?\d+(?:\.\d+)?/.exec(scalarText(raw));
-		if (match) result[field] = Math.max(0, Number(match[0]));
+		const parsed = parseNutritionMeasurement(raw, field);
+		if (parsed !== undefined && parsed <= 1_000_000) result[field] = parsed;
 	}
 	return Object.keys(result).length ? result : undefined;
 }
 
-function canonicalRecipeUrl(html: string, selectedUrl: URL) {
-	const tags = html.matchAll(/<link\b([^>]*)>/gi);
-	for (const tag of tags) {
-		const attributes = tag[1];
-		const rel = readHtmlAttribute(attributes, 'rel')?.toLowerCase().split(/\s+/) ?? [];
-		const href = readHtmlAttribute(attributes, 'href');
+function mergeRecipeNutrition(
+	draft: Recipe['nutrition'],
+	source: Partial<Recipe['nutrition']> | undefined
+): Recipe['nutrition'] {
+	const parsed = NutritionSchema.safeParse({ ...draft, ...source });
+	return parsed.success ? parsed.data : draft;
+}
+
+function hasUnsupportedNutritionBasis(source: Record<string, unknown>): boolean {
+	const servingSize = nutritionRawText(source.servingSize).replace(/[-_]+/g, ' ');
+	const basisText = Object.entries(source)
+		.filter(([key]) => key !== 'servingSize')
+		.map(([, value]) => nutritionRawText(value).replace(/[-_]+/g, ' '))
+		.join(' ');
+	const servingSizePerHundred = /\b(?:per\s*)?100\s*(?:g|grm|grams?|ml|mlt|millilit(?:er|re)s?)\b/i;
+	const perHundredVolumeOrMass =
+		/(?:\bper\s*|\s*\/\s*)100\s*(?:g|grm|grams?|ml|mlt|millilit(?:er|re)s?)\b/i;
+	const unsupportedBasisText = perHundredVolumeOrMass.test(basisText);
+	const wholeRecipeTotal =
+		/\b(?:per\s+(?:(?:whole|entire|full)\s+)?(?:recipe|batch)|(?:whole|entire|full)\s+(?:recipe|batch)|(?:recipe|batch)\s+(?:total|totals)|total\s+(?:for\s+)?(?:the\s+)?(?:recipe|batch)|1\s+(?:whole\s+)?recipe)\b/i;
+	return (
+		servingSizePerHundred.test(servingSize) ||
+		unsupportedBasisText ||
+		wholeRecipeTotal.test(`${servingSize} ${basisText}`)
+	);
+}
+
+function nutritionRawText(value: unknown): string {
+	if (value && typeof value === 'object' && !Array.isArray(value)) {
+		const record = value as Record<string, unknown>;
+		return [
+			scalarText(record.value ?? record.name ?? record.text ?? ''),
+			scalarText(record.unitCode ?? record.unitText ?? record.unitName ?? '')
+		]
+			.filter(Boolean)
+			.join(' ');
+	}
+	return scalarText(value);
+}
+
+function parseNutritionMeasurement(
+	value: unknown,
+	field: keyof Recipe['nutrition']
+): number | undefined {
+	if (value === undefined || value === null) return undefined;
+	const rawText = nutritionRawText(value).trim();
+	if (
+		!rawText ||
+		/(?:\bper\s*|\s*\/\s*)100\s*(?:g|grm|grams?|ml|mlt|millilit(?:er|re)s?)\b/i.test(rawText)
+	)
+		return undefined;
+	const match = /-?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:[.,]\d+)?|[.,]\d+)/.exec(rawText);
+	if (!match) return undefined;
+	const decimalComma = /,\d{1,2}$/.test(match[0]) && !match[0].includes('.');
+	const amount = Number(decimalComma ? match[0].replace(',', '.') : match[0].replace(/,/g, ''));
+	if (!Number.isFinite(amount) || amount < 0) return undefined;
+
+	const record =
+		value && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+	const unitHint = record
+		? scalarText(record.unitCode ?? record.unitText ?? record.unitName ?? '')
+		: '';
+	const unitSource = (unitHint || rawText.slice(match.index + match[0].length))
+		.toLowerCase()
+		.replace(/[()[\],.]/g, ' ')
+		.trim();
+	const unit = unitSource.split(/\s+/)[0] ?? '';
+
+	if (field === 'calories') {
+		if (/^(?:kj|kjo|kilojoules?)$/.test(unit)) return amount / 4.184;
+		if (/^(?:kcal|kcalorie|kcalories|cal|calorie|calories)$/.test(unit)) return amount;
+		if (unit && !/^(?:per|serving|servings)$/.test(unit)) return undefined;
+		return amount;
+	}
+
+	if (field === 'sodium') {
+		if (/^(?:g|grm|gram|grams)$/.test(unit)) return amount * 1_000;
+		if (/^(?:kg|kilogram|kilograms)$/.test(unit)) return amount * 1_000_000;
+		if (/^(?:ug|µg|μg|mcg|microgram|micrograms)$/.test(unit)) return amount / 1_000;
+		if (/^(?:mg|mgm|milligram|milligrams)$/.test(unit)) return amount;
+		if (unit && !/^(?:per|serving|servings)$/.test(unit)) return undefined;
+		return amount;
+	}
+
+	if (/^(?:mg|mgm|milligram|milligrams)$/.test(unit)) return amount / 1_000;
+	if (/^(?:kg|kilogram|kilograms)$/.test(unit)) return amount * 1_000;
+	if (/^(?:ug|µg|μg|mcg|microgram|micrograms)$/.test(unit)) return amount / 1_000_000;
+	if (/^(?:g|grm|gram|grams)$/.test(unit)) return amount;
+	if (unit && !/^(?:per|serving|servings)$/.test(unit)) return undefined;
+	return amount;
+}
+
+function canonicalRecipeUrl(
+	html: string,
+	selectedUrl: URL,
+	validateUrl: (value: string) => URL = validateRecipeUrl,
+	requireSameOrigin = false
+) {
+	const ignoredDepth = new Map<string, number>();
+	for (const token of scanHtmlTokens(html)) {
+		if (token.kind !== 'tag') continue;
+		if (token.name === 'template' || token.name === 'svg' || token.name === 'noscript') {
+			if (token.closing) {
+				const depth = ignoredDepth.get(token.name) ?? 0;
+				if (depth <= 1) ignoredDepth.delete(token.name);
+				else ignoredDepth.set(token.name, depth - 1);
+			} else if (!token.selfClosing) {
+				ignoredDepth.set(token.name, (ignoredDepth.get(token.name) ?? 0) + 1);
+			}
+			continue;
+		}
+		if (ignoredDepth.size || token.closing || token.name !== 'link') continue;
+		const rel = readHtmlAttribute(token.attributes, 'rel')?.toLowerCase().split(/\s+/) ?? [];
+		const href = readHtmlAttribute(token.attributes, 'href');
 		if (!rel.includes('canonical') || !href) continue;
 		try {
-			return validateRecipeUrl(new URL(href.replace(/&amp;/g, '&'), selectedUrl).href).href;
+			const canonical = validateUrl(new URL(href.replace(/&amp;/g, '&'), selectedUrl).href);
+			return requireSameOrigin && canonical.origin !== selectedUrl.origin
+				? selectedUrl.href
+				: canonical.href;
 		} catch {
 			return selectedUrl.href;
 		}
@@ -1467,12 +1927,59 @@ function canonicalRecipeUrl(html: string, selectedUrl: URL) {
 }
 
 function readHtmlAttribute(attributes: string, name: string): string | undefined {
-	const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	const match = new RegExp(
-		`\\b${escapedName}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`,
-		'i'
-	).exec(attributes);
-	return (match?.[1] ?? match?.[2] ?? match?.[3])?.replace(/&amp;/g, '&');
+	const expectedName = name.toLowerCase();
+	let cursor = 0;
+	while (cursor < attributes.length) {
+		while (cursor < attributes.length && isHtmlWhitespace(attributes.charCodeAt(cursor)))
+			cursor += 1;
+		if (attributes[cursor] === '/') {
+			cursor += 1;
+			continue;
+		}
+		const nameStart = cursor;
+		while (
+			cursor < attributes.length &&
+			!isHtmlWhitespace(attributes.charCodeAt(cursor)) &&
+			attributes[cursor] !== '=' &&
+			attributes[cursor] !== '>'
+		) {
+			cursor += 1;
+		}
+		if (cursor === nameStart) {
+			cursor += 1;
+			continue;
+		}
+		const nameMatches =
+			asciiEqualsIgnoreCaseAt(attributes, nameStart, expectedName) &&
+			cursor - nameStart === expectedName.length;
+		while (cursor < attributes.length && isHtmlWhitespace(attributes.charCodeAt(cursor)))
+			cursor += 1;
+		let value = '';
+		if (attributes[cursor] === '=') {
+			cursor += 1;
+			while (cursor < attributes.length && isHtmlWhitespace(attributes.charCodeAt(cursor)))
+				cursor += 1;
+			const quote = attributes[cursor] === '"' || attributes[cursor] === "'";
+			const quoteCharacter = quote ? attributes[cursor++] : '';
+			const valueStart = cursor;
+			if (quote) {
+				while (cursor < attributes.length && attributes[cursor] !== quoteCharacter) cursor += 1;
+				value = attributes.slice(valueStart, cursor);
+				if (attributes[cursor] === quoteCharacter) cursor += 1;
+			} else {
+				while (
+					cursor < attributes.length &&
+					!isHtmlWhitespace(attributes.charCodeAt(cursor)) &&
+					attributes[cursor] !== '>'
+				) {
+					cursor += 1;
+				}
+				value = attributes.slice(valueStart, cursor);
+			}
+		}
+		if (nameMatches) return value.replace(/&amp;/gi, '&');
+	}
+	return undefined;
 }
 
 function safeHttpsUrl(value: string) {
