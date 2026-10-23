@@ -123,13 +123,37 @@ server.mjs                          production Node HTTP entry point
 AI actions require a signed-in Flavorithm account. In **Settings → AI connection**, search providers or model names in one Connection input. ChatGPT subscription appears first before typing; selecting an API provider reveals its key field and a searchable model picker. Supported model-specific reasoning settings appear after model selection. See the [AI connection guide](docs/ai-connections.md).
 
 - **Provider API key (including OpenAI, Anthropic, OpenRouter, Gemini, and compatible models.dev providers):** enter the provider's API key in the current tab. It remains in tab memory and is sent to Flavorithm's server for the requested operation; it is not stored in SQLite or browser `localStorage`. Requests use that provider's API billing. The model list for these connections comes from models.dev.
-- **ChatGPT subscription:** authorize Flavorithm directly with ChatGPT. The app obtains an account model catalog and sends eligible requests to the public OpenAI Responses API using the user's granted plan access. This is separate from an OpenAI API key and its billing. The app never silently falls back to API-key billing when plan access is unavailable. No ChatGPT conversations or memories are imported.
+- **ChatGPT subscription:** authorize Flavorithm directly with ChatGPT. The app obtains an account model catalog and sends eligible requests through the Codex subscription service or, for separately registered Sign in with ChatGPT clients, the public OpenAI Responses API. This is separate from an OpenAI API key and its billing. The app never silently falls back to API-key billing when plan access is unavailable. No ChatGPT conversations or memories are imported.
 
 Recipe generation, nutrition estimates, photo ingredient recognition, and recipe-import drafts support the selected model connection. Vision requests need a model that accepts images. Nutrition values are estimates per serving, including the values in the curated starter recipes. Voice input supports browser dictation, local Whisper, Groq, and Deepgram. Configured transcription records audio in Firefox and other browsers using microphone permission; see [voice setup and provider options](docs/voice-input.md). On Skynet, run `deploy/skynet/setup-whisper.sh` once after deploying to install the private CPU-based Whisper service; the model and service stay off public ports.
 
 ChatGPT subscription connections default to an experimental Codex device-code flow: open ChatGPT, enter the displayed code, then return to Flavorithm and choose a model. Users need no API key, local server, connector download, or terminal. Account credentials stay encrypted on the server. Codex connections use the Codex subscription service, while separately registered Sign in with ChatGPT connections use the public Responses API. Test suites mock provider endpoints; real account consent and a completed live recipe request remain the final access checks. See [ChatGPT connection setup](docs/chatgpt-oauth.md).
 
 Online recipe search is a separate Brave Search integration, configured with `BRAVE_SEARCH_API_KEY`. Search results link to their sources. Recipe capture accepts public HTTPS recipe pages, first reading embedded recipe data and otherwise using readable page text. The server rejects private/local addresses, credentials in URLs, and nonstandard ports; it pins public DNS results, revalidates up to three redirects, and caps pages at 1 MB. Access restrictions, JavaScript-only pages, or missing recipe content can prevent an import; paste the text or add a screenshot instead. The legacy `import` API action retains its original publisher allowlist.
+
+### Optional host-wide ChatGPT connection
+
+An operator can use one Codex device-code connection and model for every signed-in account on a host, including accounts in different households. This is opt-in. Only the explicitly designated host admin sees the sharing controls; household ownership alone does not grant access.
+
+1. Find the trusted user's existing Flavorithm ID in the SQLite `users` table. For a running Docker installation:
+
+   ```sh
+   docker exec -i flavorithm node --input-type=module <<'JS'
+   import { DatabaseSync } from 'node:sqlite';
+   const db = new DatabaseSync(process.env.FLAVORITHM_DB_PATH, { readOnly: true });
+   console.table(db.prepare('SELECT id, name FROM users').all());
+   db.close();
+   JS
+   ```
+
+2. Set `FLAVORITHM_HOST_ADMIN_USER_ID=<existing-user-id>` in the server's private `.env`. Use the Flavorithm user ID from step 1. Set `FLAVORITHM_CHATGPT_AUTH_FLOW=device` if the deployment otherwise uses a registered hosted OAuth client.
+3. Restart the server to load the environment. For Docker, recreate the app container so it receives the new values: `docker compose up -d --no-deps --force-recreate flavorithm`. On Skynet, include `-p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml` with the Compose command, as shown in the [deployment guide](docs/docker-deployment.md).
+4. Sign in as the designated user and open **Settings → AI connection**. Select **ChatGPT subscription**. Reuse an already connected Codex account or click **Continue with ChatGPT**, open the displayed ChatGPT device-login link, enter the one-time code, and finish approval there. Wait for Flavorithm to show **Connected**. A ChatGPT provider preference alone does not mean credentials have been saved; if no account is connected, complete this login first. If a code expires or the server restarts during login, start again with a fresh code.
+5. Choose an available model, then click **Use selected connection for this host** under **Host AI administration**. Confirm that settings show **Host connection enabled** and the chosen model.
+
+While enabled, the server uses this connection and model for recipe generation, nutrition estimates, ingredient recognition, and recipe-import drafts. Other users see **Host ChatGPT connection** without the admin's identity or credentials. Credentials stay encrypted on the server; accounts share the subscription's allowance and limits. Household data stays scoped to its household. Brave recipe search and voice transcription keep their separate configurations.
+
+To stop sharing, the admin can click **Disable host connection**. Disconnecting the backing account or removing/changing `FLAVORITHM_HOST_ADMIN_USER_ID` and restarting also disables sharing. Personal connections are retained. To switch the host account or model, disable sharing, select the desired connected Codex account and model, and enable it again. See [ChatGPT connection setup](docs/chatgpt-oauth.md#optional-host-wide-codex-connection) for storage and authorization details.
 
 ### Import a recipe
 
@@ -172,6 +196,8 @@ Copy `.env.example` to `.env`. No provider key is needed for the basic local app
 | `OPENAI_OAUTH_REDIRECT_URI`           | unset                                                     | Exact hosted callback URI, ending in `/api/connections/chatgpt/callback`.                                                                                                           |
 | `OPENAI_OAUTH_CLIENT_SECRET`          | unset                                                     | Optional secret for an approved confidential OAuth client.                                                                                                                          |
 | `OPENAI_OAUTH_CLIENT_AUTH_METHOD`     | `none` for public; `client_secret_basic` for confidential | Must match the method registered for the hosted OAuth client.                                                                                                                       |
+| `FLAVORITHM_HOST_ADMIN_USER_ID`       | unset                                                     | Exact existing Flavorithm user ID allowed to manage the optional host-wide Codex connection. No default host admin. |
+| `FLAVORITHM_CHATGPT_AUTH_FLOW`        | automatic                                                 | Set `device` to force Codex device-code login, or `local` for same-computer SIWC development. See the [ChatGPT connection guide](docs/chatgpt-oauth.md). |
 | `FLAVORITHM_OAUTH_ENCRYPTION_KEY`     | base64 encoding of exactly 32 random bytes                | Stable hosted key for encrypting OAuth tokens and pending authorizations. Back it up separately from SQLite. Local mode creates an owner-only `oauth.key` file beside the database. |
 | `ADDRESS_HEADER`, `XFF_DEPTH`         | unset                                                     | Optional SvelteKit client-address settings. Configure only behind a trusted proxy that strips incoming forwarded-address headers.                                                   |
 
