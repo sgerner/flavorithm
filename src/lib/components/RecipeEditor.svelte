@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
+	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
@@ -20,6 +22,31 @@
 	);
 	let tagsText = $state(draft.tags.join(', '));
 	let error = $state('');
+	let uploading = $state(false);
+	let photoInput: HTMLInputElement;
+	async function uploadCover(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+		uploading = true;
+		error = '';
+		try {
+			const body = await prepareCover(file);
+			const response = await fetch('/api/recipe-covers', {
+				method: 'POST',
+				headers: { 'Content-Type': 'image/jpeg' },
+				body
+			});
+			const result = await response.json();
+			if (!response.ok) throw new Error(result.error || 'Could not upload the cover photo.');
+			draft.image = result.image;
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not read that photo.';
+		} finally {
+			uploading = false;
+			input.value = '';
+		}
+	}
 	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
 		['calories', 'Calories (kcal)'],
 		['fat', 'Fat (g)'],
@@ -32,6 +59,7 @@
 	];
 	function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
+		if (uploading) return;
 		const tags = [
 			...new Set(
 				tagsText
@@ -47,7 +75,7 @@
 		}));
 		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
 		const image = draft.image.trim();
-		if (image) {
+		if (image && !COVER_PATH.test(image)) {
 			try {
 				const url = new URL(image);
 				if (url.protocol !== 'https:' || url.username || url.password)
@@ -149,14 +177,49 @@
 					>Description<textarea bind:value={draft.description} maxlength="10000" rows="2"
 					></textarea></label
 				>
-				<label class="field full-field"
-					>Image URL<input
-						bind:value={draft.image}
-						maxlength="2000"
-						type="text"
-						placeholder="https://… (optional)"
-					/></label
-				>
+				<div class="full-field cover-picker">
+					<img
+						src={draft.image || recipePlaceholder(draft)}
+						alt="Recipe cover preview"
+						onerror={(event) => recipeImageError(event, draft)}
+					/>
+					<input
+						hidden
+						type="file"
+						accept="image/jpeg,image/png,image/webp"
+						bind:this={photoInput}
+						onchange={uploadCover}
+						disabled={uploading}
+					/>
+					<button
+						type="button"
+						class="secondary"
+						disabled={uploading}
+						onclick={() => photoInput.click()}
+						>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
+					>
+					{#if draft.image}<button
+							type="button"
+							class="text-button"
+							disabled={uploading}
+							onclick={() => {
+								draft.image = '';
+							}}>Remove cover</button
+						>{/if}
+					<p class="muted">
+						JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.
+						Sign-in and an internet connection are required.
+					</p>
+				</div>
+				{#if !COVER_PATH.test(draft.image)}<label class="field full-field"
+						>Image URL<input
+							bind:value={draft.image}
+							maxlength="4000"
+							type="text"
+							placeholder="https://… (optional)"
+							disabled={uploading}
+						/></label
+					>{/if}
 				<label class="field full-field"
 					>Tags<input
 						bind:value={tagsText}
@@ -259,13 +322,26 @@
 			{#if error}<p class="error" role="alert">{error}</p>{/if}
 			<div class="draft-footer">
 				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
-				<button class="primary" type="submit"><Check size={18} />Save changes</button>
+				<button class="primary" type="submit" disabled={uploading}
+					><Check size={18} />Save changes</button
+				>
 			</div>
 		</form>
 	</div>
 </div>
 
 <style>
+	.cover-picker img {
+		width: 100%;
+		height: 180px;
+		object-fit: cover;
+		border-radius: 12px;
+		margin-bottom: 12px;
+	}
+	.cover-picker p {
+		font-size: 13px;
+		margin-top: 10px;
+	}
 	.recipe-editor-dialog .full-field {
 		grid-column: 1 / -1;
 	}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
@@ -57,7 +58,7 @@
 	>
 		<div
 			class="detail-photo"
-			style:background-image={`url(${JSON.stringify(recipe.image || '/recipe-placeholder.svg')})`}
+			style:background-image={`url(${JSON.stringify(recipe.image || recipePlaceholder(recipe))}), url(${JSON.stringify(recipePlaceholder(recipe))})`}
 		>
 			<button class="icon-button close-detail" onclick={close} aria-label="Close recipe"
 				><X size={22} /></button
