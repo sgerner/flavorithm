@@ -982,7 +982,13 @@ function serverCallbackConfiguration(server: ReturnType<typeof createServer>): {
 		: null;
 }
 
-export async function handleHostedChatGPTCallback(url: URL): Promise<Response> {
+export async function handleHostedChatGPTCallback(
+	url: URL,
+	context: { userId: string | null; sessionBinding: string | null }
+): Promise<Response> {
+	if (!context.userId || !context.sessionBinding) {
+		return htmlResponse('Your Flavorithm session could not be verified.', undefined, false, 401);
+	}
 	if (url.href.length > 8_192) {
 		return htmlResponse('This callback request could not be accepted.', undefined, false, 413);
 	}
@@ -1049,6 +1055,9 @@ export async function handleHostedChatGPTCallback(url: URL): Promise<Response> {
 			false,
 			400
 		);
+	}
+	if (pending.userId !== context.userId || pending.sessionBinding !== context.sessionBinding) {
+		return htmlResponse('Your Flavorithm session could not be verified.', undefined, false, 401);
 	}
 	return finishCallback(url, stateHash, pending);
 }

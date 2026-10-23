@@ -50,6 +50,7 @@ db.exec(`
     password_hash TEXT NOT NULL,
     household_id TEXT NOT NULL REFERENCES households(id) ON DELETE RESTRICT,
     email_verified_at INTEGER,
+    sso_only INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS users_household_idx ON users(household_id);
@@ -68,10 +69,34 @@ db.exec(`
   CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    auth_source TEXT NOT NULL DEFAULT 'local',
+    issuer TEXT,
+    subject TEXT,
+    client_id TEXT,
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
   CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
+  CREATE TABLE IF NOT EXISTS external_identities (
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (issuer, subject)
+  );
+  CREATE INDEX IF NOT EXISTS external_identities_user_idx ON external_identities(user_id);
+  CREATE TABLE IF NOT EXISTS oidc_login_transactions (
+    state_hash TEXT PRIMARY KEY,
+    browser_hash TEXT NOT NULL,
+    code_verifier TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    return_to TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS oidc_login_transactions_expiry_idx ON oidc_login_transactions(expires_at);
   CREATE TABLE IF NOT EXISTS password_reset_tokens (
     token_hash TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -120,6 +145,23 @@ db.exec(`
   CREATE UNIQUE INDEX IF NOT EXISTS household_invites_id_idx ON household_invites(invite_id);
 `);
 db.prepare('UPDATE household_invites SET uses_remaining = 1 WHERE uses_remaining > 1').run();
+const userAuthColumns = db.prepare('PRAGMA table_info(users)').all() as Array<{ name: string }>;
+if (!userAuthColumns.some((column) => column.name === 'sso_only')) {
+	db.exec('ALTER TABLE users ADD COLUMN sso_only INTEGER NOT NULL DEFAULT 0');
+}
+const sessionColumns = db.prepare('PRAGMA table_info(sessions)').all() as Array<{ name: string }>;
+if (!sessionColumns.some((column) => column.name === 'auth_source')) {
+	db.exec("ALTER TABLE sessions ADD COLUMN auth_source TEXT NOT NULL DEFAULT 'local'");
+}
+if (!sessionColumns.some((column) => column.name === 'issuer')) {
+	db.exec('ALTER TABLE sessions ADD COLUMN issuer TEXT');
+}
+if (!sessionColumns.some((column) => column.name === 'subject')) {
+	db.exec('ALTER TABLE sessions ADD COLUMN subject TEXT');
+}
+if (!sessionColumns.some((column) => column.name === 'client_id')) {
+	db.exec('ALTER TABLE sessions ADD COLUMN client_id TEXT');
+}
 
 const id = () => randomBytes(16).toString('hex');
 const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
@@ -330,20 +372,96 @@ export function getUserFromSession(token: string | undefined): User | null {
 			`
 			SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
     FROM sessions JOIN users ON users.id = sessions.user_id
-    WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+    WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND sessions.auth_source = 'local'
   `
 		)
 		.get(hashToken(token), now) as DbUserRow | undefined;
 	return row ? toUser(row) : null;
 }
 
+function getUserFromSsoSession(token: string | undefined, source: 'oidc' | 'proxy'): User | null {
+	if (!token || token.length > 200) return null;
+	const now = Date.now();
+	db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+	const row = db
+		.prepare(
+			`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
+			 FROM sessions JOIN users ON users.id = sessions.user_id
+			 WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND sessions.auth_source = ?`
+		)
+		.get(hashToken(token), now, source) as DbUserRow | undefined;
+	return row ? toUser(row) : null;
+}
+
+export function getUserFromOidcSession(
+	token: string | undefined,
+	issuer: string,
+	clientId: string
+): User | null {
+	if (!token || token.length > 200) return null;
+	const now = Date.now();
+	db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+	const row = db
+		.prepare(
+			`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
+			 FROM sessions JOIN users ON users.id = sessions.user_id
+			 WHERE sessions.token_hash = ? AND sessions.expires_at > ?
+			   AND sessions.auth_source = 'oidc' AND sessions.issuer = ? AND sessions.client_id = ?`
+		)
+		.get(hashToken(token), now, issuer, clientId) as DbUserRow | undefined;
+	return row ? toUser(row) : null;
+}
+
 /** Return the stored hash for a live session without exposing its bearer token. */
 export function getSessionBinding(token: string | undefined): string | null {
 	if (!token || token.length > 200) return null;
+	const rawMode = process.env.FLAVORITHM_AUTH_MODE;
+	const configuredMode = rawMode === undefined ? 'local' : rawMode.trim().toLowerCase();
+	const source =
+		configuredMode === 'local'
+			? 'local'
+			: configuredMode === 'oidc'
+				? 'oidc'
+				: configuredMode === 'proxy'
+					? 'proxy'
+					: null;
+	if (!source) return null;
 	const binding = hashToken(token);
-	const row = db
-		.prepare('SELECT 1 AS active FROM sessions WHERE token_hash = ? AND expires_at > ?')
-		.get(binding, Date.now()) as { active: number } | undefined;
+	let oidcIssuer = '';
+	if (source === 'oidc') {
+		try {
+			oidcIssuer = new URL(process.env.FLAVORITHM_OIDC_ISSUER?.trim() ?? '').href;
+		} catch {
+			return null;
+		}
+	}
+	const query =
+		source === 'oidc'
+			? {
+					sql: 'SELECT 1 AS active FROM sessions WHERE token_hash = ? AND expires_at > ? AND auth_source = ? AND issuer = ? AND client_id = ?',
+					parameters: [
+						binding,
+						Date.now(),
+						source,
+						oidcIssuer,
+						process.env.FLAVORITHM_OIDC_CLIENT_ID?.trim() ?? ''
+					]
+				}
+			: source === 'proxy'
+				? {
+						sql: 'SELECT 1 AS active FROM sessions WHERE token_hash = ? AND expires_at > ? AND auth_source = ? AND issuer = ?',
+						parameters: [
+							binding,
+							Date.now(),
+							source,
+							process.env.FLAVORITHM_PROXY_ISSUER?.trim() || 'flavorithm:proxy'
+						]
+					}
+				: {
+						sql: 'SELECT 1 AS active FROM sessions WHERE token_hash = ? AND expires_at > ? AND auth_source = ?',
+						parameters: [binding, Date.now(), source]
+					};
+	const row = db.prepare(query.sql).get(...query.parameters) as { active: number } | undefined;
 	return row ? binding : null;
 }
 
@@ -352,15 +470,140 @@ export function deleteSession(token: string | undefined): void {
 	db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(hashToken(token));
 }
 
-function createSession(user: User): { token: string; expiresAt: number } {
+export function createOidcLoginTransaction(input: {
+	state: string;
+	browserToken: string;
+	codeVerifier: string;
+	nonce: string;
+	returnTo: string;
+	ttlMs?: number;
+}): void {
+	const now = Date.now();
+	db.prepare('DELETE FROM oidc_login_transactions WHERE expires_at <= ?').run(now);
+	db.prepare(
+		`INSERT INTO oidc_login_transactions
+		 (state_hash, browser_hash, code_verifier, nonce, return_to, expires_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`
+	).run(
+		hashToken(input.state),
+		hashToken(input.browserToken),
+		input.codeVerifier,
+		input.nonce,
+		input.returnTo,
+		now + (input.ttlMs ?? 10 * 60 * 1000),
+		now
+	);
+}
+
+export function consumeOidcLoginTransaction(
+	state: string,
+	browserToken: string
+): { codeVerifier: string; nonce: string; returnTo: string } | null {
+	if (state.length > 500 || browserToken.length > 200) return null;
+	const row = db
+		.prepare(
+			`DELETE FROM oidc_login_transactions
+			 WHERE state_hash = ? AND browser_hash = ? AND expires_at > ?
+			 RETURNING code_verifier, nonce, return_to`
+		)
+		.get(hashToken(state), hashToken(browserToken), Date.now()) as
+		{ code_verifier: string; nonce: string; return_to: string } | undefined;
+	return row
+		? { codeVerifier: row.code_verifier, nonce: row.nonce, returnTo: row.return_to }
+		: null;
+}
+
+function createSession(
+	user: User,
+	source: 'local' | 'oidc' | 'proxy' = 'local',
+	issuer?: string,
+	subject?: string,
+	clientId?: string,
+	ttlMs = SESSION_TTL_MS
+): { token: string; expiresAt: number } {
 	const token = randomBytes(32).toString('base64url');
 	const now = Date.now();
-	const expiresAt = now + SESSION_TTL_MS;
+	const expiresAt = now + ttlMs;
 	db.prepare(
-		'INSERT INTO sessions(token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
-	).run(hashToken(token), user.id, expiresAt, now);
+		'INSERT INTO sessions(token_hash, user_id, auth_source, issuer, subject, client_id, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+	).run(
+		hashToken(token),
+		user.id,
+		source,
+		issuer ?? null,
+		subject ?? null,
+		clientId ?? null,
+		expiresAt,
+		now
+	);
 	db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
 	return { token, expiresAt };
+}
+
+export function createOidcSession(
+	user: User,
+	issuer: string,
+	subject: string,
+	clientId: string,
+	ttlMs: number
+): { token: string; expiresAt: number } {
+	return createSession(user, 'oidc', issuer, subject, clientId, ttlMs);
+}
+
+export function ensureProxyBindingSession(
+	currentToken: string | undefined,
+	user: User,
+	issuer: string,
+	subject: string,
+	ttlMs: number
+): { token: string; expiresAt: number } {
+	const now = Date.now();
+	if (currentToken && currentToken.length <= 200) {
+		const tokenHash = hashToken(currentToken);
+		const activeProxyBinding = db
+			.prepare(
+				`SELECT issuer, subject FROM sessions
+				 WHERE token_hash = ? AND auth_source = 'proxy' AND expires_at > ?`
+			)
+			.get(tokenHash, now) as { issuer: string | null; subject: string | null } | undefined;
+		const existing = db
+			.prepare(
+				`SELECT 1 AS active FROM sessions
+				 WHERE token_hash = ? AND user_id = ? AND auth_source = 'proxy'
+				   AND issuer = ? AND subject = ? AND expires_at > ?`
+			)
+			.get(tokenHash, user.id, issuer, subject, now) as { active: number } | undefined;
+		if (existing) {
+			const expiresAt = now + ttlMs;
+			db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?').run(
+				expiresAt,
+				tokenHash
+			);
+			return { token: currentToken, expiresAt };
+		}
+		if (activeProxyBinding) {
+			// Identity changes revoke the previous binding so an outstanding OAuth
+			// callback cannot be completed under a different proxy identity.
+			db.prepare("DELETE FROM sessions WHERE token_hash = ? AND auth_source = 'proxy'").run(
+				tokenHash
+			);
+		}
+	}
+	return createSession(user, 'proxy', issuer, subject, undefined, ttlMs);
+}
+
+export function revokeProxyBindingSession(token: string | undefined): void {
+	if (!token || token.length > 200) return;
+	db.prepare("DELETE FROM sessions WHERE token_hash = ? AND auth_source = 'proxy'").run(
+		hashToken(token)
+	);
+}
+
+export function revokeOidcSession(token: string | undefined): void {
+	if (!token || token.length > 200) return;
+	db.prepare("DELETE FROM sessions WHERE token_hash = ? AND auth_source = 'oidc'").run(
+		hashToken(token)
+	);
 }
 
 async function passwordDigest(password: string): Promise<string> {
@@ -436,6 +679,121 @@ export async function registerUser(
 	}
 }
 
+export function resolveExternalIdentity(input: {
+	issuer: string;
+	subject: string;
+	email: string;
+	name?: string | null;
+	emailVerified: boolean;
+}): User {
+	const issuer = input.issuer.trim();
+	// Provider subjects are opaque identifiers: normalization could merge two accounts.
+	const subject = input.subject;
+	const email = input.email.trim().toLowerCase();
+	const name = (input.name?.trim() || email).slice(0, 80);
+	if (!issuer || issuer.length > 2_000 || !subject || subject.length > 500) {
+		throw new ApiError(401, 'The identity provider returned an invalid identity');
+	}
+	if (email.length > 254 || !z.string().email().safeParse(email).success) {
+		throw new ApiError(401, 'The identity provider did not provide a valid email address');
+	}
+	const now = Date.now();
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		const identity = db
+			.prepare(
+				`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
+				 FROM external_identities JOIN users ON users.id = external_identities.user_id
+				 WHERE external_identities.issuer = ? AND external_identities.subject = ?`
+			)
+			.get(issuer, subject) as DbUserRow | undefined;
+		if (identity) {
+			const collision = db
+				.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id <> ?')
+				.get(email, identity.id) as { id: string } | undefined;
+			if (collision) throw new ApiError(409, 'This identity cannot be linked to the account');
+			const emailChanged = identity.email.toLowerCase() !== email;
+			const emailVerifiedAt = emailChanged
+				? input.emailVerified
+					? now
+					: null
+				: input.emailVerified
+					? (identity.email_verified_at ?? now)
+					: (identity.email_verified_at ?? null);
+			db.prepare('UPDATE users SET name = ?, email = ?, email_verified_at = ? WHERE id = ?').run(
+				name,
+				email,
+				emailVerifiedAt,
+				identity.id
+			);
+			db.prepare(
+				'UPDATE external_identities SET email = ?, updated_at = ? WHERE issuer = ? AND subject = ?'
+			).run(email, now, issuer, subject);
+			const updated = getCurrentUser(identity.id);
+			if (!updated) throw new ApiError(401, 'Authentication required');
+			db.exec('COMMIT');
+			return toUser(updated);
+		}
+
+		// Email is only a profile attribute. It never authorizes linking an external
+		// identity to a pre-existing local account.
+		if (db.prepare('SELECT 1 FROM users WHERE email = ? COLLATE NOCASE').get(email)) {
+			throw new ApiError(409, 'This identity cannot be linked to the account');
+		}
+		const userId = id();
+		const householdId = id();
+		const user = toUser({
+			id: userId,
+			name,
+			email,
+			household_id: householdId,
+			email_verified_at: input.emailVerified ? now : null
+		});
+		const { preferences, ...initialSharedState } = createNewUserState();
+		db.prepare('INSERT INTO households(id, name, owner_id, created_at) VALUES (?, ?, ?, ?)').run(
+			householdId,
+			`${name}’s household`,
+			userId,
+			now
+		);
+		db.prepare(
+			'INSERT INTO users(id, name, email, password_hash, household_id, email_verified_at, sso_only, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)'
+		).run(userId, name, email, '', householdId, user.emailVerified ? now : null, now);
+		db.prepare(
+			'INSERT INTO household_state(household_id, state_json, version, updated_at) VALUES (?, ?, 1, ?)'
+		).run(householdId, JSON.stringify(initialSharedState), now);
+		db.prepare(
+			'INSERT INTO user_preferences(user_id, preferences_json, version, updated_at) VALUES (?, ?, 1, ?)'
+		).run(userId, JSON.stringify(preferences), now);
+		db.prepare(
+			'INSERT INTO external_identities(issuer, subject, user_id, email, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
+		).run(issuer, subject, userId, email, now, now);
+		db.exec('COMMIT');
+		return user;
+	} catch (error) {
+		db.exec('ROLLBACK');
+		if (String(error).includes('UNIQUE constraint failed: users.email')) {
+			throw new ApiError(409, 'This identity cannot be linked to the account');
+		}
+		if (
+			String(error).includes(
+				'UNIQUE constraint failed: external_identities.issuer, external_identities.subject'
+			)
+		) {
+			// A concurrent request may have created the same identity between lookup and insert.
+			const existing = db
+				.prepare(
+					`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
+					 FROM external_identities JOIN users ON users.id = external_identities.user_id
+					 WHERE external_identities.issuer = ? AND external_identities.subject = ?`
+				)
+				.get(issuer, subject) as DbUserRow | undefined;
+			if (existing) return toUser(existing);
+		}
+		throw error;
+	}
+}
+
 export async function loginUser(
 	rawEmail: string,
 	password: string
@@ -443,16 +801,17 @@ export async function loginUser(
 	const email = rawEmail.trim().toLowerCase();
 	const row = db
 		.prepare(
-			'SELECT id, name, email, household_id, email_verified_at, password_hash FROM users WHERE email = ?'
+			'SELECT id, name, email, household_id, email_verified_at, password_hash, sso_only FROM users WHERE email = ?'
 		)
-		.get(email) as (DbUserRow & { password_hash: string }) | undefined;
+		.get(email) as (DbUserRow & { password_hash: string; sso_only: number }) | undefined;
 	// Use a fixed dummy digest for unknown accounts to reduce account-enumeration timing differences.
 	const valid = await verifyPassword(
 		password,
-		row?.password_hash ??
-			'scrypt$16384$8$1$MDEyMzQ1Njc4OWFiY2RlZg$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+		row && !row.sso_only
+			? row.password_hash
+			: 'scrypt$16384$8$1$MDEyMzQ1Njc4OWFiY2RlZg$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
 	);
-	if (!row || !valid) throw new ApiError(401, 'Invalid email or password');
+	if (!row || row.sso_only || !valid) throw new ApiError(401, 'Invalid email or password');
 	const user = toUser(row);
 	const session = createSession(user);
 	return { user, ...session };
@@ -506,9 +865,9 @@ export function issuePasswordReset(emailInput: string): { email: string; token: 
 	db.exec('BEGIN IMMEDIATE');
 	try {
 		db.prepare('DELETE FROM password_reset_tokens WHERE expires_at <= ?').run(now);
-		const user = db.prepare('SELECT id, email FROM users WHERE email = ?').get(email) as
-			{ id: string; email: string } | undefined;
-		if (!user) {
+		const user = db.prepare('SELECT id, email, sso_only FROM users WHERE email = ?').get(email) as
+			{ id: string; email: string; sso_only: number } | undefined;
+		if (!user || user.sso_only) {
 			db.exec('COMMIT');
 			return null;
 		}
@@ -531,9 +890,14 @@ export async function resetUserPassword(token: string, password: string): Promis
 	const tokenHash = hashToken(token);
 	const now = Date.now();
 	const existing = db
-		.prepare('SELECT user_id FROM password_reset_tokens WHERE token_hash = ? AND expires_at > ?')
-		.get(tokenHash, now) as { user_id: string } | undefined;
-	if (!existing) throw new ApiError(400, 'Reset link is invalid or expired. Request a new one.');
+		.prepare(
+			`SELECT password_reset_tokens.user_id, users.sso_only
+			 FROM password_reset_tokens JOIN users ON users.id = password_reset_tokens.user_id
+			 WHERE password_reset_tokens.token_hash = ? AND password_reset_tokens.expires_at > ?`
+		)
+		.get(tokenHash, now) as { user_id: string; sso_only: number } | undefined;
+	if (!existing || existing.sso_only)
+		throw new ApiError(400, 'Reset link is invalid or expired. Request a new one.');
 	const passwordHash = await passwordDigest(password);
 
 	db.exec('BEGIN IMMEDIATE');

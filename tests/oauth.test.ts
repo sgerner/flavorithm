@@ -424,10 +424,11 @@ test('hosted OAuth uses the exact configured callback and encrypted server crede
 		const callback = new URL(process.env.OPENAI_OAUTH_REDIRECT_URI);
 		callback.searchParams.set('code', code);
 		callback.searchParams.set('state', authorizationUrl.searchParams.get('state')!);
-		const result = await oauth.handleHostedChatGPTCallback(callback);
+		const context = { userId: user.user.id, sessionBinding: binding };
+		const result = await oauth.handleHostedChatGPTCallback(callback, context);
 		assert.equal(result.status, 200);
 		assert.match(await result.text(), /Your ChatGPT account is connected/);
-		const replay = await oauth.handleHostedChatGPTCallback(callback);
+		const replay = await oauth.handleHostedChatGPTCallback(callback, context);
 		assert.equal(replay.status, 400);
 		const account = oauth.listChatGPTAccounts(user.user.id)[0];
 		assert.ok(account);
@@ -447,6 +448,32 @@ test('hosted OAuth uses the exact configured callback and encrypted server crede
 			'access-flavorithm-hosted-client'
 		);
 
+		// A still-active initiating session does not authorize a different browser account
+		// or a replacement session to finish this connection (including an upstream SSO switch).
+		for (const otherContext of [
+			{ userId: 'another-user', sessionBinding: binding },
+			{ userId: user.user.id, sessionBinding: 'another-session-binding' },
+			{ userId: null, sessionBinding: null }
+		]) {
+			const attempt = await oauth.startChatGPTOAuth({
+				userId: user.user.id,
+				sessionBinding: binding,
+				appUrl,
+				mode: 'hosted'
+			});
+			const switchedCallback: URL = new URL(process.env.OPENAI_OAUTH_REDIRECT_URI!);
+			switchedCallback.searchParams.set(
+				'state',
+				new URL(attempt.authorizationUrl).searchParams.get('state')!
+			);
+			switchedCallback.searchParams.set('code', 'must-not-be-exchanged');
+			assert.equal(
+				(await oauth.handleHostedChatGPTCallback(switchedCallback, otherContext)).status,
+				401
+			);
+			assert.equal(oauth.listChatGPTAccounts(user.user.id).length, 1);
+		}
+
 		const expiredStart = await oauth.startChatGPTOAuth({
 			userId: user.user.id,
 			sessionBinding: binding,
@@ -462,7 +489,7 @@ test('hosted OAuth uses the exact configured callback and encrypted server crede
 			.run(Date.now() - 1, expiredHash);
 		const expiredCallback = new URL(process.env.OPENAI_OAUTH_REDIRECT_URI);
 		expiredCallback.searchParams.set('state', expiredState);
-		const expired = await oauth.handleHostedChatGPTCallback(expiredCallback);
+		const expired = await oauth.handleHostedChatGPTCallback(expiredCallback, context);
 		assert.equal(expired.status, 400);
 		assert.equal(
 			backend

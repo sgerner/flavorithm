@@ -18,6 +18,32 @@ not prove that an external provider will accept a request.
   second use is rejected. Repeat for password recovery; verify the old password
   and old sessions no longer work after reset. Do not commit delivery credentials.
 
+## Sign-in and identity
+
+- Choose `local`, `oidc`, or `proxy` through `FLAVORITHM_AUTH_MODE`. The app
+  does not offer users an authentication-mode switch. In OIDC or proxy mode,
+  sign in with a new test identity and confirm its passwordless account and
+  starter kitchen are created on first successful authentication.
+- For OIDC, check the public `ORIGIN`, issuer, client ID, client secret when
+  applicable, and exact `${ORIGIN}/auth/callback` registration. Sign in and
+  sign out through the public HTTPS URL. Confirm the app session ends, and
+  confirm whether the provider keeps its own browser session as expected.
+  Test an existing local account with the same email; the OIDC identity must
+  not gain access to or merge with that account.
+- For proxy mode, confirm the Flavorithm upstream is reachable only through
+  the trusted proxy, the proxy overwrites identity headers, and it injects the
+  configured shared-secret header. Try direct requests with a missing or wrong
+  secret and with client-supplied identity headers; they must not authenticate.
+  Configure `FLAVORITHM_PROXY_LOGOUT_URL` for the gateway sign-out endpoint,
+  then test that using Flavorithm's sign-out action ends the gateway session.
+- For Skynet, verify that Authentik has a `Flavorithm` application assigned to
+  the embedded proxy outpost, `eat.stevengerner.com` resolves to the host, and
+  Caddy routes both app traffic and the Authentik outpost path. From a signed-
+  out browser, visiting the public URL should go straight to Authentik and
+  create the account after a successful sign-in.
+- If users authenticate to an upstream SAML-only identity provider, verify the
+  OIDC broker separately. Flavorithm's direct SSO integration uses OIDC.
+
 ## Connected features
 
 - Configure `BRAVE_SEARCH_API_KEY`, search for a recipe, import a public link,

@@ -4,6 +4,7 @@ declare global {
 	namespace App {
 		interface Locals {
 			user: User | null;
+			authMode: 'local' | 'oidc' | 'proxy' | 'invalid';
 		}
 	}
 }

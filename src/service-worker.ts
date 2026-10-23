@@ -9,8 +9,8 @@ const origin = worker.location.origin;
 const offlineUrl = new URL(resolve('/'), origin).href;
 const apiPath = new URL(resolve('/api'), origin).pathname.replace(/\/$/, '');
 
-// Manifest paths are relative to SvelteKit's base path. Use resolve for build
-// output and routes, and asset for files from the static assets directory.
+// Navigation HTML can contain an authenticated identity, including when identity is supplied by a
+// reverse proxy rather than a browser cookie. Keep only static assets in Cache Storage.
 const staticUrls = new Set(
 	[
 		...immutable.map(({ path }) => toUrl(resolve(path.replace(/^\/+/, '')))),
@@ -28,48 +28,119 @@ function isApiUrl(url: URL): boolean {
 	return pathname === apiPath || pathname.startsWith(`${apiPath}/`);
 }
 
-function hasCredentialHeaders(request: Request): boolean {
-	return (
-		request.headers.has('authorization') ||
-		request.headers.has('cookie') ||
-		request.headers.has('x-api-key')
+function cacheKey(url: string): Request {
+	// Network fetches may need the same-origin session for an authenticated reverse proxy. The
+	// cache key itself never carries cookies, authorization, or other request credentials.
+	return new Request(url, { credentials: 'omit' });
+}
+
+function authMode(response: Response): Promise<string | null> {
+	return response
+		.clone()
+		.json()
+		.then((body) => (typeof body?.authMode === 'string' ? body.authMode : null))
+		.catch(() => null);
+}
+
+async function clearOfflineShell(): Promise<void> {
+	const cache = await caches.open(cacheName);
+	await cache.delete(cacheKey(offlineUrl));
+}
+
+function isCacheableStaticResponse(response: Response, expectedUrl: string): boolean {
+	if (!response.ok || response.type === 'opaque' || response.redirected) return false;
+	const responseUrl = response.url ? new URL(response.url) : new URL(expectedUrl);
+	if (responseUrl.origin !== origin) return false;
+	if (response.headers.has('set-cookie')) return false;
+	const vary = response.headers.get('vary')?.toLowerCase() || '';
+	if (vary.split(',').some((value) => ['cookie', 'authorization'].includes(value.trim())))
+		return false;
+	const cacheControl = response.headers.get('cache-control')?.toLowerCase() || '';
+	if (/\b(private|no-store)\b/.test(cacheControl)) return false;
+	const contentType = response.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase();
+	return Boolean(
+		contentType &&
+		(contentType === 'text/css' ||
+			contentType === 'text/javascript' ||
+			contentType === 'application/javascript' ||
+			contentType === 'application/ecmascript' ||
+			contentType === 'text/ecmascript' ||
+			contentType === 'application/wasm' ||
+			contentType.startsWith('image/') ||
+			contentType.startsWith('font/') ||
+			contentType.startsWith('application/font-') ||
+			contentType === 'application/vnd.ms-fontobject')
 	);
 }
 
-function isPublicCacheableRequest(request: Request, url: URL): boolean {
-	return (
-		request.method === 'GET' &&
-		url.origin === origin &&
-		!isApiUrl(url) &&
-		!url.search &&
-		request.credentials === 'omit' &&
-		!hasCredentialHeaders(request)
+function isCacheableLocalShell(response: Response, expectedUrl: string): boolean {
+	if (
+		!response.ok ||
+		response.type === 'opaque' ||
+		response.redirected ||
+		(response.url && new URL(response.url).origin !== origin) ||
+		response.headers.get('x-flavorithm-auth-mode') !== 'local' ||
+		!response.headers.get('content-type')?.includes('text/html') ||
+		response.headers.has('set-cookie')
+	) {
+		return false;
+	}
+	const vary = response.headers.get('vary')?.toLowerCase() || '';
+	if (vary.split(',').some((value) => ['cookie', 'authorization'].includes(value.trim())))
+		return false;
+	const cacheControl = response.headers.get('cache-control')?.toLowerCase() || '';
+	return !/\b(private|no-store)\b/.test(cacheControl) && new URL(expectedUrl).origin === origin;
+}
+
+async function fetchAndCacheStatic(url: string): Promise<Response> {
+	const response = await fetch(new Request(url, { credentials: 'same-origin', cache: 'no-store' }));
+	if (isCacheableStaticResponse(response, url)) {
+		const cache = await caches.open(cacheName);
+		await cache.put(cacheKey(url), response.clone());
+	}
+	return response;
+}
+
+async function cacheLocalOfflineShell(): Promise<void> {
+	const authResponse = await fetch(
+		new Request(new URL(resolve('/api/auth'), origin).href, {
+			credentials: 'same-origin',
+			cache: 'no-store'
+		})
+	);
+	if (!authResponse.ok || (await authMode(authResponse)) !== 'local') return;
+	const response = await fetch(new Request(offlineUrl, { credentials: 'omit', cache: 'no-store' }));
+	if (
+		!response.ok ||
+		response.type === 'opaque' ||
+		response.redirected ||
+		(response.url && new URL(response.url).origin !== origin) ||
+		!isCacheableLocalShell(response, offlineUrl)
+	) {
+		return;
+	}
+	const cache = await caches.open(cacheName);
+	await cache.put(cacheKey(offlineUrl), response);
+}
+
+function offlineResponse(): Response {
+	return new Response(
+		'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Flavorithm is offline</title><body style="font:16px system-ui,sans-serif;max-width:36rem;margin:12vh auto;padding:1.5rem;color:#253b31"><h1>You’re offline</h1><p>Reconnect to verify your session and load your kitchen.</p></body></html>',
+		{
+			headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+			status: 503
+		}
 	);
 }
 
 worker.addEventListener('install', (event: ExtendableEvent) => {
 	event.waitUntil(
 		(async () => {
-			const cache = await caches.open(cacheName);
-			const staticRequests = [...staticUrls].map(
-				(url) => new Request(url, { credentials: 'omit' })
-			);
-			await cache.addAll(staticRequests);
-
-			// Store only a credential-free app shell for offline navigation fallback.
+			await Promise.allSettled([...staticUrls].map((url) => fetchAndCacheStatic(url)));
 			try {
-				const response = await fetch(
-					new Request(offlineUrl, { credentials: 'omit', cache: 'no-store' })
-				);
-				if (
-					response.ok &&
-					response.type !== 'opaque' &&
-					response.headers.get('content-type')?.includes('text/html')
-				) {
-					await cache.put(offlineUrl, response);
-				}
+				await cacheLocalOfflineShell();
 			} catch {
-				// Static assets remain available if installation happens without a connection.
+				// The public shell is optional. Authenticated HTML is never cached as a fallback.
 			}
 			await worker.skipWaiting();
 		})()
@@ -93,46 +164,59 @@ worker.addEventListener('activate', (event: ExtendableEvent) => {
 worker.addEventListener('fetch', (event: FetchEvent) => {
 	const { request } = event;
 	const url = new URL(request.url);
-	if (request.method !== 'GET' || url.origin !== origin || isApiUrl(url)) return;
+	if (request.method !== 'GET' || url.origin !== origin) return;
+	if (url.pathname === `${apiPath}/auth`) {
+		event.respondWith(
+			(async () => {
+				const response = await fetch(request);
+				if ((await authMode(response)) !== 'local') await clearOfflineShell();
+				return response;
+			})()
+		);
+		return;
+	}
+	if (isApiUrl(url)) return;
 
 	if (request.mode === 'navigate') {
 		event.respondWith(
 			(async () => {
 				try {
 					const response = await fetch(request);
-					if (response.ok && isPublicCacheableRequest(request, url) && response.type !== 'opaque') {
+					const mode = response.headers.get('x-flavorithm-auth-mode');
+					if (mode && mode !== 'local') await clearOfflineShell();
+					if (response.redirected || (response.url && new URL(response.url).origin !== origin)) {
+						await clearOfflineShell();
+					}
+					if (
+						mode === 'local' &&
+						request.credentials === 'omit' &&
+						!request.headers.has('authorization') &&
+						isCacheableLocalShell(response, url.href)
+					) {
 						const cache = await caches.open(cacheName);
-						await cache.put(request, response.clone());
+						await cache.put(cacheKey(request.url), response.clone());
 					}
 					return response;
 				} catch {
 					const cache = await caches.open(cacheName);
-					return (
-						(await cache.match(request)) ??
-						(await cache.match(offlineUrl)) ??
-						new Response(
-							'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Flavorithm is offline</title><body style="font:16px system-ui,sans-serif;max-width:36rem;margin:12vh auto;padding:1.5rem;color:#253b31"><h1>You’re offline</h1><p>Reconnect to load this page. Your pantry and recipes saved on this device are still available when the app shell loads.</p></body></html>',
-							{ headers: { 'Content-Type': 'text/html; charset=utf-8' }, status: 503 }
-						)
-					);
+					const shell = await cache.match(cacheKey(offlineUrl));
+					if (shell?.headers.get('x-flavorithm-auth-mode') === 'local') return shell;
+					return offlineResponse();
 				}
 			})()
 		);
 		return;
 	}
 
-	if (staticUrls.has(url.href)) {
-		event.respondWith(
-			(async () => {
+	if (!staticUrls.has(url.href)) return;
+	event.respondWith(
+		(async () => {
+			try {
+				return await fetchAndCacheStatic(url.href);
+			} catch {
 				const cache = await caches.open(cacheName);
-				const cached = await cache.match(url.href);
-				if (cached) return cached;
-				const response = await fetch(new Request(request, { credentials: 'omit' }));
-				if (response.ok && !hasCredentialHeaders(request) && response.type !== 'opaque') {
-					await cache.put(url.href, response.clone());
-				}
-				return response;
-			})()
-		);
-	}
+				return (await cache.match(cacheKey(url.href))) ?? new Response(null, { status: 504 });
+			}
+		})()
+	);
 });

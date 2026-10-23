@@ -1,5 +1,5 @@
 import type { RequestHandler } from './$types';
-import { ApiError, consumeRateLimit } from '#lib/server/db.ts';
+import { ApiError, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
 import { ChatGPTOAuthError, handleHostedChatGPTCallback } from '#lib/server/chatgpt-oauth.ts';
 
 export const GET: RequestHandler = async (event) => {
@@ -14,7 +14,10 @@ export const GET: RequestHandler = async (event) => {
 			});
 		}
 		consumeRateLimit(`chatgpt-oauth-callback:${address}`, 30, 15 * 60 * 1000);
-		return await handleHostedChatGPTCallback(event.url);
+		return await handleHostedChatGPTCallback(event.url, {
+			userId: event.locals.user?.id ?? null,
+			sessionBinding: getSessionBinding(event.cookies.get('flavorithm_session'))
+		});
 	} catch (error) {
 		if (error instanceof ApiError) {
 			return new Response('ChatGPT callback could not be accepted.', {

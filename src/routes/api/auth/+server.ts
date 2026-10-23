@@ -18,6 +18,7 @@ import {
 	sendPasswordResetEmail,
 	verifyEmailToken
 } from '#lib/server/db.ts';
+import { getAuthMetadata, getAuthMode } from '#lib/server/sso.ts';
 
 const authActionSchema = z.discriminatedUnion('action', [
 	z.object({
@@ -84,8 +85,11 @@ function setSessionCookie(
 }
 
 export const GET: RequestHandler = async ({ locals }) => {
+	const authMode = locals.authMode ?? getAuthMode() ?? 'invalid';
+	const authMetadata = getAuthMetadata(authMode);
 	return json({
 		user: locals.user,
+		...authMetadata,
 		capabilities: {
 			emailDelivery: Boolean(process.env.RESEND_API_KEY?.trim() && process.env.EMAIL_FROM?.trim()),
 			recipeSearch: Boolean(process.env.BRAVE_SEARCH_API_KEY?.trim())
@@ -96,13 +100,16 @@ export const GET: RequestHandler = async ({ locals }) => {
 export const POST: RequestHandler = async (event) => {
 	try {
 		assertSameOrigin(event.request);
+		const authMode = event.locals.authMode ?? getAuthMode() ?? 'invalid';
+		if (authMode !== 'local') {
+			throw new ApiError(403, 'Local password authentication is disabled for this installation.');
+		}
 		const ip = event.getClientAddress();
 		consumeRateLimit(`auth-ip:${ip}`, 20, 15 * 60 * 1000);
 		const parsed = authActionSchema.safeParse(await readJson(event.request));
 		if (!parsed.success)
 			throw new ApiError(400, 'Please provide a valid auth action, email and password');
 		const payload = parsed.data;
-
 		if (payload.action === 'logout') {
 			deleteSession(event.cookies.get('flavorithm_session'));
 			event.cookies.delete('flavorithm_session', { path: '/' });
