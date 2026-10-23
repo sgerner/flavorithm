@@ -37,6 +37,14 @@ The paired images below show desktop and phone layouts; phone captures use a 390
 
 A new guest kitchen starts with eight curated recipes, a sample pantry, and three planned meals. A newly registered account starts with the same recipe collection and an empty pantry, plan, and shopping list. Guest edits live in browser `localStorage`; accounts sync kitchen state through the server. Household changes synchronize through requests with version checks. This is not a live collaborative editor.
 
+## Basil, your kitchen butler
+
+The optional **Ask Basil** chat opens alongside the usual screens. Basil is a traditional English butler with firm culinary opinions, impeccable manners, and a barely concealed conviction that he runs the household. Ask him to build or critique a recipe, plan the week, use expiring ingredients, manage groceries, or change your cooking preferences.
+
+His retro pixel portrait blinks, raises an eyebrow, ponders requests, and flaps its moustache as replies arrive. These are visual reactions, not spoken audio; reduced-motion preferences disable the animation.
+
+Chat uses your existing AI connection and requires sign-in. Basil receives the current kitchen and recent conversation; API keys and account credentials are not included in his kitchen context. Responses can contain proposed changes: review them and choose **Apply** to update the same kitchen used by the regular screens. Settings, imports, voice capture, account, and household tasks open the existing controls. Sensitive account operations retain their normal confirmation flows. Conversation stays in memory for the current account and is cleared when the account changes or the page reloads.
+
 ## Run locally
 
 Requirements: Node.js 24 or newer and npm. Flavorithm uses Node's built-in `node:sqlite` module.
@@ -196,8 +204,8 @@ Copy `.env.example` to `.env`. No provider key is needed for the basic local app
 | `OPENAI_OAUTH_REDIRECT_URI`           | unset                                                     | Exact hosted callback URI, ending in `/api/connections/chatgpt/callback`.                                                                                                           |
 | `OPENAI_OAUTH_CLIENT_SECRET`          | unset                                                     | Optional secret for an approved confidential OAuth client.                                                                                                                          |
 | `OPENAI_OAUTH_CLIENT_AUTH_METHOD`     | `none` for public; `client_secret_basic` for confidential | Must match the method registered for the hosted OAuth client.                                                                                                                       |
-| `FLAVORITHM_HOST_ADMIN_USER_ID`       | unset                                                     | Exact existing Flavorithm user ID allowed to manage the optional host-wide Codex connection. No default host admin. |
-| `FLAVORITHM_CHATGPT_AUTH_FLOW`        | automatic                                                 | Set `device` to force Codex device-code login, or `local` for same-computer SIWC development. See the [ChatGPT connection guide](docs/chatgpt-oauth.md). |
+| `FLAVORITHM_HOST_ADMIN_USER_ID`       | unset                                                     | Exact existing Flavorithm user ID allowed to manage the optional host-wide Codex connection. No default host admin.                                                                 |
+| `FLAVORITHM_CHATGPT_AUTH_FLOW`        | automatic                                                 | Set `device` to force Codex device-code login, or `local` for same-computer SIWC development. See the [ChatGPT connection guide](docs/chatgpt-oauth.md).                            |
 | `FLAVORITHM_OAUTH_ENCRYPTION_KEY`     | base64 encoding of exactly 32 random bytes                | Stable hosted key for encrypting OAuth tokens and pending authorizations. Back it up separately from SQLite. Local mode creates an owner-only `oauth.key` file beside the database. |
 | `ADDRESS_HEADER`, `XFF_DEPTH`         | unset                                                     | Optional SvelteKit client-address settings. Configure only behind a trusted proxy that strips incoming forwarded-address headers.                                                   |
 
