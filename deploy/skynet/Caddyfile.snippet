@@ -1,0 +1,15 @@
+eat.{$DOMAIN} {
+	route {
+		reverse_proxy /outpost.goauthentik.io/* authentik-server-1:9000
+
+		forward_auth authentik-server-1:9000 {
+			uri /outpost.goauthentik.io/auth/caddy
+			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Proto https
+			copy_headers X-Authentik-Email X-Authentik-Name X-Authentik-Uid
+		}
+
+		request_header X-Flavorithm-Proxy-Secret {env.FLAVORITHM_PROXY_SHARED_SECRET}
+		reverse_proxy flavorithm:3000
+	}
+}

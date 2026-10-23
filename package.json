@@ -1,7 +1,7 @@
 {
 	"name": "flavorithm",
 	"version": "1.0.0",
-	"description": "Flavorithm \u2014 Where flavor meets algorithms. Your thoughtful kitchen companion.",
+	"description": "Flavorithm — Where flavor meets algorithms. Your thoughtful kitchen companion.",
 	"scripts": {
 		"dev": "node --env-file-if-exists=.env node_modules/vite/bin/vite.js dev",
 		"build": "vite build",
@@ -12,6 +12,7 @@
 		"seed:dev": "node --experimental-strip-types scripts/seed-dev.mjs",
 		"format": "prettier --write .",
 		"test:smoke": "node scripts/smoke-test.mjs",
+		"test:sso": "node scripts/sso-smoke-test.mjs",
 		"readiness": "node --env-file-if-exists=.env scripts/readiness.mjs"
 	},
 	"keywords": [],
@@ -25,6 +26,7 @@
 		"@sveltejs/vite-plugin-svelte": "^7.3.1",
 		"@tailwindcss/vite": "^4.3.3",
 		"jose": "^6.2.13",
+		"openid-client": "^6.8.8",
 		"svelte": "^5.57.2",
 		"tailwindcss": "^4.3.3",
 		"typescript": "^6.0.3",

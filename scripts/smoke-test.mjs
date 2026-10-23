@@ -12,6 +12,7 @@ const server = spawn(process.execPath, ['server.mjs'], {
 		PORT: '5187',
 		ORIGIN: origin,
 		FLAVORITHM_DB_PATH: ':memory:',
+		FLAVORITHM_AUTH_MODE: 'local',
 		RESEND_API_KEY: '',
 		BRAVE_SEARCH_API_KEY: ''
 	},

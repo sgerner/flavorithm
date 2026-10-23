@@ -1,0 +1,30 @@
+services:
+  flavorithm:
+    ports: !reset []
+    volumes:
+      - /home/skynet/opt/appdata/flavorithm:/app/data
+    networks:
+      - proxy
+
+  flavorithm-updater:
+    image: docker:cli
+    container_name: flavorithm-updater
+    restart: unless-stopped
+    working_dir: /app
+    command: ["/bin/sh", "/app/deploy/skynet/update.sh"]
+    environment:
+      FLAVORITHM_UPDATE_INTERVAL_SECONDS: ${FLAVORITHM_UPDATE_INTERVAL_SECONDS:-900}
+      FLAVORITHM_UPDATE_COMMAND_TIMEOUT_SECONDS: ${FLAVORITHM_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}
+      FLAVORITHM_UPDATE_BRANCH: ${FLAVORITHM_UPDATE_BRANCH:-main}
+      FLAVORITHM_UPDATE_REPO_URL: ${FLAVORITHM_UPDATE_REPO_URL:-https://github.com/sgerner/flavorithm.git}
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /home/skynet/opt/appdata/flavorithm-updater:/state
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      diun.enable: "false"
+
+networks:
+  proxy:
+    external: true

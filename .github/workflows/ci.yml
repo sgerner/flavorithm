@@ -27,5 +27,9 @@ jobs:
         run: npm test
       - name: Build production app
         run: npm run build
+      - name: Build production container
+        run: docker build --tag flavorithm:ci .
       - name: Smoke-test production server
         run: npm run test:smoke
+      - name: Smoke-test SSO proxy authentication
+        run: npm run test:sso

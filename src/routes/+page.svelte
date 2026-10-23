@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, tick } from 'svelte';
+	import type { PageData } from './$types';
 	import { focusTrap } from '#lib/focus.ts';
 	import {
 		backdropMotion,
@@ -58,9 +59,20 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
+	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
+	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
 	let user = $state<User | null>(null);
 	let ready = $state(false);
+	let kitchenLoaded = $state(false);
+	let runtimeAuthMode = $state<AuthMode | null>(null);
+	let installationAuthMode = $derived(runtimeAuthMode ?? data.authMode);
+	let managedAuth = $derived(installationAuthMode !== 'local');
+	let authMetadataLoaded = $state(false);
+	let runtimeLoginUrl = $state<string | null>(null);
+	let runtimeLogoutUrl = $state<string | null>(null);
+	let providerLoginUrl = $derived(authMetadataLoaded ? runtimeLoginUrl : data.loginUrl);
+	let providerLogoutUrl = $derived(authMetadataLoaded ? runtimeLogoutUrl : data.logoutUrl);
 	let online = $state(true);
 	let pendingSync = $state(false);
 	let sendingSync = $state(false);
@@ -96,6 +108,55 @@
 		quizDiet = kitchen.preferences.diet;
 		quizAllergies = kitchen.preferences.allergies;
 		modal = 'onboarding';
+	}
+	function openAuthentication() {
+		if (installationAuthMode === 'oidc') {
+			window.location.assign(providerLoginUrl ?? '/auth/login');
+			return;
+		}
+		if (installationAuthMode === 'proxy') {
+			window.location.reload();
+			return;
+		}
+		if (installationAuthMode === 'invalid') {
+			notify('Sign-in is unavailable because authentication is misconfigured.');
+			return;
+		}
+		modal = 'auth';
+	}
+	function clearManagedIdentity() {
+		kitchenSync?.clearContext();
+		user = null;
+		kitchen = createInitialState();
+		kitchenLoaded = false;
+		showStarter = false;
+		stateEtag = null;
+		localStorage.removeItem('flavorithm-last-account');
+		localStorage.removeItem('flavorithm-kitchen');
+		members = [];
+		householdInvites = [];
+		canManageHousehold = false;
+		inviteCode = '';
+		currentInviteId = '';
+		joinCode = '';
+	}
+	function renewManagedSession(error: unknown) {
+		if (!navigator.onLine || (error as { status?: number })?.status !== 401) return;
+		if (installationAuthMode === 'oidc') window.location.assign('/auth/login');
+		else if (installationAuthMode === 'proxy') window.location.reload();
+	}
+	function updateAuthMetadata(data: Record<string, unknown>) {
+		if (
+			data.authMode === 'local' ||
+			data.authMode === 'oidc' ||
+			data.authMode === 'proxy' ||
+			data.authMode === 'invalid'
+		) {
+			runtimeAuthMode = data.authMode;
+		}
+		runtimeLoginUrl = typeof data.loginUrl === 'string' ? data.loginUrl : null;
+		runtimeLogoutUrl = typeof data.logoutUrl === 'string' ? data.logoutUrl : null;
+		authMetadataLoaded = 'loginUrl' in data && 'logoutUrl' in data;
 	}
 	function dismissOnboarding() {
 		if (!kitchen.preferences.onboardingStatus) kitchen.preferences.onboardingStatus = 'skipped';
@@ -187,17 +248,34 @@
 	let deferredInstall = $state<any>(null);
 	async function refreshAuth() {
 		const data = await request('/api/auth');
-		const changedIdentity =
-			user && (user.id !== data.user?.id || user.householdId !== data.user?.householdId);
+		const previousMode = installationAuthMode;
+		const previousUser = user;
+		updateAuthMetadata(data);
+		const modeChanged = previousMode !== installationAuthMode;
+		const changedIdentity = Boolean(
+			(previousUser &&
+				(previousUser.id !== data.user?.id ||
+					previousUser.householdId !== data.user?.householdId)) ||
+			(modeChanged && managedAuth && data.user)
+		);
+		if (modeChanged && managedAuth) clearManagedIdentity();
 		if (changedIdentity) kitchenSync?.clearContext();
 		user = data.user ?? null;
+		if (managedAuth && !user) {
+			clearManagedIdentity();
+			renewManagedSession({ status: 401 });
+		}
 		if (changedIdentity) {
 			if (user) {
 				const latest = await request('/api/state');
 				adoptKitchen(latest.state || createNewUserState());
+				kitchenLoaded = true;
+			} else if (managedAuth) {
+				clearManagedIdentity();
 			} else {
 				kitchen = createInitialState();
 				localStorage.removeItem('flavorithm-last-account');
+				kitchenLoaded = true;
 			}
 		}
 		capabilities = {
@@ -304,8 +382,26 @@
 			headers,
 			body: body === undefined ? undefined : JSON.stringify(body)
 		});
-		const data = await response.json();
+		if (managedAuth && response.redirected) {
+			clearManagedIdentity();
+			renewManagedSession({ status: 401 });
+			throw new Error('Your organization session needs to be renewed.');
+		}
+		let data: any;
+		try {
+			data = await response.json();
+		} catch (error) {
+			if (managedAuth && (response.status === 401 || response.status === 403)) {
+				clearManagedIdentity();
+				renewManagedSession({ status: 401 });
+			}
+			throw error;
+		}
 		if (!response.ok) {
+			if (response.status === 401 && managedAuth) {
+				clearManagedIdentity();
+				renewManagedSession({ status: 401 });
+			}
 			if (response.status === 412 || response.status === 428) {
 				syncing = true;
 				clearTimeout(saveTimer);
@@ -313,7 +409,9 @@
 					'Your household changed in another tab. Reload to pick up the latest kitchen before making more changes.'
 				);
 			}
-			throw new Error(data.error || 'Something went wrong. Please try again.');
+			throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), {
+				status: response.status
+			});
 		}
 		if (url === '/api/state') stateEtag = data.state ? response.headers.get('etag') : null;
 		return data;
@@ -332,10 +430,13 @@
 		if (!ready) return;
 		document.documentElement.dataset.theme = kitchen.preferences.theme;
 		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
-		try {
-			localStorage.setItem('flavorithm-kitchen', snapshot);
-		} catch {
-			notify('Device storage is full. Export your kitchen before leaving.');
+		if (managedAuth && (!user || !kitchenLoaded)) return;
+		if (!managedAuth) {
+			try {
+				localStorage.setItem('flavorithm-kitchen', snapshot);
+			} catch {
+				notify('Device storage is full. Export your kitchen before leaving.');
+			}
 		}
 		if (user) kitchenSync?.stage(JSON.parse(snapshot));
 		clearTimeout(saveTimer);
@@ -397,14 +498,22 @@
 				}
 			})
 		});
-		try {
-			const local = localStorage.getItem('flavorithm-kitchen');
-			if (local) {
-				kitchen = JSON.parse(local);
-				if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
-			}
-		} catch {}
-		showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
+		if (managedAuth) {
+			localStorage.removeItem('flavorithm-last-account');
+			localStorage.removeItem('flavorithm-kitchen');
+			kitchen = createInitialState();
+			showStarter = false;
+		} else {
+			try {
+				const local = localStorage.getItem('flavorithm-kitchen');
+				if (local) {
+					kitchen = JSON.parse(local);
+					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
+				}
+			} catch {}
+			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
+			kitchenLoaded = true;
+		}
 		ready = true;
 		const pageUrl = new URL(window.location.href);
 		const returnFromChatGPT = pageUrl.searchParams.has('chatgpt');
@@ -413,7 +522,7 @@
 		if (returnFromChatGPT) {
 			modal = 'settings';
 		}
-		if (reset) {
+		if (reset && !managedAuth) {
 			resetToken = reset;
 			modal = 'reset';
 		}
@@ -425,21 +534,34 @@
 		}
 		request('/api/auth')
 			.then(async (data) => {
+				updateAuthMetadata(data);
+				if (managedAuth) {
+					localStorage.removeItem('flavorithm-last-account');
+					localStorage.removeItem('flavorithm-kitchen');
+					kitchen = createInitialState();
+					kitchenLoaded = false;
+					showStarter = false;
+				}
 				capabilities = {
 					emailDelivery: Boolean(data.capabilities?.emailDelivery),
 					recipeSearch: Boolean(data.capabilities?.recipeSearch)
 				};
 				syncing = true;
-				user = data.user;
+				user = data.user ?? null;
 				if (!user) {
 					kitchenSync?.clearContext();
 					localStorage.removeItem('flavorithm-last-account');
+					if (managedAuth) {
+						clearManagedIdentity();
+						renewManagedSession({ status: 401 });
+					}
 				}
 				if (data.user) {
 					const saved = await request('/api/state');
 					adoptKitchen(saved.state || createNewUserState());
+					kitchenLoaded = true;
 				}
-				user = data.user;
+				user = data.user ?? null;
 				if (user) showStarter = false;
 				syncing = false;
 				if (user && returnFromChatGPT) await openSettings();
@@ -447,7 +569,7 @@
 					await refreshConnections().catch(() =>
 						notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 					);
-				if (verificationToken) {
+				if (verificationToken && !managedAuth) {
 					try {
 						const verified = await request('/api/auth', {
 							action: 'verifyEmail',
@@ -464,16 +586,25 @@
 					}
 				}
 			})
-			.catch(() => {
-				try {
-					const cached = JSON.parse(localStorage.getItem('flavorithm-last-account') || 'null');
-					if (cached?.id && cached?.householdId) {
-						user = cached;
-						kitchenSync?.restore(cached);
-					}
-				} catch {}
+			.catch((error) => {
+				if (managedAuth) {
+					clearManagedIdentity();
+					renewManagedSession(error);
+				} else {
+					try {
+						const cached = JSON.parse(localStorage.getItem('flavorithm-last-account') || 'null');
+						if (cached?.id && cached?.householdId) {
+							user = cached;
+							kitchenSync?.restore(cached);
+						}
+					} catch {}
+				}
 				syncing = false;
-				notify('Working locally. Pending edits will retry when you reconnect.');
+				notify(
+					managedAuth
+						? 'Your organization session could not be confirmed. Reconnect to continue.'
+						: 'Working locally. Pending edits will retry when you reconnect.'
+				);
 			});
 		if ('serviceWorker' in navigator)
 			navigator.serviceWorker.register('/service-worker.js').catch(() => {
@@ -486,6 +617,7 @@
 		const connectionChanged = () => {
 			online = navigator.onLine;
 			if (online) void reconnectKitchen();
+			else if (managedAuth) clearManagedIdentity();
 		};
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
@@ -501,9 +633,11 @@
 	function adoptKitchen(state: AppState) {
 		if (user && kitchenSync) {
 			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), state, stateEtag || '');
-			try {
-				localStorage.setItem('flavorithm-last-account', JSON.stringify(user));
-			} catch {}
+			if (!managedAuth) {
+				try {
+					localStorage.setItem('flavorithm-last-account', JSON.stringify(user));
+				} catch {}
+			}
 		} else kitchen = state;
 	}
 	async function retrySync(prefer?: 'local' | 'remote') {
@@ -512,6 +646,10 @@
 			await kitchenSync.sync(prefer);
 		} catch (e) {
 			syncErrors = (e as Error).message;
+			if (managedAuth) {
+				clearManagedIdentity();
+				renewManagedSession(e);
+			}
 		}
 	}
 	async function reconnectKitchen() {
@@ -520,7 +658,10 @@
 			await refreshAuth();
 			if (!user) {
 				kitchenSync?.clearContext();
-				notify('Sign in again to sync the edits saved on this device.');
+				if (managedAuth) {
+					clearManagedIdentity();
+					renewManagedSession({ status: 401 });
+				} else notify('Sign in again to sync the edits saved on this device.');
 				return;
 			}
 			if (previous?.id !== user.id || previous?.householdId !== user.householdId)
@@ -530,6 +671,10 @@
 			await retrySync();
 		} catch (e) {
 			syncErrors = (e as Error).message;
+			if (managedAuth) {
+				clearManagedIdentity();
+				renewManagedSession(e);
+			}
 		}
 	}
 	function exportPendingChanges() {
@@ -594,6 +739,10 @@
 	}
 	async function authenticate(event: SubmitEvent) {
 		event.preventDefault();
+		if (managedAuth) {
+			openAuthentication();
+			return;
+		}
 		busy = true;
 		error = '';
 		try {
@@ -642,6 +791,17 @@
 		}
 	}
 	async function logout() {
+		if (managedAuth) {
+			if (!providerLogoutUrl) return;
+			try {
+				await flushKitchen();
+			} catch {
+				notify('Signing out. The latest edits may still be syncing.');
+			}
+			clearManagedIdentity();
+			window.location.assign(providerLogoutUrl);
+			return;
+		}
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -735,7 +895,7 @@
 	}
 	async function connectChatGPT(accountId?: string, reconsent = false) {
 		if (!user) {
-			modal = 'auth';
+			openAuthentication();
 			return;
 		}
 		connectionBusy = true;
@@ -845,8 +1005,12 @@
 	}
 	function needAI() {
 		if (!user) {
-			modal = 'auth';
-			notify('Create an account to use your AI connection.');
+			openAuthentication();
+			notify(
+				managedAuth
+					? 'Sign in through your organization to use your AI connection.'
+					: 'Create an account to use your AI connection.'
+			);
 			return false;
 		}
 		const isPlan = kitchen.preferences.provider === 'chatgpt';
@@ -1191,7 +1355,7 @@
 	async function household() {
 		mobileNav = false;
 		if (!user) {
-			modal = 'auth';
+			openAuthentication();
 			return;
 		}
 		modal = 'household';
@@ -1367,6 +1531,7 @@
 	}
 	async function deleteAccount(event: SubmitEvent) {
 		event.preventDefault();
+		if (managedAuth) return;
 		busy = true;
 		error = '';
 		try {
@@ -1422,6 +1587,10 @@
 	}
 	async function recover(event: SubmitEvent) {
 		event.preventDefault();
+		if (managedAuth) {
+			openAuthentication();
+			return;
+		}
 		busy = true;
 		error = '';
 		try {
@@ -1490,7 +1659,7 @@
 			return;
 		}
 		if (!user) {
-			modal = 'auth';
+			openAuthentication();
 			return;
 		}
 		busy = true;
@@ -1564,10 +1733,14 @@
 				></span></button
 			>
 		</div>
-		<button class="profile-button" onclick={() => (user ? openSettings() : (modal = 'auth'))}
+		<button class="profile-button" onclick={() => (user ? openSettings() : openAuthentication())}
 			><span class="profile-avatar">{user ? user.name.slice(0, 1).toUpperCase() : 'Y'}</span><span
-				><b>{user?.name || 'Sign in'}</b><small
-					>{user ? 'Account settings' : 'Save your pantry and recipes'}</small
+				><b>{user?.name || (managedAuth ? 'Managed by provider' : 'Sign in')}</b><small
+					>{user
+						? 'Account settings'
+						: managedAuth
+							? 'Organization access'
+							: 'Save your pantry and recipes'}</small
 				></span
 			><ArrowUpRight size={16} /></button
 		>
@@ -1588,7 +1761,7 @@
 					aria-label="Switch color mode"
 					onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
 					>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}</button
-				><button class="top-avatar" onclick={() => (user ? household() : (modal = 'auth'))}
+				><button class="top-avatar" onclick={() => (user ? household() : openAuthentication())}
 					>{user?.name.slice(0, 1) || 'Y'}</button
 				>
 			</div>
@@ -2328,6 +2501,16 @@
 							>Add ingredients <ArrowRight size={17} /></button
 						>
 					</div>
+				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
+					<h2>Managed by your organization</h2>
+					<p class="muted">
+						Your account and access are managed by your organization's identity provider.
+					</p>
+					{#if providerLoginUrl}<a class="primary full" href={providerLoginUrl}
+							>Continue with organization sign-in <ArrowRight size={17} /></a
+						>{:else}<p class="field-help">
+							Sign in through your organization's access proxy, then reload Flavorithm.
+						</p>{/if}
 				{:else if modal === 'auth'}<span class="dialog-spark">✳</span>
 					<h2>{authMode === 'register' ? 'Create an account' : 'Sign in'}</h2>
 					<p class="muted">Sync your pantry, recipes, and household.</p>
@@ -2459,18 +2642,24 @@
 						>
 					</div>
 					{#if user}<div class="settings-section">
-							<h3>Account email</h3>
-							<p class="muted">{user.email} · {user.emailVerified ? 'Verified' : 'Not verified'}</p>
-							{#if user.emailVerified}<p class="field-help">
-									Email verification is optional for using your kitchen.
-								</p>{:else}<button
-									class="secondary"
-									disabled={!capabilities.emailDelivery || verificationBusy}
-									onclick={sendEmailVerification}
-									>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
-								>{#if !capabilities.emailDelivery}<p class="field-help">
-										Email delivery is unavailable. Set RESEND_API_KEY and EMAIL_FROM to enable it.
-									</p>{/if}{/if}
+							<h3>{managedAuth ? 'Organization account' : 'Account email'}</h3>
+							<p class="muted">
+								{user.email}{managedAuth
+									? ' · Managed by your identity provider'
+									: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
+							</p>
+							{#if !managedAuth}
+								{#if user.emailVerified}<p class="field-help">
+										Email verification is optional for using your kitchen.
+									</p>{:else}<button
+										class="secondary"
+										disabled={!capabilities.emailDelivery || verificationBusy}
+										onclick={sendEmailVerification}
+										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
+									>{#if !capabilities.emailDelivery}<p class="field-help">
+											Email delivery is unavailable. Set RESEND_API_KEY and EMAIL_FROM to enable it.
+										</p>{/if}{/if}
+							{/if}
 						</div>{/if}
 					<div class="settings-section">
 						<h3>Web recipe search</h3>
@@ -2484,10 +2673,13 @@
 						<h3 id="ai-connection-heading" tabindex="-1">AI connection</h3>
 						<p class="muted">Connect a model for recipe generation, photos, and nutrition.</p>
 						{#if !user}<p class="field-help">
-								Sign in to link your ChatGPT plan or use your own API key.
+								{managedAuth
+									? 'Sign in through your organization to connect a model.'
+									: 'Sign in to link your ChatGPT plan or use your own API key.'}
 							</p>
-							<button class="secondary" onclick={() => (modal = 'auth')}>Sign in to connect</button
-							>{/if}
+							{#if !managedAuth}<button class="secondary" onclick={openAuthentication}
+									>Sign in to connect</button
+								>{/if}{/if}
 						<div class="two-fields">
 							<label class="field"
 								>Connection<select
@@ -2641,25 +2833,33 @@
 					{#if user}<div class="settings-section">
 							<h3>Your data</h3>
 							<p class="muted">
-								Export your account and shared kitchen, or permanently remove your account.
+								{managedAuth
+									? 'Export your account and shared kitchen.'
+									: 'Export your account and shared kitchen, or permanently remove your account.'}
 							</p>
 							<div class="dialog-actions">
 								<button class="secondary" onclick={exportKitchen}
 									><Download size={16} /> Export my data</button
-								><button
-									class="text-button danger"
-									onclick={() => {
-										modal = 'delete';
-										error = '';
-									}}>Delete account</button
-								>
+								>{#if !managedAuth}<button
+										class="text-button danger"
+										onclick={() => {
+											modal = 'delete';
+											error = '';
+										}}>Delete account</button
+									>{/if}
 							</div>
 						</div>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<div class="dialog-actions">
-						{#if user}<button class="text-button" onclick={logout}
-								><LogOut size={16} /> Sign out</button
-							>{:else}<button class="text-button" onclick={() => (modal = 'auth')}
-								>Create an account</button
+						{#if user && (!managedAuth || providerLogoutUrl)}<button
+								class="text-button"
+								onclick={logout}><LogOut size={16} /> Sign out</button
+							>{:else if user && managedAuth}<span class="field-help"
+								>Sign-out is managed by your access proxy.</span
+							>{:else if !user && !managedAuth}<button
+								class="text-button"
+								onclick={openAuthentication}>Create an account</button
+							>{:else if !user}<button class="text-button" onclick={openAuthentication}
+								>Organization sign-in</button
 							>{/if}{#if deferredInstall}<button
 								class="secondary"
 								onclick={() => deferredInstall.prompt()}>Install app</button
@@ -2783,7 +2983,7 @@
 						onclick={leaveHousehold}
 						disabled={busy}>Leave household</button
 					>
-				{:else if modal === 'delete'}
+				{:else if modal === 'delete' && !managedAuth}
 					<h2>Delete your account?</h2>
 					<p class="muted">
 						This permanently deletes your account, preferences, and sessions. Your shared kitchen
@@ -2803,7 +3003,9 @@
 							disabled={busy}>Permanently delete my account</button
 						>
 					</form>
-				{:else if modal === 'recover' || modal === 'reset'}<span class="dialog-spark">✳</span>
+				{:else if (modal === 'recover' || modal === 'reset') && !managedAuth}<span
+						class="dialog-spark">✳</span
+					>
 					<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
 					<p class="muted">
 						{modal === 'reset'
