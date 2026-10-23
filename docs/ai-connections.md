@@ -12,4 +12,4 @@ Other catalog providers remain searchable but are marked unavailable; cloud-role
 
 Models that only return embeddings/audio/images and deprecated models are excluded. Models without image input can generate recipes and nutrition from text; choose an image-capable model for photos. Catalog membership is not proof that an API key or subscription has entitlement to a model. A live request is the final access check.
 
-ChatGPT uses its authenticated account catalog for selectable models, supplemented with matching models.dev reasoning metadata. It does not use API-key billing. See [ChatGPT authorization](chatgpt-oauth.md) for direct local, registered hosted, and self-hosted connector setup.
+ChatGPT uses its authenticated account catalog for selectable models, supplemented with matching models.dev reasoning metadata. It does not use API-key billing. See [ChatGPT authorization](chatgpt-oauth.md) for the Codex device-code trial and the alternative registered SIWC integration. Users never need a local connector or terminal; the app displays a code and an OpenAI authorization link, then saves the connection automatically.

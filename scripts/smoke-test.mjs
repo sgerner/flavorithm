@@ -13,6 +13,8 @@ const server = spawn(process.execPath, ['server.mjs'], {
 		ORIGIN: origin,
 		FLAVORITHM_DB_PATH: ':memory:',
 		FLAVORITHM_AUTH_MODE: 'local',
+		// Keep this smoke entirely offline; device endpoints are exercised with signed mocks.
+		FLAVORITHM_CHATGPT_AUTH_FLOW: 'local',
 		RESEND_API_KEY: '',
 		BRAVE_SEARCH_API_KEY: ''
 	},

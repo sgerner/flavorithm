@@ -90,7 +90,12 @@ export async function listChatGPTModels(
 	providers: Array<{
 		id: string;
 		name: string;
-		models: Array<{ id: string; name: string; vision: boolean }>;
+		models: Array<{
+			id: string;
+			name: string;
+			vision: boolean;
+			reasoning?: { efforts: string[]; toggle: boolean };
+		}>;
 	}>;
 }> {
 	let response: Response;
@@ -117,6 +122,16 @@ export async function listChatGPTModels(
 		.map((model: any) => ({
 			id: model.slug,
 			name: model.display_name,
+			...(Array.isArray(model.supported_reasoning_levels)
+				? {
+						reasoning: {
+							efforts: model.supported_reasoning_levels
+								.map((level: any) => level?.effort)
+								.filter((effort: unknown) => typeof effort === 'string'),
+							toggle: false
+						}
+					}
+				: {}),
 			vision: Array.isArray(model.input_modalities)
 				? model.input_modalities.includes('image')
 				: false
