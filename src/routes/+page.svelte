@@ -52,6 +52,8 @@
 	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
+	import ButlerChat from '#lib/components/ButlerChat.svelte';
+	import { applyButlerCommands } from '#lib/butler.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
@@ -1248,7 +1250,7 @@
 				provider: kitchen.preferences.provider,
 				model: kitchen.preferences.model,
 				reasoning: kitchen.preferences.reasoning,
-				...(action === 'capture'
+				...(action === 'capture' || action === 'chat'
 					? {}
 					: {
 							pantry: kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired'),
@@ -1262,6 +1264,132 @@
 			signal
 		);
 	}
+	let butlerChat = $state<ButlerChat>();
+	let butlerSnapshot = '';
+	async function askButler(
+		message: string,
+		history: { role: 'user' | 'assistant'; content: string }[]
+	) {
+		if (!needAI()) {
+			butlerChat?.close();
+			throw new Error('Sign in and connect a model in Settings to speak with Basil.');
+		}
+		const owner = `${user?.id}:${user?.householdId}`;
+		const snapshot = JSON.stringify(kitchen);
+		const { diet, allergies, maxTime, complexity, cuisines, theme, dark } = kitchen.preferences;
+		const context = JSON.stringify({
+			...JSON.parse(snapshot),
+			preferences: { diet, allergies, maxTime, complexity, cuisines, theme, dark },
+			today: dateKey(new Date()),
+			availableThemes: themes,
+			selectedRecipeId: selected?.id ?? editingRecipe?.id,
+			page
+		});
+		const result = await ai('chat', {
+			prompt: message,
+			messages: [
+				...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
+				{ role: 'user', content: message }
+			],
+			context
+		});
+		if (owner !== `${user?.id}:${user?.householdId}`)
+			throw new Error('The active kitchen changed. Ask Basil again.');
+		butlerSnapshot = snapshot;
+		return result as { reply: string; commands: unknown[] };
+	}
+	function applyButler(commands: unknown[]) {
+		if (JSON.stringify(kitchen) !== butlerSnapshot) {
+			throw new Error(
+				'Your kitchen changed since this proposal. Ask Basil for an updated proposal.'
+			);
+		}
+		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
+		kitchen = result.state;
+		for (const effect of result.effects) {
+			if (effect.type === 'navigate') navigate(effect.page);
+			else if (effect.type === 'recipe.open') {
+				butlerChat?.close();
+				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
+				if (recipe && effect.mode === 'edit') editSavedRecipe(recipe);
+				else if (recipe && effect.mode === 'cook') {
+					const meal = kitchen.meals.find(
+						(item) => item.recipeId === recipe.id && !item.completedAt
+					);
+					if (meal) openCookDialog(meal);
+					else selected = recipe;
+				} else selected = recipe ?? null;
+			} else if (effect.type === 'ui') {
+				butlerChat?.close();
+				openButlerControl(effect.action);
+			}
+		}
+		notify('Basil’s instructions applied.');
+	}
+	function openButlerControl(target: string) {
+		switch (target) {
+			case 'settings':
+			case 'voice-settings':
+				void openSettings();
+				break;
+			case 'ai-settings':
+				void openSettings(true);
+				break;
+			case 'recipe-new':
+			case 'import':
+				openImport();
+				break;
+			case 'pantry-add':
+				modal = 'pantry';
+				break;
+			case 'onboarding':
+				openOnboarding();
+				break;
+			case 'household':
+			case 'invite':
+			case 'join-household':
+				void household();
+				break;
+			case 'export-kitchen':
+				void exportKitchen();
+				break;
+			case 'export-shopping':
+				exportList();
+				break;
+			case 'export-pending':
+				exportPendingChanges();
+				break;
+			case 'sign-in':
+				openAuthentication();
+				break;
+			case 'sign-out':
+				void logout();
+				break;
+			case 'delete-account':
+				if (!managedAuth) modal = 'delete';
+				else void openSettings();
+				break;
+			case 'leave-household':
+				modal = 'leave';
+				break;
+			case 'scan':
+				imageInput?.click();
+				break;
+			case 'dictate':
+				dictateRecipe();
+				break;
+			case 'generate':
+				modal = 'generate';
+				break;
+			case 'search':
+				modal = 'search';
+				break;
+			case 'taste':
+				modal = 'taste';
+				break;
+		}
+	}
+
 	async function generate() {
 		if (!needAI()) return;
 		busy = true;
@@ -1917,6 +2045,16 @@
 		}
 	}
 </script>
+
+{#if ready}
+	<ButlerChat
+		bind:this={butlerChat}
+		{kitchen}
+		owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
+		request={askButler}
+		apply={applyButler}
+	/>
+{/if}
 
 <svelte:head><title>Flavorithm — Where flavor meets algorithms</title></svelte:head>
 <svelte:window
