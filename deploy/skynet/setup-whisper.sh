@@ -15,9 +15,9 @@ if [ ! -s "$model_file" ]; then
   test -s "$model_tmp"
   mv "$model_tmp" "$model_file"
 fi
-chown 10001:10001 "$model_dir" "$model_file"
-chmod 0750 "$model_dir"
-chmod 0640 "$model_file"
+# The service runs as UID 10001 and only needs read access to this model.
+chmod 0755 "$model_dir"
+chmod 0644 "$model_file"
 
 cd "$stack_dir"
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml config --quiet
