@@ -1,8 +1,8 @@
+import { startCodexDevice, pollCodexDevice, cancelCodexDevice } from '#lib/server/codex-device.ts';
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
 import { ApiError, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
-import { getChatGPTAccount } from '#lib/server/oauth-storage.ts';
 import {
 	ChatGPTOAuthError,
 	disconnectChatGPTAccount,
@@ -10,7 +10,6 @@ import {
 	getChatGPTOAuthAvailability,
 	listChatGPTAccounts,
 	startChatGPTOAuth,
-	startChatGPTCompanion,
 	finishChatGPTCompanion
 } from '#lib/server/chatgpt-oauth.ts';
 
@@ -21,6 +20,8 @@ const bodySchema = z.discriminatedUnion('action', [
 		reconsent: z.boolean().optional()
 	}),
 	z.object({ action: z.literal('disconnect'), accountId: z.string().min(1).max(100) }),
+	z.object({ action: z.literal('poll'), loginId: z.string().uuid() }),
+	z.object({ action: z.literal('cancel'), loginId: z.string().uuid() }),
 	z.object({
 		action: z.literal('import'),
 		bundle: z.object({
@@ -78,7 +79,7 @@ export const POST: RequestHandler = async (event) => {
 		if (!event.locals.user) throw new ApiError(401, 'Authentication required');
 		const address = requestAddress(event);
 		if (!address) throw new ApiError(403, 'The request source could not be verified');
-		consumeRateLimit(`chatgpt-connection-ip:${address}`, 40, 15 * 60 * 1000);
+		consumeRateLimit(`chatgpt-connection-ip:${address}`, 600, 15 * 60 * 1000);
 
 		const contentLength = Number(event.request.headers.get('content-length') ?? 0);
 		if (Number.isFinite(contentLength) && contentLength > 100_000)
@@ -106,6 +107,19 @@ export const POST: RequestHandler = async (event) => {
 		const sessionToken = event.cookies.get('flavorithm_session');
 		const sessionBinding = getSessionBinding(sessionToken);
 		if (!sessionBinding) throw new ApiError(401, 'Authentication required');
+		if (parsed.data.action === 'poll' || parsed.data.action === 'cancel') {
+			consumeRateLimit(`chatgpt-device:${event.locals.user.id}`, 400, 15 * 60 * 1000);
+			const input = {
+				userId: event.locals.user.id,
+				sessionBinding,
+				appUrl: event.url,
+				loginId: parsed.data.loginId
+			};
+			return json(
+				parsed.data.action === 'poll' ? await pollCodexDevice(input) : cancelCodexDevice(input),
+				{ headers: { 'Cache-Control': 'no-store' } }
+			);
+		}
 		if (parsed.data.action === 'import') {
 			consumeRateLimit(`chatgpt-import:${event.locals.user.id}`, 20, 15 * 60 * 1000);
 			return json(
@@ -127,22 +141,15 @@ export const POST: RequestHandler = async (event) => {
 			);
 		}
 		enforceChatGPTStartRateLimit(event.locals.user.id, address);
-		const savedAccount = parsed.data.accountId
-			? getChatGPTAccount(event.locals.user.id, parsed.data.accountId)
-			: null;
-		if (
-			availability.mode === 'companion' ||
-			(availability.mode === 'hosted' && savedAccount?.mode === 'local')
-		)
+		if (availability.mode === 'device')
 			return json(
-				startChatGPTCompanion({
+				await startCodexDevice({
 					userId: event.locals.user.id,
 					sessionBinding,
 					appUrl: event.url,
-					accountId: parsed.data.accountId,
-					reconsent: parsed.data.reconsent
+					accountId: parsed.data.accountId
 				}),
-				{ headers: { 'Cache-Control': 'no-store, max-age=0' } }
+				{ headers: { 'Cache-Control': 'no-store' } }
 			);
 		const result = await startChatGPTOAuth({
 			userId: event.locals.user.id,

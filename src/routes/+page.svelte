@@ -209,6 +209,13 @@
 	}>({ configured: false, mode: 'unavailable', accounts: [] });
 	let connectionBusy = $state(false);
 	let chatGPTAuthorizationUrl = $state('');
+	let chatGPTDevice = $state<{
+		loginId: string;
+		userCode: string;
+		verificationUrl: string;
+		expiresAt: number;
+		interval: number;
+	} | null>(null);
 	let connectionPoll: ReturnType<typeof setInterval> | undefined;
 	let connectionPopup: Window | null = null;
 	let connectionPollCount = 0;
@@ -222,9 +229,6 @@
 	let catalogLoading = $state(false);
 	let catalogError = $state('');
 	let catalogVersion = 0;
-	let chatGPTCompanion = $state<{ script: string; filename: string; expiresAt: number } | null>(
-		null
-	);
 	let prompt = $state('');
 	let importSession = $state<ImportSession>(emptyImportSession());
 	let resumeImport = $state(false);
@@ -835,6 +839,7 @@
 			clearInterval(connectionPoll);
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
+			chatGPTDevice = null;
 			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 			stateEtag = null;
 			syncing = false;
@@ -853,11 +858,11 @@
 		catalogVersion++;
 		catalogLoading = false;
 		catalogError = '';
-		chatGPTCompanion = null;
 		clearInterval(connectionPoll);
 		connectionPopup?.close();
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
+		chatGPTDevice = null;
 		chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 	}
 	async function loadModelCatalog() {
@@ -940,7 +945,7 @@
 		connectionPopup?.close();
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
-		chatGPTCompanion = null;
+		chatGPTDevice = null;
 		kitchen.preferences.model = '';
 		kitchen.preferences.reasoning = undefined;
 		accountModels = [];
@@ -952,53 +957,6 @@
 			error = (e as Error).message;
 		}
 	}
-	function downloadChatGPTCompanion() {
-		if (!chatGPTCompanion) return;
-		const url = URL.createObjectURL(
-			new Blob([chatGPTCompanion.script], { type: 'text/javascript' })
-		);
-		const link = document.createElement('a');
-		link.href = url;
-		link.download = chatGPTCompanion.filename;
-		link.click();
-		setTimeout(() => URL.revokeObjectURL(url), 1000);
-	}
-	async function importChatGPTConnection(file: File) {
-		if (!user || connectionBusy) return;
-		connectionBusy = true;
-		error = '';
-		const owner = user.id;
-		try {
-			if (file.size > 100_000)
-				throw new Error(
-					'Choose the encrypted connection file created by the connector (under 100 KB).'
-				);
-			let bundle: unknown;
-			try {
-				bundle = JSON.parse(await file.text());
-			} catch {
-				throw new Error('Choose the connector’s JSON connection file.');
-			}
-			const result = await request('/api/connections/chatgpt', { action: 'import', bundle });
-			if (user?.id !== owner) return;
-			await refreshConnections();
-			kitchen.preferences.chatgptAccountId = result.accountId;
-			kitchen.preferences.provider = 'chatgpt';
-			kitchen.preferences.model = '';
-			kitchen.preferences.reasoning = undefined;
-			chatGPTCompanion = null;
-			await loadModelCatalog();
-			notify(
-				result.planEnabled
-					? 'ChatGPT connected. Choose a model.'
-					: 'ChatGPT signed in. Enable plan usage to generate recipes.'
-			);
-		} catch (e) {
-			error = (e as Error).message;
-		} finally {
-			connectionBusy = false;
-		}
-	}
 	async function connectChatGPT(accountId?: string, reconsent = false) {
 		if (!user) {
 			openAuthentication();
@@ -1008,9 +966,10 @@
 		const owner = user.id;
 		connectionBusy = true;
 		chatGPTAuthorizationUrl = '';
+		chatGPTDevice = null;
 		error = '';
 		connectionPopup =
-			chatGPT.mode === 'companion'
+			chatGPT.mode === 'device'
 				? null
 				: window.open('about:blank', 'flavorithm-chatgpt-connect', 'popup,width=620,height=780');
 		try {
@@ -1022,12 +981,45 @@
 				reconsent
 			});
 			if (attempt !== connectionAttempt || user?.id !== owner) return;
-			if (result.kind === 'companion') {
-				connectionPopup?.close();
-				chatGPTCompanion = result;
-				connectionBusy = false;
+			if (result.kind === 'device') {
+				chatGPTDevice = result;
+				clearInterval(connectionPoll);
+				let polling = false;
+				connectionPoll = setInterval(async () => {
+					if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
+					polling = true;
+					try {
+						const connected = await request('/api/connections/chatgpt', {
+							action: 'poll',
+							loginId: result.loginId
+						});
+						if (attempt !== connectionAttempt || user?.id !== owner) return;
+						if (connected.connected) {
+							clearInterval(connectionPoll);
+							connectionBusy = false;
+							chatGPTDevice = null;
+							await refreshConnections();
+							if (attempt !== connectionAttempt || user?.id !== owner) return;
+							kitchen.preferences.chatgptAccountId = connected.accountId;
+							kitchen.preferences.provider = 'chatgpt';
+							kitchen.preferences.model = '';
+							kitchen.preferences.reasoning = undefined;
+							await loadModelCatalog();
+							notify('ChatGPT connected. Choose a model.');
+						}
+					} catch (e) {
+						if (attempt !== connectionAttempt || user?.id !== owner) return;
+						clearInterval(connectionPoll);
+						connectionBusy = false;
+						chatGPTDevice = null;
+						error = (e as Error).message;
+					} finally {
+						polling = false;
+					}
+				}, result.interval * 1000);
 				return;
 			}
+
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
 			else if (importSession.text || importSession.photo || importSession.draft) {
@@ -1051,6 +1043,7 @@
 						clearInterval(connectionPoll);
 						connectionBusy = false;
 						chatGPTAuthorizationUrl = '';
+						chatGPTDevice = null;
 						const account = chatGPT.accounts.find(
 							(a) =>
 								a.connected &&
@@ -1078,12 +1071,14 @@
 						clearInterval(connectionPoll);
 						connectionBusy = false;
 						chatGPTAuthorizationUrl = '';
+						chatGPTDevice = null;
 						error = 'The connection window timed out. Try connecting again.';
 					}
 				} catch (e) {
 					clearInterval(connectionPoll);
 					connectionBusy = false;
 					chatGPTAuthorizationUrl = '';
+					chatGPTDevice = null;
 					error = (e as Error).message;
 				} finally {
 					polling = false;
@@ -1093,9 +1088,34 @@
 			connectionPopup?.close();
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
+			chatGPTDevice = null;
 			error = (e as Error).message;
 		}
 	}
+	async function cancelChatGPTDevice() {
+		const current = chatGPTDevice;
+		connectionAttempt++;
+		clearInterval(connectionPoll);
+		connectionBusy = false;
+		chatGPTDevice = null;
+		if (current) {
+			try {
+				await request('/api/connections/chatgpt', { action: 'cancel', loginId: current.loginId });
+			} catch {
+				/* Session expiry also prevents pending authorization from saving credentials. */
+			}
+		}
+	}
+	async function copyChatGPTDeviceCode() {
+		if (!chatGPTDevice) return;
+		try {
+			await navigator.clipboard.writeText(chatGPTDevice.userCode);
+			notify('Code copied.');
+		} catch {
+			notify('Select the code and copy it manually.');
+		}
+	}
+
 	async function disconnectChatGPT() {
 		if (!activeChatGPTAccount) return;
 		connectionBusy = true;
@@ -1107,7 +1127,6 @@
 			});
 			await refreshConnections();
 			accountModels = [];
-			chatGPTCompanion = null;
 			kitchen.preferences.reasoning = undefined;
 			kitchen.preferences.model = '';
 			notify(
@@ -1120,6 +1139,7 @@
 		} finally {
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
+			chatGPTDevice = null;
 		}
 	}
 	function needAI() {
@@ -2803,15 +2823,15 @@
 							loading={catalogLoading}
 							{catalogError}
 							authorizationUrl={chatGPTAuthorizationUrl}
-							companion={chatGPTCompanion}
+							device={chatGPTDevice}
+							oncancel={cancelChatGPTDevice}
+							oncopycode={copyChatGPTDeviceCode}
 							onselect={(id) => changeConnection(id)}
 							onaccount={() => changeConnection()}
 							onconnect={connectChatGPT}
 							ondisconnect={disconnectChatGPT}
 							onrefresh={refreshAISettings}
 							onsignin={openAuthentication}
-							ondownload={downloadChatGPTCompanion}
-							onimport={importChatGPTConnection}
 						/>
 					</div>
 

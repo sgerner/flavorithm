@@ -1,4 +1,4 @@
-import { chatGPTResponse } from './chatgpt-inference.ts';
+import { chatGPTResponse, listChatGPTModels } from './chatgpt-inference.ts';
 import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpsRequest, type RequestOptions } from 'node:https';
 import { isIP } from 'node:net';
@@ -8,6 +8,7 @@ import { PROVIDER_ENDPOINTS } from './provider-endpoints.ts';
 import {
 	modelMetadata,
 	type ConnectionProvider,
+	type ConnectionModel,
 	type ReasoningSettings
 } from '#lib/ai-connections.ts';
 
@@ -315,7 +316,7 @@ export async function runAIRequest(
 	input: unknown,
 	fetcher: Fetcher = fetch,
 	pageFetcher: SecureRecipePageFetcher = secureRecipePageFetcher,
-	connection?: { accessToken: string },
+	connection?: { accessToken: string; codex?: boolean },
 	requestSignal?: AbortSignal
 ) {
 	const parsed = AIRequestSchema.safeParse(input);
@@ -345,9 +346,14 @@ export async function runAIRequest(
 			'This provider needs an integration that Flavorithm does not support yet.'
 		);
 	if (request.reasoning && Object.keys(request.reasoning).length) {
-		const catalog = await getSupportedModels(requestFetcher);
-		const metadata = catalog.providers
-			.find((p) => p.id === (provider === 'chatgpt' ? 'openai' : provider))
+		const catalog = connection?.codex
+			? await listChatGPTModels(connection.accessToken, requestFetcher)
+			: await getSupportedModels(requestFetcher);
+		const metadata: ConnectionModel['reasoning'] = catalog.providers
+			.find(
+				(p) =>
+					p.id === (connection?.codex ? 'chatgpt' : provider === 'chatgpt' ? 'openai' : provider)
+			)
 			?.models.find((m) => m.id === selectedModel)?.reasoning;
 		if (
 			!metadata ||

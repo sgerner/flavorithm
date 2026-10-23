@@ -9,6 +9,7 @@ export type ChatGPTCredentials = {
 	accessToken: string;
 	refreshToken: string | null;
 	idToken: string;
+	codexAccountId?: string;
 };
 
 export type ChatGPTAccount = {
@@ -341,7 +342,7 @@ export function saveChatGPTAccount(input: {
 			`SELECT ${selectColumns} FROM chatgpt_oauth_accounts WHERE user_id = ? AND client_id = ? AND subject = ?`
 		)
 		.get(input.userId, input.clientId, input.subject) as AccountRow | undefined;
-	if (!input.accountId && input.mode === 'local') {
+	if (!input.accountId && input.mode === 'local' && !input.scopes.includes('codex.subscription')) {
 		const conflictingRegistration = db
 			.prepare(
 				'SELECT 1 AS present FROM chatgpt_oauth_accounts WHERE user_id = ? AND client_id = ? AND subject <> ?'

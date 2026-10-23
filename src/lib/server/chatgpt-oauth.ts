@@ -1,3 +1,10 @@
+import {
+	CODEX_CLIENT_ID,
+	CODEX_SCOPE,
+	CODEX_TOKEN_URL,
+	codexTokenExpiry,
+	codexSubscriptionFetch
+} from './codex-device.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { buildCompanionScript, type CompanionConfig } from './chatgpt-companion.ts';
@@ -56,7 +63,7 @@ export class ChatGPTOAuthError extends ApiError {
 }
 
 export type OAuthAvailability = {
-	mode: 'local' | 'hosted' | 'companion' | 'unavailable';
+	mode: 'local' | 'hosted' | 'device' | 'unavailable';
 	safeReason?: string;
 };
 
@@ -192,10 +199,16 @@ export function getChatGPTOAuthAvailability(input: {
 		!!input.clientAddress &&
 		isLoopbackAddress(input.clientAddress) &&
 		(!configuredOrigin || isLoopbackOrigin(configuredOrigin));
-	if (localRequest) return { mode: 'local' };
+	if (localRequest && process.env.FLAVORITHM_CHATGPT_AUTH_FLOW === 'local')
+		return { mode: 'local' };
 	const hosted = hostedClientConfig();
-	if (hosted && new URL(hosted.redirectUri).origin === input.url.origin) return { mode: 'hosted' };
-	if (input.url.protocol === 'https:') return { mode: 'companion' };
+	if (
+		process.env.FLAVORITHM_CHATGPT_AUTH_FLOW !== 'device' &&
+		hosted &&
+		new URL(hosted.redirectUri).origin === input.url.origin
+	)
+		return { mode: 'hosted' };
+	if (localRequest || input.url.protocol === 'https:') return { mode: 'device' };
 	return {
 		mode: 'unavailable',
 		safeReason:
@@ -209,7 +222,8 @@ export function listChatGPTAccounts(userId: string): PublicChatGPTAccount[] {
 		label: account.label,
 		...(account.email ? { email: account.email } : {}),
 		subject: account.subject,
-		planEnabled: account.scopes.includes('chatgpt.tokens.use.direct'),
+		planEnabled:
+			account.scopes.includes('chatgpt.tokens.use.direct') || account.scopes.includes(CODEX_SCOPE),
 		connected: Boolean(account.credentialEnvelope),
 		updatedAt: account.updatedAt
 	}));
@@ -269,7 +283,7 @@ function validateAccountForReauthorization(
 	if (account.mode !== mode) {
 		throw new ChatGPTOAuthError(
 			409,
-			'This ChatGPT account was connected in another OAuth mode.',
+			'This connection was created for another installation type. Use Add account to authorize a new connection on this server.',
 			'chatgpt_account_mode_mismatch'
 		);
 	}
@@ -1347,7 +1361,10 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 				'ChatGPT account was not found.',
 				'chatgpt_account_not_found'
 			);
-		if (!account.scopes.includes('chatgpt.tokens.use.direct')) {
+		if (
+			!account.scopes.includes('chatgpt.tokens.use.direct') &&
+			account.clientId !== CODEX_CLIENT_ID
+		) {
 			throw new ChatGPTOAuthError(
 				403,
 				'ChatGPT plan access was not approved for this account.',
@@ -1404,7 +1421,7 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 			const body = new URLSearchParams({
 				grant_type: 'refresh_token',
 				refresh_token: credentials.refreshToken,
-				resource: OPENAI_RESOURCE
+				...(account.clientId === CODEX_CLIENT_ID ? {} : { resource: OPENAI_RESOURCE })
 			});
 			const { headers, body: authenticatedBody } = hostedAuthHeadersAndBody(
 				account.mode,
@@ -1413,13 +1430,16 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 			);
 			let response: Response;
 			try {
-				response = await fetch(OPENAI_TOKEN_URL, {
-					method: 'POST',
-					headers,
-					body: authenticatedBody,
-					redirect: 'error',
-					signal: AbortSignal.timeout(12_000)
-				});
+				response = await fetch(
+					account.clientId === CODEX_CLIENT_ID ? CODEX_TOKEN_URL : OPENAI_TOKEN_URL,
+					{
+						method: 'POST',
+						headers,
+						body: authenticatedBody,
+						redirect: 'error',
+						signal: AbortSignal.timeout(12_000)
+					}
+				);
 			} catch {
 				throw new ChatGPTOAuthError(
 					502,
@@ -1434,10 +1454,16 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 				responseBody = null;
 			}
 			if (!response.ok) {
-				const errorCode =
+				const providerError =
 					responseBody && typeof responseBody === 'object' && 'error' in responseBody
 						? (responseBody as { error?: unknown }).error
 						: null;
+				const errorCode =
+					typeof providerError === 'string'
+						? providerError
+						: providerError && typeof providerError === 'object' && 'code' in providerError
+							? providerError.code
+							: null;
 				if (
 					typeof errorCode === 'string' &&
 					new Set([
@@ -1477,8 +1503,16 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 					'chatgpt_refresh_failed'
 				);
 			}
-			const expiresIn = Number(refreshResult.expires_in);
-			if (!Number.isFinite(expiresIn) || expiresIn <= 0 || expiresIn > 86_400) {
+			const expiresIn =
+				account.clientId === CODEX_CLIENT_ID
+					? (codexTokenExpiry(refreshResult.access_token, refreshResult.expires_in) - Date.now()) /
+						1000
+					: Number(refreshResult.expires_in);
+			if (
+				!Number.isFinite(expiresIn) ||
+				expiresIn <= 0 ||
+				expiresIn > (account.clientId === CODEX_CLIENT_ID ? 31 * 86_400 : 86_400)
+			) {
 				throw new ChatGPTOAuthError(
 					502,
 					'ChatGPT access could not be refreshed. Please retry.',
@@ -1486,6 +1520,7 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 				);
 			}
 			const nextCredentials: ChatGPTCredentials = {
+				...credentials,
 				accessToken: refreshResult.access_token,
 				refreshToken:
 					typeof refreshResult.refresh_token === 'string'
@@ -1495,7 +1530,11 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 					typeof refreshResult.id_token === 'string' ? refreshResult.id_token : credentials.idToken
 			};
 			const scopes =
-				typeof refreshResult.scope === 'string' ? scopesFrom(refreshResult.scope) : account.scopes;
+				account.clientId === CODEX_CLIENT_ID
+					? [CODEX_SCOPE]
+					: typeof refreshResult.scope === 'string'
+						? scopesFrom(refreshResult.scope)
+						: account.scopes;
 			const saved = persistRefreshedChatGPTCredentials({
 				userId,
 				accountId: account.id,
@@ -1511,7 +1550,7 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 					'ChatGPT access could not be saved securely.',
 					'chatgpt_credentials_unavailable'
 				);
-			if (!scopes.includes('chatgpt.tokens.use.direct')) {
+			if (!scopes.includes('chatgpt.tokens.use.direct') && account.clientId !== CODEX_CLIENT_ID) {
 				throw new ChatGPTOAuthError(
 					403,
 					'ChatGPT plan access is no longer authorized.',
@@ -1550,4 +1589,27 @@ export function enforceChatGPTStartRateLimit(userId: string, clientAddress: stri
 
 export function validateHostedOAuthConfiguration(): boolean {
 	return Boolean(hostedClientConfig());
+}
+
+export async function getChatGPTConnection(
+	userId: string,
+	accountId: string,
+	fetcher: typeof fetch
+) {
+	const accessToken = await getChatGPTAccessToken(userId, accountId);
+	const account = getChatGPTAccount(userId, accountId);
+	if (!account?.credentialEnvelope) throw new ApiError(401, 'Reconnect your ChatGPT account.');
+	if (account.clientId !== CODEX_CLIENT_ID) return { accessToken, fetcher, codex: false };
+	const credentials = decryptChatGPTCredentials(
+		userId,
+		account.id,
+		account.mode,
+		account.credentialEnvelope
+	);
+	if (!credentials.codexAccountId) throw new ApiError(401, 'Reconnect your Codex subscription.');
+	return {
+		accessToken,
+		codex: true,
+		fetcher: codexSubscriptionFetch(accessToken, credentials.codexAccountId, fetcher)
+	};
 }

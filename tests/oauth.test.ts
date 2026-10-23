@@ -574,7 +574,7 @@ test('self-hosted connector completes local PKCE OAuth and imports encrypted cre
 	const appUrl = new URL('https://flavorithm.example/');
 	assert.equal(
 		oauth.getChatGPTOAuthAvailability({ url: appUrl, clientAddress: '203.0.113.1' }).mode,
-		'companion'
+		'device'
 	);
 	const storage = await import('../src/lib/server/oauth-storage.ts');
 	const vmHost = storage.ensureChatGPTHostId();
@@ -719,7 +719,7 @@ test('companion import retains sign-in without claiming plan access when the pro
 	});
 });
 
-test('connection API exposes an actionable self-hosted setup and enforces authentication, origin, size, and one-use import', async () => {
+test('connection API offers device auth, supports configured hosted OAuth, and finishes legacy imports', async () => {
 	const route = await import('../src/routes/api/connections/chatgpt/+server.ts');
 	const user = await createLocalUser('companion-route@example.com');
 	const url = new URL('https://flavorithm.example/api/connections/chatgpt');
@@ -745,12 +745,38 @@ test('connection API exposes an actionable self-hosted setup and enforces authen
 			)
 		}) as unknown as Parameters<typeof route.GET>[0];
 	const status = await route.GET(event());
-	assert.deepEqual(await status.json(), { configured: true, mode: 'companion', accounts: [] });
+	const availability = await status.json();
+	assert.equal(availability.configured, true);
+	assert.equal(availability.mode, 'device');
+	assert.deepEqual(availability.accounts, []);
 	assert.match(status.headers.get('cache-control')!, /no-store/);
-	const started = await route.POST(event({ action: 'start' }));
-	assert.equal(started.status, 200);
-	assert.match(started.headers.get('cache-control')!, /no-store/);
-	assert.equal((await started.json()).kind, 'companion');
+	const config = {
+		OPENAI_OAUTH_CLIENT_ID: 'oaiapp_hosted_browser',
+		OPENAI_OAUTH_REDIRECT_URI: `${url.origin}/api/connections/chatgpt/callback`,
+		FLAVORITHM_OAUTH_ENCRYPTION_KEY: randomBytes(32).toString('base64')
+	};
+	const previous = Object.fromEntries(Object.keys(config).map((key) => [key, process.env[key]]));
+	Object.assign(process.env, config);
+	try {
+		const configured = await route.GET(event());
+		assert.equal((await configured.json()).mode, 'hosted');
+		const started = await route.POST(event({ action: 'start' }));
+		assert.equal(started.status, 200);
+		assert.match(started.headers.get('cache-control')!, /no-store/);
+		const result = await started.json();
+		const authorization = new URL(result.authorizationUrl);
+		assert.equal(authorization.origin, 'https://auth.openai.com');
+		assert.equal(authorization.searchParams.get('client_id'), config.OPENAI_OAUTH_CLIENT_ID);
+		assert.equal(authorization.searchParams.get('redirect_uri'), config.OPENAI_OAUTH_REDIRECT_URI);
+		assert.equal(authorization.searchParams.get('code_challenge_method'), 'S256');
+		assert.equal('script' in result, false);
+		assert.equal(authorization.searchParams.has('client_secret'), false);
+	} finally {
+		for (const [key, value] of Object.entries(previous)) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 	assert.equal(
 		(await route.POST(event({ action: 'start' }, 'https://attacker.example'))).status,
 		403

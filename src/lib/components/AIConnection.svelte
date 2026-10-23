@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowUpRight, Download, RefreshCw, Upload, Check } from '@lucide/svelte';
+	import { ArrowUpRight, RefreshCw, Check, Copy } from '@lucide/svelte';
 	import SearchPicker from './SearchPicker.svelte';
 	import { revealMotion } from '#lib/motion.ts';
 	import type { Preferences } from '#lib/types.ts';
@@ -22,15 +22,15 @@
 		loading,
 		catalogError,
 		authorizationUrl,
-		companion,
+		device,
+		oncancel,
+		oncopycode,
 		onselect,
 		onaccount,
 		onconnect,
 		ondisconnect,
 		onrefresh,
-		onsignin,
-		ondownload,
-		onimport
+		onsignin
 	}: {
 		preferences: Preferences;
 		apiKey: string;
@@ -44,17 +44,16 @@
 		loading: boolean;
 		catalogError: string;
 		authorizationUrl: string;
-		companion: { filename: string; expiresAt: number } | null;
+		device: { userCode: string; verificationUrl: string; expiresAt: number } | null;
+		oncancel: () => void;
+		oncopycode: () => void;
 		onselect: (id: string) => void;
 		onaccount: () => void;
 		onconnect: (id?: string, reconsent?: boolean) => void;
 		ondisconnect: () => void;
 		onrefresh: () => void;
 		onsignin: () => void;
-		ondownload: () => void;
-		onimport: (file: File) => void;
 	} = $props();
-	let fileInput = $state<HTMLInputElement>();
 	let provider = $derived(providers.find((p) => p.id === preferences.provider));
 	let subscription = $derived(preferences.provider === 'chatgpt');
 	let models = $derived(subscription ? accountModels : provider?.models || []);
@@ -172,52 +171,39 @@
 						onclick={() => onconnect(activeAccount?.id, true)}>Enable plan usage</button
 					>{/if}
 			</div>
-			{#if chatGPT.mode === 'companion' && !companion}<p class="field-help">
-					This self-hosted installation authorizes on your computer, then imports an encrypted
-					connection. Requires Node.js 24 or newer.
+
+			{#if device}
+				<div class="device-login" in:revealMotion role="status">
+					<p>Open ChatGPT and enter this code:</p>
+					<div class="device-code-row">
+						<code>{device.userCode}</code><button
+							class="text-button"
+							onclick={oncopycode}
+							aria-label="Copy ChatGPT authorization code"><Copy size={18} /></button
+						>
+					</div>
+					<div class="connection-actions">
+						<a
+							class="primary"
+							href={device.verificationUrl}
+							target="_blank"
+							rel="noopener noreferrer">Open ChatGPT <ArrowUpRight size={17} /></a
+						><button class="secondary" onclick={oncancel}>Cancel</button>
+					</div>
+					<p class="field-help">Waiting for approval. This code expires in 15 minutes.</p>
+				</div>
+			{:else if chatGPT.mode === 'device'}
+				<p class="field-help">
+					Connect in your browser with a one-time code. No API key or installation needed.
 				</p>
-			{:else if chatGPT.mode === 'local'}<p class="field-help">
-					Authorize in the browser on the computer running Flavorithm. No API key needed.
+			{/if}
+			{#if chatGPT.mode === 'local'}<p class="field-help">
+					Complete ChatGPT authorization in your browser. Flavorithm handles the connection.
 				</p>
 			{:else if !chatGPT.configured && signedIn}<p class="field-help" role="status">
 					{chatGPT.safeReason ||
 						'Unable to load authorization options. Retry the connection settings.'}
 				</p>{/if}
-			{#if companion}
-				<div class="companion-steps" in:revealMotion>
-					<ol>
-						<li>
-							<button class="text-button" onclick={ondownload}
-								><Download size={16} /> Download the connector</button
-							><span>On a computer with Node.js 24 or newer.</span>
-						</li>
-						<li>
-							Open a terminal in your Downloads folder and run:<code>node {companion.filename}</code
-							><span>Complete ChatGPT sign-in in the browser that opens.</span>
-						</li>
-						<li>
-							<button class="secondary" disabled={busy} onclick={() => fileInput?.click()}
-								><Upload size={16} /> Import connection file</button
-							><span>Select the encrypted JSON file created by the connector.</span>
-						</li>
-					</ol>
-					<p class="field-help">
-						Expires in 10 minutes. Import here in this same Flavorithm session, then delete both
-						downloaded files.
-					</p>
-				</div>
-			{/if}
-			<input
-				bind:this={fileInput}
-				type="file"
-				accept="application/json,.json"
-				hidden
-				onchange={(event) => {
-					const file = event.currentTarget.files?.[0];
-					event.currentTarget.value = '';
-					if (file) onimport(file);
-				}}
-			/>
 			{#if authorizationUrl}<a
 					class="text-button auth-fallback"
 					href={authorizationUrl}
@@ -343,38 +329,29 @@
 		align-items: center;
 		font-size: 15px;
 	}
-	.companion-steps {
-		margin-top: 20px;
+	.device-login {
+		margin-block: 20px;
 		padding-block: 16px;
 		border-block: 1px solid var(--line);
 	}
-	ol {
-		margin: 0;
-		padding-left: 24px;
+	.device-code-row {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		margin-block: 12px;
 	}
-	li {
-		padding-left: 5px;
-		margin-bottom: 18px;
-		font-size: 16px;
-		line-height: 1.6;
-	}
-	li:last-child {
-		margin-bottom: 0;
-	}
-	li span {
-		display: block;
-		color: var(--muted);
-		font-size: 15px;
-		margin-top: 5px;
-	}
-	code {
-		display: block;
-		padding: 12px;
-		margin-block: 8px;
-		font-size: 14px;
-		background: var(--wash);
-		overflow-wrap: anywhere;
+	.device-code-row code {
+		font-size: clamp(22px, 6vw, 30px);
+		font-weight: 700;
+		letter-spacing: 0.08em;
 		user-select: all;
+		overflow-wrap: anywhere;
+	}
+	.device-login .primary {
+		display: inline-flex;
+		align-items: center;
+		gap: 8px;
+		text-decoration: none;
 	}
 	.reasoning-fields {
 		display: grid;

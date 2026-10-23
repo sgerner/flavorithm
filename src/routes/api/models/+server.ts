@@ -1,4 +1,4 @@
-import { getChatGPTAccessToken } from '#lib/server/chatgpt-oauth.ts';
+import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
 import { json } from '@sveltejs/kit';
@@ -26,14 +26,15 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 		if (url.searchParams.get('connection') === 'chatgpt') {
 			const accountId = url.searchParams.get('accountId');
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			const accessToken = await getChatGPTAccessToken(locals.user.id, accountId);
-			const result = await listChatGPTModels(accessToken, fetch);
+			const connection = await getChatGPTConnection(locals.user.id, accountId, fetch);
+			const result = await listChatGPTModels(connection.accessToken, connection.fetcher);
 			try {
 				const catalog = await publicCatalog(fetch);
 				const openai = catalog.providers.find((provider) => provider.id === 'openai');
 				for (const model of result.providers[0].models) {
 					const metadata = openai?.models.find((candidate) => candidate.id === model.id);
-					if (metadata?.reasoning) Object.assign(model, { reasoning: metadata.reasoning });
+					if (metadata?.reasoning && !model.reasoning)
+						Object.assign(model, { reasoning: metadata.reasoning });
 				}
 			} catch {
 				/* An unavailable public catalog must not hide entitled account models. */
