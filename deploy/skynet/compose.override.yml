@@ -14,9 +14,17 @@ services:
     image: ghcr.io/ggml-org/whisper.cpp@sha256:7a4e5f481192899f6c3853ff181ea6347b219ca2f388e1d84870b84ad80f6b7f
     container_name: flavorithm-whisper
     restart: unless-stopped
-    entrypoint: ["/bin/bash", "-ec"]
-    command: >-
-      exec whisper-server --model /models/ggml-base.bin --host 0.0.0.0 --port 8080 --threads 4 --no-gpu
+    entrypoint: ["whisper-server"]
+    command:
+      - --model
+      - /models/ggml-base.bin
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --threads
+      - "4"
+      - --no-gpu
     user: "10001:10001"
     volumes:
       - /home/skynet/opt/appdata/flavorithm-whisper:/models:ro
