@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
@@ -25,6 +26,7 @@
 		nutrition,
 		edit,
 		remove,
+		toggleHidden,
 		busy
 	}: {
 		recipe: Recipe;
@@ -36,6 +38,7 @@
 		nutrition: () => void;
 		edit: () => void;
 		remove: () => void;
+		toggleHidden: () => void;
 		busy: boolean;
 	} = $props();
 	let nutritionMode = $state('serving');
@@ -57,7 +60,7 @@
 	>
 		<div
 			class="detail-photo"
-			style:background-image={`url(${JSON.stringify(recipe.image || '/recipe-placeholder.svg')})`}
+			style:background-image={`url(${JSON.stringify(recipe.image || recipePlaceholder(recipe))}), url(${JSON.stringify(recipePlaceholder(recipe))})`}
 		>
 			<button class="icon-button close-detail" onclick={close} aria-label="Close recipe"
 				><X size={22} /></button
@@ -89,6 +92,9 @@
 					onclick={save}
 					aria-label="Save recipe"
 					><Bookmark size={19} fill={recipe.saved ? 'currentColor' : 'none'} /></button
+				>
+				<button class="secondary recipe-manage-button" onclick={toggleHidden}
+					>{recipe.hidden ? 'Restore' : 'Hide'}</button
 				>
 				{#if recipe.saved}<button class="secondary recipe-manage-button" onclick={edit}>Edit</button
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
@@ -145,7 +151,9 @@
 					</div>
 				</div>
 			{:else}<div class="nutrition-panel" transition:revealMotion|global>
-					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">Ingredients or servings changed. Refresh this estimate before relying on it.</p>{/if}
+					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
+							Ingredients or servings changed. Refresh this estimate before relying on it.
+						</p>{/if}
 					<label class="servings nutrition-selector"
 						>Show nutrition for<select bind:value={nutritionMode}
 							><option value="serving">One serving</option><option value="recipe"

@@ -256,3 +256,11 @@ The automated tests cover application logic and use mocked provider/network resp
 - Provider models, account eligibility, quotas, billing, and limits are managed by external services and can change. API-key billing and ChatGPT plan usage are separate.
 - The Codex device-code connection is experimental and subject to provider model access and protocol changes. The separate registered SIWC integration requires its own approved client. Neither path requires users to run a local connector.
 - The app is designed for one server instance. It reconciles pending edits when syncing but does not stream live multi-user updates. Household invitations are private codes rather than emailed invitations; multi-host deployment requires additional infrastructure.
+
+### Recipe cover photos
+
+Open a saved recipe and choose **Edit → Upload cover photo** to add or replace its cover. JPG, PNG, and WebP files up to 10 MB are accepted. Photos are resized to fit within 1200 pixels, converted to JPEG, and stripped of camera metadata. Choose **Remove cover** to use an illustration, then **Save changes** to keep the change. Import-source photos remain separate from cover photos.
+
+Cover uploads require sign-in and a network connection. Photos are stored in the SQLite database, served only to members of the household, and included in database backups. JSON recipe exports contain cover references rather than image bytes; those references require access to the original installation and household. Uploaded photos are not available offline. Storage is limited to 50 MB per household; unused uploads older than 24 hours are reclaimed on subsequent uploads. Recent unfinished edits keep their photos during that window.
+
+Recipes without photos use six local food illustrations, selected by title/tags with a stable varied fallback. These illustrations also display when a recipe image fails to load and are available with the cached app shell.

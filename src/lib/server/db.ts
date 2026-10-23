@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
 import { createNewUserState } from '#lib/data.ts';
+import { COVER_PATH } from '#lib/cover-upload.ts';
 import { MAX_RECIPES } from '#lib/recipe-collection.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
 
@@ -215,7 +216,7 @@ const recipeSchema = z.object({
 	id: z.string().min(1).max(100),
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
-	image: publicUrlSchema,
+	image: z.union([publicUrlSchema, z.string().regex(COVER_PATH)]),
 	time: z.number().finite().min(0).max(100_000),
 	servings: z.number().finite().min(1).max(10_000),
 	difficulty: z.string().max(80),
@@ -229,7 +230,8 @@ const recipeSchema = z.object({
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().finite().min(0).max(5).optional(),
-	saved: z.boolean().optional()
+	saved: z.boolean().optional(),
+	hidden: z.boolean().optional()
 });
 
 const preferencesSchema = z.object({

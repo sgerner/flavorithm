@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick } from 'svelte';
 	import type { PageData } from './$types';
 	import { focusTrap } from '#lib/focus.ts';
@@ -2042,7 +2043,8 @@
 										onclick={() => (selected = recipe)}
 										aria-label={`Open ${recipe.title}`}
 										><img
-											src={recipe.image || '/recipe-placeholder.svg'}
+											src={recipe.image || recipePlaceholder(recipe)}
+											onerror={(event) => recipeImageError(event, recipe)}
 											alt={recipe.title}
 											loading={i > 2 ? 'lazy' : 'eager'}
 										/></button
@@ -2265,9 +2267,13 @@
 													class="calendar-meal"
 												>
 													<button class="meal-open" onclick={() => (selected = recipe)}
-														><img src={recipe.image || '/recipe-placeholder.svg'} alt="" /><b
-															>{recipe.title}</b
-														><small>{recipe.time} min · {meal.servings} servings</small></button
+														><img
+															src={recipe.image || recipePlaceholder(recipe)}
+															onerror={(event) => recipeImageError(event, recipe)}
+															alt=""
+														/><b>{recipe.title}</b><small
+															>{recipe.time} min · {meal.servings} servings</small
+														></button
 													>
 													<div class="calendar-meal-actions">
 														{#if meal.completedAt}<small class="cooked-badge"
@@ -2318,7 +2324,11 @@
 									kitchen.recipes.find((item) => item.id === meal.recipeId)}{#if recipe}<article
 										class="cooked-history-row"
 									>
-										<img src={recipe.image || '/recipe-placeholder.svg'} alt="" />
+										<img
+											src={recipe.image || recipePlaceholder(recipe)}
+											onerror={(event) => recipeImageError(event, recipe)}
+											alt=""
+										/>
 										<div>
 											<b>{recipe.title}</b><span
 												>{new Date(meal.completedAt!).toLocaleDateString('en', {
@@ -3142,7 +3152,11 @@
 									if (!mealDate) mealDate = dateKey(new Date());
 									modal = 'plan';
 								}}
-								><img src={recipe.image || '/recipe-placeholder.svg'} alt="" /><span
+								><img
+									src={recipe.image || recipePlaceholder(recipe)}
+									onerror={(event) => recipeImageError(event, recipe)}
+									alt=""
+								/><span
 									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
 								><Plus size={17} /></button
 							>{/each}
