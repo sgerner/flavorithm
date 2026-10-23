@@ -85,6 +85,7 @@
 	let page = $state('discover');
 	let filter = $state('For you');
 	let query = $state('');
+	let showHiddenRecipes = $state(false);
 	let toast = $state('');
 	let busy = $state(false);
 	let mobileNav = $state(false);
@@ -337,6 +338,7 @@
 		const matches = kitchen.recipes.filter(
 			(r) =>
 				(page !== 'saved' || r.saved) &&
+				(showHiddenRecipes || !r.hidden) &&
 				(!query ||
 					`${r.title} ${r.cuisine} ${r.tags.join(' ')}`
 						.toLowerCase()
@@ -1286,6 +1288,18 @@
 		kitchen.recipes = [...kitchen.recipes];
 		notify(r.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
+	function toggleRecipeHidden(recipe: Recipe) {
+		const hidden = !recipe.hidden;
+		kitchen.recipes = kitchen.recipes.map((item) =>
+			item.id === recipe.id ? { ...item, hidden } : item
+		);
+		selected = null;
+		notify(
+			hidden
+				? `${recipe.title} hidden. Show hidden recipes to find it again.`
+				: `${recipe.title} restored to your recipe list.`
+		);
+	}
 	function editSavedRecipe(recipe: Recipe) {
 		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
 		if (!saved) return;
@@ -2022,6 +2036,12 @@
 									onclick={() => (filter = item)}
 									>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
 								>{/each}
+							<button
+								class:active={showHiddenRecipes}
+								aria-pressed={showHiddenRecipes}
+								onclick={() => (showHiddenRecipes = !showHiddenRecipes)}
+								>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+							>
 						</div>
 						<div class="search-box">
 							<Search size={17} /><input
@@ -2048,7 +2068,9 @@
 											alt={recipe.title}
 											loading={i > 2 ? 'lazy' : 'eager'}
 										/></button
-									><span class="recipe-badge">{recipe.tags[0] || recipe.cuisine}</span><button
+									><span class="recipe-badge"
+										>{recipe.hidden ? 'Hidden' : recipe.tags[0] || recipe.cuisine}</span
+									><button
 										class:saved={recipe.saved}
 										class="save-recipe"
 										onclick={() => saveRecipe(recipe)}
@@ -2507,6 +2529,7 @@
 		nutrition={refreshNutrition}
 		edit={() => editSavedRecipe(selected!)}
 		remove={() => askDeleteRecipe(selected!)}
+		toggleHidden={() => toggleRecipeHidden(selected!)}
 		{busy}
 		rate={(n) => {
 			selected!.rating = n;
