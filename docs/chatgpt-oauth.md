@@ -11,7 +11,9 @@ Flavorithm implements the Codex OAuth device-code protocol for the requested sel
 
 Users do not install Node.js, run a local server, download a connector, import a token file, or enter an API key. The app server requests the code, polls at the provider's interval, and exchanges the approved code. It supports multiple separate accounts/workspaces per Flavorithm user. Reconnecting a saved account must verify that account's original identity.
 
-The code expires after 15 minutes and **Cancel** invalidates the app's attempt. Pending attempts are held in server memory and bound to the initiating user, live app session, and origin; restarting the server or reloading the browser requires starting again. Tokens stay on the server, encrypted using the owner-only `oauth.key` beside SQLite. Back up that key and the database together.
+The code expires after 15 minutes and **Cancel** invalidates the app's attempt. Pending attempts are encrypted in SQLite and bound to the initiating user, live app session, and origin. They survive server/container restarts when the database and its owner-only `oauth.key` are persisted together. Keep the initiating Flavorithm tab open: its poller retries brief network/server outages until the code expires. Reloading the browser still requires starting again.
+
+Database leases coordinate polling across workers and recover after an interrupted poll. Credentials and the completed result are saved in one transaction, so a lost success response can be retried without another provider exchange. If the process stops during the final one-time token exchange before credentials are committed, a fresh login is required; Flavorithm reports the interrupted exchange after the lease expires rather than replaying the provider code. Tokens stay encrypted on the server. Back up the database and key together.
 
 ## Implementation and testing status
 
