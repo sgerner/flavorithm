@@ -1,5 +1,8 @@
 import { createServer } from 'node:http';
 
+// Database and OAuth key files are private to the service account by default.
+process.umask(0o077);
+
 const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || '0.0.0.0';
 if (!Number.isInteger(port) || port < 1 || port > 65535)
