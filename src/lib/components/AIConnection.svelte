@@ -36,7 +36,14 @@
 		apiKey: string;
 		providers: ConnectionProvider[];
 		accountModels: ConnectionModel[];
-		chatGPT: { configured: boolean; mode: string; safeReason?: string; accounts: Account[] };
+		chatGPT: {
+			configured: boolean;
+			mode: string;
+			hostAdmin?: boolean;
+			host?: { model: string } | null;
+			safeReason?: string;
+			accounts: Account[];
+		};
 		activeAccount?: Account;
 		signedIn: boolean;
 		managedAuth: boolean;
@@ -54,6 +61,24 @@
 		onrefresh: () => void;
 		onsignin: () => void;
 	} = $props();
+	let hostError = $state('');
+	async function setHost(enabled: boolean) {
+		hostError = '';
+		try {
+			const response = await fetch('/api/connections/chatgpt', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					action: 'host',
+					...(enabled ? { accountId: activeAccount?.id, model: preferences.model } : {})
+				})
+			});
+			if (!response.ok) throw new Error((await response.json()).error);
+			onrefresh();
+		} catch (error) {
+			hostError = (error as Error).message;
+		}
+	}
 	let provider = $derived(providers.find((p) => p.id === preferences.provider));
 	let subscription = $derived(preferences.provider === 'chatgpt');
 	let models = $derived(subscription ? accountModels : provider?.models || []);
@@ -105,6 +130,33 @@
 	</p>
 	{#if !managedAuth}<button class="secondary" onclick={onsignin}>Sign in to connect</button>{/if}
 {/if}
+{#if chatGPT.hostAdmin}
+	<div class="device-login">
+		<h4>Host AI administration</h4>
+		<p class="field-help">
+			Use one Codex connection and model for every signed-in account on this host, across
+			households.
+		</p>
+		{#if chatGPT.host}<p>Host connection enabled · {chatGPT.host.model}</p>
+			<button class="secondary" onclick={() => setHost(false)}>Disable host connection</button>
+		{:else}<p class="field-help">
+				Connect ChatGPT with a device code below and choose its model, then enable sharing.
+			</p>
+			<button
+				class="secondary"
+				disabled={busy ||
+					!subscription ||
+					!activeAccount?.connected ||
+					activeAccount.id === 'host-chatgpt' ||
+					!preferences.model}
+				onclick={() => setHost(true)}>Use selected connection for this host</button
+			>{/if}
+		{#if hostError}<p class="error" role="alert">{hostError}</p>{/if}
+	</div>
+{/if}
+{#if chatGPT.host}<p class="field-help">
+		AI is provided by this host. Model: {chatGPT.host.model}.
+	</p>{/if}
 <SearchPicker
 	label="Connection"
 	placeholder={loading ? 'Loading connections…' : 'Search providers or models…'}
@@ -148,30 +200,31 @@
 					</select></label
 				>
 			{/if}
-			<div class="connection-actions">
-				<button
-					class="primary"
-					disabled={busy || !signedIn || !chatGPT.configured}
-					onclick={() => onconnect(activeAccount?.id)}
-				>
-					{busy
-						? 'Connecting…'
-						: activeAccount
-							? 'Reconnect with ChatGPT'
-							: 'Continue with ChatGPT'}<ArrowUpRight size={17} />
-				</button>
-				{#if activeAccount}<button
-						class="secondary"
+			{#if activeAccount?.id !== 'host-chatgpt'}
+				<div class="connection-actions">
+					<button
+						class="primary"
 						disabled={busy || !signedIn || !chatGPT.configured}
-						onclick={() => onconnect()}>Add account</button
-					>{/if}
-				{#if activeAccount?.connected && !activeAccount.planEnabled}<button
-						class="secondary"
-						disabled={busy || !chatGPT.configured}
-						onclick={() => onconnect(activeAccount?.id, true)}>Enable plan usage</button
-					>{/if}
-			</div>
-
+						onclick={() => onconnect(activeAccount?.id)}
+					>
+						{busy
+							? 'Connecting…'
+							: activeAccount
+								? 'Reconnect with ChatGPT'
+								: 'Continue with ChatGPT'}<ArrowUpRight size={17} />
+					</button>
+					{#if activeAccount}<button
+							class="secondary"
+							disabled={busy || !signedIn || !chatGPT.configured}
+							onclick={() => onconnect()}>Add account</button
+						>{/if}
+					{#if activeAccount?.connected && !activeAccount.planEnabled}<button
+							class="secondary"
+							disabled={busy || !chatGPT.configured}
+							onclick={() => onconnect(activeAccount?.id, true)}>Enable plan usage</button
+						>{/if}
+				</div>
+			{/if}
 			{#if device}
 				<div class="device-login" in:revealMotion role="status">
 					<p>Open ChatGPT and enter this code:</p>
@@ -210,7 +263,7 @@
 					target="_blank"
 					rel="noreferrer noopener">Open ChatGPT authorization <ArrowUpRight size={16} /></a
 				>{/if}
-			{#if activeAccount?.connected}
+			{#if activeAccount?.connected && activeAccount.id !== 'host-chatgpt'}
 				<div class="connection-actions">
 					<a
 						class="text-button"

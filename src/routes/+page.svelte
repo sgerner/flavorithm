@@ -255,6 +255,8 @@
 		updatedAt?: number;
 	};
 	let chatGPT = $state<{
+		hostAdmin?: boolean;
+		host?: { model: string } | null;
 		configured: boolean;
 		mode: string;
 		safeReason?: string;
@@ -954,6 +956,11 @@
 		const result = await request('/api/connections/chatgpt');
 		if (user?.id !== owner) return;
 		chatGPT = result;
+		if (chatGPT.host) {
+			kitchen.preferences.provider = 'chatgpt';
+			kitchen.preferences.chatgptAccountId = 'host-chatgpt';
+			kitchen.preferences.model = chatGPT.host.model;
+		}
 		if (!chatGPT.accounts.some((a) => a.id === kitchen.preferences.chatgptAccountId))
 			kitchen.preferences.chatgptAccountId =
 				chatGPT.accounts.find((a) => a.connected && a.planEnabled)?.id || chatGPT.accounts[0]?.id;

@@ -65,3 +65,25 @@ Existing SIWC and previously imported connections retain their own inference and
 Access and refresh credentials are encrypted with AES-256-GCM and bound to the app user, account, and credential mode. Tokens are absent from browser storage, kitchen exports, errors, and logs. Disconnect removes local credentials and attempts remote revocation; when revocation cannot be confirmed, review app access in ChatGPT. Account deletion cascades to stored credentials.
 
 Recipe generation, nutrition, photo recognition, and recipe import use the selected connection. Voice dictation remains browser-based; internet search uses the separately configured Brave key. A connection does not expose ChatGPT conversations or memories. Model availability and subscription limits come from OpenAI.
+
+### Optional host-wide Codex connection
+
+Set `FLAVORITHM_HOST_ADMIN_USER_ID` to the exact ID of an existing, trusted
+Flavorithm user and restart the server. There is no implicit host admin; household
+ownership does not grant this capability. Sign in as that user, connect ChatGPT
+using the existing device-code flow, choose a model, and select **Use selected
+connection for this host** in AI connection settings. If your deployment uses
+another OAuth flow, set `FLAVORITHM_CHATGPT_AUTH_FLOW=device` for device login.
+
+While enabled, all authenticated AI generation uses that connection and model,
+including accounts in other households. Search retains its existing behavior.
+Users see a generic host connection without the admin's email or credentials.
+Only the configured admin sees host controls; the server also checks authorization.
+Credentials remain encrypted in the existing OAuth store, with the existing refresh
+coordination. The host shares the subscription's allowance and limits.
+
+The admin can disable sharing in settings. Disconnecting the backing account,
+removing the admin configuration, or changing its user ID also disables sharing.
+Existing personal connections are retained. Household recipes and preferences
+remain scoped as before. This setting does not establish subscription eligibility
+or increase the subscription's usage allowance.
