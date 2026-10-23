@@ -37,6 +37,7 @@ export type Recipe = {
 	nutritionStale?: boolean;
 	rating?: number;
 	saved?: boolean;
+	hidden?: boolean;
 };
 export type Meal = {
 	id: string;

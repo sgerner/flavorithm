@@ -229,7 +229,8 @@ const recipeSchema = z.object({
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().finite().min(0).max(5).optional(),
-	saved: z.boolean().optional()
+	saved: z.boolean().optional(),
+	hidden: z.boolean().optional()
 });
 
 const preferencesSchema = z.object({
