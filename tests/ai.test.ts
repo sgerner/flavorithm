@@ -1459,7 +1459,7 @@ test('capture page transport caps arbitrary-host pages at one megabyte', async (
 	);
 });
 
-test('models catalog only exposes the supported providers and marks image input models', () => {
+test('models catalog discovers providers and marks image input models', () => {
 	const catalog = {
 		openai: {
 			name: 'OpenAI',
@@ -1479,6 +1479,7 @@ test('models catalog only exposes the supported providers and marks image input 
 			{
 				id: 'openai',
 				name: 'OpenAI',
+				supported: true,
 				models: [
 					{ id: 'gpt-4.1-mini', name: 'GPT-4.1 mini', vision: true },
 					{ id: 'o1-mini', name: 'o1 mini', vision: false }
@@ -1487,7 +1488,14 @@ test('models catalog only exposes the supported providers and marks image input 
 			{
 				id: 'anthropic',
 				name: 'Anthropic',
+				supported: true,
 				models: [{ id: 'claude-sonnet', name: 'claude-sonnet', vision: true }]
+			},
+			{
+				id: 'google',
+				name: 'Google',
+				supported: true,
+				models: [{ id: 'gemini', name: 'gemini', vision: true }]
 			}
 		]
 	});
@@ -1513,6 +1521,7 @@ test('model endpoint fetch uses the public models.dev catalog URL', async () => 
 		{
 			id: 'openrouter',
 			name: 'OpenRouter',
+			supported: true,
 			models: [{ id: 'openai/gpt-4.1-mini', name: 'GPT-4.1 mini', vision: true }]
 		}
 	]);

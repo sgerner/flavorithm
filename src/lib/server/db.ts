@@ -243,6 +243,16 @@ const preferencesSchema = z.object({
 	dark: z.boolean(),
 	provider: z.string().max(100),
 	model: z.string().max(200),
+	reasoning: z
+		.object({
+			effort: z
+				.string()
+				.regex(/^[a-z_]{1,24}$/)
+				.optional(),
+			enabled: z.boolean().optional(),
+			budgetTokens: z.number().int().min(0).max(32_768).optional()
+		})
+		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
 	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
 });
