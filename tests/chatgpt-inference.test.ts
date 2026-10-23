@@ -77,6 +77,27 @@ test('ChatGPT vision sends a Responses image input', async () => {
 		}
 	);
 });
+test('ChatGPT reasoning uses the Responses effort field only when explicitly selected', async () => {
+	for (const effort of [undefined, 'high']) {
+		await chatGPTResponse(
+			{ ...options, ...(effort ? { reasoning: { effort } } : {}) },
+			async (_input, init) => {
+				const body = JSON.parse(String(init?.body));
+				assert.deepEqual(body.reasoning, effort ? { effort } : undefined);
+				assert.equal(body.store, false);
+				return stream([
+					{
+						type: 'response.completed',
+						response: {
+							status: 'completed',
+							output: [{ content: [{ type: 'output_text', text: '{}' }] }]
+						}
+					}
+				]);
+			}
+		);
+	}
+});
 test('ChatGPT rejects incomplete, failed, or abruptly ended streams instead of saving partial recipes', async () => {
 	for (const events of [
 		[{ type: 'response.output_text.delta', delta: 'partial' }],

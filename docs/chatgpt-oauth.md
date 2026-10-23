@@ -6,17 +6,31 @@ Flavorithm supports the current **Sign in with ChatGPT** plan-usage flow. Users 
 
 1. Start Flavorithm with `npm run dev`, or `npm run build` followed by `npm start`.
 2. Open the app from `localhost` or `127.0.0.1` on the same computer as its server. Sign into your Flavorithm account.
-3. In **Settings & themes → Your kitchen intelligence**, choose **ChatGPT subscription**, then **Continue with ChatGPT**.
+3. In **Settings → AI connection**, open **Connection** and choose **ChatGPT subscription**, then **Continue with ChatGPT**. ChatGPT appears first before you type a search.
 4. Complete OpenAI's account selection and permission screen yourself. No API key is required for this connection.
 5. Return to Flavorithm and choose a model from the connected account's catalog. A successful completed inference request is the entitlement check; appearing in the catalog alone does not prove access.
 
 On first connection, the app generates a stable host ID and requests dynamic registration as Flavorithm. OpenAI returns an issued client ID for that user/workspace registration. Later reconnections reuse that issued ID and host ID with fresh state, PKCE, and nonce values.
 
-The local callback is a temporary HTTP listener bound only to `127.0.0.1` on an available port, at `/auth/callback`. This is why a phone accessing a server on a different computer cannot complete the local flow. Use a registered hosted integration for a remotely hosted deployment.
+The local callback is a temporary HTTP listener bound only to `127.0.0.1` on an available port, at `/auth/callback`. A phone accessing a server on another computer uses the self-hosted connection procedure below.
 
 If plan usage is declined, the account remains signed in with **Sign-in only** status. **Enable plan usage** starts a new, explicit consent flow. Multiple registrations remain separate even if they have the same email address. Disconnecting clears local tokens and attempts remote revocation. If remote revocation cannot be confirmed, the app says so and links to ChatGPT's usage/access settings.
 
-## Hosted deployment
+## Self-hosted connection, including Authentik
+
+For an HTTPS self-hosted installation without a registered hosted OAuth client, **Continue with ChatGPT** shows a local connector workflow:
+
+1. Download the generated `flavorithm-chatgpt-connect-….mjs` connector on a computer with Node.js 24 or newer.
+2. Open a terminal in the download folder and run the exact `node …` command shown in Settings. The connector opens ChatGPT authorization in the computer's browser. Complete the account selection and consent yourself.
+3. Return to the same signed-in Flavorithm session and use **Import connection file** to select the encrypted JSON file created by the connector. Then select a model. Delete both files after importing.
+
+Each connector expires after ten minutes. Start again if it expires. When using Flavorithm on a phone, complete these steps on a computer signed into Flavorithm. The saved connection then belongs to your Flavorithm account and can be used on your phone.
+
+This follows OpenAI's documented self-hosted VM procedure: finish OAuth locally, then securely transfer the selected registration to the VM. The connector binds a temporary listener only to `127.0.0.1`, validates state, PKCE, the issued client registration, and the signed ID token, then writes an AES-256-GCM encrypted transfer file with owner-only permissions. Its one-use key and expected nonce are bound to an encrypted, expiring server transaction and the initiating Flavorithm session. Import verifies the signature, issuer, audience, nonce, original account for reconnections, session, origin, and expiry again. The browser handles an encrypted bundle, never plaintext OAuth tokens. The server preserves its own host ID and owns subsequent token refreshes.
+
+This works through the normal authenticated application route; no Authentik bypass, public import endpoint, client secret, or fabricated HTTPS callback is needed. The server stores credentials encrypted using the owner-only `oauth.key` alongside SQLite. Back up that key with the database. Account credentials remain per-user.
+
+## Registered hosted integration
 
 OpenAI documents dynamic registration for open-source/local clients. Paid or remotely hosted apps need an appropriately approved client registration; do not use the dynamic local flow with a fabricated HTTPS redirect.
 
@@ -66,4 +80,5 @@ Run `npm run check`, `npm test`, `npm run build`, and `npm run test:smoke`. OAut
 - [Models and Responses inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
 - [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
 - [Hosted client registration](https://developers.openai.com/siwc/request-client-id)
+- [Self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
 - [Anthropic Agent SDK requirements](https://code.claude.com/docs/en/agent-sdk/overview)

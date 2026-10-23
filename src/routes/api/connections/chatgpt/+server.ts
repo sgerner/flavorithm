@@ -2,13 +2,16 @@ import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
 import { ApiError, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
+import { getChatGPTAccount } from '#lib/server/oauth-storage.ts';
 import {
 	ChatGPTOAuthError,
 	disconnectChatGPTAccount,
 	enforceChatGPTStartRateLimit,
 	getChatGPTOAuthAvailability,
 	listChatGPTAccounts,
-	startChatGPTOAuth
+	startChatGPTOAuth,
+	startChatGPTCompanion,
+	finishChatGPTCompanion
 } from '#lib/server/chatgpt-oauth.ts';
 
 const bodySchema = z.discriminatedUnion('action', [
@@ -17,7 +20,20 @@ const bodySchema = z.discriminatedUnion('action', [
 		accountId: z.string().min(1).max(100).optional(),
 		reconsent: z.boolean().optional()
 	}),
-	z.object({ action: z.literal('disconnect'), accountId: z.string().min(1).max(100) })
+	z.object({ action: z.literal('disconnect'), accountId: z.string().min(1).max(100) }),
+	z.object({
+		action: z.literal('import'),
+		bundle: z.object({
+			version: z.literal(1),
+			pairingId: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+			iv: z.string().regex(/^[A-Za-z0-9_-]{16}$/),
+			tag: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+			data: z
+				.string()
+				.regex(/^[A-Za-z0-9_-]+$/)
+				.max(90_000)
+		})
+	})
 ]);
 
 function requestAddress(event: Parameters<RequestHandler>[0]): string | null {
@@ -40,12 +56,15 @@ export const GET: RequestHandler = async (event) => {
 	if (!event.locals.user) return json({ error: 'Authentication required' }, { status: 401 });
 	const address = requestAddress(event);
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
-	return json({
-		configured: availability.mode !== 'unavailable',
-		mode: availability.mode,
-		accounts: listChatGPTAccounts(event.locals.user.id),
-		...(availability.safeReason ? { safeReason: availability.safeReason } : {})
-	});
+	return json(
+		{
+			configured: availability.mode !== 'unavailable',
+			mode: availability.mode,
+			accounts: listChatGPTAccounts(event.locals.user.id),
+			...(availability.safeReason ? { safeReason: availability.safeReason } : {})
+		},
+		{ headers: { 'Cache-Control': 'no-store, max-age=0' } }
+	);
 };
 
 export const POST: RequestHandler = async (event) => {
@@ -62,10 +81,10 @@ export const POST: RequestHandler = async (event) => {
 		consumeRateLimit(`chatgpt-connection-ip:${address}`, 40, 15 * 60 * 1000);
 
 		const contentLength = Number(event.request.headers.get('content-length') ?? 0);
-		if (Number.isFinite(contentLength) && contentLength > 4_096)
+		if (Number.isFinite(contentLength) && contentLength > 100_000)
 			throw new ApiError(413, 'Request body is too large');
 		const body = await event.request.text();
-		if (Buffer.byteLength(body, 'utf8') > 4_096)
+		if (Buffer.byteLength(body, 'utf8') > 100_000)
 			throw new ApiError(413, 'Request body is too large');
 		let value: unknown;
 		try {
@@ -76,12 +95,29 @@ export const POST: RequestHandler = async (event) => {
 		const parsed = bodySchema.safeParse(value);
 		if (!parsed.success)
 			throw new ApiError(400, 'Please provide a valid ChatGPT connection action');
+		if (parsed.data.action !== 'import' && Buffer.byteLength(body, 'utf8') > 4_096)
+			throw new ApiError(413, 'Request body is too large');
 
 		if (parsed.data.action === 'disconnect') {
 			consumeRateLimit(`chatgpt-disconnect:${event.locals.user.id}`, 20, 15 * 60 * 1000);
 			return json(await disconnectChatGPTAccount(event.locals.user.id, parsed.data.accountId));
 		}
 
+		const sessionToken = event.cookies.get('flavorithm_session');
+		const sessionBinding = getSessionBinding(sessionToken);
+		if (!sessionBinding) throw new ApiError(401, 'Authentication required');
+		if (parsed.data.action === 'import') {
+			consumeRateLimit(`chatgpt-import:${event.locals.user.id}`, 20, 15 * 60 * 1000);
+			return json(
+				await finishChatGPTCompanion({
+					userId: event.locals.user.id,
+					sessionBinding,
+					appUrl: event.url,
+					bundle: parsed.data.bundle
+				}),
+				{ headers: { 'Cache-Control': 'no-store' } }
+			);
+		}
 		const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
 		if (availability.mode === 'unavailable') {
 			throw new ChatGPTOAuthError(
@@ -90,10 +126,24 @@ export const POST: RequestHandler = async (event) => {
 				'chatgpt_oauth_unavailable'
 			);
 		}
-		const sessionToken = event.cookies.get('flavorithm_session');
-		const sessionBinding = getSessionBinding(sessionToken);
-		if (!sessionBinding) throw new ApiError(401, 'Authentication required');
 		enforceChatGPTStartRateLimit(event.locals.user.id, address);
+		const savedAccount = parsed.data.accountId
+			? getChatGPTAccount(event.locals.user.id, parsed.data.accountId)
+			: null;
+		if (
+			availability.mode === 'companion' ||
+			(availability.mode === 'hosted' && savedAccount?.mode === 'local')
+		)
+			return json(
+				startChatGPTCompanion({
+					userId: event.locals.user.id,
+					sessionBinding,
+					appUrl: event.url,
+					accountId: parsed.data.accountId,
+					reconsent: parsed.data.reconsent
+				}),
+				{ headers: { 'Cache-Control': 'no-store, max-age=0' } }
+			);
 		const result = await startChatGPTOAuth({
 			userId: event.locals.user.id,
 			sessionBinding,

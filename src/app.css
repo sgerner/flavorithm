@@ -3540,18 +3540,6 @@ html.dark[data-theme='nosh'] {
 	grid-row: span 4;
 	grid-template-rows: subgrid;
 }
-.subscription-connection {
-	border-block: 1px solid var(--line);
-	padding: 20px 0;
-	margin: 8px 0 18px;
-}
-.subscription-connection .section-line h3 {
-	font-size: 15px;
-}
-.subscription-connection > .muted {
-	font-size: 14px;
-	margin-top: 12px;
-}
 .connection-actions {
 	display: flex;
 	align-items: center;
@@ -3570,20 +3558,6 @@ html.dark[data-theme='nosh'] {
 }
 .connection-status.connected {
 	color: var(--green);
-}
-.provider-note {
-	font-size: 14px;
-	padding: 13px;
-	background: var(--wash);
-	color: var(--muted);
-	line-height: 1.8;
-}
-.provider-note a {
-	display: inline-flex;
-	align-items: center;
-	gap: 5px;
-	color: var(--green);
-	border-bottom: 1px solid var(--line);
 }
 
 .sidebar-close,

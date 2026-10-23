@@ -1,3 +1,5 @@
+import type { ReasoningSettings } from './ai-connections.ts';
+
 export type Ingredient = {
 	id: string;
 	name: string;
@@ -64,6 +66,7 @@ export type Preferences = {
 	dark: boolean;
 	provider: string;
 	model: string;
+	reasoning?: ReasoningSettings;
 	ratings?: Record<string, number>;
 	chatgptAccountId?: string;
 };

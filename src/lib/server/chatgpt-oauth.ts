@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
+import { buildCompanionScript, type CompanionConfig } from './chatgpt-companion.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from 'jose';
 import { ApiError, consumeRateLimit } from '#lib/server/db.ts';
@@ -7,6 +8,7 @@ import {
 	claimChatGPTRefreshLease,
 	clearChatGPTCredentials,
 	consumeHostedOAuthTransaction,
+	consumeChatGPTPairing,
 	decryptChatGPTCredentials,
 	ensureChatGPTHostId,
 	getChatGPTAccount,
@@ -16,6 +18,7 @@ import {
 	releaseChatGPTRefreshLease,
 	saveChatGPTAccount,
 	storeHostedOAuthTransaction,
+	storeChatGPTPairing,
 	type ChatGPTAccount,
 	type ChatGPTCredentials,
 	type OAuthMode
@@ -53,7 +56,7 @@ export class ChatGPTOAuthError extends ApiError {
 }
 
 export type OAuthAvailability = {
-	mode: 'local' | 'hosted' | 'unavailable';
+	mode: 'local' | 'hosted' | 'companion' | 'unavailable';
 	safeReason?: string;
 };
 
@@ -192,10 +195,11 @@ export function getChatGPTOAuthAvailability(input: {
 	if (localRequest) return { mode: 'local' };
 	const hosted = hostedClientConfig();
 	if (hosted && new URL(hosted.redirectUri).origin === input.url.origin) return { mode: 'hosted' };
+	if (input.url.protocol === 'https:') return { mode: 'companion' };
 	return {
 		mode: 'unavailable',
 		safeReason:
-			'ChatGPT plan connections are available on localhost or when hosted OAuth is configured.'
+			'Use HTTPS or open Flavorithm on localhost to authorize a ChatGPT connection securely.'
 	};
 }
 
@@ -479,6 +483,174 @@ export async function startChatGPTOAuth(input: {
 	}
 	if (input.reconsent) authorizationUrl.searchParams.set('prompt', 'consent');
 	return { authorizationUrl: authorizationUrl.toString() };
+}
+
+export function startChatGPTCompanion(input: {
+	userId: string;
+	sessionBinding: string;
+	appUrl: URL;
+	accountId?: string;
+	reconsent?: boolean;
+}): { kind: 'companion'; script: string; filename: string; expiresAt: number } {
+	if (!isSessionBindingActive(input.userId, input.sessionBinding))
+		throw new ChatGPTOAuthError(
+			401,
+			'Your Flavorithm session has expired.',
+			'chatgpt_session_expired'
+		);
+	if (input.appUrl.protocol !== 'https:')
+		throw new ChatGPTOAuthError(
+			403,
+			'Use HTTPS to transfer a ChatGPT connection.',
+			'chatgpt_https_required'
+		);
+	const account = validateAccountForReauthorization(input.userId, input.accountId, 'local');
+	ensureChatGPTHostId(); // Keep the VM's identity separate from the computer completing OAuth.
+	const setup: CompanionConfig = {
+		pairingId: randomValue(),
+		pairingKey: randomValue(),
+		nonce: randomValue(),
+		origin: input.appUrl.origin,
+		expiresAt: Date.now() + TRANSACTION_TTL_MS,
+		clientId: account.clientId,
+		newRegistration: account.newRegistration,
+		...(account.account?.email ? { loginHint: account.account.email } : {}),
+		reconsent: input.reconsent ?? false
+	};
+	storeChatGPTPairing(
+		input.userId,
+		setup.pairingId,
+		JSON.stringify({ ...setup, sessionBinding: input.sessionBinding, accountId: input.accountId }),
+		setup.expiresAt
+	);
+	return {
+		kind: 'companion',
+		script: buildCompanionScript(setup),
+		filename: `flavorithm-chatgpt-connect-${setup.pairingId.slice(0, 8)}.mjs`,
+		expiresAt: setup.expiresAt
+	};
+}
+
+export async function finishChatGPTCompanion(input: {
+	userId: string;
+	sessionBinding: string;
+	appUrl: URL;
+	bundle: { version: 1; pairingId: string; iv: string; tag: string; data: string };
+}): Promise<{ connected: true; accountId: string; planEnabled: boolean }> {
+	const value = consumeChatGPTPairing(input.userId, input.bundle.pairingId);
+	if (!value)
+		throw new ChatGPTOAuthError(
+			400,
+			'This connection file expired or was already used. Download a new connector.',
+			'chatgpt_pairing_expired'
+		);
+	const setup = JSON.parse(value) as CompanionConfig & {
+		sessionBinding: string;
+		accountId?: string;
+	};
+	if (
+		setup.sessionBinding !== input.sessionBinding ||
+		setup.origin !== input.appUrl.origin ||
+		!isSessionBindingActive(input.userId, input.sessionBinding)
+	)
+		throw new ChatGPTOAuthError(
+			403,
+			'Import the connection in the Flavorithm session that downloaded its connector.',
+			'chatgpt_pairing_session_mismatch'
+		);
+	let imported: { clientId: string; token: Record<string, unknown>; receivedAt: number };
+	try {
+		const decipher = createDecipheriv(
+			'aes-256-gcm',
+			Buffer.from(setup.pairingKey, 'base64url'),
+			Buffer.from(input.bundle.iv, 'base64url')
+		);
+		decipher.setAAD(Buffer.from(`flavorithm:companion:${setup.origin}:${setup.pairingId}`));
+		decipher.setAuthTag(Buffer.from(input.bundle.tag, 'base64url'));
+		imported = JSON.parse(
+			Buffer.concat([
+				decipher.update(Buffer.from(input.bundle.data, 'base64url')),
+				decipher.final()
+			]).toString('utf8')
+		);
+	} catch {
+		throw new ChatGPTOAuthError(
+			400,
+			'The encrypted connection file could not be verified.',
+			'chatgpt_pairing_invalid'
+		);
+	}
+	if (
+		!imported ||
+		typeof imported.clientId !== 'string' ||
+		!imported.clientId ||
+		imported.clientId.length > 200 ||
+		imported.clientId === INITIAL_CLIENT_ID ||
+		(!setup.newRegistration && imported.clientId !== setup.clientId) ||
+		!Number.isFinite(imported.receivedAt) ||
+		imported.receivedAt > Date.now() + 5_000 ||
+		Date.now() - imported.receivedAt > TRANSACTION_TTL_MS ||
+		!imported.token ||
+		typeof imported.token !== 'object'
+	)
+		throw new ChatGPTOAuthError(
+			400,
+			'The connection file is invalid. Authorize again.',
+			'chatgpt_pairing_invalid'
+		);
+	const parsed = validateTokenResponse(imported.token);
+	parsed.expiresAt -= Math.max(0, Date.now() - imported.receivedAt);
+	if (parsed.expiresAt <= Date.now())
+		throw new ChatGPTOAuthError(
+			400,
+			'The imported ChatGPT token expired. Authorize again.',
+			'chatgpt_pairing_expired'
+		);
+	const identity = await verifyIdentityToken(
+		parsed.credentials.idToken,
+		imported.clientId,
+		setup.nonce
+	);
+	if (setup.accountId) {
+		const previous = getChatGPTAccount(input.userId, setup.accountId);
+		if (
+			!previous ||
+			previous.mode !== 'local' ||
+			previous.clientId !== imported.clientId ||
+			previous.subject !== identity.sub
+		)
+			throw new ChatGPTOAuthError(
+				401,
+				'Authorize the same ChatGPT account, or add a new account.',
+				'chatgpt_account_mismatch'
+			);
+	}
+	if (!isSessionBindingActive(input.userId, input.sessionBinding))
+		throw new ChatGPTOAuthError(
+			401,
+			'Your Flavorithm session has expired.',
+			'chatgpt_session_expired'
+		);
+	const saved = saveChatGPTAccount({
+		userId: input.userId,
+		...(setup.accountId ? { accountId: setup.accountId } : {}),
+		mode: 'local',
+		clientId: imported.clientId,
+		subject: identity.sub!,
+		email:
+			identity.email_verified === true && typeof identity.email === 'string'
+				? identity.email
+				: null,
+		scopes: parsed.scopes,
+		credentials: parsed.credentials,
+		expiresAt: parsed.expiresAt,
+		earliestRefreshAt: parsed.earliestRefreshAt
+	});
+	return {
+		connected: true,
+		accountId: saved.id,
+		planEnabled: parsed.scopes.includes('chatgpt.tokens.use.direct')
+	};
 }
 
 function setLoopbackCallbackConfiguration(

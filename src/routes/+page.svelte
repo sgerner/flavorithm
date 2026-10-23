@@ -53,6 +53,8 @@
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
+	import AIConnection from '#lib/components/AIConnection.svelte';
+	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
@@ -125,6 +127,7 @@
 		modal = 'auth';
 	}
 	function clearManagedIdentity() {
+		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
 		kitchen = createInitialState();
@@ -209,14 +212,19 @@
 	let connectionPoll: ReturnType<typeof setInterval> | undefined;
 	let connectionPopup: Window | null = null;
 	let connectionPollCount = 0;
+	let connectionAttempt = 0;
 	let activeChatGPTAccount = $derived(
 		chatGPT.accounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
 	);
 
-	let modelQuery = $state('');
-	let providers = $state<
-		{ id: string; name: string; models: { id: string; name: string; vision: boolean }[] }[]
-	>([]);
+	let providers = $state<ConnectionProvider[]>([]);
+	let accountModels = $state<ConnectionModel[]>([]);
+	let catalogLoading = $state(false);
+	let catalogError = $state('');
+	let catalogVersion = 0;
+	let chatGPTCompanion = $state<{ script: string; filename: string; expiresAt: number } | null>(
+		null
+	);
 	let prompt = $state('');
 	let importSession = $state<ImportSession>(emptyImportSession());
 	let resumeImport = $state(false);
@@ -259,7 +267,10 @@
 			(modeChanged && managedAuth && data.user)
 		);
 		if (modeChanged && managedAuth) clearManagedIdentity();
-		if (changedIdentity) kitchenSync?.clearContext();
+		if (changedIdentity) {
+			kitchenSync?.clearContext();
+			clearAIConnectionState();
+		}
 		user = data.user ?? null;
 		if (managedAuth && !user) {
 			clearManagedIdentity();
@@ -820,7 +831,7 @@
 			resumeImport = false;
 			kitchen = createInitialState();
 			localStorage.removeItem('flavorithm-kitchen');
-			apiKey = '';
+			clearAIConnectionState();
 			clearInterval(connectionPoll);
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
@@ -834,30 +845,67 @@
 		}
 	}
 
+	function clearAIConnectionState() {
+		connectionAttempt++;
+		apiKey = '';
+		providers = [];
+		accountModels = [];
+		catalogVersion++;
+		catalogLoading = false;
+		catalogError = '';
+		chatGPTCompanion = null;
+		clearInterval(connectionPoll);
+		connectionPopup?.close();
+		connectionBusy = false;
+		chatGPTAuthorizationUrl = '';
+		chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
+	}
 	async function loadModelCatalog() {
 		if (!user) return;
-		if (kitchen.preferences.provider === 'chatgpt') {
-			if (
-				!kitchen.preferences.chatgptAccountId ||
-				!activeChatGPTAccount?.planEnabled ||
-				!activeChatGPTAccount?.connected
-			) {
-				providers = [];
-				return;
-			}
-			providers = (
-				await request(
-					`/api/models?connection=chatgpt&accountId=${encodeURIComponent(kitchen.preferences.chatgptAccountId)}`
-				)
-			).providers;
-		} else providers = (await request('/api/models')).providers;
+		const version = ++catalogVersion;
+		const owner = user.id;
+		const accountId = kitchen.preferences.chatgptAccountId;
+		const isAccount =
+			kitchen.preferences.provider === 'chatgpt' &&
+			accountId &&
+			activeChatGPTAccount?.connected &&
+			activeChatGPTAccount.planEnabled;
+		catalogLoading = true;
+		catalogError = '';
+		const [catalog, account] = await Promise.allSettled([
+			request('/api/models'),
+			isAccount
+				? request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`)
+				: Promise.resolve(null)
+		]);
+		if (version !== catalogVersion || user?.id !== owner) return;
+		if (catalog.status === 'fulfilled') providers = catalog.value.providers;
+		else catalogError = catalog.reason.message || 'The provider catalog could not be loaded.';
+		if (account.status === 'fulfilled') accountModels = account.value?.providers[0]?.models || [];
+		else {
+			accountModels = [];
+			catalogError = account.reason.message || 'ChatGPT models could not be loaded.';
+		}
+		catalogLoading = false;
 	}
 	async function refreshConnections() {
 		if (!user) return;
-		chatGPT = await request('/api/connections/chatgpt');
+		const owner = user.id;
+		const result = await request('/api/connections/chatgpt');
+		if (user?.id !== owner) return;
+		chatGPT = result;
 		if (!chatGPT.accounts.some((a) => a.id === kitchen.preferences.chatgptAccountId))
 			kitchen.preferences.chatgptAccountId =
 				chatGPT.accounts.find((a) => a.connected && a.planEnabled)?.id || chatGPT.accounts[0]?.id;
+	}
+	async function refreshAISettings() {
+		error = '';
+		try {
+			await refreshConnections();
+		} catch (e) {
+			error = (e as Error).message;
+		}
+		await loadModelCatalog();
 	}
 	async function openSettings(focusAI = false) {
 		mobileNav = false;
@@ -881,10 +929,21 @@
 			error = (e as Error).message;
 		}
 	}
-	async function changeConnection() {
-		apiKey = '';
+	async function changeConnection(providerId?: string) {
+		if (providerId === kitchen.preferences.provider) return;
+		connectionAttempt++;
+		if (providerId && providerId !== kitchen.preferences.provider) {
+			apiKey = '';
+			kitchen.preferences.provider = providerId;
+		}
+		clearInterval(connectionPoll);
+		connectionPopup?.close();
+		connectionBusy = false;
+		chatGPTAuthorizationUrl = '';
+		chatGPTCompanion = null;
 		kitchen.preferences.model = '';
-		modelQuery = '';
+		kitchen.preferences.reasoning = undefined;
+		accountModels = [];
 		error = '';
 		try {
 			await refreshConnections();
@@ -893,19 +952,67 @@
 			error = (e as Error).message;
 		}
 	}
+	function downloadChatGPTCompanion() {
+		if (!chatGPTCompanion) return;
+		const url = URL.createObjectURL(
+			new Blob([chatGPTCompanion.script], { type: 'text/javascript' })
+		);
+		const link = document.createElement('a');
+		link.href = url;
+		link.download = chatGPTCompanion.filename;
+		link.click();
+		setTimeout(() => URL.revokeObjectURL(url), 1000);
+	}
+	async function importChatGPTConnection(file: File) {
+		if (!user || connectionBusy) return;
+		connectionBusy = true;
+		error = '';
+		const owner = user.id;
+		try {
+			if (file.size > 100_000)
+				throw new Error(
+					'Choose the encrypted connection file created by the connector (under 100 KB).'
+				);
+			let bundle: unknown;
+			try {
+				bundle = JSON.parse(await file.text());
+			} catch {
+				throw new Error('Choose the connector’s JSON connection file.');
+			}
+			const result = await request('/api/connections/chatgpt', { action: 'import', bundle });
+			if (user?.id !== owner) return;
+			await refreshConnections();
+			kitchen.preferences.chatgptAccountId = result.accountId;
+			kitchen.preferences.provider = 'chatgpt';
+			kitchen.preferences.model = '';
+			kitchen.preferences.reasoning = undefined;
+			chatGPTCompanion = null;
+			await loadModelCatalog();
+			notify(
+				result.planEnabled
+					? 'ChatGPT connected. Choose a model.'
+					: 'ChatGPT signed in. Enable plan usage to generate recipes.'
+			);
+		} catch (e) {
+			error = (e as Error).message;
+		} finally {
+			connectionBusy = false;
+		}
+	}
 	async function connectChatGPT(accountId?: string, reconsent = false) {
 		if (!user) {
 			openAuthentication();
 			return;
 		}
+		const attempt = ++connectionAttempt;
+		const owner = user.id;
 		connectionBusy = true;
 		chatGPTAuthorizationUrl = '';
 		error = '';
-		connectionPopup = window.open(
-			'about:blank',
-			'flavorithm-chatgpt-connect',
-			'popup,width=620,height=780'
-		);
+		connectionPopup =
+			chatGPT.mode === 'companion'
+				? null
+				: window.open('about:blank', 'flavorithm-chatgpt-connect', 'popup,width=620,height=780');
 		try {
 			const previousAccounts = new Map(chatGPT.accounts.map((a) => [a.id, a.updatedAt]));
 			const previous = JSON.stringify(chatGPT.accounts);
@@ -914,6 +1021,14 @@
 				accountId,
 				reconsent
 			});
+			if (attempt !== connectionAttempt || user?.id !== owner) return;
+			if (result.kind === 'companion') {
+				connectionPopup?.close();
+				chatGPTCompanion = result;
+				connectionBusy = false;
+				return;
+			}
+			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
 			else if (importSession.text || importSession.photo || importSession.draft) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
@@ -925,10 +1040,11 @@
 			connectionPollCount = 0;
 			let polling = false;
 			connectionPoll = setInterval(async () => {
-				if (polling) return;
+				if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
 				polling = true;
 				try {
 					await refreshConnections();
+					if (attempt !== connectionAttempt || user?.id !== owner) return;
 					connectionPollCount++;
 					const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
 					if (connectionChanged || connectionPopup?.closed) {
@@ -946,6 +1062,7 @@
 							kitchen.preferences.chatgptAccountId = account.id;
 							kitchen.preferences.provider = 'chatgpt';
 							kitchen.preferences.model = '';
+							kitchen.preferences.reasoning = undefined;
 							await loadModelCatalog();
 							connectionPopup?.close();
 							notify(
@@ -989,7 +1106,9 @@
 				accountId: activeChatGPTAccount.id
 			});
 			await refreshConnections();
-			providers = [];
+			accountModels = [];
+			chatGPTCompanion = null;
+			kitchen.preferences.reasoning = undefined;
 			kitchen.preferences.model = '';
 			notify(
 				result.remoteRevoked
@@ -1038,6 +1157,7 @@
 					: { apiKey }),
 				provider: kitchen.preferences.provider,
 				model: kitchen.preferences.model,
+				reasoning: kitchen.preferences.reasoning,
 				...(action === 'capture'
 					? {}
 					: {
@@ -2670,164 +2790,29 @@
 							</p>{/if}
 					</div>
 					<div class="settings-section intelligence-settings">
-						<h3 id="ai-connection-heading" tabindex="-1">AI connection</h3>
-						<p class="muted">Connect a model for recipe generation, photos, and nutrition.</p>
-						{#if !user}<p class="field-help">
-								{managedAuth
-									? 'Sign in through your organization to connect a model.'
-									: 'Sign in to link your ChatGPT plan or use your own API key.'}
-							</p>
-							{#if !managedAuth}<button class="secondary" onclick={openAuthentication}
-									>Sign in to connect</button
-								>{/if}{/if}
-						<div class="two-fields">
-							<label class="field"
-								>Connection<select
-									bind:value={kitchen.preferences.provider}
-									onchange={changeConnection}
-									><option value="chatgpt">ChatGPT subscription</option><option value="openai"
-										>OpenAI API key</option
-									><option value="anthropic">Anthropic API key</option><option value="openrouter"
-										>OpenRouter API key</option
-									></select
-								></label
-							><label class="field"
-								>Search models<input
-									bind:value={modelQuery}
-									placeholder={kitchen.preferences.provider === 'chatgpt'
-										? 'Your account’s models…'
-										: 'Search models.dev…'}
-								/></label
-							>
-						</div>
-						{#if kitchen.preferences.provider === 'chatgpt'}
-							<div class="subscription-connection">
-								<div class="section-line">
-									<h3>Cook with your ChatGPT plan</h3>
-									<span
-										class="connection-status"
-										class:connected={activeChatGPTAccount?.connected &&
-											activeChatGPTAccount?.planEnabled}
-										>{activeChatGPTAccount?.connected
-											? activeChatGPTAccount.planEnabled
-												? 'Plan enabled'
-												: 'Sign-in only'
-											: 'Not connected'}</span
-									>
-								</div>
-								<p class="muted">
-									Authorize Flavorithm with ChatGPT. Eligible requests use your plan allowance and
-									app limits, without an API key.
-								</p>
-								{#if chatGPT.accounts.length}<label class="field"
-										>ChatGPT account<select
-											bind:value={kitchen.preferences.chatgptAccountId}
-											onchange={changeConnection}
-											>{#each chatGPT.accounts as account}<option value={account.id}
-													>{account.label}{account.connected
-														? ''
-														: ' · reconnect'}{account.planEnabled ? '' : ' · plan disabled'}</option
-												>{/each}</select
-										></label
-									>{/if}
-								{#if chatGPT.configured}<div class="connection-actions">
-										<button
-											class="primary"
-											disabled={connectionBusy || !user}
-											onclick={() => connectChatGPT(activeChatGPTAccount?.id)}
-											>{connectionBusy
-												? 'Waiting for ChatGPT…'
-												: activeChatGPTAccount
-													? 'Reconnect with ChatGPT'
-													: 'Continue with ChatGPT'}<ArrowUpRight size={16} /></button
-										>{#if chatGPT.accounts.length}<button
-												class="secondary"
-												disabled={connectionBusy}
-												onclick={() => connectChatGPT()}>Add another account</button
-											>{/if}{#if activeChatGPTAccount?.connected && !activeChatGPTAccount.planEnabled}<button
-												class="secondary"
-												disabled={connectionBusy}
-												onclick={() => connectChatGPT(activeChatGPTAccount?.id, true)}
-												>Enable plan usage</button
-											>{/if}
-									</div>{:else}<p class="field-help">
-										{chatGPT.safeReason ||
-											'Sign in to see the connection options for this installation.'}
-									</p>{/if}
-								{#if chatGPTAuthorizationUrl}<div class="connection-actions">
-										<a
-											class="secondary"
-											href={chatGPTAuthorizationUrl}
-											target="_blank"
-											rel="noreferrer noopener"
-											>Continue ChatGPT sign-in <ArrowUpRight size={16} /></a
-										>
-									</div>
-									<p class="field-help">Opens a new tab so your recipe draft stays here.</p>{/if}
-								{#if chatGPT.mode === 'local'}<p class="field-help">
-										Connect from a browser on the computer running Flavorithm. OpenAI’s local-app
-										flow returns to a temporary 127.0.0.1 callback.
-									</p>{/if}
-								{#if activeChatGPTAccount?.connected}<div class="connection-actions">
-										<a
-											class="text-button"
-											href="https://chatgpt.com/settings/usage"
-											target="_blank"
-											rel="noreferrer">Manage usage in ChatGPT <ArrowUpRight size={14} /></a
-										><button
-											class="text-button danger"
-											disabled={connectionBusy}
-											onclick={disconnectChatGPT}>Disconnect account</button
-										>
-									</div>{/if}
-								<p class="field-help">
-									Plan availability and weekly app limits are managed by ChatGPT. Flavorithm will
-									not switch to API-key billing automatically. Your ChatGPT conversations and
-									memories are not imported.
-								</p>
-							</div>
-						{:else}
-							<label class="field"
-								>API key<input
-									type="password"
-									autocomplete="off"
-									placeholder="Your provider API key"
-									bind:value={apiKey}
-								/></label
-							>
-							<p class="field-help">
-								API keys stay in memory for this tab. Requests use the selected provider’s API
-								billing. Image scanning needs a model that supports images.
-							</p>
-							{#if kitchen.preferences.provider === 'anthropic'}<p class="provider-note">
-									Claude subscription access through third-party products requires Anthropic
-									approval. This connection uses the supported Console API key flow. <a
-										href="https://code.claude.com/docs/en/agent-sdk/overview"
-										target="_blank"
-										rel="noreferrer">Read the current requirements <ArrowUpRight size={13} /></a
-									>
-								</p>{/if}
-						{/if}
-						<label class="field"
-							>Model<select bind:value={kitchen.preferences.model}
-								><option value="">Select a model</option
-								>{#each (providers.find((p) => p.id === kitchen.preferences.provider)?.models || []).filter( (m) => `${m.name} ${m.id}`
-											.toLowerCase()
-											.includes(modelQuery.toLowerCase()) ) as model}<option value={model.id}
-										>{model.name}{model.vision ? ' · image input' : ''}</option
-									>{/each}</select
-							></label
-						>
-						{#if kitchen.preferences.provider === 'chatgpt' && activeChatGPTAccount?.connected && activeChatGPTAccount.planEnabled}<button
-								class="text-button"
-								onclick={() => loadModelCatalog().catch((e) => (error = e.message))}
-								><RefreshCw size={14} /> Refresh account model catalog</button
-							>{/if}
-						<label class="field"
-							>Default cooking complexity<select bind:value={kitchen.preferences.complexity}
-								><option>Easy</option><option>Moderate</option><option>Adventurous</option></select
-							></label
-						>
+						<AIConnection
+							bind:preferences={kitchen.preferences}
+							bind:apiKey
+							{providers}
+							{accountModels}
+							{chatGPT}
+							activeAccount={activeChatGPTAccount}
+							signedIn={Boolean(user)}
+							{managedAuth}
+							busy={connectionBusy}
+							loading={catalogLoading}
+							{catalogError}
+							authorizationUrl={chatGPTAuthorizationUrl}
+							companion={chatGPTCompanion}
+							onselect={(id) => changeConnection(id)}
+							onaccount={() => changeConnection()}
+							onconnect={connectChatGPT}
+							ondisconnect={disconnectChatGPT}
+							onrefresh={refreshAISettings}
+							onsignin={openAuthentication}
+							ondownload={downloadChatGPTCompanion}
+							onimport={importChatGPTConnection}
+						/>
 					</div>
 
 					{#if user}<div class="settings-section">

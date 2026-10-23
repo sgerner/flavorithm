@@ -323,3 +323,23 @@ test('import estimates survive household storage, with bounded notes', async () 
 	invalidProvenance.recipes[0].provenance = 'unknown';
 	assert.equal(backend.validateAppState(invalidProvenance), null);
 });
+
+test('reasoning preferences survive persistence and reject invalid budgets', async () => {
+	const account = await backend.registerUser(
+		'Reasoning Test',
+		'reasoning-settings@example.com',
+		'a secure test password'
+	);
+	const state = backend.getState(account.user);
+	state.preferences.reasoning = { effort: 'high', enabled: true, budgetTokens: 2048 };
+	backend.saveState(account.user, state, {
+		ifMatch: backend.getStateEtag(account.user),
+		ifNoneMatch: null
+	});
+	assert.deepEqual(
+		backend.getState(account.user).preferences.reasoning,
+		state.preferences.reasoning
+	);
+	state.preferences.reasoning.budgetTokens = -1;
+	assert.equal(backend.validateAppState(state), null);
+});

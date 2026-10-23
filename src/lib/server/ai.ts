@@ -4,8 +4,14 @@ import { request as httpsRequest, type RequestOptions } from 'node:https';
 import { isIP } from 'node:net';
 import { z } from 'zod';
 import type { Ingredient, Preferences, Recipe } from '#lib/types.ts';
+import { PROVIDER_ENDPOINTS } from './provider-endpoints.ts';
+import {
+	modelMetadata,
+	type ConnectionProvider,
+	type ReasoningSettings
+} from '#lib/ai-connections.ts';
 
-export type AIProvider = 'openai' | 'anthropic' | 'openrouter' | 'chatgpt';
+export type AIProvider = string;
 export type AIAction = 'generate' | 'vision' | 'nutrition' | 'search' | 'import' | 'capture';
 
 const MAX_IMAGE_DATA_LENGTH = 7_000_000;
@@ -41,7 +47,7 @@ const PreferencesInputSchema = z.object({
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
 	theme: z.string().max(80),
 	dark: z.boolean(),
-	provider: z.string().max(40),
+	provider: z.string().max(100),
 	model: z.string().max(200)
 });
 
@@ -83,8 +89,21 @@ const RecipeInputSchema = z.object({
 const AIRequestSchema = z
 	.object({
 		action: z.enum(['generate', 'vision', 'nutrition', 'search', 'import', 'capture']),
-		provider: z.enum(['openai', 'anthropic', 'openrouter', 'chatgpt']).optional(),
+		provider: z
+			.string()
+			.regex(/^[a-z0-9-]{1,100}$/)
+			.optional(),
 		model: z.string().trim().max(200).optional(),
+		reasoning: z
+			.object({
+				effort: z
+					.string()
+					.regex(/^[a-z_]{1,24}$/)
+					.optional(),
+				enabled: z.boolean().optional(),
+				budgetTokens: z.number().int().min(0).max(32_768).optional()
+			})
+			.optional(),
 		apiKey: z.string().max(1_000).optional(),
 		connectionId: z.string().max(100).optional(),
 		pantry: z.array(IngredientInputSchema).max(300).optional().default([]),
@@ -321,6 +340,42 @@ export async function runAIRequest(
 	if (!provider || !selectedModel || !selectedApiKey) {
 		throw new AIRequestError('A provider, model, and API key are required.');
 	}
+	if (provider !== 'chatgpt' && !Object.hasOwn(PROVIDER_ENDPOINTS, provider))
+		throw new AIRequestError(
+			'This provider needs an integration that Flavorithm does not support yet.'
+		);
+	if (request.reasoning && Object.keys(request.reasoning).length) {
+		const catalog = await getSupportedModels(requestFetcher);
+		const metadata = catalog.providers
+			.find((p) => p.id === (provider === 'chatgpt' ? 'openai' : provider))
+			?.models.find((m) => m.id === selectedModel)?.reasoning;
+		if (
+			!metadata ||
+			(request.reasoning.effort && !metadata.efforts.includes(request.reasoning.effort)) ||
+			(request.reasoning.enabled !== undefined && !metadata.toggle) ||
+			(request.reasoning.budgetTokens !== undefined &&
+				(metadata.budgetMin === undefined ||
+					request.reasoning.budgetTokens < metadata.budgetMin ||
+					request.reasoning.budgetTokens > (metadata.budgetMax ?? 32_768)))
+		)
+			throw new AIRequestError('Choose reasoning settings supported by the selected model.');
+		if (
+			request.reasoning.enabled === false &&
+			(request.reasoning.effort || request.reasoning.budgetTokens !== undefined)
+		)
+			throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
+		if (
+			provider === 'anthropic' &&
+			metadata.budgetMin !== undefined &&
+			request.reasoning.enabled !== false &&
+			(request.reasoning.enabled || request.reasoning.effort) &&
+			request.reasoning.budgetTokens === undefined
+		)
+			request.reasoning.budgetTokens = Math.min(
+				metadata.budgetMax ?? 32_768,
+				Math.max(2048, metadata.budgetMin)
+			);
+	}
 	if (request.action === 'import') {
 		if (!request.url) throw new AIRequestError('A recipe URL is required to import a recipe.');
 		return importRecipe(
@@ -330,7 +385,8 @@ export async function runAIRequest(
 			selectedApiKey,
 			requestFetcher,
 			pageFetcher,
-			requestSignal
+			requestSignal,
+			request.reasoning
 		);
 	}
 	if (request.action === 'capture') {
@@ -357,7 +413,8 @@ export async function runAIRequest(
 					request.action,
 					prompt,
 					image,
-					requestFetcher
+					requestFetcher,
+					request.reasoning
 				)
 			: await callOpenAICompatible(
 					provider,
@@ -366,7 +423,8 @@ export async function runAIRequest(
 					request.action,
 					prompt,
 					image,
-					requestFetcher
+					requestFetcher,
+					request.reasoning
 				);
 
 	return validateResult(request.action, modelResult);
@@ -504,14 +562,92 @@ function promptFor(action: ModelResultSchema) {
 	return `Return only valid JSON matching this schema. Do not add markdown or text outside the JSON object. Required result schema: ${JSON.stringify(SUPPORTED_JSON_SCHEMAS[action])}`;
 }
 
-async function callOpenAICompatible(
-	provider: Exclude<AIProvider, 'anthropic'>,
+export function compatibleReasoning(
+	provider: string,
+	settings?: ReasoningSettings
+): Record<string, unknown> {
+	if (!settings) return {};
+	if (provider === 'openrouter')
+		return {
+			reasoning: {
+				...(settings.effort ? { effort: settings.effort } : {}),
+				...(settings.enabled !== undefined ? { enabled: settings.enabled } : {}),
+				...(settings.budgetTokens !== undefined ? { max_tokens: settings.budgetTokens } : {})
+			}
+		};
+	return {
+		...(settings.effort ? { reasoning_effort: settings.effort } : {}),
+		...(provider === 'deepseek' && settings.enabled !== undefined
+			? { thinking: { type: settings.enabled ? 'enabled' : 'disabled' } }
+			: {})
+	};
+}
+
+async function callGoogle(
 	model: string,
 	apiKey: string,
 	action: Exclude<AIAction, 'search'>,
 	prompt: string,
 	image: ReturnType<typeof parseDataImage> | undefined,
-	fetcher: Fetcher
+	fetcher: Fetcher,
+	reasoning?: ReasoningSettings
+) {
+	const response = await fetchWithTimeout(
+		fetcher,
+		`${PROVIDER_ENDPOINTS.google}/models/${encodeURIComponent(model)}:generateContent`,
+		{
+			method: 'POST',
+			redirect: 'error',
+			headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+			body: JSON.stringify({
+				systemInstruction: { parts: [{ text: promptFor(action) }] },
+				contents: [
+					{
+						role: 'user',
+						parts: [
+							{ text: prompt },
+							...(image ? [{ inlineData: { mimeType: image.mediaType, data: image.base64 } }] : [])
+						]
+					}
+				],
+				generationConfig: {
+					responseMimeType: 'application/json',
+					maxOutputTokens: 8192 + (reasoning?.budgetTokens ?? 0),
+					...(reasoning
+						? {
+								thinkingConfig: {
+									...(reasoning.effort ? { thinkingLevel: reasoning.effort.toUpperCase() } : {}),
+									...(reasoning.budgetTokens !== undefined
+										? { thinkingBudget: reasoning.budgetTokens }
+										: {})
+								}
+							}
+						: {})
+				}
+			}),
+			signal: AbortSignal.timeout(reasoning ? 90_000 : PROVIDER_TIMEOUT_MS)
+		},
+		'Google'
+	);
+	const body = await readJsonResponse(response, 'Google');
+	if (!response.ok) throw upstreamError(response.status, 'Google');
+	return parseModelJson(
+		body?.candidates?.[0]?.content?.parts
+			?.filter((part: any) => !part.thought && typeof part.text === 'string')
+			.map((part: any) => part.text)
+			.join('\n')
+	);
+}
+
+async function callOpenAICompatible(
+	provider: AIProvider,
+	model: string,
+	apiKey: string,
+	action: Exclude<AIAction, 'search'>,
+	prompt: string,
+	image: ReturnType<typeof parseDataImage> | undefined,
+	fetcher: Fetcher,
+	reasoning?: ReasoningSettings
 ) {
 	if (provider === 'chatgpt')
 		return parseModelJson(
@@ -521,15 +657,17 @@ async function callOpenAICompatible(
 					model,
 					instructions: promptFor(action),
 					prompt,
-					image: image?.dataUrl
+					image: image?.dataUrl,
+					reasoning
 				},
 				fetcher
 			)
 		);
-	const endpoint =
-		provider === 'openrouter'
-			? 'https://openrouter.ai/api/v1/chat/completions'
-			: 'https://api.openai.com/v1/chat/completions';
+	if (provider === 'google')
+		return callGoogle(model, apiKey, action, prompt, image, fetcher, reasoning);
+	if (!Object.hasOwn(PROVIDER_ENDPOINTS, provider))
+		throw new AIRequestError('Unsupported provider.');
+	const endpoint = `${PROVIDER_ENDPOINTS[provider]}/chat/completions`;
 	const userContent = image
 		? [
 				{ type: 'text', text: prompt },
@@ -548,15 +686,19 @@ async function callOpenAICompatible(
 			},
 			body: JSON.stringify({
 				model,
+				...compatibleReasoning(provider, reasoning),
 				messages: [
 					{ role: 'system', content: promptFor(action) },
 					{ role: 'user', content: userContent }
 				],
-				response_format: { type: 'json_object' },
-				max_completion_tokens:
-					action === 'generate' || action === 'import' || action === 'capture' ? 4096 : 1200
+				...(['openai', 'openrouter'].includes(provider)
+					? { response_format: { type: 'json_object' } }
+					: {}),
+				[provider === 'openai' ? 'max_completion_tokens' : 'max_tokens']:
+					(action === 'generate' || action === 'import' || action === 'capture' ? 4096 : 1200) +
+					(reasoning?.budgetTokens ?? (reasoning ? 4096 : 0))
 			}),
-			signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+			signal: AbortSignal.timeout(reasoning ? 90_000 : PROVIDER_TIMEOUT_MS)
 		},
 		'AI provider'
 	);
@@ -582,7 +724,8 @@ async function callAnthropic(
 	action: Exclude<AIAction, 'search'>,
 	prompt: string,
 	image: ReturnType<typeof parseDataImage> | undefined,
-	fetcher: Fetcher
+	fetcher: Fetcher,
+	reasoning?: ReasoningSettings
 ) {
 	const userContent = image
 		? [
@@ -607,17 +750,26 @@ async function callAnthropic(
 			body: JSON.stringify({
 				model,
 				max_tokens:
-					action === 'generate' || action === 'import' || action === 'capture' ? 4096 : 1200,
+					(action === 'generate' || action === 'import' || action === 'capture' ? 4096 : 1200) +
+					(reasoning?.budgetTokens ?? (reasoning ? 4096 : 0)),
+				...(reasoning?.enabled === false
+					? { thinking: { type: 'disabled' } }
+					: reasoning?.budgetTokens
+						? { thinking: { type: 'enabled', budget_tokens: reasoning.budgetTokens } }
+						: reasoning?.enabled || reasoning?.effort
+							? { thinking: { type: 'adaptive' } }
+							: {}),
 				system: promptFor(action),
 				messages: [{ role: 'user', content: userContent }],
 				output_config: {
+					...(reasoning?.effort ? { effort: reasoning.effort } : {}),
 					format: {
 						type: 'json_schema',
 						schema: SUPPORTED_JSON_SCHEMAS[action]
 					}
 				}
 			}),
-			signal: AbortSignal.timeout(PROVIDER_TIMEOUT_MS)
+			signal: AbortSignal.timeout(reasoning ? 90_000 : PROVIDER_TIMEOUT_MS)
 		},
 		'Anthropic'
 	);
@@ -1144,8 +1296,26 @@ async function captureRecipe(
 	assertRequestActive(requestSignal);
 	const modelResult =
 		provider === 'anthropic'
-			? await callAnthropic(provider, model, apiKey, 'capture', prompt, image, fetcher)
-			: await callOpenAICompatible(provider, model, apiKey, 'capture', prompt, image, fetcher);
+			? await callAnthropic(
+					provider,
+					model,
+					apiKey,
+					'capture',
+					prompt,
+					image,
+					fetcher,
+					request.reasoning
+				)
+			: await callOpenAICompatible(
+					provider,
+					model,
+					apiKey,
+					'capture',
+					prompt,
+					image,
+					fetcher,
+					request.reasoning
+				);
 	const parsed = CapturedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
 	const { assumptions, ...draft } = parsed.data;
@@ -1506,7 +1676,8 @@ async function importRecipe(
 	apiKey: string,
 	fetcher: Fetcher,
 	pageFetcher: SecureRecipePageFetcher,
-	requestSignal?: AbortSignal
+	requestSignal?: AbortSignal,
+	reasoning?: ReasoningSettings
 ) {
 	const selectedUrl = validateRecipeUrl(inputUrl);
 	assertRequestActive(requestSignal);
@@ -1529,8 +1700,26 @@ async function importRecipe(
 	const prompt = buildImportPrompt(sourceRecipe, sourceUrl);
 	const modelResult =
 		provider === 'anthropic'
-			? await callAnthropic(provider, model, apiKey, 'import', prompt, undefined, fetcher)
-			: await callOpenAICompatible(provider, model, apiKey, 'import', prompt, undefined, fetcher);
+			? await callAnthropic(
+					provider,
+					model,
+					apiKey,
+					'import',
+					prompt,
+					undefined,
+					fetcher,
+					reasoning
+				)
+			: await callOpenAICompatible(
+					provider,
+					model,
+					apiKey,
+					'import',
+					prompt,
+					undefined,
+					fetcher,
+					reasoning
+				);
 	const parsed = ImportedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
 	return {
@@ -2020,24 +2209,15 @@ async function readJsonResponse(response: Response, service: string): Promise<an
 	}
 }
 
-const SUPPORTED_PROVIDERS = ['openai', 'anthropic', 'openrouter'] as const;
-
-export type SupportedModelResponse = {
-	providers: Array<{
-		id: AIProvider;
-		name: string;
-		models: Array<{ id: string; name: string; vision: boolean }>;
-	}>;
-};
+export type SupportedModelResponse = { providers: ConnectionProvider[] };
 
 export function transformModelCatalog(catalog: unknown): SupportedModelResponse {
-	if (!catalog || typeof catalog !== 'object')
+	if (!catalog || typeof catalog !== 'object' || Array.isArray(catalog))
 		throw new AIRequestError('The model catalog is invalid.', 502);
-	const root = catalog as Record<string, any>;
-	const providers: SupportedModelResponse['providers'] = [];
-	for (const providerId of SUPPORTED_PROVIDERS) {
-		const source = root[providerId];
+	const providers: ConnectionProvider[] = [];
+	for (const [providerId, source] of Object.entries(catalog as Record<string, any>)) {
 		if (
+			!/^[a-z0-9-]{1,100}$/.test(providerId) ||
 			!source ||
 			typeof source !== 'object' ||
 			!source.models ||
@@ -2046,22 +2226,61 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 			continue;
 		const models = Object.entries(source.models as Record<string, any>)
 			.flatMap(([key, model]) => {
-				if (!model || typeof model !== 'object') return [];
+				if (!model || typeof model !== 'object' || model.status === 'deprecated') return [];
+				if (Array.isArray(model.modalities?.output) && !model.modalities.output.includes('text'))
+					return [];
 				const id = typeof model.id === 'string' ? model.id : key;
-				const name = typeof model.name === 'string' ? model.name : id;
 				if (!id || id.length > 200) return [];
-				const modalities = model.modalities?.input;
-				const vision = Array.isArray(modalities) && modalities.includes('image');
-				return [{ id, name, vision }];
+				return [
+					{
+						id,
+						name: typeof model.name === 'string' ? model.name : id,
+						vision:
+							Array.isArray(model.modalities?.input) && model.modalities.input.includes('image'),
+						...modelMetadata(model)
+					}
+				].map((entry) => {
+					if (entry.reasoning) {
+						if (!['anthropic', 'openrouter', 'deepseek'].includes(providerId))
+							entry.reasoning.toggle = false;
+						if (
+							!['anthropic', 'openrouter', 'google'].includes(providerId) ||
+							(providerId === 'google' && entry.reasoning.efforts.length)
+						) {
+							delete entry.reasoning.budgetMin;
+							delete entry.reasoning.budgetMax;
+						}
+						if (
+							!entry.reasoning.efforts.length &&
+							!entry.reasoning.toggle &&
+							entry.reasoning.budgetMin === undefined
+						)
+							delete entry.reasoning;
+					}
+					return entry;
+				});
 			})
 			.sort((a, b) => a.name.localeCompare(b.name));
-		if (models.length) {
-			providers.push({
-				id: providerId,
-				name: typeof source.name === 'string' ? source.name : providerId,
-				models
-			});
-		}
+		if (!models.length) continue;
+		let documentation: string | undefined;
+		try {
+			const url = new URL(source.doc);
+			if (url.protocol === 'https:' && !url.username && !url.password) documentation = url.href;
+		} catch {}
+		providers.push({
+			id: providerId,
+			name: typeof source.name === 'string' ? source.name : providerId,
+			models,
+			supported: Object.hasOwn(PROVIDER_ENDPOINTS, providerId),
+			...(Array.isArray(source.env)
+				? {
+						apiKeyHint: source.env.find(
+							(key: unknown) => typeof key === 'string' && /KEY|TOKEN/.test(key)
+						)
+					}
+				: {}),
+			...(documentation ? { documentation } : {})
+		});
 	}
 	return { providers };
 }
@@ -2075,7 +2294,7 @@ export async function getSupportedModels(
 		{
 			method: 'GET',
 			redirect: 'error',
-			headers: { Accept: 'application/json' },
+			headers: { Accept: 'application/json', 'User-Agent': 'Flavorithm/1.0' },
 			signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
 		},
 		'Model catalog'

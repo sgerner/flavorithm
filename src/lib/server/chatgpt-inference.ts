@@ -1,3 +1,4 @@
+import type { ReasoningSettings } from '#lib/ai-connections.ts';
 /** Official Sign in with ChatGPT plan inference, over the public Responses API. */
 export class ChatGPTInferenceError extends Error {
 	status: number;
@@ -134,6 +135,7 @@ export async function chatGPTResponse(
 		instructions: string;
 		prompt: string;
 		image?: string;
+		reasoning?: ReasoningSettings;
 	},
 	fetcher: typeof fetch = fetch
 ): Promise<string> {
@@ -158,6 +160,7 @@ export async function chatGPTResponse(
 			signal: controller,
 			body: JSON.stringify({
 				model: options.model,
+				...(options.reasoning?.effort ? { reasoning: { effort: options.reasoning.effort } } : {}),
 				instructions: options.instructions,
 				input: [{ role: 'user', content }],
 				store: false,

@@ -10,6 +10,7 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"test": "node --experimental-strip-types --test tests/*.test.ts",
 		"seed:dev": "node --experimental-strip-types scripts/seed-dev.mjs",
+		"catalog:update": "node scripts/update-provider-endpoints.mjs",
 		"format": "prettier --write .",
 		"test:smoke": "node scripts/smoke-test.mjs",
 		"test:sso": "node scripts/sso-smoke-test.mjs",
