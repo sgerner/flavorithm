@@ -26,7 +26,6 @@
 		nutrition,
 		edit,
 		remove,
-		toggleHidden,
 		busy
 	}: {
 		recipe: Recipe;
@@ -38,7 +37,6 @@
 		nutrition: () => void;
 		edit: () => void;
 		remove: () => void;
-		toggleHidden: () => void;
 		busy: boolean;
 	} = $props();
 	let nutritionMode = $state('serving');
@@ -92,9 +90,6 @@
 					onclick={save}
 					aria-label="Save recipe"
 					><Bookmark size={19} fill={recipe.saved ? 'currentColor' : 'none'} /></button
-				>
-				<button class="secondary recipe-manage-button" onclick={toggleHidden}
-					>{recipe.hidden ? 'Restore' : 'Hide'}</button
 				>
 				{#if recipe.saved}<button class="secondary recipe-manage-button" onclick={edit}>Edit</button
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
@@ -151,9 +146,7 @@
 					</div>
 				</div>
 			{:else}<div class="nutrition-panel" transition:revealMotion|global>
-					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
-							Ingredients or servings changed. Refresh this estimate before relying on it.
-						</p>{/if}
+					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">Ingredients or servings changed. Refresh this estimate before relying on it.</p>{/if}
 					<label class="servings nutrition-selector"
 						>Show nutrition for<select bind:value={nutritionMode}
 							><option value="serving">One serving</option><option value="recipe"
