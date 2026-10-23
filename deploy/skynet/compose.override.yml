@@ -3,8 +3,44 @@ services:
     ports: !reset []
     volumes:
       - /home/skynet/opt/appdata/flavorithm:/app/data
+    environment:
+      WHISPER_TRANSCRIPTION_URL: http://flavorithm-whisper:8080/inference
+      WHISPER_MODEL: base
     networks:
       - proxy
+      - voice
+
+  flavorithm-whisper:
+    image: ghcr.io/ggml-org/whisper.cpp@sha256:7a4e5f481192899f6c3853ff181ea6347b219ca2f388e1d84870b84ad80f6b7f
+    container_name: flavorithm-whisper
+    restart: unless-stopped
+    entrypoint: ["/bin/bash", "-ec"]
+    command: >-
+      exec whisper-server --model /models/ggml-base.bin --host 0.0.0.0 --port 8080 --threads 4 --no-gpu
+    user: "10001:10001"
+    volumes:
+      - /home/skynet/opt/appdata/flavorithm-whisper:/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,uid=10001,gid=10001,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    cpus: 4
+    mem_limit: 2g
+    healthcheck:
+      test: [CMD, curl, --fail, --silent, http://127.0.0.1:8080/health]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+    networks:
+      - voice
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+      diun.enable: "false"
 
   flavorithm-updater:
     image: docker:cli
@@ -28,3 +64,6 @@ services:
 networks:
   proxy:
     external: true
+  voice:
+    name: flavorithm-voice
+    internal: true
