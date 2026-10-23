@@ -55,6 +55,9 @@
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
+	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
+	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
+	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
@@ -191,6 +194,54 @@
 	let password = $state('');
 	let error = $state('');
 	let apiKey = $state('');
+	let voiceProvider = $state<VoiceProvider>('auto');
+	let voiceModel = $state('');
+	let voiceApiKey = $state('');
+	let localVoiceAvailable = $state(false);
+	let voiceState = $state<VoiceState>('idle');
+	let voiceStarting = $state(false);
+	let voiceTarget = $state('');
+	let voiceCapture: VoiceCapture | undefined;
+	let voiceOwner = $derived(user?.id ?? '');
+	$effect(() => {
+		const owner = voiceOwner;
+		if (typeof window === 'undefined') return;
+		voiceCapture?.cancel();
+		voiceStarting = false;
+		voiceApiKey = '';
+		voiceProvider = 'auto';
+		voiceModel = '';
+		localVoiceAvailable = false;
+		if (owner) {
+			try {
+				const saved = JSON.parse(localStorage.getItem(`flavorithm-voice:${owner}`) || '{}');
+				const spec = voiceProviders.find((item) => item.id === saved.provider);
+				if (spec) {
+					voiceProvider = spec.id;
+					voiceModel =
+						'models' in spec
+							? (spec.models as readonly string[]).includes(saved.model)
+								? saved.model
+								: spec.models[0]
+							: '';
+				}
+			} catch {}
+			fetch('/api/voice')
+				.then((r) => (r.ok ? r.json() : null))
+				.then((data) => {
+					if (user?.id === owner) localVoiceAvailable = Boolean(data?.localAvailable);
+				})
+				.catch(() => {});
+		}
+		return () => voiceCapture?.cancel();
+	});
+	$effect(() => {
+		if (voiceTarget && modal !== voiceTarget) {
+			voiceCapture?.cancel();
+			voiceStarting = false;
+			voiceTarget = '';
+		}
+	});
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
 	let verificationBusy = $state(false);
@@ -646,6 +697,7 @@
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
 			clearInterval(connectionPoll);
+			voiceCapture?.cancel();
 		};
 	});
 	function adoptKitchen(state: AppState) {
@@ -1247,42 +1299,63 @@
 	function dictateRecipe() {
 		startDictation(true);
 	}
-	function startDictation(forRecipe: boolean) {
-		const Recognition =
-			(window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-		if (!Recognition) {
-			notify('Voice input is unavailable in this browser. Try Chrome or type your ingredients.');
+	async function startDictation(forRecipe: boolean) {
+		if (voiceStarting || voiceState !== 'idle') return;
+		const provider =
+			voiceProvider === 'auto'
+				? localVoiceAvailable && user
+					? 'local'
+					: 'browser'
+				: voiceProvider;
+		if (provider !== 'browser' && !user) {
+			openAuthentication();
 			return;
 		}
-		const recognition = new Recognition();
+		if ((provider === 'groq' || provider === 'deepgram') && !voiceApiKey.trim()) {
+			modal = 'settings';
+			notify('Add a voice API key in Voice input settings.');
+			return;
+		}
+		if (provider === 'local' && !localVoiceAvailable) {
+			modal = 'settings';
+			notify('Local Whisper needs an endpoint configured by the server operator.');
+			return;
+		}
+		voiceCapture?.cancel();
+		voiceStarting = true;
+		voiceTarget = forRecipe ? 'import' : 'pantry';
+		if (!forRecipe) modal = 'pantry';
 		const inputSession = importSession;
-		recognition.lang = navigator.language;
-		recognition.interimResults = false;
-		recognition.onresult = (e: any) => {
-			if (forRecipe) {
-				if (modal !== 'import' || importSession !== inputSession || importSession.draft) return;
-				importSession.text = [importSession.text, e.results[0][0].transcript]
-					.filter(Boolean)
-					.join('\n')
-					.slice(0, 20000);
-			} else {
-				pantryInput += (pantryInput ? ', ' : '') + e.results[0][0].transcript;
-				modal = 'pantry';
-				notify('Review your ingredients, then add them.');
+		const owner = user?.id;
+		const capture = new VoiceCapture({
+			state: (value) => {
+				voiceState = value;
+			},
+			text: (text) => {
+				if (user?.id !== owner || modal !== (forRecipe ? 'import' : 'pantry')) return;
+				if (forRecipe) {
+					if (importSession !== inputSession || importSession.draft) return;
+					importSession.text = [importSession.text, text]
+						.filter(Boolean)
+						.join('\n')
+						.slice(0, 20000);
+				} else {
+					pantryInput = [pantryInput, text].filter(Boolean).join(', ');
+					notify('Review your ingredients, then add them.');
+				}
+			},
+			error: (message) => {
+				notify(message);
 			}
-		};
-		recognition.onerror = () => notify('Microphone access failed. Check browser permissions.');
+		});
+		voiceCapture = capture;
 		try {
-			recognition.start();
-			notify(
-				forRecipe
-					? 'Listening… describe your recipe.'
-					: 'Listening… tell us what’s in your kitchen.'
-			);
-		} catch {
-			notify('Voice input could not start. Try again or paste text.');
+			await capture.start({ provider, model: voiceModel, apiKey: voiceApiKey });
+		} finally {
+			if (voiceCapture === capture) voiceStarting = false;
 		}
 	}
+
 	function saveRecipe(r: Recipe) {
 		r.saved = !r.saved;
 		kitchen.recipes = [...kitchen.recipes];
@@ -2566,6 +2639,28 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
+				{#if voiceState !== 'idle' || voiceStarting}<div class="voice-session" in:revealMotion>
+						<p role="status" aria-live="polite">
+							{voiceStarting
+								? 'Opening microphone…'
+								: voiceState === 'recording'
+									? 'Listening… up to 2 minutes'
+									: 'Transcribing…'}
+						</p>
+						<div class="dialog-actions">
+							{#if voiceState === 'recording'}<button
+									class="primary"
+									onclick={() => voiceCapture?.stop()}>Stop recording</button
+								>{/if}<button
+								class="secondary"
+								onclick={() => {
+									voiceCapture?.cancel();
+									voiceStarting = false;
+								}}>Cancel voice</button
+							>
+						</div>
+					</div>{/if}
+
 				<button
 					class="icon-button dialog-close"
 					onclick={() => {
@@ -2841,6 +2936,15 @@
 							</p>{:else}<p class="muted">
 								Unavailable. Set BRAVE_SEARCH_API_KEY on this installation to enable search.
 							</p>{/if}
+					</div>
+					<div class="settings-section">
+						<VoiceSettings
+							bind:provider={voiceProvider}
+							bind:model={voiceModel}
+							bind:apiKey={voiceApiKey}
+							localAvailable={localVoiceAvailable}
+							userId={user?.id}
+						/>
 					</div>
 					<div class="settings-section intelligence-settings">
 						<AIConnection
@@ -3232,6 +3336,19 @@
 	</div>{/if}
 
 <style>
+	.voice-session {
+		position: sticky;
+		top: 0;
+		z-index: 5;
+		background: var(--surface);
+		padding: 16px;
+		border-bottom: 2px solid var(--accent);
+	}
+	.voice-session p {
+		font-size: 17px;
+		margin: 0 0 12px;
+	}
+
 	.expiry-filters {
 		display: flex;
 		gap: 8px;
