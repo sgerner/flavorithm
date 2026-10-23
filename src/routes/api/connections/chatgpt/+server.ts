@@ -1,3 +1,9 @@
+import {
+	configureHostAI,
+	getHostAI,
+	isHostAdmin,
+	HOST_CONNECTION_ID
+} from '#lib/server/host-ai.ts';
 import { startCodexDevice, pollCodexDevice, cancelCodexDevice } from '#lib/server/codex-device.ts';
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
@@ -14,6 +20,11 @@ import {
 } from '#lib/server/chatgpt-oauth.ts';
 
 const bodySchema = z.discriminatedUnion('action', [
+	z.object({
+		action: z.literal('host'),
+		accountId: z.string().min(1).max(100).optional(),
+		model: z.string().min(1).max(200).optional()
+	}),
 	z.object({
 		action: z.literal('start'),
 		accountId: z.string().min(1).max(100).optional(),
@@ -59,9 +70,23 @@ export const GET: RequestHandler = async (event) => {
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
 	return json(
 		{
+			hostAdmin: isHostAdmin(event.locals.user.id),
+			host: getHostAI() ? { model: getHostAI()!.model } : null,
 			configured: availability.mode !== 'unavailable',
 			mode: availability.mode,
-			accounts: listChatGPTAccounts(event.locals.user.id),
+			accounts: [
+				...(getHostAI()
+					? [
+							{
+								id: HOST_CONNECTION_ID,
+								label: 'Host ChatGPT connection',
+								connected: true,
+								planEnabled: true
+							}
+						]
+					: []),
+				...listChatGPTAccounts(event.locals.user.id)
+			],
 			...(availability.safeReason ? { safeReason: availability.safeReason } : {})
 		},
 		{ headers: { 'Cache-Control': 'no-store, max-age=0' } }
@@ -98,6 +123,11 @@ export const POST: RequestHandler = async (event) => {
 			throw new ApiError(400, 'Please provide a valid ChatGPT connection action');
 		if (parsed.data.action !== 'import' && Buffer.byteLength(body, 'utf8') > 4_096)
 			throw new ApiError(413, 'Request body is too large');
+
+		if (parsed.data.action === 'host') {
+			configureHostAI(event.locals.user.id, parsed.data.accountId, parsed.data.model);
+			return json({ enabled: Boolean(getHostAI()) }, { headers: { 'Cache-Control': 'no-store' } });
+		}
 
 		if (parsed.data.action === 'disconnect') {
 			consumeRateLimit(`chatgpt-disconnect:${event.locals.user.id}`, 20, 15 * 60 * 1000);

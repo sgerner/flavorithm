@@ -1,3 +1,4 @@
+import { getHostAI } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { json } from '@sveltejs/kit';
@@ -28,6 +29,16 @@ export const POST: RequestHandler = async (event) => {
 			throw new AIRequestError('Request body must contain valid JSON.');
 		}
 
+		const host = getHostAI();
+		if (
+			host &&
+			body &&
+			typeof body === 'object' &&
+			(!('action' in body) || body.action !== 'search')
+		) {
+			body = { ...body, provider: 'chatgpt', model: host.model, connectionId: host.accountId };
+		}
+
 		let connection: { accessToken: string; codex?: boolean } | undefined;
 		let providerFetch = event.fetch;
 		if (
@@ -40,7 +51,7 @@ export const POST: RequestHandler = async (event) => {
 			const accountId =
 				'connectionId' in body && typeof body.connectionId === 'string' ? body.connectionId : '';
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			const resolved = await getChatGPTConnection(user.id, accountId, event.fetch);
+			const resolved = await getChatGPTConnection(host?.userId ?? user.id, accountId, event.fetch);
 			connection = { accessToken: resolved.accessToken, codex: resolved.codex };
 			providerFetch = resolved.fetcher;
 		}
