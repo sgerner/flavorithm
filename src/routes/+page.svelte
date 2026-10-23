@@ -1071,6 +1071,14 @@
 						}
 					} catch (e) {
 						if (attempt !== connectionAttempt || user?.id !== owner) return;
+						const status = (e as { status?: number }).status;
+						// Keep the original login alive through brief deployment/network outages.
+						if (
+							chatGPTDevice &&
+							Date.now() < result.expiresAt &&
+							(status === undefined || status === 429 || status >= 500)
+						)
+							return;
 						clearInterval(connectionPoll);
 						connectionBusy = false;
 						chatGPTDevice = null;

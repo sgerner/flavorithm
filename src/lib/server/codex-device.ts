@@ -1,7 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createRemoteJWKSet, customFetch, decodeJwt, jwtVerify } from 'jose';
 import { ApiError } from '#lib/server/db.ts';
-import { getChatGPTAccount, isSessionBindingActive, saveChatGPTAccount } from './oauth-storage.ts';
+import {
+	getChatGPTAccount,
+	isSessionBindingActive,
+	saveChatGPTAccount,
+	storeCodexDeviceAttempt,
+	getCodexDeviceAttempt,
+	deleteCodexDeviceAttempt,
+	claimCodexDeviceAttempt,
+	markCodexDeviceExchange,
+	releaseCodexDeviceAttempt,
+	completeCodexDeviceAttempt
+} from './oauth-storage.ts';
 
 // Codex's public device client, as used by the upstream Codex CLI and OSS clients.
 export const CODEX_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -19,10 +30,9 @@ type Attempt = {
 	expiresAt: number;
 	interval: number;
 	nextPoll: number;
-	busy: boolean;
 	result?: { connected: true; accountId: string; planEnabled: true };
 };
-const attempts = new Map<string, Attempt>();
+
 function fail(status: number, message: string): never {
 	throw new ApiError(status, message);
 }
@@ -128,15 +138,12 @@ export async function startCodexDevice(
 		code.length > 100
 	)
 		fail(502, 'ChatGPT returned an invalid device code.');
-	// Replace earlier attempts only after successfully obtaining a new code.
-	for (const [id, a] of attempts)
-		if (a.userId === input.userId || a.expiresAt <= Date.now()) attempts.delete(id);
 	const loginId = randomUUID();
 	const interval = Math.max(5, Number(data.interval) || 5);
 	if (!Number.isFinite(interval) || interval > 900)
 		fail(502, 'ChatGPT returned an invalid polling interval.');
 	const expiresAt = Date.now() + TTL;
-	attempts.set(loginId, {
+	const attempt: Attempt = {
 		userId: input.userId,
 		session: input.sessionBinding,
 		origin: input.appUrl.origin,
@@ -145,8 +152,15 @@ export async function startCodexDevice(
 		userCode: code,
 		expiresAt,
 		interval,
-		nextPoll: Date.now() + interval * 1000,
-		busy: false
+		nextPoll: Date.now() + interval * 1000
+	};
+	live(input.userId, input.sessionBinding);
+	storeCodexDeviceAttempt({
+		id: loginId,
+		userId: input.userId,
+		expiresAt,
+		nextPoll: attempt.nextPoll,
+		payload: JSON.stringify(attempt)
 	});
 	return {
 		kind: 'device' as const,
@@ -159,7 +173,8 @@ export async function startCodexDevice(
 }
 function owned(input: { userId: string; sessionBinding: string; appUrl: URL; loginId: string }) {
 	live(input.userId, input.sessionBinding);
-	const a = attempts.get(input.loginId);
+	const stored = getCodexDeviceAttempt(input.loginId);
+	const a = stored ? (JSON.parse(stored.payload) as Attempt) : null;
 	if (
 		!a ||
 		a.userId !== input.userId ||
@@ -168,7 +183,7 @@ function owned(input: { userId: string; sessionBinding: string; appUrl: URL; log
 	)
 		fail(404, 'This ChatGPT connection attempt is unavailable. Start again.');
 	if (a.expiresAt <= Date.now()) {
-		attempts.delete(input.loginId);
+		deleteCodexDeviceAttempt(input.loginId);
 		fail(410, 'ChatGPT authorization expired. Start again.');
 	}
 	return a;
@@ -180,7 +195,7 @@ export function cancelCodexDevice(input: {
 	loginId: string;
 }) {
 	owned(input);
-	attempts.delete(input.loginId);
+	deleteCodexDeviceAttempt(input.loginId);
 	return { cancelled: true };
 }
 export async function pollCodexDevice(
@@ -189,24 +204,29 @@ export async function pollCodexDevice(
 ) {
 	const a = owned(input);
 	if (a.result) return a.result;
-	if (a.busy || Date.now() < a.nextPoll) return { pending: true };
-	a.busy = true;
+	const stored = getCodexDeviceAttempt(input.loginId)!;
+	if (stored.exchanging && stored.leaseUntil <= Date.now()) {
+		deleteCodexDeviceAttempt(input.loginId);
+		fail(409, 'ChatGPT token exchange was interrupted. Start again.');
+	}
+	const leaseToken = randomUUID();
 	a.nextPoll = Date.now() + a.interval * 1000;
+	if (!claimCodexDeviceAttempt(input.loginId, leaseToken, a.nextPoll)) return { pending: true };
+	let receivedDeviceReply = false;
 	try {
 		const { response, data } = await providerJson(
 			`${AUTH}/api/accounts/deviceauth/token`,
 			{ device_auth_id: a.deviceId, user_code: a.userCode },
 			fetcher
 		);
+		receivedDeviceReply = true;
+		if (response.status >= 500) return { pending: true };
 		if (response.status === 403 || response.status === 404) return { pending: true };
 		if (response.status === 429) {
 			a.nextPoll = Date.now() + Math.max(a.interval, 10) * 1000;
 			return { pending: true };
 		}
-		if (!response.ok) {
-			attempts.delete(input.loginId);
-			fail(502, 'ChatGPT authorization failed. Start again.');
-		}
+		if (!response.ok) fail(502, 'ChatGPT authorization failed. Start again.');
 		if (
 			typeof data.authorization_code !== 'string' ||
 			typeof data.code_verifier !== 'string' ||
@@ -214,8 +234,10 @@ export async function pollCodexDevice(
 			createHash('sha256').update(data.code_verifier).digest('base64url') !== data.code_challenge
 		)
 			fail(502, 'ChatGPT returned an invalid authorization exchange.');
-		// Consume the provider code once. A failed exchange requires a fresh login.
-		a.nextPoll = a.expiresAt;
+		// Persist the irreversible exchange boundary so a restarted worker never replays a consumed code.
+		owned(input);
+		if (!markCodexDeviceExchange(input.loginId, leaseToken))
+			fail(404, 'This ChatGPT connection attempt is unavailable. Start again.');
 		const token = await providerJson(
 			CODEX_TOKEN_URL,
 			new URLSearchParams({
@@ -276,33 +298,38 @@ export async function pollCodexDevice(
 					'You authorized a different ChatGPT account. Use Add account to connect it separately.'
 				);
 		}
-		const saved = saveChatGPTAccount({
-			userId: a.userId,
-			accountId: a.accountId,
-			mode: 'local',
-			clientId: CODEX_CLIENT_ID,
-			subject: `${identity.sub}:${account}`,
-			email: typeof identity.email === 'string' ? identity.email : null,
-			scopes: [CODEX_SCOPE],
-			credentials: {
-				accessToken: t.access_token,
-				refreshToken: t.refresh_token,
-				idToken: t.id_token,
-				codexAccountId: account
-			},
-			expiresAt,
-			earliestRefreshAt: 0
+		completeCodexDeviceAttempt(input.loginId, leaseToken, () => {
+			owned(input);
+			const saved = saveChatGPTAccount({
+				userId: a.userId,
+				accountId: a.accountId,
+				mode: 'local',
+				clientId: CODEX_CLIENT_ID,
+				subject: `${identity.sub}:${account}`,
+				email: typeof identity.email === 'string' ? identity.email : null,
+				scopes: [CODEX_SCOPE],
+				credentials: {
+					accessToken: t.access_token,
+					refreshToken: t.refresh_token,
+					idToken: t.id_token,
+					codexAccountId: account
+				},
+				expiresAt,
+				earliestRefreshAt: 0
+			});
+			a.result = { connected: true, accountId: saved.id, planEnabled: true };
+			a.deviceId = '';
+			a.userCode = '';
+			return JSON.stringify(a);
 		});
-		a.result = { connected: true, accountId: saved.id, planEnabled: true };
-		a.deviceId = '';
-		a.userCode = '';
-		return a.result;
+		return a.result!;
 	} catch (error) {
+		if (!receivedDeviceReply) return { pending: true };
 		// A consumed exchange or invalid identity must never be retried with the same code.
-		attempts.delete(input.loginId);
+		deleteCodexDeviceAttempt(input.loginId, leaseToken);
 		throw error;
 	} finally {
-		a.busy = false;
+		releaseCodexDeviceAttempt(input.loginId, leaseToken, a.nextPoll);
 	}
 }
 

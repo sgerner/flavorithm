@@ -508,3 +508,37 @@ test('nested Codex terminal refresh errors require reconnection and JWT expiry w
 	assert.equal(device.codexTokenExpiry(token), expires * 1000);
 	assert.throws(() => device.codexTokenExpiry('opaque-token'), { status: 502 });
 });
+
+test('temporary provider outages retain the same encrypted attempt and polling backoff', async (t) => {
+	const owner = await user();
+	const f = fixture();
+	let now = Date.now();
+	t.mock.method(Date, 'now', () => now);
+	const started = await device.startCodexDevice(owner, f.fetcher);
+	const input = { ...owner, loginId: started.loginId };
+	now += 6000;
+	assert.deepEqual(
+		await device.pollCodexDevice(input, async () => {
+			throw new Error('temporary network outage');
+		}),
+		{ pending: true }
+	);
+	assert.ok(storage.getCodexDeviceAttempt(started.loginId));
+	assert.deepEqual(await device.pollCodexDevice(input, f.fetcher), { pending: true });
+	now += 6000;
+	assert.deepEqual(
+		await device.pollCodexDevice(input, async () => new Response('unavailable', { status: 503 })),
+		{ pending: true }
+	);
+	now += 6000;
+	assert.deepEqual(
+		await device.pollCodexDevice(input, async () => new Response('', { status: 429 })),
+		{ pending: true }
+	);
+	now += 6000;
+	const before = f.state.calls.length;
+	assert.deepEqual(await device.pollCodexDevice(input, f.fetcher), { pending: true });
+	assert.equal(f.state.calls.length, before);
+	now += 6000;
+	assert.equal('connected' in (await device.pollCodexDevice(input, f.fetcher)), true);
+});

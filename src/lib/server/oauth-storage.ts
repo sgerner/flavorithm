@@ -531,3 +531,112 @@ export function isSessionBindingActive(userId: string, binding: string): boolean
 		.get(binding, userId, Date.now()) as { active: number } | undefined;
 	return !!row;
 }
+
+// Pending device grants use the same persistent local key as saved Codex credentials.
+db.exec(`CREATE TABLE IF NOT EXISTS codex_device_attempts (
+ id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+ expires_at INTEGER NOT NULL, next_poll INTEGER NOT NULL, envelope TEXT NOT NULL,
+ lease_token TEXT, lease_until INTEGER NOT NULL DEFAULT 0,
+ exchanging INTEGER NOT NULL DEFAULT 0
+)`);
+export function storeCodexDeviceAttempt(input: {
+	id: string;
+	userId: string;
+	expiresAt: number;
+	nextPoll: number;
+	payload: string;
+}) {
+	const envelope = encryptHostedPending(input.userId, `device:${input.id}`, input.payload, 'local');
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		db.prepare('DELETE FROM codex_device_attempts WHERE user_id = ? OR expires_at <= ?').run(
+			input.userId,
+			Date.now()
+		);
+		db.prepare(
+			'INSERT INTO codex_device_attempts(id,user_id,expires_at,next_poll,envelope) VALUES(?,?,?,?,?)'
+		).run(input.id, input.userId, input.expiresAt, input.nextPoll, envelope);
+		db.exec('COMMIT');
+	} catch (error) {
+		db.exec('ROLLBACK');
+		throw error;
+	}
+}
+export function getCodexDeviceAttempt(id: string) {
+	const row = db.prepare('SELECT * FROM codex_device_attempts WHERE id = ?').get(id) as
+		| {
+				user_id: string;
+				expires_at: number;
+				next_poll: number;
+				envelope: string;
+				lease_token: string | null;
+				lease_until: number;
+				exchanging: number;
+		  }
+		| undefined;
+	if (!row) return null;
+	return {
+		userId: row.user_id,
+		expiresAt: row.expires_at,
+		nextPoll: row.next_poll,
+		payload: decryptHostedPending(row.user_id, `device:${id}`, row.envelope, 'local'),
+		leaseToken: row.lease_token,
+		leaseUntil: row.lease_until,
+		exchanging: Boolean(row.exchanging)
+	};
+}
+export function deleteCodexDeviceAttempt(id: string, leaseToken?: string) {
+	db.prepare(
+		'DELETE FROM codex_device_attempts WHERE id = ? AND (? IS NULL OR lease_token = ?)'
+	).run(id, leaseToken ?? null, leaseToken ?? null);
+}
+export function claimCodexDeviceAttempt(id: string, leaseToken: string, nextPoll: number) {
+	const now = Date.now();
+	return (
+		Number(
+			db
+				.prepare(
+					`UPDATE codex_device_attempts SET lease_token=?,lease_until=?,next_poll=?
+ WHERE id=? AND expires_at>? AND next_poll<=? AND lease_until<=? AND exchanging=0`
+				)
+				.run(leaseToken, now + 90_000, nextPoll, id, now, now, now).changes
+		) === 1
+	);
+}
+export function markCodexDeviceExchange(id: string, leaseToken: string) {
+	return (
+		Number(
+			db
+				.prepare(
+					'UPDATE codex_device_attempts SET exchanging=1 WHERE id=? AND lease_token=? AND expires_at>? AND lease_until>?'
+				)
+				.run(id, leaseToken, Date.now(), Date.now()).changes
+		) === 1
+	);
+}
+export function releaseCodexDeviceAttempt(id: string, leaseToken: string, nextPoll: number) {
+	db.prepare(
+		'UPDATE codex_device_attempts SET lease_token=NULL,lease_until=0,next_poll=? WHERE id=? AND lease_token=? AND exchanging=0'
+	).run(nextPoll, id, leaseToken);
+}
+/** Save credentials and the idempotent completion together, only if cancellation has not won. */
+export function completeCodexDeviceAttempt(id: string, leaseToken: string, commit: () => string) {
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		const row = db
+			.prepare(
+				'SELECT user_id FROM codex_device_attempts WHERE id=? AND lease_token=? AND expires_at>? AND lease_until>? AND exchanging=1'
+			)
+			.get(id, leaseToken, Date.now(), Date.now()) as { user_id: string } | undefined;
+		if (!row) throw new Error('Device authorization is no longer active.');
+		const payload = commit();
+		const envelope = encryptHostedPending(row.user_id, `device:${id}`, payload, 'local');
+		db.prepare(
+			'UPDATE codex_device_attempts SET envelope=?,exchanging=0,lease_token=NULL,lease_until=0 WHERE id=? AND lease_token=?'
+		).run(envelope, id, leaseToken);
+		db.exec('COMMIT');
+	} catch (error) {
+		db.exec('ROLLBACK');
+		throw error;
+	}
+}
