@@ -39,11 +39,11 @@ A new guest kitchen starts with eight curated recipes, a sample pantry, and thre
 
 ## Basil, your kitchen butler
 
-The optional **Ask Basil** chat opens alongside the usual screens. Basil is a traditional English butler with firm culinary opinions, impeccable manners, and a barely concealed conviction that he runs the household. Ask him to build or critique a recipe, plan the week, use expiring ingredients, manage groceries, or change your cooking preferences.
+The optional **Ask Basil** chat opens alongside the usual screens. Basil is a traditional English butler with firm culinary opinions, formal manners, a pointedly raised eyebrow, and a barely concealed conviction that he runs the household. He addresses the proprietor as “Master” followed by their display name, or “master of the house.” Ask him to build or critique a recipe, plan the week, use expiring ingredients, manage groceries, or change your cooking preferences.
 
 His retro pixel portrait blinks, raises an eyebrow, ponders requests, and flaps its moustache as replies arrive. These are visual reactions, not spoken audio; reduced-motion preferences disable the animation.
 
-Chat uses your existing AI connection and requires sign-in. Basil receives the current kitchen and recent conversation; API keys and account credentials are not included in his kitchen context. Responses can contain proposed changes: review them and choose **Apply** to update the same kitchen used by the regular screens. Settings, imports, voice capture, account, and household tasks open the existing controls. Sensitive account operations retain their normal confirmation flows. Conversation stays in memory for the current account and is cleared when the account changes or the page reloads.
+Chat uses your existing AI connection and requires sign-in. Basil receives the current kitchen, your display name, and recent conversation; API keys and account credentials are not included in his kitchen context. Replies render as Markdown. Proposed changes appear as action cards with one-click add, update, or remove buttons; dependent changes stay together in one action. They update the same kitchen used by the regular screens. Animated waiting and sync indicators show requests in progress, and **Stop** cancels a pending reply. Settings, imports, voice capture, account, and household tasks open the existing controls. Sensitive account operations retain their normal confirmation flows. Conversation stays in memory for the current account and is cleared when the account changes or the page reloads.
 
 ## Run locally
 

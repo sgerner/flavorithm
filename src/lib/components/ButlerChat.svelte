@@ -1,31 +1,51 @@
 <script lang="ts">
 	import { onDestroy, tick } from 'svelte';
-	import { X, Send, Check, RotateCcw, ChevronDown } from '@lucide/svelte';
+	import {
+		X,
+		Send,
+		Check,
+		RotateCcw,
+		LoaderCircle,
+		Square,
+		Plus,
+		Trash2,
+		Pencil,
+		ArrowRight
+	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
+	import ChatMarkdown from './ChatMarkdown.svelte';
+	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
 	import type { AppState } from '#lib/types.ts';
 
 	type Turn = { role: 'user' | 'assistant'; content: string };
-	type Message = Turn & {
-		id: number;
-		commands?: unknown[];
-		snapshot?: string;
-		status?: 'pending' | 'applied' | 'dismissed';
-	};
+	type Action = ButlerAction & { status: 'pending' | 'applied' | 'dismissed' };
+	type Message = Turn & { id: number; actions?: Action[]; snapshot?: string };
 	let {
 		kitchen,
 		owner,
 		request,
-		apply
+		apply,
+		userName = '',
+		syncing = false,
+		pendingSync = false
 	}: {
 		kitchen: AppState;
 		owner: string;
-		request: (prompt: string, history: Turn[]) => Promise<{ reply: string; commands: unknown[] }>;
-		apply: (commands: unknown[]) => void;
+		userName?: string;
+		syncing?: boolean;
+		pendingSync?: boolean;
+		request: (
+			prompt: string,
+			history: Turn[],
+			signal?: AbortSignal
+		) => Promise<{ reply: string; commands: unknown[] }>;
+		apply: (commands: unknown[], expectedSnapshot: string) => string | Promise<string>;
 	} = $props();
 	let open = $state(false);
 	let draft = $state('');
 	let messages = $state<Message[]>([]);
 	let busy = $state(false);
+	let applying = $state('');
 	let error = $state('');
 	let failedPrompt = $state('');
 	let input = $state<HTMLTextAreaElement>();
@@ -35,19 +55,17 @@
 	let generation = 0;
 	let currentOwner = '';
 	let alive = true;
+	let controller: AbortController | undefined;
+	let requestTimer: ReturnType<typeof setTimeout> | undefined;
 	let reaction = $state<'idle' | 'speaking' | 'pleased'>('idle');
 	let reactionTimer: ReturnType<typeof setTimeout> | undefined;
-	const mood = $derived(busy ? 'thinking' : error ? 'concerned' : reaction);
+	const working = $derived(busy || !!applying);
+	const mood = $derived(working ? 'thinking' : error ? 'concerned' : reaction);
+	const address = $derived(
+		userName.trim() ? `Master ${userName.trim().slice(0, 80)}` : 'master of the house'
+	);
 	const status = $derived(
-		busy
-			? 'Considering your predicament…'
-			: error
-				? 'A minor complication. We shall recover.'
-				: reaction === 'speaking'
-					? 'If I may offer a rather good opinion…'
-					: reaction === 'pleased'
-						? 'There. Civilisation restored.'
-						: 'Your kitchen. Properly managed.'
+		working ? 'Attending to it…' : error ? 'A minor complication.' : 'Your kitchen, in hand.'
 	);
 	function react(value: 'speaking' | 'pleased', duration: number) {
 		clearTimeout(reactionTimer);
@@ -61,28 +79,33 @@
 		reaction = 'idle';
 	}
 	const starters = [
-		'Plan dinners for the week using my pantry.',
-		'Help me build a recipe from scratch.',
-		'Review my recipes. Be honest.',
-		'What can you take care of for me?'
+		{ label: 'Plan my week', prompt: 'Plan dinners for the week using my pantry.' },
+		{ label: 'Create a recipe', prompt: 'Help me build a recipe from scratch.' },
+		{ label: 'Review my recipes', prompt: 'Review my recipes. Be honest.' }
 	];
+	function cancelRequest() {
+		controller?.abort();
+		clearTimeout(requestTimer);
+		controller = undefined;
+		generation++;
+		busy = false;
+		resetReaction();
+	}
 	$effect(() => {
 		if (owner !== currentOwner) {
 			currentOwner = owner;
-			resetReaction();
-			generation++;
+			cancelRequest();
 			messages = [];
 			draft = '';
 			error = '';
 			failedPrompt = '';
-			busy = false;
+			applying = '';
 			open = false;
 		}
 	});
 	onDestroy(() => {
 		alive = false;
-		resetReaction();
-		generation++;
+		cancelRequest();
 	});
 	async function scroll() {
 		await tick();
@@ -104,92 +127,107 @@
 		} else launcher?.focus();
 	}
 	function clear() {
-		resetReaction();
-		generation++;
+		cancelRequest();
 		messages = [];
-		busy = false;
 		error = '';
 		failedPrompt = '';
 		input?.focus();
 	}
 	async function send(prompt = draft.trim(), retry = false) {
-		if (!prompt || busy || !owner) return;
+		if (!prompt || working || !owner) return;
 		resetReaction();
 		const token = ++generation;
 		const history = messages
 			.slice(retry ? -21 : -20, retry ? -1 : undefined)
-			.map(({ role, content }) => ({ role, content }));
-		for (const message of messages) if (message.status === 'pending') message.status = 'dismissed';
+			.map(({ role, content, actions }) => {
+				const applied = actions
+					?.filter((action) => action.status === 'applied')
+					.map((action) => action.title);
+				return {
+					role,
+					content: applied?.length ? `${content}\n\n[User applied: ${applied.join('; ')}]` : content
+				};
+			});
+		for (const message of messages)
+			for (const action of message.actions ?? [])
+				if (action.status === 'pending') action.status = 'dismissed';
 		if (!retry) messages.push({ id: ++sequence, role: 'user', content: prompt });
 		draft = '';
 		error = '';
 		failedPrompt = '';
 		busy = true;
 		const snapshot = JSON.stringify(kitchen);
+		const currentController = new AbortController();
+		controller = currentController;
+		requestTimer = setTimeout(
+			() => currentController.abort(new Error('Basil took too long to respond. Please try again.')),
+			90000
+		);
 		void scroll();
 		try {
-			const result = await request(prompt, history);
+			const result = await request(prompt, history, currentController.signal);
+			currentController.signal.throwIfAborted();
 			if (!alive || token !== generation) return;
+			const actions = buildButlerActions(result.commands, JSON.parse(snapshot)).map(
+				(action): Action => ({ ...action, status: 'pending' })
+			);
 			react('speaking', Math.min(12000, Math.max(2400, result.reply.length * 28)));
 			messages.push({
 				id: ++sequence,
 				role: 'assistant',
 				content: result.reply,
-				commands: result.commands,
-				snapshot,
-				status: 'pending'
+				actions,
+				snapshot
 			});
 		} catch (e) {
 			if (!alive || token !== generation) return;
-			error = e instanceof Error ? e.message : 'Basil could not connect. Please try again.';
+			error = currentController.signal.aborted
+				? 'The request was interrupted. Please try again.'
+				: e instanceof Error
+					? e.message
+					: 'Basil could not connect. Please try again.';
 			failedPrompt = prompt;
 		} finally {
 			if (alive && token === generation) {
+				clearTimeout(requestTimer);
+				controller = undefined;
 				busy = false;
 				void scroll();
 			}
 		}
 	}
-	function applyProposal(message: Message) {
+	function stop() {
+		cancelRequest();
+		error = '';
+		failedPrompt = '';
+	}
+	async function applyAction(message: Message, action: Action) {
+		if (working || action.status !== 'pending' || !message.snapshot) return;
+		const token = generation;
+		const activeOwner = owner;
+		applying = `${message.id}:${action.id}`;
+		error = '';
+		await tick();
+		if (!alive || token !== generation || activeOwner !== owner) return;
 		try {
-			if (message.snapshot !== JSON.stringify(kitchen)) {
-				throw new Error(
-					'Your kitchen has changed since this proposal. Ask Basil to update it before applying.'
-				);
-			}
-			apply(message.commands ?? []);
-			message.status = 'applied';
+			if (message.snapshot !== JSON.stringify(kitchen))
+				throw new Error('Your kitchen changed. Ask Basil for an updated proposal.');
+			const snapshot = await apply(action.commands, message.snapshot);
+			if (!alive || token !== generation) return;
+			message.snapshot = snapshot;
+			action.status = 'applied';
 			react('pleased', 2200);
-			message.content += '\n\n[You applied this proposal.]';
-			error = '';
 		} catch (e) {
-			error = e instanceof Error ? e.message : 'The changes could not be applied.';
+			if (alive && token === generation)
+				error = e instanceof Error ? e.message : 'The changes could not be applied.';
+		} finally {
+			if (alive && token === generation) applying = '';
 		}
 	}
 	function words(value: string) {
 		return value.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[._-]/g, ' ');
 	}
-	function label(command: unknown): string {
-		if (!command || typeof command !== 'object') return 'Kitchen action';
-		const item = command as Record<string, unknown>;
-		const labels: Record<string, string> = {
-			'recipe.upsert': 'Save recipe',
-			'recipe.delete': 'Delete recipe',
-			'pantry.upsert': 'Update pantry',
-			'pantry.delete': 'Remove pantry item',
-			'meal.upsert': 'Schedule meal',
-			'meal.delete': 'Remove meal',
-			'meal.complete': 'Complete meal',
-			'shopping.upsert': 'Update shopping item',
-			'shopping.delete': 'Remove shopping item',
-			'shopping.generate': 'Build shopping list',
-			'preferences.update': 'Update preferences',
-			navigate: 'Go to ' + String(item.page ?? ''),
-			'recipe.open': 'Open recipe',
-			ui: 'Open ' + words(String(item.action ?? 'controls'))
-		};
-		return labels[String(item.type)] ?? words(String(item.type ?? 'Kitchen action'));
-	}
+
 	function preview(command: unknown): string {
 		function format(value: unknown, depth = 0): string {
 			if (Array.isArray(value))
@@ -211,19 +249,22 @@
 			kitchen.recipes.find((item) => item.id === target)?.title ??
 			kitchen.pantry.find((item) => item.id === target)?.name ??
 			kitchen.shopping.find((item) => item.id === target)?.name;
-		return [name, format(command)].filter(Boolean).join('\n') || label(command);
+		return [name, format(command)].filter(Boolean).join('\n') || 'Kitchen update';
 	}
 </script>
 
 <button
 	class="butler-launcher"
+	class:waiting={busy || syncing}
 	bind:this={launcher}
 	onclick={toggle}
 	aria-expanded={open}
 	aria-controls="butler-panel"
 	aria-label={open ? 'Close Basil chat' : 'Chat with Basil, your kitchen butler'}
+	title="Chat with Basil"
 >
-	<BasilAvatar {mood} size={36} active={open} /><span>Ask Basil</span>
+	<BasilAvatar {mood} size={32} active={open} /><span>Basil</span>
+	{#if busy || syncing}<LoaderCircle size={13} class="spin launcher-spinner" />{/if}
 </button>
 
 {#if open}
@@ -237,12 +278,12 @@
 			if (event.key === 'Escape') {
 				event.stopPropagation();
 				event.preventDefault();
-				void toggle();
+				close();
 			}
 		}}
 	>
 		<header>
-			<BasilAvatar {mood} size={62} active={open} />
+			<BasilAvatar {mood} size={46} active={open} />
 			<div class="butler-heading">
 				<h2>Basil</h2>
 				<p>{status}</p>
@@ -250,12 +291,13 @@
 			<button
 				class="icon-button"
 				onclick={clear}
-				disabled={busy || messages.length === 0}
+				disabled={working || messages.length === 0}
 				aria-label="Clear conversation"
 				title="Clear conversation"><RotateCcw size={17} /></button
 			>
-			<button class="icon-button" onclick={toggle} aria-label="Close chat"><X size={20} /></button>
+			<button class="icon-button" onclick={close} aria-label="Close chat"><X size={20} /></button>
 		</header>
+		{#if busy || syncing}<div class="request-progress" aria-hidden="true"></div>{/if}
 		<div
 			class="butler-transcript"
 			bind:this={transcript}
@@ -263,65 +305,97 @@
 			aria-label="Conversation"
 			aria-live="polite"
 			aria-relevant="additions text"
-			aria-busy={busy}
+			aria-busy={working}
 		>
-			<div class="butler-introduction">
-				<span class="eyebrow">AT YOUR SERVICE. NATURALLY.</span>
-				<p>
-					I’m Basil. Your butler, culinary counsel, and the reason dinner will happen at a sensible
-					hour. You retain the final say, naturally. I shall endeavour to make it a good one.
-				</p>
-				<p class="butler-hint">
-					Recipes, pantry, meal plans, shopping, settings—ask away. You can review my proposed
-					changes before applying them.
-				</p>
-			</div>
 			{#if messages.length === 0}
+				<div class="butler-introduction">
+					<p>At your service, {address}. Shall we impose some order upon dinner?</p>
+				</div>
 				<div class="butler-starters">
-					{#each starters as starter}<button onclick={() => send(starter)} disabled={busy || !owner}
-							>{starter}</button
+					{#each starters as starter}<button
+							onclick={() => send(starter.prompt)}
+							disabled={working || !owner}>{starter.label}<ArrowRight size={14} /></button
 						>{/each}
 				</div>
 			{/if}
 			{#each messages as message (message.id)}
 				<article class:user-message={message.role === 'user'} class="butler-message">
 					<span class="speaker">{message.role === 'user' ? 'You' : 'Basil'}</span>
-					<p>{message.content}</p>
-					{#if message.commands?.length}
-						<div class="butler-proposal">
-							<strong
-								>{message.commands.length} proposed {message.commands.length === 1
-									? 'action'
-									: 'actions'}</strong
-							>
-							{#each message.commands as command}<details>
-									<summary>{label(command)}<ChevronDown size={13} /></summary>
-									<pre>{preview(command)}</pre>
-								</details>{/each}
-							{#if message.status === 'pending'}
-								<div class="proposal-buttons">
-									<button
-										class="butler-primary"
-										onclick={() => applyProposal(message)}
-										disabled={busy}><Check size={15} />Apply changes</button
-									><button onclick={() => (message.status = 'dismissed')}>Dismiss</button>
-								</div>
-							{:else}<small
-									>{message.status === 'applied'
-										? 'Applied to your kitchen'
-										: 'Proposal closed'}</small
-								>{/if}
+					{#if message.role === 'assistant'}<ChatMarkdown content={message.content} />{:else}<p
+							class="user-content"
+						>
+							{message.content}
+						</p>{/if}
+					{#if message.actions?.length}
+						<div class="butler-actions">
+							{#each message.actions as action (action.id)}
+								<section
+									class="action-card"
+									class:action-applied={action.status === 'applied'}
+									class:action-dismissed={action.status === 'dismissed'}
+									aria-label={action.title}
+								>
+									<div class="action-info">
+										<strong>{action.title}</strong>
+										<p>{action.summary}</p>
+									</div>
+									<details>
+										<summary>Details</summary>
+										<div class="action-details">
+											{#each action.commands as command}<pre>{preview(command)}</pre>{/each}
+										</div>
+									</details>
+									{#if action.status === 'pending'}
+										<div class="action-controls">
+											<button
+												class="butler-primary action-button"
+												class:destructive={action.destructive}
+												onclick={() => applyAction(message, action)}
+												disabled={working || message.snapshot !== JSON.stringify(kitchen)}
+											>
+												{#if applying === `${message.id}:${action.id}`}<LoaderCircle
+														size={15}
+														class="spin"
+													/>{:else if action.destructive}<Trash2
+														size={14}
+													/>{:else if action.label.startsWith('Add')}<Plus
+														size={14}
+													/>{:else if action.label.startsWith('Save') || action.label.startsWith('Update')}<Pencil
+														size={14}
+													/>{:else}<Check size={14} />{/if}{action.label}
+											</button>
+											<button
+												class="dismiss-action"
+												onclick={() => (action.status = 'dismissed')}
+												disabled={working}
+												aria-label={`Dismiss ${action.title}`}>Dismiss</button
+											>
+										</div>
+									{:else}<span class="action-result"
+											>{#if action.status === 'applied'}<Check
+													size={13}
+												/>Applied{:else}Dismissed{/if}</span
+										>{/if}
+								</section>
+							{/each}
+							{#if message.actions.some((action) => action.status === 'pending') && message.snapshot !== JSON.stringify(kitchen)}<p
+									class="stale-proposal"
+								>
+									Kitchen changed. Ask Basil to update these actions.
+								</p>{/if}
 						</div>
 					{/if}
 				</article>
 			{/each}
-			{#if busy}<p class="butler-working" role="status">
-					Basil is consulting the pantry and raising an eyebrow…
-				</p>{/if}
 		</div>
+		{#if busy}<div class="butler-working" role="status">
+				<span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span><span
+					>Basil is considering…</span
+				>
+			</div>{/if}
 		{#if error}<div class="butler-error" role="alert">
 				<p>{error}</p>
-				{#if failedPrompt}<button onclick={() => send(failedPrompt, true)} disabled={busy}
+				{#if failedPrompt}<button onclick={() => send(failedPrompt, true)} disabled={working}
 						>Try again</button
 					>{/if}
 			</div>{/if}
@@ -336,91 +410,88 @@
 				id="butler-message"
 				bind:this={input}
 				bind:value={draft}
-				placeholder={owner ? 'What shall we attend to?' : 'Sign in to consult Basil'}
+				placeholder="Your instructions…"
 				rows="2"
 				maxlength="2000"
-				disabled={busy || !owner}
+				disabled={working || !owner}
 				onkeydown={(event) => {
 					if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
 						event.preventDefault();
 						void send();
 					}
 				}}></textarea>
-			<button
-				class="butler-primary butler-send"
-				type="submit"
-				disabled={busy || !draft.trim() || !owner}
-				aria-label="Send message"><Send size={18} /></button
-			>
+			{#if busy}<button
+					class="butler-primary butler-send"
+					type="button"
+					onclick={stop}
+					aria-label="Stop reply"
+					title="Stop reply"><Square size={16} /></button
+				>
+			{:else}<button
+					class="butler-primary butler-send"
+					type="submit"
+					disabled={working || !draft.trim() || !owner}
+					aria-label="Send message"><Send size={18} /></button
+				>{/if}
 		</form>
-		<footer>AI assistance · Check recipes and dietary requirements.</footer>
+		<div class="sync-line" role="status">
+			{#if syncing}<LoaderCircle size={12} class="spin" />Saving changes…{:else if pendingSync}Changes
+				awaiting sync{/if}
+		</div>
 	</div>
 {/if}
 
 <style>
-	@keyframes butler-arrival {
-		from {
-			opacity: 0;
-			transform: translateY(10px);
-		}
-		to {
-			opacity: 1;
-			transform: translateY(0);
-		}
-	}
-	@media (prefers-reduced-motion: reduce) {
-		.butler-panel {
-			animation: none;
-		}
-	}
-
 	.butler-launcher {
 		position: fixed;
-		right: 24px;
-		bottom: 24px;
+		right: 16px;
+		bottom: max(10px, env(safe-area-inset-bottom));
 		z-index: 45;
 		display: flex;
 		align-items: center;
-		gap: 9px;
-		padding: 6px 16px 6px 7px;
+		gap: 5px;
+		padding: 4px 10px 4px 4px;
 		border: 1px solid var(--line);
-		border-radius: 50px;
+		border-radius: 40px;
 		color: var(--surface);
 		background: var(--ink);
-		box-shadow: 0 5px 24px #0002;
+		box-shadow: 0 4px 20px #0002;
+		font-size: 12px;
 		font-weight: 650;
 	}
 	.butler-panel {
 		animation: butler-arrival 180ms ease-out;
 		position: fixed;
-		right: 24px;
-		bottom: 86px;
+		right: 16px;
+		bottom: calc(60px + env(safe-area-inset-bottom));
 		z-index: 46;
-		width: min(440px, calc(100vw - 32px));
-		height: min(740px, calc(100dvh - 112px));
+		width: min(440px, calc(100vw - 24px));
+		height: min(740px, calc(100dvh - 80px - env(safe-area-inset-bottom)));
 		display: flex;
 		flex-direction: column;
 		background: var(--surface);
 		color: var(--ink);
 		border: 1px solid var(--line);
-		border-radius: 20px;
+		border-radius: 18px;
 		box-shadow: 0 18px 70px #0003;
 		overflow: hidden;
 	}
 	header {
 		display: flex;
 		align-items: center;
-		gap: 11px;
-		padding: 18px;
+		gap: 9px;
+		padding: 10px 12px;
 		border-bottom: 1px solid var(--line);
+		flex-shrink: 0;
 	}
 	.butler-heading {
 		flex: 1;
+		min-width: 0;
 	}
 	h2 {
 		margin: 0;
 		font:
-			26px Georgia,
+			24px Georgia,
 			serif;
 	}
 	header p {
@@ -429,43 +500,45 @@
 		font-size: 11px;
 	}
 	.icon-button {
-		padding: 8px;
+		padding: 10px;
 		border-radius: 8px;
 	}
 	.icon-button:hover {
 		background: var(--wash);
 	}
+	.request-progress {
+		height: 2px;
+		flex-shrink: 0;
+		background: linear-gradient(90deg, transparent, var(--green), transparent);
+		background-size: 50% 100%;
+		background-repeat: no-repeat;
+		animation: progress 1.6s ease-in-out infinite;
+	}
 	.butler-transcript {
 		flex: 1;
+		min-height: 0;
 		overflow-y: auto;
-		padding: 20px;
+		padding: 16px;
 		overscroll-behavior: contain;
-	}
-	.eyebrow {
-		font-size: 9px;
-		letter-spacing: 1.5px;
-		font-weight: 700;
-		color: var(--muted);
 	}
 	.butler-introduction p {
 		font:
-			18px/1.55 Georgia,
+			18px/1.5 Georgia,
 			serif;
-		margin: 12px 0;
-	}
-	.butler-introduction .butler-hint {
-		font:
-			12px/1.6 'DM Sans',
-			sans-serif;
-		color: var(--muted);
+		margin: 8px 0 16px;
 	}
 	.butler-starters {
 		display: grid;
-		gap: 8px;
-		margin: 22px 0;
+		gap: 7px;
+		margin-bottom: 16px;
 	}
 	.butler-starters button {
-		padding: 11px 13px;
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		gap: 12px;
+		min-height: 44px;
+		padding: 10px 12px;
 		border: 1px solid var(--line);
 		text-align: left;
 		border-radius: 10px;
@@ -475,15 +548,16 @@
 		background: var(--wash);
 	}
 	.butler-message {
-		padding: 14px 0;
+		padding: 12px 0;
 		border-top: 1px solid var(--line);
+		overflow-wrap: anywhere;
 	}
 	.butler-message.user-message {
 		background: var(--wash);
-		padding: 12px 14px;
+		padding: 10px 12px;
 		border: 0;
 		border-radius: 12px;
-		margin: 16px 0;
+		margin: 10px 0;
 	}
 	.speaker {
 		font-size: 10px;
@@ -492,54 +566,75 @@
 		letter-spacing: 1px;
 		color: var(--muted);
 	}
-	.butler-message p {
+	.user-content {
 		margin: 7px 0 0;
 		white-space: pre-wrap;
-		overflow-wrap: anywhere;
 		font-size: 13px;
-		line-height: 1.65;
+		line-height: 1.6;
 	}
-	.butler-proposal {
+	.butler-actions {
+		display: grid;
+		gap: 8px;
+		margin-top: 12px;
+	}
+	.action-card {
 		padding: 12px;
 		border: 1px solid var(--line);
-		border-radius: 10px;
-		margin-top: 14px;
+		border-radius: 12px;
 		font-size: 12px;
+		background: var(--wash);
 	}
-	.butler-proposal strong {
-		display: block;
-		margin-bottom: 8px;
+	.action-info strong {
+		font-size: 13px;
+		line-height: 1.4;
 	}
-	details {
-		border-top: 1px solid var(--line);
+	.action-info p {
+		margin: 5px 0 0;
+		font-size: 11px;
+		line-height: 1.45;
+		color: var(--muted);
 	}
 	summary {
-		display: flex;
-		align-items: center;
-		justify-content: space-between;
-		padding: 9px 0;
+		display: inline-block;
+		margin-top: 8px;
+		padding: 4px 0;
+		font-size: 11px;
+		color: var(--muted);
 		cursor: pointer;
-		text-transform: capitalize;
+		text-decoration: underline;
+		text-underline-offset: 3px;
+	}
+	.action-details {
+		max-height: 240px;
+		overflow: auto;
 	}
 	pre {
 		white-space: pre-wrap;
 		overflow-wrap: anywhere;
-		max-height: 240px;
-		overflow: auto;
-		font-size: 10px;
-		background: var(--wash);
-		padding: 8px;
-		border-radius: 5px;
+		font-family: inherit;
+		font-size: 11px;
+		line-height: 1.5;
+		padding: 8px 0;
+		margin: 0;
+		border-bottom: 1px solid var(--line);
 	}
-	.proposal-buttons {
+	.action-controls {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 10px;
-		margin-top: 12px;
+		margin-top: 10px;
 		align-items: center;
 	}
-	.proposal-buttons button {
-		padding: 9px 10px;
+	.action-button {
+		min-height: 40px;
+		padding: 9px 12px;
+		font-size: 12px;
+	}
+	.dismiss-action {
+		min-height: 40px;
+		padding: 8px 0;
 		font-size: 11px;
+		color: var(--muted);
 	}
 	.butler-primary {
 		display: inline-flex;
@@ -551,13 +646,62 @@
 		border-radius: 8px;
 		font-weight: 600;
 	}
+	.destructive {
+		background: #963e38;
+		color: #fff;
+	}
+	.action-result {
+		display: inline-flex;
+		gap: 5px;
+		align-items: center;
+		margin-top: 10px;
+		font-size: 11px;
+		color: var(--muted);
+	}
+	.action-dismissed {
+		background: transparent;
+	}
+	.stale-proposal {
+		font-size: 11px;
+		color: var(--muted);
+		margin: 2px 0 0;
+	}
 	.butler-working {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		min-height: 40px;
+		margin: 0 14px;
+		flex-shrink: 0;
 		font-size: 12px;
 		color: var(--muted);
-		font-style: italic;
+	}
+	.typing-dots {
+		display: flex;
+		gap: 4px;
+		align-items: center;
+		height: 16px;
+	}
+	.typing-dots i {
+		display: block;
+		width: 5px;
+		height: 5px;
+		border-radius: 50%;
+		background: var(--green);
+		animation: dot 1.2s ease-in-out infinite;
+	}
+	.typing-dots i:nth-child(2) {
+		animation-delay: 0.15s;
+	}
+	.typing-dots i:nth-child(3) {
+		animation-delay: 0.3s;
+	}
+	.butler-panel :global(.spin),
+	.butler-launcher :global(.spin) {
+		animation: spin 1s linear infinite;
 	}
 	.butler-error {
-		margin: 0 16px 10px;
+		margin: 0 12px 8px;
 		padding: 10px;
 		border: 1px solid var(--line);
 		border-radius: 8px;
@@ -567,11 +711,13 @@
 		margin: 0;
 	}
 	.butler-error button {
+		min-height: 32px;
 		text-decoration: underline;
-		margin-top: 8px;
+		margin-top: 4px;
 	}
 	form {
-		margin: 0 14px;
+		margin: 0 12px;
+		flex-shrink: 0;
 		display: flex;
 		gap: 8px;
 		border: 1px solid var(--line);
@@ -587,7 +733,7 @@
 		border: 0;
 		background: transparent;
 		color: var(--ink);
-		font-size: 13px;
+		font-size: 14px;
 		padding: 5px;
 	}
 	textarea:focus {
@@ -598,15 +744,20 @@
 		outline-offset: 2px;
 	}
 	.butler-send {
-		width: 36px;
-		height: 36px;
+		width: 40px;
+		height: 40px;
 		flex: none;
 	}
-	footer {
-		padding: 9px 15px 12px;
-		font-size: 9px;
+	.sync-line {
+		min-height: 23px;
+		flex-shrink: 0;
+		padding: 4px 12px 7px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 5px;
+		font-size: 10px;
 		color: var(--muted);
-		text-align: center;
 	}
 	.sr-only {
 		position: absolute;
@@ -619,29 +770,73 @@
 		white-space: nowrap;
 		border: 0;
 	}
+	@keyframes butler-arrival {
+		from {
+			opacity: 0;
+			transform: translateY(8px);
+		}
+		to {
+			opacity: 1;
+			transform: translateY(0);
+		}
+	}
+	@keyframes spin {
+		to {
+			transform: rotate(360deg);
+		}
+	}
+	@keyframes dot {
+		0%,
+		80%,
+		100% {
+			transform: translateY(0);
+			opacity: 0.4;
+		}
+		40% {
+			transform: translateY(-4px);
+			opacity: 1;
+		}
+	}
+	@keyframes progress {
+		from {
+			background-position: -100% 0;
+		}
+		to {
+			background-position: 200% 0;
+		}
+	}
 	@media (max-width: 640px) {
 		.butler-launcher {
-			right: 16px;
-			bottom: 84px;
-			padding: 12px 16px;
+			right: 10px;
+			bottom: max(8px, env(safe-area-inset-bottom));
 		}
 		.butler-panel {
-			right: 12px;
-			bottom: 146px;
-			width: calc(100vw - 24px);
-			height: min(680px, calc(100dvh - 164px));
-			border-radius: 16px;
-		}
-		header {
-			padding: 12px;
+			right: 8px;
+			bottom: calc(56px + env(safe-area-inset-bottom));
+			width: calc(100vw - 16px);
+			height: calc(100dvh - 68px - env(safe-area-inset-bottom));
+			border-radius: 14px;
 		}
 		.butler-transcript {
-			padding: 16px;
+			padding: 12px;
+		}
+		textarea {
+			font-size: 16px;
 		}
 	}
 	@media (prefers-reduced-motion: reduce) {
-		:global(.butler-transcript) {
-			scroll-behavior: auto;
+		.butler-panel,
+		.request-progress,
+		.typing-dots i,
+		.butler-panel :global(.spin),
+		.butler-launcher :global(.spin) {
+			animation: none;
+		}
+		.request-progress {
+			background: var(--green);
+		}
+		.typing-dots i {
+			opacity: 0.75;
 		}
 	}
 </style>
