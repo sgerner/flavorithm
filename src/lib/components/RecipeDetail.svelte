@@ -151,7 +151,9 @@
 					</div>
 				</div>
 			{:else}<div class="nutrition-panel" transition:revealMotion|global>
-					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">Ingredients or servings changed. Refresh this estimate before relying on it.</p>{/if}
+					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
+							Ingredients or servings changed. Refresh this estimate before relying on it.
+						</p>{/if}
 					<label class="servings nutrition-selector"
 						>Show nutrition for<select bind:value={nutritionMode}
 							><option value="serving">One serving</option><option value="recipe"
