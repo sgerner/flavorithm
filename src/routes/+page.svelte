@@ -1265,10 +1265,10 @@
 		);
 	}
 	let butlerChat = $state<ButlerChat>();
-	let butlerSnapshot = '';
 	async function askButler(
 		message: string,
-		history: { role: 'user' | 'assistant'; content: string }[]
+		history: { role: 'user' | 'assistant'; content: string }[],
+		signal?: AbortSignal
 	) {
 		if (!needAI()) {
 			butlerChat?.close();
@@ -1283,23 +1283,27 @@
 			today: dateKey(new Date()),
 			availableThemes: themes,
 			selectedRecipeId: selected?.id ?? editingRecipe?.id,
+			userName: user?.name?.trim().slice(0, 80),
 			page
 		});
-		const result = await ai('chat', {
-			prompt: message,
-			messages: [
-				...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
-				{ role: 'user', content: message }
-			],
-			context
-		});
+		const result = await ai(
+			'chat',
+			{
+				prompt: message,
+				messages: [
+					...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
+					{ role: 'user', content: message }
+				],
+				context
+			},
+			signal
+		);
 		if (owner !== `${user?.id}:${user?.householdId}`)
 			throw new Error('The active kitchen changed. Ask Basil again.');
-		butlerSnapshot = snapshot;
 		return result as { reply: string; commands: unknown[] };
 	}
-	function applyButler(commands: unknown[]) {
-		if (JSON.stringify(kitchen) !== butlerSnapshot) {
+	function applyButler(commands: unknown[], expectedSnapshot: string) {
+		if (JSON.stringify(kitchen) !== expectedSnapshot) {
 			throw new Error(
 				'Your kitchen changed since this proposal. Ask Basil for an updated proposal.'
 			);
@@ -1324,7 +1328,7 @@
 				openButlerControl(effect.action);
 			}
 		}
-		notify('Basil’s instructions applied.');
+		return JSON.stringify(kitchen);
 	}
 	function openButlerControl(target: string) {
 		switch (target) {
@@ -2053,6 +2057,9 @@
 		owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
 		request={askButler}
 		apply={applyButler}
+		userName={user?.name ?? ''}
+		syncing={sendingSync}
+		{pendingSync}
 	/>
 {/if}
 
