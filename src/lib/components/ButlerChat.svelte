@@ -15,7 +15,7 @@
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
 	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
-	import type { AppState } from '#lib/types.ts';
+	import type { AppState, Recipe } from '#lib/types.ts';
 
 	type Turn = { role: 'user' | 'assistant'; content: string };
 	type Action = ButlerAction & { status: 'pending' | 'applied' | 'dismissed' };
@@ -37,11 +37,31 @@
 		request: (
 			prompt: string,
 			history: Turn[],
-			signal?: AbortSignal
+			signal?: AbortSignal,
+			recipeDrafts?: Recipe[]
 		) => Promise<{ reply: string; commands: unknown[] }>;
 		apply: (commands: unknown[], expectedSnapshot: string) => string | Promise<string>;
 	} = $props();
 	let open = $state(false);
+	let recipeDrafts = $state<Recipe[]>([]);
+	let viewportStyle = $state('');
+	$effect(() => {
+		if (!open) return;
+		const viewport = window.visualViewport;
+		if (!viewport) return;
+		const update = () => {
+			viewportStyle = `--chat-viewport-height: ${viewport.height}px; --chat-viewport-bottom: ${Math.max(0, window.innerHeight - viewport.offsetTop - viewport.height)}px`;
+		};
+		update();
+		viewport.addEventListener('resize', update);
+		viewport.addEventListener('scroll', update);
+		window.addEventListener('resize', update);
+		return () => {
+			viewport.removeEventListener('resize', update);
+			viewport.removeEventListener('scroll', update);
+			window.removeEventListener('resize', update);
+		};
+	});
 	let draft = $state('');
 	let messages = $state<Message[]>([]);
 	let busy = $state(false);
@@ -96,6 +116,7 @@
 			currentOwner = owner;
 			cancelRequest();
 			messages = [];
+			recipeDrafts = [];
 			draft = '';
 			error = '';
 			failedPrompt = '';
@@ -129,6 +150,7 @@
 	function clear() {
 		cancelRequest();
 		messages = [];
+		recipeDrafts = [];
 		error = '';
 		failedPrompt = '';
 		input?.focus();
@@ -165,12 +187,17 @@
 		);
 		void scroll();
 		try {
-			const result = await request(prompt, history, currentController.signal);
+			const result = await request(prompt, history, currentController.signal, recipeDrafts);
 			currentController.signal.throwIfAborted();
 			if (!alive || token !== generation) return;
 			const actions = buildButlerActions(result.commands, JSON.parse(snapshot)).map(
 				(action): Action => ({ ...action, status: 'pending' })
 			);
+			const drafts = new Map(recipeDrafts.map((recipe) => [recipe.id, recipe]));
+			for (const action of actions)
+				for (const command of action.commands)
+					if (command.type === 'recipe.upsert') drafts.set(command.recipe.id, command.recipe);
+			recipeDrafts = [...drafts.values()].slice(-10);
 			react('speaking', Math.min(12000, Math.max(2400, result.reply.length * 28)));
 			messages.push({
 				id: ++sequence,
@@ -215,6 +242,10 @@
 			const snapshot = await apply(action.commands, message.snapshot);
 			if (!alive || token !== generation) return;
 			message.snapshot = snapshot;
+			const savedIds = action.commands.flatMap((command) =>
+				command.type === 'recipe.upsert' ? [command.recipe.id] : []
+			);
+			recipeDrafts = recipeDrafts.filter((recipe) => !savedIds.includes(recipe.id));
 			action.status = 'applied';
 			react('pleased', 2200);
 		} catch (e) {
@@ -270,6 +301,7 @@
 {#if open}
 	<div
 		class="butler-panel"
+		style={viewportStyle}
 		id="butler-panel"
 		role="dialog"
 		tabindex="-1"
@@ -366,7 +398,13 @@
 											</button>
 											<button
 												class="dismiss-action"
-												onclick={() => (action.status = 'dismissed')}
+												onclick={() => {
+													action.status = 'dismissed';
+													const ids = action.commands.flatMap((command) =>
+														command.type === 'recipe.upsert' ? [command.recipe.id] : []
+													);
+													recipeDrafts = recipeDrafts.filter((recipe) => !ids.includes(recipe.id));
+												}}
 												disabled={working}
 												aria-label={`Dismiss ${action.title}`}>Dismiss</button
 											>
@@ -463,10 +501,13 @@
 		animation: butler-arrival 180ms ease-out;
 		position: fixed;
 		right: 16px;
-		bottom: calc(60px + env(safe-area-inset-bottom));
+		bottom: calc(var(--chat-viewport-bottom, 0px) + 60px + env(safe-area-inset-bottom));
 		z-index: 46;
 		width: min(440px, calc(100vw - 24px));
-		height: min(740px, calc(100dvh - 80px - env(safe-area-inset-bottom)));
+		height: min(
+			740px,
+			calc(var(--chat-viewport-height, 100dvh) - 80px - env(safe-area-inset-bottom))
+		);
 		display: flex;
 		flex-direction: column;
 		background: var(--surface);
@@ -812,9 +853,9 @@
 		}
 		.butler-panel {
 			right: 8px;
-			bottom: calc(56px + env(safe-area-inset-bottom));
+			bottom: calc(var(--chat-viewport-bottom, 0px) + 8px + env(safe-area-inset-bottom));
 			width: calc(100vw - 16px);
-			height: calc(100dvh - 68px - env(safe-area-inset-bottom));
+			height: calc(var(--chat-viewport-height, 100dvh) - 20px - env(safe-area-inset-bottom));
 			border-radius: 14px;
 		}
 		.butler-transcript {

@@ -1268,7 +1268,8 @@
 	async function askButler(
 		message: string,
 		history: { role: 'user' | 'assistant'; content: string }[],
-		signal?: AbortSignal
+		signal?: AbortSignal,
+		recipeDrafts: Recipe[] = []
 	) {
 		if (!needAI()) {
 			butlerChat?.close();
@@ -1282,6 +1283,7 @@
 			preferences: { diet, allergies, maxTime, complexity, cuisines, theme, dark },
 			today: dateKey(new Date()),
 			availableThemes: themes,
+			recipeDrafts,
 			selectedRecipeId: selected?.id ?? editingRecipe?.id,
 			userName: user?.name?.trim().slice(0, 80),
 			page

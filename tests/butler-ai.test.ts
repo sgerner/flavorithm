@@ -27,6 +27,12 @@ test('butler chat uses the selected provider and validates discussion responses'
 			{ reply: 'Very good. Let us give Wednesday a fighting chance.', commands: [] },
 			(body) => {
 				assert.match(body.messages[0].content, /Basil/);
+				assert.match(
+					body.messages[0].content,
+					/recipe card with recipe.upsert instead of listing ingredients or cooking steps/
+				);
+				assert.match(body.messages[0].content, /preserve its ID and unchanged fields/);
+				assert.match(body.messages[0].content, /Drafts are unsaved proposals/);
 				assert.match(body.messages[0].content, /formal, impeccably courteous/);
 				assert.match(body.messages[0].content, /'Master \{userName\}'/);
 				assert.match(body.messages[0].content, /'master of the house'/);
@@ -105,4 +111,41 @@ test('butler chat requires bounded conversation and kitchen context before infer
 	])
 		await assert.rejects(runAIRequest(input, fetcher), AIRequestError);
 	assert.equal(called, false);
+});
+
+test('Basil can revise an unsaved recipe card in the same conversation', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const { applyButlerCommands } = await import('../src/lib/butler.ts');
+	const kitchen = createInitialState();
+	const draft = { ...kitchen.recipes[0], id: 'basil-draft', title: 'Weeknight supper' };
+	const revised = { ...draft, servings: 6 };
+	const result = (await runAIRequest(
+		{
+			...request,
+			messages: [
+				{ role: 'user', content: 'Create a weeknight supper recipe card.' },
+				{ role: 'assistant', content: 'Your card is ready to review.' },
+				{ role: 'user', content: 'Make it serve six.' }
+			],
+			context: JSON.stringify({ ...kitchen, recipeDrafts: [draft] })
+		},
+		provider(
+			{
+				reply: 'Revised for six. Review the updated card.',
+				commands: [{ type: 'recipe.upsert', recipe: revised }]
+			},
+			(body) => {
+				assert.match(body.messages[1].content, /recipeDrafts/);
+				assert.match(body.messages[1].content, /basil-draft/);
+				assert.match(body.messages[1].content, /Make it serve six/);
+			}
+		)
+	)) as { reply: string; commands: unknown[] };
+	assert.equal(
+		kitchen.recipes.some((recipe) => recipe.id === draft.id),
+		false
+	);
+	const updated = applyButlerCommands(kitchen, result.commands).state;
+	assert.equal(updated.recipes.filter((recipe) => recipe.id === draft.id).length, 1);
+	assert.equal(updated.recipes.find((recipe) => recipe.id === draft.id)?.servings, 6);
 });
