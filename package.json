@@ -13,7 +13,7 @@
 		"catalog:update": "node scripts/update-provider-endpoints.mjs",
 		"format": "prettier --write .",
 		"format:check": "prettier --check .",
-		"prepare": "husky",
+		"prepare": "node -e \"if (process.env.NODE_ENV !== 'production') import('husky').then(({default: husky}) => husky())\"",
 		"test:smoke": "node scripts/smoke-test.mjs",
 		"test:sso": "node scripts/sso-smoke-test.mjs",
 		"readiness": "node --env-file-if-exists=.env scripts/readiness.mjs"
