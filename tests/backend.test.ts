@@ -240,7 +240,7 @@ test('password recovery tokens are hashed, one-use, expiring, and revoke old ses
 	let sentBody: Record<string, unknown> | undefined;
 	const delivered = await backend.sendPasswordResetEmail(
 		reset.email,
-		`https://flavorithm.example/?reset=${reset.token}`,
+		`https://flavorithm.example/?source=mail&reset=${reset.token}`,
 		'test-api-key',
 		'Flavorithm <kitchen@example.com>',
 		async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -253,6 +253,7 @@ test('password recovery tokens are hashed, one-use, expiring, and revoke old ses
 	assert.equal(delivered, true);
 	assert.equal(endpoint, 'https://api.resend.com/emails');
 	assert.deepEqual(sentBody?.to, [account.user.email]);
+	assert.match(String(sentBody?.html), /source=mail&amp;reset=/);
 
 	await backend.resetUserPassword(reset.token, 'replacement secure password');
 	assert.equal(backend.getUserFromSession(account.token), null);
