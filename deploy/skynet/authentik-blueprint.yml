@@ -3,7 +3,7 @@ version: 1
 metadata:
   name: Flavorithm forward-auth application
   labels:
-    blueprints.goauthentik.io/instantiate: "true"
+    blueprints.goauthentik.io/instantiate: 'true'
 
 entries:
   - model: authentik_providers_proxy.proxyprovider
@@ -14,7 +14,8 @@ entries:
       name: Flavorithm
       mode: forward_single
       external_host: https://eat.stevengerner.com
-      authorization_flow: !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
+      authorization_flow:
+        !Find [authentik_flows.flow, [slug, default-provider-authorization-implicit-consent]]
       invalidation_flow: !Find [authentik_flows.flow, [slug, default-provider-invalidation-flow]]
 
   - model: authentik_core.application

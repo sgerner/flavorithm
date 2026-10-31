@@ -12,6 +12,8 @@
 		"seed:dev": "node --experimental-strip-types scripts/seed-dev.mjs",
 		"catalog:update": "node scripts/update-provider-endpoints.mjs",
 		"format": "prettier --write .",
+		"format:check": "prettier --check .",
+		"prepare": "husky",
 		"test:smoke": "node scripts/smoke-test.mjs",
 		"test:sso": "node scripts/sso-smoke-test.mjs",
 		"readiness": "node --env-file-if-exists=.env scripts/readiness.mjs"
@@ -38,11 +40,16 @@
 	},
 	"devDependencies": {
 		"@types/node": "^26.6.5",
+		"husky": "^9.1.7",
+		"lint-staged": "^17.6.0",
 		"prettier": "^3.9.10",
 		"prettier-plugin-svelte": "^4.1.1",
 		"svelte-check": "^4.7.7"
 	},
 	"private": true,
+	"lint-staged": {
+		"*": "prettier --write --ignore-unknown"
+	},
 	"imports": {
 		"#lib": "./src/lib",
 		"#lib/*": "./src/lib/*"

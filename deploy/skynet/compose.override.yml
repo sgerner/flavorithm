@@ -14,18 +14,18 @@ services:
     image: ghcr.io/ggml-org/whisper.cpp@sha256:7a4e5f481192899f6c3853ff181ea6347b219ca2f388e1d84870b84ad80f6b7f
     container_name: flavorithm-whisper
     restart: unless-stopped
-    entrypoint: ["whisper-server"]
+    entrypoint: ['whisper-server']
     command:
       - --model
       - /models/ggml-base.bin
       - --host
       - 0.0.0.0
       - --port
-      - "8080"
+      - '8080'
       - --threads
-      - "4"
+      - '4'
       - --no-gpu
-    user: "10001:10001"
+    user: '10001:10001'
     volumes:
       - /home/skynet/opt/appdata/flavorithm-whisper:/models:ro
     read_only: true
@@ -47,15 +47,15 @@ services:
     networks:
       - voice
     labels:
-      com.centurylinklabs.watchtower.enable: "false"
-      diun.enable: "false"
+      com.centurylinklabs.watchtower.enable: 'false'
+      diun.enable: 'false'
 
   flavorithm-updater:
     image: docker:cli
     container_name: flavorithm-updater
     restart: unless-stopped
     working_dir: /app
-    command: ["/bin/sh", "/app/deploy/skynet/update.sh"]
+    command: ['/bin/sh', '/app/deploy/skynet/update.sh']
     environment:
       FLAVORITHM_UPDATE_INTERVAL_SECONDS: ${FLAVORITHM_UPDATE_INTERVAL_SECONDS:-900}
       FLAVORITHM_UPDATE_COMMAND_TIMEOUT_SECONDS: ${FLAVORITHM_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}
@@ -66,8 +66,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - /home/skynet/opt/appdata/flavorithm-updater:/state
     labels:
-      com.centurylinklabs.watchtower.enable: "false"
-      diun.enable: "false"
+      com.centurylinklabs.watchtower.enable: 'false'
+      diun.enable: 'false'
 
 networks:
   proxy:
