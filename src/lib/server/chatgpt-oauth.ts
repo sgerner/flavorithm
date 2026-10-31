@@ -1587,10 +1587,6 @@ export function enforceChatGPTStartRateLimit(userId: string, clientAddress: stri
 	consumeRateLimit(`chatgpt-oauth-ip:${clientAddress}`, 30, 15 * 60 * 1000);
 }
 
-export function validateHostedOAuthConfiguration(): boolean {
-	return Boolean(hostedClientConfig());
-}
-
 export async function getChatGPTConnection(
 	userId: string,
 	accountId: string,
