@@ -17,7 +17,7 @@
 </script>
 
 <script lang="ts">
-	import { onDestroy, tick } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
 	import { revealMotion } from '#lib/motion.ts';
 	let {
@@ -36,6 +36,8 @@
 	} = $props();
 	let busy = $state(false);
 	let reading = $state(false);
+	let reviewingDraft = $state(untrack(() => session.draft !== null));
+	let retryAvailable = $state(false);
 	let error = $state('');
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
@@ -51,9 +53,11 @@
 		['protein', 'Protein (g)']
 	];
 	let controller: AbortController | undefined;
+	let captureGeneration = 0;
 	let alive = true;
 	onDestroy(() => {
 		alive = false;
+		captureGeneration++;
 		controller?.abort();
 	});
 
@@ -115,24 +119,47 @@
 		event.preventDefault();
 		if (busy || reading || !alive || (!session.text.trim() && !session.photo)) return;
 		error = '';
+		retryAvailable = false;
 		busy = true;
-		controller = new AbortController();
+		const generation = ++captureGeneration;
+		const currentController = new AbortController();
+		controller = currentController;
 		try {
 			const result = await capture(
 				{ prompt: session.text, ...(session.photo ? { image: session.photo } : {}) },
-				controller.signal
+				currentController.signal
 			);
-			if (alive && result) {
+			if (alive && generation === captureGeneration && result) {
 				session.draft = result.recipe;
 				session.assumptions = result.assumptions;
+				reviewingDraft = true;
 				await tick();
-				if (alive) heading?.focus();
+				if (alive && generation === captureGeneration) heading?.focus();
 			}
 		} catch (e) {
-			if (alive && !controller.signal.aborted) error = (e as Error).message;
+			if (alive && generation === captureGeneration) {
+				error = currentController.signal.aborted
+					? 'Request cancelled. Your input is still here; try again when you’re ready.'
+					: e instanceof Error
+						? e.message
+						: 'Could not create a recipe draft. Please try again.';
+				retryAvailable = true;
+			}
 		} finally {
-			if (alive) busy = false;
+			if (alive && generation === captureGeneration) {
+				busy = false;
+				controller = undefined;
+			}
 		}
+	}
+	function cancelPrepare() {
+		if (!busy) return;
+		captureGeneration++;
+		controller?.abort();
+		controller = undefined;
+		busy = false;
+		error = 'Request cancelled. Your input is still here; try again when you’re ready.';
+		retryAvailable = true;
 	}
 	function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
@@ -175,7 +202,7 @@
 	}
 </script>
 
-{#if !session.draft}
+{#if !reviewingDraft || !session.draft}
 	<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Import a recipe</h2>
 	<p class="muted capture-help">Paste a recipe, link, or rough ingredient notes.</p>
 	<form onsubmit={prepare}>
@@ -228,6 +255,7 @@
 						onclick={() => {
 							session = emptyImportSession();
 							error = '';
+							retryAvailable = false;
 						}}>Clear</button
 					>{/if}
 			</div>
@@ -249,14 +277,25 @@
 					If a website can’t be read, copy its recipe text or attach a screenshot instead.
 				</p>{/if}{/if}
 		<div class="capture-actions">
+			{#if busy}<button class="secondary" type="button" onclick={cancelPrepare}>Cancel</button>{/if}
 			<button
 				class="primary full"
 				type="submit"
 				disabled={busy || reading || (!session.text.trim() && !session.photo)}
 				aria-busy={busy}
-				>{busy ? 'Making your draft…' : 'Create recipe draft'}<Check size={18} /></button
+				>{busy ? 'Making your draft…' : retryAvailable ? 'Try again' : 'Create recipe draft'}<Check
+					size={18}
+				/></button
 			>
 		</div>
+		{#if session.draft}<button
+				class="text-button"
+				type="button"
+				onclick={() => {
+					error = '';
+					reviewingDraft = true;
+				}}>Return to reviewed draft</button
+			>{/if}
 		<p class="field-help">
 			Uses your connected model. You’ll review quantities and steps before saving.
 		</p>
@@ -407,6 +446,8 @@
 			onclick={() => {
 				session = emptyImportSession();
 				error = '';
+				reviewingDraft = false;
+				retryAvailable = false;
 			}}>Discard draft</button
 		>
 		{#if draft.source}<p class="field-help">
@@ -418,7 +459,7 @@
 				class="secondary"
 				type="button"
 				onclick={() => {
-					session.draft = null;
+					reviewingDraft = false;
 					error = '';
 				}}><ChevronLeft size={18} />Back</button
 			><button class="primary" type="submit"><Check size={18} />Save recipe</button>

@@ -161,6 +161,65 @@ export function reconcileShoppingList(
 	return [...retained, ...generated];
 }
 
+/** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
+export function transferPurchasedItemsToPantry(
+	pantry: Ingredient[],
+	purchases: ShoppingItem[],
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): Ingredient[] {
+	const result = pantry.map((item) => ({ ...item }));
+	const buckets = new Map<
+		string,
+		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+	>();
+	for (const item of purchases) {
+		if (
+			!item.checked ||
+			!Number.isFinite(item.quantity) ||
+			!(item.quantity > 0) ||
+			!item.unit.trim()
+		)
+			continue;
+		const normalizedName = normalizeName(item.name);
+		const unit = unitInfo(item.unit);
+		const key = `${normalizedName}\u0000${unit.dimension}`;
+		const bucket = buckets.get(key) ?? { name: item.name.trim(), unit, quantityBase: 0 };
+		bucket.quantityBase += item.quantity * unit.factor;
+		buckets.set(key, bucket);
+	}
+
+	const usedIds = new Set(result.map((item) => item.id));
+	for (const [key, bucket] of buckets) {
+		const [normalizedName] = key.split('\u0000');
+		const destination = result.find(
+			(item) =>
+				normalizeName(item.name) === normalizedName &&
+				unitInfo(item.unit).dimension === bucket.unit.dimension &&
+				!item.expires?.trim()
+		);
+		if (destination) {
+			destination.quantity = roundPantryQuantity(
+				destination.quantity + bucket.quantityBase / unitInfo(destination.unit).factor
+			);
+			continue;
+		}
+
+		const baseId = createId();
+		let id = baseId;
+		let suffix = 2;
+		while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+		usedIds.add(id);
+		result.push({
+			id,
+			name: bucket.name,
+			quantity: roundPantryQuantity(bucket.quantityBase / bucket.unit.factor),
+			unit: bucket.unit.display,
+			category: 'Pantry'
+		});
+	}
+	return result;
+}
+
 function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
 	return state.recipes.find((recipe) => recipe.id === meal.recipeId);
 }

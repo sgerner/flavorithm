@@ -10,7 +10,8 @@ import {
 	convertCompatibleQuantity,
 	expiryStatus,
 	normalizeIngredientName,
-	reconcileShoppingList
+	reconcileShoppingList,
+	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
 
@@ -84,7 +85,11 @@ function state(overrides: Partial<AppState> = {}): AppState {
 
 test('converts compatible units and rejects cross-dimension conversions', () => {
 	assert.ok(Math.abs((convertCompatibleQuantity(1, 'cup', 'tbsp') ?? 0) - 16) < 0.01);
+	assert.ok(Math.abs((convertCompatibleQuantity(1, 'pint', 'cups') ?? 0) - 2) < 0.01);
+	assert.ok(Math.abs((convertCompatibleQuantity(1, 'quart', 'fl oz') ?? 0) - 32) < 0.01);
 	assert.equal(convertCompatibleQuantity(1, 'cup', 'g'), undefined);
+	assert.equal(convertCompatibleQuantity(1, 'package', 'cup'), undefined);
+	assert.equal(convertCompatibleQuantity(1, 'can', 'each'), undefined);
 	assert.equal(normalizeIngredientName('green onions'), normalizeDomainName('green onions'));
 	assert.deepEqual(domainUnitInfo('cups'), domainUnitInfo('cup'));
 });
@@ -140,6 +145,43 @@ test('a checked generated row keeps its id when a larger requirement creates a r
 	assert.deepEqual(repeated, refreshed);
 	assert.equal(new Set(repeated.map((item) => item.id)).size, repeated.length);
 	assert.equal(repeated.find((item) => !item.checked)?.quantity, 1);
+});
+
+test('purchased shopping rows merge aliases and compatible units without changing an expiring lot', () => {
+	const merged = transferPurchasedItemsToPantry(
+		[pantry('olive oil', 0.25, 'cup')],
+		[
+			shopping('merge-tbsp', 'extra virgin olive oil', 1, 'tbsp', true),
+			shopping('merge-tsp', 'olive oil', 1, 'tsp', true)
+		],
+		() => 'unused'
+	);
+	assert.equal(merged.length, 1);
+	assert.equal(merged[0].unit, 'cup');
+	assert.ok(Math.abs(merged[0].quantity - 1 / 3) < 0.001);
+
+	const result = transferPurchasedItemsToPantry(
+		[pantry('olive oil', 0.25, 'cup', '2026-11-05')],
+		[
+			shopping('oil-tbsp', 'extra virgin olive oil', 1, 'tbsp', true),
+			shopping('oil-tsp', 'olive oil', 1, 'tsp', true),
+			shopping('oil-not-checked', 'olive oil', 1, 'cup', false),
+			shopping('oil-package', 'olive oil', 1, 'package', true)
+		],
+		(() => {
+			let id = 0;
+			return () => `purchase-${++id}`;
+		})()
+	);
+
+	assert.equal(result.length, 3);
+	assert.equal(result[0].quantity, 0.25);
+	assert.equal(result[0].expires, '2026-11-05');
+	const purchasedOil = result.find((item) => item.unit === 'tbsp');
+	assert.ok(purchasedOil);
+	assert.equal(normalizeIngredientName(purchasedOil.name), 'olive oil');
+	assert.ok(Math.abs(purchasedOil.quantity - 1.33) < 0.01);
+	assert.equal(result.find((item) => item.unit === 'package')?.quantity, 1);
 });
 
 test('completing a meal deducts compatible pantry quantities once and never goes below zero', () => {

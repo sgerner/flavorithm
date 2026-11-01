@@ -31,8 +31,8 @@ function recipe(overrides: Partial<Recipe> = {}): Recipe {
 	};
 }
 
-function pantry(name: string, quantity: number, unit: string): Ingredient {
-	return { id: `${name}-${unit}`, name, quantity, unit, category: 'Test' };
+function pantry(name: string, quantity: number, unit: string, expires?: string): Ingredient {
+	return { id: `${name}-${unit}`, name, quantity, unit, category: 'Test', expires };
 }
 
 test('deduplicates common ingredient names and converts compatible units before subtracting pantry', () => {
@@ -83,6 +83,69 @@ test('an explicit meal plan scales servings and excludes unplanned recipes', () 
 		[{ name: 'rice', quantity: 2 }]
 	);
 	assert.deepEqual(buildShoppingList(recipes, [], []), []);
+});
+
+test('shopping allocates pantry lots by meal date so expired leftovers do not cover later meals', () => {
+	const tomatoRecipe = recipe({
+		servings: 2,
+		ingredients: [{ name: 'tomato', quantity: 50, unit: 'g' }]
+	});
+	const result = buildShoppingList(
+		[tomatoRecipe],
+		[
+			pantry('tomato', 100, 'g', '2026-10-24'),
+			{ ...pantry('tomatoes', 50, 'g'), expires: '2026-10-31' }
+		],
+		[
+			{ id: 'later', date: '2026-10-26', slot: 'Dinner', recipeId: 'pasta', servings: 4 },
+			{ id: 'earlier', date: '2026-10-22', slot: 'Dinner', recipeId: 'pasta', servings: 2 }
+		]
+	);
+
+	assert.equal(result.length, 1);
+	assert.equal(result[0].name, 'tomato');
+	assert.equal(result[0].quantity, 50);
+	assert.equal(result[0].unit, 'g');
+});
+
+test('a blank recipe serving baseline cannot use pantry stock to claim the recipe is covered', () => {
+	const recipeWithBlankServings = recipe({
+		servings: '' as unknown as number,
+		ingredients: [{ name: 'egg', quantity: 2, unit: 'each' }]
+	});
+	const result = buildShoppingList([recipeWithBlankServings], [pantry('eggs', 2, 'each')]);
+
+	assert.equal(result.length, 1);
+	assert.equal(result[0].quantity, 2);
+});
+
+test('standard culinary volume units convert while package sizes remain unrelated', () => {
+	const recipes = [recipe({ ingredients: [{ name: 'broth', quantity: 1, unit: 'quart' }] })];
+	const covered = buildShoppingList(recipes, [pantry('broth', 2, 'pints')]);
+	assert.deepEqual(covered, []);
+
+	const packageSizeIsUnknown = buildShoppingList(recipes, [pantry('broth', 1, 'package')]);
+	assert.equal(packageSizeIsUnknown.length, 1);
+	assert.equal(packageSizeIsUnknown[0].quantity, 1);
+	assert.equal(packageSizeIsUnknown[0].unit, 'qt');
+});
+
+test('unplanned and blank-date shopping requests check expiry against today', () => {
+	const riceRecipe = recipe({
+		ingredients: [{ name: 'rice', quantity: 1, unit: 'cup' }]
+	});
+	const expiredRice = [pantry('rice', 1, 'cup', '2026-10-21')];
+	const now = new Date(2026, 9, 22, 12);
+	const unplanned = buildShoppingList([riceRecipe], expiredRice, undefined, now);
+	const blankDate = buildShoppingList(
+		[riceRecipe],
+		expiredRice,
+		[{ id: 'dinner', date: '', slot: 'Dinner', recipeId: 'pasta', servings: 2 }],
+		now
+	);
+
+	assert.equal(unplanned[0].quantity, 1);
+	assert.equal(blankDate[0].quantity, 1);
 });
 
 test('pantry subtraction stays within the same measurement dimension', () => {

@@ -91,7 +91,10 @@ test('concurrent recipe deletion and meal addition never creates orphaned plans'
 		servings: 2
 	});
 	remote.recipes.shift();
-	assert.ok(mergeKitchenStates(base, local, remote).conflicts.length);
+	const pending = mergeKitchenStates(base, local, remote);
+	assert.ok(pending.conflicts.length);
+	assert.equal(pending.state.meals[0]?.id, 'meal');
+	assert.ok(pending.state.recipes.some((recipe) => recipe.id === pending.state.meals[0].recipeId));
 	const resolved = mergeKitchenStates(base, local, remote, 'local').state;
 	assert.ok(resolved.recipes.some((recipe) => recipe.id === resolved.meals[0].recipeId));
 	assert.equal(mergeKitchenStates(base, local, remote, 'remote').state.meals.length, 0);

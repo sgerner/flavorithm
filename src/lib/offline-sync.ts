@@ -340,10 +340,12 @@ export function mergeKitchenStates(
 			local: describeMealRecipe(local, meal.id, meal.recipeId),
 			remote: describeMealRecipe(remote, meal.id, meal.recipeId)
 		});
-		if (prefer) {
-			const recipe = (prefer === 'local' ? local : remote).recipes.find(
-				(recipe) => recipe.id === meal.recipeId
-			);
+		{
+			// Keep the complete proposed meal available for review and backup until a choice is made.
+			const candidates = prefer
+				? (prefer === 'local' ? local : remote).recipes
+				: [...local.recipes, ...remote.recipes];
+			const recipe = candidates.find((recipe) => recipe.id === meal.recipeId);
 			if (recipe) {
 				state.recipes.push(structuredClone(recipe));
 				recipeIds.add(recipe.id);

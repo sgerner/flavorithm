@@ -18,6 +18,16 @@ addUnits('volume', 1000, 'l', ['l', 'liter', 'liters', 'litre', 'litres']);
 addUnits('volume', 4.928921594, 'tsp', ['tsp', 'teaspoon', 'teaspoons']);
 addUnits('volume', 14.78676478, 'tbsp', ['tbsp', 'tablespoon', 'tablespoons']);
 addUnits('volume', 236.5882365, 'cup', ['cup', 'cups']);
+addUnits('volume', 29.5735295625, 'fl oz', [
+	'fl oz',
+	'fl. oz',
+	'fluid oz',
+	'fluid ounce',
+	'fluid ounces'
+]);
+addUnits('volume', 473.176473, 'pt', ['pt', 'pint', 'pints']);
+addUnits('volume', 946.352946, 'qt', ['qt', 'quart', 'quarts']);
+addUnits('volume', 3785.411784, 'gal', ['gal', 'gallon', 'gallons']);
 addUnits('count', 1, 'each', [
 	'ea',
 	'each',
@@ -107,6 +117,52 @@ function roundQuantity(value: number): number {
 	return Object.is(rounded, -0) ? 0 : rounded;
 }
 
+function calendarDate(value: string): { year: number; month: number; day: number } | undefined {
+	const cleaned = value.trim();
+	const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(cleaned);
+	if (dateOnly) {
+		const year = Number(dateOnly[1]);
+		const month = Number(dateOnly[2]) - 1;
+		const day = Number(dateOnly[3]);
+		const parsed = new Date(0);
+		parsed.setFullYear(year, month, day);
+		parsed.setHours(0, 0, 0, 0);
+		if (parsed.getFullYear() !== year || parsed.getMonth() !== month || parsed.getDate() !== day)
+			return undefined;
+		return { year, month, day };
+	}
+	const parsed = new Date(cleaned);
+	if (!Number.isFinite(parsed.getTime())) return undefined;
+	return { year: parsed.getFullYear(), month: parsed.getMonth(), day: parsed.getDate() };
+}
+
+function dateOrdinal(date: { year: number; month: number; day: number }): number {
+	const utcDate = new Date(0);
+	utcDate.setUTCFullYear(date.year, date.month, date.day);
+	utcDate.setUTCHours(0, 0, 0, 0);
+	return Math.floor(utcDate.getTime() / 86_400_000);
+}
+
+function localDateKey(value: Date): string | undefined {
+	if (!Number.isFinite(value.getTime())) return undefined;
+	return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
+}
+
+function expiredBefore(expires: string | undefined, date: string | undefined): boolean {
+	if (!expires?.trim() || !date?.trim()) return false;
+	const expiryDate = calendarDate(expires);
+	const scheduledDate = calendarDate(date);
+	return Boolean(
+		expiryDate && scheduledDate && dateOrdinal(expiryDate) < dateOrdinal(scheduledDate)
+	);
+}
+
+type ShoppingRequirement = {
+	quantityBase: number;
+	mealDate?: string;
+	canUsePantry: boolean;
+};
+
 /**
  * Build a consolidated shopping list. With no meal plan, each recipe is included
  * at its listed serving count. Passing a meal array (including an empty array)
@@ -115,16 +171,27 @@ function roundQuantity(value: number): number {
 export function buildShoppingList(
 	recipes: Recipe[],
 	pantry: Ingredient[],
-	meals?: Meal[]
+	meals?: Meal[],
+	now: Date = new Date()
 ): ShoppingItem[] {
 	const recipesById = new Map(recipes.map((recipe) => [recipe.id, recipe]));
-	const requested: Array<{ recipe: Recipe; servings: number }> =
+	const requested: Array<{ recipe: Recipe; servings: number; mealDate?: string }> =
 		meals === undefined
-			? recipes.map((recipe) => ({ recipe, servings: recipe.servings }))
+			? recipes.map((recipe) => ({
+					recipe,
+					servings: recipe.servings,
+					mealDate: localDateKey(now)
+				}))
 			: meals.flatMap((meal) => {
 					const recipe = recipesById.get(meal.recipeId);
 					return recipe && Number.isFinite(meal.servings) && meal.servings > 0
-						? [{ recipe, servings: meal.servings }]
+						? [
+								{
+									recipe,
+									servings: meal.servings,
+									mealDate: meal.date.trim() ? meal.date : localDateKey(now)
+								}
+							]
 						: [];
 				});
 
@@ -137,11 +204,13 @@ export function buildShoppingList(
 			unit: UnitInfo;
 			quantityBase: number;
 			pantryBase: number;
+			requirements: ShoppingRequirement[];
 		}
 	>();
 
-	for (const { recipe, servings } of requested) {
-		const scale = recipe.servings > 0 ? servings / recipe.servings : 1;
+	for (const { recipe, servings, mealDate } of requested) {
+		const hasServingBaseline = Number.isFinite(recipe.servings) && recipe.servings > 0;
+		const scale = hasServingBaseline ? servings / recipe.servings : 1;
 		for (const ingredient of recipe.ingredients) {
 			if (
 				!Number.isFinite(ingredient.quantity) ||
@@ -158,20 +227,67 @@ export function buildShoppingList(
 				dimension: unit.dimension,
 				unit,
 				quantityBase: 0,
-				pantryBase: 0
+				pantryBase: 0,
+				requirements: []
 			};
-			bucket.quantityBase += ingredient.quantity * scale * unit.factor;
+			const quantityBase = ingredient.quantity * scale * unit.factor;
+			bucket.quantityBase += quantityBase;
+			bucket.requirements.push({
+				quantityBase,
+				mealDate,
+				// Without a recipe serving baseline, pantry stock cannot prove this request is covered.
+				canUsePantry: hasServingBaseline && Boolean(mealDate && calendarDate(mealDate))
+			});
 			buckets.set(key, bucket);
 		}
 	}
 
+	const pantryByBucket = new Map<
+		string,
+		Array<{ quantityBase: number; expires?: string; index: number }>
+	>();
 	for (const item of pantry) {
 		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
 		const normalizedName = normalizeName(item.name);
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		const bucket = buckets.get(key);
-		if (bucket) bucket.pantryBase += item.quantity * unit.factor;
+		if (!buckets.has(key)) continue;
+		const lots = pantryByBucket.get(key) ?? [];
+		lots.push({
+			quantityBase: item.quantity * unit.factor,
+			expires: item.expires,
+			index: lots.length
+		});
+		pantryByBucket.set(key, lots);
+	}
+
+	for (const [key, bucket] of buckets) {
+		const lots = (pantryByBucket.get(key) ?? []).sort((a, b) => {
+			const expiryA = a.expires ? calendarDate(a.expires) : undefined;
+			const expiryB = b.expires ? calendarDate(b.expires) : undefined;
+			const priorityA = expiryA ? dateOrdinal(expiryA) : Number.MAX_SAFE_INTEGER;
+			const priorityB = expiryB ? dateOrdinal(expiryB) : Number.MAX_SAFE_INTEGER;
+			return priorityA - priorityB || a.index - b.index;
+		});
+		const requirements = [...bucket.requirements].sort((a, b) => {
+			const dateA = a.mealDate ? calendarDate(a.mealDate) : undefined;
+			const dateB = b.mealDate ? calendarDate(b.mealDate) : undefined;
+			const orderA = dateA ? dateOrdinal(dateA) : Number.MAX_SAFE_INTEGER;
+			const orderB = dateB ? dateOrdinal(dateB) : Number.MAX_SAFE_INTEGER;
+			return orderA - orderB;
+		});
+		for (const requirement of requirements) {
+			if (!requirement.canUsePantry) continue;
+			let need = requirement.quantityBase;
+			for (const lot of lots) {
+				if (need <= 0) break;
+				if (!(lot.quantityBase > 0) || expiredBefore(lot.expires, requirement.mealDate)) continue;
+				const used = Math.min(need, lot.quantityBase);
+				lot.quantityBase -= used;
+				need -= used;
+				bucket.pantryBase += used;
+			}
+		}
 	}
 
 	return [...buckets.values()]

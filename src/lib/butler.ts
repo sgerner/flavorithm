@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { AppState } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList } from './domain.ts';
-import { completeMeal, reconcileShoppingList, expiryStatus } from './kitchen-workflows.ts';
+import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
@@ -192,11 +192,7 @@ function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
 	);
 	state.shopping = reconcileShoppingList(
 		state.shopping,
-		buildShoppingList(
-			state.recipes,
-			state.pantry.filter((item) => expiryStatus(item.expires, now) !== 'expired'),
-			meals
-		),
+		buildShoppingList(state.recipes, state.pantry, meals, now),
 		`week:${startKey}`
 	);
 }
@@ -244,10 +240,19 @@ export function applyButlerCommands(
 				requireId(state.pantry, command.id);
 				state.pantry = state.pantry.filter((item) => item.id !== command.id);
 				break;
-			case 'meal.upsert':
+			case 'meal.upsert': {
 				requireId(state.recipes, command.meal.recipeId);
-				state.meals = upsert(state.meals, command.meal);
+				const previous = state.meals.find((item) => item.id === command.meal.id);
+				const meal = previous?.completedAt
+					? {
+							...command.meal,
+							completedAt: previous.completedAt,
+							leftoverServings: previous.leftoverServings
+						}
+					: command.meal;
+				state.meals = upsert(state.meals, meal);
 				break;
+			}
 			case 'meal.delete':
 				requireId(state.meals, command.id);
 				state.meals = state.meals.filter((item) => item.id !== command.id);
