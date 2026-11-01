@@ -34,8 +34,7 @@ function averageSignal(entries: RatedRecipe[], matches: (recipe: Recipe) => bool
 
 function pantryScores(
 	recipe: Recipe,
-	pantry: Ingredient[],
-	now: Date
+	pantry: Map<string, { item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]>
 ): { available: number; expiring: number } {
 	const ingredients = recipe.ingredients.filter(
 		(item) => Number.isFinite(item.quantity) && item.quantity > 0 && item.unit.trim()
@@ -47,10 +46,7 @@ function pantryScores(
 	for (const ingredient of ingredients) {
 		let quantityAvailable = 0;
 		let quantityExpiring = 0;
-		for (const item of pantry) {
-			if (normalizeIngredientName(item.name) !== normalizeIngredientName(ingredient.name)) continue;
-			if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-			if (expiryStatus(item.expires, now) === 'expired') continue;
+		for (const { item, expiry } of pantry.get(normalizeIngredientName(ingredient.name)) ?? []) {
 			const compatibleQuantity = convertCompatibleQuantity(
 				item.quantity,
 				item.unit,
@@ -58,7 +54,7 @@ function pantryScores(
 			);
 			if (compatibleQuantity === undefined || compatibleQuantity <= 0) continue;
 			quantityAvailable += compatibleQuantity;
-			if (expiryStatus(item.expires, now) === 'soon') quantityExpiring += compatibleQuantity;
+			if (expiry === 'soon') quantityExpiring += compatibleQuantity;
 		}
 		availability += Math.min(1, quantityAvailable / ingredient.quantity);
 		expiringAvailability += Math.min(1, quantityExpiring / ingredient.quantity);
@@ -82,7 +78,7 @@ function learnedTimeSignal(recipe: Recipe, rated: RatedRecipe[]): number {
 
 function scoreRecipe(
 	recipe: Recipe,
-	pantryItems: Ingredient[],
+	pantryItems: Map<string, { item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]>,
 	preferences: Preferences,
 	rated: RatedRecipe[],
 	now: Date
@@ -129,7 +125,7 @@ function scoreRecipe(
 		if (recipe.tags.some((tag) => normalized(tag).includes(diet))) score += 2;
 	}
 
-	const pantryMatch = pantryScores(recipe, pantryItems, now);
+	const pantryMatch = pantryScores(recipe, pantryItems);
 	score += pantryMatch.available * 9;
 	score += pantryMatch.expiring * 4;
 	return score;
@@ -147,11 +143,24 @@ export function rankRecipes(
 		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
 	});
 
+	const pantryIndex = new Map<
+		string,
+		{ item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]
+	>();
+	for (const item of pantry) {
+		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
+		const expiry = expiryStatus(item.expires, now);
+		if (expiry === 'expired') continue;
+		const key = normalizeIngredientName(item.name);
+		const entries = pantryIndex.get(key) ?? [];
+		entries.push({ item, expiry });
+		pantryIndex.set(key, entries);
+	}
 	return recipes
 		.map((recipe, index) => ({
 			recipe,
 			index,
-			score: scoreRecipe(recipe, pantry, preferences, rated, now)
+			score: scoreRecipe(recipe, pantryIndex, preferences, rated, now)
 		}))
 		.sort((a, b) => b.score - a.score || a.index - b.index)
 		.map(({ recipe }) => recipe);

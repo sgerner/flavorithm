@@ -27,7 +27,9 @@
 		edit,
 		remove,
 		toggleHidden,
-		busy
+		busy,
+		initialServings,
+		completedSteps = $bindable<number[]>([])
 	}: {
 		recipe: Recipe;
 		close: () => void;
@@ -40,12 +42,39 @@
 		remove: () => void;
 		toggleHidden: () => void;
 		busy: boolean;
+		initialServings?: number;
+		completedSteps?: number[];
 	} = $props();
 	let nutritionMode = $state('serving');
 	let nutritionMultiplier = $derived(nutritionMode === 'recipe' ? recipe.servings : 1);
 	let tab = $state('recipe');
-	let completed = $state<number[]>([]);
-	let servingCount = $state(untrack(() => recipe.servings));
+	let completed = $derived(
+		completedSteps.filter(
+			(step) => Number.isInteger(step) && step >= 0 && step < recipe.steps.length
+		)
+	);
+	let servingCount = $state<number | undefined>(untrack(() => initialServings ?? recipe.servings));
+	let previousRecipeId = untrack(() => recipe.id);
+	let previousRecipeServings = untrack(() => recipe.servings);
+	let previousInitialServings = untrack(() => initialServings);
+	$effect(() => {
+		if (
+			recipe.id !== previousRecipeId ||
+			recipe.servings !== previousRecipeServings ||
+			initialServings !== previousInitialServings
+		) {
+			previousRecipeId = recipe.id;
+			previousRecipeServings = recipe.servings;
+			previousInitialServings = initialServings;
+			servingCount = initialServings ?? recipe.servings;
+		}
+	});
+	let validServings = $derived(
+		typeof servingCount === 'number' &&
+			Number.isInteger(servingCount) &&
+			servingCount >= 1 &&
+			servingCount <= 24
+	);
 </script>
 
 <div class="modal-backdrop" transition:backdropMotion|global>
@@ -82,10 +111,20 @@
 				><span><ChefHat size={16} />{recipe.difficulty}</span>
 			</div>
 			<div class="detail-actions">
-				<button class="primary" onclick={() => plan(servingCount)}
-					><CalendarPlus size={17} /> Plan a meal</button
-				><button class="secondary" onclick={() => shop(servingCount)}
-					><ShoppingBasket size={17} /> Shopping list</button
+				<button
+					class="primary"
+					disabled={!validServings}
+					aria-describedby={!validServings ? 'servings-help' : undefined}
+					onclick={() => {
+						if (validServings && servingCount !== undefined) plan(servingCount);
+					}}><CalendarPlus size={17} /> Plan a meal</button
+				><button
+					class="secondary"
+					disabled={!validServings}
+					aria-describedby={!validServings ? 'servings-help' : undefined}
+					onclick={() => {
+						if (validServings && servingCount !== undefined) shop(servingCount);
+					}}><ShoppingBasket size={17} /> Shopping list</button
 				><button
 					class:active={recipe.saved}
 					class="icon-button"
@@ -99,6 +138,9 @@
 				{#if recipe.saved}<button class="secondary recipe-manage-button" onclick={edit}>Edit</button
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
+			{#if !validServings}<p class="field-help" id="servings-help">
+					Enter 1–24 servings to plan or shop.
+				</p>{/if}
 			<div class="tabs">
 				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
 				><button class:active={tab === 'nutrition'} onclick={() => (tab = 'nutrition')}
@@ -115,6 +157,8 @@
 									type="number"
 									min="1"
 									max="24"
+									step="1"
+									aria-invalid={!validServings}
 									bind:value={servingCount}
 								/> servings</label
 							>
@@ -122,7 +166,9 @@
 						<ul class="ingredients-list">
 							{#each recipe.ingredients as item}<li>
 									<span
-										>{+((item.quantity * servingCount) / recipe.servings).toFixed(2)}
+										>{validServings && servingCount !== undefined
+											? +((item.quantity * servingCount) / recipe.servings).toFixed(2)
+											: '—'}
 										{item.unit}</span
 									>{item.name}
 								</li>{/each}
@@ -134,11 +180,12 @@
 							{#each recipe.steps as step, i}<li>
 									<button
 										class:done={completed.includes(i)}
+										aria-pressed={completed.includes(i)}
+										aria-label={`Mark step ${i + 1} ${completed.includes(i) ? 'incomplete' : 'complete'}`}
 										onclick={() =>
-											(completed = completed.includes(i)
+											(completedSteps = completed.includes(i)
 												? completed.filter((n) => n !== i)
 												: [...completed, i])}
-										aria-label={`Mark step ${i + 1} complete`}
 										>{#if completed.includes(i)}<span transition:fadeMotion|global
 												><Check size={16} /></span
 											>{:else}<span transition:fadeMotion|global

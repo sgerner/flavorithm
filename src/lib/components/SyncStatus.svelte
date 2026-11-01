@@ -26,7 +26,9 @@
 	} = $props();
 	let review = $state(false);
 	function describe(path: string): string {
-		const match = /^kitchen\.(recipes|pantry|shopping|meals)\[([^\]]+)\](?:\.(.*))?$/.exec(path);
+		const match = /^kitchen\.(recipes|pantry|shopping|meals)(?:\[([^\]]+)\])?(?:\.(.*))?$/.exec(
+			path
+		);
 		const names: Record<string, string> = {
 			maxTime: 'Cooking time',
 			complexity: 'Difficulty',
@@ -46,10 +48,22 @@
 			slot: 'Meal',
 			checked: 'Purchased',
 			nutrition: 'Nutrition',
+			calories: 'Calories',
+			protein: 'Protein',
+			carbs: 'Carbohydrates',
+			fat: 'Fat',
+			fiber: 'Fiber',
 			ratings: 'Ratings'
 		};
 		if (match) {
 			const group = match[1] as 'recipes' | 'pantry' | 'shopping' | 'meals';
+			if (!match[2])
+				return {
+					recipes: 'Recipes',
+					pantry: 'Pantry',
+					shopping: 'Shopping list',
+					meals: 'Meal plan'
+				}[group];
 			const item = kitchen[group].find((entry) => entry.id === match[2]);
 			const name =
 				item && 'title' in item
@@ -59,30 +73,50 @@
 						: item && 'date' in item
 							? `${item.date} ${item.slot}`
 							: 'Removed item';
-			return `${name} · ${names[match[3]] || match[3] || 'Item'}`;
+			return `${name} · ${
+				match[3]
+					?.split('.')
+					.map((field) => names[field] || field)
+					.join(' · ') || 'Item'
+			}`;
 		}
 		const field = path.replace(/^kitchen\.preferences\./, '').split('.')[0];
 		return names[field] || 'Kitchen preferences';
 	}
-	const valueText = (value: unknown) =>
-		value === undefined
-			? 'Removed'
-			: typeof value === 'string'
-				? value
-				: JSON.stringify(value, null, 2);
+	function valueText(value: unknown): string {
+		if (value === undefined || value === null) return 'Removed';
+		if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+		if (Array.isArray(value)) return value.length ? value.map(valueText).join('; ') : 'None';
+		if (typeof value === 'object') {
+			const item = value as Record<string, unknown>;
+			if (typeof item.title === 'string') return item.title;
+			if (typeof item.name === 'string')
+				return `${item.name}${item.quantity !== undefined ? ` · ${item.quantity} ${item.unit || ''}` : ''}`;
+			return Object.entries(item)
+				.map(([key, entry]) => `${key}: ${valueText(entry)}`)
+				.join('; ');
+		}
+		return String(value);
+	}
 </script>
 
-{#if !online || pending || conflicts.length || error}
+{#if online && !pending && !syncing && !conflicts.length && !error}
+	<p class="muted" role="status">Kitchen saved</p>
+{:else}
 	<section class="sync-notice" aria-label="Kitchen synchronization" in:revealMotion|global>
 		<div role="status">
 			{#if !online}<CloudOff size={18} /><span
-					>Offline{pending && !error ? ' · Changes saved on this device' : ''}</span
+					>Offline{pending && !error ? ' · Changes pending on this device' : ''}</span
 				>
 			{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
 			{:else if syncing}<RefreshCw size={18} /><span>Syncing your kitchen…</span>
-			{:else}<span>{error || 'Changes saved on this device. Waiting to sync.'}</span>{/if}
+			{:else}<span
+					>{error
+						? 'Kitchen sync failed. Your changes are pending.'
+						: 'Changes pending on this device. Waiting to sync.'}</span
+				>{/if}
 		</div>
-		{#if error && (!online || conflicts.length)}<p class="error" role="alert">{error}</p>{/if}
+		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		{#if conflicts.length}
 			<button class="secondary" onclick={() => (review = !review)}
 				>{review ? 'Hide changes' : 'Review changes'}</button

@@ -4413,3 +4413,25 @@ html.dark[data-theme='nosh'] {
 .import-notes[open] summary::after {
 	content: '−';
 }
+
+/* Keep keyboard navigation direct and error feedback readable in both themes. */
+.skip-link {
+	position: fixed;
+	top: 0.5rem;
+	left: 0.5rem;
+	z-index: 1000;
+	padding: 0.75rem 1rem;
+	background: var(--paper);
+	color: var(--ink);
+	transform: translateY(-200%);
+}
+.skip-link:focus {
+	transform: translateY(0);
+}
+.dark .error {
+	color: #ffb4a2;
+	border-left-color: currentColor;
+}
+.shopping-row.checked .shopping-name {
+	text-decoration: line-through;
+}

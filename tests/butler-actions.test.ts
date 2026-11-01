@@ -155,6 +155,49 @@ test('pantry changes group atomically with meal completion that deducts pantry',
 	assert.ok(result.meals[0].completedAt);
 });
 
+test('meal upsert preserves completion so a later completion cannot deduct pantry twice', () => {
+	const kitchen = createInitialState();
+	const originalRecipe = kitchen.recipes[0];
+	kitchen.recipes = [
+		{
+			...originalRecipe,
+			servings: 1,
+			ingredients: [{ name: 'tomato', quantity: 1, unit: 'each' }]
+		}
+	];
+	const meal = {
+		id: 'completed-dinner',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		recipeId: originalRecipe.id,
+		servings: 1
+	};
+	kitchen.meals = [meal];
+	kitchen.pantry = [
+		{ id: 'tomato', name: 'tomato', quantity: 2, unit: 'each', category: 'Produce' }
+	];
+	const now = new Date('2026-10-22T18:30:00.000Z');
+	const completed = applyButlerCommands(
+		kitchen,
+		[{ type: 'meal.complete', id: meal.id, deductPantry: true }],
+		now
+	).state;
+	assert.equal(completed.pantry[0].quantity, 1);
+	const upserted = applyButlerCommands(
+		completed,
+		[{ type: 'meal.upsert', meal: { ...meal, date: '2026-10-23' } }],
+		now
+	).state;
+	assert.equal(upserted.meals[0].completedAt, completed.meals[0].completedAt);
+	assert.equal(upserted.meals[0].leftoverServings, completed.meals[0].leftoverServings);
+	const repeated = applyButlerCommands(
+		upserted,
+		[{ type: 'meal.complete', id: meal.id, deductPantry: true }],
+		now
+	).state;
+	assert.equal(repeated.pantry[0].quantity, 1);
+});
+
 test('moving an existing meal groups with removal of its previous recipe', () => {
 	const kitchen = createInitialState();
 	const oldRecipe = kitchen.recipes[0];

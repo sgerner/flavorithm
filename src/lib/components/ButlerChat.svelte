@@ -15,6 +15,7 @@
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
 	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
+	import { focusTrap } from '#lib/focus.ts';
 	import type { AppState, Recipe } from '#lib/types.ts';
 
 	type Turn = { role: 'user' | 'assistant'; content: string };
@@ -27,13 +28,15 @@
 		apply,
 		userName = '',
 		syncing = false,
-		pendingSync = false
+		pendingSync = false,
+		open = $bindable(false)
 	}: {
 		kitchen: AppState;
 		owner: string;
 		userName?: string;
 		syncing?: boolean;
 		pendingSync?: boolean;
+		open?: boolean;
 		request: (
 			prompt: string,
 			history: Turn[],
@@ -42,7 +45,6 @@
 		) => Promise<{ reply: string; commands: unknown[] }>;
 		apply: (commands: unknown[], expectedSnapshot: string) => string | Promise<string>;
 	} = $props();
-	let open = $state(false);
 	let recipeDrafts = $state<Recipe[]>([]);
 	let viewportStyle = $state('');
 	$effect(() => {
@@ -135,9 +137,10 @@
 			behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'
 		});
 	}
-	export function close() {
+	export async function close() {
 		resetReaction();
 		open = false;
+		await tick();
 		launcher?.focus();
 	}
 	async function toggle() {
@@ -145,7 +148,10 @@
 		if (open) {
 			await tick();
 			input?.focus();
-		} else launcher?.focus();
+		} else {
+			await tick();
+			launcher?.focus();
+		}
 	}
 	function clear() {
 		cancelRequest();
@@ -303,7 +309,9 @@
 		class="butler-panel"
 		style={viewportStyle}
 		id="butler-panel"
+		use:focusTrap
 		role="dialog"
+		aria-modal="true"
 		tabindex="-1"
 		aria-label="Chat with Basil"
 		onkeydown={(event) => {

@@ -48,7 +48,12 @@
 	import type { AppState, Meal, Recipe, User } from '#lib/types.ts';
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
-	import { completeMeal, expiryStatus, reconcileShoppingList } from '#lib/kitchen-workflows.ts';
+	import {
+		completeMeal,
+		expiryStatus,
+		reconcileShoppingList,
+		transferPurchasedItemsToPantry
+	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
@@ -61,6 +66,7 @@
 	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
@@ -77,6 +83,7 @@
 	let installationAuthMode = $derived(runtimeAuthMode ?? data.authMode);
 	let managedAuth = $derived(installationAuthMode !== 'local');
 	let authMetadataLoaded = $state(false);
+	let guestPersistenceReady = $state(false);
 	let runtimeLoginUrl = $state<string | null>(null);
 	let runtimeLogoutUrl = $state<string | null>(null);
 	let providerLoginUrl = $derived(authMetadataLoaded ? runtimeLoginUrl : data.loginUrl);
@@ -92,9 +99,32 @@
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
 	let toast = $state('');
+	let toastUndo = $state<(() => void) | null>(null);
+	let toastVersion = 0;
 	let busy = $state(false);
 	let mobileNav = $state(false);
 	let modal = $state('');
+	const dialogNames: Record<string, string> = {
+		onboarding: 'Recipe preferences',
+		import: 'Import recipe',
+		pantry: 'Add pantry ingredients',
+		auth: 'Sign in or create an account',
+		generate: 'Generate recipes',
+		settings: 'Settings',
+		household: 'Your household',
+		removeMember: 'Remove household member',
+		leave: 'Leave household',
+		delete: 'Delete account',
+		recover: 'Recover your account',
+		reset: 'Reset password',
+		deleteRecipe: 'Delete recipe',
+		editMeal: 'Edit planned meal',
+		cookMeal: 'Complete cooking',
+		plan: 'Plan a meal',
+		pickRecipe: 'Choose a recipe',
+		taste: 'Recipe preferences',
+		search: 'Find recipes online'
+	};
 	let quizTime = $state(45);
 	let quizComplexity = $state('Easy');
 	let quizCuisines = $state<string[]>([]);
@@ -142,7 +172,7 @@
 		showStarter = false;
 		stateEtag = null;
 		localStorage.removeItem('flavorithm-last-account');
-		localStorage.removeItem('flavorithm-kitchen');
+		quarantineLegacyKitchen(localStorage);
 		members = [];
 		householdInvites = [];
 		canManageHousehold = false;
@@ -310,6 +340,7 @@
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
 	let shoppingText = $state('');
+	let editingShoppingId = $state('');
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -436,11 +467,48 @@
 	function dateKey(date: Date) {
 		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 	}
-	function notify(message: string) {
+	function notify(message: string, undo?: () => void) {
 		toast = message;
-		setTimeout(() => {
-			if (toast === message) toast = '';
-		}, 4200);
+		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+		toastUndo = undo
+			? () => {
+					toastUndo = null;
+					toast = '';
+					if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
+				}
+			: null;
+		const version = ++toastVersion;
+		setTimeout(
+			() => {
+				if (toastVersion === version) {
+					toast = '';
+					toastUndo = null;
+				}
+			},
+			undo ? 10000 : 4200
+		);
+	}
+	function removeShoppingItem(item: AppState['shopping'][number]) {
+		const removed = structuredClone($state.snapshot(item));
+		kitchen.shopping = kitchen.shopping.filter((entry) => entry.id !== item.id);
+		notify(`${item.name} removed.`, () => {
+			if (!kitchen.shopping.some((entry) => entry.id === removed.id))
+				kitchen.shopping.push(removed);
+		});
+	}
+	function removePlannedMeal(meal: Meal) {
+		const removed = structuredClone($state.snapshot(meal));
+		kitchen.meals = kitchen.meals.filter((entry) => entry.id !== meal.id);
+		refreshWeekShopping(weekStartForDate(meal.date));
+		notify('Planned meal removed.', () => {
+			if (
+				kitchen.recipes.some((recipe) => recipe.id === removed.recipeId) &&
+				!kitchen.meals.some((entry) => entry.id === removed.id)
+			) {
+				kitchen.meals.push(removed);
+				refreshWeekShopping(weekStartForDate(removed.date));
+			}
+		});
 	}
 	async function request(url: string, body?: unknown, method = 'POST', signal?: AbortSignal) {
 		const headers: Record<string, string> =
@@ -476,11 +544,9 @@
 				renewManagedSession({ status: 401 });
 			}
 			if (response.status === 412 || response.status === 428) {
-				syncing = true;
 				clearTimeout(saveTimer);
-				notify(
-					'Your household changed in another tab. Reload to pick up the latest kitchen before making more changes.'
-				);
+				void reconnectKitchen();
+				notify('Your household changed in another tab. Checking for updates.');
 			}
 			throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), {
 				status: response.status
@@ -504,9 +570,9 @@
 		document.documentElement.dataset.theme = kitchen.preferences.theme;
 		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
 		if (managedAuth && (!user || !kitchenLoaded)) return;
-		if (!managedAuth) {
+		if (!managedAuth && !user && guestPersistenceReady) {
 			try {
-				localStorage.setItem('flavorithm-kitchen', snapshot);
+				localStorage.setItem('flavorithm-guest-kitchen', snapshot);
 			} catch {
 				notify('Device storage is full. Export your kitchen before leaving.');
 			}
@@ -573,12 +639,14 @@
 		});
 		if (managedAuth) {
 			localStorage.removeItem('flavorithm-last-account');
-			localStorage.removeItem('flavorithm-kitchen');
+			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
 			showStarter = false;
 		} else {
 			try {
-				const local = localStorage.getItem('flavorithm-kitchen');
+				// The legacy key could contain a signed-in household. Preserve it separately without loading it.
+				quarantineLegacyKitchen(localStorage);
+				const local = localStorage.getItem('flavorithm-guest-kitchen');
 				if (local) {
 					kitchen = JSON.parse(local);
 					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
@@ -610,7 +678,7 @@
 				updateAuthMetadata(data);
 				if (managedAuth) {
 					localStorage.removeItem('flavorithm-last-account');
-					localStorage.removeItem('flavorithm-kitchen');
+					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
 					kitchenLoaded = false;
 					showStarter = false;
@@ -678,6 +746,9 @@
 						? 'Your organization session could not be confirmed. Reconnect to continue.'
 						: 'Working locally. Pending edits will retry when you reconnect.'
 				);
+			})
+			.finally(() => {
+				guestPersistenceReady = true;
 			});
 		if ('serviceWorker' in navigator)
 			navigator.serviceWorker.register('/service-worker.js').catch(() => {
@@ -786,31 +857,37 @@
 	}
 	function navigate(id: string) {
 		page = id;
-		query = '';
-		filter = 'For you';
 		mobileNav = false;
 	}
 	function addIngredients() {
 		const names = pantryInput
 			.split(/[,\n;]/)
-			.map((s) => s.trim())
+			.map((value) => value.trim())
 			.filter(Boolean);
-		for (const value of names) {
+		if (!names.length) return;
+		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const additions = names.map((value) => {
 			const match = value.match(
 				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
 			);
-			kitchen.pantry.push({
+			return {
 				id: crypto.randomUUID(),
 				name: match ? match[3] : value,
 				quantity: match ? Number(match[1]) : 1,
 				unit: match?.[2] || 'piece',
-				category: 'Pantry'
-			});
-		}
+				checked: true
+			};
+		});
+		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
+		const applied = JSON.stringify(kitchen.pantry);
 		pantryInput = '';
 		modal = '';
-		notify(`${names.length} ingredients added to your pantry.`);
+		notify(`${names.length} ingredients added to your pantry.`, () => {
+			if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
+			else notify('Your pantry changed again. Review the current quantities before editing.');
+		});
 	}
+
 	async function authenticate(event: SubmitEvent) {
 		event.preventDefault();
 		if (managedAuth) {
@@ -822,26 +899,22 @@
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
-			const guestTaste =
-				authMode === 'register' && kitchen.preferences.onboardingStatus
-					? {
-							maxTime: kitchen.preferences.maxTime,
-							complexity: kitchen.preferences.complexity,
-							cuisines: [...(kitchen.preferences.cuisines ?? [])],
-							diet: kitchen.preferences.diet,
-							allergies: kitchen.preferences.allergies,
-							onboardingStatus: kitchen.preferences.onboardingStatus
-						}
-					: null;
+			const guestKitchen =
+				authMode === 'register' ? (JSON.parse(JSON.stringify(kitchen)) as AppState) : null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
 			user = result.user;
 			const saved = await request('/api/state');
-			if (saved.state) adoptKitchen(saved.state);
+			if (guestKitchen) {
+				adoptKitchen(saved.state || createNewUserState());
+				kitchen = guestKitchen;
+				kitchenSync?.stage(guestKitchen);
+				await kitchenSync?.sync();
+			} else if (saved.state) adoptKitchen(saved.state);
 			else {
-				kitchen = createNewUserState();
+				kitchen = guestKitchen ?? createNewUserState();
 				await request('/api/state', { state: kitchen }, 'PUT');
+				adoptKitchen(kitchen);
 			}
-			if (guestTaste) Object.assign(kitchen.preferences, guestTaste);
 			user = result.user;
 			showStarter = false;
 			syncing = false;
@@ -893,7 +966,7 @@
 			importSession = emptyImportSession();
 			resumeImport = false;
 			kitchen = createInitialState();
-			localStorage.removeItem('flavorithm-kitchen');
+			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
 			clearInterval(connectionPoll);
 			connectionBusy = false;
@@ -1265,6 +1338,15 @@
 		);
 	}
 	let butlerChat = $state<ButlerChat>();
+	let butlerOpen = $state(false);
+	let cookingSteps = $state<Record<string, number[]>>({});
+	let selectedMealServings = $state<number | undefined>();
+	let cookingSessionKey = $derived(
+		`${user?.id ?? 'guest'}:${user?.householdId ?? ''}:${selected?.id ?? ''}`
+	);
+	$effect(() => {
+		if (selected && !cookingSteps[cookingSessionKey]) cookingSteps[cookingSessionKey] = [];
+	});
 	async function askButler(
 		message: string,
 		history: { role: 'user' | 'assistant'; content: string }[],
@@ -1310,6 +1392,7 @@
 				'Your kitchen changed since this proposal. Ask Basil for an updated proposal.'
 			);
 		}
+		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
 		for (const effect of result.effects) {
@@ -1330,7 +1413,12 @@
 				openButlerControl(effect.action);
 			}
 		}
-		return JSON.stringify(kitchen);
+		const appliedSnapshot = JSON.stringify(kitchen);
+		notify('Basil’s changes applied.', () => {
+			if (JSON.stringify(kitchen) === appliedSnapshot) kitchen = previousKitchen;
+			else notify('Your kitchen changed again. Review the current values before editing.');
+		});
+		return appliedSnapshot;
 	}
 	function openButlerControl(target: string) {
 		switch (target) {
@@ -1430,9 +1518,10 @@
 				reader.readAsDataURL(file);
 			});
 			const result = await ai('vision', { image });
-			pantryInput = result.ingredients
+			const recognized = result.ingredients
 				.map((i: any) => `${i.quantity} ${i.unit} ${i.name}`)
 				.join('\n');
+			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n');
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
@@ -1578,8 +1667,7 @@
 		const recipes = kitchen.recipes.filter((recipe) =>
 			meals.some((meal) => meal.recipeId === recipe.id)
 		);
-		const usablePantry = kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired');
-		const additions = buildShoppingList(recipes, usablePantry, meals);
+		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
 	}
 	function confirmDeleteRecipe() {
@@ -1614,8 +1702,11 @@
 		item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1000000)) : 1;
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
-		const usablePantry = kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired');
-		const additions = buildShoppingList(items, usablePantry, meals);
+		if (meals?.some((meal) => !Number.isFinite(meal.servings) || meal.servings <= 0)) {
+			notify('Enter a valid serving count before making a shopping list.');
+			return;
+		}
+		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
 		page = 'shopping';
@@ -1684,6 +1775,7 @@
 		cookingMealId = '';
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
+		selectedMealServings = meal.servings;
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
@@ -1710,6 +1802,8 @@
 			recipeId: selected.id,
 			servings: plannedServings
 		});
+		refreshWeekShopping(weekStartForDate(mealDate));
+		selectedMealServings = undefined;
 		selected = null;
 		modal = '';
 		page = 'planner';
@@ -1937,7 +2031,7 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
-			localStorage.removeItem('flavorithm-kitchen');
+			quarantineLegacyKitchen(localStorage);
 			syncing = false;
 			modal = '';
 			notify('Your account and personal data have been deleted.');
@@ -2053,19 +2147,25 @@
 </script>
 
 {#if ready}
-	<ButlerChat
-		bind:this={butlerChat}
-		{kitchen}
-		owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
-		request={askButler}
-		apply={applyButler}
-		userName={user?.name ?? ''}
-		syncing={sendingSync}
-		{pendingSync}
-	/>
+	<div inert={!!modal || !!selected || !!editingRecipe}>
+		<ButlerChat
+			bind:this={butlerChat}
+			bind:open={butlerOpen}
+			{kitchen}
+			owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
+			request={askButler}
+			apply={applyButler}
+			userName={user?.name ?? ''}
+			syncing={sendingSync}
+			{pendingSync}
+		/>
+	</div>
 {/if}
 
-<svelte:head><title>Flavorithm — Where flavor meets algorithms</title></svelte:head>
+<svelte:head
+	><title>{nav.find((item) => item.id === page)?.name || 'Discover'} · Flavorithm</title
+	></svelte:head
+>
 <svelte:window
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
@@ -2077,12 +2177,19 @@
 />
 <input
 	class="visually-hidden"
+	inert={!!modal || !!selected || !!editingRecipe || butlerOpen}
 	type="file"
 	accept="image/jpeg,image/png,image/webp"
+	aria-label="Scan pantry ingredients from a photo"
 	bind:this={imageInput}
 	onchange={scan}
 />
-<div class="app-shell" inert={!!modal || !!selected || !!editingRecipe}>
+<a
+	class="skip-link"
+	inert={!!modal || !!selected || !!editingRecipe || butlerOpen}
+	href="#kitchen-content">Skip to kitchen content</a
+>
+<div class="app-shell" inert={!!modal || !!selected || !!editingRecipe || butlerOpen}>
 	{#if mobileNav}<button
 			class="nav-backdrop"
 			aria-label="Dismiss navigation"
@@ -2135,7 +2242,7 @@
 			><ArrowUpRight size={16} /></button
 		>
 	</aside>
-	<main>
+	<main id="kitchen-content" tabindex="-1">
 		<header class="topbar">
 			<button
 				class="icon-button mobile-menu"
@@ -2151,7 +2258,10 @@
 					aria-label="Switch color mode"
 					onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
 					>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}</button
-				><button class="top-avatar" onclick={() => (user ? household() : openAuthentication())}
+				><button
+					class="top-avatar"
+					aria-label={user ? 'Open household and account' : 'Sign in or create an account'}
+					onclick={() => (user ? household() : openAuthentication())}
 					>{user?.name.slice(0, 1) || 'Y'}</button
 				>
 			</div>
@@ -2295,7 +2405,10 @@
 								<div class="recipe-image">
 									<button
 										class="image-open"
-										onclick={() => (selected = recipe)}
+										onclick={() => {
+											selectedMealServings = undefined;
+											selected = recipe;
+										}}
 										aria-label={`Open ${recipe.title}`}
 										><img
 											src={recipe.image || recipePlaceholder(recipe)}
@@ -2319,8 +2432,12 @@
 											{recipe.rating ? `★ ${recipe.rating.toFixed(1)}` : ''}</span
 										>
 									</div>
-									<button class="recipe-title" onclick={() => (selected = recipe)}
-										>{recipe.title}<ArrowUpRight size={18} /></button
+									<button
+										class="recipe-title"
+										onclick={() => {
+											selectedMealServings = undefined;
+											selected = recipe;
+										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
 									<p>{recipe.description}</p>
 									<div class="recipe-meta">
@@ -2369,6 +2486,12 @@
 				</section>
 				<div class="pantry-summary">
 					<span><b>{kitchen.pantry.length}</b> ingredients</span>
+					{#if kitchen.pantry.some((item) => item.quantity === 0)}<button
+							class="text-button"
+							onclick={() => {
+								kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
+							}}>Clear depleted items</button
+						>{/if}
 					<div>
 						<button class="secondary" onclick={() => imageInput.click()}
 							><Camera size={17} /> Scan a photo</button
@@ -2442,11 +2565,11 @@
 				</div>
 				{#if !kitchen.pantry.length}<div class="empty-state">
 						<Carrot size={40} />
-						<h3>No ingredients yet</h3>
+						<h2>No ingredients yet</h2>
 						<p>Add a few things from your fridge to get started.</p>
 					</div>{:else if !visiblePantry.length}<div class="empty-state filtered-pantry-empty">
 						<Carrot size={34} />
-						<h3>No matching ingredients</h3>
+						<h2>No matching ingredients</h2>
 						<p>Try another expiry filter or update a best-before date.</p>
 					</div>{/if}
 				<div class="pantry-footer">
@@ -2523,7 +2646,12 @@
 												kitchen.recipes.find((r) => r.id === meal.recipeId)}{#if recipe}<div
 													class="calendar-meal"
 												>
-													<button class="meal-open" onclick={() => (selected = recipe)}
+													<button
+														class="meal-open"
+														onclick={() => {
+															selectedMealServings = meal.servings;
+															selected = recipe;
+														}}
 														><img
 															src={recipe.image || recipePlaceholder(recipe)}
 															onerror={(event) => recipeImageError(event, recipe)}
@@ -2547,11 +2675,7 @@
 														<button
 															class="remove-meal"
 															aria-label="Remove planned meal"
-															onclick={() => {
-																const startDate = weekStartForDate(meal.date);
-																kitchen.meals = kitchen.meals.filter((m) => m.id !== meal.id);
-																refreshWeekShopping(startDate);
-															}}><X size={13} /></button
+															onclick={() => removePlannedMeal(meal)}><X size={13} /></button
 														>
 													</div>
 												</div>{/if}{/each}<button
@@ -2604,7 +2728,12 @@
 														meal.leftoverServings = 0;
 														notify('Leftovers marked used.');
 													}}>Use leftovers <Check size={15} /></button
-												>{/if}<button class="text-button" onclick={() => (selected = recipe)}
+												>{/if}<button
+												class="text-button"
+												onclick={() => {
+													selectedMealServings = undefined;
+													selected = recipe;
+												}}
 												>{recipe.rating ? 'View rating' : 'Rate recipe'} <Star size={15} /></button
 											>
 										</div>
@@ -2652,36 +2781,57 @@
 									onclick={() => (item.checked = !item.checked)}
 									>{#if item.checked}<Check size={16} />{/if}</button
 								>
-								<div class="shopping-item-edit">
-									<input
-										class="shopping-name"
-										aria-label="Shopping item name"
-										bind:value={item.name}
-										maxlength="100"
-										onblur={() => normalizeShoppingItem(item)}
-									/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
-								</div>
-								<span class="shopping-quantity"
-									><input
-										aria-label={`Quantity of ${item.name}`}
-										type="number"
-										min="0.01"
-										max="1000000"
-										step="0.01"
-										bind:value={item.quantity}
-										onblur={() => normalizeShoppingItem(item)}
-									/><input
-										aria-label={`Unit for ${item.name}`}
-										bind:value={item.unit}
-										maxlength="40"
-										onblur={() => normalizeShoppingItem(item)}
-									/></span
-								><button
+								{#if editingShoppingId === item.id}<div class="shopping-item-edit">
+										<input
+											class="shopping-name"
+											aria-label="Shopping item name"
+											bind:value={item.name}
+											maxlength="100"
+											onblur={() => normalizeShoppingItem(item)}
+										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
+									</div>
+									<span class="shopping-quantity"
+										><input
+											aria-label={`Quantity of ${item.name}`}
+											type="number"
+											min="0.01"
+											max="1000000"
+											step="0.01"
+											bind:value={item.quantity}
+											onblur={() => normalizeShoppingItem(item)}
+										/><input
+											aria-label={`Unit for ${item.name}`}
+											bind:value={item.unit}
+											maxlength="40"
+											onblur={() => normalizeShoppingItem(item)}
+										/></span
+									>
+									<button
+										class="text-button"
+										onclick={() => {
+											normalizeShoppingItem(item);
+											editingShoppingId = '';
+										}}>Done</button
+									>
+								{:else}
+									<div class="shopping-item-edit">
+										<b class="shopping-name">{item.name}</b><small class="shopping-source"
+											>{shoppingSourceLabel(item.sourceKey)}</small
+										>
+									</div>
+									<span class="shopping-quantity"
+										>{item.quantity}
+										{item.unit}<button
+											class="text-button"
+											aria-label={`Edit ${item.name}`}
+											onclick={() => (editingShoppingId = item.id)}>Edit</button
+										></span
+									>
+								{/if}
+								<button
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
-									onclick={() =>
-										(kitchen.shopping = kitchen.shopping.filter((i) => i.id !== item.id))}
-									><X size={15} /></button
+									onclick={() => removeShoppingItem(item)}><X size={15} /></button
 								>
 							</div>{/each}{#if !kitchen.shopping.length}<div class="empty-state">
 								<ShoppingBasket size={40} />
@@ -2717,20 +2867,7 @@
 							class="text-button"
 							onclick={() => {
 								const checked = kitchen.shopping.filter((i) => i.checked);
-								for (const item of checked) {
-									const found = kitchen.pantry.find(
-										(p) => p.name.toLowerCase() === item.name.toLowerCase() && p.unit === item.unit
-									);
-									if (found) found.quantity += item.quantity;
-									else
-										kitchen.pantry.push({
-											id: crypto.randomUUID(),
-											name: item.name,
-											quantity: item.quantity,
-											unit: item.unit,
-											category: 'Pantry'
-										});
-								}
+								kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
 								kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
 								notify(`${checked.length} purchased items moved to your pantry.`);
 							}}>Put purchased items in my pantry <ArrowRight size={16} /></button
@@ -2741,18 +2878,26 @@
 		</div>
 	</main>
 </div>
-{#if toast}<div
-		class="toast"
-		role="status"
-		transition:revealMotion|global={{ y: 25, duration: 250 }}
-	>
-		<span>✳</span>{toast}<button onclick={() => (toast = '')} aria-label="Dismiss notification"
-			><X size={16} /></button
+<div class="visually-hidden" role="status" aria-atomic="true">{toast}</div>
+{#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
+		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
+			onclick={() => (toast = '')}
+			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
-		close={() => (selected = null)}
+		initialServings={selectedMealServings ?? selected.servings}
+		bind:completedSteps={
+			() => cookingSteps[cookingSessionKey] ?? [],
+			(steps) => {
+				cookingSteps[cookingSessionKey] = steps;
+			}
+		}
+		close={() => {
+			selected = null;
+			selectedMealServings = undefined;
+		}}
 		save={() => saveRecipe(selected!)}
 		shop={(servings) =>
 			shoppingFor(
@@ -2793,11 +2938,7 @@
 				role="dialog"
 				aria-labelledby={modal === 'import' ? 'recipe-import-title' : undefined}
 				aria-modal="true"
-				aria-label={modal === 'onboarding'
-					? 'Recipe preferences'
-					: modal === 'import'
-						? 'Import recipe'
-						: modal}
+				aria-label={dialogNames[modal] || 'Kitchen dialog'}
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
@@ -3048,6 +3189,7 @@
 						<div class="theme-grid">
 							{#each themes as theme}<button
 									class:active={kitchen.preferences.theme === theme}
+									aria-pressed={kitchen.preferences.theme === theme}
 									onclick={() => (kitchen.preferences.theme = theme)}
 									>{theme}{#if kitchen.preferences.theme === theme}<Check size={13} />{/if}</button
 								>{/each}
