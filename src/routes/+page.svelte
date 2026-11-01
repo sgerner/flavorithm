@@ -2147,17 +2147,19 @@
 </script>
 
 {#if ready}
-	<ButlerChat
-		bind:this={butlerChat}
-		bind:open={butlerOpen}
-		{kitchen}
-		owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
-		request={askButler}
-		apply={applyButler}
-		userName={user?.name ?? ''}
-		syncing={sendingSync}
-		{pendingSync}
-	/>
+	<div inert={!!modal || !!selected || !!editingRecipe}>
+		<ButlerChat
+			bind:this={butlerChat}
+			bind:open={butlerOpen}
+			{kitchen}
+			owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
+			request={askButler}
+			apply={applyButler}
+			userName={user?.name ?? ''}
+			syncing={sendingSync}
+			{pendingSync}
+		/>
+	</div>
 {/if}
 
 <svelte:head
@@ -2175,13 +2177,18 @@
 />
 <input
 	class="visually-hidden"
+	inert={!!modal || !!selected || !!editingRecipe || butlerOpen}
 	type="file"
 	accept="image/jpeg,image/png,image/webp"
 	aria-label="Scan pantry ingredients from a photo"
 	bind:this={imageInput}
 	onchange={scan}
 />
-<a class="skip-link" href="#kitchen-content">Skip to kitchen content</a>
+<a
+	class="skip-link"
+	inert={!!modal || !!selected || !!editingRecipe || butlerOpen}
+	href="#kitchen-content">Skip to kitchen content</a
+>
 <div class="app-shell" inert={!!modal || !!selected || !!editingRecipe || butlerOpen}>
 	{#if mobileNav}<button
 			class="nav-backdrop"
