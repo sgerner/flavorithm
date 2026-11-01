@@ -155,15 +155,6 @@ export function isAuthModeConfigured(mode: AuthMode): boolean {
 	return proxySettings() !== null;
 }
 
-export function ssoFailureMessage(mode: RuntimeAuthMode): string {
-	if (mode === 'invalid') return 'Authentication is not configured correctly.';
-	return mode === 'oidc'
-		? 'Organization sign-in is not configured correctly.'
-		: mode === 'proxy'
-			? 'Proxy authentication is not configured correctly.'
-			: 'Authentication is not configured correctly.';
-}
-
 let testFetch: typeof fetch | undefined;
 export function setSsoFetchForTests(fetcher: typeof fetch | undefined): void {
 	testFetch = fetcher;

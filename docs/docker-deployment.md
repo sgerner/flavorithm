@@ -22,8 +22,82 @@ docker compose logs -f flavorithm
 ```
 
 The container health check requests the PWA manifest through the app server.
-Recipe and account data live in the `flavorithm-data` volume. Back up the
-SQLite database while the app is stopped or use SQLite's online backup API.
+Recipe and account data live in the Compose-managed `flavorithm-data` volume.
+The Skynet override replaces that named volume with the bind mount
+`/home/skynet/opt/appdata/flavorithm`; the backup and restore steps below work
+with either storage setup.
+
+## Back up and restore
+
+Run these commands from the repository checkout. For Skynet, add
+`-p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml` to each
+`docker compose` command so it selects the app's bind mount and deployment
+project.
+
+The online backup command uses Node 24's SQLite backup API against the running
+database, so committed changes in the WAL are included. It writes a temporary
+backup into `/app/data`, copies it out of the container, and removes the
+temporary file. The local `oauth.key` is copied separately when present; if you
+use hosted OAuth, preserve the matching `FLAVORITHM_OAUTH_ENCRYPTION_KEY` from
+the private deployment configuration instead.
+
+```sh
+mkdir -p backups
+container_id="$(docker compose ps -q flavorithm)"
+test -n "$container_id"
+
+docker compose exec -T flavorithm rm -f /app/data/flavorithm-backup.sqlite
+docker compose exec -T flavorithm node --input-type=module -e '
+import { DatabaseSync, backup } from "node:sqlite";
+const db = new DatabaseSync("/app/data/flavorithm.sqlite", { readOnly: true });
+await backup(db, "/app/data/flavorithm-backup.sqlite");
+db.close();
+'
+docker cp "$container_id:/app/data/flavorithm-backup.sqlite" backups/flavorithm.sqlite
+docker compose exec -T flavorithm rm -f /app/data/flavorithm-backup.sqlite
+chmod 600 backups/flavorithm.sqlite
+
+if docker compose exec -T flavorithm test -f /app/data/oauth.key; then
+  docker cp "$container_id:/app/data/oauth.key" backups/oauth.key
+  chmod 600 backups/oauth.key
+fi
+```
+
+Backups contain private kitchen data and may contain OAuth credentials. Keep
+the files and any hosted encryption key access restricted. Test restores before
+relying on the backups.
+
+To restore, stop the app gracefully first and keep its stopped Compose
+container in place. The helper below uses that container's mounts and writes
+as the image's runtime user (UID 1000), so the named volume and Skynet bind
+mount retain the expected ownership. It also removes stale WAL and shared-memory
+sidecars after replacing the database.
+
+```sh
+container_id="$(docker compose ps -aq flavorithm)"
+test -n "$container_id"
+docker compose stop --timeout 30 flavorithm
+docker run --rm --volumes-from "$container_id" --user 1000:1000 --entrypoint sh flavorithm:local -c '
+  cat > /app/data/flavorithm.sqlite
+  chmod 600 /app/data/flavorithm.sqlite
+  rm -f /app/data/flavorithm.sqlite-wal /app/data/flavorithm.sqlite-shm
+' < backups/flavorithm.sqlite
+
+# Only when the backup uses local OAuth encryption and includes oauth.key.
+if [ -f backups/oauth.key ]; then
+  docker run --rm --volumes-from "$container_id" --user 1000:1000 --entrypoint sh flavorithm:local -c '
+    cat > /app/data/oauth.key
+    chmod 600 /app/data/oauth.key
+  ' < backups/oauth.key
+fi
+
+docker compose up -d flavorithm
+```
+
+For hosted OAuth, restore the matching `FLAVORITHM_OAUTH_ENCRYPTION_KEY` in
+`.env` before starting the app. Do not copy a database by itself while the app
+is running: SQLite may have committed data in its WAL that is not in the main
+database file.
 
 ## Deploy on Skynet with Authentik
 

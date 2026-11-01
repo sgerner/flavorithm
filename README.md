@@ -228,6 +228,8 @@ sqlite3 data/flavorithm.sqlite ".backup 'backups/flavorithm-backup.sqlite'"
 
 Alternatively, stop the app gracefully and copy the database after the process exits. Do not copy only the main `.sqlite` file while the app is running: uncheckpointed changes may still be in its write-ahead log. Also back up the local `oauth.key`, or the hosted `FLAVORITHM_OAUTH_ENCRYPTION_KEY`, separately. Without the matching key, encrypted OAuth credentials in a restored database cannot be decrypted. Store backups and keys securely, and test a restore before relying on them.
 
+To restore a file-copy backup, stop the app first, replace the database, and remove any old `-wal` or `-shm` sidecars before restarting. Restore its matching `oauth.key` or hosted encryption key at the same time. For Docker named volumes and the Skynet bind mount, use the [Docker backup and restore steps](docs/docker-deployment.md#back-up-and-restore) so the copied files keep the runtime user's ownership.
+
 The app includes a personal JSON export in Settings. It is not a replacement for a database backup: it does not contain server credentials or encrypted OAuth tokens.
 
 ## PWA and offline behavior
@@ -254,17 +256,19 @@ Give the process a persistent writable volume for `FLAVORITHM_DB_PATH`; the defa
 
 ## Commands and checks
 
-| Command              | Description                                                                                               |
-| -------------------- | --------------------------------------------------------------------------------------------------------- |
-| `npm run dev`        | Start the Vite development server.                                                                        |
-| `npm run check`      | Sync SvelteKit types and run `svelte-check`.                                                              |
-| `npm test`           | Run the Node test suite.                                                                                  |
-| `npm run build`      | Build the SvelteKit Node adapter app.                                                                     |
-| `npm start`          | Run the built app with `server.mjs`.                                                                      |
-| `npm run test:smoke` | Start the built app with an isolated in-memory database and exercise production HTTP routes. Build first. |
-| `npm run seed:dev`   | Create a disposable prefilled local demo account; see [development fixtures](docs/dev-fixtures.md).       |
-| `npm run readiness`  | Check deployment configuration without printing credentials.                                              |
-| `npm run format`     | Format the repository with Prettier.                                                                      |
+| Command                | Description                                                                                               |
+| ---------------------- | --------------------------------------------------------------------------------------------------------- |
+| `npm run dev`          | Start the Vite development server.                                                                        |
+| `npm run check`        | Sync SvelteKit types and run `svelte-check`.                                                              |
+| `npm test`             | Run the Node test suite.                                                                                  |
+| `npm run test:sso`     | Run the SSO and trusted-proxy integration tests.                                                          |
+| `npm run build`        | Build the SvelteKit Node adapter app.                                                                     |
+| `npm start`            | Run the built app with `server.mjs`.                                                                      |
+| `npm run test:smoke`   | Start the built app with an isolated in-memory database and exercise production HTTP routes. Build first. |
+| `npm run seed:dev`     | Create a disposable prefilled local demo account; see [development fixtures](docs/dev-fixtures.md).       |
+| `npm run readiness`    | Check deployment configuration without printing credentials.                                              |
+| `npm run format:check` | Check Prettier formatting without changing files.                                                         |
+| `npm run format`       | Format the repository with Prettier.                                                                      |
 
 The automated tests cover application logic and use mocked provider/network responses. They do not make live AI, Brave Search, Resend, or ChatGPT requests. Browser behavior such as camera selection, speech recognition, installation prompts, and a real reverse-proxy deployment depends on the user's browser and hosting environment.
 

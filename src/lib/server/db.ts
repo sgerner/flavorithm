@@ -12,6 +12,7 @@ const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const INVITE_TTL_MS = 48 * 60 * 60 * 1000;
 const PASSWORD_RESET_TTL_MS = 60 * 60 * 1000;
 const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_CLEANUP_INTERVAL_MS = 15 * 60 * 1000;
 const MAX_BODY_BYTES = 1_000_000;
 const RESEND_ENDPOINT = 'https://api.resend.com/emails';
 const DEFAULT_PREFERENCES: Preferences = {
@@ -376,9 +377,9 @@ function assertCurrentHousehold(user: User): DbUserRow {
 }
 
 export function getUserFromSession(token: string | undefined): User | null {
-	if (!token || token.length > 200) return null;
 	const now = Date.now();
-	db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+	cleanupExpiredSessions(now);
+	if (!token || token.length > 200) return null;
 	const row = db
 		.prepare(
 			`
@@ -391,18 +392,12 @@ export function getUserFromSession(token: string | undefined): User | null {
 	return row ? toUser(row) : null;
 }
 
-function getUserFromSsoSession(token: string | undefined, source: 'oidc' | 'proxy'): User | null {
-	if (!token || token.length > 200) return null;
-	const now = Date.now();
+let lastSessionCleanupAt = 0;
+function cleanupExpiredSessions(now: number): void {
+	if (now >= lastSessionCleanupAt && now - lastSessionCleanupAt < SESSION_CLEANUP_INTERVAL_MS)
+		return;
 	db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
-	const row = db
-		.prepare(
-			`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
-			 FROM sessions JOIN users ON users.id = sessions.user_id
-			 WHERE sessions.token_hash = ? AND sessions.expires_at > ? AND sessions.auth_source = ?`
-		)
-		.get(hashToken(token), now, source) as DbUserRow | undefined;
-	return row ? toUser(row) : null;
+	lastSessionCleanupAt = now;
 }
 
 export function getUserFromOidcSession(
@@ -410,9 +405,9 @@ export function getUserFromOidcSession(
 	issuer: string,
 	clientId: string
 ): User | null {
-	if (!token || token.length > 200) return null;
 	const now = Date.now();
-	db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+	cleanupExpiredSessions(now);
+	if (!token || token.length > 200) return null;
 	const row = db
 		.prepare(
 			`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at
@@ -548,7 +543,7 @@ function createSession(
 		expiresAt,
 		now
 	);
-	db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now);
+	cleanupExpiredSessions(now);
 	return { token, expiresAt };
 }
 
@@ -933,18 +928,23 @@ export async function resetUserPassword(token: string, password: string): Promis
 	}
 }
 
-export async function sendPasswordResetEmail(
-	email: string,
-	resetUrl: string,
-	apiKey: string,
-	from: string,
-	fetcher: typeof fetch = fetch
-): Promise<boolean> {
-	const safeUrl = resetUrl
+function escapeHtml(value: string): string {
+	return value
 		.replaceAll('&', '&amp;')
 		.replaceAll('"', '&quot;')
 		.replaceAll('<', '&lt;')
 		.replaceAll('>', '&gt;');
+}
+
+async function sendResendEmail(
+	email: string,
+	subject: string,
+	text: string,
+	html: string,
+	apiKey: string,
+	from: string,
+	fetcher: typeof fetch
+): Promise<boolean> {
 	try {
 		const response = await fetcher(RESEND_ENDPOINT, {
 			method: 'POST',
@@ -956,9 +956,9 @@ export async function sendPasswordResetEmail(
 			body: JSON.stringify({
 				from,
 				to: [email],
-				subject: 'Reset your Flavorithm password',
-				text: `Use this link to reset your password. It expires in one hour.\n\n${resetUrl}\n\nIf you did not request this, you can ignore this message.`,
-				html: `<p>Use this link to reset your Flavorithm password. It expires in one hour.</p><p><a href="${safeUrl}">Reset password</a></p><p>If you did not request this, you can ignore this message.</p>`
+				subject,
+				text,
+				html
 			}),
 			signal: AbortSignal.timeout(10_000)
 		});
@@ -966,6 +966,24 @@ export async function sendPasswordResetEmail(
 	} catch {
 		return false;
 	}
+}
+
+export function sendPasswordResetEmail(
+	email: string,
+	resetUrl: string,
+	apiKey: string,
+	from: string,
+	fetcher: typeof fetch = fetch
+): Promise<boolean> {
+	return sendResendEmail(
+		email,
+		'Reset your Flavorithm password',
+		`Use this link to reset your password. It expires in one hour.\n\n${resetUrl}\n\nIf you did not request this, you can ignore this message.`,
+		`<p>Use this link to reset your Flavorithm password. It expires in one hour.</p><p><a href="${escapeHtml(resetUrl)}">Reset password</a></p><p>If you did not request this, you can ignore this message.</p>`,
+		apiKey,
+		from,
+		fetcher
+	);
 }
 
 export function issueEmailVerification(userId: string): { email: string; token: string } | null {
@@ -1025,39 +1043,22 @@ export function verifyEmailToken(token: string): User {
 	}
 }
 
-export async function sendEmailVerificationEmail(
+export function sendEmailVerificationEmail(
 	email: string,
 	verificationUrl: string,
 	apiKey: string,
 	from: string,
 	fetcher: typeof fetch = fetch
 ): Promise<boolean> {
-	const safeUrl = verificationUrl
-		.replaceAll('&', '&amp;')
-		.replaceAll('"', '&quot;')
-		.replaceAll('<', '&lt;')
-		.replaceAll('>', '&gt;');
-	try {
-		const response = await fetcher(RESEND_ENDPOINT, {
-			method: 'POST',
-			redirect: 'error',
-			headers: {
-				Authorization: `Bearer ${apiKey}`,
-				'Content-Type': 'application/json'
-			},
-			body: JSON.stringify({
-				from,
-				to: [email],
-				subject: 'Verify your Flavorithm email',
-				text: `Use this link to verify your email address. It expires in 24 hours.\n\n${verificationUrl}\n\nIf you did not request this, you can ignore this message.`,
-				html: `<p>Use this link to verify your Flavorithm email address. It expires in 24 hours.</p><p><a href="${safeUrl}">Verify email</a></p><p>If you did not request this, you can ignore this message.</p>`
-			}),
-			signal: AbortSignal.timeout(10_000)
-		});
-		return response.ok;
-	} catch {
-		return false;
-	}
+	return sendResendEmail(
+		email,
+		'Verify your Flavorithm email',
+		`Use this link to verify your email address. It expires in 24 hours.\n\n${verificationUrl}\n\nIf you did not request this, you can ignore this message.`,
+		`<p>Use this link to verify your Flavorithm email address. It expires in 24 hours.</p><p><a href="${escapeHtml(verificationUrl)}">Verify email</a></p><p>If you did not request this, you can ignore this message.</p>`,
+		apiKey,
+		from,
+		fetcher
+	);
 }
 
 type RateBucket = { count: number; resetAt: number };

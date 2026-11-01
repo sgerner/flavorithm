@@ -137,7 +137,7 @@ test('email verification tokens are hashed, one-use, expiring, and delivered thr
 	let sentBody: Record<string, unknown> | undefined;
 	const delivered = await backend.sendEmailVerificationEmail(
 		verification.email,
-		`https://flavorithm.example/?verify=${verification.token}`,
+		`https://flavorithm.example/?source=mail&verify=${verification.token}`,
 		'test-api-key',
 		'Flavorithm <kitchen@example.com>',
 		async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -151,6 +151,7 @@ test('email verification tokens are hashed, one-use, expiring, and delivered thr
 	assert.equal(endpoint, 'https://api.resend.com/emails');
 	assert.deepEqual(sentBody?.to, [account.user.email]);
 	assert.match(String(sentBody?.text), new RegExp(verification.token));
+	assert.match(String(sentBody?.html), /source=mail&amp;verify=/);
 
 	const verified = backend.verifyEmailToken(verification.token);
 	assert.equal(verified.emailVerified, true);

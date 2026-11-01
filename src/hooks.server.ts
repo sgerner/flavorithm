@@ -64,6 +64,14 @@ function proxyUnauthorizedResponse(api: boolean): Response {
 			});
 }
 
+function ensureNoStore(response: Response): void {
+	const cacheControl = response.headers.get('Cache-Control');
+	const alreadyNoStore = cacheControl
+		?.split(',')
+		.some((directive) => directive.trim().toLowerCase() === 'no-store');
+	if (!alreadyNoStore) response.headers.set('Cache-Control', 'no-store, max-age=0');
+}
+
 function withSecurityHeaders(
 	response: Response,
 	request: Request,
@@ -81,13 +89,13 @@ function withSecurityHeaders(
 		response.headers.set('Strict-Transport-Security', 'max-age=31536000');
 	}
 	if (isApiPath(pathname)) {
-		response.headers.set('Cache-Control', 'no-store, max-age=0');
+		ensureNoStore(response);
 		response.headers.set('Pragma', 'no-cache');
 		response.headers.set('Expires', '0');
 	}
 	if (pathname.startsWith('/auth/')) response.headers.set('Cache-Control', 'no-store');
 	if (authMode === 'oidc' || authMode === 'proxy') {
-		response.headers.set('Cache-Control', 'no-store, max-age=0');
+		ensureNoStore(response);
 	}
 	return response;
 }

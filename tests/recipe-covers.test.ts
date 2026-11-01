@@ -5,13 +5,15 @@ import { recipePlaceholder } from '../src/lib/recipe-cover.ts';
 import { COVER_PATH, MAX_COVER_BYTES } from '../src/lib/cover-upload.ts';
 
 process.env.FLAVORITHM_DB_PATH = ':memory:';
+process.env.FLAVORITHM_AUTH_MODE = 'local';
 const backend = await import('../src/lib/server/db.ts');
+const { handle } = await import('../src/hooks.server.ts');
 const { storeCover, readCover } = await import('../src/lib/server/recipe-covers.ts');
 const upload = await import('../src/routes/api/recipe-covers/+server.ts');
 const download = await import('../src/routes/api/recipe-covers/[id]/+server.ts');
 
 test('covers are validated, resized, deduplicated, household private, and survive state validation', async () => {
-	const { user } = await backend.registerUser(
+	const { user, token } = await backend.registerUser(
 		'Cover owner',
 		'cover@example.com',
 		'secure password for covers'
@@ -55,6 +57,18 @@ test('covers are validated, resized, deduplicated, household private, and surviv
 	});
 	const event = { locals: { user }, params: { id } };
 	assert.equal((await download.GET(event as never)).status, 200);
+	const coverUrl = `https://flavorithm.example/api/recipe-covers/${id}`;
+	const hookedResponse = await handle({
+		event: {
+			request: new Request(coverUrl),
+			url: new URL(coverUrl),
+			cookies: { get: (name: string) => (name === 'flavorithm_session' ? token : undefined) },
+			locals: { user: null, authMode: 'invalid' }
+		},
+		resolve: async (resolvedEvent: { locals: { user: typeof user } }) =>
+			download.GET({ ...resolvedEvent, params: { id } } as never)
+	} as never);
+	assert.equal(hookedResponse.headers.get('cache-control'), 'private, no-store');
 	assert.equal((await download.GET({ ...event, locals: { user: other } } as never)).status, 404);
 	assert.equal((await download.GET({ ...event, locals: {} } as never)).status, 401);
 	const post = (body: Uint8Array, origin = 'http://localhost') =>
