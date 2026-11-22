@@ -18,8 +18,16 @@
 
 <script lang="ts">
 	import { onDestroy, tick, untrack } from 'svelte';
-	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
+	import { ArrowDown, ArrowUp, Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
 	import { revealMotion } from '#lib/motion.ts';
+	import {
+		describeInvalidControl,
+		insertDraftItem,
+		MAX_DRAFT_INGREDIENTS,
+		MAX_DRAFT_STEPS,
+		moveDraftItem,
+		openClosedImportNotes
+	} from '#lib/recipe-draft.ts';
 	let {
 		session = $bindable(),
 		capture,
@@ -42,6 +50,9 @@
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let heading = $state<HTMLHeadingElement>();
+	let formEl = $state<HTMLFormElement>();
+	let nutritionDetails = $state<HTMLDetailsElement>();
+	let pendingInvalid: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null = null;
 	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
 		['calories', 'Calories (kcal)'],
 		['fat', 'Fat (g)'],
@@ -52,6 +63,140 @@
 		['sugar', 'Sugar (g)'],
 		['protein', 'Protein (g)']
 	];
+	function scrollAndFocus(row: HTMLElement | undefined, control: HTMLElement | null | undefined) {
+		row?.scrollIntoView({ block: 'nearest' });
+		control?.scrollIntoView({ block: 'nearest' });
+		control?.focus({ preventScroll: true });
+	}
+	async function addIngredient(afterIndex?: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		const inserted = insertDraftItem(
+			draft.ingredients,
+			afterIndex ?? draft.ingredients.length - 1,
+			{ name: '', quantity: 1, unit: 'piece' },
+			MAX_DRAFT_INGREDIENTS
+		);
+		if (!inserted) return;
+		draft.ingredients = inserted.items;
+		await tick();
+		if (!alive) return;
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLInputElement>('.ingredient-name'));
+	}
+	async function moveIngredient(index: number, direction: -1 | 1) {
+		const draft = session.draft;
+		if (!draft) return;
+		const moved = moveDraftItem(draft.ingredients, index, direction);
+		if (!moved) return;
+		draft.ingredients = moved.items;
+		await tick();
+		if (!alive) return;
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLInputElement>('.ingredient-name')
+		);
+	}
+	async function removeIngredient(index: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		draft.ingredients = draft.ingredients.filter((_, i) => i !== index);
+		await tick();
+		if (!alive) return;
+		const rows = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLInputElement>('.ingredient-name')?.focus({ preventScroll: true });
+		} else {
+			formEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[0]
+				?.focus({ preventScroll: true });
+		}
+	}
+	async function addStep(afterIndex?: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		const inserted = insertDraftItem(
+			draft.steps,
+			afterIndex ?? draft.steps.length - 1,
+			'',
+			MAX_DRAFT_STEPS
+		);
+		if (!inserted) return;
+		draft.steps = inserted.items;
+		await tick();
+		if (!alive) return;
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-step')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLTextAreaElement>('textarea'));
+	}
+	async function moveStep(index: number, direction: -1 | 1) {
+		const draft = session.draft;
+		if (!draft) return;
+		const moved = moveDraftItem(draft.steps, index, direction);
+		if (!moved) return;
+		draft.steps = moved.items;
+		await tick();
+		if (!alive) return;
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-step')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLTextAreaElement>('textarea')
+		);
+	}
+	async function removeStep(index: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		draft.steps = draft.steps.filter((_, i) => i !== index);
+		await tick();
+		if (!alive) return;
+		const rows = formEl?.querySelectorAll<HTMLElement>('.draft-step');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLTextAreaElement>('textarea')?.focus({ preventScroll: true });
+		} else {
+			formEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[1]
+				?.focus({ preventScroll: true });
+		}
+	}
+	async function handleInvalid(event: Event) {
+		const target = event.target;
+		if (!(
+			target instanceof HTMLInputElement ||
+			target instanceof HTMLTextAreaElement ||
+			target instanceof HTMLSelectElement
+		)) {
+			return;
+		}
+		openClosedImportNotes(target);
+		event.preventDefault();
+		if (pendingInvalid) return;
+		pendingInvalid = target;
+		error = describeInvalidControl(target);
+		await tick();
+		const control = pendingInvalid;
+		pendingInvalid = null;
+		if (!alive) return;
+		scrollAndFocus(
+			control.closest<HTMLElement>('.field, .draft-ingredient, .draft-step') ?? undefined,
+			control
+		);
+	}
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
@@ -161,30 +306,58 @@
 		error = 'Request cancelled. Your input is still here; try again when you’re ready.';
 		retryAvailable = true;
 	}
-	function saveDraft(event: SubmitEvent) {
+	async function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
 		const draft = session.draft;
 		if (!draft) return;
+		error = '';
 		const ingredients = draft.ingredients.map((i) => ({
 			...i,
 			name: i.name.trim(),
 			unit: i.unit.trim()
 		}));
 		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
+		const invalidNutritionIndex = nutritionFields.findIndex(
+			([key]) =>
+				typeof draft.nutrition[key] !== 'number' ||
+				!Number.isFinite(draft.nutrition[key]) ||
+				draft.nutrition[key] < 0 ||
+				draft.nutrition[key] > 1000000
+		);
 		if (
 			!draft.title.trim() ||
 			!ingredients.length ||
+			ingredients.length > MAX_DRAFT_INGREDIENTS ||
 			!steps.length ||
+			steps.length > MAX_DRAFT_STEPS ||
+			steps.some((step) => step.length > 10000) ||
 			ingredients.some(
-				(i) => !i.name || !i.unit || !Number.isFinite(i.quantity) || i.quantity <= 0
+				(i) =>
+					!i.name ||
+					!i.unit ||
+					!Number.isFinite(i.quantity) ||
+					i.quantity <= 0 ||
+					i.quantity > 1000000
 			) ||
 			!Number.isFinite(draft.time) ||
-			draft.time <= 0 ||
+			draft.time < 1 ||
+			draft.time > 100000 ||
 			!Number.isFinite(draft.servings) ||
-			draft.servings < 1
+			draft.servings < 1 ||
+			draft.servings > 10000 ||
+			invalidNutritionIndex !== -1
 		) {
 			error =
-				'Add a title, time, servings, at least one ingredient with a quantity and unit, and a cooking step.';
+				'Add a title, time, servings, at least one ingredient with a quantity and unit, a cooking step, and nutrition values from 0 to 1,000,000.';
+			if (invalidNutritionIndex !== -1 && nutritionDetails) {
+				nutritionDetails.open = true;
+				await tick();
+				if (alive) {
+					const input =
+						nutritionDetails.querySelectorAll<HTMLInputElement>('input')[invalidNutritionIndex];
+					scrollAndFocus(input?.closest<HTMLElement>('.field') ?? undefined, input);
+				}
+			}
 			return;
 		}
 		try {
@@ -305,7 +478,7 @@
 	<div class="draft-heading" in:revealMotion>
 		<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Review your recipe</h2>
 	</div>
-	<form onsubmit={saveDraft} in:revealMotion>
+	<form bind:this={formEl} onsubmit={saveDraft} oninvalidcapture={handleInvalid} in:revealMotion>
 		<div class="draft-summary">
 			<label class="field draft-title"
 				>Title<input bind:value={draft.title} required maxlength="200" /></label
@@ -351,9 +524,8 @@
 			<button
 				class="text-button"
 				type="button"
-				disabled={draft.ingredients.length >= 60}
-				onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
-				><Plus size={17} />Add</button
+				disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+				onclick={() => void addIngredient()}><Plus size={17} />Add</button
 			>
 		</div>
 		<div class="draft-ingredients">
@@ -384,39 +556,97 @@
 						maxlength="40"
 						placeholder="Unit"
 					/>
-					<button
-						class="icon-button"
-						type="button"
-						aria-label={`Remove ingredient ${i + 1}`}
-						onclick={() =>
-							(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
-						><X size={18} /></button
-					>
+					<div class="draft-row-actions">
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move ingredient ${i + 1} up`}
+							disabled={i === 0}
+							onclick={() => void moveIngredient(i, -1)}><ArrowUp size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move ingredient ${i + 1} down`}
+							disabled={i === draft.ingredients.length - 1}
+							onclick={() => void moveIngredient(i, 1)}><ArrowDown size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Insert below ingredient ${i + 1}`}
+							disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+							onclick={() => void addIngredient(i)}><Plus size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Remove ingredient ${i + 1}`}
+							onclick={() => void removeIngredient(i)}><X size={18} /></button
+						>
+					</div>
 				</div>{/each}
 		</div>
+		<button
+			class="secondary draft-list-add"
+			type="button"
+			disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+			onclick={() => void addIngredient()}><Plus size={17} />Add ingredient</button
+		>
 		<div class="draft-section-heading">
 			<h3>Steps</h3>
 			<button
 				class="text-button"
 				type="button"
-				disabled={draft.steps.length >= 40}
-				onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
+				disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+				onclick={() => void addStep()}><Plus size={17} />Add</button
 			>
 		</div>
-		{#each draft.steps as step, i}<div class="draft-step">
-				<span>{i + 1}</span><textarea
-					aria-label={`Step ${i + 1}`}
-					bind:value={draft.steps[i]}
-					required
-					maxlength="10000"
-					rows="2"></textarea><button
-					class="icon-button"
-					type="button"
-					aria-label={`Remove step ${i + 1}`}
-					onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
-					><X size={18} /></button
-				>
-			</div>{/each}
+		<div class="draft-steps">
+			{#each draft.steps as _, i}<div class="draft-step">
+					<span>{i + 1}</span><textarea
+						aria-label={`Step ${i + 1}`}
+						bind:value={draft.steps[i]}
+						required
+						maxlength="10000"
+						rows="2"></textarea>
+					<div class="draft-row-actions">
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move step ${i + 1} up`}
+							disabled={i === 0}
+							onclick={() => void moveStep(i, -1)}><ArrowUp size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move step ${i + 1} down`}
+							disabled={i === draft.steps.length - 1}
+							onclick={() => void moveStep(i, 1)}><ArrowDown size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Insert below step ${i + 1}`}
+							disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+							onclick={() => void addStep(i)}><Plus size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Remove step ${i + 1}`}
+							onclick={() => void removeStep(i)}><X size={18} /></button
+						>
+					</div>
+				</div>{/each}
+		</div>
+		<button
+			class="secondary draft-list-add"
+			type="button"
+			disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+			onclick={() => void addStep()}><Plus size={17} />Add step</button
+		>
 		<details class="import-notes">
 			<summary>More recipe details</summary><label class="field"
 				>Description<textarea bind:value={draft.description} maxlength="10000" rows="2"
@@ -424,7 +654,7 @@
 			><label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label
 			><label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label>
 		</details>
-		<details class="import-notes">
+		<details class="import-notes" bind:this={nutritionDetails}>
 			<summary>Nutrition estimates</summary>
 			<p>Estimates per serving; re-estimate after ingredient or serving changes.</p>
 			<div class="draft-summary">
