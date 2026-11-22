@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
+import { HOST_CONNECTION_ID } from '#lib/ai-connections.ts';
 import { createNewUserState } from '#lib/data.ts';
 import { COVER_PATH } from '#lib/cover-upload.ts';
 import { MAX_RECIPES } from '#lib/recipe-collection.ts';
@@ -257,6 +258,7 @@ const preferencesSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
+	usePersonalAI: z.boolean().optional(),
 	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
 });
 
@@ -1078,6 +1080,12 @@ export function consumeRateLimit(key: string, limit: number, windowMs: number): 
 	current.count += 1;
 }
 
+function sanitizePersonalPreferences(preferences: Preferences): Preferences {
+	if (preferences.chatgptAccountId !== HOST_CONNECTION_ID) return preferences;
+	const { chatgptAccountId: _hostAccountId, ...rest } = preferences;
+	return rest.provider === 'chatgpt' ? { ...rest, model: '' } : rest;
+}
+
 export function getState(user: User): AppState | null {
 	assertCurrentHousehold(user);
 	const row = db
@@ -1089,9 +1097,11 @@ export function getState(user: User): AppState | null {
 		const preferenceRow = db
 			.prepare('SELECT preferences_json FROM user_preferences WHERE user_id = ?')
 			.get(user.id) as { preferences_json: string } | undefined;
-		const preferences = preferenceRow
-			? (JSON.parse(preferenceRow.preferences_json) as Preferences)
-			: DEFAULT_PREFERENCES;
+		const preferences = sanitizePersonalPreferences(
+			preferenceRow
+				? (JSON.parse(preferenceRow.preferences_json) as Preferences)
+				: DEFAULT_PREFERENCES
+		);
 		const ratings = preferences.ratings ?? {};
 		const recipes = shared.recipes.map((recipe) => {
 			const { rating: _householdRating, ...householdRecipe } = recipe;
@@ -1131,7 +1141,8 @@ export function saveState(
 		return sharedRecipe;
 	});
 	const shared = { ...stateWithoutPreferences, recipes: sharedRecipes };
-	const personalPreferences: Preferences = { ...preferences, ratings };
+	const sanitizedPreferences = sanitizePersonalPreferences(preferences);
+	const personalPreferences: Preferences = { ...sanitizedPreferences, ratings };
 	const now = Date.now();
 	db.exec('BEGIN IMMEDIATE');
 	try {
@@ -1172,7 +1183,7 @@ export function saveState(
       ON CONFLICT(user_id) DO UPDATE SET preferences_json = excluded.preferences_json, version = user_preferences.version + 1, updated_at = excluded.updated_at`
 		).run(user.id, JSON.stringify(personalPreferences), now);
 		db.exec('COMMIT');
-		return value;
+		return { ...value, preferences: sanitizedPreferences };
 	} catch (error) {
 		db.exec('ROLLBACK');
 		throw error;

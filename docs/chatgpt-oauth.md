@@ -77,12 +77,15 @@ using the existing device-code flow, choose a model, and select **Use selected
 connection for this host** in AI connection settings. If your deployment uses
 another OAuth flow, set `FLAVORITHM_CHATGPT_AUTH_FLOW=device` for device login.
 
-While enabled, all authenticated AI generation uses that connection and model,
-including accounts in other households. Search retains its existing behavior.
-Users see a generic host connection without the admin's email or credentials.
-Only the configured admin sees host controls; the server also checks authorization.
-Credentials remain encrypted in the existing OAuth store, with the existing refresh
-coordination. The host shares the subscription's allowance and limits.
+While enabled, authenticated AI requests use that connection and model by default,
+including accounts in other households, while ignoring incompatible saved reasoning
+settings and leaving personal preferences untouched. Users can enable a personal AI
+override in settings to use their own API key or ChatGPT subscription instead. Search
+retains its existing behavior. Users see a generic host connection and read-only host
+model without the admin's email or credentials. Only the configured admin sees host
+controls; the server also checks authorization. Credentials remain encrypted in the
+existing OAuth store, with the existing refresh coordination. The host shares the
+subscription's allowance and limits.
 
 The admin can disable sharing in settings. Disconnecting the backing account,
 removing the admin configuration, or changing its user ID also disables sharing.

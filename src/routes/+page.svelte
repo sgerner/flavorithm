@@ -65,7 +65,11 @@
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
 	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
-	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import {
+		HOST_CONNECTION_ID,
+		type ConnectionProvider,
+		type ConnectionModel
+	} from '#lib/ai-connections.ts';
 	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
@@ -307,9 +311,13 @@
 	let connectionPopup: Window | null = null;
 	let connectionPollCount = 0;
 	let connectionAttempt = 0;
-	let activeChatGPTAccount = $derived(
-		chatGPT.accounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
+	let personalChatGPTAccounts = $derived(
+		chatGPT.accounts.filter((a) => a.id !== HOST_CONNECTION_ID)
 	);
+	let activeChatGPTAccount = $derived(
+		personalChatGPTAccounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
+	);
+	let usingHostAI = $derived(Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI));
 
 	let providers = $state<ConnectionProvider[]>([]);
 	let accountModels = $state<ConnectionModel[]>([]);
@@ -1001,8 +1009,12 @@
 		if (!user) return;
 		const version = ++catalogVersion;
 		const owner = user.id;
-		const accountId = kitchen.preferences.chatgptAccountId;
+		const accountId =
+			kitchen.preferences.chatgptAccountId !== HOST_CONNECTION_ID
+				? kitchen.preferences.chatgptAccountId
+				: undefined;
 		const isAccount =
+			!usingHostAI &&
 			kitchen.preferences.provider === 'chatgpt' &&
 			accountId &&
 			activeChatGPTAccount?.connected &&
@@ -1031,14 +1043,21 @@
 		const result = await request('/api/connections/chatgpt');
 		if (user?.id !== owner) return;
 		chatGPT = result;
-		if (chatGPT.host) {
-			kitchen.preferences.provider = 'chatgpt';
-			kitchen.preferences.chatgptAccountId = 'host-chatgpt';
-			kitchen.preferences.model = chatGPT.host.model;
+		const personalAccounts = chatGPT.accounts.filter((a) => a.id !== HOST_CONNECTION_ID);
+		if (kitchen.preferences.chatgptAccountId === HOST_CONNECTION_ID) {
+			kitchen.preferences.chatgptAccountId = undefined;
+			if (kitchen.preferences.provider === 'chatgpt') kitchen.preferences.model = '';
 		}
-		if (!chatGPT.accounts.some((a) => a.id === kitchen.preferences.chatgptAccountId))
+		if (
+			personalAccounts.length &&
+			(kitchen.preferences.provider === 'chatgpt' || kitchen.preferences.chatgptAccountId) &&
+			!personalAccounts.some((a) => a.id === kitchen.preferences.chatgptAccountId)
+		) {
 			kitchen.preferences.chatgptAccountId =
-				chatGPT.accounts.find((a) => a.connected && a.planEnabled)?.id || chatGPT.accounts[0]?.id;
+				personalAccounts.find((a) => a.connected && a.planEnabled)?.id || personalAccounts[0]?.id;
+		} else if (!personalAccounts.length && kitchen.preferences.chatgptAccountId) {
+			kitchen.preferences.chatgptAccountId = undefined;
+		}
 	}
 	async function refreshAISettings() {
 		error = '';
@@ -1191,6 +1210,7 @@
 						chatGPTDevice = null;
 						const account = chatGPT.accounts.find(
 							(a) =>
+								a.id !== HOST_CONNECTION_ID &&
 								a.connected &&
 								(accountId
 									? a.id === accountId
@@ -1287,7 +1307,15 @@
 			chatGPTDevice = null;
 		}
 	}
-	function needAI() {
+	function hasPersonalAIReady() {
+		const isPlan = kitchen.preferences.provider === 'chatgpt';
+		return (
+			(isPlan
+				? Boolean(activeChatGPTAccount?.connected && activeChatGPTAccount.planEnabled)
+				: Boolean(apiKey)) && Boolean(kitchen.preferences.model)
+		);
+	}
+	async function needAI() {
 		if (!user) {
 			openAuthentication();
 			notify(
@@ -1297,12 +1325,14 @@
 			);
 			return false;
 		}
+		if (usingHostAI) return true;
+		if (!kitchen.preferences.usePersonalAI && !hasPersonalAIReady()) {
+			await refreshConnections().catch(() => {});
+			if (usingHostAI) return true;
+		}
 		const isPlan = kitchen.preferences.provider === 'chatgpt';
-		if (
-			(isPlan ? !activeChatGPTAccount?.connected || !activeChatGPTAccount.planEnabled : !apiKey) ||
-			!kitchen.preferences.model
-		) {
-			openSettings(true);
+		if (!hasPersonalAIReady()) {
+			void openSettings(true);
 			notify(
 				isPlan
 					? 'Connect your ChatGPT plan and choose an available model.'
@@ -1313,29 +1343,52 @@
 		return true;
 	}
 	async function ai(action: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) {
-		return request(
-			'/api/ai',
-			{
-				action,
-				...(kitchen.preferences.provider === 'chatgpt'
-					? { connectionId: kitchen.preferences.chatgptAccountId }
-					: { apiKey }),
-				provider: kitchen.preferences.provider,
-				model: kitchen.preferences.model,
-				reasoning: kitchen.preferences.reasoning,
-				...(action === 'capture' || action === 'chat'
-					? {}
+		const isSearch = action === 'search';
+		const useHost = !isSearch && Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI);
+		const buildPayload = (hostMode: boolean) => ({
+			action,
+			...(isSearch
+				? {}
+				: hostMode && chatGPT.host
+					? {
+							usePersonalAI: false,
+							provider: 'chatgpt',
+							model: chatGPT.host.model,
+							connectionId: HOST_CONNECTION_ID
+						}
 					: {
-							pantry: kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired'),
-							preferences: kitchen.preferences,
-							recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
-							prompt
+							usePersonalAI: true,
+							...(kitchen.preferences.provider === 'chatgpt'
+								? { connectionId: kitchen.preferences.chatgptAccountId }
+								: { apiKey }),
+							provider: kitchen.preferences.provider,
+							model: kitchen.preferences.model,
+							reasoning: kitchen.preferences.reasoning
 						}),
-				...extra
-			},
-			'POST',
-			signal
-		);
+			...(action === 'capture' || action === 'chat' || isSearch
+				? {}
+				: {
+						pantry: kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired'),
+						preferences: kitchen.preferences,
+						recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
+						prompt
+					}),
+			...extra
+		});
+		try {
+			return await request('/api/ai', buildPayload(useHost), 'POST', signal);
+		} catch (err) {
+			if (useHost && (err as { status?: number })?.status === 400) {
+				await refreshConnections().catch(() => {});
+				if (!chatGPT.host) {
+					if (hasPersonalAIReady()) {
+						return await request('/api/ai', buildPayload(false), 'POST', signal);
+					}
+					void openSettings(true);
+				}
+			}
+			throw err;
+		}
 	}
 	let butlerChat = $state<ButlerChat>();
 	let butlerOpen = $state(false);
@@ -1353,7 +1406,7 @@
 		signal?: AbortSignal,
 		recipeDrafts: Recipe[] = []
 	) {
-		if (!needAI()) {
+		if (!(await needAI())) {
 			butlerChat?.close();
 			throw new Error('Sign in and connect a model in Settings to speak with Basil.');
 		}
@@ -1485,7 +1538,7 @@
 	}
 
 	async function generate() {
-		if (!needAI()) return;
+		if (!(await needAI())) return;
 		busy = true;
 		error = '';
 		try {
@@ -1504,7 +1557,11 @@
 	}
 	async function scan(event: Event) {
 		const file = (event.target as HTMLInputElement).files?.[0];
-		if (!file || !needAI()) return;
+		if (!file) return;
+		if (!(await needAI())) {
+			if (imageInput) imageInput.value = '';
+			return;
+		}
 		if (file.size > 5 * 1024 * 1024) {
 			notify('Choose a photo under 5 MB.');
 			return;
@@ -1924,7 +1981,7 @@
 		}
 	}
 	async function refreshNutrition() {
-		if (!selected || !needAI()) return;
+		if (!selected || !(await needAI())) return;
 		busy = true;
 		try {
 			const result = await ai('nutrition', { recipe: selected });
@@ -1966,7 +2023,7 @@
 		openImport(url);
 	}
 	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
-		if (!needAI()) {
+		if (!(await needAI())) {
 			resumeImport = true;
 			return null;
 		}
@@ -3273,6 +3330,9 @@
 							ondisconnect={disconnectChatGPT}
 							onrefresh={refreshAISettings}
 							onsignin={openAuthentication}
+							onoverride={() => {
+								void loadModelCatalog();
+							}}
 						/>
 					</div>
 

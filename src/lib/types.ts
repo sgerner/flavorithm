@@ -70,6 +70,7 @@ export type Preferences = {
 	reasoning?: ReasoningSettings;
 	ratings?: Record<string, number>;
 	chatgptAccountId?: string;
+	usePersonalAI?: boolean;
 };
 export type AppState = {
 	pantry: Ingredient[];

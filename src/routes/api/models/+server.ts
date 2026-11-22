@@ -27,10 +27,17 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 		if (url.searchParams.get('connection') === 'chatgpt') {
 			const accountId = url.searchParams.get('accountId');
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			const host = accountId === HOST_CONNECTION_ID ? getHostAI() : null;
+			const isHostAccount = accountId === HOST_CONNECTION_ID;
+			const host = isHostAccount ? getHostAI() : null;
+			if (isHostAccount && !host) {
+				return json(
+					{ providers: [{ id: 'chatgpt', name: 'ChatGPT plan', models: [] }] },
+					{ headers: { 'cache-control': 'no-store' } }
+				);
+			}
 			const connection = await getChatGPTConnection(
-				host?.userId ?? locals.user.id,
-				host?.accountId ?? accountId,
+				host ? host.userId : locals.user.id,
+				host ? host.accountId : accountId,
 				fetch
 			);
 			const result = await listChatGPTModels(connection.accessToken, connection.fetcher);

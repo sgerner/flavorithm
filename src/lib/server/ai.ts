@@ -109,6 +109,7 @@ const AIRequestSchema = z
 			.optional(),
 		apiKey: z.string().max(1_000).optional(),
 		connectionId: z.string().max(100).optional(),
+		usePersonalAI: z.boolean().optional(),
 		pantry: z.array(IngredientInputSchema).max(300).optional().default([]),
 		preferences: PreferencesInputSchema.optional(),
 		recipes: z.array(RecipeInputSchema).max(250).optional().default([]),
