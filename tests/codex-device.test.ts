@@ -542,3 +542,59 @@ test('temporary provider outages retain the same encrypted attempt and polling b
 	now += 6000;
 	assert.equal('connected' in (await device.pollCodexDevice(input, f.fetcher)), true);
 });
+
+test('mid-TTL revoked Codex token refreshes once, rebuilds codexSubscriptionFetch bearer header, and clears grant if retry returns 401', async (t) => {
+	const owner = await user();
+	const f = fixture();
+	let now = Date.now();
+	t.mock.method(Date, 'now', () => now);
+	const start = await device.startCodexDevice(owner, f.fetcher);
+	now += 6000;
+	const polled = await device.pollCodexDevice({ ...owner, loginId: start.loginId }, f.fetcher);
+	if (!('accountId' in polled)) throw new Error('Expected saved Codex account');
+	t.mock.method(globalThis, 'fetch', f.fetcher);
+
+	const modelsRoute = await import('../src/routes/api/models/+server.ts');
+	const seenHeaders: string[] = [];
+	const recovered = await modelsRoute.GET({
+		locals: { user: owner.user },
+		url: new URL(
+			`https://flavorithm.example/api/models?connection=chatgpt&accountId=${encodeURIComponent(polled.accountId)}`
+		),
+		fetch: (async (input: any, init: any) => {
+			const url = String(input);
+			if (url === 'https://models.dev/api.json') return Response.json({});
+			assert.equal(new URL(url).origin, 'https://chatgpt.com');
+			assert.equal(new Headers(init?.headers).get('chatgpt-account-id'), 'account-1');
+			const auth = new Headers(init?.headers).get('authorization') ?? '';
+			seenHeaders.push(auth);
+			if (auth === 'Bearer test-access') {
+				return Response.json({ error: { message: 'Revoked mid-TTL' } }, { status: 401 });
+			}
+			assert.equal(auth, 'Bearer rotated-access');
+			return Response.json({
+				models: [{ slug: 'codex-model', display_name: 'Codex Model', visibility: 'list' }]
+			});
+		}) as typeof fetch
+	} as any);
+	assert.equal(recovered.status, 200);
+	assert.deepEqual(seenHeaders, ['Bearer test-access', 'Bearer rotated-access']);
+	assert.equal(f.state.refreshes, 1);
+	assert.equal(oauth.listChatGPTAccounts(owner.userId)[0]?.connected, true);
+
+	// When retry also returns 401, clear credentials and return 422 chatgpt_reauth_required.
+	const failedRetry = await modelsRoute.GET({
+		locals: { user: owner.user },
+		url: new URL(
+			`https://flavorithm.example/api/models?connection=chatgpt&accountId=${encodeURIComponent(polled.accountId)}`
+		),
+		fetch: (async (input: any) => {
+			if (String(input) === 'https://models.dev/api.json') return Response.json({});
+			return Response.json({ error: { message: 'Still unauthorized' } }, { status: 401 });
+		}) as typeof fetch
+	} as any);
+	assert.equal(failedRetry.status, 422);
+	assert.equal((await failedRetry.json()).code, 'chatgpt_reauth_required');
+	assert.equal(storage.getChatGPTAccount(owner.userId, polled.accountId)?.credentialEnvelope, null);
+	assert.equal(oauth.listChatGPTAccounts(owner.userId)[0]?.connected, false);
+});

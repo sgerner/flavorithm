@@ -34,6 +34,7 @@ let revocationAttempts = 0;
 let revocationFails = false;
 const revokedTokens: string[] = [];
 let refreshErrorCode: string | null = null;
+let refreshHttpStatus = 400;
 const refreshTokensSeen: string[] = [];
 let refreshGate: Promise<void> | null = null;
 let refreshStarted: (() => void) | null = null;
@@ -112,7 +113,7 @@ globalThis.fetch = async (input, init) => {
 			});
 		}
 		if (form.get('grant_type') === 'refresh_token') {
-			if (refreshErrorCode) return responseJson({ error: refreshErrorCode }, 400);
+			if (refreshErrorCode) return responseJson({ error: refreshErrorCode }, refreshHttpStatus);
 			refreshCount += 1;
 			refreshTokensSeen.push(form.get('refresh_token') ?? '');
 			const refreshNumber = refreshCount;
@@ -793,4 +794,159 @@ test('connection API offers device auth, supports configured hosted OAuth, and f
 	assert.equal(oauth.listChatGPTAccounts(user.user.id)[0].connected, true);
 	const anonymous = { ...event(), locals: { user: null } };
 	assert.equal((await route.GET(anonymous as never)).status, 401);
+});
+
+test('mid-TTL upstream 401 refreshes once across concurrent callers, retries routes, preserves transient credentials, and remaps personal reauth to 422', async () => {
+	const modelsRoute = await import('../src/routes/api/models/+server.ts');
+	const aiRoute = await import('../src/routes/api/ai/+server.ts');
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const { defaultPreferences, seedRecipes } = await import('../src/lib/data.ts');
+	const user = await createLocalUser('oauth-mid-ttl-recovery@example.com');
+
+	// Unauthenticated callers still receive HTTP 401.
+	const unauthModels = await modelsRoute.GET({
+		locals: { user: null },
+		fetch: async () => Response.json({}),
+		url: new URL('http://127.0.0.1:3000/api/models')
+	} as never);
+	assert.equal(unauthModels.status, 401);
+	const unauthAI = await aiRoute.POST({
+		locals: { user: null },
+		fetch: async () => Response.json({}),
+		request: new Request('http://127.0.0.1:3000/api/ai', {
+			method: 'POST',
+			headers: { origin: 'http://127.0.0.1:3000', 'content-type': 'application/json' },
+			body: JSON.stringify({ action: 'generate' })
+		})
+	} as never);
+	assert.equal(unauthAI.status, 401);
+
+	const authUrl = await beginFlow(user);
+	const connected = await callbackFor(authUrl, { issuedClientId: 'oaiapp_mid_ttl' });
+	assert.equal(connected.response.status, 200);
+	const account = oauth.listChatGPTAccounts(user.user.id)[0]!;
+	const initialToken = `access-${connected.clientId}`;
+
+	// Token is still mid-TTL (expires 1 hour from now), yet OpenAI revokes it early.
+	const seenTokens: string[] = [];
+	const beforeRefreshes = refreshCount;
+	const providerFetch: typeof fetch = async (input, init) => {
+		const target = String(input);
+		if (target === 'https://models.dev/api.json') return Response.json({});
+		const auth = new Headers(init?.headers).get('authorization') ?? '';
+		seenTokens.push(auth);
+		if (auth === `Bearer ${initialToken}`) {
+			return Response.json({ error: { message: 'Token revoked' } }, { status: 401 });
+		}
+		if (target === 'https://api.openai.com/v1/models') {
+			return Response.json({
+				models: [{ slug: 'gpt-5', display_name: 'GPT-5', visibility: 'list' }]
+			});
+		}
+		return new Response(
+			`data: ${JSON.stringify({
+				type: 'response.completed',
+				response: {
+					status: 'completed',
+					output: [
+						{
+							content: [
+								{
+									type: 'output_text',
+									text: JSON.stringify({
+										recipes: [seedRecipes[0], seedRecipes[1], seedRecipes[2]]
+									})
+								}
+							]
+						}
+					]
+				}
+			})}\n\n`,
+			{ headers: { 'content-type': 'text/event-stream' } }
+		);
+	};
+
+	const [modelsRes, aiRes] = await Promise.all([
+		modelsRoute.GET({
+			locals: { user: user.user },
+			fetch: providerFetch,
+			url: new URL(
+				`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+			)
+		} as never),
+		aiRoute.POST({
+			locals: { user: user.user },
+			fetch: providerFetch,
+			request: new Request('http://127.0.0.1:3000/api/ai', {
+				method: 'POST',
+				headers: { origin: 'http://127.0.0.1:3000', 'content-type': 'application/json' },
+				body: JSON.stringify({
+					action: 'generate',
+					provider: 'chatgpt',
+					model: 'gpt-5',
+					connectionId: account.id,
+					preferences: defaultPreferences
+				})
+			})
+		} as never)
+	]);
+	assert.equal(modelsRes.status, 200);
+	assert.equal(aiRes.status, 200);
+	assert.equal(refreshCount - beforeRefreshes, 1, 'concurrent 401s rotate the refresh token once');
+	assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, true);
+
+	// Transient 5xx refresh failure returns 502 without clearing encrypted credentials.
+	refreshErrorCode = 'server_error';
+	refreshHttpStatus = 503;
+	try {
+		const transient = await modelsRoute.GET({
+			locals: { user: user.user },
+			fetch: async (input: RequestInfo | URL) =>
+				String(input) === 'https://models.dev/api.json'
+					? Response.json({})
+					: Response.json({ error: { message: 'Unauthorized' } }, { status: 401 }),
+			url: new URL(
+				`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+			)
+		} as never);
+		assert.equal(transient.status, 502);
+		assert.equal((await transient.json()).code, 'chatgpt_refresh_failed');
+		assert.ok(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope);
+		assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, true);
+	} finally {
+		refreshErrorCode = null;
+		refreshHttpStatus = 400;
+	}
+
+	// Retry also returning 401 clears credentials and remaps signed-in response to 422 chatgpt_reauth_required.
+	const retryRejected = await aiRoute.POST({
+		locals: { user: user.user },
+		fetch: async () => Response.json({ error: { message: 'Still invalid' } }, { status: 401 }),
+		request: new Request('http://127.0.0.1:3000/api/ai', {
+			method: 'POST',
+			headers: { origin: 'http://127.0.0.1:3000', 'content-type': 'application/json' },
+			body: JSON.stringify({
+				action: 'generate',
+				provider: 'chatgpt',
+				model: 'gpt-5',
+				connectionId: account.id,
+				preferences: defaultPreferences
+			})
+		})
+	} as never);
+	assert.equal(retryRejected.status, 422);
+	assert.equal((await retryRejected.json()).code, 'chatgpt_reauth_required');
+	assert.equal(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope, null);
+	assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, false);
+
+	// Subsequent signed-in model catalog calls while disconnected also return 422 chatgpt_reauth_required.
+	const disconnectedModels = await modelsRoute.GET({
+		locals: { user: user.user },
+		fetch: async () => Response.json({}),
+		url: new URL(
+			`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+		)
+	} as never);
+	assert.equal(disconnectedModels.status, 422);
+	assert.equal((await disconnectedModels.json()).code, 'chatgpt_reauth_required');
 });

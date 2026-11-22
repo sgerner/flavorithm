@@ -5,6 +5,7 @@ import {
 	codexTokenExpiry,
 	codexSubscriptionFetch
 } from './codex-device.ts';
+import { ChatGPTInferenceError } from './chatgpt-inference.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
 import { buildCompanionScript, type CompanionConfig } from './chatgpt-companion.ts';
@@ -1351,7 +1352,24 @@ export async function disconnectChatGPTAccount(
 	return { remoteRevoked };
 }
 
-async function refreshAccountAccessToken(userId: string, accountId: string): Promise<string> {
+const TERMINAL_REFRESH_ERROR_CODES = new Set([
+	'invalid_grant',
+	'invalid_client',
+	'unauthorized_client',
+	'invalid_refresh_token',
+	'token_expired',
+	'refresh_token_expired',
+	'refresh_token_invalidated',
+	'refresh_token_reused'
+]);
+
+async function refreshAccountAccessToken(
+	userId: string,
+	accountId: string,
+	options?: { force?: boolean; rejectedAccessToken?: string }
+): Promise<string> {
+	const force = Boolean(options?.force);
+	const rejectedAccessToken = options?.rejectedAccessToken;
 	const deadline = Date.now() + 20_000;
 	while (Date.now() < deadline) {
 		const account = getChatGPTAccount(userId, accountId);
@@ -1394,8 +1412,19 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 			);
 		}
 		const now = Date.now();
-		if (account.expiresAt > now + ACCESS_TOKEN_EARLY_REFRESH_MS) return credentials.accessToken;
-		if (account.expiresAt > now && account.earliestRefreshAt > now) return credentials.accessToken;
+		if (force) {
+			if (
+				rejectedAccessToken &&
+				credentials.accessToken !== rejectedAccessToken &&
+				account.expiresAt > now
+			) {
+				return credentials.accessToken;
+			}
+		} else {
+			if (account.expiresAt > now + ACCESS_TOKEN_EARLY_REFRESH_MS) return credentials.accessToken;
+			if (account.expiresAt > now && account.earliestRefreshAt > now)
+				return credentials.accessToken;
+		}
 		if (!credentials.refreshToken) {
 			clearChatGPTCredentials(userId, account.id);
 			throw new ChatGPTOAuthError(
@@ -1404,7 +1433,7 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 				'chatgpt_account_reauth_required'
 			);
 		}
-		if (account.earliestRefreshAt > now) {
+		if (!force && account.earliestRefreshAt > now) {
 			throw new ChatGPTOAuthError(
 				503,
 				'ChatGPT access is temporarily waiting to refresh. Please retry shortly.',
@@ -1465,15 +1494,8 @@ async function refreshAccountAccessToken(userId: string, accountId: string): Pro
 							? providerError.code
 							: null;
 				if (
-					typeof errorCode === 'string' &&
-					new Set([
-						'invalid_grant',
-						'invalid_refresh_token',
-						'token_expired',
-						'refresh_token_expired',
-						'refresh_token_invalidated',
-						'refresh_token_reused'
-					]).has(errorCode)
+					response.status === 401 ||
+					(typeof errorCode === 'string' && TERMINAL_REFRESH_ERROR_CODES.has(errorCode))
 				) {
 					clearChatGPTCredentials(userId, account.id, leaseToken);
 					throw new ChatGPTOAuthError(
@@ -1582,9 +1604,113 @@ export async function getChatGPTAccessToken(userId: string, accountId: string): 
 	}
 }
 
+export async function forceRefreshChatGPTAccessToken(
+	userId: string,
+	accountId: string,
+	rejectedAccessToken?: string
+): Promise<string> {
+	const key = `${userId}:${accountId}`;
+	while (true) {
+		const existing = refreshPromises.get(key);
+		if (!existing) break;
+		const candidate = await existing;
+		if (!rejectedAccessToken || candidate !== rejectedAccessToken) {
+			return candidate;
+		}
+		if (refreshPromises.get(key) === existing) {
+			refreshPromises.delete(key);
+			break;
+		}
+	}
+	const promise = refreshAccountAccessToken(userId, accountId, {
+		force: true,
+		rejectedAccessToken
+	});
+	refreshPromises.set(key, promise);
+	try {
+		return await promise;
+	} finally {
+		if (refreshPromises.get(key) === promise) refreshPromises.delete(key);
+	}
+}
+
+function clearRejectedChatGPTAccessToken(
+	userId: string,
+	accountId: string,
+	rejectedAccessToken: string
+): void {
+	const account = getChatGPTAccount(userId, accountId);
+	if (!account?.credentialEnvelope) return;
+	const leaseToken = randomUUID();
+	if (!claimChatGPTRefreshLease(userId, accountId, leaseToken, Date.now() + REFRESH_LEASE_MS)) {
+		return;
+	}
+	try {
+		const latest = getChatGPTAccount(userId, accountId);
+		if (!latest?.credentialEnvelope) return;
+		const stored = decryptChatGPTCredentials(
+			userId,
+			latest.id,
+			latest.mode,
+			latest.credentialEnvelope
+		);
+		if (stored.accessToken === rejectedAccessToken) {
+			clearChatGPTCredentials(userId, accountId, leaseToken);
+		}
+	} catch {
+		clearChatGPTCredentials(userId, accountId, leaseToken);
+	} finally {
+		releaseChatGPTRefreshLease(userId, accountId, leaseToken);
+	}
+}
+
 export function enforceChatGPTStartRateLimit(userId: string, clientAddress: string): void {
 	consumeRateLimit(`chatgpt-oauth:${userId}`, 10, 15 * 60 * 1000);
 	consumeRateLimit(`chatgpt-oauth-ip:${clientAddress}`, 30, 15 * 60 * 1000);
+}
+
+function buildChatGPTConnection(
+	userId: string,
+	accountId: string,
+	fetcher: typeof fetch,
+	accessToken: string
+) {
+	const account = getChatGPTAccount(userId, accountId);
+	if (!account?.credentialEnvelope)
+		throw new ChatGPTOAuthError(
+			401,
+			'Reconnect this ChatGPT account to continue.',
+			'chatgpt_account_reauth_required'
+		);
+	if (account.clientId !== CODEX_CLIENT_ID) return { accessToken, fetcher, codex: false };
+	let credentials: ChatGPTCredentials;
+	try {
+		credentials = decryptChatGPTCredentials(
+			userId,
+			account.id,
+			account.mode,
+			account.credentialEnvelope
+		);
+	} catch {
+		throw new ChatGPTOAuthError(
+			503,
+			'ChatGPT credentials could not be read securely.',
+			'chatgpt_credentials_unavailable'
+		);
+	}
+	if (!credentials.codexAccountId) {
+		clearChatGPTCredentials(userId, account.id);
+		throw new ChatGPTOAuthError(
+			401,
+			'Reconnect your Codex subscription.',
+			'chatgpt_account_reauth_required'
+		);
+	}
+	return {
+		accessToken,
+		codex: true,
+		fetcher: codexSubscriptionFetch(accessToken, credentials.codexAccountId, fetcher)
+	};
 }
 
 export async function getChatGPTConnection(
@@ -1593,19 +1719,35 @@ export async function getChatGPTConnection(
 	fetcher: typeof fetch
 ) {
 	const accessToken = await getChatGPTAccessToken(userId, accountId);
-	const account = getChatGPTAccount(userId, accountId);
-	if (!account?.credentialEnvelope) throw new ApiError(401, 'Reconnect your ChatGPT account.');
-	if (account.clientId !== CODEX_CLIENT_ID) return { accessToken, fetcher, codex: false };
-	const credentials = decryptChatGPTCredentials(
-		userId,
-		account.id,
-		account.mode,
-		account.credentialEnvelope
-	);
-	if (!credentials.codexAccountId) throw new ApiError(401, 'Reconnect your Codex subscription.');
-	return {
-		accessToken,
-		codex: true,
-		fetcher: codexSubscriptionFetch(accessToken, credentials.codexAccountId, fetcher)
-	};
+	return buildChatGPTConnection(userId, accountId, fetcher, accessToken);
+}
+
+export async function withChatGPTConnection<T>(
+	userId: string,
+	accountId: string,
+	fetcher: typeof fetch,
+	operation: (connection: Awaited<ReturnType<typeof getChatGPTConnection>>) => Promise<T>
+): Promise<T> {
+	let connection = await getChatGPTConnection(userId, accountId, fetcher);
+	try {
+		return await operation(connection);
+	} catch (error) {
+		if (!(error instanceof ChatGPTInferenceError) || error.status !== 401) {
+			throw error;
+		}
+		const refreshedToken = await forceRefreshChatGPTAccessToken(
+			userId,
+			accountId,
+			connection.accessToken
+		);
+		connection = buildChatGPTConnection(userId, accountId, fetcher, refreshedToken);
+		try {
+			return await operation(connection);
+		} catch (retryError) {
+			if (retryError instanceof ChatGPTInferenceError && retryError.status === 401) {
+				clearRejectedChatGPTAccessToken(userId, accountId, refreshedToken);
+			}
+			throw retryError;
+		}
+	}
 }

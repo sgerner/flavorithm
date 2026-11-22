@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { searchConnections, searchModels } from '../src/lib/ai-connections.ts';
+import {
+	reconcileModelPreferences,
+	searchConnections,
+	searchModels
+} from '../src/lib/ai-connections.ts';
 import { transformModelCatalog, runAIRequest, AIRequestError } from '../src/lib/server/ai.ts';
 
 const model = {
