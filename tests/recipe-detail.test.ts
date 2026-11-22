@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { rankRecipes } from '../src/lib/discovery.ts';
 import { mergeKitchenStates } from '../src/lib/offline-sync.ts';
+import { MAX_SERVINGS } from '../src/lib/recipe-draft.ts';
 import {
 	MAX_RECIPE_SERVINGS,
 	MIN_RECIPE_SERVINGS,
@@ -71,18 +72,21 @@ function samplePreferences(overrides: Partial<Preferences> = {}): Preferences {
 	};
 }
 
-test('serving steppers clamp between 1 and 24 and fall back cleanly on blank or fractional input', () => {
+test('serving steppers clamp between 1 and MAX_SERVINGS and fall back cleanly on blank or fractional input', () => {
+	assert.equal(MAX_RECIPE_SERVINGS, MAX_SERVINGS);
 	assert.equal(isValidServings(1), true);
 	assert.equal(isValidServings(24), true);
+	assert.equal(isValidServings(25), true);
+	assert.equal(isValidServings(MAX_SERVINGS), true);
 	assert.equal(isValidServings(0), false);
-	assert.equal(isValidServings(25), false);
+	assert.equal(isValidServings(MAX_SERVINGS + 1), false);
 	assert.equal(isValidServings(2.5), false);
 	assert.equal(isValidServings(null), false);
 	assert.equal(isValidServings(undefined), false);
 	assert.equal(isValidServings(Number.NaN), false);
 
 	assert.equal(stepServings(MIN_RECIPE_SERVINGS, -1, 4), 1);
-	assert.equal(stepServings(MAX_RECIPE_SERVINGS, 1, 4), 24);
+	assert.equal(stepServings(MAX_RECIPE_SERVINGS, 1, 4), MAX_SERVINGS);
 	assert.equal(stepServings(4, 1, 4), 5);
 	assert.equal(stepServings(4, -1, 4), 3);
 
@@ -90,11 +94,11 @@ test('serving steppers clamp between 1 and 24 and fall back cleanly on blank or 
 	assert.equal(stepServings(null, 1, 4), 5);
 	assert.equal(stepServings(undefined, -1, 4), 3);
 	assert.equal(stepServings(null, -1, 1), 1);
-	assert.equal(stepServings(undefined, 1, 24), 24);
+	assert.equal(stepServings(undefined, 1, MAX_SERVINGS), MAX_SERVINGS);
 
-	// Out-of-range and fractional input clamp into 1..24
+	// Out-of-range and fractional input clamp into 1..MAX_SERVINGS
 	assert.equal(stepServings(0, 1, 2), 1);
-	assert.equal(stepServings(30, -1, 2), 24);
+	assert.equal(stepServings(MAX_SERVINGS + 50, -1, 2), MAX_SERVINGS);
 	assert.equal(stepServings(2.4, 1, 2), 3);
 	assert.equal(stepServings(2.4, -1, 2), 2);
 	assert.equal(clampServings(Number.NaN), 1);
@@ -103,7 +107,8 @@ test('serving steppers clamp between 1 and 24 and fall back cleanly on blank or 
 test('transient blank servings keep scaled ingredients and nutrition stable via lastValidServings', () => {
 	assert.equal(resolveServingsFallback(undefined, 4), 4);
 	assert.equal(resolveServingsFallback(6, 4), 6);
-	assert.equal(resolveServingsFallback(50, 4), 24);
+	assert.equal(resolveServingsFallback(50, 4), 50);
+	assert.equal(resolveServingsFallback(MAX_SERVINGS + 50, 4), MAX_SERVINGS);
 
 	// User scaled from 2 -> 5, then pressed Backspace (null/undefined)
 	const activeDuringBlank = resolveActiveServings(null, 5);

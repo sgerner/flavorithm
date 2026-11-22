@@ -424,28 +424,16 @@ export async function runAIRequest(
 	const prompt = buildPrompt(request);
 	const image = request.action === 'vision' ? parseDataImage(request.image) : undefined;
 	assertRequestActive(requestSignal);
-	const modelResult =
-		provider === 'anthropic'
-			? await callAnthropic(
-					provider,
-					selectedModel,
-					selectedApiKey,
-					request.action,
-					prompt,
-					image,
-					requestFetcher,
-					request.reasoning
-				)
-			: await callOpenAICompatible(
-					provider,
-					selectedModel,
-					selectedApiKey,
-					request.action,
-					prompt,
-					image,
-					requestFetcher,
-					request.reasoning
-				);
+	const modelResult = await callProvider(
+		provider,
+		selectedModel,
+		selectedApiKey,
+		request.action,
+		prompt,
+		image,
+		requestFetcher,
+		request.reasoning
+	);
 
 	return validateResult(request.action, modelResult);
 }
@@ -631,6 +619,34 @@ export function compatibleReasoning(
 	};
 }
 
+function outputTokenBudget(
+	action: Exclude<AIAction, 'search'>,
+	reasoning?: ReasoningSettings
+): number {
+	return (
+		(action === 'chat'
+			? 8192
+			: action === 'generate' || action === 'import' || action === 'capture'
+				? 4096
+				: 1200) + (reasoning?.budgetTokens ?? (reasoning ? 4096 : 0))
+	);
+}
+
+function callProvider(
+	provider: AIProvider,
+	model: string,
+	apiKey: string,
+	action: Exclude<AIAction, 'search'>,
+	prompt: string,
+	image: ReturnType<typeof parseDataImage> | undefined,
+	fetcher: Fetcher,
+	reasoning?: ReasoningSettings
+) {
+	return provider === 'anthropic'
+		? callAnthropic(provider, model, apiKey, action, prompt, image, fetcher, reasoning)
+		: callOpenAICompatible(provider, model, apiKey, action, prompt, image, fetcher, reasoning);
+}
+
 async function callGoogle(
 	model: string,
 	apiKey: string,
@@ -742,12 +758,10 @@ async function callOpenAICompatible(
 				...(['openai', 'openrouter'].includes(provider)
 					? { response_format: { type: 'json_object' } }
 					: {}),
-				[provider === 'openai' ? 'max_completion_tokens' : 'max_tokens']:
-					(action === 'chat'
-						? 8192
-						: action === 'generate' || action === 'import' || action === 'capture'
-							? 4096
-							: 1200) + (reasoning?.budgetTokens ?? (reasoning ? 4096 : 0))
+				[provider === 'openai' ? 'max_completion_tokens' : 'max_tokens']: outputTokenBudget(
+					action,
+					reasoning
+				)
 			}),
 			signal: AbortSignal.timeout(reasoning ? 90_000 : PROVIDER_TIMEOUT_MS)
 		},
@@ -800,12 +814,7 @@ async function callAnthropic(
 			},
 			body: JSON.stringify({
 				model,
-				max_tokens:
-					(action === 'chat'
-						? 8192
-						: action === 'generate' || action === 'import' || action === 'capture'
-							? 4096
-							: 1200) + (reasoning?.budgetTokens ?? (reasoning ? 4096 : 0)),
+				max_tokens: outputTokenBudget(action, reasoning),
 				...(reasoning?.enabled === false
 					? { thinking: { type: 'disabled' } }
 					: reasoning?.budgetTokens
@@ -894,7 +903,7 @@ async function searchRecipes(prompt: string, fetcher: Fetcher) {
 	const searchKey = typeof process !== 'undefined' ? process.env.BRAVE_SEARCH_API_KEY : undefined;
 	if (!searchKey) {
 		throw new AIRequestError(
-			'Recipe search is not configured. Set BRAVE_SEARCH_API_KEY on the server.',
+			'Recipe search is not configured on this installation. Ask the server operator to enable online recipe search.',
 			503
 		);
 	}
@@ -1353,28 +1362,16 @@ async function captureRecipe(
 		sourceUrl
 	});
 	assertRequestActive(requestSignal);
-	const modelResult =
-		provider === 'anthropic'
-			? await callAnthropic(
-					provider,
-					model,
-					apiKey,
-					'capture',
-					prompt,
-					image,
-					fetcher,
-					request.reasoning
-				)
-			: await callOpenAICompatible(
-					provider,
-					model,
-					apiKey,
-					'capture',
-					prompt,
-					image,
-					fetcher,
-					request.reasoning
-				);
+	const modelResult = await callProvider(
+		provider,
+		model,
+		apiKey,
+		'capture',
+		prompt,
+		image,
+		fetcher,
+		request.reasoning
+	);
 	const parsed = CapturedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
 	const { assumptions, ...draft } = parsed.data;
@@ -1757,28 +1754,16 @@ async function importRecipe(
 		throw new AIRequestError('The selected page does not contain a structured recipe.', 422);
 	const sourceUrl = canonicalRecipeUrl(html, selectedUrl);
 	const prompt = buildImportPrompt(sourceRecipe, sourceUrl);
-	const modelResult =
-		provider === 'anthropic'
-			? await callAnthropic(
-					provider,
-					model,
-					apiKey,
-					'import',
-					prompt,
-					undefined,
-					fetcher,
-					reasoning
-				)
-			: await callOpenAICompatible(
-					provider,
-					model,
-					apiKey,
-					'import',
-					prompt,
-					undefined,
-					fetcher,
-					reasoning
-				);
+	const modelResult = await callProvider(
+		provider,
+		model,
+		apiKey,
+		'import',
+		prompt,
+		undefined,
+		fetcher,
+		reasoning
+	);
 	const parsed = ImportedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
 	return {

@@ -1,7 +1,10 @@
+import { isValidServings, MAX_SERVINGS } from './recipe-draft.ts';
 import type { Recipe } from './types.ts';
 
+export { isValidServings };
+
 export const MIN_RECIPE_SERVINGS = 1;
-export const MAX_RECIPE_SERVINGS = 24;
+export const MAX_RECIPE_SERVINGS = MAX_SERVINGS;
 
 export const RECIPE_TABS = ['recipe', 'nutrition'] as const;
 export type RecipeTab = (typeof RECIPE_TABS)[number];
@@ -9,15 +12,6 @@ export type RecipeTab = (typeof RECIPE_TABS)[number];
 export type NutritionMode = 'serving' | 'scaled' | 'recipe';
 
 export const RATING_STARS = [1, 2, 3, 4, 5] as const;
-
-export function isValidServings(value: number | null | undefined): value is number {
-	return (
-		typeof value === 'number' &&
-		Number.isInteger(value) &&
-		value >= MIN_RECIPE_SERVINGS &&
-		value <= MAX_RECIPE_SERVINGS
-	);
-}
 
 export function clampServings(value: number): number {
 	if (!Number.isFinite(value)) return MIN_RECIPE_SERVINGS;

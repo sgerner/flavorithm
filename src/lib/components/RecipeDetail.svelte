@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
+	import { MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
@@ -235,7 +236,7 @@
 									type="number"
 									inputmode="numeric"
 									min="1"
-									max="24"
+									max={MAX_SERVINGS}
 									step="1"
 									aria-invalid={!validServings}
 									aria-describedby={!validServings ? 'servings-help' : undefined}
@@ -248,7 +249,7 @@
 							</div>
 						</div>
 						<p class="servings-help" id="servings-help" aria-live="polite">
-							{#if !validServings}Enter 1–24 servings to plan or shop.{/if}
+							{#if !validServings}Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.{/if}
 						</p>
 						<ul class="ingredients-list">
 							{#each recipe.ingredients as item}<li>
@@ -288,7 +289,9 @@
 					class="nutrition-panel"
 					in:revealMotion|global
 				>
-					<p class="visually-hidden" id="servings-help">Enter 1–24 servings to plan or shop.</p>
+					<p class="visually-hidden" id="servings-help">
+						Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.
+					</p>
 					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
 							Ingredients or servings changed. Refresh this estimate before relying on it.
 						</p>{/if}
@@ -402,6 +405,9 @@
 		min-height: 44px;
 		padding-inline: 12px;
 		white-space: nowrap;
+	}
+	.servings input {
+		width: 76px;
 	}
 	.nutrition-stale {
 		padding: 10px 12px;
