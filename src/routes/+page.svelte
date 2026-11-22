@@ -51,8 +51,10 @@
 	import {
 		completeMeal,
 		expiryStatus,
+		normalizeIngredientName,
 		reconcileShoppingList,
-		transferPurchasedItemsToPantry
+		transferPurchasedItemsToPantry,
+		unitInfo
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
@@ -66,7 +68,11 @@
 	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
-	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
+	import {
+		migrateGuestKitchenOnSignup,
+		quarantineLegacyKitchen,
+		sanitizeKitchenState
+	} from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
@@ -339,8 +345,15 @@
 	let deductPantry = $state(false);
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
+	let pantryDrafts = $state<Record<string, { quantity: number | null; unit: string }>>({});
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
+	let editingShoppingDraft = $state<{
+		id: string;
+		name: string;
+		quantity: number | null;
+		unit: string;
+	} | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -489,10 +502,17 @@
 		);
 	}
 	function removeShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId === item.id) {
+			editingShoppingId = '';
+			editingShoppingDraft = null;
+		}
 		const removed = structuredClone($state.snapshot(item));
 		kitchen.shopping = kitchen.shopping.filter((entry) => entry.id !== item.id);
 		notify(`${item.name} removed.`, () => {
-			if (!kitchen.shopping.some((entry) => entry.id === removed.id))
+			if (
+				kitchen.shopping.length < 1_000 &&
+				!kitchen.shopping.some((entry) => entry.id === removed.id)
+			)
 				kitchen.shopping.push(removed);
 		});
 	}
@@ -565,19 +585,20 @@
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
 	$effect(() => {
-		const snapshot = JSON.stringify(kitchen);
+		const rawSnapshot = JSON.stringify(kitchen);
 		if (!ready) return;
 		document.documentElement.dataset.theme = kitchen.preferences.theme;
 		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
 		if (managedAuth && (!user || !kitchenLoaded)) return;
+		const sanitized = sanitizeKitchenState(JSON.parse(rawSnapshot));
 		if (!managedAuth && !user && guestPersistenceReady) {
 			try {
-				localStorage.setItem('flavorithm-guest-kitchen', snapshot);
+				localStorage.setItem('flavorithm-guest-kitchen', JSON.stringify(sanitized));
 			} catch {
 				notify('Device storage is full. Export your kitchen before leaving.');
 			}
 		}
-		if (user) kitchenSync?.stage(JSON.parse(snapshot));
+		if (user) kitchenSync?.stage(sanitized);
 		clearTimeout(saveTimer);
 		if (user && !syncing && online)
 			saveTimer = setTimeout(() => {
@@ -589,9 +610,9 @@
 		kitchenSync = createKitchenSync({
 			storage: localStorage,
 			getUser: () => user,
-			getState: () => JSON.parse(JSON.stringify(kitchen)),
+			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				kitchen = state;
+				kitchen = sanitizeKitchenState(state);
 			},
 			onStatus: (status) => {
 				pendingSync = status.pending;
@@ -648,8 +669,9 @@
 				quarantineLegacyKitchen(localStorage);
 				const local = localStorage.getItem('flavorithm-guest-kitchen');
 				if (local) {
-					kitchen = JSON.parse(local);
-					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
+					const sanitized = sanitizeKitchenState(JSON.parse(local));
+					if (!themes.includes(sanitized.preferences.theme)) sanitized.preferences.theme = 'nosh';
+					kitchen = sanitized;
 				}
 			} catch {}
 			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
@@ -776,14 +798,15 @@
 		};
 	});
 	function adoptKitchen(state: AppState) {
+		const sanitized = sanitizeKitchenState(state);
 		if (user && kitchenSync) {
-			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), state, stateEtag || '');
+			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), sanitized, stateEtag || '');
 			if (!managedAuth) {
 				try {
 					localStorage.setItem('flavorithm-last-account', JSON.stringify(user));
 				} catch {}
 			}
-		} else kitchen = state;
+		} else kitchen = sanitized;
 	}
 	async function retrySync(prefer?: 'local' | 'remote') {
 		if (!online || !user || !kitchenSync) return;
@@ -832,10 +855,11 @@
 			);
 	}
 	async function flushKitchen() {
+		commitInlineEdits();
 		clearTimeout(saveTimer);
 		await writeChain;
 		if (user && kitchenSync) {
-			kitchenSync.stage(JSON.parse(JSON.stringify(kitchen)));
+			kitchenSync.stage(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))));
 			await kitchenSync.sync();
 			if (kitchenSync.snapshot())
 				throw new Error(
@@ -845,6 +869,9 @@
 	}
 
 	function freshKitchen() {
+		pantryDrafts = {};
+		editingShoppingId = '';
+		editingShoppingDraft = null;
 		kitchen.pantry = [];
 		kitchen.meals = [];
 		kitchen.shopping = [];
@@ -856,36 +883,88 @@
 		notify('Sample pantry and meal plan cleared. Starter recipes kept.');
 	}
 	function navigate(id: string) {
+		commitInlineEdits();
 		page = id;
 		mobileNav = false;
 	}
 	function addIngredients() {
-		const names = pantryInput
+		const entries = pantryInput
+			.slice(0, 20_000)
 			.split(/[,\n;]/)
 			.map((value) => value.trim())
 			.filter(Boolean);
-		if (!names.length) return;
+		if (!entries.length) return;
+		commitInlineEdits();
 		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
-		const additions = names.map((value) => {
+		const existingKeys = new Set(
+			kitchen.pantry
+				.filter((item) => !item.expires?.trim())
+				.map(
+					(item) => `${normalizeIngredientName(item.name)}\u0000${unitInfo(item.unit).dimension}`
+				)
+		);
+		let lotCount = kitchen.pantry.length;
+		let rejectedZero = 0;
+		let skippedCapacity = 0;
+		const additions: AppState['shopping'] = [];
+		for (const value of entries) {
 			const match = value.match(
 				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
 			);
-			return {
+			const quantity = match ? Number(match[1]) : 1;
+			if (!Number.isFinite(quantity) || quantity <= 0) {
+				rejectedZero += 1;
+				continue;
+			}
+			const name = (match ? match[3] : value).trim().slice(0, 200);
+			if (!name) {
+				rejectedZero += 1;
+				continue;
+			}
+			const unit = (match?.[2] || 'piece').trim().slice(0, 40) || 'piece';
+			const key = `${normalizeIngredientName(name)}\u0000${unitInfo(unit).dimension}`;
+			if (!existingKeys.has(key)) {
+				if (lotCount >= 1_000) {
+					skippedCapacity += 1;
+					continue;
+				}
+				existingKeys.add(key);
+				lotCount += 1;
+			}
+			additions.push({
 				id: crypto.randomUUID(),
-				name: match ? match[3] : value,
-				quantity: match ? Number(match[1]) : 1,
-				unit: match?.[2] || 'piece',
+				name,
+				quantity: Math.min(1_000_000, quantity),
+				unit,
 				checked: true
-			};
-		});
+			});
+		}
+		if (!additions.length) {
+			notify(
+				skippedCapacity > 0 && rejectedZero === 0
+					? 'Your pantry can hold up to 1,000 ingredients.'
+					: 'Enter a quantity above zero for each ingredient.'
+			);
+			return;
+		}
 		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
 		const applied = JSON.stringify(kitchen.pantry);
 		pantryInput = '';
 		modal = '';
-		notify(`${names.length} ingredients added to your pantry.`, () => {
-			if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-			else notify('Your pantry changed again. Review the current quantities before editing.');
-		});
+		const acceptedCount = additions.length;
+		const suffix =
+			skippedCapacity > 0
+				? ' (1,000-ingredient limit reached)'
+				: rejectedZero > 0
+					? ` (${rejectedZero} zero-quantity skipped)`
+					: '';
+		notify(
+			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}.`,
+			() => {
+				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
+				else notify('Your pantry changed again. Review the current quantities before editing.');
+			}
+		);
 	}
 
 	async function authenticate(event: SubmitEvent) {
@@ -898,22 +977,45 @@
 		error = '';
 		try {
 			syncing = true;
+			commitInlineEdits();
 			clearTimeout(saveTimer);
 			const guestKitchen =
-				authMode === 'register' ? (JSON.parse(JSON.stringify(kitchen)) as AppState) : null;
+				authMode === 'register' ? sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))) : null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
 			user = result.user;
-			const saved = await request('/api/state');
+			let migratedSynced = true;
 			if (guestKitchen) {
-				adoptKitchen(saved.state || createNewUserState());
-				kitchen = guestKitchen;
-				kitchenSync?.stage(guestKitchen);
-				await kitchenSync?.sync();
-			} else if (saved.state) adoptKitchen(saved.state);
-			else {
-				kitchen = guestKitchen ?? createNewUserState();
-				await request('/api/state', { state: kitchen }, 'PUT');
-				adoptKitchen(kitchen);
+				const migrated = await migrateGuestKitchenOnSignup({
+					guestState: guestKitchen,
+					loadInitialState: async () => {
+						const saved = await request('/api/state');
+						return { state: saved.state || null, etag: stateEtag || '' };
+					},
+					adoptBaseline: (baseline, etag) => {
+						stateEtag = etag || null;
+						adoptKitchen(baseline);
+					},
+					stage: (next) => {
+						kitchen = next;
+						kitchenSync?.stage(next);
+					},
+					sync: async () => {
+						await kitchenSync?.sync();
+					},
+					hasPendingFailure: () => Boolean(syncErrors || kitchenSync?.snapshot())
+				});
+				kitchen = migrated.state;
+				kitchenLoaded = true;
+				migratedSynced = migrated.synced;
+			} else {
+				const saved = await request('/api/state');
+				if (saved.state) adoptKitchen(saved.state);
+				else {
+					kitchen = createNewUserState();
+					await request('/api/state', { state: kitchen }, 'PUT');
+					adoptKitchen(kitchen);
+				}
+				kitchenLoaded = true;
 			}
 			user = result.user;
 			showStarter = false;
@@ -929,7 +1031,14 @@
 				modal = '';
 				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
 			}
-			notify(`Welcome to your kitchen, ${user?.name.split(' ')[0]}.`);
+			const firstName = user?.name.split(' ')[0] || 'chef';
+			if (guestKitchen && !migratedSynced) {
+				notify(
+					`Welcome, ${firstName}. Your kitchen is saved on this device and will sync when you reconnect.`
+				);
+			} else {
+				notify(`Welcome to your kitchen, ${firstName}.`);
+			}
 		} catch (e) {
 			error = (e as Error).message;
 		} finally {
@@ -1521,7 +1630,7 @@
 			const recognized = result.ingredients
 				.map((i: any) => `${i.quantity} ${i.unit} ${i.name}`)
 				.join('\n');
-			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n');
+			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n').slice(0, 20000);
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
@@ -1578,7 +1687,7 @@
 						.join('\n')
 						.slice(0, 20000);
 				} else {
-					pantryInput = [pantryInput, text].filter(Boolean).join(', ');
+					pantryInput = [pantryInput, text].filter(Boolean).join(', ').slice(0, 20000);
 					notify('Review your ingredients, then add them.');
 				}
 			},
@@ -1695,11 +1804,156 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
+	function normalizePantryItem(item: AppState['pantry'][number]) {
+		const draft = pantryDrafts[item.id];
+		delete pantryDrafts[item.id];
+		if (!kitchen.pantry.some((entry) => entry.id === item.id)) return;
+		const rawQuantity = draft ? draft.quantity : item.quantity;
+		const parsed =
+			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
+				? 0
+				: Number(rawQuantity);
+		const clamped = Number.isFinite(parsed) ? Math.min(1_000_000, Math.max(0, parsed)) : 0;
+		item.quantity = Object.is(clamped, -0) ? 0 : clamped;
+		const rawUnit = draft ? draft.unit : item.unit;
+		item.unit =
+			String(rawUnit ?? '')
+				.trim()
+				.slice(0, 40) || 'piece';
+		item.expires = item.expires?.trim().slice(0, 50) || undefined;
+	}
+	function startEditingShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId && editingShoppingId !== item.id) {
+			const previous = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
+			if (previous) normalizeShoppingItem(previous);
+		}
+		editingShoppingId = item.id;
+		editingShoppingDraft = {
+			id: item.id,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit
+		};
+	}
+	function finishEditingShoppingItem(item: AppState['shopping'][number]) {
+		normalizeShoppingItem(item);
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+	}
 	function normalizeShoppingItem(item: AppState['shopping'][number]) {
-		item.name = item.name.trim().slice(0, 100) || 'Shopping item';
-		item.unit = item.unit.trim().slice(0, 40) || 'piece';
-		const quantity = Number(item.quantity);
-		item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1000000)) : 1;
+		const draft = editingShoppingDraft?.id === item.id ? editingShoppingDraft : null;
+		const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
+		const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
+		const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
+		const rawQuantity = draft ? draft.quantity : item.quantity;
+		const parsed =
+			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
+				? Number.NaN
+				: Number(rawQuantity);
+		const fallbackQuantity =
+			Number.isFinite(item.quantity) && item.quantity >= 0.01 && item.quantity <= 1_000_000
+				? item.quantity
+				: 1;
+		const quantity = Number.isFinite(parsed)
+			? Math.max(0.01, Math.min(parsed, 1_000_000))
+			: fallbackQuantity;
+		item.name = name;
+		item.unit = unit;
+		item.quantity = quantity;
+		if (draft) {
+			draft.name = name;
+			draft.unit = unit;
+			draft.quantity = quantity;
+		}
+	}
+	function commitInlineEdits() {
+		for (const id of Object.keys(pantryDrafts)) {
+			const item = kitchen.pantry.find((entry) => entry.id === id);
+			if (item) normalizePantryItem(item);
+			else delete pantryDrafts[id];
+		}
+		if (editingShoppingId) {
+			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
+			if (item) normalizeShoppingItem(item);
+			editingShoppingId = '';
+			editingShoppingDraft = null;
+		}
+	}
+	function addShoppingQuickItem() {
+		const raw = shoppingText.trim();
+		if (!raw) return;
+		const match = raw.match(
+			/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
+		);
+		const quantity = match ? Number(match[1]) : 1;
+		if (!Number.isFinite(quantity) || quantity <= 0) {
+			notify('Enter a quantity above zero.');
+			return;
+		}
+		const name = (match ? match[3] : raw).trim().slice(0, 200);
+		if (!name) return;
+		if (kitchen.shopping.length >= 1_000) {
+			notify('Your shopping list can hold up to 1,000 items.');
+			return;
+		}
+		const unit = (match?.[2] || 'piece').trim().slice(0, 40) || 'piece';
+		kitchen.shopping.push({
+			id: crypto.randomUUID(),
+			name,
+			quantity: Math.min(1_000_000, quantity),
+			unit,
+			checked: false
+		});
+		shoppingText = '';
+	}
+	function movePurchasedToPantry() {
+		commitInlineEdits();
+		const checked = kitchen.shopping.filter((i) => i.checked);
+		if (!checked.length) {
+			notify('Mark items purchased first to move them to your pantry.');
+			return;
+		}
+		const existingKeys = new Set(
+			kitchen.pantry
+				.filter((item) => !item.expires?.trim())
+				.map(
+					(item) => `${normalizeIngredientName(item.name)}\u0000${unitInfo(item.unit).dimension}`
+				)
+		);
+		let lotCount = kitchen.pantry.length;
+		const accepted: AppState['shopping'] = [];
+		const acceptedIds = new Set<string>();
+		for (const item of checked) {
+			const name = item.name.trim().slice(0, 200);
+			const unit = item.unit.trim().slice(0, 40);
+			if (!name || !unit || !Number.isFinite(item.quantity) || item.quantity <= 0) continue;
+			const key = `${normalizeIngredientName(name)}\u0000${unitInfo(unit).dimension}`;
+			if (!existingKeys.has(key)) {
+				if (lotCount >= 1_000) continue;
+				existingKeys.add(key);
+				lotCount += 1;
+			}
+			accepted.push({
+				...item,
+				name,
+				unit,
+				quantity: Math.min(1_000_000, item.quantity)
+			});
+			acceptedIds.add(item.id);
+		}
+		if (!accepted.length) {
+			notify(
+				kitchen.pantry.length >= 1_000
+					? 'Your pantry can hold up to 1,000 ingredients.'
+					: 'Enter a quantity above zero before moving purchased items.'
+			);
+			return;
+		}
+		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, accepted);
+		kitchen.shopping = kitchen.shopping.filter((i) => !acceptedIds.has(i.id));
+		notify(
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`
+		);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
 		if (meals?.some((meal) => !Number.isFinite(meal.servings) || meal.servings <= 0)) {
@@ -2544,22 +2798,57 @@
 									aria-label={`Quantity of ${item.name}`}
 									type="number"
 									min="0"
+									max="1000000"
 									step="0.25"
-									bind:value={item.quantity}
+									bind:value={
+										() =>
+											item.id in pantryDrafts ? pantryDrafts[item.id].quantity : item.quantity,
+										(value) => {
+											pantryDrafts[item.id] = {
+												quantity: value,
+												unit: pantryDrafts[item.id]?.unit ?? item.unit
+											};
+										}
+									}
+									onblur={() => normalizePantryItem(item)}
+									onkeydown={(e) => {
+										if (e.key === 'Enter') e.currentTarget.blur();
+									}}
 								/><input
 									class="unit-input"
 									aria-label={`Unit for ${item.name}`}
-									bind:value={item.unit}
+									maxlength="40"
+									bind:value={
+										() => (item.id in pantryDrafts ? pantryDrafts[item.id].unit : item.unit),
+										(value) => {
+											pantryDrafts[item.id] = {
+												quantity:
+													item.id in pantryDrafts ? pantryDrafts[item.id].quantity : item.quantity,
+												unit: value
+											};
+										}
+									}
+									onblur={() => normalizePantryItem(item)}
+									onkeydown={(e) => {
+										if (e.key === 'Enter') e.currentTarget.blur();
+									}}
 								/></label
 							><input
 								aria-label={`Expiry for ${item.name}`}
 								type="date"
-								bind:value={item.expires}
+								bind:value={
+									() => item.expires ?? '',
+									(value) => {
+										item.expires = value ? value.trim().slice(0, 50) : undefined;
+									}
+								}
 							/><button
 								class="icon-button"
 								aria-label={`Remove ${item.name}`}
-								onclick={() => (kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id))}
-								><X size={16} /></button
+								onclick={() => {
+									delete pantryDrafts[item.id];
+									kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id);
+								}}><X size={16} /></button
 							>
 						</div>{/each}
 				</div>
@@ -2781,13 +3070,18 @@
 									onclick={() => (item.checked = !item.checked)}
 									>{#if item.checked}<Check size={16} />{/if}</button
 								>
-								{#if editingShoppingId === item.id}<div class="shopping-item-edit">
+								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<div
+										class="shopping-item-edit"
+									>
 										<input
 											class="shopping-name"
 											aria-label="Shopping item name"
-											bind:value={item.name}
-											maxlength="100"
+											bind:value={editingShoppingDraft.name}
+											maxlength="200"
 											onblur={() => normalizeShoppingItem(item)}
+											onkeydown={(e) => {
+												if (e.key === 'Enter') finishEditingShoppingItem(item);
+											}}
 										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
 									</div>
 									<span class="shopping-quantity"
@@ -2797,21 +3091,23 @@
 											min="0.01"
 											max="1000000"
 											step="0.01"
-											bind:value={item.quantity}
+											bind:value={editingShoppingDraft.quantity}
 											onblur={() => normalizeShoppingItem(item)}
+											onkeydown={(e) => {
+												if (e.key === 'Enter') finishEditingShoppingItem(item);
+											}}
 										/><input
 											aria-label={`Unit for ${item.name}`}
-											bind:value={item.unit}
+											bind:value={editingShoppingDraft.unit}
 											maxlength="40"
 											onblur={() => normalizeShoppingItem(item)}
+											onkeydown={(e) => {
+												if (e.key === 'Enter') finishEditingShoppingItem(item);
+											}}
 										/></span
 									>
-									<button
-										class="text-button"
-										onclick={() => {
-											normalizeShoppingItem(item);
-											editingShoppingId = '';
-										}}>Done</button
+									<button class="text-button" onclick={() => finishEditingShoppingItem(item)}
+										>Done</button
 									>
 								{:else}
 									<div class="shopping-item-edit">
@@ -2824,7 +3120,7 @@
 										{item.unit}<button
 											class="text-button"
 											aria-label={`Edit ${item.name}`}
-											onclick={() => (editingShoppingId = item.id)}>Edit</button
+											onclick={() => startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
 								{/if}
@@ -2845,32 +3141,18 @@
 							class="inline-add"
 							onsubmit={(e) => {
 								e.preventDefault();
-								if (shoppingText.trim()) {
-									kitchen.shopping.push({
-										id: crypto.randomUUID(),
-										name: shoppingText.trim(),
-										quantity: 1,
-										unit: 'piece',
-										checked: false
-									});
-									shoppingText = '';
-								}
+								addShoppingQuickItem();
 							}}
 						>
 							<Plus size={18} /><input
 								aria-label="Add shopping item"
 								placeholder="Anything else for the basket?"
+								maxlength="200"
 								bind:value={shoppingText}
 							/><button class="text-button">Add</button>
 						</form>
-						<button
-							class="text-button"
-							onclick={() => {
-								const checked = kitchen.shopping.filter((i) => i.checked);
-								kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
-								kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
-								notify(`${checked.length} purchased items moved to your pantry.`);
-							}}>Put purchased items in my pantry <ArrowRight size={16} /></button
+						<button class="text-button" onclick={movePurchasedToPantry}
+							>Put purchased items in my pantry <ArrowRight size={16} /></button
 						>
 					</div>
 				</div>
@@ -3057,6 +3339,7 @@
 					<label class="field"
 						>Ingredients<textarea
 							bind:value={pantryInput}
+							maxlength="20000"
 							placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
 							rows="5"></textarea></label
 					>
@@ -3170,6 +3453,7 @@
 					<label class="field"
 						>Allergies & ingredients to avoid<input
 							bind:value={kitchen.preferences.allergies}
+							maxlength="2000"
 							placeholder="e.g. peanuts, shellfish"
 						/></label
 					>

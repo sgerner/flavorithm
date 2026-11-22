@@ -52,6 +52,16 @@
 		['sugar', 'Sugar (g)'],
 		['protein', 'Protein (g)']
 	];
+	function isNutritionValid(recipe: Recipe | null): boolean {
+		if (!recipe) return true;
+		return nutritionFields.every(
+			([key]) =>
+				Number.isFinite(recipe.nutrition[key]) &&
+				recipe.nutrition[key] >= 0 &&
+				recipe.nutrition[key] <= 1000000
+		);
+	}
+	let nutritionOpen = $state(untrack(() => !isNutritionValid(session.draft)));
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
@@ -132,6 +142,7 @@
 			if (alive && generation === captureGeneration && result) {
 				session.draft = result.recipe;
 				session.assumptions = result.assumptions;
+				nutritionOpen = !isNutritionValid(result.recipe);
 				reviewingDraft = true;
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
@@ -165,35 +176,59 @@
 		event.preventDefault();
 		const draft = session.draft;
 		if (!draft) return;
+		error = '';
+		const title = draft.title.trim();
 		const ingredients = draft.ingredients.map((i) => ({
 			...i,
 			name: i.name.trim(),
 			unit: i.unit.trim()
 		}));
 		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
+		const nutritionValid = isNutritionValid(draft);
 		if (
-			!draft.title.trim() ||
-			!ingredients.length ||
-			!steps.length ||
-			ingredients.some(
-				(i) => !i.name || !i.unit || !Number.isFinite(i.quantity) || i.quantity <= 0
-			) ||
+			!title ||
+			title.length > 200 ||
 			!Number.isFinite(draft.time) ||
-			draft.time <= 0 ||
+			draft.time < 1 ||
+			draft.time > 100000 ||
 			!Number.isFinite(draft.servings) ||
-			draft.servings < 1
+			draft.servings < 1 ||
+			draft.servings > 10000 ||
+			!ingredients.length ||
+			ingredients.length > 60 ||
+			ingredients.some(
+				(i) =>
+					!i.name ||
+					i.name.length > 200 ||
+					!i.unit ||
+					i.unit.length > 40 ||
+					!Number.isFinite(i.quantity) ||
+					i.quantity <= 0 ||
+					i.quantity > 1000000
+			) ||
+			!steps.length ||
+			steps.length > 40 ||
+			steps.some((step) => step.length > 10000) ||
+			!nutritionValid
 		) {
+			if (!nutritionValid) nutritionOpen = true;
 			error =
-				'Add a title, time, servings, at least one ingredient with a quantity and unit, and a cooking step.';
+				'Check the title, cooking time, servings, ingredient quantities, cooking steps, and nutrition values.';
 			return;
 		}
 		try {
 			save({
 				...draft,
-				title: draft.title.trim(),
+				title,
+				description: draft.description.trim().slice(0, 10000),
+				cuisine: draft.cuisine.trim().slice(0, 100),
+				difficulty: draft.difficulty.trim().slice(0, 80),
 				ingredients,
 				steps,
-				importNotes: [...session.assumptions],
+				importNotes: session.assumptions
+					.map((note) => note.trim().slice(0, 300))
+					.filter(Boolean)
+					.slice(0, 30),
 				saved: true
 			});
 		} catch (e) {
@@ -255,6 +290,7 @@
 						onclick={() => {
 							session = emptyImportSession();
 							error = '';
+							nutritionOpen = false;
 							retryAvailable = false;
 						}}>Clear</button
 					>{/if}
@@ -305,7 +341,7 @@
 	<div class="draft-heading" in:revealMotion>
 		<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Review your recipe</h2>
 	</div>
-	<form onsubmit={saveDraft} in:revealMotion>
+	<form onsubmit={saveDraft} novalidate in:revealMotion>
 		<div class="draft-summary">
 			<label class="field draft-title"
 				>Title<input bind:value={draft.title} required maxlength="200" /></label
@@ -424,7 +460,7 @@
 			><label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label
 			><label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label>
 		</details>
-		<details class="import-notes">
+		<details class="import-notes" bind:open={nutritionOpen}>
 			<summary>Nutrition estimates</summary>
 			<p>Estimates per serving; re-estimate after ingredient or serving changes.</p>
 			<div class="draft-summary">
@@ -446,6 +482,7 @@
 			onclick={() => {
 				session = emptyImportSession();
 				error = '';
+				nutritionOpen = false;
 				reviewingDraft = false;
 				retryAvailable = false;
 			}}>Discard draft</button
