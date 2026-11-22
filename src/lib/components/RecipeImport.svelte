@@ -9,6 +9,7 @@
 	import { revealMotion } from '#lib/motion.ts';
 	import {
 		createDraftBaseline,
+		isValidNutrition,
 		MAX_SERVINGS,
 		NUTRITION_FIELDS,
 		validateRecipeDraft
@@ -33,7 +34,9 @@
 	let busy = $state(false);
 	let reading = $state(false);
 	let reviewingDraft = $state(untrack(() => session.draft !== null));
-	let nutritionOpen = $state(false);
+	let nutritionOpen = $state(
+		untrack(() => (session.draft ? !isValidNutrition(session.draft.nutrition) : false))
+	);
 	let retryAvailable = $state(false);
 	let error = $state('');
 	let dragging = $state(false);
@@ -146,7 +149,7 @@
 				session.draft = result.recipe;
 				session.baseline = createDraftBaseline(result.recipe);
 				session.assumptions = result.assumptions;
-				nutritionOpen = false;
+				nutritionOpen = !isValidNutrition(result.recipe.nutrition);
 				reviewingDraft = true;
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
@@ -266,6 +269,7 @@
 						onclick={() => {
 							session = emptyImportSession();
 							error = '';
+							nutritionOpen = false;
 							retryAvailable = false;
 						}}>Clear</button
 					>{/if}
