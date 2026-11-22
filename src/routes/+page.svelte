@@ -3671,7 +3671,7 @@
 	}
 	.expiry-filters button.active {
 		background: var(--green);
-		color: var(--paper);
+		color: var(--on-green);
 		border-color: var(--green);
 	}
 	.expiry-filters button span {
@@ -3689,18 +3689,6 @@
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 4px;
-	}
-	.expiry-badge {
-		font-size: 12px;
-		color: var(--muted);
-	}
-	.expiry-badge.expired {
-		color: #a43f36;
-		font-weight: 600;
-	}
-	.expiry-badge.soon {
-		color: #926b17;
-		font-weight: 600;
 	}
 	.use-first {
 		display: inline-flex;
@@ -3864,13 +3852,6 @@
 		color: var(--muted);
 		line-height: 1.5;
 	}
-	.danger-action {
-		background: #a43f36;
-		color: white;
-	}
-	.dialog-actions .danger-action:hover {
-		background: #87332c;
-	}
 	@media (max-width: 650px) {
 		.expiry-filters {
 			display: grid;
@@ -3930,16 +3911,6 @@
 		font-size: 13px;
 		color: var(--muted);
 		overflow-wrap: anywhere;
-	}
-	.member-role {
-		padding: 4px 7px;
-		background: var(--wash);
-		color: var(--muted);
-		font-size: 12px;
-	}
-	.member-role.owner-role {
-		background: var(--accent);
-		color: var(--ink);
 	}
 	.member-remove {
 		min-height: 40px;
