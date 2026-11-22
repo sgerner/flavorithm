@@ -3,7 +3,14 @@ import { test } from 'node:test';
 process.env.FLAVORITHM_DB_PATH = ':memory:';
 const { transcribeVoice, validateVoiceAudio, localWhisperUrl } =
 	await import('../src/lib/server/voice.ts');
-const { pcmWav, VoiceCapture } = await import('../src/lib/voice-capture.ts');
+const {
+	pcmWav,
+	VoiceCapture,
+	appendDictatedText,
+	planVoiceRetry,
+	planVoiceStart,
+	resolveClosedDialog
+} = await import('../src/lib/voice-capture.ts');
 const { MAX_WAV_BYTES } = await import('../src/lib/voice-config.ts');
 const route = await import('../src/routes/api/voice/+server.ts');
 function form(provider = 'groq', model = 'whisper-large-v3-turbo') {
@@ -120,6 +127,10 @@ test('rejects missing keys, arbitrary models, malformed audio, empty transcripts
 	await assert.rejects(
 		transcribeVoice(form(), (async () => Response.json({ text: '' })) as typeof fetch),
 		/No speech/
+	);
+	await assert.rejects(
+		transcribeVoice(form(), (async () => Response.json({ status: 'ok' })) as typeof fetch),
+		/unexpected response/
 	);
 	await assert.rejects(
 		transcribeVoice(form(), (async () => new Response('a'.repeat(256001))) as typeof fetch)
@@ -420,4 +431,362 @@ test('record/stop converts to WAV, uploads once, and cancellation suppresses a l
 	assert.deepEqual(text, ['fresh carrots']);
 	assert.equal(uploads, 2);
 	assert.equal(states.at(-1), 'idle');
+});
+
+test('failed uploads retain 16kHz WAV across 401/429/502/503/HTML/empty/malformed/network errors, surface readable messages, retry manually without re-encoding, and free memory on success/discard/cancel/new capture', async (t) => {
+	let stoppedTracks = 0;
+	let decodeCalls = 0;
+	let nextResponse: () => Promise<Response> = async () =>
+		Response.json(
+			{ error: 'The voice service rejected its API key. Check Voice input in Settings.' },
+			{ status: 401 }
+		);
+	const sentUploads: { provider: string; apiKey: string; wavBytes: Uint8Array }[] = [];
+	const overrides = {
+		navigator: {
+			language: 'en-US',
+			mediaDevices: {
+				getUserMedia: async () => ({
+					getTracks: () => [
+						{
+							stop: () => {
+								stoppedTracks++;
+							}
+						}
+					]
+				})
+			}
+		},
+		MediaRecorder: class {
+			state = 'inactive';
+			mimeType = 'audio/webm';
+			ondataavailable?: (event: any) => void;
+			onstop?: () => void;
+			static isTypeSupported() {
+				return true;
+			}
+			start() {
+				this.state = 'recording';
+			}
+			stop() {
+				this.state = 'inactive';
+				queueMicrotask(() => {
+					this.ondataavailable?.({ data: new Blob(['recorded-audio']) });
+					this.onstop?.();
+				});
+			}
+		},
+		OfflineAudioContext: class {
+			destination = {};
+			async decodeAudioData() {
+				decodeCalls++;
+				return { duration: 0.1 };
+			}
+			createBufferSource() {
+				return { buffer: null, connect() {}, start() {} };
+			}
+			async startRendering() {
+				return { getChannelData: () => new Float32Array(1600).fill(0.25) };
+			}
+		},
+		fetch: async (_input: any, init: any) => {
+			const audio = init.body.get('audio') as File;
+			const wavBytes = new Uint8Array(await audio.arrayBuffer());
+			validateVoiceAudio(wavBytes);
+			sentUploads.push({
+				provider: String(init.body.get('provider')),
+				apiKey: String(init.body.get('apiKey')),
+				wavBytes
+			});
+			return nextResponse();
+		}
+	};
+	for (const [name, value] of Object.entries(overrides)) {
+		const previous = Object.getOwnPropertyDescriptor(globalThis, name);
+		Object.defineProperty(globalThis, name, { configurable: true, value });
+		t.after(() => {
+			if (previous) Object.defineProperty(globalThis, name, previous);
+			else Reflect.deleteProperty(globalThis, name);
+		});
+	}
+
+	const states: string[] = [];
+	const transcripts: string[] = [];
+	const errors: string[] = [];
+	const retainedFlags: boolean[] = [];
+	let resolveIdle: (() => void) | undefined;
+	const waitForIdle = () =>
+		new Promise<void>((resolve) => {
+			resolveIdle = resolve;
+		});
+	const capture = new VoiceCapture({
+		state: (value) => {
+			states.push(value);
+			if (value === 'idle') {
+				resolveIdle?.();
+				resolveIdle = undefined;
+			}
+		},
+		text: (value) => transcripts.push(value),
+		error: (value) => errors.push(value),
+		retained: (value) => retainedFlags.push(value)
+	});
+
+	// Initial recording fails with 401
+	await capture.start({ provider: 'groq', model: 'whisper-large-v3-turbo', apiKey: 'bad-key' });
+	const firstIdle = waitForIdle();
+	capture.stop();
+	await firstIdle;
+	assert.equal(stoppedTracks, 1);
+	assert.equal(decodeCalls, 1);
+	assert.equal(capture.hasRetainedAudio, true);
+	assert.equal(retainedFlags.at(-1), true);
+	assert.equal(states.at(-1), 'idle');
+	assert.match(errors.at(-1)!, /rejected its API key/);
+
+	// Manual retries across 429, 502 HTML gateway, 503 empty body, 200 malformed JSON, 200 empty body, and network failure
+	for (const failure of [
+		async () =>
+			Response.json(
+				{ error: 'Voice service usage limit reached. Check your provider quota or try later.' },
+				{ status: 429 }
+			),
+		async () => new Response('<html><body>502 Bad Gateway</body></html>', { status: 502 }),
+		async () => new Response('', { status: 503 }),
+		async () => new Response('{malformed json', { status: 200 }),
+		async () => new Response('', { status: 200 }),
+		async () => {
+			throw new TypeError('Failed to fetch');
+		}
+	]) {
+		nextResponse = failure;
+		await capture.retry({
+			provider: 'groq',
+			model: 'whisper-large-v3-turbo',
+			apiKey: 'updated-key'
+		});
+		assert.equal(capture.hasRetainedAudio, true);
+		assert.equal(decodeCalls, 1, 'must reuse encoded WAV without re-decoding');
+		assert.equal(states.at(-1), 'idle');
+		assert.doesNotMatch(
+			errors.at(-1)!,
+			/Unexpected token|Unexpected end|SyntaxError|Failed to fetch/i
+		);
+	}
+
+	// Switching to browser provider during retry preserves retained WAV and explains clearly
+	await capture.retry({ provider: 'browser', model: '', apiKey: '' });
+	assert.equal(capture.hasRetainedAudio, true);
+	assert.match(errors.at(-1)!, /Browser dictation cannot transcribe a saved recording/);
+
+	// Manual retry with valid cloud key succeeds, emits transcript, and clears retained audio
+	nextResponse = async () => Response.json({ text: 'chickpeas and spinach' });
+	await capture.retry({ provider: 'deepgram', model: 'nova-3', apiKey: 'good-deepgram-key' });
+	assert.equal(capture.hasRetainedAudio, false);
+	assert.equal(retainedFlags.at(-1), false);
+	assert.deepEqual(transcripts, ['chickpeas and spinach']);
+	assert.equal(sentUploads.at(-1)?.provider, 'deepgram');
+	assert.equal(sentUploads.at(-1)?.apiKey, 'good-deepgram-key');
+	assert.deepEqual(sentUploads.at(-1)?.wavBytes, sentUploads[0].wavBytes);
+
+	// Discard frees retained audio memory
+	nextResponse = async () => new Response('<html>502</html>', { status: 502 });
+	await capture.start({ provider: 'local', model: '', apiKey: '' });
+	const secondIdle = waitForIdle();
+	capture.stop();
+	await secondIdle;
+	assert.equal(capture.hasRetainedAudio, true);
+	capture.discard();
+	assert.equal(capture.hasRetainedAudio, false);
+	assert.equal(retainedFlags.at(-1), false);
+
+	// Starting a new capture frees previously retained audio
+	await capture.start({ provider: 'local', model: '', apiKey: '' });
+	const thirdIdle = waitForIdle();
+	capture.stop();
+	await thirdIdle;
+	assert.equal(capture.hasRetainedAudio, true);
+	nextResponse = async () => Response.json({ text: 'fresh basil' });
+	await capture.start({ provider: 'local', model: '', apiKey: '' });
+	assert.equal(capture.hasRetainedAudio, false);
+	capture.cancel();
+	assert.equal(capture.hasRetainedAudio, false);
+});
+
+test('browser dictation stays active across pauses and appends multiple phrases until stopped', async (t) => {
+	let instance: any;
+	let startCalls = 0;
+	let stopCalls = 0;
+	const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+	const previousNavigator = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+	Object.defineProperty(globalThis, 'navigator', {
+		configurable: true,
+		value: { language: 'en-US' }
+	});
+	Object.defineProperty(globalThis, 'window', {
+		configurable: true,
+		value: {
+			SpeechRecognition: class {
+				lang = '';
+				continuous = false;
+				interimResults = true;
+				onresult?: (event: any) => void;
+				onerror?: (event: any) => void;
+				onend?: () => void;
+				constructor() {
+					instance = this;
+				}
+				start() {
+					startCalls++;
+				}
+				stop() {
+					stopCalls++;
+					this.onend?.();
+				}
+				abort() {}
+			}
+		}
+	});
+	t.after(() => {
+		if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+		else Reflect.deleteProperty(globalThis, 'window');
+		if (previousNavigator) Object.defineProperty(globalThis, 'navigator', previousNavigator);
+		else Reflect.deleteProperty(globalThis, 'navigator');
+	});
+
+	const states: string[] = [];
+	const phrases: string[] = [];
+	const errors: string[] = [];
+	const capture = new VoiceCapture({
+		state: (value) => states.push(value),
+		text: (value) => phrases.push(value),
+		error: (value) => errors.push(value)
+	});
+
+	await capture.start({ provider: 'browser', model: '', apiKey: '' });
+	assert.equal(instance.continuous, true);
+	assert.equal(instance.interimResults, false);
+	assert.deepEqual(states, ['recording']);
+	assert.equal(startCalls, 1);
+
+	// First spoken phrase, then second phrase in continuous mode
+	instance.onresult?.({
+		resultIndex: 0,
+		results: [[{ transcript: '2 tomatoes' }]]
+	});
+	instance.onresult?.({
+		resultIndex: 1,
+		results: [[{ transcript: '2 tomatoes' }], [{ transcript: '200 g pasta' }]]
+	});
+
+	// Natural shelf-checking pause where browser emits no-speech + onend
+	instance.onerror?.({ error: 'no-speech' });
+	instance.onend?.();
+	assert.equal(errors.length, 0);
+	assert.equal(startCalls, 2, 'restarts recognition across silence pauses');
+	assert.deepEqual(states, ['recording']);
+
+	// Third phrase after pause restart (resultIndex resets to 0 on restarted session)
+	instance.onresult?.({
+		resultIndex: 0,
+		results: [[{ transcript: 'fresh spinach' }]]
+	});
+
+	// User explicitly stops dictation
+	capture.stop();
+	assert.equal(stopCalls, 1);
+	assert.deepEqual(phrases, ['2 tomatoes', '200 g pasta', 'fresh spinach']);
+	assert.deepEqual(states, ['recording', 'idle']);
+});
+
+test('voice dialog context helpers preserve pantry/import across Settings and Sign-in redirects and open import for recipe dictation', () => {
+	// Pantry missing cloud key -> redirects to Settings and restores pantry on close
+	const pantryPlan = planVoiceStart({
+		forRecipe: false,
+		modal: 'pantry',
+		provider: 'groq',
+		localAvailable: false,
+		signedIn: true,
+		apiKey: ''
+	});
+	assert.deepEqual(pantryPlan, {
+		action: 'settings',
+		targetDialog: 'pantry',
+		resumeDialog: 'pantry',
+		message: 'Add a voice API key in Voice input settings.'
+	});
+	assert.deepEqual(resolveClosedDialog('settings', pantryPlan.resumeDialog), {
+		modal: 'pantry',
+		resumeDialog: ''
+	});
+
+	// Recipe dictation started with no dialog open -> targets and remembers import
+	const recipeNoModal = planVoiceStart({
+		forRecipe: true,
+		modal: '',
+		provider: 'deepgram',
+		localAvailable: false,
+		signedIn: true,
+		apiKey: ''
+	});
+	assert.deepEqual(recipeNoModal, {
+		action: 'settings',
+		targetDialog: 'import',
+		resumeDialog: 'import',
+		message: 'Add a voice API key in Voice input settings.'
+	});
+	assert.deepEqual(resolveClosedDialog('settings', recipeNoModal.resumeDialog), {
+		modal: 'import',
+		resumeDialog: ''
+	});
+
+	// Signed-out cloud voice redirects to auth and restores originating dialog
+	const authRedirect = planVoiceStart({
+		forRecipe: false,
+		modal: 'pantry',
+		provider: 'groq',
+		localAvailable: false,
+		signedIn: false,
+		apiKey: ''
+	});
+	assert.equal(authRedirect.action, 'auth');
+	assert.equal(authRedirect.resumeDialog, 'pantry');
+	assert.deepEqual(resolveClosedDialog('auth', authRedirect.resumeDialog), {
+		modal: 'pantry',
+		resumeDialog: ''
+	});
+
+	// Retry plan checks missing key before uploading and succeeds once key is entered
+	assert.equal(
+		planVoiceRetry({
+			modal: 'import',
+			voiceTarget: 'import',
+			provider: 'groq',
+			localAvailable: false,
+			signedIn: true,
+			apiKey: '   '
+		}).action,
+		'settings'
+	);
+	assert.deepEqual(
+		planVoiceRetry({
+			modal: 'import',
+			voiceTarget: 'import',
+			provider: 'groq',
+			localAvailable: false,
+			signedIn: true,
+			apiKey: 'gsk_valid'
+		}),
+		{ action: 'retry', provider: 'groq' }
+	);
+
+	// Appending phrases formats pantry with commas and import with newlines
+	let pantryText = '';
+	pantryText = appendDictatedText('pantry', pantryText, '2 eggs');
+	pantryText = appendDictatedText('pantry', pantryText, 'spinach');
+	assert.equal(pantryText, '2 eggs, spinach');
+
+	let importText = '1 tbsp olive oil\n';
+	importText = appendDictatedText('import', importText, '2 cloves garlic');
+	assert.equal(importText, '1 tbsp olive oil\n2 cloves garlic');
 });
