@@ -8,7 +8,7 @@ import { startCodexDevice, pollCodexDevice, cancelCodexDevice } from '#lib/serve
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
-import { ApiError, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
+import { ApiError, clientAddress, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
 import {
 	ChatGPTOAuthError,
 	disconnectChatGPTAccount,
@@ -48,14 +48,6 @@ const bodySchema = z.discriminatedUnion('action', [
 	})
 ]);
 
-function requestAddress(event: Parameters<RequestHandler>[0]): string | null {
-	try {
-		return event.getClientAddress();
-	} catch {
-		return null;
-	}
-}
-
 function handleError(error: unknown): Response {
 	if (error instanceof ChatGPTOAuthError) {
 		return json({ error: error.message, code: error.code }, { status: error.status });
@@ -66,7 +58,7 @@ function handleError(error: unknown): Response {
 
 export const GET: RequestHandler = async (event) => {
 	if (!event.locals.user) return json({ error: 'Authentication required' }, { status: 401 });
-	const address = requestAddress(event);
+	const address = clientAddress(event);
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
 	return json(
 		{
@@ -102,7 +94,7 @@ export const POST: RequestHandler = async (event) => {
 		if (fetchSite && fetchSite !== 'same-origin')
 			throw new ApiError(403, 'Cross-origin request rejected');
 		if (!event.locals.user) throw new ApiError(401, 'Authentication required');
-		const address = requestAddress(event);
+		const address = clientAddress(event);
 		if (!address) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`chatgpt-connection-ip:${address}`, 600, 15 * 60 * 1000);
 
