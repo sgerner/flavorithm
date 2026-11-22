@@ -1968,7 +1968,7 @@
 					if (importSession !== activeVoiceImportSession || importSession.draft) return;
 					importSession.text = appendDictatedText('import', importSession.text, text);
 				} else {
-					pantryInput = appendDictatedText('pantry', pantryInput, text);
+					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
 				}
 			},
