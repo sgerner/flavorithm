@@ -23,20 +23,20 @@ const authActionSchema = z.discriminatedUnion('action', [
 	z.object({
 		action: z.literal('register'),
 		name: z.string().trim().min(2).max(80),
-		email: z.string().trim().email().max(254),
+		email: z.string().trim().max(254).pipe(z.email()),
 		password: z.string().min(10).max(128)
 	}),
 	z.object({
 		action: z.literal('login'),
 		name: z.string().optional(),
-		email: z.string().trim().email().max(254),
+		email: z.string().trim().max(254).pipe(z.email()),
 		password: z.string().min(1).max(128)
 	}),
 	z.object({ action: z.literal('logout') }),
 	z.object({ action: z.literal('deleteAccount'), password: z.string().min(1).max(128) }),
 	z.object({
 		action: z.literal('requestPasswordReset'),
-		email: z.string().trim().email().max(254)
+		email: z.string().trim().max(254).pipe(z.email())
 	}),
 	z.object({
 		action: z.literal('resetPassword'),
