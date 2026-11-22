@@ -2390,20 +2390,19 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const cache = publicCatalogCache;
 	const key = publicCatalogKey(fetcher);
-	const cached = cache.get(key);
+	const cached = publicCatalogCache.get(key);
 	const now = Date.now();
 	if (cached && now < cached.expiresAt) return cached.pending;
 
 	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		if (cache.get(key)?.pending === pending) {
-			cache.delete(key);
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
 		}
 		throw error;
 	});
-	cache.set(key, { pending, expiresAt });
+	publicCatalogCache.set(key, { pending, expiresAt });
 	return pending;
 }
 
