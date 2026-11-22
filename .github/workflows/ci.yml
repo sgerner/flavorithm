@@ -40,6 +40,8 @@ jobs:
         run: npm run build
       - name: Build production container
         run: docker build --tag flavorithm:ci .
+      - name: Verify container readiness check
+        run: docker run --rm flavorithm:ci npm run readiness
       - name: Smoke-test production server
         run: npm run test:smoke
       - name: Smoke-test SSO proxy authentication
