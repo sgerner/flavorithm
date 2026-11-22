@@ -514,8 +514,19 @@ test('failed uploads retain 16kHz WAV across 401/429/502/503/HTML/empty/malforme
 	const transcripts: string[] = [];
 	const errors: string[] = [];
 	const retainedFlags: boolean[] = [];
+	let resolveIdle: (() => void) | undefined;
+	const waitForIdle = () =>
+		new Promise<void>((resolve) => {
+			resolveIdle = resolve;
+		});
 	const capture = new VoiceCapture({
-		state: (value) => states.push(value),
+		state: (value) => {
+			states.push(value);
+			if (value === 'idle') {
+				resolveIdle?.();
+				resolveIdle = undefined;
+			}
+		},
 		text: (value) => transcripts.push(value),
 		error: (value) => errors.push(value),
 		retained: (value) => retainedFlags.push(value)
@@ -523,8 +534,9 @@ test('failed uploads retain 16kHz WAV across 401/429/502/503/HTML/empty/malforme
 
 	// Initial recording fails with 401
 	await capture.start({ provider: 'groq', model: 'whisper-large-v3-turbo', apiKey: 'bad-key' });
+	const firstIdle = waitForIdle();
 	capture.stop();
-	await new Promise((resolve) => setTimeout(resolve, 10));
+	await firstIdle;
 	assert.equal(stoppedTracks, 1);
 	assert.equal(decodeCalls, 1);
 	assert.equal(capture.hasRetainedAudio, true);
@@ -580,8 +592,9 @@ test('failed uploads retain 16kHz WAV across 401/429/502/503/HTML/empty/malforme
 	// Discard frees retained audio memory
 	nextResponse = async () => new Response('<html>502</html>', { status: 502 });
 	await capture.start({ provider: 'local', model: '', apiKey: '' });
+	const secondIdle = waitForIdle();
 	capture.stop();
-	await new Promise((resolve) => setTimeout(resolve, 10));
+	await secondIdle;
 	assert.equal(capture.hasRetainedAudio, true);
 	capture.discard();
 	assert.equal(capture.hasRetainedAudio, false);
@@ -589,8 +602,9 @@ test('failed uploads retain 16kHz WAV across 401/429/502/503/HTML/empty/malforme
 
 	// Starting a new capture frees previously retained audio
 	await capture.start({ provider: 'local', model: '', apiKey: '' });
+	const thirdIdle = waitForIdle();
 	capture.stop();
-	await new Promise((resolve) => setTimeout(resolve, 10));
+	await thirdIdle;
 	assert.equal(capture.hasRetainedAudio, true);
 	nextResponse = async () => Response.json({ text: 'fresh basil' });
 	await capture.start({ provider: 'local', model: '', apiKey: '' });
