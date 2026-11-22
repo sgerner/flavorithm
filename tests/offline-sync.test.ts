@@ -3,14 +3,13 @@ import assert from 'node:assert/strict';
 import { createNewUserState } from '../src/lib/data.ts';
 import { completeMeal } from '../src/lib/kitchen-workflows.ts';
 import {
-	mergeKitchenStates,
+	clearPendingJournalRecords,
 	isKitchenState,
-	readPending,
+	mergeKitchenStates,
 	readPendingJournal,
+	syncPendingKitchenJournal,
 	writePending,
-	writePendingJournal,
-	clearPending,
-	syncPendingKitchen
+	writePendingJournal
 } from '../src/lib/offline-sync.ts';
 
 test('offline snapshots are isolated by both account and household', () => {
@@ -34,11 +33,13 @@ test('offline snapshots are isolated by both account and household', () => {
 		etag: 'v1',
 		updatedAt: 1
 	});
-	assert.ok(readPending(storage, user));
-	assert.equal(readPending(storage, { ...user, id: 'b' }), null);
-	assert.equal(readPending(storage, { ...user, householdId: 'other' }), null);
-	clearPending(storage, user);
-	assert.equal(readPending(storage, user), null);
+	const journal = readPendingJournal(storage, user);
+	assert.equal(journal.records.length, 1);
+	assert.equal(journal.error, '');
+	assert.equal(readPendingJournal(storage, { ...user, id: 'b' }).records.length, 0);
+	assert.equal(readPendingJournal(storage, { ...user, householdId: 'other' }).records.length, 0);
+	clearPendingJournalRecords(storage, user, journal.records);
+	assert.equal(readPendingJournal(storage, user).records.length, 0);
 });
 
 test('three-way merge preserves independent edits, additions and deletions', () => {
@@ -160,8 +161,14 @@ test('concurrent equal pantry deductions conflict, while identical snapshots rem
 	);
 	assert.ok(result.conflicts.some((item) => item.path === 'kitchen.pantry[flour].quantity'));
 	let writes = 0;
-	const blocked = await syncPendingKitchen(
-		{ userId: 'a', householdId: 'home', base, local, etag: 'old', updatedAt: 0 },
+	const blocked = await syncPendingKitchenJournal(
+		[
+			{
+				writerId: 'legacy-main',
+				pending: { userId: 'a', householdId: 'home', base, local, etag: 'old', updatedAt: 0 },
+				keys: []
+			}
+		],
 		{
 			identity: { userId: 'a', householdId: 'home' },
 			get: async () => ({ state: remote, etag: 'current', userId: 'a', householdId: 'home' }),
@@ -186,8 +193,14 @@ test('sync retries a changing ETag without losing independent remote edits', asy
 		remote = structuredClone(base);
 	local.preferences.maxTime = 20;
 	let writes = 0;
-	const result = await syncPendingKitchen(
-		{ userId: 'a', householdId: 'h', base, local, etag: 'old', updatedAt: 0 },
+	const result = await syncPendingKitchenJournal(
+		[
+			{
+				writerId: 'legacy-main',
+				pending: { userId: 'a', householdId: 'h', base, local, etag: 'old', updatedAt: 0 },
+				keys: []
+			}
+		],
 		{
 			identity: { userId: 'a', householdId: 'h' },
 			get: async () => ({ state: remote, etag: `v${writes}`, userId: 'a', householdId: 'h' }),
@@ -214,8 +227,14 @@ test('sync never writes unresolved conflicts', async () => {
 	local.preferences.maxTime = 20;
 	remote.preferences.maxTime = 60;
 	let writes = 0;
-	const result = await syncPendingKitchen(
-		{ userId: 'a', householdId: 'h', base, local, etag: 'old', updatedAt: 0 },
+	const result = await syncPendingKitchenJournal(
+		[
+			{
+				writerId: 'legacy-main',
+				pending: { userId: 'a', householdId: 'h', base, local, etag: 'old', updatedAt: 0 },
+				keys: []
+			}
+		],
 		{
 			identity: { userId: 'a', householdId: 'h' },
 			get: async () => ({ state: remote, etag: 'new', userId: 'a', householdId: 'h' }),
@@ -252,15 +271,21 @@ test('sync rejects pending snapshots from another account or household before an
 	};
 	await assert.rejects(
 		() =>
-			syncPendingKitchen(
-				{
-					userId: 'a',
-					householdId: 'old-home',
-					base,
-					local: base,
-					etag: 'old',
-					updatedAt: 0
-				},
+			syncPendingKitchenJournal(
+				[
+					{
+						writerId: 'legacy-main',
+						pending: {
+							userId: 'a',
+							householdId: 'old-home',
+							base,
+							local: base,
+							etag: 'old',
+							updatedAt: 0
+						},
+						keys: []
+					}
+				],
 				transport
 			),
 		{ status: 409 }
@@ -274,15 +299,21 @@ test('sync rejects a GET response for another identity before writing', async ()
 	let writes = 0;
 	await assert.rejects(
 		() =>
-			syncPendingKitchen(
-				{
-					userId: 'a',
-					householdId: 'home',
-					base,
-					local: structuredClone(base),
-					etag: 'old',
-					updatedAt: 0
-				},
+			syncPendingKitchenJournal(
+				[
+					{
+						writerId: 'legacy-main',
+						pending: {
+							userId: 'a',
+							householdId: 'home',
+							base,
+							local: structuredClone(base),
+							etag: 'old',
+							updatedAt: 0
+						},
+						keys: []
+					}
+				],
 				{
 					identity: { userId: 'a', householdId: 'home' },
 					get: async () => ({
@@ -308,15 +339,21 @@ test('sync rechecks its identity after GET before PUT', async () => {
 	let writes = 0;
 	await assert.rejects(
 		() =>
-			syncPendingKitchen(
-				{
-					userId: 'a',
-					householdId: 'home',
-					base,
-					local: structuredClone(base),
-					etag: 'old',
-					updatedAt: 0
-				},
+			syncPendingKitchenJournal(
+				[
+					{
+						writerId: 'legacy-main',
+						pending: {
+							userId: 'a',
+							householdId: 'home',
+							base,
+							local: structuredClone(base),
+							etag: 'old',
+							updatedAt: 0
+						},
+						keys: []
+					}
+				],
 				{
 					identity,
 					get: async () => {
@@ -467,4 +504,10 @@ test('isKitchenState enforces client boundary schema bounds', () => {
 	const badEffort = structuredClone(valid);
 	badEffort.preferences.reasoning = { effort: 'x-high' };
 	assert.equal(isKitchenState(badEffort), false);
+
+	for (const nonFinite of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+		const badNumber = structuredClone(valid);
+		badNumber.recipes[0].nutrition.calories = nonFinite;
+		assert.equal(isKitchenState(badNumber), false);
+	}
 });

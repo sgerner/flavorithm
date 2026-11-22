@@ -52,14 +52,14 @@ const publicHttpsUrlSchema = z
 	.refine(isPublicHttpsUrl, 'Only public HTTPS URLs are allowed');
 
 const nutritionSchema = z.object({
-	calories: z.number().finite().min(0).max(1_000_000),
-	fat: z.number().finite().min(0).max(1_000_000),
-	saturatedFat: z.number().finite().min(0).max(1_000_000),
-	sodium: z.number().finite().min(0).max(1_000_000),
-	carbs: z.number().finite().min(0).max(1_000_000),
-	fiber: z.number().finite().min(0).max(1_000_000),
-	sugar: z.number().finite().min(0).max(1_000_000),
-	protein: z.number().finite().min(0).max(1_000_000)
+	calories: z.number().min(0).max(1_000_000),
+	fat: z.number().min(0).max(1_000_000),
+	saturatedFat: z.number().min(0).max(1_000_000),
+	sodium: z.number().min(0).max(1_000_000),
+	carbs: z.number().min(0).max(1_000_000),
+	fiber: z.number().min(0).max(1_000_000),
+	sugar: z.number().min(0).max(1_000_000),
+	protein: z.number().min(0).max(1_000_000)
 });
 
 const recipeSchema = z.object({
@@ -67,8 +67,8 @@ const recipeSchema = z.object({
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
 	image: z.union([publicHttpsUrlSchema, z.string().regex(COVER_PATH)]),
-	time: z.number().finite().min(0).max(100_000),
-	servings: z.number().finite().min(1).max(10_000),
+	time: z.number().min(0).max(100_000),
+	servings: z.number().min(1).max(10_000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -76,7 +76,7 @@ const recipeSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40)
 			})
 		)
@@ -87,7 +87,7 @@ const recipeSchema = z.object({
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -95,7 +95,7 @@ const recipeSchema = z.object({
 const preferencesSchema = z.object({
 	diet: z.string().max(200),
 	allergies: z.string().max(2_000),
-	maxTime: z.number().finite().min(0).max(100_000),
+	maxTime: z.number().min(0).max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
 	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
@@ -114,7 +114,7 @@ const preferencesSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
-	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
+	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
 const kitchenStateSchema = z.object({
@@ -123,7 +123,7 @@ const kitchenStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				category: z.string().max(100),
 				expires: z.string().max(50).optional()
@@ -138,9 +138,9 @@ const kitchenStateSchema = z.object({
 				date: z.string().max(50),
 				slot: z.string().max(100),
 				recipeId: z.string().max(100),
-				servings: z.number().finite().min(1).max(10_000),
+				servings: z.number().min(1).max(10_000),
 				completedAt: z.string().max(50).optional(),
-				leftoverServings: z.number().finite().min(0).max(10_000).optional()
+				leftoverServings: z.number().min(0).max(10_000).optional()
 			})
 		)
 		.max(1_000),
@@ -149,7 +149,7 @@ const kitchenStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				checked: z.boolean(),
 				sourceKey: z.string().max(200).optional()
@@ -219,14 +219,6 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 		return null;
 	}
 	return value as PendingKitchen;
-}
-
-export function readPending(storage: StorageLike, user: User): PendingKitchen | null {
-	try {
-		return parsePending(JSON.parse(storage.getItem(key(user)) || 'null'), user);
-	} catch {
-		return null;
-	}
 }
 
 /** Read every per-writer durable delta, plus the old single-slot format for migration. */
@@ -381,10 +373,6 @@ export function clearPendingJournalRecords(
 				storage.removeItem(captured.key);
 		}
 	}
-}
-
-export function clearPending(storage: StorageLike, user: User): void {
-	storage.removeItem(key(user));
 }
 
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -574,33 +562,6 @@ function assertSameSyncIdentity(
 			{ status: 409 }
 		);
 	}
-}
-
-/** Always reconcile against current server state and use its ETag for the write. */
-export async function syncPendingKitchen(
-	pending: PendingKitchen,
-	transport: KitchenTransport,
-	prefer?: 'local' | 'remote'
-): Promise<{ state: AppState; etag: string; conflicts: SyncConflict[]; saved: boolean }> {
-	const identity = { ...transport.identity };
-	assertSameSyncIdentity(identity, { userId: pending.userId, householdId: pending.householdId });
-	const base = structuredClone(pending.base);
-	const local = structuredClone(pending.local);
-	for (let attempt = 0; attempt < 3; attempt += 1) {
-		const remote = await transport.get();
-		assertSameSyncIdentity(identity, remote);
-		assertSameSyncIdentity(identity, transport.identity);
-		const merged = mergeKitchenStates(base, local, remote.state, prefer);
-		if (merged.conflicts.length && !prefer)
-			return { state: merged.state, etag: remote.etag, conflicts: merged.conflicts, saved: false };
-		try {
-			const result = await transport.put(merged.state, remote.etag);
-			return { ...result, conflicts: [], saved: true };
-		} catch (error) {
-			if ((error as { status?: number }).status !== 412 || attempt === 2) throw error;
-		}
-	}
-	throw new Error('Your household is changing quickly. Try syncing again.');
 }
 
 /** Apply independent writer snapshots in creation order while retaining conflicts between them. */

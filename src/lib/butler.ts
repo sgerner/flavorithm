@@ -16,9 +16,9 @@ function isPublicHttpsUrl(value: string): boolean {
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
-const quantity = z.number().finite().nonnegative().max(1000000);
-const cookingTime = z.number().finite().nonnegative().max(100000);
-const leftoverQuantity = z.number().finite().nonnegative().max(10000);
+const quantity = z.number().nonnegative().max(1000000);
+const cookingTime = z.number().nonnegative().max(100000);
+const leftoverQuantity = z.number().nonnegative().max(10000);
 const nutrition = z.object({
 	calories: quantity,
 	fat: quantity,
@@ -41,7 +41,7 @@ const recipe = z.object({
 			'Use a public HTTPS image URL or a recipe cover.'
 		),
 	time: cookingTime,
-	servings: z.number().finite().min(1).max(10000),
+	servings: z.number().min(1).max(10000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -60,7 +60,7 @@ const recipe = z.object({
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -85,8 +85,8 @@ const meal = z
 		date,
 		slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 		recipeId: id,
-		servings: z.number().finite().min(1).max(10000),
-		completedAt: z.string().datetime().max(50).optional(),
+		servings: z.number().min(1).max(10000),
+		completedAt: z.iso.datetime().max(50).optional(),
 		leftoverServings: leftoverQuantity.optional()
 	})
 	.refine(
@@ -105,7 +105,7 @@ const preferences = z
 	.object({
 		diet: z.string().max(200),
 		allergies: z.string().max(500),
-		maxTime: z.number().finite().nonnegative().max(100000),
+		maxTime: z.number().nonnegative().max(100000),
 		complexity: z.string().max(80),
 		cuisines: z.array(z.string().trim().min(1).max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
@@ -123,7 +123,7 @@ const preferences = z
 				budgetTokens: z.number().int().min(0).max(32768).optional()
 			})
 			.strict(),
-		ratings: z.record(id, z.number().finite().min(0).max(5)),
+		ratings: z.record(id, z.number().min(0).max(5)),
 		chatgptAccountId: z.string().max(100)
 	})
 	.partial()

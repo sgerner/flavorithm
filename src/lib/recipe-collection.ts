@@ -29,7 +29,9 @@ export function isPublicHttpsRecipeUrl(value: string): boolean {
 
 export function sanitizeImportNotes(assumptions: string[]): string[] {
 	return assumptions
-		.map((note) => note.trim().slice(0, MAX_IMPORT_NOTE_LENGTH))
+		.map((note) =>
+			typeof note === 'string' ? note.trim().slice(0, MAX_IMPORT_NOTE_LENGTH).trim() : ''
+		)
 		.filter(Boolean)
 		.slice(0, MAX_IMPORT_NOTES);
 }
