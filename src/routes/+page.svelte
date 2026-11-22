@@ -81,9 +81,12 @@
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
+		backfillSampleData,
+		clearSampleData,
 		completeMeal,
 		deleteShoppingItem,
 		expiryStatus,
+		hasSampleData,
 		reconcileShoppingList,
 		restoreShoppingItem,
 		transferPurchasedItemsToPantry
@@ -577,6 +580,7 @@
 			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
 		)
 	);
+	let hasSampleRecords = $derived(hasSampleData(kitchen));
 	let checkedCount = $derived(kitchen.shopping.filter((item) => item.checked).length);
 	let visibleShopping = $derived(
 		shoppingFilter === 'unpurchased'
@@ -804,16 +808,18 @@
 			kitchen = createInitialState();
 			showStarter = false;
 		} else {
+			const started = localStorage.getItem('flavorithm-started') === 'yes';
 			try {
 				// The legacy key could contain a signed-in household. Preserve it separately without loading it.
 				quarantineLegacyKitchen(localStorage);
 				const local = localStorage.getItem('flavorithm-guest-kitchen');
 				if (local) {
-					kitchen = JSON.parse(local);
+					const parsed = JSON.parse(local) as AppState;
+					kitchen = started ? parsed : backfillSampleData(parsed);
 					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
 				}
 			} catch {}
-			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
+			showStarter = !started;
 			kitchenLoaded = true;
 		}
 		ready = true;
@@ -1013,16 +1019,37 @@
 		}
 	}
 
+	function promotePantryItem(item: AppState['pantry'][number]) {
+		if (item.sample) delete item.sample;
+	}
 	function freshKitchen() {
-		kitchen.pantry = [];
-		kitchen.meals = [];
-		kitchen.shopping = [];
-		kitchen.recipes = kitchen.recipes.map((r) => ({ ...r, rating: undefined, saved: false }));
+		if (!hasSampleData(kitchen)) {
+			showStarter = false;
+			if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
+			return;
+		}
+		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
+		const wasShowingStarter = showStarter;
+		const previousStarted =
+			!user && !managedAuth ? localStorage.getItem('flavorithm-started') : null;
+		kitchen = clearSampleData(previousKitchen);
+		const appliedSnapshot = JSON.stringify(kitchen);
 		showStarter = false;
-		localStorage.setItem('flavorithm-started', 'yes');
-		page = 'pantry';
-		modal = 'pantry';
-		notify('Sample pantry and meal plan cleared. Starter recipes kept.');
+		if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
+		if (modal === 'settings') closeDialog();
+		notify('Sample data cleared.', () => {
+			if (JSON.stringify(kitchen) === appliedSnapshot) {
+				kitchen = previousKitchen;
+				if (wasShowingStarter && !user && !managedAuth) {
+					showStarter = true;
+					if (previousStarted === null) localStorage.removeItem('flavorithm-started');
+					else localStorage.setItem('flavorithm-started', previousStarted);
+				}
+				notify('Sample data restored.');
+			} else {
+				notify('Your kitchen changed again. Review the current values before editing.');
+			}
+		});
 	}
 	function navigate(id: string) {
 		page = id;
@@ -1069,7 +1096,9 @@
 			syncing = true;
 			clearTimeout(saveTimer);
 			const guestKitchen =
-				authMode === 'register' ? (JSON.parse(JSON.stringify(kitchen)) as AppState) : null;
+				authMode === 'register'
+					? clearSampleData(JSON.parse(JSON.stringify(kitchen)) as AppState)
+					: null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
 			user = result.user;
 			const saved = await request('/api/state');
@@ -1776,6 +1805,7 @@
 
 	function saveRecipe(r: Recipe) {
 		r.saved = !r.saved;
+		delete r.sampleSaved;
 		kitchen.recipes = [...kitchen.recipes];
 		notify(r.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
@@ -1812,8 +1842,9 @@
 		const nutritionNeedsRefresh =
 			previous.servings !== updated.servings ||
 			JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
+		const { sampleSaved: _sampleSaved, ...cleanUpdated } = updated;
 		const saved = {
-			...updated,
+			...cleanUpdated,
 			saved: true,
 			nutritionStale: nutritionNeedsRefresh ? true : previous.nutritionStale
 		};
@@ -2000,6 +2031,7 @@
 		meal.date = updatedDate;
 		meal.slot = mealSlot;
 		meal.servings = Math.round(plannedServings);
+		delete meal.sample;
 		refreshWeekShopping(previousWeek);
 		refreshWeekShopping(weekStartForDate(meal.date));
 		weekOffset = weekOffsetForDate(updatedDate);
@@ -2633,7 +2665,7 @@
 					}}
 					exportPending={exportPendingChanges}
 				/>{/if}
-			{#if showStarter}<div class="starter-note">
+			{#if showStarter && hasSampleRecords}<div class="starter-note">
 					<span><Sparkles size={14} /> Sample kitchen</span><button onclick={freshKitchen}
 						>Start fresh <ArrowRight size={13} /></button
 					><button
@@ -2870,13 +2902,17 @@
 					>
 				</section>
 				<div class="pantry-summary">
-					<span><b>{kitchen.pantry.length}</b> ingredients</span>
-					{#if kitchen.pantry.some((item) => item.quantity === 0)}<button
-							class="text-button"
-							onclick={() => {
-								kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
-							}}>Clear depleted items</button
-						>{/if}
+					<span class="pantry-summary-meta"
+						><span><b>{kitchen.pantry.length}</b> ingredients</span
+						>{#if kitchen.pantry.some((item) => item.quantity === 0)}<button
+								class="text-button"
+								onclick={() => {
+									kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
+								}}>Clear depleted items</button
+							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
+								>Clear sample data</button
+							>{/if}</span
+					>
 					<div>
 						<button class="secondary" onclick={() => imageInput.click()}
 							><Camera size={17} /> Scan a photo</button
@@ -2907,7 +2943,10 @@
 							<span class="pantry-ingredient">
 								<span class="ingredient-symbol">{ingredientEmoji(item.name)}</span><span
 									class="ingredient-meta"
-									><b>{item.name}</b><small
+									><span class="ingredient-title-line"
+										><b>{item.name}</b>{#if item.sample}<small class="sample-badge">Sample</small
+											>{/if}</span
+									><small
 										class="expiry-badge"
 										class:expired={expiry === 'expired'}
 										class:soon={expiry === 'soon'}
@@ -2931,15 +2970,19 @@
 									min="0"
 									step="0.25"
 									bind:value={item.quantity}
+									oninput={() => promotePantryItem(item)}
 								/><input
 									class="unit-input"
 									aria-label={`Unit for ${item.name}`}
 									bind:value={item.unit}
+									oninput={() => promotePantryItem(item)}
 								/></label
 							><input
 								aria-label={`Expiry for ${item.name}`}
 								type="date"
 								bind:value={item.expires}
+								oninput={() => promotePantryItem(item)}
+								onchange={() => promotePantryItem(item)}
 							/><button
 								class="icon-button"
 								aria-label={`Remove ${item.name}`}
@@ -3673,7 +3716,16 @@
 						/>
 					</div>
 
-					{#if user}<div class="settings-section">
+					{#if hasSampleRecords}<div class="settings-section">
+							<h3>Sample data</h3>
+							<p class="muted">
+								Remove untouched starter ingredients, planned meals, and saved recipe bookmarks
+								while keeping everything you added or edited.
+							</p>
+							<div class="dialog-actions">
+								<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
+							</div>
+						</div>{/if}{#if user}<div class="settings-section">
 							<h3>Your data</h3>
 							<p class="muted">
 								{managedAuth
@@ -4142,6 +4194,12 @@
 		background: color-mix(in srgb, currentColor 12%, transparent);
 		text-align: center;
 	}
+	.pantry-summary-meta {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 18px;
+	}
 	.pantry-ingredient {
 		min-width: 0;
 	}
@@ -4151,6 +4209,22 @@
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 4px;
+	}
+	.ingredient-title-line {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.sample-badge {
+		padding: 1px 6px;
+		border: 1px solid var(--line);
+		background: var(--wash);
+		color: var(--muted);
+		font-size: 11px;
+		font-weight: 500;
+		letter-spacing: 0.4px;
+		text-transform: uppercase;
 	}
 	.expiry-badge {
 		font-size: 12px;

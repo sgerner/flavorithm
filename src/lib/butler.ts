@@ -2,7 +2,13 @@ import { z } from 'zod';
 import type { AppState } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList } from './domain.ts';
-import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
+import {
+	completeMeal,
+	promoteSampleBookmark,
+	promoteSampleIngredient,
+	promoteSampleMeal,
+	reconcileShoppingList
+} from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
@@ -50,6 +56,7 @@ const recipe = z.object({
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
+	sampleSaved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
 const pantry = z.object({
@@ -58,7 +65,8 @@ const pantry = z.object({
 	quantity,
 	unit: z.string().max(40),
 	category: z.string().max(80),
-	expires: z.string().max(40).optional()
+	expires: z.string().max(40).optional(),
+	sample: z.boolean().optional()
 });
 const date = z
 	.string()
@@ -72,9 +80,10 @@ const meal = z.object({
 	date,
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
-	servings: z.number().min(1).max(10000),
+	servings: z.number().finite().min(1).max(10000),
 	completedAt: z.iso.datetime().optional(),
-	leftoverServings: quantity.optional()
+	leftoverServings: quantity.optional(),
+	sample: z.boolean().optional()
 });
 const shopping = z.object({
 	id,
@@ -213,7 +222,7 @@ export function applyButlerCommands(
 		switch (command.type) {
 			case 'recipe.upsert': {
 				const previous = state.recipes.find((item) => item.id === command.recipe.id);
-				const updated = { ...command.recipe };
+				const updated = promoteSampleBookmark({ ...command.recipe });
 				if (
 					previous &&
 					(previous.servings !== updated.servings ||
@@ -239,7 +248,7 @@ export function applyButlerCommands(
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
 				break;
 			case 'pantry.upsert':
-				state.pantry = upsert(state.pantry, command.item);
+				state.pantry = upsert(state.pantry, promoteSampleIngredient(command.item));
 				break;
 			case 'pantry.delete':
 				requireId(state.pantry, command.id);
@@ -248,13 +257,14 @@ export function applyButlerCommands(
 			case 'meal.upsert': {
 				requireId(state.recipes, command.meal.recipeId);
 				const previous = state.meals.find((item) => item.id === command.meal.id);
+				const cleanMeal = promoteSampleMeal(command.meal);
 				const meal = previous?.completedAt
 					? {
-							...command.meal,
+							...cleanMeal,
 							completedAt: previous.completedAt,
 							leftoverServings: previous.leftoverServings
 						}
-					: command.meal;
+					: cleanMeal;
 				state.meals = upsert(state.meals, meal);
 				break;
 			}
