@@ -122,6 +122,11 @@
 				>{review ? 'Hide changes' : 'Review changes'}</button
 			>
 		{:else if online && !syncing}<button class="secondary" onclick={retry}>Retry sync</button>{/if}
+		{#if (pending || Boolean(error) || conflicts.length > 0) && !(review && conflicts.length)}
+			<button class="secondary" onclick={exportPending}
+				><Download size={16} /> Back up my changes</button
+			>
+		{/if}
 		{#if review && conflicts.length}
 			<div class="sync-review">
 				<p>

@@ -67,6 +67,7 @@
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
 	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
+	import { exportKitchenArchive } from '#lib/kitchen-export.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
@@ -100,6 +101,7 @@
 	let showHiddenRecipes = $state(false);
 	let toast = $state('');
 	let toastUndo = $state<(() => void) | null>(null);
+	let toastActionLabel = $state('Undo');
 	let toastVersion = 0;
 	let busy = $state(false);
 	let mobileNav = $state(false);
@@ -467,12 +469,14 @@
 	function dateKey(date: Date) {
 		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 	}
-	function notify(message: string, undo?: () => void) {
+	function notify(message: string, undo?: () => void, actionLabel = 'Undo') {
 		toast = message;
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+		toastActionLabel = undo ? actionLabel : 'Undo';
 		toastUndo = undo
 			? () => {
 					toastUndo = null;
+					toastActionLabel = 'Undo';
 					toast = '';
 					if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
 				}
@@ -483,6 +487,7 @@
 				if (toastVersion === version) {
 					toast = '';
 					toastUndo = null;
+					toastActionLabel = 'Undo';
 				}
 			},
 			undo ? 10000 : 4200
@@ -574,7 +579,13 @@
 			try {
 				localStorage.setItem('flavorithm-guest-kitchen', snapshot);
 			} catch {
-				notify('Device storage is full. Export your kitchen before leaving.');
+				notify(
+					'Device storage is full. Export your kitchen before leaving.',
+					() => {
+						void exportKitchen();
+					},
+					'Export now'
+				);
 			}
 		}
 		if (user) kitchenSync?.stage(JSON.parse(snapshot));
@@ -823,13 +834,7 @@
 		}
 	}
 	function exportPendingChanges() {
-		const snapshot = kitchenSync?.snapshot();
-		if (snapshot)
-			download(
-				JSON.stringify(snapshot.local, null, 2),
-				'flavorithm-pending-kitchen.json',
-				'application/json'
-			);
+		void exportKitchen();
 	}
 	async function flushKitchen() {
 		clearTimeout(saveTimer);
@@ -1986,10 +1991,37 @@
 	}
 	async function exportKitchen() {
 		try {
-			const data = await request('/api/export');
-			download(JSON.stringify(data, null, 2), 'flavorithm-kitchen.json', 'application/json');
+			const currentUser = user ? ($state.snapshot(user) as User) : null;
+			const currentState = $state.snapshot(kitchen) as AppState;
+			const result = await exportKitchenArchive({
+				user: currentUser,
+				state: currentState,
+				online: online && navigator.onLine,
+				pendingSnapshot: currentUser ? (kitchenSync?.snapshot() ?? null) : null,
+				hasPendingSync: currentUser ? pendingSync : false,
+				storage: currentUser ? localStorage : null,
+				fetchAccountExport: currentUser
+					? async () => {
+							const response = await fetch('/api/export', {
+								headers: { Accept: 'application/json' },
+								redirect: 'manual',
+								signal: AbortSignal.timeout(8000)
+							});
+							if (!response.ok || response.type === 'opaqueredirect' || response.redirected) {
+								throw new Error(`Export endpoint returned ${response.status}`);
+							}
+							return (await response.json()) as {
+								exportedAt?: string;
+								user?: User | null;
+								state?: AppState | null;
+							};
+						}
+					: undefined
+			});
+			download(result.json, result.filename, 'application/json');
+			notify(result.notice);
 		} catch (e) {
-			notify((e as Error).message);
+			notify((e as Error).message || 'Could not export your kitchen.');
 		}
 	}
 	function download(content: string, filename: string, type: string) {
@@ -2880,8 +2912,13 @@
 </div>
 <div class="visually-hidden" role="status" aria-atomic="true">{toast}</div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
-			onclick={() => (toast = '')}
+		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>{toastActionLabel}</button
+			>{/if}<button
+			onclick={() => {
+				toast = '';
+				toastUndo = null;
+				toastActionLabel = 'Undo';
+			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
@@ -3276,25 +3313,30 @@
 						/>
 					</div>
 
-					{#if user}<div class="settings-section">
-							<h3>Your data</h3>
-							<p class="muted">
-								{managedAuth
-									? 'Export your account and shared kitchen.'
-									: 'Export your account and shared kitchen, or permanently remove your account.'}
-							</p>
-							<div class="dialog-actions">
-								<button class="secondary" onclick={exportKitchen}
-									><Download size={16} /> Export my data</button
-								>{#if !managedAuth}<button
-										class="text-button danger"
-										onclick={() => {
-											modal = 'delete';
-											error = '';
-										}}>Delete account</button
-									>{/if}
-							</div>
-						</div>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="settings-section">
+						<h3>Your data</h3>
+						<p class="muted">
+							{#if !user}
+								Export the kitchen saved in this browser as JSON.
+							{:else if managedAuth}
+								Export your account and shared kitchen.
+							{:else}
+								Export your account and shared kitchen, or permanently remove your account.
+							{/if}
+						</p>
+						<div class="dialog-actions">
+							<button class="secondary" onclick={exportKitchen}
+								><Download size={16} /> Export my data</button
+							>{#if user && !managedAuth}<button
+									class="text-button danger"
+									onclick={() => {
+										modal = 'delete';
+										error = '';
+									}}>Delete account</button
+								>{/if}
+						</div>
+					</div>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<div class="dialog-actions">
 						{#if user && (!managedAuth || providerLogoutUrl)}<button
 								class="text-button"
