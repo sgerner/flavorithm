@@ -154,6 +154,7 @@
 			return;
 		}
 		openClosedImportNotes(target);
+		if (nutritionDetails?.open) nutritionOpen = true;
 		event.preventDefault();
 		if (pendingInvalid) return;
 		pendingInvalid = target;
@@ -221,11 +222,22 @@
 		['sugar', 'Sugar (g)'],
 		['protein', 'Protein (g)']
 	];
+	function isNutritionValid(target: Recipe): boolean {
+		return nutritionFields.every(
+			([key]) =>
+				typeof target.nutrition[key] === 'number' &&
+				Number.isFinite(target.nutrition[key]) &&
+				target.nutrition[key] >= 0 &&
+				target.nutrition[key] <= 1000000
+		);
+	}
+	let nutritionOpen = $state(untrack(() => !isNutritionValid(draft)));
 	async function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
 		if (uploading) return;
 		error = '';
 		confirmingDiscard = false;
+		const title = draft.title.trim();
 		const tags = [
 			...new Set(
 				tagsText
@@ -258,8 +270,10 @@
 				draft.nutrition[key] < 0 ||
 				draft.nutrition[key] > 1000000
 		);
+		const nutritionValid = invalidNutritionIndex === -1;
 		if (
-			!draft.title.trim() ||
+			!title ||
+			title.length > 200 ||
 			!Number.isFinite(draft.time) ||
 			draft.time < 1 ||
 			draft.time > 100000 ||
@@ -271,7 +285,9 @@
 			ingredients.some(
 				(item) =>
 					!item.name ||
+					item.name.length > 200 ||
 					!item.unit ||
+					item.unit.length > 40 ||
 					!Number.isFinite(item.quantity) ||
 					item.quantity <= 0 ||
 					item.quantity > 1000000
@@ -281,8 +297,9 @@
 			steps.some((step) => step.length > 10000) ||
 			tags.length > 30 ||
 			tags.some((tag) => tag.length > 100) ||
-			invalidNutritionIndex !== -1
+			!nutritionValid
 		) {
+			if (!nutritionValid) nutritionOpen = true;
 			error =
 				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
 			if (invalidNutritionIndex !== -1 && nutritionDetails) {
@@ -296,11 +313,11 @@
 		}
 		save({
 			...draft,
-			title: draft.title.trim(),
-			description: draft.description.trim(),
+			title,
+			description: draft.description.trim().slice(0, 10000),
 			image,
-			cuisine: draft.cuisine.trim(),
-			difficulty: draft.difficulty.trim(),
+			cuisine: draft.cuisine.trim().slice(0, 100),
+			difficulty: draft.difficulty.trim().slice(0, 80),
 			tags,
 			ingredients,
 			steps
@@ -537,7 +554,7 @@
 				disabled={draft.steps.length >= MAX_DRAFT_STEPS}
 				onclick={() => void addStep()}><Plus size={17} />Add step</button
 			>
-			<details class="import-notes" bind:this={nutritionDetails}>
+			<details class="import-notes" bind:this={nutritionDetails} bind:open={nutritionOpen}>
 				<summary>Nutrition estimates</summary>
 				<p>
 					Estimated values per serving. Ingredient or serving changes will mark these values as

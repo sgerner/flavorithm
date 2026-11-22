@@ -367,6 +367,53 @@ test('purchased shopping rows merge aliases and compatible units without changin
 	assert.equal(result.find((item) => item.unit === 'package')?.quantity, 1);
 });
 
+test('pantry transfers clamp negative or null baseline stock, cap quantities at 1,000,000, and bound array size', () => {
+	const corruptedPantry: Ingredient[] = [
+		pantry('flour', -3, 'cup'),
+		pantry('sugar', null as unknown as number, 'cup'),
+		pantry('rice', 999_999.5, 'cup')
+	];
+	const transferred = transferPurchasedItemsToPantry(
+		corruptedPantry,
+		[
+			shopping('buy-flour', 'flour', 2, 'cups', true),
+			shopping('buy-sugar', 'sugar', 1.5, 'cups', true),
+			shopping('buy-rice', 'rice', 10, 'cups', true),
+			shopping('buy-salt', 'salt', 2_500_000, 'g', true),
+			shopping('buy-zero', 'pepper', 0, 'tsp', true),
+			shopping('buy-blank', '   ', 2, 'tsp', true)
+		],
+		() => 'new-salt'
+	);
+
+	assert.equal(transferred.find((item) => item.name === 'flour')?.quantity, 2);
+	assert.equal(transferred.find((item) => item.name === 'sugar')?.quantity, 1.5);
+	assert.equal(transferred.find((item) => item.name === 'rice')?.quantity, 1_000_000);
+	assert.equal(transferred.find((item) => item.name === 'salt')?.quantity, 1_000_000);
+	assert.equal(
+		transferred.find((item) => item.name === 'pepper'),
+		undefined
+	);
+
+	const fullPantry = Array.from({ length: 1_000 }, (_, index) =>
+		pantry(`item-${index}`, 1, 'piece')
+	);
+	const capped = transferPurchasedItemsToPantry(
+		fullPantry,
+		[
+			shopping('merge-existing', 'item-0', 3, 'piece', true),
+			shopping('overflow', 'brand-new-ingredient', 2, 'piece', true)
+		],
+		() => 'unused-overflow'
+	);
+	assert.equal(capped.length, 1_000);
+	assert.equal(capped[0].quantity, 4);
+	assert.equal(
+		capped.some((item) => item.name === 'brand-new-ingredient'),
+		false
+	);
+});
+
 test('completing a meal deducts compatible pantry quantities once and never goes below zero', () => {
 	const plannedRecipe = recipe({
 		id: 'soup',
@@ -435,6 +482,33 @@ test('completion consumes soonest-expiring usable lots first and skips expired l
 	assert.equal(completed.meals[0].leftoverServings, 2);
 });
 
+test('completion skips malformed expiry dates while consuming ISO and blank expiry lots', () => {
+	const plannedRecipe = recipe({
+		id: 'sauce',
+		ingredients: [{ name: 'tomato', quantity: 60, unit: 'g' }]
+	});
+	const input = state({
+		pantry: [
+			{ ...pantry('tomato', 100, 'g'), id: 'bad-feb', expires: '2026-02-30' },
+			{ ...pantry('tomato', 100, 'g'), id: 'bad-text', expires: 'next-week' },
+			pantry('tomato', 20, 'g', '2026-10-22T00:00:00Z'),
+			{ ...pantry('tomato', 50, 'g'), id: 'blank-expires', expires: '' }
+		],
+		recipes: [plannedRecipe],
+		meals: [{ id: 'dinner', date: '2026-10-22', slot: 'Dinner', recipeId: 'sauce', servings: 2 }]
+	});
+	const completed = completeMeal(
+		input,
+		'dinner',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date(2026, 9, 22, 20)
+	);
+	assert.equal(completed.pantry[0].quantity, 100);
+	assert.equal(completed.pantry[1].quantity, 100);
+	assert.equal(completed.pantry[2].quantity, 0);
+	assert.equal(completed.pantry[3].quantity, 10);
+});
+
 test('completion preserves small quantities in large pantry units and handles invalid dates', () => {
 	const plannedRecipe = recipe({
 		id: 'spice',
@@ -460,11 +534,15 @@ test('completion preserves small quantities in large pantry units and handles in
 test('expiry uses local calendar dates and treats the next three days as soon', () => {
 	const now = new Date(2026, 9, 22, 23, 45);
 	assert.equal(expiryStatus(undefined, now), 'unknown');
+	assert.equal(expiryStatus('', now), 'unknown');
 	assert.equal(expiryStatus('2026-10-21', now), 'expired');
 	assert.equal(expiryStatus('2026-10-22', now), 'soon');
 	assert.equal(expiryStatus('2026-10-25', now), 'soon');
 	assert.equal(expiryStatus('2026-10-26', now), 'fresh');
 	assert.equal(expiryStatus('2026-02-30', now), 'unknown');
+	assert.equal(expiryStatus('not-a-date', now), 'unknown');
+	assert.equal(expiryStatus('2026-11-19T00:00:00Z', new Date(2026, 10, 19, 23, 45)), 'soon');
+	assert.equal(expiryStatus('2026-11-19T23:59:59Z', new Date(2026, 10, 20, 0, 15)), 'expired');
 });
 
 test('recipe ranking learns ratings and boosts compatible pantry ingredients nearing expiry', () => {
@@ -542,5 +620,46 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
+	);
+});
+
+test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and guards invalid now', () => {
+	const invalidMatch = recipe({
+		id: 'invalid-lot',
+		ingredients: [{ name: 'spinach', quantity: 1, unit: 'cup' }]
+	});
+	const blankMatch = recipe({
+		id: 'blank-lot',
+		ingredients: [{ name: 'rice', quantity: 1, unit: 'cup' }]
+	});
+	const isoSoonMatch = recipe({
+		id: 'iso-soon-lot',
+		ingredients: [{ name: 'avocado', quantity: 1, unit: 'each' }]
+	});
+	const ranked = rankRecipes(
+		[invalidMatch, blankMatch, isoSoonMatch],
+		[
+			pantry('spinach', 1, 'cup', '2026-02-30'),
+			{ ...pantry('spinach', 1, 'cup'), id: 'spinach-bad-text', expires: 'soonish' },
+			pantry('rice', 1, 'cup', ''),
+			pantry('avocado', 1, 'each', '2026-11-19T00:00:00Z')
+		],
+		preferences(),
+		new Date(2026, 10, 19, 20)
+	);
+	assert.deepEqual(
+		ranked.map((item) => item.id),
+		['iso-soon-lot', 'blank-lot', 'invalid-lot']
+	);
+
+	const fallbackRanked = rankRecipes(
+		[invalidMatch, blankMatch],
+		[pantry('spinach', 1, 'cup', '2000-01-01'), pantry('rice', 1, 'cup', '')],
+		preferences(),
+		new Date(Number.NaN)
+	);
+	assert.deepEqual(
+		fallbackRanked.map((item) => item.id),
+		['blank-lot', 'invalid-lot']
 	);
 });
