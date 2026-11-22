@@ -7,7 +7,14 @@ import {
 	unitInfo
 } from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
-export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
+export {
+	normalizeName,
+	normalizeName as normalizeIngredientName,
+	parseIngredientLine,
+	parseIngredientLines,
+	unitInfo,
+	type ParsedIngredient
+} from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
 export function convertCompatibleQuantity(
@@ -377,7 +384,7 @@ export function transferPurchasedItemsToPantry(
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category?: string }
 	>();
 	for (const item of purchases) {
 		if (
@@ -397,6 +404,10 @@ export function transferPurchasedItemsToPantry(
 			quantityBase: 0
 		};
 		bucket.quantityBase += item.quantity * unit.factor;
+		const category = item.category?.trim();
+		if (category && (!bucket.category || (bucket.category === 'Pantry' && category !== 'Pantry'))) {
+			bucket.category = category;
+		}
 		buckets.set(key, bucket);
 	}
 
@@ -431,7 +442,7 @@ export function transferPurchasedItemsToPantry(
 			name: bucket.name,
 			quantity: Math.min(1_000_000, roundPantryQuantity(bucket.quantityBase / bucket.unit.factor)),
 			unit: bucket.unit.display.slice(0, 40),
-			category: 'Pantry'
+			category: bucket.category?.slice(0, 100) || 'Pantry'
 		});
 	}
 	return result;
