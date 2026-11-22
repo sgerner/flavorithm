@@ -2359,12 +2359,8 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-type CachedModelCatalog = {
-	pending: Promise<SupportedModelResponse>;
-	expiresAt: number;
-};
-let defaultPublicCatalog: CachedModelCatalog | undefined;
-const customFetcherCatalogs = new WeakMap<Fetcher, CachedModelCatalog>();
+let publicCatalog: Promise<SupportedModelResponse> | undefined;
+let publicCatalogExpiresAt = 0;
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2386,23 +2382,22 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const useSharedCache = fetcher === fetch || fetcher.name === 'server_fetch';
-	const existing = useSharedCache ? defaultPublicCatalog : customFetcherCatalogs.get(fetcher);
-	const now = Date.now();
-	if (existing && now < existing.expiresAt) return existing.pending;
-
-	const entry: CachedModelCatalog = {
-		expiresAt: now + PUBLIC_MODEL_CATALOG_TTL_MS,
-		pending: getSupportedModels(fetcher).catch((error) => {
-			if (useSharedCache) {
-				if (defaultPublicCatalog === entry) defaultPublicCatalog = undefined;
-			} else if (customFetcherCatalogs.get(fetcher) === entry) {
-				customFetcherCatalogs.delete(fetcher);
+	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
+		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+		const pending = getSupportedModels(fetcher).catch((error) => {
+			if (publicCatalog === pending) {
+				publicCatalog = undefined;
+				publicCatalogExpiresAt = 0;
 			}
 			throw error;
-		})
-	};
-	if (useSharedCache) defaultPublicCatalog = entry;
-	else customFetcherCatalogs.set(fetcher, entry);
-	return entry.pending;
+		});
+		publicCatalog = pending;
+	}
+	return publicCatalog;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
 }
