@@ -58,7 +58,7 @@ export function parseQuickShoppingItems(
 		const match = value.match(QUICK_SHOPPING_ITEM_PATTERN);
 		const parsedQuantity = match ? Number(match[1]) : NaN;
 		const validQuantity = Number.isFinite(parsedQuantity) && parsedQuantity > 0;
-		const rawName = (validQuantity && match ? match[3] : value).trim().slice(0, 100);
+		const rawName = (validQuantity && match ? match[3] : value).trim().slice(0, 200);
 		if (!rawName) continue;
 		const quantity = validQuantity
 			? Math.min(1_000_000, Math.round(parsedQuantity * 100) / 100 || parsedQuantity)
