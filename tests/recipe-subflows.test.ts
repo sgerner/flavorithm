@@ -84,7 +84,7 @@ function makeEscapeState(overrides: Partial<EscapeLayerState> = {}): EscapeLayer
 		memberToRemove: null,
 		inviteCode: '',
 		currentInviteId: '',
-		resumeImport: false,
+		resumeDialog: '',
 		onboardingStatus: 'completed',
 		...overrides
 	};
@@ -345,7 +345,7 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 	assert.equal(canceledFromPicker.selected, null);
 });
 
-test('settings, onboarding, resumeImport, and identity reset helpers preserve or clear recipe state appropriately', () => {
+test('settings, onboarding, resumeDialog, and identity reset helpers preserve or clear recipe state appropriately', () => {
 	const activeRecipe = makeRecipe({ nutritionStale: true });
 
 	// Settings opened from RecipeDetail (e.g. Refresh nutrition -> needAI) keeps RecipeDetail inert, then restores on Done.
@@ -373,16 +373,38 @@ test('settings, onboarding, resumeImport, and identity reset helpers preserve or
 	assert.equal(closedOnboarding.onboardingStatus, 'skipped');
 	assert.equal(closedOnboarding.selected, activeRecipe);
 
-	// Settings opened during recipe import resumes import modal when closed.
+	// Settings or auth opened during recipe import or pantry dictation resumes target dialog when closed.
 	const resumedImport = closeModalDialog(
 		makeEscapeState({
 			modal: 'settings',
-			resumeImport: true,
+			resumeDialog: 'import',
 			selected: null
 		})
 	);
 	assert.equal(resumedImport.modal, 'import');
-	assert.equal(resumedImport.resumeImport, false);
+	assert.equal(resumedImport.resumeDialog, '');
+
+	const resumedPantry = closeModalDialog(
+		makeEscapeState({
+			modal: 'auth',
+			resumeDialog: 'pantry',
+			selected: activeRecipe
+		})
+	);
+	assert.equal(resumedPantry.modal, 'pantry');
+	assert.equal(resumedPantry.resumeDialog, '');
+	assert.equal(resumedPantry.selected, activeRecipe);
+
+	const closedPantry = closeModalDialog(
+		makeEscapeState({
+			modal: 'pantry',
+			resumeDialog: 'pantry',
+			selected: activeRecipe
+		})
+	);
+	assert.equal(closedPantry.modal, '');
+	assert.equal(closedPantry.resumeDialog, '');
+	assert.equal(closedPantry.selected, activeRecipe);
 
 	// Account, household, and freshKitchen reset helper clears all transient recipe state.
 	assert.deepEqual(clearRecipeSubflowState(), {

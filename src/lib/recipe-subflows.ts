@@ -1,5 +1,6 @@
 import { isValidServings } from '#lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe } from '#lib/types.ts';
+import { resolveClosedDialog, type ResumeDialog } from '#lib/voice-capture.ts';
 
 export type RecipeSubflowReset = {
 	selected: null;
@@ -20,7 +21,7 @@ export type ModalDialogState<TMember = unknown> = {
 	memberToRemove: TMember | null;
 	inviteCode: string;
 	currentInviteId: string;
-	resumeImport: boolean;
+	resumeDialog: ResumeDialog;
 	onboardingStatus?: 'completed' | 'skipped';
 };
 
@@ -277,11 +278,10 @@ export function closeModalDialog<TMember = unknown>(
 	if (state.modal === 'onboarding') {
 		if (!next.onboardingStatus) next.onboardingStatus = 'skipped';
 		next.modal = '';
-	} else if (state.resumeImport && (state.modal === 'settings' || state.modal === 'auth')) {
-		next.resumeImport = false;
-		next.modal = 'import';
 	} else {
-		next.modal = '';
+		const resolved = resolveClosedDialog(state.modal, state.resumeDialog);
+		next.resumeDialog = resolved.resumeDialog;
+		next.modal = resolved.modal;
 	}
 	return next;
 }
