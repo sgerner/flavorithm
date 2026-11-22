@@ -2359,8 +2359,17 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+const DEFAULT_CATALOG_FETCHER = Symbol('default-catalog-fetcher');
+const nativeFetch: Fetcher = fetch;
 let publicCatalog: Promise<SupportedModelResponse> | undefined;
 let publicCatalogExpiresAt = 0;
+let publicCatalogFetcher: Fetcher | symbol | undefined;
+
+function resolveCatalogFetcherKey(fetcher: Fetcher): Fetcher | symbol {
+	return fetcher === nativeFetch || fetcher.name === 'server_fetch'
+		? DEFAULT_CATALOG_FETCHER
+		: fetcher;
+}
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2382,12 +2391,19 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
+	const fetcherKey = resolveCatalogFetcherKey(fetcher);
+	if (
+		!publicCatalog ||
+		publicCatalogFetcher !== fetcherKey ||
+		Date.now() >= publicCatalogExpiresAt
+	) {
+		publicCatalogFetcher = fetcherKey;
 		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
 		const pending = getSupportedModels(fetcher).catch((error) => {
 			if (publicCatalog === pending) {
 				publicCatalog = undefined;
 				publicCatalogExpiresAt = 0;
+				publicCatalogFetcher = undefined;
 			}
 			throw error;
 		});
