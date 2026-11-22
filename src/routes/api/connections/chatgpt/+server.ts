@@ -5,10 +5,9 @@ import {
 	HOST_CONNECTION_ID
 } from '#lib/server/host-ai.ts';
 import { startCodexDevice, pollCodexDevice, cancelCodexDevice } from '#lib/server/codex-device.ts';
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
-import { ApiError, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
+import { ApiError, clientAddress, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
 import {
 	ChatGPTOAuthError,
 	disconnectChatGPTAccount,
@@ -31,8 +30,8 @@ const bodySchema = z.discriminatedUnion('action', [
 		reconsent: z.boolean().optional()
 	}),
 	z.object({ action: z.literal('disconnect'), accountId: z.string().min(1).max(100) }),
-	z.object({ action: z.literal('poll'), loginId: z.string().uuid() }),
-	z.object({ action: z.literal('cancel'), loginId: z.string().uuid() }),
+	z.object({ action: z.literal('poll'), loginId: z.uuid() }),
+	z.object({ action: z.literal('cancel'), loginId: z.uuid() }),
 	z.object({
 		action: z.literal('import'),
 		bundle: z.object({
@@ -48,27 +47,24 @@ const bodySchema = z.discriminatedUnion('action', [
 	})
 ]);
 
-function requestAddress(event: Parameters<RequestHandler>[0]): string | null {
-	try {
-		return event.getClientAddress();
-	} catch {
-		return null;
-	}
-}
-
 function handleError(error: unknown): Response {
 	if (error instanceof ChatGPTOAuthError) {
-		return json({ error: error.message, code: error.code }, { status: error.status });
+		return Response.json({ error: error.message, code: error.code }, { status: error.status });
 	}
-	if (error instanceof ApiError) return json({ error: error.message }, { status: error.status });
-	return json({ error: 'The ChatGPT connection request could not be completed.' }, { status: 500 });
+	if (error instanceof ApiError)
+		return Response.json({ error: error.message }, { status: error.status });
+	return Response.json(
+		{ error: 'The ChatGPT connection request could not be completed.' },
+		{ status: 500 }
+	);
 }
 
 export const GET: RequestHandler = async (event) => {
-	if (!event.locals.user) return json({ error: 'Authentication required' }, { status: 401 });
-	const address = requestAddress(event);
+	if (!event.locals.user)
+		return Response.json({ error: 'Authentication required' }, { status: 401 });
+	const address = clientAddress(event);
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
-	return json(
+	return Response.json(
 		{
 			hostAdmin: isHostAdmin(event.locals.user.id),
 			host: getHostAI() ? { model: getHostAI()!.model } : null,
@@ -102,7 +98,7 @@ export const POST: RequestHandler = async (event) => {
 		if (fetchSite && fetchSite !== 'same-origin')
 			throw new ApiError(403, 'Cross-origin request rejected');
 		if (!event.locals.user) throw new ApiError(401, 'Authentication required');
-		const address = requestAddress(event);
+		const address = clientAddress(event);
 		if (!address) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`chatgpt-connection-ip:${address}`, 600, 15 * 60 * 1000);
 
@@ -126,12 +122,17 @@ export const POST: RequestHandler = async (event) => {
 
 		if (parsed.data.action === 'host') {
 			configureHostAI(event.locals.user.id, parsed.data.accountId, parsed.data.model);
-			return json({ enabled: Boolean(getHostAI()) }, { headers: { 'Cache-Control': 'no-store' } });
+			return Response.json(
+				{ enabled: Boolean(getHostAI()) },
+				{ headers: { 'Cache-Control': 'no-store' } }
+			);
 		}
 
 		if (parsed.data.action === 'disconnect') {
 			consumeRateLimit(`chatgpt-disconnect:${event.locals.user.id}`, 20, 15 * 60 * 1000);
-			return json(await disconnectChatGPTAccount(event.locals.user.id, parsed.data.accountId));
+			return Response.json(
+				await disconnectChatGPTAccount(event.locals.user.id, parsed.data.accountId)
+			);
 		}
 
 		const sessionToken = event.cookies.get('flavorithm_session');
@@ -145,14 +146,14 @@ export const POST: RequestHandler = async (event) => {
 				appUrl: event.url,
 				loginId: parsed.data.loginId
 			};
-			return json(
+			return Response.json(
 				parsed.data.action === 'poll' ? await pollCodexDevice(input) : cancelCodexDevice(input),
 				{ headers: { 'Cache-Control': 'no-store' } }
 			);
 		}
 		if (parsed.data.action === 'import') {
 			consumeRateLimit(`chatgpt-import:${event.locals.user.id}`, 20, 15 * 60 * 1000);
-			return json(
+			return Response.json(
 				await finishChatGPTCompanion({
 					userId: event.locals.user.id,
 					sessionBinding,
@@ -172,7 +173,7 @@ export const POST: RequestHandler = async (event) => {
 		}
 		enforceChatGPTStartRateLimit(event.locals.user.id, address);
 		if (availability.mode === 'device')
-			return json(
+			return Response.json(
 				await startCodexDevice({
 					userId: event.locals.user.id,
 					sessionBinding,
@@ -189,7 +190,7 @@ export const POST: RequestHandler = async (event) => {
 			...(parsed.data.accountId ? { accountId: parsed.data.accountId } : {}),
 			reconsent: parsed.data.reconsent ?? false
 		});
-		return json(result, { headers: { 'Cache-Control': 'no-store, max-age=0' } });
+		return Response.json(result, { headers: { 'Cache-Control': 'no-store, max-age=0' } });
 	} catch (error) {
 		return handleError(error);
 	}
