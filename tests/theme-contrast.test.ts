@@ -417,7 +417,7 @@ test('zero custom foreground declarations lack a paired or theme-verified backgr
 						}
 					}
 
-					if (rule.selector.startsWith('.banner-') || rule.selector === '.orbit-text') {
+					if (rule.selector.startsWith('.banner-')) {
 						// Explicitly scoped inside .inspiration-banner (background: #294b37)
 						const ratio = contrastRatio(
 							resolveColor(fg, {}, false),
