@@ -2018,9 +2018,13 @@
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
-		openImport(url);
+		importSession = { ...emptyImportSession(), url };
+		openImport();
 	}
-	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
+	async function captureImport(
+		input: { url?: string; prompt: string; image?: string },
+		signal: AbortSignal
+	) {
 		if (!needAI()) {
 			resumeImport = true;
 			return null;
