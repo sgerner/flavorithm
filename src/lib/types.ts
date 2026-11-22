@@ -55,6 +55,9 @@ export type ShoppingItem = {
 	unit: string;
 	checked: boolean;
 	sourceKey?: string;
+	requirementKey?: string;
+	requirementQuantity?: number;
+	customized?: boolean;
 };
 export type Preferences = {
 	diet: string;

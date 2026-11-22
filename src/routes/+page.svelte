@@ -49,8 +49,11 @@
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
+		activeShoppingWeeks,
 		completeMeal,
 		expiryStatus,
+		isTransferablePurchase,
+		parseIngredientInput,
 		reconcileShoppingList,
 		transferPurchasedItemsToPantry
 	} from '#lib/kitchen-workflows.ts';
@@ -167,6 +170,7 @@
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
+		trackedWeeks = [];
 		kitchen = createInitialState();
 		kitchenLoaded = false;
 		showStarter = false;
@@ -341,6 +345,13 @@
 	let pantryFilter = $state('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
+	let editingShoppingSnapshot = $state<{
+		id: string;
+		name: string;
+		quantity: number;
+		unit: string;
+	} | null>(null);
+	let trackedWeeks = $state<string[]>([]);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -776,6 +787,7 @@
 		};
 	});
 	function adoptKitchen(state: AppState) {
+		trackedWeeks = activeShoppingWeeks(state.shopping);
 		if (user && kitchenSync) {
 			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), state, stateEtag || '');
 			if (!managedAuth) {
@@ -848,6 +860,7 @@
 		kitchen.pantry = [];
 		kitchen.meals = [];
 		kitchen.shopping = [];
+		trackedWeeks = [];
 		kitchen.recipes = kitchen.recipes.map((r) => ({ ...r, rating: undefined, saved: false }));
 		showStarter = false;
 		localStorage.setItem('flavorithm-started', 'yes');
@@ -865,26 +878,33 @@
 			.map((value) => value.trim())
 			.filter(Boolean);
 		if (!names.length) return;
-		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
 		const additions = names.map((value) => {
-			const match = value.match(
-				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
-			);
+			const parsed = parseIngredientInput(value);
 			return {
 				id: crypto.randomUUID(),
-				name: match ? match[3] : value,
-				quantity: match ? Number(match[1]) : 1,
-				unit: match?.[2] || 'piece',
+				name: parsed.name,
+				quantity: parsed.quantity,
+				unit: parsed.unit,
 				checked: true
 			};
 		});
+		const activeWeeks = activeShoppingWeeks(kitchen.shopping);
 		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
-		const applied = JSON.stringify(kitchen.pantry);
+		refreshActiveWeeks(activeWeeks);
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
 		modal = '';
 		notify(`${names.length} ingredients added to your pantry.`, () => {
-			if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-			else notify('Your pantry changed again. Review the current quantities before editing.');
+			if (
+				JSON.stringify(kitchen.pantry) === appliedPantry &&
+				JSON.stringify(kitchen.shopping) === appliedShopping
+			) {
+				kitchen.pantry = previousPantry;
+				kitchen.shopping = previousShopping;
+			} else notify('Your pantry changed again. Review the current quantities before editing.');
 		});
 	}
 
@@ -965,6 +985,7 @@
 			canManageHousehold = false;
 			importSession = emptyImportSession();
 			resumeImport = false;
+			trackedWeeks = [];
 			kitchen = createInitialState();
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
@@ -1638,6 +1659,7 @@
 			nutritionStale: nutritionNeedsRefresh ? true : previous.nutritionStale
 		};
 		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
+		refreshActiveWeeks();
 		editingRecipe = null;
 		notify(
 			nutritionNeedsRefresh ? 'Recipe updated. Refresh its nutrition estimate.' : 'Recipe updated.'
@@ -1655,9 +1677,15 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
+	function trackShoppingWeek(startDate: string) {
+		if (/^\d{4}-\d{2}-\d{2}$/.test(startDate) && !trackedWeeks.includes(startDate)) {
+			trackedWeeks = [...trackedWeeks, startDate];
+		}
+	}
 	function refreshWeekShopping(startDate: string) {
 		const start = new Date(`${startDate}T12:00:00`);
 		if (Number.isNaN(start.getTime())) return;
+		trackShoppingWeek(startDate);
 		const dates = Array.from({ length: 7 }, (_, index) => {
 			const day = new Date(start);
 			day.setDate(day.getDate() + index);
@@ -1669,6 +1697,14 @@
 		);
 		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+	}
+	function refreshActiveWeeks(extraWeeks: Iterable<string> = []) {
+		const weeks = new Set([
+			...activeShoppingWeeks(kitchen.shopping),
+			...trackedWeeks,
+			...extraWeeks
+		]);
+		for (const startDate of weeks) refreshWeekShopping(startDate);
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -1695,17 +1731,41 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
+	function startEditingShoppingItem(item: AppState['shopping'][number]) {
+		editingShoppingId = item.id;
+		editingShoppingSnapshot = {
+			id: item.id,
+			name: item.name,
+			quantity: Number(item.quantity),
+			unit: item.unit
+		};
+	}
+	function markShoppingItemEdited(item: AppState['shopping'][number]) {
+		if (!item.sourceKey) return;
+		if (
+			editingShoppingSnapshot?.id === item.id &&
+			item.name === editingShoppingSnapshot.name &&
+			Number(item.quantity) === editingShoppingSnapshot.quantity &&
+			item.unit === editingShoppingSnapshot.unit
+		) {
+			return;
+		}
+		item.customized = true;
+	}
 	function normalizeShoppingItem(item: AppState['shopping'][number]) {
 		item.name = item.name.trim().slice(0, 100) || 'Shopping item';
-		item.unit = item.unit.trim().slice(0, 40) || 'piece';
+		item.unit = item.unit.trim().slice(0, 40) || 'each';
 		const quantity = Number(item.quantity);
 		item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1000000)) : 1;
+		markShoppingItemEdited(item);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
 		if (meals?.some((meal) => !Number.isFinite(meal.servings) || meal.servings <= 0)) {
 			notify('Enter a valid serving count before making a shopping list.');
 			return;
 		}
+		const weekMatch = sourceKey.match(/^week:(\d{4}-\d{2}-\d{2})$/);
+		if (weekMatch) trackShoppingWeek(weekMatch[1]);
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
@@ -1771,7 +1831,7 @@
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
-		refreshWeekShopping(startDate);
+		refreshActiveWeeks([startDate]);
 		cookingMealId = '';
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
@@ -1975,6 +2035,7 @@
 	function saveImportedRecipe(recipe: Recipe) {
 		const saved = { ...recipe, saved: true };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		refreshActiveWeeks();
 		importSession = emptyImportSession();
 		resumeImport = false;
 		modal = '';
@@ -2030,6 +2091,7 @@
 			apiKey = '';
 			deletePassword = '';
 			stateEtag = null;
+			trackedWeeks = [];
 			kitchen = createInitialState();
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
@@ -2490,6 +2552,7 @@
 							class="text-button"
 							onclick={() => {
 								kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
+								refreshActiveWeeks();
 							}}>Clear depleted items</button
 						>{/if}
 					<div>
@@ -2546,20 +2609,28 @@
 									min="0"
 									step="0.25"
 									bind:value={item.quantity}
+									oninput={() => refreshActiveWeeks()}
+									onchange={() => refreshActiveWeeks()}
 								/><input
 									class="unit-input"
 									aria-label={`Unit for ${item.name}`}
 									bind:value={item.unit}
+									oninput={() => refreshActiveWeeks()}
+									onchange={() => refreshActiveWeeks()}
 								/></label
 							><input
 								aria-label={`Expiry for ${item.name}`}
 								type="date"
 								bind:value={item.expires}
+								oninput={() => refreshActiveWeeks()}
+								onchange={() => refreshActiveWeeks()}
 							/><button
 								class="icon-button"
 								aria-label={`Remove ${item.name}`}
-								onclick={() => (kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id))}
-								><X size={16} /></button
+								onclick={() => {
+									kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id);
+									refreshActiveWeeks();
+								}}><X size={16} /></button
 							>
 						</div>{/each}
 				</div>
@@ -2749,7 +2820,7 @@
 						<h1>Shopping list<span class="heading-spark">✴</span></h1>
 						<p>
 							Generated rows show their recipe or meal-plan source. Editing a row keeps your changes
-							visible until that source is refreshed.
+							visible while that ingredient is still needed.
 						</p>
 					</div>
 					<button class="secondary" onclick={exportList}><Download size={17} /> Export list</button>
@@ -2787,6 +2858,7 @@
 											aria-label="Shopping item name"
 											bind:value={item.name}
 											maxlength="100"
+											oninput={() => markShoppingItemEdited(item)}
 											onblur={() => normalizeShoppingItem(item)}
 										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
 									</div>
@@ -2798,11 +2870,13 @@
 											max="1000000"
 											step="0.01"
 											bind:value={item.quantity}
+											oninput={() => markShoppingItemEdited(item)}
 											onblur={() => normalizeShoppingItem(item)}
 										/><input
 											aria-label={`Unit for ${item.name}`}
 											bind:value={item.unit}
 											maxlength="40"
+											oninput={() => markShoppingItemEdited(item)}
 											onblur={() => normalizeShoppingItem(item)}
 										/></span
 									>
@@ -2811,6 +2885,7 @@
 										onclick={() => {
 											normalizeShoppingItem(item);
 											editingShoppingId = '';
+											editingShoppingSnapshot = null;
 										}}>Done</button
 									>
 								{:else}
@@ -2824,7 +2899,7 @@
 										{item.unit}<button
 											class="text-button"
 											aria-label={`Edit ${item.name}`}
-											onclick={() => (editingShoppingId = item.id)}>Edit</button
+											onclick={() => startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
 								{/if}
@@ -2846,11 +2921,12 @@
 							onsubmit={(e) => {
 								e.preventDefault();
 								if (shoppingText.trim()) {
+									const parsed = parseIngredientInput(shoppingText);
 									kitchen.shopping.push({
 										id: crypto.randomUUID(),
-										name: shoppingText.trim(),
-										quantity: 1,
-										unit: 'piece',
+										name: parsed.name.slice(0, 100) || 'Shopping item',
+										quantity: parsed.quantity,
+										unit: parsed.unit.slice(0, 40) || 'each',
 										checked: false
 									});
 									shoppingText = '';
@@ -2866,10 +2942,13 @@
 						<button
 							class="text-button"
 							onclick={() => {
-								const checked = kitchen.shopping.filter((i) => i.checked);
-								kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
-								kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
-								notify(`${checked.length} purchased items moved to your pantry.`);
+								const activeWeeks = activeShoppingWeeks(kitchen.shopping);
+								const transferable = kitchen.shopping.filter(isTransferablePurchase);
+								const transferredIds = new Set(transferable.map((i) => i.id));
+								kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, transferable);
+								kitchen.shopping = kitchen.shopping.filter((i) => !transferredIds.has(i.id));
+								refreshActiveWeeks(activeWeeks);
+								notify(`${transferable.length} purchased items moved to your pantry.`);
 							}}>Put purchased items in my pantry <ArrowRight size={16} /></button
 						>
 					</div>

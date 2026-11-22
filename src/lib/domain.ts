@@ -41,11 +41,52 @@ addUnits('count', 1, 'each', [
 	'large'
 ]);
 addUnits('count:clove', 1, 'clove', ['clove', 'cloves']);
-addUnits('count:head', 1, 'head', ['head', 'heads', 'small head', 'medium head', 'large head']);
+addUnits('count:head', 1, 'head', [
+	'head',
+	'heads',
+	'small head',
+	'small heads',
+	'medium head',
+	'medium heads',
+	'large head',
+	'large heads'
+]);
 addUnits('count:slice', 1, 'slice', ['slice', 'slices']);
 addUnits('count:can', 1, 'can', ['can', 'cans']);
 addUnits('count:pinch', 1, 'pinch', ['pinch', 'pinches']);
 addUnits('count:dash', 1, 'dash', ['dash', 'dashes']);
+addUnits('count:bunch', 1, 'bunch', ['bunch', 'bunches']);
+
+const containerUnits: Record<string, string> = {
+	package: 'package',
+	packages: 'package',
+	pkg: 'package',
+	pkgs: 'package',
+	bag: 'bag',
+	bags: 'bag',
+	box: 'box',
+	boxes: 'box',
+	bottle: 'bottle',
+	bottles: 'bottle',
+	jar: 'jar',
+	jars: 'jar'
+};
+
+const unicodeFractions: Record<string, number> = {
+	'¼': 0.25,
+	'½': 0.5,
+	'¾': 0.75,
+	'⅓': 1 / 3,
+	'⅔': 2 / 3,
+	'⅛': 0.125,
+	'⅜': 0.375,
+	'⅝': 0.625,
+	'⅞': 0.875
+};
+
+const parsableUnitTokens = [...Object.keys(unitAliases), ...Object.keys(containerUnits)].sort(
+	(a, b) => b.length - a.length
+);
 
 const ingredientAliases: Record<string, string> = {
 	avocadoes: 'avocado',
@@ -107,9 +148,126 @@ export function normalizeName(name: string): string {
 
 export function unitInfo(unit: string): UnitInfo {
 	const cleaned = cleanText(unit);
-	return (
-		unitAliases[cleaned] ?? { dimension: `unit:${cleaned}`, factor: 1, display: cleaned || 'each' }
-	);
+	if (!cleaned) return unitAliases.each;
+	return unitAliases[cleaned] ?? { dimension: `unit:${cleaned}`, factor: 1, display: cleaned };
+}
+
+function parseLeadingQuantity(text: string): { quantity: number; rest: string } | undefined {
+	const mixed = /^(\d+)\s+(\d+)\s*\/\s*(\d+)(?=\s|[a-zA-Z]|$)/.exec(text);
+	if (mixed) {
+		const denom = Number(mixed[3]);
+		if (denom > 0) {
+			return {
+				quantity: Number(mixed[1]) + Number(mixed[2]) / denom,
+				rest: text.slice(mixed[0].length)
+			};
+		}
+	}
+	const mixedUnicode = /^(\d+)\s*([¼½¾⅓⅔⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)/.exec(text);
+	if (mixedUnicode) {
+		return {
+			quantity: Number(mixedUnicode[1]) + unicodeFractions[mixedUnicode[2]],
+			rest: text.slice(mixedUnicode[0].length)
+		};
+	}
+	const singleUnicode = /^([¼½¾⅓⅔⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)/.exec(text);
+	if (singleUnicode) {
+		return {
+			quantity: unicodeFractions[singleUnicode[1]],
+			rest: text.slice(singleUnicode[0].length)
+		};
+	}
+	const fraction = /^(\d+)\s*\/\s*(\d+)(?=\s|[a-zA-Z]|$)/.exec(text);
+	if (fraction) {
+		const denom = Number(fraction[2]);
+		if (denom > 0) {
+			return {
+				quantity: Number(fraction[1]) / denom,
+				rest: text.slice(fraction[0].length)
+			};
+		}
+	}
+	const decimal = /^(\d+(?:\.\d+)?|\.\d+)(?=\s|[a-zA-Z]|$)/.exec(text);
+	if (decimal) {
+		return {
+			quantity: Number(decimal[1]),
+			rest: text.slice(decimal[0].length)
+		};
+	}
+	return undefined;
+}
+
+export function parseIngredientInput(raw: string): {
+	name: string;
+	quantity: number;
+	unit: string;
+	hasExplicitQuantity: boolean;
+	hasExplicitUnit: boolean;
+} {
+	const compact = raw.trim().replace(/\s+/g, ' ');
+	if (!compact) {
+		return {
+			name: '',
+			quantity: 1,
+			unit: 'each',
+			hasExplicitQuantity: false,
+			hasExplicitUnit: false
+		};
+	}
+
+	const leading = parseLeadingQuantity(compact);
+	if (
+		leading &&
+		Number.isFinite(leading.quantity) &&
+		leading.quantity > 0 &&
+		leading.quantity <= 1_000_000
+	) {
+		const restTrimmed = leading.rest.trim();
+		if (restTrimmed) {
+			const quantity = Math.max(0.01, Math.round(leading.quantity * 1000) / 1000);
+			const lowerRest = restTrimmed.toLowerCase();
+			for (const token of parsableUnitTokens) {
+				if (!lowerRest.startsWith(token)) continue;
+				const afterToken = restTrimmed.slice(token.length);
+				const sepMatch = /^\.?\s+/.exec(afterToken);
+				if (!sepMatch) continue;
+				const afterUnit = afterToken
+					.slice(sepMatch[0].length)
+					.replace(/^of\s+/i, '')
+					.replace(/[.,;:]$/, '')
+					.trim();
+				if (!afterUnit) continue;
+				const unit = containerUnits[token] ?? unitInfo(token).display;
+				return {
+					name: afterUnit,
+					quantity,
+					unit,
+					hasExplicitQuantity: true,
+					hasExplicitUnit: true
+				};
+			}
+
+			const fallbackName = restTrimmed.replace(/[.,;:]$/, '').trim();
+			if (fallbackName) {
+				return {
+					name: fallbackName,
+					quantity,
+					unit: 'each',
+					hasExplicitQuantity: true,
+					hasExplicitUnit: false
+				};
+			}
+		}
+	}
+
+	const plainName = compact.replace(/[.,;:]$/, '').trim() || compact;
+	return {
+		name: plainName,
+		quantity: 1,
+		unit: 'each',
+		hasExplicitQuantity: false,
+		hasExplicitUnit: false
+	};
 }
 
 function roundQuantity(value: number): number {

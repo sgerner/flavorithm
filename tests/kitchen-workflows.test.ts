@@ -6,10 +6,13 @@ import {
 	unitInfo as domainUnitInfo
 } from '../src/lib/domain.ts';
 import {
+	activeShoppingWeeks,
 	completeMeal,
 	convertCompatibleQuantity,
 	expiryStatus,
+	isTransferablePurchase,
 	normalizeIngredientName,
+	parseIngredientInput,
 	reconcileShoppingList,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
@@ -359,5 +362,127 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
+	);
+});
+
+test('parsed manual shopping entries and blank-unit purchases merge into pantry while keeping invalid rows', () => {
+	const parsed = parseIngredientInput('2 cups jasmine rice');
+	const riceRow = shopping('manual-rice', parsed.name, parsed.quantity, parsed.unit, true);
+	const unitlessNew = shopping('basil-lemons', 'lemons', 3, '', true);
+	const unitlessMerge = shopping('basil-eggs', 'eggs', 2, '', true);
+	const invalidZero = shopping('invalid-zero', 'milk', 0, 'cup', true);
+	const invalidBlankName = shopping('invalid-name', '   ', 1, 'each', true);
+	const uncheckedItem = shopping('needed', 'butter', 1, 'tbsp', false);
+
+	const candidates = [
+		riceRow,
+		unitlessNew,
+		unitlessMerge,
+		invalidZero,
+		invalidBlankName,
+		uncheckedItem
+	];
+	const transferable = candidates.filter(isTransferablePurchase);
+	assert.deepEqual(
+		transferable.map((item) => item.id),
+		['manual-rice', 'basil-lemons', 'basil-eggs']
+	);
+
+	const updatedPantry = transferPurchasedItemsToPantry(
+		[pantry('jasmine rice', 2, 'cups'), pantry('egg', 4, 'whole')],
+		candidates,
+		(() => {
+			let count = 0;
+			return () => `lot-${++count}`;
+		})()
+	);
+	assert.equal(updatedPantry.find((item) => item.name === 'jasmine rice')?.quantity, 4);
+	assert.equal(updatedPantry.find((item) => item.name === 'egg')?.quantity, 6);
+	const addedLemons = updatedPantry.find((item) => item.name === 'lemons');
+	assert.ok(addedLemons);
+	assert.equal(addedLemons.unit, 'each');
+	assert.equal(addedLemons.quantity, 3);
+
+	const transferredIds = new Set(transferable.map((item) => item.id));
+	const remainingShopping = candidates.filter((item) => !transferredIds.has(item.id));
+	assert.deepEqual(
+		remainingShopping.map((item) => item.id),
+		['invalid-zero', 'invalid-name', 'unchecked'].map((id) => (id === 'unchecked' ? 'needed' : id))
+	);
+});
+
+test('weekly refresh preserves customized unchecked rows while active and credits edited checked rows without duplicates', () => {
+	const scope = 'week:2026-10-19';
+	const otherScope = 'week:2026-10-26';
+	const initial = reconcileShoppingList(
+		[shopping('other-week', 'olive oil', 2, 'tbsp', false, otherScope)],
+		[
+			shopping('req-oil', 'olive oil', 2, 'tbsp', false),
+			shopping('req-chickpeas', 'chickpeas', 15, 'oz', false)
+		],
+		scope
+	);
+	assert.deepEqual(activeShoppingWeeks(initial), ['2026-10-26', '2026-10-19']);
+
+	const edited = initial.map((row) => {
+		if (row.sourceKey !== scope) return row;
+		if (row.name === 'olive oil') {
+			return { ...row, quantity: 1, unit: 'cup', customized: true };
+		}
+		return { ...row, name: 'canned chickpeas', quantity: 1, unit: 'can', checked: true };
+	});
+
+	const afterSecondMeal = reconcileShoppingList(
+		edited,
+		[
+			shopping('req-oil-2', 'olive oil', 3, 'tbsp', false),
+			shopping('req-chickpeas-2', 'chickpeas', 15, 'oz', false),
+			shopping('req-rice', 'jasmine rice', 1, 'cup', false)
+		],
+		scope
+	);
+
+	const weekRows = afterSecondMeal.filter((item) => item.sourceKey === scope);
+	assert.equal(weekRows.length, 3);
+	const oilRow = weekRows.find((item) => item.name === 'olive oil');
+	assert.ok(oilRow);
+	assert.equal(oilRow.quantity, 1);
+	assert.equal(oilRow.unit, 'cup');
+	assert.equal(oilRow.checked, false);
+	assert.equal(oilRow.customized, true);
+
+	const chickpeaRows = weekRows.filter((item) => item.name.includes('chickpea'));
+	assert.equal(chickpeaRows.length, 1);
+	assert.equal(chickpeaRows[0].checked, true);
+	assert.equal(chickpeaRows[0].unit, 'can');
+
+	assert.equal(afterSecondMeal.find((item) => item.sourceKey === otherScope)?.quantity, 2);
+	assert.deepEqual(
+		reconcileShoppingList(
+			afterSecondMeal,
+			[
+				shopping('req-oil-2', 'olive oil', 3, 'tbsp', false),
+				shopping('req-chickpeas-2', 'chickpeas', 15, 'oz', false),
+				shopping('req-rice', 'jasmine rice', 1, 'cup', false)
+			],
+			scope
+		),
+		afterSecondMeal
+	);
+
+	// Removing meals that needed olive oil drops the customized unchecked olive oil row while keeping checked items.
+	const afterOilMealRemoved = reconcileShoppingList(
+		afterSecondMeal,
+		[shopping('req-rice', 'jasmine rice', 1, 'cup', false)],
+		scope
+	);
+	const remainingWeekRows = afterOilMealRemoved.filter((item) => item.sourceKey === scope);
+	assert.equal(
+		remainingWeekRows.some((item) => item.name === 'olive oil'),
+		false
+	);
+	assert.equal(
+		remainingWeekRows.some((item) => item.checked && item.unit === 'can'),
+		true
 	);
 });

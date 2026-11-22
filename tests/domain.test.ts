@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState, seedRecipes } from '../src/lib/data.ts';
-import { buildShoppingList, preferenceSummary } from '../src/lib/domain.ts';
+import {
+	buildShoppingList,
+	parseIngredientInput,
+	preferenceSummary,
+	unitInfo
+} from '../src/lib/domain.ts';
 import type { Ingredient, Meal, Recipe } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -184,4 +189,64 @@ test('starter recipes have distinct Unsplash images, complete cooking directions
 	first.pantry[0].quantity += 1;
 	assert.notEqual(first.pantry[0].quantity, second.pantry[0].quantity);
 	assert.notEqual(first.recipes[0].ingredients, second.recipes[0].ingredients);
+});
+
+test('parses typed quantities, fractions, culinary units, and unitless entries', () => {
+	assert.deepEqual(parseIngredientInput('2 cups jasmine rice'), {
+		name: 'jasmine rice',
+		quantity: 2,
+		unit: 'cup',
+		hasExplicitQuantity: true,
+		hasExplicitUnit: true
+	});
+	assert.deepEqual(parseIngredientInput('1 1/2 tbsp of olive oil'), {
+		name: 'olive oil',
+		quantity: 1.5,
+		unit: 'tbsp',
+		hasExplicitQuantity: true,
+		hasExplicitUnit: true
+	});
+	assert.deepEqual(parseIngredientInput('½ tsp kosher salt'), {
+		name: 'kosher salt',
+		quantity: 0.5,
+		unit: 'tsp',
+		hasExplicitQuantity: true,
+		hasExplicitUnit: true
+	});
+	assert.deepEqual(parseIngredientInput('200g pasta'), {
+		name: 'pasta',
+		quantity: 200,
+		unit: 'g',
+		hasExplicitQuantity: true,
+		hasExplicitUnit: true
+	});
+	assert.deepEqual(parseIngredientInput('12 fl. oz. chicken broth'), {
+		name: 'chicken broth',
+		quantity: 12,
+		unit: 'fl oz',
+		hasExplicitQuantity: true,
+		hasExplicitUnit: true
+	});
+	assert.deepEqual(parseIngredientInput('1 large head broccoli'), {
+		name: 'broccoli',
+		quantity: 1,
+		unit: 'head',
+		hasExplicitQuantity: true,
+		hasExplicitUnit: true
+	});
+	assert.deepEqual(parseIngredientInput('2 eggs'), {
+		name: 'eggs',
+		quantity: 2,
+		unit: 'each',
+		hasExplicitQuantity: true,
+		hasExplicitUnit: false
+	});
+	assert.deepEqual(parseIngredientInput('2% milk'), {
+		name: '2% milk',
+		quantity: 1,
+		unit: 'each',
+		hasExplicitQuantity: false,
+		hasExplicitUnit: false
+	});
+	assert.deepEqual(unitInfo(''), unitInfo('each'));
 });

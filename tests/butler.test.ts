@@ -257,3 +257,161 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 		{ id: 'manual', name: 'tea', quantity: 1, unit: 'box', checked: false }
 	]);
 });
+
+test('butler pantry mutations and cross-week meal moves refresh active and target weekly lists', () => {
+	const current = createInitialState();
+	const omelette = structuredClone(current.recipes[0]);
+	omelette.id = 'omelette';
+	omelette.title = 'Omelette';
+	omelette.servings = 2;
+	omelette.ingredients = [
+		{ name: 'eggs', quantity: 3, unit: 'each' },
+		{ name: 'butter', quantity: 1, unit: 'tbsp' }
+	];
+	current.recipes = [omelette];
+	current.pantry = [
+		{ id: 'pantry-eggs', name: 'eggs', quantity: 3, unit: 'whole', category: 'Dairy & eggs' }
+	];
+	current.meals = [
+		{
+			id: 'tue-breakfast',
+			date: '2026-10-20',
+			slot: 'Breakfast',
+			recipeId: 'omelette',
+			servings: 2
+		}
+	];
+	current.shopping = [];
+
+	const now = new Date('2026-10-20T09:00:00Z');
+	const initialWeek = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.deepEqual(
+		initialWeek.shopping.map((item) => item.name),
+		['butter']
+	);
+
+	// Deleting eggs from pantry immediately surfaces eggs in the active week:2026-10-19 list.
+	const afterEggDelete = applyButlerCommands(
+		initialWeek,
+		[{ type: 'pantry.delete', id: 'pantry-eggs' }],
+		now
+	).state;
+	assert.deepEqual(
+		afterEggDelete.shopping.map((item) => ({ name: item.name, quantity: item.quantity })),
+		[
+			{ name: 'butter', quantity: 1 },
+			{ name: 'eggs', quantity: 3 }
+		]
+	);
+
+	// Moving the meal to next week clears week:2026-10-19 and populates previously empty week:2026-10-26.
+	const afterMove = applyButlerCommands(
+		afterEggDelete,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'tue-breakfast',
+					date: '2026-10-27',
+					slot: 'Breakfast',
+					recipeId: 'omelette',
+					servings: 2
+				}
+			}
+		],
+		now
+	).state;
+	assert.equal(
+		afterMove.shopping.some((item) => item.sourceKey === 'week:2026-10-19'),
+		false
+	);
+	assert.deepEqual(
+		afterMove.shopping
+			.filter((item) => item.sourceKey === 'week:2026-10-26')
+			.map((item) => item.name),
+		['butter', 'eggs']
+	);
+});
+
+test('pairing meal commands with explicit shopping edits or deletions preserves the shopping commands', () => {
+	const current = createInitialState();
+	const pasta = structuredClone(current.recipes[0]);
+	pasta.id = 'pasta';
+	pasta.servings = 2;
+	pasta.ingredients = [
+		{ name: 'olive oil', quantity: 2, unit: 'tbsp' },
+		{ name: 'garlic', quantity: 3, unit: 'cloves' }
+	];
+	current.recipes = [pasta];
+	current.pantry = [];
+	current.meals = [];
+	current.shopping = [];
+
+	const now = new Date('2026-10-20T12:00:00Z');
+	const scheduled = applyButlerCommands(
+		current,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'wed-dinner',
+					date: '2026-10-21',
+					slot: 'Dinner',
+					recipeId: 'pasta',
+					servings: 2
+				}
+			}
+		],
+		now
+	).state;
+	const oilItem = scheduled.shopping.find((item) => item.name === 'olive oil')!;
+	const garlicItem = scheduled.shopping.find((item) => item.name === 'garlic')!;
+	assert.ok(oilItem);
+	assert.ok(garlicItem);
+
+	const paired = applyButlerCommands(
+		scheduled,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'fri-dinner',
+					date: '2026-10-23',
+					slot: 'Dinner',
+					recipeId: 'pasta',
+					servings: 2
+				}
+			},
+			{
+				type: 'shopping.upsert',
+				item: {
+					id: oilItem.id,
+					name: 'olive oil',
+					quantity: 1,
+					unit: 'cup',
+					checked: false,
+					sourceKey: oilItem.sourceKey
+				}
+			},
+			{
+				type: 'shopping.delete',
+				id: garlicItem.id
+			}
+		],
+		now
+	).state;
+
+	assert.equal(
+		paired.shopping.some((item) => item.id === garlicItem.id),
+		false
+	);
+	const updatedOil = paired.shopping.find((item) => item.id === oilItem.id);
+	assert.ok(updatedOil);
+	assert.equal(updatedOil.quantity, 1);
+	assert.equal(updatedOil.unit, 'cup');
+	assert.equal(updatedOil.customized, true);
+});

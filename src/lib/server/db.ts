@@ -295,7 +295,10 @@ const appStateSchema = z.object({
 				quantity: z.number().finite().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				checked: z.boolean(),
-				sourceKey: z.string().max(200).optional()
+				sourceKey: z.string().max(200).optional(),
+				requirementKey: z.string().max(260).optional(),
+				requirementQuantity: z.number().finite().min(0).max(10_000_000_000).optional(),
+				customized: z.boolean().optional()
 			})
 		)
 		.max(1_000),

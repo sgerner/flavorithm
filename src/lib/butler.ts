@@ -1,8 +1,13 @@
 import { z } from 'zod';
-import type { AppState } from './types.ts';
+import type { AppState, ShoppingItem } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList } from './domain.ts';
-import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
+import {
+	activeShoppingWeeks,
+	completeMeal,
+	reconcileShoppingList,
+	weekStartForDate
+} from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
@@ -82,7 +87,10 @@ const shopping = z.object({
 	quantity,
 	unit: z.string().max(40),
 	checked: z.boolean(),
-	sourceKey: z.string().max(200).optional()
+	sourceKey: z.string().max(200).optional(),
+	requirementKey: z.string().max(260).optional(),
+	requirementQuantity: z.number().finite().nonnegative().max(10_000_000_000).optional(),
+	customized: z.boolean().optional()
 });
 const preferences = z
 	.object({
@@ -206,6 +214,22 @@ export function applyButlerCommands(
 	const commands = z.array(ButlerCommandSchema).max(50).parse(input);
 	let state = structuredClone(current);
 	const effects: ButlerEffect[] = [];
+	const dirtyWeeks = new Set<string>();
+	const explicitDeletedShoppingIds = new Set<string>();
+
+	const markActiveWeeksDirty = () => {
+		for (const week of activeShoppingWeeks(state.shopping)) dirtyWeeks.add(week);
+	};
+
+	const flushDirtyWeeks = () => {
+		if (dirtyWeeks.size === 0) return;
+		for (const week of dirtyWeeks) refreshShoppingWeek(state, week, now);
+		if (explicitDeletedShoppingIds.size > 0) {
+			state.shopping = state.shopping.filter((item) => !explicitDeletedShoppingIds.has(item.id));
+		}
+		dirtyWeeks.clear();
+	};
+
 	for (const command of commands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
@@ -224,10 +248,12 @@ export function applyButlerCommands(
 						...state.preferences.ratings,
 						[updated.id]: updated.rating
 					};
+				markActiveWeeksDirty();
 				break;
 			}
 			case 'recipe.delete':
 				requireId(state.recipes, command.id);
+				markActiveWeeksDirty();
 				state.recipes = state.recipes.filter((item) => item.id !== command.id);
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
 				state.shopping = state.shopping.filter((item) => item.sourceKey !== `recipe:${command.id}`);
@@ -235,14 +261,20 @@ export function applyButlerCommands(
 				break;
 			case 'pantry.upsert':
 				state.pantry = upsert(state.pantry, command.item);
+				markActiveWeeksDirty();
 				break;
 			case 'pantry.delete':
 				requireId(state.pantry, command.id);
 				state.pantry = state.pantry.filter((item) => item.id !== command.id);
+				markActiveWeeksDirty();
 				break;
 			case 'meal.upsert': {
 				requireId(state.recipes, command.meal.recipeId);
+				markActiveWeeksDirty();
 				const previous = state.meals.find((item) => item.id === command.meal.id);
+				if (previous && !previous.completedAt) {
+					dirtyWeeks.add(weekStartForDate(previous.date));
+				}
 				const meal = previous?.completedAt
 					? {
 							...command.meal,
@@ -251,14 +283,19 @@ export function applyButlerCommands(
 						}
 					: command.meal;
 				state.meals = upsert(state.meals, meal);
+				if (!meal.completedAt) {
+					dirtyWeeks.add(weekStartForDate(meal.date));
+				}
 				break;
 			}
 			case 'meal.delete':
 				requireId(state.meals, command.id);
+				markActiveWeeksDirty();
 				state.meals = state.meals.filter((item) => item.id !== command.id);
 				break;
 			case 'meal.complete':
 				requireId(state.meals, command.id);
+				markActiveWeeksDirty();
 				state = completeMeal(
 					state,
 					command.id,
@@ -269,17 +306,50 @@ export function applyButlerCommands(
 					now
 				);
 				break;
-			case 'shopping.upsert':
-				state.shopping = upsert(state.shopping, command.item);
+			case 'shopping.upsert': {
+				flushDirtyWeeks();
+				explicitDeletedShoppingIds.delete(command.item.id);
+				const previous = state.shopping.find((value) => value.id === command.item.id);
+				const sourceKey = command.item.sourceKey ?? previous?.sourceKey;
+				const nextItem: ShoppingItem = {
+					...command.item,
+					...(sourceKey ? { sourceKey } : {}),
+					...((command.item.requirementKey ?? previous?.requirementKey)
+						? { requirementKey: command.item.requirementKey ?? previous?.requirementKey }
+						: {}),
+					...((command.item.requirementQuantity ?? previous?.requirementQuantity) !== undefined
+						? {
+								requirementQuantity:
+									command.item.requirementQuantity ?? previous?.requirementQuantity
+							}
+						: {})
+				};
+				if (
+					sourceKey &&
+					(command.item.customized ??
+						(!previous ||
+							Boolean(previous.customized) ||
+							previous.name !== nextItem.name ||
+							previous.quantity !== nextItem.quantity ||
+							previous.unit !== nextItem.unit))
+				) {
+					nextItem.customized = true;
+				}
+				state.shopping = upsert(state.shopping, nextItem);
 				break;
+			}
 			case 'shopping.delete':
+				flushDirtyWeeks();
 				requireId(state.shopping, command.id);
+				explicitDeletedShoppingIds.add(command.id);
 				state.shopping = state.shopping.filter((item) => item.id !== command.id);
 				break;
 			case 'shopping.generate': {
+				explicitDeletedShoppingIds.clear();
 				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
-				refreshShoppingWeek(state, calendarKey(start), now);
+				dirtyWeeks.add(calendarKey(start));
+				flushDirtyWeeks();
 				break;
 			}
 			case 'preferences.update':
@@ -295,20 +365,7 @@ export function applyButlerCommands(
 				break;
 		}
 	}
-	if (
-		commands.some(
-			(command) =>
-				(command.type.startsWith('recipe.') && command.type !== 'recipe.open') ||
-				command.type.startsWith('meal.')
-		)
-	) {
-		const weeks = new Set(
-			state.shopping.flatMap(
-				(item) => item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1] ?? []
-			)
-		);
-		for (const week of weeks) refreshShoppingWeek(state, week, now);
-	}
+	flushDirtyWeeks();
 	if (
 		state.recipes.length > MAX_RECIPES ||
 		state.pantry.length > 1000 ||
