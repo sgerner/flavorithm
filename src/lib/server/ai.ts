@@ -2359,17 +2359,15 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
-type CachedPublicCatalog = {
+const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+type PublicCatalogCacheEntry = {
 	pending: Promise<SupportedModelResponse>;
 	expiresAt: number;
 };
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
-const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let defaultPublicCatalog: CachedPublicCatalog | undefined;
-let customFetcherCatalogs = new WeakMap<Fetcher, CachedPublicCatalog>();
-
-function isDefaultPublicCatalogFetcher(fetcher: Fetcher): boolean {
-	return fetcher === globalThis.fetch || fetcher.name === 'server_fetch';
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
 }
 
 export async function getSupportedModels(
@@ -2391,31 +2389,24 @@ export async function getSupportedModels(
 	return transformModelCatalog(body);
 }
 
-export function getPublicModelCatalog(
-	fetcher: Fetcher = globalThis.fetch
-): Promise<SupportedModelResponse> {
-	const useDefaultCache = isDefaultPublicCatalogFetcher(fetcher);
-	const cached = useDefaultCache ? defaultPublicCatalog : customFetcherCatalogs.get(fetcher);
-	if (cached && Date.now() < cached.expiresAt) {
-		return cached.pending;
-	}
-	const expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	const key = publicCatalogKey(fetcher);
+	const cached = publicCatalogCache.get(key);
+	const now = Date.now();
+	if (cached && now < cached.expiresAt) return cached.pending;
+
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		const current = useDefaultCache ? defaultPublicCatalog : customFetcherCatalogs.get(fetcher);
-		if (current?.pending === pending) {
-			if (useDefaultCache) defaultPublicCatalog = undefined;
-			else customFetcherCatalogs.delete(fetcher);
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
 		}
 		throw error;
 	});
-	const entry: CachedPublicCatalog = { pending, expiresAt };
-	if (useDefaultCache) defaultPublicCatalog = entry;
-	else customFetcherCatalogs.set(fetcher, entry);
+	publicCatalogCache.set(key, { pending, expiresAt });
 	return pending;
 }
 
 /** Clear the shared catalog cache so injected-fetch tests remain isolated. */
 export function resetPublicModelCatalogCache(): void {
-	defaultPublicCatalog = undefined;
-	customFetcherCatalogs = new WeakMap<Fetcher, CachedPublicCatalog>();
+	publicCatalogCache = new WeakMap();
 }
