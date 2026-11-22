@@ -558,7 +558,11 @@ export function createKitchenSync(options: {
 			return;
 		}
 
-		const now = Date.now();
+		const latestJournalTimestamp = loaded.records.reduce(
+			(max, record) => Math.max(max, record.pending.createdAt ?? 0, record.pending.updatedAt),
+			0
+		);
+		const now = Math.max(Date.now(), latestJournalTimestamp + 1);
 		const pending: PendingKitchen = {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
