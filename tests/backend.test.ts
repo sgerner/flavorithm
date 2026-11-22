@@ -92,11 +92,141 @@ test('accounts, shared household state, invites and owner-safe leave', async () 
 
 	const aliceAfterLeave = backend.leaveHousehold(alice.user);
 	assert.notEqual(aliceAfterLeave.householdId, bobAfterJoin.householdId);
+	const alicePersonalState = backend.getState(aliceAfterLeave);
+	assert.ok(alicePersonalState);
+	assert.equal(alicePersonalState.recipes.length, data.seedRecipes.length);
+	assert.equal(
+		alicePersonalState.recipes.every((recipe: { saved?: boolean }) => recipe.saved === false),
+		true
+	);
+	assert.deepEqual(alicePersonalState.pantry, []);
+	assert.deepEqual(alicePersonalState.meals, []);
+	assert.deepEqual(alicePersonalState.shopping, []);
+	assert.equal(alicePersonalState.preferences.diet, 'Vegetarian');
+	assert.deepEqual(alicePersonalState.preferences.cuisines, ['Japanese']);
+	assert.deepEqual(
+		backend
+			.listHouseholdMembers(bobAfterJoin)
+			.map(({ id, role }: { id: string; role: 'owner' | 'member' }) => ({ id, role })),
+		[{ id: bobAfterJoin.id, role: 'owner' }]
+	);
+	assert.throws(() => backend.leaveHousehold(bobAfterJoin), { status: 400 });
+	assert.throws(() => backend.leaveHousehold(aliceAfterLeave), { status: 400 });
 	assert.equal(backend.listHouseholdMembers(bobAfterJoin).length, 1);
-	const bobAfterLeave = backend.leaveHousehold(bobAfterJoin);
-	assert.equal(backend.listHouseholdMembers(bobAfterLeave).length, 1);
-	assert.equal(backend.getState(bobAfterLeave), null);
+	assert.equal(backend.getState(bobAfterJoin)?.pantry[0]?.quantity, 4);
+	assert.equal(backend.getState(aliceAfterLeave)?.recipes.length, data.seedRecipes.length);
 	assert.equal(backend.getUserFromSession(alice.token)?.householdId, aliceAfterLeave.householdId);
+});
+
+test('populated solo kitchens require confirmation before joinHousehold replaces state or consumes invites', async () => {
+	const host = await backend.registerUser(
+		'Host Kitchen',
+		'host-join-guard@example.com',
+		'a secure host password'
+	);
+	const hostState = backend.getState(host.user)!;
+	hostState.pantry = [
+		{ id: 'host-olive-oil', name: 'Olive oil', quantity: 1, unit: 'bottle', category: 'Oils' }
+	];
+	backend.saveState(host.user, hostState, {
+		ifMatch: backend.getStateEtag(host.user),
+		ifNoneMatch: null
+	});
+
+	const populatedCases: Array<{ label: string; mutate: (state: any) => void }> = [
+		{
+			label: 'pantry stock',
+			mutate: (state) => {
+				state.pantry = [
+					{ id: 'beans', name: 'Black beans', quantity: 2, unit: 'cans', category: 'Canned goods' }
+				];
+			}
+		},
+		{
+			label: 'planned meal',
+			mutate: (state) => {
+				state.meals = [
+					{
+						id: 'meal-1',
+						date: '2026-11-22',
+						slot: 'Dinner',
+						recipeId: state.recipes[0].id,
+						servings: 2
+					}
+				];
+			}
+		},
+		{
+			label: 'shopping item',
+			mutate: (state) => {
+				state.shopping = [
+					{ id: 'shop-1', name: 'Lemons', quantity: 3, unit: 'whole', checked: false }
+				];
+			}
+		},
+		{
+			label: 'saved starter recipe',
+			mutate: (state) => {
+				state.recipes[0].saved = true;
+			}
+		},
+		{
+			label: 'custom recipe',
+			mutate: (state) => {
+				state.recipes.push({
+					...state.recipes[0],
+					id: 'custom-family-stew',
+					title: 'Family Stew',
+					saved: false
+				});
+			}
+		}
+	];
+
+	const db = backend.getDatabase();
+	for (const [index, entry] of populatedCases.entries()) {
+		const solo = await backend.registerUser(
+			`Solo ${index}`,
+			`solo-guard-${index}@example.com`,
+			'a secure solo password'
+		);
+		const oldHouseholdId = solo.user.householdId;
+		const soloState = backend.getState(solo.user)!;
+		entry.mutate(soloState);
+		backend.saveState(solo.user, soloState, {
+			ifMatch: backend.getStateEtag(solo.user),
+			ifNoneMatch: null
+		});
+
+		const invite = backend.createHouseholdInvite(host.user);
+		assert.throws(
+			() => backend.joinHousehold(solo.user, 'invalid-invite-code'),
+			{ status: 400 },
+			`invalid invite fails with 400 before confirmation check (${entry.label})`
+		);
+		assert.throws(
+			() => backend.joinHousehold(solo.user, invite.inviteCode),
+			{ status: 409, code: 'confirm_replace' },
+			`unconfirmed join rejected with 409 for ${entry.label}`
+		);
+
+		const inviteRow = db
+			.prepare('SELECT uses_remaining FROM household_invites WHERE invite_id = ?')
+			.get(invite.inviteId) as { uses_remaining: number } | undefined;
+		assert.equal(inviteRow?.uses_remaining, 1, `invite stays unconsumed for ${entry.label}`);
+		assert.ok(
+			db.prepare('SELECT 1 FROM household_state WHERE household_id = ?').get(oldHouseholdId),
+			`solo household_state preserved when unconfirmed for ${entry.label}`
+		);
+
+		const joined = backend.joinHousehold(solo.user, invite.inviteCode, { confirmReplace: true });
+		assert.equal(joined.householdId, host.user.householdId);
+		assert.equal(backend.getState(joined)?.pantry[0]?.name, 'Olive oil');
+		const usedInviteRow = db
+			.prepare('SELECT uses_remaining FROM household_invites WHERE invite_id = ?')
+			.get(invite.inviteId) as { uses_remaining: number } | undefined;
+		assert.equal(usedInviteRow?.uses_remaining, 0);
+	}
 });
 
 test('state validation rejects malformed values and registration enforces the UI password minimum', async () => {
@@ -343,4 +473,97 @@ test('reasoning preferences survive persistence and reject invalid budgets', asy
 	);
 	state.preferences.reasoning.budgetTokens = -1;
 	assert.equal(backend.validateAppState(state), null);
+});
+
+test('all foreign keys have unconditional leading indexes and auth/household queries avoid table scans', async () => {
+	await import('../src/lib/server/oauth-storage.ts');
+	await import('../src/lib/server/host-ai.ts');
+	await import('../src/lib/server/recipe-covers.ts');
+	const database = backend.getDatabase();
+
+	const tables = (
+		database
+			.prepare(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+			)
+			.all() as Array<{ name: string }>
+	).map((row) => row.name);
+	assert.equal(tables.length, 17);
+
+	let foreignKeyCount = 0;
+	for (const table of tables) {
+		const foreignKeys = database.prepare(`PRAGMA foreign_key_list("${table}")`).all() as Array<{
+			id: number;
+			seq: number;
+			table: string;
+			from: string;
+			to: string;
+		}>;
+		const indexes = database.prepare(`PRAGMA index_list("${table}")`).all() as Array<{
+			name: string;
+			partial: number;
+		}>;
+		for (const fk of foreignKeys) {
+			foreignKeyCount += 1;
+			assert.equal(fk.seq, 0, `Expected single-column foreign key on ${table}.${fk.from}`);
+			const hasLeadingUnconditionalIndex = indexes.some((index) => {
+				if (index.partial !== 0) return false;
+				const columns = database.prepare(`PRAGMA index_info("${index.name}")`).all() as Array<{
+					seqno: number;
+					name: string | null;
+				}>;
+				return columns.some((column) => column.seqno === 0 && column.name === fk.from);
+			});
+			assert.equal(
+				hasLeadingUnconditionalIndex,
+				true,
+				`Expected unconditional leading index on ${table}.${fk.from} -> ${fk.table}.${fk.to}`
+			);
+		}
+	}
+	assert.equal(foreignKeyCount, 14);
+
+	const queries = [
+		'DELETE FROM users WHERE id = ?',
+		'DELETE FROM households WHERE id = ?',
+		`SELECT invite_id AS inviteId, expires_at AS expiresAt
+		 FROM household_invites
+		 WHERE household_id = ? AND expires_at > ? AND uses_remaining > 0
+		 ORDER BY expires_at`,
+		'DELETE FROM sessions WHERE user_id = ?',
+		'DELETE FROM password_reset_tokens WHERE user_id = ?',
+		'DELETE FROM email_verification_tokens WHERE user_id = ?',
+		'DELETE FROM sessions WHERE expires_at <= ?',
+		'DELETE FROM password_reset_tokens WHERE expires_at <= ?',
+		'DELETE FROM email_verification_tokens WHERE expires_at <= ?',
+		'DELETE FROM oidc_login_transactions WHERE expires_at <= ?'
+	];
+
+	for (const sql of queries) {
+		const plan = database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{
+			parent: number;
+			detail: string;
+		}>;
+		assert.ok(plan.length > 0, `Expected query plan for: ${sql}`);
+		assert.equal(
+			plan.some((step) => step.detail.startsWith('SEARCH ')),
+			true,
+			`Expected SEARCH step in plan for ${sql}: ${JSON.stringify(plan)}`
+		);
+		for (const step of plan) {
+			assert.doesNotMatch(step.detail, /\bSCAN\b/, `Unexpected SCAN in plan for: ${sql}`);
+			assert.doesNotMatch(
+				step.detail,
+				/TEMP B-TREE/,
+				`Unexpected TEMP B-TREE sort in plan for: ${sql}`
+			);
+			if (step.parent === 0) {
+				assert.match(
+					step.detail,
+					/^(SEARCH |MULTI-INDEX OR$)/,
+					`Expected SEARCH or MULTI-INDEX OR root step for: ${sql}`
+				);
+			}
+		}
+	}
 });

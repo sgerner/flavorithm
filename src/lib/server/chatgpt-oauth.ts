@@ -6,7 +6,7 @@ import {
 	codexSubscriptionFetch
 } from './codex-device.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { CompanionConfig } from './chatgpt-companion.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from 'jose';
@@ -16,6 +16,8 @@ import {
 	clearChatGPTCredentials,
 	consumeHostedOAuthTransaction,
 	consumeChatGPTPairing,
+	decipherOAuthEnvelope,
+	decodeHostedEncryptionKey,
 	decryptChatGPTCredentials,
 	ensureChatGPTHostId,
 	getChatGPTAccount,
@@ -140,13 +142,6 @@ function isLoopbackOrigin(value: string): boolean {
 	} catch {
 		return false;
 	}
-}
-
-function decodeHostedEncryptionKey(): boolean {
-	const raw = process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY?.trim();
-	if (!raw) return false;
-	const value = Buffer.from(raw, 'base64');
-	return value.length === 32 && value.toString('base64') === raw;
 }
 
 function hostedClientConfig(): HostedClient | null {
@@ -527,18 +522,12 @@ export async function finishChatGPTCompanion(input: {
 		);
 	let imported: { clientId: string; token: Record<string, unknown>; receivedAt: number };
 	try {
-		const decipher = createDecipheriv(
-			'aes-256-gcm',
-			Buffer.from(setup.pairingKey, 'base64url'),
-			Buffer.from(input.bundle.iv, 'base64url')
-		);
-		decipher.setAAD(Buffer.from(`flavorithm:companion:${setup.origin}:${setup.pairingId}`));
-		decipher.setAuthTag(Buffer.from(input.bundle.tag, 'base64url'));
 		imported = JSON.parse(
-			Buffer.concat([
-				decipher.update(Buffer.from(input.bundle.data, 'base64url')),
-				decipher.final()
-			]).toString('utf8')
+			decipherOAuthEnvelope(
+				input.bundle,
+				Buffer.from(setup.pairingKey, 'base64url'),
+				Buffer.from(`flavorithm:companion:${setup.origin}:${setup.pairingId}`)
+			)
 		);
 	} catch {
 		throw new ChatGPTOAuthError(

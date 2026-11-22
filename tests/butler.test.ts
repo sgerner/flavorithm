@@ -119,6 +119,117 @@ test('unsupported actions, unsafe images, invalid calendar dates and preference 
 	assert.doesNotThrow(() => z.toJSONSchema(ButlerResponseSchema));
 });
 
+test('ButlerResponseSchema produces expected JSON Schema and rejects non-finite numbers and invalid datetimes', () => {
+	const schema = z.toJSONSchema(ButlerResponseSchema) as Record<string, any>;
+	assert.equal(schema.$schema, 'https://json-schema.org/draft/2020-12/schema');
+	assert.equal(schema.type, 'object');
+	assert.deepEqual(schema.required, ['reply', 'commands']);
+	assert.equal(schema.additionalProperties, false);
+	assert.deepEqual(schema.properties.reply, {
+		type: 'string',
+		minLength: 1,
+		maxLength: 12000
+	});
+	assert.equal(schema.properties.commands.type, 'array');
+	assert.equal(schema.properties.commands.maxItems, 50);
+
+	const variants = schema.properties.commands.items.oneOf as Array<Record<string, any>>;
+	assert.equal(variants.length, 14);
+
+	const recipeUpsert = variants.find((item) => item.properties.type.const === 'recipe.upsert')!;
+	assert.deepEqual(recipeUpsert.properties.recipe.properties.servings, {
+		type: 'number',
+		minimum: 1,
+		maximum: 10000
+	});
+	assert.deepEqual(recipeUpsert.properties.recipe.properties.nutrition.properties.calories, {
+		type: 'number',
+		minimum: 0,
+		maximum: 1000000
+	});
+
+	const mealUpsert = variants.find((item) => item.properties.type.const === 'meal.upsert')!;
+	assert.deepEqual(mealUpsert.properties.meal.properties.servings, {
+		type: 'number',
+		minimum: 1,
+		maximum: 10000
+	});
+	const completedAtSchema = mealUpsert.properties.meal.properties.completedAt;
+	assert.equal(completedAtSchema.type, 'string');
+	assert.equal(completedAtSchema.format, 'date-time');
+	assert.equal(new RegExp(completedAtSchema.pattern).test('2026-10-22T12:00:00Z'), true);
+	assert.equal(new RegExp(completedAtSchema.pattern).test('2026-10-22 12:00:00'), false);
+
+	const preferencesUpdate = variants.find(
+		(item) => item.properties.type.const === 'preferences.update'
+	)!;
+	assert.deepEqual(preferencesUpdate.properties.preferences.properties.maxTime, {
+		type: 'number',
+		minimum: 0,
+		maximum: 100000
+	});
+	assert.equal(preferencesUpdate.properties.preferences.additionalProperties, false);
+
+	assert.equal(
+		ButlerResponseSchema.safeParse({
+			reply: 'Planned dinner.',
+			commands: [
+				{
+					type: 'meal.upsert',
+					meal: {
+						id: 'dinner',
+						date: '2026-10-23',
+						slot: 'Dinner',
+						recipeId: 'soup',
+						servings: 2,
+						completedAt: '2026-10-23T18:30:00.000Z'
+					}
+				}
+			]
+		}).success,
+		true
+	);
+	assert.equal(
+		ButlerResponseSchema.safeParse({
+			reply: 'Bad timestamp.',
+			commands: [
+				{
+					type: 'meal.upsert',
+					meal: {
+						id: 'dinner',
+						date: '2026-10-23',
+						slot: 'Dinner',
+						recipeId: 'soup',
+						servings: 2,
+						completedAt: '2026-10-23 18:30:00'
+					}
+				}
+			]
+		}).success,
+		false
+	);
+	for (const badValue of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+		assert.equal(
+			ButlerResponseSchema.safeParse({
+				reply: 'Non-finite pantry quantity.',
+				commands: [
+					{
+						type: 'pantry.upsert',
+						item: {
+							id: 'salt',
+							name: 'Salt',
+							quantity: badValue,
+							unit: 'tsp',
+							category: 'Spices'
+						}
+					}
+				]
+			}).success,
+			false
+		);
+	}
+});
+
 test('weekly shopping ignores cooked meals and expired pantry and shares the UI scope', () => {
 	const current = createInitialState();
 	const recipe = current.recipes[0];
@@ -256,4 +367,92 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 	assert.deepEqual(result.state.shopping, [
 		{ id: 'manual', name: 'tea', quantity: 1, unit: 'box', checked: false }
 	]);
+});
+
+test('recipe.delete retains checked recipe purchases and shopping.delete refreshes checked week scopes only', () => {
+	const now = new Date('2026-10-23T12:00:00Z');
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	recipe.ingredients = [
+		{ name: 'carrot', quantity: 4, unit: 'each' },
+		{ name: 'onion', quantity: 2, unit: 'each' }
+	];
+	current.pantry = [];
+	current.meals = [
+		{
+			id: 'meal',
+			recipeId: recipe.id,
+			date: '2026-10-23',
+			slot: 'Dinner',
+			servings: recipe.servings
+		}
+	];
+	current.shopping = [
+		{
+			id: 'recipe-bought',
+			name: 'olive oil',
+			quantity: 1,
+			unit: 'cup',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		},
+		{
+			id: 'recipe-needed',
+			name: 'carrot',
+			quantity: 4,
+			unit: 'each',
+			checked: false,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	];
+
+	const afterRecipeDelete = applyButlerCommands(
+		current,
+		[{ type: 'recipe.delete', id: recipe.id }],
+		now
+	).state;
+	assert.deepEqual(afterRecipeDelete.shopping, [
+		{
+			id: 'recipe-bought',
+			name: 'olive oil',
+			quantity: 1,
+			unit: 'cup',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	]);
+
+	// Weekly shopping: generate week, dismiss unchecked onion, check carrot, then delete checked carrot
+	const generated = applyButlerCommands(
+		{ ...current, shopping: [] },
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	const onion = generated.shopping.find((item) => item.name === 'onion')!;
+	const afterDismissOnion = applyButlerCommands(
+		generated,
+		[{ type: 'shopping.delete', id: onion.id }],
+		now
+	).state;
+	assert.equal(
+		afterDismissOnion.shopping.some((item) => item.name === 'onion'),
+		false
+	);
+
+	const carrot = afterDismissOnion.shopping.find((item) => item.name === 'carrot')!;
+	const withCheckedCarrot = applyButlerCommands(
+		afterDismissOnion,
+		[{ type: 'shopping.upsert', item: { ...carrot, checked: true } }],
+		now
+	).state;
+	const afterDeleteCheckedCarrot = applyButlerCommands(
+		withCheckedCarrot,
+		[{ type: 'shopping.delete', id: carrot.id }],
+		now
+	).state;
+	const refreshedCarrot = afterDeleteCheckedCarrot.shopping.find((item) => item.name === 'carrot');
+	assert.ok(refreshedCarrot);
+	assert.equal(refreshedCarrot.checked, false);
+	assert.equal(refreshedCarrot.quantity, 4);
+	assert.equal(refreshedCarrot.sourceKey, 'week:2026-10-19');
 });

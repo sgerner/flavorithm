@@ -1,17 +1,21 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { ChatGPTInferenceError } from '../src/lib/server/chatgpt-inference.ts';
 import {
 	AIRequestError,
 	fetchCaptureRecipePage,
 	fetchRecipePage,
+	getPublicModelCatalog,
 	getSupportedModels,
+	resetPublicModelCatalogCache,
 	runAIRequest,
 	transformModelCatalog,
 	validateCaptureRecipeUrl,
 	validateRecipeUrl
 } from '../src/lib/server/ai.ts';
+
+beforeEach(() => resetPublicModelCatalogCache());
 
 const nutrition = {
 	calories: 420,
@@ -280,8 +284,97 @@ test('capture turns recipe text into an unsaved validated draft and never fetche
 	assert.equal(result.recipe.saved, false);
 	assert.equal(result.recipe.image, '');
 	assert.equal(result.recipe.source, undefined);
-	assert.deepEqual(result.assumptions, capturedRecipe.assumptions);
+	assert.equal(result.recipe.provenance, 'ai-generated');
+	assert.equal(result.assumptions.length, capturedRecipe.assumptions.length + 1);
+	assert.match(result.assumptions[0], /not fetched/i);
+	assert.deepEqual(result.assumptions.slice(1), capturedRecipe.assumptions);
 	assert.equal(JSON.stringify(result).includes('temporary-capture-key'), false);
+});
+
+test('capture fetches url while applying prompt as user notes and preserves web-import provenance', async () => {
+	let pageFetches = 0;
+	let observedUrl = '';
+	let observedPrompt = '';
+	const pageHtml = structuredRecipeHtml({ calories: '380 kcal' });
+	const fetcher: typeof fetch = async (_input, init) => {
+		observedPrompt = JSON.parse(String(init?.body)).messages[1].content;
+		return jsonResponse({
+			choices: [{ message: { content: JSON.stringify(capturedRecipe) } }]
+		});
+	};
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/chickpea-skillet',
+			prompt: 'Double the garlic and use smoked paprika.'
+		},
+		fetcher,
+		async (url) => {
+			pageFetches += 1;
+			observedUrl = url;
+			return new Response(pageHtml, { headers: { 'content-type': 'text/html' } });
+		}
+	)) as any;
+
+	assert.equal(pageFetches, 1);
+	assert.equal(observedUrl, 'https://recipes.example.test/chickpea-skillet');
+	assert.match(observedPrompt, /User notes for the fetched recipe:/);
+	assert.match(observedPrompt, /Double the garlic and use smoked paprika\./);
+	assert.match(observedPrompt, /Structured recipe data from the fetched page:/);
+	assert.doesNotMatch(observedPrompt, /Recipe text supplied by the user:/);
+	assert.equal(result.recipe.source, 'https://recipes.example.test/chickpea-skillet');
+	assert.equal(result.recipe.provenance, 'web-import');
+	assert.deepEqual(result.assumptions, capturedRecipe.assumptions);
+});
+
+test('capture skips fetching links accompanied by notes in prompt and bounds assumptions warnings', async () => {
+	let pageFetches = 0;
+	const maxAssumptions = Array.from({ length: 30 }, (_, index) =>
+		`Assumption ${index + 1}: ${'x'.repeat(300)}`.slice(0, 300)
+	);
+	const fetcher: typeof fetch = async () =>
+		jsonResponse({
+			choices: [
+				{
+					message: {
+						content: JSON.stringify({
+							...capturedRecipe,
+							assumptions: maxAssumptions
+						})
+					}
+				}
+			]
+		});
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: '',
+			prompt: 'https://recipes.example.test/chili\nMake it vegetarian and halve the salt.'
+		},
+		fetcher,
+		async () => {
+			pageFetches += 1;
+			throw new Error('unseparated links in prompt must not be fetched');
+		}
+	)) as any;
+
+	assert.equal(pageFetches, 0);
+	assert.equal(result.recipe.source, undefined);
+	assert.equal(result.recipe.provenance, 'ai-generated');
+	assert.equal(result.assumptions.length, 30);
+	assert.match(result.assumptions[0], /not fetched/i);
+	assert.deepEqual(result.assumptions.slice(1), maxAssumptions.slice(0, 29));
+	for (const note of result.assumptions) {
+		assert.ok(note.length >= 1 && note.length <= 300);
+	}
 });
 
 test('capture sends photo bytes to Anthropic and includes assumptions in its response schema', async () => {
@@ -1107,7 +1200,9 @@ test('search fails with a clear configuration error when Brave is not configured
 			(error: unknown) =>
 				error instanceof AIRequestError &&
 				error.status === 503 &&
-				error.message.includes('BRAVE_SEARCH_API_KEY')
+				error.message ===
+					'Recipe search is not configured on this installation. Ask the server operator to enable online recipe search.' &&
+				!error.message.includes('BRAVE_SEARCH_API_KEY')
 		);
 	} finally {
 		if (previous === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
@@ -1246,6 +1341,329 @@ test('import normalizes a real allowlisted JSON-LD recipe and preserves server-v
 	assert.equal(result.recipes[0].nutrition.sodium, 600);
 	assert.match(result.recipes[0].id, /^[0-9a-f-]{36}$/i);
 	assert.equal(JSON.stringify(result).includes('temporary-import-key'), false);
+});
+
+test('import routes Anthropic requests with text-only content, import schema, and reasoning budget', async () => {
+	const sourceImage = 'https://images.allrecipes.com/anthropic-recipe.jpg';
+	const html = `
+		<link rel="canonical" href="https://www.allrecipes.com/recipe/anthropic-original/">
+		<script type="application/ld+json">${JSON.stringify({
+			'@context': 'https://schema.org',
+			'@type': 'Recipe',
+			name: 'Source Lentil Stew',
+			description: 'A hearty lentil stew.',
+			image: sourceImage,
+			recipeYield: '4 servings',
+			totalTime: 'PT35M',
+			recipeIngredient: ['1 cup lentils'],
+			recipeInstructions: ['Simmer the lentils.']
+		})}</script>
+	`;
+	const catalog = {
+		anthropic: {
+			name: 'Anthropic',
+			models: {
+				'claude-sonnet-4-6': {
+					reasoning: true,
+					reasoning_options: [{ type: 'effort', values: ['low', 'high'] }],
+					modalities: { input: ['text', 'image'], output: ['text'] }
+				}
+			}
+		}
+	};
+	let observedUrl = '';
+	let observedHeaders: Headers | undefined;
+	let observedBody: any;
+	const fetcher: typeof fetch = async (input, init) => {
+		if (String(input) === 'https://models.dev/api.json') return jsonResponse(catalog);
+		observedUrl = String(input);
+		observedHeaders = new Headers(init?.headers);
+		observedBody = JSON.parse(String(init?.body));
+		return jsonResponse({
+			content: [
+				{
+					type: 'text',
+					text: JSON.stringify({
+						...generatedRecipe,
+						image: 'https://model-invented.example/ignored.jpg'
+					})
+				}
+			]
+		});
+	};
+
+	const result = (await runAIRequest(
+		{
+			action: 'import',
+			provider: 'anthropic',
+			model: 'claude-sonnet-4-6',
+			apiKey: 'anthropic-import-key',
+			url: 'https://www.allrecipes.com/recipe/selected/',
+			reasoning: { effort: 'high' }
+		},
+		fetcher,
+		async () => new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } })
+	)) as any;
+
+	assert.equal(observedUrl, 'https://api.anthropic.com/v1/messages');
+	assert.equal(observedHeaders?.get('x-api-key'), 'anthropic-import-key');
+	assert.equal(typeof observedBody.messages[0].content, 'string');
+	assert.match(observedBody.messages[0].content, /1 cup lentils/);
+	assert.equal(observedBody.max_tokens, 4096 + 4096);
+	assert.deepEqual(observedBody.thinking, { type: 'adaptive' });
+	assert.equal(observedBody.output_config.effort, 'high');
+	assert.equal(observedBody.output_config.format.type, 'json_schema');
+	assert.equal(observedBody.output_config.format.schema.properties.assumptions, undefined);
+	assert.equal(result.recipes[0].source, 'https://www.allrecipes.com/recipe/anthropic-original/');
+	assert.equal(result.recipes[0].image, sourceImage);
+	assert.equal(result.recipes[0].provenance, 'web-import');
+});
+
+test('token budgets apply action tiers, reasoning reserves, provider keys, and keep Google distinct', async () => {
+	const catalog = {
+		openai: {
+			name: 'OpenAI',
+			models: {
+				'gpt-test': {
+					reasoning: true,
+					reasoning_options: [{ type: 'effort', values: ['low', 'high'] }],
+					modalities: { input: ['text', 'image'], output: ['text'] }
+				}
+			}
+		},
+		openrouter: {
+			name: 'OpenRouter',
+			models: {
+				'or-test': {
+					reasoning: true,
+					reasoning_options: [
+						{ type: 'effort', values: ['low', 'high'] },
+						{ type: 'toggle' },
+						{ type: 'budget_tokens', min: 0, max: 8192 }
+					],
+					modalities: { input: ['text', 'image'], output: ['text'] }
+				}
+			}
+		},
+		anthropic: {
+			name: 'Anthropic',
+			models: {
+				'claude-adaptive': {
+					reasoning: true,
+					reasoning_options: [{ type: 'effort', values: ['low', 'high'] }],
+					modalities: { input: ['text', 'image'], output: ['text'] }
+				},
+				'claude-budget': {
+					reasoning: true,
+					reasoning_options: [{ type: 'budget_tokens', min: 1024, max: 8192 }],
+					modalities: { input: ['text', 'image'], output: ['text'] }
+				}
+			}
+		},
+		google: {
+			name: 'Google',
+			models: {
+				'gemini-effort': {
+					reasoning: true,
+					reasoning_options: [{ type: 'effort', values: ['low', 'high'] }],
+					modalities: { input: ['text', 'image'], output: ['text'] }
+				},
+				'gemini-budget': {
+					reasoning: true,
+					reasoning_options: [{ type: 'budget_tokens', min: 1024, max: 8192 }],
+					modalities: { input: ['text', 'image'], output: ['text'] }
+				}
+			}
+		}
+	};
+
+	const recipeForNutrition = { ...generatedRecipe, id: 'recipe-1' };
+	const chatContext = JSON.stringify({
+		recipes: [],
+		meals: [],
+		pantry: [],
+		shopping: [],
+		today: '2026-11-21'
+	});
+	const pageFetcher = async () =>
+		new Response(structuredRecipeHtml(undefined), { headers: { 'content-type': 'text/html' } });
+
+	const actionInputs: Array<{
+		action: 'chat' | 'generate' | 'import' | 'capture' | 'vision' | 'nutrition';
+		expectedBase: number;
+		extra: Record<string, unknown>;
+		responsePayload: unknown;
+	}> = [
+		{
+			action: 'chat',
+			expectedBase: 8192,
+			extra: { messages: [{ role: 'user', content: 'Plan dinner.' }], context: chatContext },
+			responsePayload: { reply: 'Dinner is arranged.', commands: [] }
+		},
+		{
+			action: 'generate',
+			expectedBase: 4096,
+			extra: { preferences },
+			responsePayload: { recipes: [generatedRecipe] }
+		},
+		{
+			action: 'import',
+			expectedBase: 4096,
+			extra: { url: 'https://www.allrecipes.com/recipe/rice' },
+			responsePayload: generatedRecipe
+		},
+		{
+			action: 'capture',
+			expectedBase: 4096,
+			extra: { prompt: 'Rice and chickpeas' },
+			responsePayload: capturedRecipe
+		},
+		{
+			action: 'vision',
+			expectedBase: 1200,
+			extra: { image: 'data:image/png;base64,aGVsbG8=' },
+			responsePayload: {
+				ingredients: [{ name: 'apple', quantity: 1, unit: 'item', category: 'Produce' }]
+			}
+		},
+		{
+			action: 'nutrition',
+			expectedBase: 1200,
+			extra: { recipe: recipeForNutrition },
+			responsePayload: nutrition
+		}
+	];
+
+	for (const { action, expectedBase, extra, responsePayload } of actionInputs) {
+		for (const [provider, model] of [
+			['openai', 'gpt-test'],
+			['openrouter', 'or-test'],
+			['anthropic', 'claude-adaptive']
+		] as const) {
+			let observedBody: any;
+			await runAIRequest(
+				{ action, provider, model, apiKey: 'test-key', ...extra },
+				async (input, init) => {
+					if (String(input) === 'https://models.dev/api.json') return jsonResponse(catalog);
+					observedBody = JSON.parse(String(init?.body));
+					const serialized = JSON.stringify(responsePayload);
+					return provider === 'anthropic'
+						? jsonResponse({ content: [{ type: 'text', text: serialized }] })
+						: jsonResponse({ choices: [{ message: { content: serialized } }] });
+				},
+				pageFetcher
+			);
+
+			if (provider === 'openai') {
+				assert.equal(observedBody.max_completion_tokens, expectedBase, `${provider}:${action}`);
+				assert.equal(observedBody.max_tokens, undefined, `${provider}:${action}`);
+			} else {
+				assert.equal(observedBody.max_tokens, expectedBase, `${provider}:${action}`);
+				assert.equal(observedBody.max_completion_tokens, undefined, `${provider}:${action}`);
+			}
+		}
+	}
+
+	const reserveCases: Array<{
+		label: string;
+		provider: 'openai' | 'openrouter' | 'anthropic';
+		model: string;
+		reasoning?: Record<string, unknown>;
+		expectedTokens: number;
+	}> = [
+		{
+			label: 'openai effort without budgetTokens adds 4096',
+			provider: 'openai',
+			model: 'gpt-test',
+			reasoning: { effort: 'high' },
+			expectedTokens: 1200 + 4096
+		},
+		{
+			label: 'openrouter effort without budgetTokens adds 4096',
+			provider: 'openrouter',
+			model: 'or-test',
+			reasoning: { effort: 'high' },
+			expectedTokens: 1200 + 4096
+		},
+		{
+			label: 'openrouter explicit budgetTokens adds exact budget',
+			provider: 'openrouter',
+			model: 'or-test',
+			reasoning: { budgetTokens: 2048 },
+			expectedTokens: 1200 + 2048
+		},
+		{
+			label: 'openrouter zero budgetTokens adds 0',
+			provider: 'openrouter',
+			model: 'or-test',
+			reasoning: { budgetTokens: 0 },
+			expectedTokens: 1200
+		},
+		{
+			label: 'anthropic adaptive effort without budgetTokens adds 4096',
+			provider: 'anthropic',
+			model: 'claude-adaptive',
+			reasoning: { effort: 'high' },
+			expectedTokens: 1200 + 4096
+		},
+		{
+			label: 'anthropic explicit budgetTokens adds exact budget',
+			provider: 'anthropic',
+			model: 'claude-budget',
+			reasoning: { budgetTokens: 3072 },
+			expectedTokens: 1200 + 3072
+		}
+	];
+
+	for (const { label, provider, model, reasoning, expectedTokens } of reserveCases) {
+		let observedBody: any;
+		await runAIRequest(
+			{
+				action: 'nutrition',
+				provider,
+				model,
+				apiKey: 'test-key',
+				recipe: recipeForNutrition,
+				reasoning
+			},
+			async (input, init) => {
+				if (String(input) === 'https://models.dev/api.json') return jsonResponse(catalog);
+				observedBody = JSON.parse(String(init?.body));
+				return provider === 'anthropic'
+					? jsonResponse({ content: [{ type: 'text', text: JSON.stringify(nutrition) }] })
+					: jsonResponse({ choices: [{ message: { content: JSON.stringify(nutrition) } }] });
+			}
+		);
+		const actual =
+			provider === 'openai' ? observedBody.max_completion_tokens : observedBody.max_tokens;
+		assert.equal(actual, expectedTokens, label);
+	}
+
+	for (const [model, reasoning, expectedMaxOutputTokens] of [
+		['gemini-effort', undefined, 8192],
+		['gemini-effort', { effort: 'high' }, 8192],
+		['gemini-budget', { budgetTokens: 2048 }, 8192 + 2048]
+	] as const) {
+		let observedBody: any;
+		await runAIRequest(
+			{
+				action: 'nutrition',
+				provider: 'google',
+				model,
+				apiKey: 'test-key',
+				recipe: recipeForNutrition,
+				reasoning
+			},
+			async (input, init) => {
+				if (String(input) === 'https://models.dev/api.json') return jsonResponse(catalog);
+				observedBody = JSON.parse(String(init?.body));
+				return jsonResponse({
+					candidates: [{ content: { parts: [{ text: JSON.stringify(nutrition) }] } }]
+				});
+			}
+		);
+		assert.equal(observedBody.generationConfig.maxOutputTokens, expectedMaxOutputTokens);
+	}
 });
 
 test('import rejects unapproved URLs before fetching a page or calling an AI provider', async () => {
@@ -1526,4 +1944,58 @@ test('model endpoint fetch uses the public models.dev catalog URL', async () => 
 			models: [{ id: 'openai/gpt-4.1-mini', name: 'GPT-4.1 mini', vision: true }]
 		}
 	]);
+});
+
+test('getPublicModelCatalog isolates custom fetchers while sharing cache across SvelteKit server_fetch wrappers', async (t) => {
+	let firstCalls = 0;
+	const firstFetcher: typeof fetch = async () => {
+		firstCalls += 1;
+		return jsonResponse({
+			anthropic: {
+				name: 'Anthropic',
+				models: { 'claude-only': { name: 'Claude Only', modalities: { input: ['text'] } } }
+			}
+		});
+	};
+	let secondCalls = 0;
+	const secondFetcher: typeof fetch = async () => {
+		secondCalls += 1;
+		return jsonResponse({
+			openai: {
+				name: 'OpenAI',
+				models: { 'gpt-only': { name: 'GPT Only', modalities: { input: ['text'] } } }
+			}
+		});
+	};
+
+	const first = await getPublicModelCatalog(firstFetcher);
+	const firstCached = await getPublicModelCatalog(firstFetcher);
+	const second = await getPublicModelCatalog(secondFetcher);
+	assert.equal(firstCalls, 1);
+	assert.equal(secondCalls, 1);
+	assert.equal(first.providers[0]?.id, 'anthropic');
+	assert.equal(firstCached.providers[0]?.id, 'anthropic');
+	assert.equal(second.providers[0]?.id, 'openai');
+
+	let globalCalls = 0;
+	t.mock.method(globalThis, 'fetch', async () => {
+		globalCalls += 1;
+		return jsonResponse({
+			google: {
+				name: 'Google',
+				models: { 'gemini-shared': { name: 'Gemini Shared', modalities: { input: ['text'] } } }
+			}
+		});
+	});
+	const makeServerFetch = (): typeof fetch => {
+		const server_fetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
+		return server_fetch;
+	};
+	const requestOneCatalog = await getPublicModelCatalog(makeServerFetch());
+	const requestTwoCatalog = await getPublicModelCatalog(makeServerFetch());
+	const directGlobalCatalog = await getPublicModelCatalog();
+	assert.equal(globalCalls, 1);
+	assert.equal(requestOneCatalog.providers[0]?.id, 'google');
+	assert.equal(requestTwoCatalog.providers[0]?.id, 'google');
+	assert.equal(directGlobalCatalog.providers[0]?.id, 'google');
 });
