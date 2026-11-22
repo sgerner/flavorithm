@@ -23,6 +23,7 @@ const SEARCH_TIMEOUT_MS = 15_000;
 const IMPORT_TIMEOUT_MS = 8_000;
 const MAX_RECIPE_PAGE_BYTES = 1_000_000;
 const MAX_CAPTURE_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_ANTHROPIC_BASE64_BYTES = 5 * 1024 * 1024;
 
 export class AIRequestError extends Error {
 	status: number;
@@ -423,6 +424,9 @@ export async function runAIRequest(
 
 	const prompt = buildPrompt(request);
 	const image = request.action === 'vision' ? parseDataImage(request.image) : undefined;
+	if (image && image.byteLength > MAX_CAPTURE_IMAGE_BYTES) {
+		throw new AIRequestError('Ingredient photos must be 5 MB or smaller.', 413);
+	}
 	assertRequestActive(requestSignal);
 	const modelResult =
 		provider === 'anthropic'
@@ -778,6 +782,12 @@ async function callAnthropic(
 	fetcher: Fetcher,
 	reasoning?: ReasoningSettings
 ) {
+	if (image && image.base64.length > MAX_ANTHROPIC_BASE64_BYTES) {
+		throw new AIRequestError(
+			'Photos sent to Anthropic must be 5 MB or smaller after encoding.',
+			413
+		);
+	}
 	const userContent = image
 		? [
 				{

@@ -1067,6 +1067,37 @@ test('capture rejects empty input, unsafe URLs, malformed provider results, and 
 		),
 		(error: unknown) => error instanceof AIRequestError && error.status === 413
 	);
+	await assert.rejects(
+		runAIRequest(
+			{
+				action: 'vision',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'vision-key',
+				image: oversizedImage
+			},
+			noFetch
+		),
+		(error: unknown) => error instanceof AIRequestError && error.status === 413
+	);
+
+	const anthropicOversizedBase64 = `data:image/jpeg;base64,${Buffer.alloc(3_932_161).toString('base64')}`;
+	for (const action of ['vision', 'capture'] as const) {
+		await assert.rejects(
+			runAIRequest(
+				{
+					action,
+					provider: 'anthropic',
+					model: 'claude-sonnet-4-6',
+					apiKey: 'anthropic-key',
+					image: anthropicOversizedBase64
+				},
+				noFetch
+			),
+			(error: unknown) => error instanceof AIRequestError && error.status === 413
+		);
+	}
+	assert.equal(fetches, 0);
 
 	await assert.rejects(
 		runAIRequest(

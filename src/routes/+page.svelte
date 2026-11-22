@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick } from 'svelte';
 	import type { PageData } from './$types';
@@ -1467,7 +1468,7 @@
 				modal = 'leave';
 				break;
 			case 'scan':
-				imageInput?.click();
+				if (!busy) imageInput?.click();
 				break;
 			case 'dictate':
 				dictateRecipe();
@@ -1503,20 +1504,16 @@
 		}
 	}
 	async function scan(event: Event) {
-		const file = (event.target as HTMLInputElement).files?.[0];
-		if (!file || !needAI()) return;
-		if (file.size > 5 * 1024 * 1024) {
-			notify('Choose a photo under 5 MB.');
+		const input = event.currentTarget as HTMLInputElement | null;
+		const file = (input ?? (event.target as HTMLInputElement | null))?.files?.[0];
+		if (!file || busy || !needAI()) {
+			if (input) input.value = '';
+			if (imageInput) imageInput.value = '';
 			return;
 		}
 		busy = true;
 		try {
-			const image = await new Promise<string>((resolve, reject) => {
-				const reader = new FileReader();
-				reader.onload = () => resolve(String(reader.result));
-				reader.onerror = reject;
-				reader.readAsDataURL(file);
-			});
+			const image = await prepareAIPhoto(file);
 			const result = await ai('vision', { image });
 			const recognized = result.ingredients
 				.map((i: any) => `${i.quantity} ${i.unit} ${i.name}`)
@@ -1525,9 +1522,12 @@
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
-			notify((e as Error).message);
+			notify(
+				e instanceof Error && e.message ? e.message : 'Could not read that photo. Try another file.'
+			);
 		} finally {
 			busy = false;
+			if (input) input.value = '';
 			if (imageInput) imageInput.value = '';
 		}
 	}
@@ -2182,6 +2182,7 @@
 	accept="image/jpeg,image/png,image/webp"
 	aria-label="Scan pantry ingredients from a photo"
 	bind:this={imageInput}
+	disabled={busy}
 	onchange={scan}
 />
 <a
@@ -2319,6 +2320,7 @@
 						<button
 							class="secondary"
 							aria-label="Scan ingredients from a photo"
+							disabled={busy}
 							onclick={() => imageInput.click()}><Camera size={19} /></button
 						>
 						<button class="secondary" aria-label="Dictate ingredients" onclick={dictate}
@@ -2338,6 +2340,7 @@
 								><button
 									class="banner-icon"
 									aria-label="Scan ingredients from a photo"
+									disabled={busy}
 									onclick={() => imageInput.click()}><Camera size={20} /></button
 								><button class="banner-icon" aria-label="Dictate ingredients" onclick={dictate}
 									><Mic size={20} /></button
@@ -2493,7 +2496,7 @@
 							}}>Clear depleted items</button
 						>{/if}
 					<div>
-						<button class="secondary" onclick={() => imageInput.click()}
+						<button class="secondary" disabled={busy} onclick={() => imageInput.click()}
 							><Camera size={17} /> Scan a photo</button
 						><button class="secondary" onclick={dictate}
 							><Mic size={17} /> Tell us what you have</button

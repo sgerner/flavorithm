@@ -165,7 +165,7 @@ To stop sharing, the admin can click **Disable host connection**. Disconnecting 
 
 ### Import a recipe
 
-Choose **Import** in Discover or Recipe collection. One box accepts complete recipes, rough notes, or a standalone HTTPS link. Add a JPG, PNG, or WebP photo (up to 5 MB), paste an image from the clipboard, or drop a photo or text into the box. **Use voice** records and appends editable transcription using the selected voice connection (or browser dictation). Text input is limited to 20,000 characters.
+Choose **Import** in Discover or Recipe collection. One box accepts complete recipes, rough notes, or a standalone HTTPS link. Add a JPG, PNG, or WebP photo (up to 20 MB, resized automatically in the browser before upload), paste an image from the clipboard, or drop a photo or text into the box. **Use voice** records and appends editable transcription using the selected voice connection (or browser dictation). Text input is limited to 20,000 characters.
 
 Choose **Create recipe draft**, then review quantities, servings, instructions, and the model’s estimate notes. Ingredients, steps, recipe details, and per-serving nutrition are editable. Dismiss notes you have resolved; remaining notes stay with the saved recipe. Nutrition remains an estimate and can be re-estimated from the saved recipe after ingredient or serving changes. **Save recipe** adds the draft to the household’s collection and makes it available for planning, shopping lists, and ratings.
 
