@@ -197,7 +197,9 @@ export async function chatGPTResponse(
 	if (!response.body) throw new ChatGPTInferenceError('ChatGPT returned an empty stream.');
 	const reader = response.body.getReader();
 	const decoder = new TextDecoder();
-	let buffer = '';
+	const chunks: string[] = [];
+	let trailingCR = false;
+	let trailingLF = false;
 	let bytes = 0;
 	let output = '';
 	let completed = false;
@@ -237,6 +239,50 @@ export async function chatGPTResponse(
 			completed = true;
 		}
 	}
+
+	function scanChunk(decoded: string, flush = false) {
+		let chunk = trailingCR ? '\r' + decoded : decoded;
+		trailingCR = false;
+		if (!flush && chunk.endsWith('\r')) {
+			trailingCR = true;
+			chunk = chunk.slice(0, -1);
+		}
+		if (!chunk) return;
+		if (chunk.includes('\r')) chunk = chunk.replace(/\r\n/g, '\n');
+
+		let start = 0;
+		if (trailingLF && chunk.startsWith('\n')) {
+			const last = chunks[chunks.length - 1];
+			if (last.length === 1) chunks.pop();
+			else chunks[chunks.length - 1] = last.slice(0, -1);
+			const raw = chunks.join('');
+			chunks.length = 0;
+			trailingLF = false;
+			consumeEvent(raw);
+			start = 1;
+		}
+		let separator: number;
+		while ((separator = chunk.indexOf('\n\n', start)) !== -1) {
+			const slice = chunk.slice(start, separator);
+			let raw: string;
+			if (chunks.length > 0) {
+				if (slice) chunks.push(slice);
+				raw = chunks.join('');
+				chunks.length = 0;
+			} else {
+				raw = slice;
+			}
+			trailingLF = false;
+			consumeEvent(raw);
+			start = separator + 2;
+		}
+		if (start < chunk.length) {
+			const remainder = start === 0 ? chunk : chunk.slice(start);
+			chunks.push(remainder);
+			trailingLF = remainder.endsWith('\n');
+		}
+	}
+
 	try {
 		while (true) {
 			const { done, value } = await reader.read();
@@ -244,20 +290,19 @@ export async function chatGPTResponse(
 			bytes += value.byteLength;
 			if (bytes > MAX_RESPONSE_BYTES)
 				throw new ChatGPTInferenceError('ChatGPT returned an oversized response.');
-			buffer += decoder.decode(value, { stream: true });
-			buffer = buffer.replace(/\r\n/g, '\n');
-			let separator: number;
-			while ((separator = buffer.indexOf('\n\n')) !== -1) {
-				consumeEvent(buffer.slice(0, separator));
-				buffer = buffer.slice(separator + 2);
-			}
+			scanChunk(decoder.decode(value, { stream: true }));
 			if (completed) {
 				await reader.cancel();
 				break;
 			}
 		}
-		buffer += decoder.decode();
-		if (buffer.trim() && !completed) consumeEvent(buffer);
+		if (!completed) {
+			scanChunk(decoder.decode(), true);
+			if (!completed && chunks.length > 0) {
+				const remainder = chunks.join('');
+				if (remainder.trim()) consumeEvent(remainder);
+			}
+		}
 	} catch (error) {
 		await reader.cancel().catch(() => {});
 		if (error instanceof ChatGPTInferenceError) throw error;

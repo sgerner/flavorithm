@@ -1,5 +1,6 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
 import { normalizeName, unitInfo } from './domain.ts';
+import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
@@ -138,7 +139,10 @@ export function reconcileShoppingList(
 	for (const [key, bucket] of additionBuckets) {
 		const alreadyPurchased = checkedByBucket.get(key) ?? 0;
 		const remainingBase = Math.max(0, bucket.quantityBase - alreadyPurchased);
-		const remainingQuantity = roundQuantity(remainingBase / bucket.unit.factor);
+		const remainingQuantity = Math.min(
+			MAX_SHOPPING_QUANTITY,
+			roundQuantity(remainingBase / bucket.unit.factor)
+		);
 		if (remainingQuantity <= 0) continue;
 		const reusableId = existingUncheckedIds.get(key);
 		let id: string;
