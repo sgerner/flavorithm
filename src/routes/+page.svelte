@@ -478,6 +478,7 @@
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
 	let plannedServings = $state(2);
+	let pickingForSlot = $state(false);
 	let editingMealId = $state('');
 	let cookingMealId = $state('');
 	let deductPantry = $state(false);
@@ -1949,6 +1950,31 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
+	function weekOffsetForDate(value: string) {
+		const target = new Date(`${value}T12:00:00`);
+		if (Number.isNaN(target.getTime())) return weekOffset;
+		target.setDate(target.getDate() - ((target.getDay() + 6) % 7));
+		const currentMonday = new Date();
+		currentMonday.setHours(12, 0, 0, 0);
+		currentMonday.setDate(currentMonday.getDate() - ((currentMonday.getDay() + 6) % 7));
+		const utcTarget = Date.UTC(target.getFullYear(), target.getMonth(), target.getDate());
+		const utcCurrent = Date.UTC(
+			currentMonday.getFullYear(),
+			currentMonday.getMonth(),
+			currentMonday.getDate()
+		);
+		return Math.round((utcTarget - utcCurrent) / (7 * 86_400_000));
+	}
+	function resetMealDialogState() {
+		pickingForSlot = false;
+		mealDate = '';
+		mealSlot = 'Dinner';
+		plannedServings = 2;
+		editingMealId = '';
+		cookingMealId = '';
+		deductPantry = false;
+		leftoverServings = 0;
+	}
 	function refreshWeekShopping(startDate: string) {
 		const start = new Date(`${startDate}T12:00:00`);
 		if (Number.isNaN(start.getTime())) return;
@@ -2012,21 +2038,72 @@
 				: 'You have everything you need. Happy cooking!'
 		);
 	}
+	function openRecipePicker(slotTarget?: { date: string; slot: string }) {
+		resetMealDialogState();
+		selected = null;
+		selectedMealServings = undefined;
+		if (slotTarget) {
+			pickingForSlot = true;
+			mealDate = slotTarget.date;
+			mealSlot = slotTarget.slot;
+		} else {
+			mealDate = dateKey(new Date());
+			mealSlot = 'Dinner';
+		}
+		modal = 'pickRecipe';
+	}
+	function choosePickedRecipe(recipe: Recipe) {
+		if (pickingForSlot && mealDate && ['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) {
+			const scheduledDate = mealDate;
+			const scheduledSlot = mealSlot;
+			const scheduledWeek = weekStartForDate(scheduledDate);
+			const servings = isValidServings(recipe.servings) ? recipe.servings : 2;
+			const created: Meal = {
+				id: crypto.randomUUID(),
+				date: scheduledDate,
+				slot: scheduledSlot,
+				recipeId: recipe.id,
+				servings
+			};
+			kitchen.meals.push(created);
+			refreshWeekShopping(scheduledWeek);
+			weekOffset = weekOffsetForDate(scheduledDate);
+			selectedMealServings = undefined;
+			selected = null;
+			resetMealDialogState();
+			modal = '';
+			page = 'planner';
+			notify(`${recipe.title} scheduled.`, () => {
+				const existing = kitchen.meals.find((entry) => entry.id === created.id);
+				if (!existing) return;
+				const affectedWeek = weekStartForDate(existing.date);
+				kitchen.meals = kitchen.meals.filter((entry) => entry.id !== created.id);
+				refreshWeekShopping(affectedWeek);
+				if (affectedWeek !== scheduledWeek) refreshWeekShopping(scheduledWeek);
+			});
+			return;
+		}
+		planRecipe(recipe, recipe.servings);
+	}
 	function planRecipe(r: Recipe, servings = r.servings) {
+		resetMealDialogState();
 		plannedServings = servings;
 		selected = r;
 		mealDate = dateKey(new Date());
+		mealSlot = 'Dinner';
 		modal = 'plan';
 	}
 	function editPlannedMeal(meal: Meal) {
 		if (meal.completedAt) return;
+		resetMealDialogState();
 		editingMealId = meal.id;
 		mealDate = meal.date;
 		mealSlot = meal.slot;
 		plannedServings = meal.servings;
 		modal = 'editMeal';
 	}
-	function saveMealChanges() {
+	function saveMealChanges(event?: SubmitEvent) {
+		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === editingMealId);
 		if (!meal || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
 		if (!isValidServings(plannedServings)) {
@@ -2034,23 +2111,27 @@
 			return;
 		}
 		const previousWeek = weekStartForDate(meal.date);
-		meal.date = mealDate;
+		const updatedDate = mealDate;
+		meal.date = updatedDate;
 		meal.slot = mealSlot;
 		meal.servings = Math.round(plannedServings);
 		refreshWeekShopping(previousWeek);
 		refreshWeekShopping(weekStartForDate(meal.date));
-		editingMealId = '';
+		weekOffset = weekOffsetForDate(updatedDate);
+		resetMealDialogState();
 		modal = '';
 		notify('Meal plan updated.');
 	}
 	function openCookDialog(meal: Meal) {
 		if (meal.completedAt) return;
+		resetMealDialogState();
 		cookingMealId = meal.id;
 		deductPantry = false;
 		leftoverServings = 0;
 		modal = 'cookMeal';
 	}
-	function markMealCooked() {
+	function markMealCooked(event?: SubmitEvent) {
+		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === cookingMealId);
 		if (!meal) return;
 		if (
@@ -2062,16 +2143,17 @@
 			return;
 		}
 		const recipeId = meal.recipeId;
+		const servingsCooked = meal.servings;
 		const startDate = weekStartForDate(meal.date);
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
 		refreshWeekShopping(startDate);
-		cookingMealId = '';
+		resetMealDialogState();
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
-		selectedMealServings = meal.servings;
+		selectedMealServings = servingsCooked;
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
@@ -2088,22 +2170,26 @@
 		modal = 'generate';
 		await generate();
 	}
-	function addMeal() {
-		if (!selected || !mealDate) return;
+	function addMeal(event?: SubmitEvent) {
+		event?.preventDefault();
+		if (!selected || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
 		if (!isValidServings(plannedServings)) {
 			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			return;
 		}
+		const scheduledDate = mealDate;
 		kitchen.meals.push({
 			id: crypto.randomUUID(),
-			date: mealDate,
+			date: scheduledDate,
 			slot: mealSlot,
 			recipeId: selected.id,
 			servings: plannedServings
 		});
-		refreshWeekShopping(weekStartForDate(mealDate));
+		refreshWeekShopping(weekStartForDate(scheduledDate));
+		weekOffset = weekOffsetForDate(scheduledDate);
 		selectedMealServings = undefined;
 		selected = null;
+		resetMealDialogState();
 		modal = '';
 		page = 'planner';
 		notify('Meal scheduled.');
@@ -2284,9 +2370,18 @@
 			if (aiController) cancelAIRequest();
 			prompt = '';
 		}
-		if (modal === 'plan') selected = null;
-		if (modal === 'editMeal') editingMealId = '';
-		if (modal === 'cookMeal') cookingMealId = '';
+		if (modal === 'plan') {
+			selected = null;
+			selectedMealServings = undefined;
+		}
+		if (
+			modal === 'plan' ||
+			modal === 'pickRecipe' ||
+			modal === 'editMeal' ||
+			modal === 'cookMeal'
+		) {
+			resetMealDialogState();
+		}
 		if (modal === 'deleteRecipe') recipeToDelete = null;
 		if (modal === 'removeMember') memberToRemove = null;
 		if (modal === 'household') {
@@ -3030,12 +3125,8 @@
 						<h1>Meal planner<span class="heading-spark" aria-hidden="true">✷</span></h1>
 						<p>Schedule meals and build your weekly shopping list.</p>
 					</div>
-					<button
-						class="primary"
-						onclick={() => {
-							selected = null;
-							modal = 'pickRecipe';
-						}}><Plus size={17} /> Plan a meal</button
+					<button class="primary" onclick={() => openRecipePicker()}
+						><Plus size={17} /> Plan a meal</button
 					>
 				</section>
 				<div class="calendar-toolbar">
@@ -3126,11 +3217,7 @@
 													</div>
 												</div>{/if}{/each}<button
 											class="add-meal"
-											onclick={() => {
-												mealDate = dayKey;
-												mealSlot = slot;
-												modal = 'pickRecipe';
-											}}
+											onclick={() => openRecipePicker({ date: dayKey, slot })}
 											aria-label={`Plan ${slot} for ${day.toDateString()}`}
 											><Plus size={17} /></button
 										>
@@ -4039,94 +4126,97 @@
 						>
 					</div>
 				{:else if modal === 'editMeal'}
+					{@const editingMeal = kitchen.meals.find((meal) => meal.id === editingMealId)}
+					{@const editingMealRecipe = kitchen.recipes.find(
+						(recipe) => recipe.id === editingMeal?.recipeId
+					)}
 					<h2>Edit planned meal</h2>
-					<p class="muted">
-						Update this meal in place. Its calendar entry keeps the same identity.
-					</p>
-					<label class="field"
-						>When are we cooking?<input type="date" required bind:value={mealDate} /></label
-					>
-					<label class="field"
-						>Meal<select bind:value={mealSlot}
-							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-						></label
-					>
-					<label class="field"
-						>Servings<input
-							type="number"
-							min="1"
-							max={MAX_SERVINGS}
-							step="1"
-							required
-							bind:value={plannedServings}
-						/></label
-					>
-					<div class="dialog-actions">
-						<button class="secondary" onclick={closeDialog}>Cancel</button><button
-							class="primary"
-							disabled={!mealDate || !plannedServings || plannedServings < 1}
-							onclick={saveMealChanges}>Save meal</button
+					<p class="muted">{editingMealRecipe?.title}</p>
+					<form onsubmit={saveMealChanges}>
+						<label class="field"
+							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
 						>
-					</div>
+						<label class="field"
+							>Meal<select required bind:value={mealSlot}
+								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+							></label
+						>
+						<label class="field"
+							>Servings<input
+								type="number"
+								min="1"
+								max={MAX_SERVINGS}
+								step="1"
+								required
+								bind:value={plannedServings}
+							/></label
+						>
+						<div class="dialog-actions">
+							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
+								class="primary"
+								type="submit">Save meal</button
+							>
+						</div>
+					</form>
 				{:else if modal === 'cookMeal'}
 					{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
 					{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
 					<h2>Mark meal cooked</h2>
 					<p class="muted">{cookingRecipe?.title}</p>
-					<label class="cook-option"
-						><input type="checkbox" bind:checked={deductPantry} /><span
-							><b>Deduct ingredients from pantry</b><small
-								>Uses the planned serving amount and available matching stock.</small
-							></span
-						></label
-					>
-					<label class="field"
-						>Leftover servings<input
-							type="number"
-							min="0"
-							max={cookingMeal?.servings ?? MAX_SERVINGS}
-							step="1"
-							bind:value={leftoverServings}
-						/><small class="field-help">Enter 0 if there are no leftovers.</small></label
-					>
-					<div class="dialog-actions">
-						<button class="secondary" onclick={closeDialog}>Cancel</button><button
-							class="primary"
-							onclick={markMealCooked}><Check size={17} /> Mark cooked</button
+					<form onsubmit={markMealCooked}>
+						<label class="cook-option"
+							><input type="checkbox" bind:checked={deductPantry} /><span
+								><b>Deduct ingredients from pantry</b><small
+									>Uses the planned serving amount and available matching stock.</small
+								></span
+							></label
 						>
-					</div>
+						<label class="field"
+							>Leftover servings<input
+								type="number"
+								min="0"
+								max={cookingMeal?.servings ?? MAX_SERVINGS}
+								step="1"
+								required
+								bind:value={leftoverServings}
+							/><small class="field-help">Enter 0 if there are no leftovers.</small></label
+						>
+						<div class="dialog-actions">
+							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
+								class="primary"
+								type="submit"><Check size={17} /> Mark cooked</button
+							>
+						</div>
+					</form>
 				{:else if modal === 'plan'}
 					<h2>Schedule a recipe</h2>
 					<p class="muted">{selected?.title}</p>
-					<label class="field"
-						>When are we cooking?<input type="date" required bind:value={mealDate} /></label
-					><label class="field"
-						>Meal<select bind:value={mealSlot}
-							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-						></label
-					><label class="field"
-						>Servings<input
-							type="number"
-							min="1"
-							max={MAX_SERVINGS}
-							step="1"
-							bind:value={plannedServings}
-						/></label
-					><button
-						class="primary full"
-						disabled={!mealDate || !plannedServings || plannedServings < 1}
-						onclick={addMeal}><CalendarDays size={17} /> Put it on the calendar</button
-					>
+					<form onsubmit={addMeal}>
+						<label class="field"
+							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
+						><label class="field"
+							>Meal<select required bind:value={mealSlot}
+								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+							></label
+						><label class="field"
+							>Servings<input
+								type="number"
+								min="1"
+								max={MAX_SERVINGS}
+								step="1"
+								required
+								bind:value={plannedServings}
+							/></label
+						><button class="primary full" type="submit"
+							><CalendarDays size={17} /> Put it on the calendar</button
+						>
+					</form>
 				{:else if modal === 'pickRecipe'}
 					<h2>Choose a recipe</h2>
 					<div class="pick-list">
 						{#each kitchen.recipes as recipe}<button
-								onclick={() => {
-									selected = recipe;
-									plannedServings = recipe.servings;
-									if (!mealDate) mealDate = dateKey(new Date());
-									modal = 'plan';
-								}}
+								type="button"
+								onclick={() => choosePickedRecipe(recipe)}
 								><img
 									src={recipe.image || recipePlaceholder(recipe)}
 									onerror={(event) => recipeImageError(event, recipe)}
@@ -4408,14 +4498,19 @@
 		display: flex;
 		align-items: flex-start;
 		gap: 12px;
+		min-height: 44px;
+		padding: 12px 14px;
 		margin: 22px 0;
+		border: 1px solid var(--line);
+		background: var(--surface);
+		cursor: pointer;
 		font-size: 14px;
 	}
 	.cook-option input {
-		width: 20px;
-		height: 20px;
-		flex: 0 0 20px;
-		margin-top: 2px;
+		width: 24px;
+		height: 24px;
+		flex: 0 0 24px;
+		margin-top: 1px;
 		accent-color: var(--green);
 	}
 	.cook-option span {
