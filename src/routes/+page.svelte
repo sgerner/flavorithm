@@ -1,3 +1,33 @@
+<script module lang="ts">
+	const COOKED_HISTORY_PAGE_SIZE = 20;
+	const MEAL_SLOTS = ['Breakfast', 'Lunch', 'Dinner'] as const;
+	const weekdayFormatter = new Intl.DateTimeFormat('en', { weekday: 'short' });
+	const cookedBadgeFormatter = new Intl.DateTimeFormat('en', {
+		month: 'short',
+		day: 'numeric'
+	});
+	const historyDateFormatter = new Intl.DateTimeFormat('en', {
+		weekday: 'short',
+		month: 'short',
+		day: 'numeric'
+	});
+
+	function mealSlotKey(date: string, slot: string) {
+		return `${date}:${slot}`;
+	}
+
+	function formatCompletedDate(
+		value: string | undefined,
+		formatter: Intl.DateTimeFormat,
+		fallback = 'Unknown date'
+	) {
+		if (!value) return fallback;
+		const timestamp = Date.parse(value);
+		if (!Number.isFinite(timestamp)) return fallback;
+		return formatter.format(timestamp);
+	}
+</script>
+
 <script lang="ts">
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick } from 'svelte';
@@ -168,6 +198,7 @@
 		kitchenSync?.clearContext();
 		user = null;
 		kitchen = createInitialState();
+		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
 		showStarter = false;
 		stateEtag = null;
@@ -331,6 +362,7 @@
 	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
+	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
 	let plannedServings = $state(2);
@@ -453,6 +485,26 @@
 			return date;
 		});
 	});
+	let recipesById = $derived(new Map(kitchen.recipes.map((recipe) => [recipe.id, recipe])));
+	let plannerMeals = $derived.by(() => {
+		const byDateSlot = new Map<string, Meal[]>();
+		const completed: Meal[] = [];
+		for (const meal of kitchen.meals) {
+			const slotKey = mealSlotKey(meal.date, meal.slot);
+			const bucket = byDateSlot.get(slotKey);
+			if (bucket) bucket.push(meal);
+			else byDateSlot.set(slotKey, [meal]);
+			if (meal.completedAt) completed.push(meal);
+		}
+		completed.sort((a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? ''));
+		return { mealsByDateSlot: byDateSlot, completedMeals: completed };
+	});
+	let mealsByDateSlot = $derived(plannerMeals.mealsByDateSlot);
+	let completedMeals = $derived(plannerMeals.completedMeals);
+	let renderableCompletedMeals = $derived(
+		completedMeals.filter((meal) => recipesById.has(meal.recipeId))
+	);
+	let visibleCompletedMeals = $derived(renderableCompletedMeals.slice(0, cookedHistoryLimit));
 	function ingredientEmoji(name: string) {
 		return /tomato/i.test(name)
 			? '🍅'
@@ -966,6 +1018,7 @@
 			importSession = emptyImportSession();
 			resumeImport = false;
 			kitchen = createInitialState();
+			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
 			clearInterval(connectionPoll);
@@ -2031,6 +2084,7 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
+			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
 			modal = '';
@@ -2578,6 +2632,7 @@
 					>
 				</div>
 			{:else if page === 'planner'}
+				{@const todayKey = dateKey(new Date())}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
 						<h1>Meal planner<span class="heading-spark">✷</span></h1>
@@ -2631,21 +2686,15 @@
 						class="calendar-grid"
 						in:revealMotion|global={{ y: 8, duration: 220 }}
 					>
-						{#each week as day}<div
-								class:today={dateKey(day) === dateKey(new Date())}
-								class="calendar-day"
-							>
+						{#each week as day}{@const dayKey = dateKey(day)}
+							<div class:today={dayKey === todayKey} class="calendar-day">
 								<div class="day-heading">
-									<span>{day.toLocaleDateString('en', { weekday: 'short' })}</span><b
-										>{day.getDate()}</b
-									>
+									<span>{weekdayFormatter.format(day)}</span><b>{day.getDate()}</b>
 								</div>
-								{#each ['Breakfast', 'Lunch', 'Dinner'] as slot}<div class="meal-slot">
+								{#each MEAL_SLOTS as slot}<div class="meal-slot">
 										<span class="meal-label">{slot}</span
-										>{#each kitchen.meals.filter((m) => m.date === dateKey(day) && m.slot === slot) as meal}{@const recipe =
-												kitchen.recipes.find((r) => r.id === meal.recipeId)}{#if recipe}<div
-													class="calendar-meal"
-												>
+										>{#each mealsByDateSlot.get(mealSlotKey(dayKey, slot)) ?? [] as meal}{@const recipe =
+												recipesById.get(meal.recipeId)}{#if recipe}<div class="calendar-meal">
 													<button
 														class="meal-open"
 														onclick={() => {
@@ -2661,11 +2710,12 @@
 														></button
 													>
 													<div class="calendar-meal-actions">
-														{#if meal.completedAt}<small class="cooked-badge"
-																>Cooked {new Date(meal.completedAt).toLocaleDateString('en', {
-																	month: 'short',
-																	day: 'numeric'
-																})}</small
+														{#if meal.completedAt}{@const cookedDate = formatCompletedDate(
+																meal.completedAt,
+																cookedBadgeFormatter,
+																''
+															)}<small class="cooked-badge"
+																>{cookedDate ? `Cooked ${cookedDate}` : 'Cooked'}</small
 															>{:else}<button
 																class="text-button"
 																onclick={() => editPlannedMeal(meal)}>Edit</button
@@ -2681,7 +2731,7 @@
 												</div>{/if}{/each}<button
 											class="add-meal"
 											onclick={() => {
-												mealDate = dateKey(day);
+												mealDate = dayKey;
 												mealSlot = slot;
 												modal = 'pickRecipe';
 											}}
@@ -2694,17 +2744,12 @@
 				<section class="cooked-history">
 					<div class="section-line">
 						<h2>Cooked history</h2>
-						<span class="muted"
-							>{kitchen.meals.filter((meal) => meal.completedAt).length} meals</span
-						>
+						<span class="muted">{completedMeals.length} meals</span>
 					</div>
-					{#if kitchen.meals.some((meal) => meal.completedAt)}<div class="cooked-history-list">
-							{#each kitchen.meals
-								.filter((meal) => meal.completedAt)
-								.sort( (a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? '') ) as meal (meal.id)}{@const recipe =
-									kitchen.recipes.find((item) => item.id === meal.recipeId)}{#if recipe}<article
-										class="cooked-history-row"
-									>
+					{#if renderableCompletedMeals.length}<div class="cooked-history-list">
+							{#each visibleCompletedMeals as meal (meal.id)}{@const recipe = recipesById.get(
+									meal.recipeId
+								)}{#if recipe}<article class="cooked-history-row">
 										<img
 											src={recipe.image || recipePlaceholder(recipe)}
 											onerror={(event) => recipeImageError(event, recipe)}
@@ -2712,11 +2757,8 @@
 										/>
 										<div>
 											<b>{recipe.title}</b><span
-												>{new Date(meal.completedAt!).toLocaleDateString('en', {
-													weekday: 'short',
-													month: 'short',
-													day: 'numeric'
-												})} · {meal.servings} servings{meal.leftoverServings
+												>{formatCompletedDate(meal.completedAt, historyDateFormatter)} · {meal.servings}
+												servings{meal.leftoverServings
 													? ` · ${meal.leftoverServings} leftover`
 													: ''}</span
 											>
@@ -2738,7 +2780,12 @@
 											>
 										</div>
 									</article>{/if}{/each}
-						</div>{:else}<p class="muted history-empty">
+						</div>
+						{#if renderableCompletedMeals.length > cookedHistoryLimit}<button
+								type="button"
+								class="secondary history-more"
+								onclick={() => (cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE)}>Show more</button
+							>{/if}{:else}<p class="muted history-empty">
 							Meals marked cooked will appear here. You can add leftovers and update pantry stock
 							when you finish a meal.
 						</p>{/if}
@@ -3530,9 +3577,7 @@
 					</div>
 				{:else if modal === 'cookMeal'}
 					{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
-					{@const cookingRecipe = kitchen.recipes.find(
-						(recipe) => recipe.id === cookingMeal?.recipeId
-					)}
+					{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
 					<h2>Mark meal cooked</h2>
 					<p class="muted">{cookingRecipe?.title}</p>
 					<label class="cook-option"
@@ -3840,6 +3885,10 @@
 	}
 	.history-empty {
 		margin-top: 12px;
+	}
+	.history-more {
+		margin-top: 16px;
+		min-height: 44px;
 	}
 	.cook-option {
 		display: flex;
