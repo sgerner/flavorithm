@@ -2,12 +2,11 @@ import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { AIRequestError, getPublicModelCatalog } from '#lib/server/ai.ts';
 
 export const GET: RequestHandler = async ({ locals, fetch, url }) => {
-	if (!locals.user) return json({ error: 'Unauthorized.' }, { status: 401 });
+	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
 
 	try {
 		if (url.searchParams.get('connection') === 'chatgpt') {
@@ -31,19 +30,19 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 			} catch {
 				/* An unavailable public catalog must not hide entitled account models. */
 			}
-			return json(result, {
+			return Response.json(result, {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return json(await getPublicModelCatalog(fetch), {
+		return Response.json(await getPublicModelCatalog(fetch), {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {
 		if (error instanceof ApiError || error instanceof ChatGPTInferenceError)
-			return json({ error: error.message }, { status: error.status });
+			return Response.json({ error: error.message }, { status: error.status });
 		if (error instanceof AIRequestError) {
-			return json({ error: error.message }, { status: error.status });
+			return Response.json({ error: error.message }, { status: error.status });
 		}
-		return json({ error: 'The model catalog could not be loaded.' }, { status: 500 });
+		return Response.json({ error: 'The model catalog could not be loaded.' }, { status: 500 });
 	}
 };

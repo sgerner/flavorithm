@@ -1,4 +1,3 @@
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
 import {
@@ -88,7 +87,7 @@ function setSessionCookie(
 export const GET: RequestHandler = async ({ locals }) => {
 	const authMode = locals.authMode ?? getAuthMode() ?? 'invalid';
 	const authMetadata = getAuthMetadata(authMode);
-	return json({
+	return Response.json({
 		user: locals.user,
 		...authMetadata,
 		capabilities: {
@@ -112,7 +111,7 @@ export const POST: RequestHandler = async (event) => {
 		if (payload.action === 'logout') {
 			deleteSession(event.cookies.get('flavorithm_session'));
 			event.cookies.delete('flavorithm_session', { path: '/' });
-			return json({ user: null });
+			return Response.json({ user: null });
 		}
 		const ip = clientAddress(event);
 		if (!ip) throw new ApiError(403, 'The request source could not be verified');
@@ -122,7 +121,7 @@ export const POST: RequestHandler = async (event) => {
 			consumeRateLimit(`delete-account:${event.locals.user.id}`, 5, 15 * 60 * 1000);
 			await deleteUserAccount(event.locals.user.id, payload.password);
 			event.cookies.delete('flavorithm_session', { path: '/' });
-			return json({ user: null });
+			return Response.json({ user: null });
 		}
 		if (payload.action === 'requestPasswordReset') {
 			const apiKey = process.env.RESEND_API_KEY?.trim();
@@ -144,7 +143,9 @@ export const POST: RequestHandler = async (event) => {
 				const sent = await sendPasswordResetEmail(reset.email, resetUrl.toString(), apiKey, from);
 				if (!sent) console.warn('Password reset email delivery failed.');
 			}
-			return json({ message: 'If an account exists, a password reset link will be sent.' });
+			return Response.json({
+				message: 'If an account exists, a password reset link will be sent.'
+			});
 		}
 		if (payload.action === 'requestEmailVerification') {
 			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
@@ -171,17 +172,17 @@ export const POST: RequestHandler = async (event) => {
 				);
 				if (!sent) console.warn('Email verification delivery failed.');
 			}
-			return json({ message: 'If your email needs verification, a link will be sent.' });
+			return Response.json({ message: 'If your email needs verification, a link will be sent.' });
 		}
 		if (payload.action === 'verifyEmail') {
 			consumeRateLimit(`email-verify-complete-ip:${ip}`, 10, 15 * 60 * 1000);
-			return json({ user: verifyEmailToken(payload.token) });
+			return Response.json({ user: verifyEmailToken(payload.token) });
 		}
 		if (payload.action === 'resetPassword') {
 			consumeRateLimit(`password-reset-complete-ip:${ip}`, 10, 15 * 60 * 1000);
 			await resetUserPassword(payload.token, payload.password);
 			event.cookies.delete('flavorithm_session', { path: '/' });
-			return json({ user: null });
+			return Response.json({ user: null });
 		}
 
 		const email = payload.email.toLowerCase();
@@ -190,12 +191,12 @@ export const POST: RequestHandler = async (event) => {
 			consumeRateLimit(`register-ip:${ip}`, 5, 60 * 60 * 1000);
 			const result = await registerUser(payload.name, email, payload.password);
 			setSessionCookie(event.cookies, event.request, result.token, result.expiresAt);
-			return json({ user: result.user }, { status: 201 });
+			return Response.json({ user: result.user }, { status: 201 });
 		}
 
 		const result = await loginUser(email, payload.password);
 		setSessionCookie(event.cookies, event.request, result.token, result.expiresAt);
-		return json({ user: result.user });
+		return Response.json({ user: result.user });
 	} catch (error) {
 		return errorResponse(error);
 	}
