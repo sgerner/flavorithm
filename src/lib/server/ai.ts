@@ -2359,8 +2359,12 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let publicCatalog: Promise<SupportedModelResponse> | undefined;
-let publicCatalogExpiresAt = 0;
+type CatalogCacheEntry = {
+	promise: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+let publicCatalog: CatalogCacheEntry | undefined;
+const customFetcherCatalogs = new WeakMap<Fetcher, CatalogCacheEntry>();
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2382,16 +2386,22 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
-		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
-		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (publicCatalog === pending) {
-				publicCatalog = undefined;
-				publicCatalogExpiresAt = 0;
-			}
-			throw error;
-		});
-		publicCatalog = pending;
+	const useSharedCache = fetcher === fetch || fetcher.name === 'server_fetch';
+	const current = useSharedCache ? publicCatalog : customFetcherCatalogs.get(fetcher);
+	if (current && Date.now() < current.expiresAt) {
+		return current.promise;
 	}
-	return publicCatalog;
+	const expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const pending = getSupportedModels(fetcher).catch((error) => {
+		if (useSharedCache) {
+			if (publicCatalog?.promise === pending) publicCatalog = undefined;
+		} else if (customFetcherCatalogs.get(fetcher)?.promise === pending) {
+			customFetcherCatalogs.delete(fetcher);
+		}
+		throw error;
+	});
+	const next: CatalogCacheEntry = { promise: pending, expiresAt };
+	if (useSharedCache) publicCatalog = next;
+	else customFetcherCatalogs.set(fetcher, next);
+	return pending;
 }
