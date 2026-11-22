@@ -91,7 +91,7 @@ button {
 }
 button:disabled {
 	opacity: 0.5;
-	cursor: wait;
+	cursor: not-allowed;
 }
 button,
 a {
@@ -541,7 +541,7 @@ main {
 	border: 1px solid var(--line);
 	background: transparent;
 }
-.secondary:hover {
+.secondary:hover:not(:disabled) {
 	background: var(--wash);
 }
 .recipe-toolbar {
@@ -1005,13 +1005,40 @@ main {
 .shopping-progress {
 	height: 3px;
 	background: var(--line);
-	margin: 22px 0 8px;
+	margin: 22px 0 14px;
 }
 .shopping-progress span {
 	display: block;
 	height: 100%;
 	background: #98a766;
 	transition: width 0.35s;
+}
+.shopping-filters {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+	margin: 0 0 6px;
+}
+.shopping-filters button {
+	min-height: 44px;
+	display: inline-flex;
+	align-items: center;
+	gap: 9px;
+	padding: 8px 12px;
+	border: 1px solid var(--line);
+	background: var(--surface);
+	font-size: 14px;
+}
+.shopping-filters button.active {
+	background: var(--green);
+	color: var(--paper);
+	border-color: var(--green);
+}
+.shopping-filters button span {
+	min-width: 22px;
+	padding: 2px 5px;
+	background: color-mix(in srgb, currentColor 12%, transparent);
+	text-align: center;
 }
 .shopping-row {
 	display: flex;
@@ -1050,8 +1077,8 @@ main {
 	align-items: center;
 	gap: 12px;
 	border-bottom: 1px solid var(--line);
-	padding: 13px 0;
-	margin-bottom: 15px;
+	padding: 10px 0;
+	margin: 0;
 }
 .inline-add input {
 	background: none;
@@ -1059,6 +1086,28 @@ main {
 	width: 100%;
 	padding: 10px 0;
 	font-size: 14px;
+}
+.shopping-complete {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 8px 16px;
+	padding: 16px;
+	margin-top: 12px;
+	background: var(--wash);
+	border: 1px solid var(--line);
+	font-size: 14px;
+}
+.shopping-complete p {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	color: var(--ink);
+	font-weight: 500;
+}
+.shopping-transfer {
+	margin-top: 15px;
 }
 .modal-backdrop {
 	position: fixed;
@@ -2810,6 +2859,24 @@ html.dark[data-theme='nosh'] {
 		gap: 24px;
 	}
 
+	.shopping-progress {
+		margin: 14px 0 12px;
+	}
+
+	.shopping-filters {
+		display: grid;
+		grid-template-columns: repeat(2, minmax(0, 1fr));
+		margin: 0 0 4px;
+	}
+
+	.shopping-filters button {
+		min-height: 44px;
+		justify-content: center;
+		gap: 6px;
+		padding-inline: 8px;
+		font-size: 13px;
+	}
+
 	.shopping-row {
 		gap: 8px;
 		padding: 10px 0;
@@ -2841,6 +2908,8 @@ html.dark[data-theme='nosh'] {
 
 	.inline-add {
 		gap: 7px;
+		padding: 6px 0;
+		margin: 0;
 	}
 
 	.inline-add input {
