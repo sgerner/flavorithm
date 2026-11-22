@@ -1167,7 +1167,12 @@
 
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else if (importSession.text || importSession.photo || importSession.draft) {
+			else if (
+				importSession.url ||
+				importSession.text ||
+				importSession.photo ||
+				importSession.draft
+			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
 				window.location.assign(result.authorizationUrl);
@@ -1963,9 +1968,13 @@
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
-		openImport(url);
+		importSession = { ...emptyImportSession(), url };
+		openImport();
 	}
-	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
+	async function captureImport(
+		input: { url?: string; prompt: string; image?: string },
+		signal: AbortSignal
+	) {
 		if (!needAI()) {
 			resumeImport = true;
 			return null;
