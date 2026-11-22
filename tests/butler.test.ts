@@ -595,6 +595,47 @@ test('pantry.upsert retires matching checked rows once per scope and refreshes a
 	assert.equal(result.shopping[0].quantity, 12);
 });
 
+test('butler accepts manual provenance, preserves it across edits, and emits recipe-new ui effects', () => {
+	const current = createInitialState();
+	const manualRecipe = {
+		...structuredClone(current.recipes[0]),
+		id: 'handwritten-pie',
+		title: 'Family Apple Pie',
+		provenance: 'manual' as const,
+		saved: true
+	};
+	const added = applyButlerCommands(current, [
+		{ type: 'recipe.upsert', recipe: manualRecipe },
+		{ type: 'ui', action: 'recipe-new' }
+	]);
+	assert.equal(
+		added.state.recipes.find((item) => item.id === 'handwritten-pie')?.provenance,
+		'manual'
+	);
+	assert.deepEqual(added.effects, [{ type: 'ui', action: 'recipe-new' }]);
+
+	const editedWithoutProvenance = {
+		...manualRecipe,
+		servings: 6,
+		provenance: undefined
+	};
+	const updated = applyButlerCommands(added.state, [
+		{ type: 'recipe.upsert', recipe: editedWithoutProvenance },
+		{
+			type: 'recipe.upsert',
+			recipe: {
+				...editedWithoutProvenance,
+				title: 'Spiced Family Apple Pie',
+				provenance: 'ai-generated'
+			}
+		}
+	]);
+	const finalRecipe = updated.state.recipes.find((item) => item.id === 'handwritten-pie');
+	assert.equal(finalRecipe?.provenance, 'manual');
+	assert.equal(finalRecipe?.title, 'Spiced Family Apple Pie');
+	assert.equal(finalRecipe?.nutritionStale, true);
+});
+
 test('recipe.delete retains checked recipe purchases and shopping.delete refreshes checked week scopes only', () => {
 	const now = new Date('2026-10-23T12:00:00Z');
 	const current = createInitialState();
