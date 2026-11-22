@@ -10,6 +10,7 @@ import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
+import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
@@ -19,6 +20,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
+import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
 
 const { MAX_RECIPES } = recipeCollectionMod;
@@ -160,7 +162,8 @@ function createModuleMap() {
 			dialogMotion: () => ({}),
 			revealMotion: () => ({}),
 			fadeMotion: () => ({}),
-			motionDuration: () => 0
+			motionDuration: () => 0,
+			prefersReducedMotion: () => true
 		},
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
@@ -169,8 +172,9 @@ function createModuleMap() {
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
-		'#lib/voice-capture.ts': { VoiceCapture: class {} },
+		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
+		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
