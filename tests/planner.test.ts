@@ -15,6 +15,7 @@ import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
+import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import { MAX_RECIPES, insertRecipes } from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
@@ -51,6 +52,7 @@ function injectPlannerHook(svelteSource: string): string {
 		get week() { return week; },
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
+		get deductPantry() { return deductPantry; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
 		get recipesById() { return recipesById; },
@@ -61,6 +63,9 @@ function injectPlannerHook(svelteSource: string): string {
 		dateKey,
 		mealSlotKey,
 		formatCompletedDate,
+		openRecipePicker,
+		choosePickedRecipe,
+		openCookDialog,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
 		saveMealChanges,
@@ -108,6 +113,7 @@ type PlannerHarnessApi = {
 	authMetadataLoaded: boolean;
 	readonly week: Date[];
 	weekOffset: number;
+	readonly deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
 	readonly mealsByDateSlot: Map<string, Meal[]>;
@@ -121,6 +127,9 @@ type PlannerHarnessApi = {
 		formatter: Intl.DateTimeFormat,
 		fallback?: string
 	) => string;
+	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
+	choosePickedRecipe: (recipe: Recipe) => void;
+	openCookDialog: (meal: Meal) => void;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
 	saveMealChanges: () => void;
@@ -154,6 +163,7 @@ function createModuleMap() {
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
+		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': { insertRecipes },
 		'#lib/butler.ts': butlerMod,
@@ -743,6 +753,50 @@ test('editing a planned meal updates mealsByDateSlot reactively', () => {
 		const moved = api.mealsByDateSlot.get(api.mealSlotKey(wednesday, 'Dinner'));
 		assert.equal(moved?.length, 1);
 		assert.equal(moved?.[0].servings, 4);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('choosing a recipe for a planner slot keeps valid servings above 24', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-large-pot', 'Large Pot Pasta');
+		recipe.servings = 250;
+		const scheduledDate = '2026-11-23';
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [] };
+
+		api.openRecipePicker({ date: scheduledDate, slot: 'Lunch' });
+		api.choosePickedRecipe(recipe);
+
+		assert.equal(api.kitchen.meals.length, 1);
+		assert.equal(api.kitchen.meals[0].date, scheduledDate);
+		assert.equal(api.kitchen.meals[0].slot, 'Lunch');
+		assert.equal(api.kitchen.meals[0].recipeId, recipe.id);
+		assert.equal(api.kitchen.meals[0].servings, 250);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('marking a meal cooked keeps pantry deduction opt-in', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-cook', 'Weeknight Pasta');
+		const meal: Meal = {
+			id: 'meal-cook',
+			date: '2026-11-23',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: recipe.servings
+		};
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
+
+		api.openCookDialog(meal);
+
+		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
 	}
