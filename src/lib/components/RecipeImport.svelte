@@ -1,10 +1,19 @@
 <script module lang="ts">
+	import {
+		createDraftBaseline,
+		isValidNutrition,
+		MAX_SERVINGS,
+		NUTRITION_FIELDS,
+		validateRecipeDraft,
+		type RecipeDraftBaseline
+	} from '#lib/recipe-draft.ts';
 	import type { Recipe } from '#lib/types.ts';
 	export type ImportSession = {
 		text: string;
 		photo: string;
 		photoName: string;
 		draft: Recipe | null;
+		baseline: RecipeDraftBaseline | null;
 		assumptions: string[];
 	};
 	export const emptyImportSession = (): ImportSession => ({
@@ -12,6 +21,7 @@
 		photo: '',
 		photoName: '',
 		draft: null,
+		baseline: null,
 		assumptions: []
 	});
 </script>
@@ -37,31 +47,17 @@
 	let busy = $state(false);
 	let reading = $state(false);
 	let reviewingDraft = $state(untrack(() => session.draft !== null));
+	let nutritionOpen = $state(
+		untrack(() => (session.draft ? !isValidNutrition(session.draft.nutrition) : false))
+	);
 	let retryAvailable = $state(false);
 	let error = $state('');
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let heading = $state<HTMLHeadingElement>();
-	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
-		['calories', 'Calories (kcal)'],
-		['fat', 'Fat (g)'],
-		['saturatedFat', 'Saturated fat (g)'],
-		['sodium', 'Sodium (mg)'],
-		['carbs', 'Carbohydrates (g)'],
-		['fiber', 'Fiber (g)'],
-		['sugar', 'Sugar (g)'],
-		['protein', 'Protein (g)']
-	];
-	function isNutritionValid(recipe: Recipe | null): boolean {
-		if (!recipe) return true;
-		return nutritionFields.every(
-			([key]) =>
-				Number.isFinite(recipe.nutrition[key]) &&
-				recipe.nutrition[key] >= 0 &&
-				recipe.nutrition[key] <= 1000000
-		);
+	if (untrack(() => session.draft !== null && session.baseline === null)) {
+		session.baseline = untrack(() => createDraftBaseline(session.draft!));
 	}
-	let nutritionOpen = $state(untrack(() => !isNutritionValid(session.draft)));
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
@@ -141,8 +137,9 @@
 			);
 			if (alive && generation === captureGeneration && result) {
 				session.draft = result.recipe;
+				session.baseline = createDraftBaseline(result.recipe);
 				session.assumptions = result.assumptions;
-				nutritionOpen = !isNutritionValid(result.recipe);
+				nutritionOpen = !isValidNutrition(result.recipe.nutrition);
 				reviewingDraft = true;
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
@@ -176,61 +173,18 @@
 		event.preventDefault();
 		const draft = session.draft;
 		if (!draft) return;
-		error = '';
-		const title = draft.title.trim();
-		const ingredients = draft.ingredients.map((i) => ({
-			...i,
-			name: i.name.trim(),
-			unit: i.unit.trim()
-		}));
-		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
-		const nutritionValid = isNutritionValid(draft);
-		if (
-			!title ||
-			title.length > 200 ||
-			!Number.isFinite(draft.time) ||
-			draft.time < 1 ||
-			draft.time > 100000 ||
-			!Number.isFinite(draft.servings) ||
-			draft.servings < 1 ||
-			draft.servings > 10000 ||
-			!ingredients.length ||
-			ingredients.length > 60 ||
-			ingredients.some(
-				(i) =>
-					!i.name ||
-					i.name.length > 200 ||
-					!i.unit ||
-					i.unit.length > 40 ||
-					!Number.isFinite(i.quantity) ||
-					i.quantity <= 0 ||
-					i.quantity > 1000000
-			) ||
-			!steps.length ||
-			steps.length > 40 ||
-			steps.some((step) => step.length > 10000) ||
-			!nutritionValid
-		) {
-			if (!nutritionValid) nutritionOpen = true;
-			error =
-				'Check the title, cooking time, servings, ingredient quantities, cooking steps, and nutrition values.';
+		const validation = validateRecipeDraft(draft, {
+			baseline: session.baseline,
+			assumptions: session.assumptions
+		});
+		if (!validation.ok) {
+			if (validation.nutritionInvalid) nutritionOpen = true;
+			error = validation.error;
 			return;
 		}
+		error = '';
 		try {
-			save({
-				...draft,
-				title,
-				description: draft.description.trim().slice(0, 10000),
-				cuisine: draft.cuisine.trim().slice(0, 100),
-				difficulty: draft.difficulty.trim().slice(0, 80),
-				ingredients,
-				steps,
-				importNotes: session.assumptions
-					.map((note) => note.trim().slice(0, 300))
-					.filter(Boolean)
-					.slice(0, 30),
-				saved: true
-			});
+			save(validation.recipe);
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -361,7 +315,7 @@
 					type="number"
 					bind:value={draft.servings}
 					min="1"
-					max="10000"
+					max={MAX_SERVINGS}
 					step="1"
 					required
 				/></label
@@ -464,7 +418,7 @@
 			<summary>Nutrition estimates</summary>
 			<p>Estimates per serving; re-estimate after ingredient or serving changes.</p>
 			<div class="draft-summary">
-				{#each nutritionFields as [key, label]}<label class="field"
+				{#each NUTRITION_FIELDS as [key, label]}<label class="field"
 						>{label}<input
 							type="number"
 							min="0"

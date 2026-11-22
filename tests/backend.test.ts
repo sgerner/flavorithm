@@ -344,3 +344,96 @@ test('reasoning preferences survive persistence and reject invalid budgets', asy
 	state.preferences.reasoning.budgetTokens = -1;
 	assert.equal(backend.validateAppState(state), null);
 });
+
+test('all foreign keys have unconditional leading indexes and auth/household queries avoid table scans', async () => {
+	await import('../src/lib/server/oauth-storage.ts');
+	await import('../src/lib/server/host-ai.ts');
+	await import('../src/lib/server/recipe-covers.ts');
+	const database = backend.getDatabase();
+
+	const tables = (
+		database
+			.prepare(
+				"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+			)
+			.all() as Array<{ name: string }>
+	).map((row) => row.name);
+	assert.equal(tables.length, 17);
+
+	let foreignKeyCount = 0;
+	for (const table of tables) {
+		const foreignKeys = database.prepare(`PRAGMA foreign_key_list("${table}")`).all() as Array<{
+			id: number;
+			seq: number;
+			table: string;
+			from: string;
+			to: string;
+		}>;
+		const indexes = database.prepare(`PRAGMA index_list("${table}")`).all() as Array<{
+			name: string;
+			partial: number;
+		}>;
+		for (const fk of foreignKeys) {
+			foreignKeyCount += 1;
+			assert.equal(fk.seq, 0, `Expected single-column foreign key on ${table}.${fk.from}`);
+			const hasLeadingUnconditionalIndex = indexes.some((index) => {
+				if (index.partial !== 0) return false;
+				const columns = database.prepare(`PRAGMA index_info("${index.name}")`).all() as Array<{
+					seqno: number;
+					name: string | null;
+				}>;
+				return columns.some((column) => column.seqno === 0 && column.name === fk.from);
+			});
+			assert.equal(
+				hasLeadingUnconditionalIndex,
+				true,
+				`Expected unconditional leading index on ${table}.${fk.from} -> ${fk.table}.${fk.to}`
+			);
+		}
+	}
+	assert.equal(foreignKeyCount, 14);
+
+	const queries = [
+		'DELETE FROM users WHERE id = ?',
+		'DELETE FROM households WHERE id = ?',
+		`SELECT invite_id AS inviteId, expires_at AS expiresAt
+		 FROM household_invites
+		 WHERE household_id = ? AND expires_at > ? AND uses_remaining > 0
+		 ORDER BY expires_at`,
+		'DELETE FROM sessions WHERE user_id = ?',
+		'DELETE FROM password_reset_tokens WHERE user_id = ?',
+		'DELETE FROM email_verification_tokens WHERE user_id = ?',
+		'DELETE FROM sessions WHERE expires_at <= ?',
+		'DELETE FROM password_reset_tokens WHERE expires_at <= ?',
+		'DELETE FROM email_verification_tokens WHERE expires_at <= ?',
+		'DELETE FROM oidc_login_transactions WHERE expires_at <= ?'
+	];
+
+	for (const sql of queries) {
+		const plan = database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{
+			parent: number;
+			detail: string;
+		}>;
+		assert.ok(plan.length > 0, `Expected query plan for: ${sql}`);
+		assert.equal(
+			plan.some((step) => step.detail.startsWith('SEARCH ')),
+			true,
+			`Expected SEARCH step in plan for ${sql}: ${JSON.stringify(plan)}`
+		);
+		for (const step of plan) {
+			assert.doesNotMatch(step.detail, /\bSCAN\b/, `Unexpected SCAN in plan for: ${sql}`);
+			assert.doesNotMatch(
+				step.detail,
+				/TEMP B-TREE/,
+				`Unexpected TEMP B-TREE sort in plan for: ${sql}`
+			);
+			if (step.parent === 0) {
+				assert.match(
+					step.detail,
+					/^(SEARCH |MULTI-INDEX OR$)/,
+					`Expected SEARCH or MULTI-INDEX OR root step for: ${sql}`
+				);
+			}
+		}
+	}
+});
