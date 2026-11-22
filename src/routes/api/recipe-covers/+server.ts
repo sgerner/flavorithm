@@ -1,4 +1,3 @@
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { ApiError, assertSameOrigin, errorResponse } from '#lib/server/db.ts';
 import { storeCover } from '#lib/server/recipe-covers.ts';
@@ -28,7 +27,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 		} finally {
 			reader.releaseLock();
 		}
-		return json({ image: await storeCover(locals.user.householdId, Buffer.concat(chunks)) });
+		return Response.json({
+			image: await storeCover(locals.user.householdId, Buffer.concat(chunks))
+		});
 	} catch (error) {
 		return errorResponse(error);
 	}

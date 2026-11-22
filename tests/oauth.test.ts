@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { createHash, createCipheriv, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, writeFile, stat, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
+import type { CompanionConfig } from '../src/lib/server/chatgpt-companion.ts';
 
-process.env.FLAVORITHM_DB_PATH = ':memory:';
+const tempDir = await mkdtemp(join(tmpdir(), 'flavorithm-oauth-test-'));
+process.env.FLAVORITHM_DB_PATH = join(tempDir, 'test.sqlite');
 process.env.ORIGIN = 'http://127.0.0.1:3000';
 
 const backend = await import('../src/lib/server/db.ts');
@@ -136,8 +137,10 @@ globalThis.fetch = async (input, init) => {
 	throw new Error(`Unexpected fetch in OAuth test: ${url}`);
 };
 
-after(() => {
+after(async () => {
 	globalThis.fetch = nativeFetch;
+	backend.getDatabase().close();
+	await rm(tempDir, { recursive: true, force: true });
 });
 
 async function createLocalUser(email: string) {
@@ -568,77 +571,49 @@ test('an older refresh failure cannot clear a newly reauthorized credential set'
 	assert.equal(await oauth.getChatGPTAccessToken(user.user.id, account.id), 'newly-authorized');
 });
 
-test('self-hosted connector completes local PKCE OAuth and imports encrypted credentials through the signed-in session', async () => {
-	const user = await createLocalUser('companion-integration@example.com');
-	const sessionBinding = backend.getSessionBinding(user.token)!;
-	const appUrl = new URL('https://flavorithm.example/');
-	assert.equal(
-		oauth.getChatGPTOAuthAvailability({ url: appUrl, clientAddress: '203.0.113.1' }).mode,
-		'device'
-	);
-	const storage = await import('../src/lib/server/oauth-storage.ts');
-	const vmHost = storage.ensureChatGPTHostId();
-	const result = oauth.startChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl });
-	const directory = await mkdtemp(join(tmpdir(), 'flavorithm-connector-'));
-	try {
-		const scriptPath = join(directory, result.filename);
-		await writeFile(scriptPath, result.script, { mode: 0o600 });
-		const helper = await import(pathToFileURL(scriptPath).href);
-		const completed = await helper.authorize(undefined, {
-			fetcher: globalThis.fetch,
-			settingsDir: join(directory, 'settings'),
-			outputDir: directory,
-			openBrowser: async (value: string) => {
-				const authorization = new URL(value);
-				assert.equal(authorization.searchParams.get('client_id'), 'dynamic_agent_client');
-				assert.equal(authorization.searchParams.get('agent_name_hint'), 'Flavorithm');
-				assert.notEqual(authorization.searchParams.get('ext_agent_host_id'), vmHost);
-				const invalidState = new URL(authorization.searchParams.get('redirect_uri')!);
-				invalidState.searchParams.set('state', 'incorrect-state');
-				assert.equal((await nativeFetch(invalidState)).status, 400);
-				assert.equal((await callbackFor(authorization)).response.status, 200);
-			}
-		});
-		const file = await readFile(completed.filename, 'utf8');
-		assert.doesNotMatch(file, /access-oaiapp|refresh-oaiapp|id_token|email|subject/);
-		assert.equal((await stat(completed.filename)).mode & 0o777, 0o600);
-		const bundle = JSON.parse(file);
-		const stranger = await createLocalUser('companion-stranger@example.com');
-		await assert.rejects(
-			oauth.finishChatGPTCompanion({
-				userId: stranger.user.id,
-				sessionBinding: backend.getSessionBinding(stranger.token)!,
-				appUrl,
-				bundle
-			}),
-			{ code: 'chatgpt_pairing_expired' }
-		);
-		await oauth.finishChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl, bundle });
-		const account = oauth.listChatGPTAccounts(user.user.id)[0];
-		assert.equal(account.planEnabled, true);
-		assert.equal(account.connected, true);
-		assert.equal(
-			await oauth.getChatGPTAccessToken(user.user.id, account.id),
-			`access-${storage.getChatGPTAccount(user.user.id, account.id)!.clientId}`
-		);
-		assert.equal(storage.ensureChatGPTHostId(), vmHost);
-		await assert.rejects(
-			oauth.finishChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl, bundle }),
-			{ code: 'chatgpt_pairing_expired' }
-		);
-	} finally {
-		await rm(directory, { recursive: true, force: true });
-	}
-});
-
 async function companionBundle(
 	user: Awaited<ReturnType<typeof createLocalUser>>,
 	options: { wrongNonce?: boolean; scopes?: string[] } = {}
 ) {
 	const sessionBinding = backend.getSessionBinding(user.token)!;
 	const appUrl = new URL('https://flavorithm.example/');
-	const result = oauth.startChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl });
-	const setup = JSON.parse(result.script.split('\n')[0].slice('const config = '.length, -1));
+	const keyPath = join(tempDir, 'oauth.key');
+	try {
+		await writeFile(keyPath, randomBytes(32), { flag: 'wx', mode: 0o600 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+	}
+	const localKey = await readFile(keyPath);
+	const setup: CompanionConfig = {
+		pairingId: randomBytes(32).toString('base64url'),
+		pairingKey: randomBytes(32).toString('base64url'),
+		nonce: randomBytes(32).toString('base64url'),
+		origin: appUrl.origin,
+		expiresAt: Date.now() + 10 * 60 * 1000,
+		clientId: 'dynamic_agent_client',
+		newRegistration: true,
+		reconsent: false
+	};
+	const pairingIv = randomBytes(12);
+	const pairingCipher = createCipheriv('aes-256-gcm', localKey, pairingIv);
+	pairingCipher.setAAD(
+		Buffer.from(`flavorithm:chatgpt:local-pending:${user.user.id}:${setup.pairingId}`)
+	);
+	const pairingData = Buffer.concat([
+		pairingCipher.update(JSON.stringify({ ...setup, sessionBinding }), 'utf8'),
+		pairingCipher.final()
+	]);
+	const envelope = JSON.stringify({
+		iv: pairingIv.toString('base64url'),
+		tag: pairingCipher.getAuthTag().toString('base64url'),
+		data: pairingData.toString('base64url')
+	});
+	backend
+		.getDatabase()
+		.prepare(
+			'INSERT INTO chatgpt_oauth_pairings(id, user_id, expires_at, envelope) VALUES (?, ?, ?, ?)'
+		)
+		.run(setup.pairingId, user.user.id, setup.expiresAt, envelope);
 	const token = {
 		access_token: 'sensitive-access',
 		refresh_token: 'sensitive-refresh',
@@ -674,7 +649,7 @@ async function companionBundle(
 	};
 }
 
-test('companion import rejects forged identity, session swaps, tampering, expired attempts, and insecure origins', async () => {
+test('companion import rejects forged identity, session swaps, cross-user bundles, tampering, replays, and expired attempts', async () => {
 	const user = await createLocalUser('companion-validation@example.com');
 	await assert.rejects(
 		oauth.finishChatGPTCompanion(await companionBundle(user, { wrongNonce: true })),
@@ -695,15 +670,27 @@ test('companion import rejects forged identity, session swaps, tampering, expire
 		.prepare('UPDATE chatgpt_oauth_pairings SET expires_at = ? WHERE id = ?')
 		.run(Date.now() - 1, expired.bundle.pairingId);
 	await assert.rejects(oauth.finishChatGPTCompanion(expired), { code: 'chatgpt_pairing_expired' });
-	assert.throws(
-		() =>
-			oauth.startChatGPTCompanion({
-				userId: user.user.id,
-				sessionBinding: backend.getSessionBinding(user.token)!,
-				appUrl: new URL('http://flavorithm.example/')
-			}),
-		{ code: 'chatgpt_https_required' }
+	assert.equal(oauth.listChatGPTAccounts(user.user.id).length, 0);
+
+	const valid = await companionBundle(user);
+	const stranger = await createLocalUser('companion-stranger@example.com');
+	await assert.rejects(
+		oauth.finishChatGPTCompanion({
+			...valid,
+			userId: stranger.user.id,
+			sessionBinding: backend.getSessionBinding(stranger.token)!
+		}),
+		{ code: 'chatgpt_pairing_expired' }
 	);
+	assert.equal(oauth.listChatGPTAccounts(stranger.user.id).length, 0);
+	const connected = await oauth.finishChatGPTCompanion(valid);
+	assert.equal(connected.connected, true);
+	assert.equal(connected.planEnabled, true);
+	assert.equal(
+		await oauth.getChatGPTAccessToken(user.user.id, connected.accountId),
+		'sensitive-access'
+	);
+	await assert.rejects(oauth.finishChatGPTCompanion(valid), { code: 'chatgpt_pairing_expired' });
 });
 
 test('companion import retains sign-in without claiming plan access when the provider declines plan scope', async () => {

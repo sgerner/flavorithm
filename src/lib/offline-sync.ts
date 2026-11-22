@@ -55,14 +55,6 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 	return value as PendingKitchen;
 }
 
-export function readPending(storage: StorageLike, user: User): PendingKitchen | null {
-	try {
-		return parsePending(JSON.parse(storage.getItem(key(user)) || 'null'), user);
-	} catch {
-		return null;
-	}
-}
-
 /** Read every per-writer durable delta, plus the old single-slot format for migration. */
 export function readPendingJournal(storage: StorageLike, user: User): PendingJournalRead {
 	const byWriter = new Map<string, PendingJournalRecord>();
@@ -189,10 +181,6 @@ export function clearPendingJournalRecords(
 				storage.removeItem(captured.key);
 		}
 	}
-}
-
-export function clearPending(storage: StorageLike, user: User): void {
-	storage.removeItem(key(user));
 }
 
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -506,77 +494,6 @@ function assertSameSyncIdentity(
 			{ status: 409 }
 		);
 	}
-}
-
-/** Always reconcile against current server state and use its ETag for the write. */
-export async function syncPendingKitchen(
-	pending: PendingKitchen,
-	transport: KitchenTransport,
-	prefer?: 'local' | 'remote',
-	reviewedEtag?: string | null
-): Promise<KitchenSyncResult> {
-	const identity = { ...transport.identity };
-	assertSameSyncIdentity(identity, { userId: pending.userId, householdId: pending.householdId });
-	const base = structuredClone(pending.base);
-	const local = structuredClone(pending.local);
-	if (prefer) {
-		const expectedEtag = reviewedEtag !== undefined ? reviewedEtag : pending.etag;
-		const remote = await transport.get();
-		assertSameSyncIdentity(identity, remote);
-		assertSameSyncIdentity(identity, transport.identity);
-		if (typeof expectedEtag !== 'string' || remote.etag !== expectedEtag) {
-			const recomputed = mergeKitchenStates(base, local, remote.state);
-			return {
-				state: recomputed.state,
-				etag: remote.etag,
-				conflicts: recomputed.conflicts,
-				saved: false,
-				staleEtag: true,
-				remoteState: structuredClone(remote.state)
-			};
-		}
-		const resolved = mergeKitchenStates(base, local, remote.state, prefer);
-		try {
-			const result = await transport.put(resolved.state, expectedEtag);
-			return { ...result, conflicts: [], saved: true };
-		} catch (error) {
-			if ((error as { status?: number }).status !== 412) throw error;
-			const latest = await transport.get();
-			assertSameSyncIdentity(identity, latest);
-			assertSameSyncIdentity(identity, transport.identity);
-			const recomputed = mergeKitchenStates(base, local, latest.state);
-			return {
-				state: recomputed.state,
-				etag: latest.etag,
-				conflicts: recomputed.conflicts,
-				saved: false,
-				staleEtag: true,
-				remoteState: structuredClone(latest.state)
-			};
-		}
-	}
-	for (let attempt = 0; attempt < 3; attempt += 1) {
-		const remote = await transport.get();
-		assertSameSyncIdentity(identity, remote);
-		assertSameSyncIdentity(identity, transport.identity);
-		const merged = mergeKitchenStates(base, local, remote.state);
-		if (merged.conflicts.length) {
-			return {
-				state: merged.state,
-				etag: remote.etag,
-				conflicts: merged.conflicts,
-				saved: false,
-				remoteState: structuredClone(remote.state)
-			};
-		}
-		try {
-			const result = await transport.put(merged.state, remote.etag);
-			return { ...result, conflicts: [], saved: true };
-		} catch (error) {
-			if ((error as { status?: number }).status !== 412 || attempt === 2) throw error;
-		}
-	}
-	throw new Error('Your household is changing quickly. Try syncing again.');
 }
 
 /** Apply independent writer snapshots in creation order while retaining conflicts between them. */
