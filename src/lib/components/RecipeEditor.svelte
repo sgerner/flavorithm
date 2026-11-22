@@ -61,9 +61,20 @@
 		['sugar', 'Sugar (g)'],
 		['protein', 'Protein (g)']
 	];
+	function isNutritionValid(target: Recipe): boolean {
+		return nutritionFields.every(
+			([key]) =>
+				Number.isFinite(target.nutrition[key]) &&
+				target.nutrition[key] >= 0 &&
+				target.nutrition[key] <= 1000000
+		);
+	}
+	let nutritionOpen = $state(untrack(() => !isNutritionValid(draft)));
 	function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
 		if (uploading) return;
+		error = '';
+		const title = draft.title.trim();
 		const tags = [
 			...new Set(
 				tagsText
@@ -89,8 +100,10 @@
 				return;
 			}
 		}
+		const nutritionValid = isNutritionValid(draft);
 		if (
-			!draft.title.trim() ||
+			!title ||
+			title.length > 200 ||
 			!Number.isFinite(draft.time) ||
 			draft.time < 1 ||
 			draft.time > 100000 ||
@@ -102,7 +115,9 @@
 			ingredients.some(
 				(item) =>
 					!item.name ||
+					item.name.length > 200 ||
 					!item.unit ||
+					item.unit.length > 40 ||
 					!Number.isFinite(item.quantity) ||
 					item.quantity <= 0 ||
 					item.quantity > 1000000
@@ -112,24 +127,20 @@
 			steps.some((step) => step.length > 10000) ||
 			tags.length > 30 ||
 			tags.some((tag) => tag.length > 100) ||
-			!nutritionFields.every(
-				([key]) =>
-					Number.isFinite(draft.nutrition[key]) &&
-					draft.nutrition[key] >= 0 &&
-					draft.nutrition[key] <= 1000000
-			)
+			!nutritionValid
 		) {
+			if (!nutritionValid) nutritionOpen = true;
 			error =
 				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
 			return;
 		}
 		save({
 			...draft,
-			title: draft.title.trim(),
-			description: draft.description.trim(),
+			title,
+			description: draft.description.trim().slice(0, 10000),
 			image,
-			cuisine: draft.cuisine.trim(),
-			difficulty: draft.difficulty.trim(),
+			cuisine: draft.cuisine.trim().slice(0, 100),
+			difficulty: draft.difficulty.trim().slice(0, 80),
 			tags,
 			ingredients,
 			steps
@@ -149,7 +160,7 @@
 	>
 		<h2 id="recipe-editor-title">Edit saved recipe</h2>
 		<p class="muted">Changes are saved to your recipe collection.</p>
-		<form onsubmit={saveDraft}>
+		<form onsubmit={saveDraft} novalidate>
 			<div class="draft-summary">
 				<label class="field draft-title"
 					>Title<input bind:value={draft.title} required maxlength="200" /></label
@@ -306,7 +317,7 @@
 						><X size={18} /></button
 					>
 				</div>{/each}
-			<details class="import-notes">
+			<details class="import-notes" bind:open={nutritionOpen}>
 				<summary>Nutrition estimates</summary>
 				<p>
 					Estimated values per serving. Ingredient or serving changes will mark these values as
