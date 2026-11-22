@@ -15,22 +15,21 @@ export const GET: RequestHandler = async (event) => {
 			const accountId = url.searchParams.get('accountId');
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
 			const host = accountId === HOST_CONNECTION_ID ? getHostAI() : null;
+			const catalogPromise = getPublicModelCatalog(catalogFetcher).catch(() => null);
 			const connection = await getChatGPTConnection(
 				host?.userId ?? locals.user.id,
 				host?.accountId ?? accountId,
 				catalogFetcher
 			);
-			const result = await listChatGPTModels(connection.accessToken, connection.fetcher);
-			try {
-				const catalog = await getPublicModelCatalog(catalogFetcher);
-				const openai = catalog.providers.find((provider) => provider.id === 'openai');
-				for (const model of result.providers[0].models) {
-					const metadata = openai?.models.find((candidate) => candidate.id === model.id);
-					if (metadata?.reasoning && !model.reasoning)
-						Object.assign(model, { reasoning: metadata.reasoning });
-				}
-			} catch {
-				/* An unavailable public catalog must not hide entitled account models. */
+			const [result, catalogData] = await Promise.all([
+				listChatGPTModels(connection.accessToken, connection.fetcher),
+				catalogPromise
+			]);
+			const openai = catalogData?.providers.find((provider) => provider.id === 'openai');
+			for (const model of result.providers[0].models) {
+				const metadata = openai?.models.find((candidate) => candidate.id === model.id);
+				if (metadata?.reasoning && !model.reasoning)
+					Object.assign(model, { reasoning: metadata.reasoning });
 			}
 			return Response.json(result, {
 				headers: { 'cache-control': 'no-store' }
