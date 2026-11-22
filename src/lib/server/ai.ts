@@ -565,18 +565,13 @@ function parseDataImage(image: string | undefined) {
 	};
 }
 
-const BASE_FETCHER = Symbol('baseFetcher');
-type TaggedFetcher = Fetcher & { [BASE_FETCHER]?: Fetcher };
-
 function withRequestSignal(fetcher: Fetcher, requestSignal?: AbortSignal): Fetcher {
 	if (!requestSignal) return fetcher;
-	const wrapped: TaggedFetcher = (input, init) => {
+	return (input, init) => {
 		assertRequestActive(requestSignal);
 		const signal = init?.signal ? AbortSignal.any([init.signal, requestSignal]) : requestSignal;
 		return fetcher(input, { ...init, signal });
 	};
-	wrapped[BASE_FETCHER] = (fetcher as TaggedFetcher)[BASE_FETCHER] ?? fetcher;
-	return wrapped;
 }
 
 function assertRequestActive(requestSignal?: AbortSignal) {
@@ -2371,9 +2366,8 @@ type PublicCatalogCacheEntry = {
 };
 let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
-function resolvePublicCatalogKey(fetcher: Fetcher): Fetcher {
-	const base = (fetcher as TaggedFetcher)[BASE_FETCHER] ?? fetcher;
-	return base.name === 'server_fetch' ? globalThis.fetch : base;
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
 }
 
 export async function getSupportedModels(
@@ -2396,7 +2390,7 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const key = resolvePublicCatalogKey(fetcher);
+	const key = publicCatalogKey(fetcher);
 	const cached = publicCatalogCache.get(key);
 	const now = Date.now();
 	if (cached && now < cached.expiresAt) return cached.pending;
@@ -2414,5 +2408,5 @@ export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<Support
 
 /** Clear the shared catalog cache so injected-fetch tests remain isolated. */
 export function resetPublicModelCatalogCache(): void {
-	publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
+	publicCatalogCache = new WeakMap();
 }
