@@ -47,14 +47,21 @@ Chat uses your existing AI connection and requires sign-in. Basil receives the c
 
 ## Run locally
 
-Requirements: Node.js 24 or newer and npm. Flavorithm uses Node's built-in `node:sqlite` module.
+Requirements: Node.js 24 LTS (`>=24.19.0 <25.0.0`) and npm. `.nvmrc` pins Node.js `24` for version managers and `.npmrc` enforces `engine-strict=true` during installs. Flavorithm uses Node's built-in `node:sqlite` module.
 
 ```sh
 git clone https://github.com/sgerner/flavorithm.git
 cd flavorithm
+nvm use # optional: selects Node.js 24 from .nvmrc
 npm ci
 cp .env.example .env
 npm run dev
+```
+
+To run the full local verification suite matching CI:
+
+```sh
+npm run format:check && npm run check && npm test && npm run build && npm run test:smoke && npm run test:sso
 ```
 
 Vite prints the local development URL. You can begin as a guest, or create an account to try server sync and household features. AI, online recipe search, password recovery email, and hosted ChatGPT plan access need the optional connections described below.
@@ -250,7 +257,7 @@ These controls are not a security audit. Email verification is available from Se
 
 The repo includes a multi-stage Docker image and Compose deployment. Follow the [Docker deployment guide](docs/docker-deployment.md) for Authentik forward-auth, Cloudflare DDNS, persistent SQLite storage, and automatic updates from GitHub. Run `npm run readiness` to check configuration without printing secrets. Follow [launch acceptance](docs/launch-checklist.md) for real email, provider, device, backup, and household checks. A configured key does not establish provider eligibility or successful delivery.
 
-Build and run the Node adapter on Node.js 24 or newer. Put it behind a reverse proxy that terminates HTTPS and set `ORIGIN` to the public HTTPS origin. `server.mjs` pins the application host and protocol to that origin. Configure `ADDRESS_HEADER` and `XFF_DEPTH` only when the request path passes through a trusted proxy that removes client-supplied forwarding headers.
+Build and run the Node adapter on Node.js 24 LTS (`>=24.19.0 <25.0.0`). Put it behind a reverse proxy that terminates HTTPS and set `ORIGIN` to the public HTTPS origin. `server.mjs` pins the application host and protocol to that origin. Configure `ADDRESS_HEADER` and `XFF_DEPTH` only when the request path passes through a trusted proxy that removes client-supplied forwarding headers.
 
 Give the process a persistent writable volume for `FLAVORITHM_DB_PATH`; the default path is under `data/`. This app is designed for a single app instance with a local SQLite database. Rate limits are held in process memory and are not shared between instances. Horizontal scaling needs shared storage, a shared OAuth encryption key, and a distributed rate limiter; that deployment setup is not provided here.
 
@@ -276,7 +283,7 @@ The automated tests cover application logic and use mocked provider/network resp
 
 | Symptom                                                  | Check                                                                                                                                                                                                                       |
 | -------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `node:sqlite` is unavailable                             | Use Node.js 24 or newer and confirm `node --version`.                                                                                                                                                                       |
+| `node:sqlite` is unavailable                             | Use Node.js 24 LTS (`>=24.19.0 <25.0.0`) and confirm `node --version`.                                                                                                                                                      |
 | Sign-in works, but sync returns an error                 | Check that `FLAVORITHM_DB_PATH` is writable and persistent. If the kitchen changed elsewhere, reload the latest shared state before editing again.                                                                          |
 | ChatGPT connection is unavailable locally                | Start the app on the same computer where you open it, use `localhost` or `127.0.0.1`, and complete consent in that browser. A phone connecting to another computer cannot complete the local loopback callback.             |
 | Hosted ChatGPT OAuth is unavailable                      | For device-code login, enable the grant in ChatGPT security settings or ask your workspace admin. For registered SIWC, check the issued client, callback, and encryption key. See the [OAuth guide](docs/chatgpt-oauth.md). |

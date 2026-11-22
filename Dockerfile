@@ -1,6 +1,6 @@
 FROM node:24-bookworm-slim AS dependencies
 WORKDIR /app
-COPY package.json package-lock.json ./
+COPY .npmrc package.json package-lock.json ./
 RUN npm ci
 
 FROM dependencies AS build
@@ -9,7 +9,7 @@ RUN npm run build
 
 FROM node:24-bookworm-slim AS production-dependencies
 WORKDIR /app
-COPY package.json package-lock.json ./
+COPY .npmrc package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
 FROM node:24-bookworm-slim AS runtime
