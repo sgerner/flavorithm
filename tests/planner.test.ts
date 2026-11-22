@@ -186,10 +186,12 @@ function createModuleMap() {
 		'#lib/components/RecipeImport.svelte': {
 			default: noopComponent,
 			emptyImportSession: () => ({
+				url: '',
 				text: '',
 				photo: '',
 				photoName: '',
 				draft: null,
+				baseline: null,
 				assumptions: []
 			})
 		}
