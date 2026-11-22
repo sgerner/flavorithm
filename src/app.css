@@ -2819,6 +2819,8 @@ html.dark[data-theme='nosh'] {
 	.secondary,
 	.cream-button,
 	.text-button,
+	.use-first,
+	.restock-item,
 	.banner-icon,
 	.icon-button,
 	.save-recipe,
@@ -2830,6 +2832,8 @@ html.dark[data-theme='nosh'] {
 		min-height: 44px;
 	}
 
+	.use-first,
+	.restock-item,
 	.icon-button,
 	.banner-icon,
 	.save-recipe,

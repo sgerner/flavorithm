@@ -131,22 +131,10 @@ function scoreRecipe(
 	return score;
 }
 
-/** Rank suggestions from explicit preferences, past ratings, and usable pantry ingredients. */
-export function rankRecipes(
-	recipes: Recipe[],
-	pantry: Ingredient[],
-	preferences: Preferences,
-	now: Date = new Date()
-): Recipe[] {
-	const rated: RatedRecipe[] = recipes.flatMap((recipe) => {
-		const rating = recipeRating(recipe, preferences);
-		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
-	});
+type PantryIndex = Map<string, { item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]>;
 
-	const pantryIndex = new Map<
-		string,
-		{ item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]
-	>();
+function buildPantryIndex(pantry: Ingredient[], now: Date): PantryIndex {
+	const pantryIndex: PantryIndex = new Map();
 	for (const item of pantry) {
 		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
 		const expiry = expiryStatus(item.expires, now);
@@ -156,6 +144,53 @@ export function rankRecipes(
 		entries.push({ item, expiry });
 		pantryIndex.set(key, entries);
 	}
+	return pantryIndex;
+}
+
+function ratedSignals(recipes: Recipe[], preferences: Preferences): RatedRecipe[] {
+	return recipes.flatMap((recipe) => {
+		const rating = recipeRating(recipe, preferences);
+		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
+	});
+}
+
+/** Filter and rank local recipes with positive pantryScores against stocked or targeted expiring ingredients. */
+export function rankPantryRecipes(
+	recipes: Recipe[],
+	pantry: Ingredient[],
+	preferences: Preferences,
+	targetIngredients?: Ingredient[],
+	now: Date = new Date()
+): Recipe[] {
+	const pantryIndex = buildPantryIndex(pantry, now);
+	const matchIndex =
+		targetIngredients !== undefined ? buildPantryIndex(targetIngredients, now) : pantryIndex;
+	if (!matchIndex.size) return [];
+	const rated = ratedSignals(recipes, preferences);
+
+	return recipes
+		.flatMap((recipe, index) => {
+			const targetMatch = pantryScores(recipe, matchIndex);
+			if (targetMatch.available <= 0) return [];
+			const score =
+				targetMatch.available * 18 +
+				targetMatch.expiring * 8 +
+				scoreRecipe(recipe, pantryIndex, preferences, rated, now);
+			return [{ recipe, index, score }];
+		})
+		.sort((a, b) => b.score - a.score || a.index - b.index)
+		.map(({ recipe }) => recipe);
+}
+
+/** Rank suggestions from explicit preferences, past ratings, and usable pantry ingredients. */
+export function rankRecipes(
+	recipes: Recipe[],
+	pantry: Ingredient[],
+	preferences: Preferences,
+	now: Date = new Date()
+): Recipe[] {
+	const rated = ratedSignals(recipes, preferences);
+	const pantryIndex = buildPantryIndex(pantry, now);
 	return recipes
 		.map((recipe, index) => ({
 			recipe,

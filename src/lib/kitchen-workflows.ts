@@ -220,6 +220,62 @@ export function transferPurchasedItemsToPantry(
 	return result;
 }
 
+/** Move selected or all depleted pantry items into the shopping list without duplicating compatible unchecked entries. */
+export function restockDepletedPantryItems(
+	pantry: Ingredient[],
+	shopping: ShoppingItem[],
+	selectedIds?: Iterable<string>,
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): { pantry: Ingredient[]; shopping: ShoppingItem[]; restockedCount: number; addedCount: number } {
+	const selection = selectedIds ? new Set(selectedIds) : undefined;
+	const nextPantry: Ingredient[] = [];
+	const nextShopping = shopping.map((item) => ({ ...item }));
+	const usedIds = new Set(nextShopping.map((item) => item.id));
+	const uncheckedKeys = new Set<string>();
+	for (const entry of nextShopping) {
+		if (entry.checked || !entry.name.trim()) continue;
+		uncheckedKeys.add(bucketKey(entry.name, entry.unit.trim() || 'piece'));
+	}
+
+	let restockedCount = 0;
+	let addedCount = 0;
+	for (const item of pantry) {
+		const isSelected = !selection || selection.has(item.id);
+		const isDepleted = Number.isFinite(item.quantity) && item.quantity <= 0;
+		const name = item.name.trim();
+		if (!isSelected || !isDepleted || !name) {
+			nextPantry.push({ ...item });
+			continue;
+		}
+
+		const unit = item.unit.trim() || 'piece';
+		const key = bucketKey(name, unit);
+		if (!uncheckedKeys.has(key)) {
+			if (nextShopping.length >= 1000) {
+				nextPantry.push({ ...item });
+				continue;
+			}
+			uncheckedKeys.add(key);
+			const baseId = createId();
+			let id = baseId;
+			let suffix = 2;
+			while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+			usedIds.add(id);
+			nextShopping.push({
+				id,
+				name,
+				quantity: 1,
+				unit,
+				checked: false
+			});
+			addedCount++;
+		}
+		restockedCount++;
+	}
+
+	return { pantry: nextPantry, shopping: nextShopping, restockedCount, addedCount };
+}
+
 function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
 	return state.recipes.find((recipe) => recipe.id === meal.recipeId);
 }
