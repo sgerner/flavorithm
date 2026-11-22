@@ -7,7 +7,7 @@ import {
 } from '#lib/server/ai.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
-import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
+import { ApiError, assertSameOrigin, clientAddress, consumeRateLimit } from '#lib/server/db.ts';
 import { getHostAI } from '#lib/server/host-ai.ts';
 import { getAuthMode } from '#lib/server/sso.ts';
 
@@ -47,7 +47,8 @@ export const POST: RequestHandler = async (event) => {
 			throw new ApiError(401, 'Authentication required');
 		}
 
-		const ip = event.getClientAddress();
+		const ip = clientAddress(event);
+		if (!ip) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`recipe-import-ip:${ip}`, 20, 15 * 60 * 1000);
 		if (user) {
 			consumeRateLimit(`recipe-import-user:${user.id}`, 30, 60 * 60 * 1000);

@@ -44,7 +44,7 @@ function createRouteEvent(options: {
 	body?: unknown;
 	rawBody?: string;
 	headers?: Record<string, string>;
-	ip?: string;
+	ip?: string | null;
 	user?: Record<string, unknown> | null;
 	authMode?: 'local' | 'oidc' | 'proxy' | 'invalid';
 	fetcher?: typeof fetch;
@@ -73,7 +73,10 @@ function createRouteEvent(options: {
 			user: options.user ?? null,
 			authMode: options.authMode ?? 'local'
 		},
-		getClientAddress: () => options.ip ?? '198.51.100.25',
+		getClientAddress: () => {
+			if (options.ip === null) throw new Error('ClientAddress cannot be determined');
+			return options.ip ?? '198.51.100.25';
+		},
 		fetch: options.fetcher ?? fetch,
 		cookies: {
 			get: () => undefined,
@@ -720,6 +723,13 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 			}) as never
 		);
 		assert.equal(crossSiteFetchRes.status, 403);
+
+		const missingAddressRes = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: null
+			}) as never
+		);
+		assert.equal(missingAddressRes.status, 403);
 
 		// 7. Private/local network targets and non-HTTPS schemes rejected with 400.
 		for (const forbiddenUrl of [
