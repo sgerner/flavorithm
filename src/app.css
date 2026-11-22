@@ -936,9 +936,24 @@ main {
 .pantry-row b {
 	font-weight: 500;
 }
-.pantry-row label {
+.pantry-row .pantry-amount {
 	display: flex;
 	align-items: center;
+	gap: 4px;
+	min-width: 0;
+}
+.pantry-row .pantry-field {
+	display: flex;
+	flex-direction: column;
+	min-width: 0;
+}
+.pantry-row .pantry-field-label {
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	overflow: hidden;
+	clip: rect(0, 0, 0, 0);
+	white-space: nowrap;
 }
 .pantry-row input {
 	padding: 7px 5px;
@@ -2913,18 +2928,29 @@ html.dark[data-theme='nosh'] {
 		overflow-wrap: anywhere;
 	}
 
-	.pantry-row > label {
+	.pantry-row > .pantry-amount {
 		grid-column: 1;
 		grid-row: 2;
-		gap: 4px;
-		flex-wrap: wrap;
+		align-self: start;
+		display: grid;
+		grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+		gap: 6px;
 	}
 
-	.pantry-row > label::before {
-		content: 'AMOUNT';
-		flex-basis: 100%;
-		font-size: 14px;
+	.pantry-row .pantry-field {
+		gap: 4px;
+	}
+
+	.pantry-row .pantry-field-label {
+		position: static;
+		width: auto;
+		height: auto;
+		overflow: visible;
+		clip: auto;
+		white-space: nowrap;
+		font-size: 12px;
 		letter-spacing: 0.7px;
+		text-transform: uppercase;
 		color: var(--muted);
 	}
 
@@ -2936,7 +2962,8 @@ html.dark[data-theme='nosh'] {
 	}
 
 	.pantry-row input[type='number'] {
-		width: 88px;
+		width: 100%;
+		max-width: 100%;
 		appearance: textfield;
 	}
 
@@ -2946,13 +2973,20 @@ html.dark[data-theme='nosh'] {
 	}
 
 	.pantry-row .unit-input {
-		width: 70px;
+		width: 100%;
+		max-width: 100%;
 	}
 
-	.pantry-row > input[type='date'] {
+	.pantry-row > .pantry-expiry {
 		grid-column: 2;
 		grid-row: 2;
+		align-self: start;
 		width: 100%;
+	}
+
+	.pantry-row .pantry-expiry input[type='date'] {
+		width: 100%;
+		max-width: 100%;
 		padding-inline: 4px;
 	}
 
@@ -3511,7 +3545,7 @@ html.dark[data-theme='nosh'] {
 		gap: 6px;
 	}
 
-	.pantry-row > input[type='date'] {
+	.pantry-row input[type='date'] {
 		font-size: 14px;
 	}
 

@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { CloudOff, RefreshCw, Download } from '@lucide/svelte';
 	import { revealMotion } from '#lib/motion.ts';
+	import DisclosureButton from '#lib/components/DisclosureButton.svelte';
 	import type { AppState } from '#lib/types.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	let {
@@ -24,7 +25,12 @@
 		exportPending: () => void;
 		error?: string;
 	} = $props();
+	const reviewPanelId = $props.id();
 	let review = $state(false);
+	let reviewOpen = $derived(review && conflicts.length > 0);
+	$effect(() => {
+		if (!conflicts.length) review = false;
+	});
 	function describe(path: string): string {
 		const match = /^kitchen\.(recipes|pantry|shopping|meals)(?:\[([^\]]+)\])?(?:\.(.*))?$/.exec(
 			path
@@ -118,12 +124,15 @@
 		</div>
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		{#if conflicts.length}
-			<button class="secondary" onclick={() => (review = !review)}
-				>{review ? 'Hide changes' : 'Review changes'}</button
+			<DisclosureButton
+				class="secondary"
+				expanded={reviewOpen}
+				controls={reviewOpen ? reviewPanelId : undefined}
+				onclick={() => (review = !review)}>Review changes</DisclosureButton
 			>
 		{:else if online && !syncing}<button class="secondary" onclick={retry}>Retry sync</button>{/if}
-		{#if review && conflicts.length}
-			<div class="sync-review">
+		{#if reviewOpen}
+			<div id={reviewPanelId} class="sync-review">
 				<p>
 					Your edits are kept on this device until you choose. Independent changes will be kept
 					either way.

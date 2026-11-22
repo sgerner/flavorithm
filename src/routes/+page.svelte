@@ -61,6 +61,7 @@
 	import { applyButlerCommands } from '#lib/butler.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
+	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
 	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
@@ -2219,15 +2220,19 @@
 		<div class="bottom-nav">
 			<button onclick={household}><Users size={18} /> My household <Plus size={15} /></button
 			><button onclick={() => openSettings()}><Settings size={18} /> Settings & themes</button
-			><button
+			><ToggleButton
+				pressed={kitchen.preferences.dark}
 				onclick={() => {
 					kitchen.preferences.dark = !kitchen.preferences.dark;
 				}}
-				>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}{kitchen
-					.preferences.dark
-					? 'Light mode'
-					: 'Dark mode'}<span class="mode-toggle" class:on={kitchen.preferences.dark}
-				></span></button
+				>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+						size={18}
+						aria-hidden="true"
+					/>{/if}Dark mode<span
+					class="mode-toggle"
+					class:on={kitchen.preferences.dark}
+					aria-hidden="true"
+				></span></ToggleButton
 			>
 		</div>
 		<button class="profile-button" onclick={() => (user ? openSettings() : openAuthentication())}
@@ -2253,16 +2258,20 @@
 				<b>{nav.find((n) => n.id === page)?.name || 'Discover'}</b>
 			</div>
 			<div class="topbar-actions">
-				<button
+				<ToggleButton
 					class="icon-button"
-					aria-label="Switch color mode"
+					label="Dark mode"
+					pressed={kitchen.preferences.dark}
 					onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-					>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}</button
+					>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+							size={18}
+							aria-hidden="true"
+						/>{/if}</ToggleButton
 				><button
 					class="top-avatar"
 					aria-label={user ? 'Open household and account' : 'Sign in or create an account'}
 					onclick={() => (user ? household() : openAuthentication())}
-					>{user?.name.slice(0, 1) || 'Y'}</button
+					><span aria-hidden="true">{user?.name.slice(0, 1) || 'Y'}</span></button
 				>
 			</div>
 		</header>
@@ -2374,18 +2383,21 @@
 						</div>
 					</div>
 					<div class="recipe-toolbar">
-						<div class="filter-tabs">
-							{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
-									class:active={filter === item}
-									aria-pressed={filter === item}
+						<div class="filter-tabs" role="group" aria-label="Filter recipes">
+							{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<ToggleButton
+									class={{ active: filter === item }}
+									pressed={filter === item}
 									onclick={() => (filter = item)}
-									>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
+									>{#if item === 'For you'}<Sparkles
+											size={14}
+											aria-hidden="true"
+										/>{/if}{item}</ToggleButton
 								>{/each}
-							<button
-								class:active={showHiddenRecipes}
-								aria-pressed={showHiddenRecipes}
+							<ToggleButton
+								class={{ active: showHiddenRecipes }}
+								pressed={showHiddenRecipes}
 								onclick={() => (showHiddenRecipes = !showHiddenRecipes)}
-								>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+								>Hidden recipes</ToggleButton
 							>
 						</div>
 						<div class="search-box">
@@ -2500,29 +2512,39 @@
 						>
 					</div>
 				</div>
-				<div class="expiry-filters" aria-label="Filter pantry by expiry">
-					{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
-							class:active={pantryFilter === option.id}
-							aria-pressed={pantryFilter === option.id}
+				<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
+					{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<ToggleButton
+							class={{ active: pantryFilter === option.id }}
+							pressed={pantryFilter === option.id}
 							onclick={() => (pantryFilter = option.id)}
-							>{option.label}<span>{option.count}</span></button
+							><span>{option.label}</span><span class="visually-hidden">{', '}</span><span
+								class="expiry-count"
+								>{option.count}<span class="visually-hidden"
+									>{` ${option.count === 1 ? 'item' : 'items'}`}</span
+								></span
+							></ToggleButton
 						>{/each}
 				</div>
 				<div class="pantry-table">
 					<div class="table-head">
 						<span>INGREDIENT</span><span>AMOUNT</span><span>BEST BEFORE</span><span></span>
 					</div>
-					{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(item.expires)}
+					{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
+							item.expires
+						)}{@const itemDomId = encodeURIComponent(item.id)}
 						<div
 							class="pantry-row"
+							role="group"
+							aria-labelledby={`pantry-item-${itemDomId}`}
 							animate:flip={{ duration: motionDuration(200) }}
 							in:revealMotion|global={{ y: 8, duration: 200 }}
 							out:fadeMotion={{ duration: 120 }}
 						>
 							<span class="pantry-ingredient">
-								<span class="ingredient-symbol">{ingredientEmoji(item.name)}</span><span
-									class="ingredient-meta"
-									><b>{item.name}</b><small
+								<span class="ingredient-symbol" aria-hidden="true"
+									>{ingredientEmoji(item.name)}</span
+								><span class="ingredient-meta"
+									><b id={`pantry-item-${itemDomId}`}>{item.name}</b><small
 										class="expiry-badge"
 										class:expired={expiry === 'expired'}
 										class:soon={expiry === 'soon'}
@@ -2536,30 +2558,45 @@
 									>{#if expiry === 'soon'}<button
 											class="text-button use-first"
 											onclick={() => useFirstIngredients([item])}
-											><Sparkles size={14} />Use first</button
+											><Sparkles size={14} aria-hidden="true" />Use first</button
 										>{/if}</span
 								>
-							</span><label
-								><input
-									aria-label={`Quantity of ${item.name}`}
-									type="number"
-									min="0"
-									step="0.25"
-									bind:value={item.quantity}
-								/><input
-									class="unit-input"
-									aria-label={`Unit for ${item.name}`}
-									bind:value={item.unit}
-								/></label
-							><input
-								aria-label={`Expiry for ${item.name}`}
-								type="date"
-								bind:value={item.expires}
-							/><button
+							</span>
+							<div class="pantry-amount">
+								<div class="pantry-field">
+									<label class="pantry-field-label" for={`pantry-amount-${itemDomId}`}
+										><span>Amount</span><span class="visually-hidden">{` of ${item.name}`}</span
+										></label
+									><input
+										id={`pantry-amount-${itemDomId}`}
+										type="number"
+										min="0"
+										step="0.25"
+										bind:value={item.quantity}
+									/>
+								</div>
+								<div class="pantry-field">
+									<label class="pantry-field-label" for={`pantry-unit-${itemDomId}`}
+										><span>Unit</span><span class="visually-hidden">{` for ${item.name}`}</span
+										></label
+									><input
+										id={`pantry-unit-${itemDomId}`}
+										class="unit-input"
+										bind:value={item.unit}
+									/>
+								</div>
+							</div>
+							<div class="pantry-field pantry-expiry">
+								<label class="pantry-field-label" for={`pantry-expiry-${itemDomId}`}
+									><span>Best before</span><span class="visually-hidden">{` for ${item.name}`}</span
+									></label
+								><input id={`pantry-expiry-${itemDomId}`} type="date" bind:value={item.expires} />
+							</div>
+							<button
 								class="icon-button"
 								aria-label={`Remove ${item.name}`}
 								onclick={() => (kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id))}
-								><X size={16} /></button
+								><X size={16} aria-hidden="true" /></button
 							>
 						</div>{/each}
 				</div>
@@ -3186,19 +3223,25 @@
 					<h2>Settings</h2>
 					<div class="settings-section">
 						<h3>Appearance</h3>
-						<div class="theme-grid">
-							{#each themes as theme}<button
-									class:active={kitchen.preferences.theme === theme}
-									aria-pressed={kitchen.preferences.theme === theme}
+						<div class="theme-grid" role="group" aria-label="Color theme">
+							{#each themes as theme}<ToggleButton
+									class={{ active: kitchen.preferences.theme === theme }}
+									pressed={kitchen.preferences.theme === theme}
 									onclick={() => (kitchen.preferences.theme = theme)}
-									>{theme}{#if kitchen.preferences.theme === theme}<Check size={13} />{/if}</button
+									>{theme}{#if kitchen.preferences.theme === theme}<Check
+											size={13}
+											aria-hidden="true"
+										/>{/if}</ToggleButton
 								>{/each}
 						</div>
-						<button
-							class="secondary"
+						<ToggleButton
+							class={{ secondary: true, active: kitchen.preferences.dark }}
+							pressed={kitchen.preferences.dark}
 							onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-							>{#if kitchen.preferences.dark}<Sun size={16} />{:else}<Moon size={16} />{/if}Switch
-							to {kitchen.preferences.dark ? 'light' : 'dark'} mode</button
+							>{#if kitchen.preferences.dark}<Sun size={16} aria-hidden="true" />{:else}<Moon
+									size={16}
+									aria-hidden="true"
+								/>{/if}Dark mode</ToggleButton
 						>
 					</div>
 
@@ -3659,7 +3702,7 @@
 		flex-wrap: wrap;
 		margin: 20px 0 10px;
 	}
-	.expiry-filters button {
+	.expiry-filters :global(button) {
 		min-height: 44px;
 		display: inline-flex;
 		align-items: center;
@@ -3669,12 +3712,12 @@
 		background: var(--surface);
 		font-size: 14px;
 	}
-	.expiry-filters button.active {
+	.expiry-filters :global(button.active) {
 		background: var(--green);
 		color: var(--paper);
 		border-color: var(--green);
 	}
-	.expiry-filters button span {
+	.expiry-filters .expiry-count {
 		min-width: 22px;
 		padding: 2px 5px;
 		background: color-mix(in srgb, currentColor 12%, transparent);
@@ -3876,7 +3919,7 @@
 			display: grid;
 			grid-template-columns: repeat(3, minmax(0, 1fr));
 		}
-		.expiry-filters button {
+		.expiry-filters :global(button) {
 			justify-content: center;
 			gap: 5px;
 			padding-inline: 6px;

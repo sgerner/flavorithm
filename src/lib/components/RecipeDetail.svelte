@@ -3,6 +3,7 @@
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
+	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import type { Recipe } from '#lib/types.ts';
 	import {
 		X,
@@ -177,22 +178,25 @@
 					<div>
 						<h3>Let's make it</h3>
 						<ol class="steps-list">
-							{#each recipe.steps as step, i}<li>
-									<button
-										class:done={completed.includes(i)}
-										aria-pressed={completed.includes(i)}
-										aria-label={`Mark step ${i + 1} ${completed.includes(i) ? 'incomplete' : 'complete'}`}
+							{#each recipe.steps as step, i}{@const stepNumber = String(i + 1).padStart(
+									2,
+									'0'
+								)}{@const isDone = completed.includes(i)}
+								<li>
+									<ToggleButton
+										class={{ done: isDone }}
+										pressed={isDone}
 										onclick={() =>
-											(completedSteps = completed.includes(i)
+											(completedSteps = isDone
 												? completed.filter((n) => n !== i)
 												: [...completed, i])}
-										>{#if completed.includes(i)}<span transition:fadeMotion|global
+										><span class="visually-hidden">{'Step '}</span><span
+											class:visually-hidden={isDone}>{stepNumber}</span
+										>{#if isDone}<span transition:fadeMotion|global aria-hidden="true"
 												><Check size={16} /></span
-											>{:else}<span transition:fadeMotion|global
-												>{String(i + 1).padStart(2, '0')}</span
-											>{/if}</button
+											>{/if}</ToggleButton
 									>
-									<p class:muted={completed.includes(i)}>{step}</p>
+									<p class:muted={isDone}>{step}</p>
 								</li>{/each}
 						</ol>
 					</div>
