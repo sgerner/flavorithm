@@ -59,15 +59,6 @@ const recipe = z.object({
 	sampleSaved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
-const pantry = z.object({
-	id,
-	name: z.string().trim().min(1).max(200),
-	quantity,
-	unit: z.string().max(40),
-	category: z.string().max(80),
-	expires: z.string().max(40).optional(),
-	sample: z.boolean().optional()
-});
 const date = z
 	.string()
 	.regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -75,6 +66,15 @@ const date = z
 		const d = new Date(value + 'T12:00:00Z');
 		return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === value;
 	}, 'Use a real calendar date.');
+const pantry = z.object({
+	id,
+	name: z.string().trim().min(1).max(200),
+	quantity,
+	unit: z.string().max(40),
+	category: z.string().max(80),
+	expires: z.union([date, z.literal('')]).optional(),
+	sample: z.boolean().optional()
+});
 const meal = z.object({
 	id,
 	date,

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState, createNewUserState, seedRecipes } from '../src/lib/data.ts';
 import { rankRecipes } from '../src/lib/discovery.ts';
-import { buildShoppingList, preferenceSummary } from '../src/lib/domain.ts';
+import { buildShoppingList, parseCalendarDate, preferenceSummary } from '../src/lib/domain.ts';
 import { clearSampleData } from '../src/lib/kitchen-workflows.ts';
 import type { Ingredient, Meal, Recipe } from '../src/lib/types.ts';
 
@@ -101,13 +101,85 @@ test('shopping allocates pantry lots by meal date so expired leftovers do not co
 		[
 			{ id: 'later', date: '2026-10-26', slot: 'Dinner', recipeId: 'pasta', servings: 4 },
 			{ id: 'earlier', date: '2026-10-22', slot: 'Dinner', recipeId: 'pasta', servings: 2 }
-		]
+		],
+		new Date(2026, 9, 20, 12)
 	);
 
 	assert.equal(result.length, 1);
 	assert.equal(result[0].name, 'tomato');
 	assert.equal(result[0].quantity, 50);
 	assert.equal(result[0].unit, 'g');
+});
+
+test('parseCalendarDate validates real calendar dates and keeps ISO date prefixes across timezones', () => {
+	assert.deepEqual(parseCalendarDate('2026-10-22'), { year: 2026, month: 9, day: 22 });
+	assert.deepEqual(parseCalendarDate('2024-02-29'), { year: 2024, month: 1, day: 29 });
+	assert.deepEqual(parseCalendarDate('2026-11-19T00:00:00Z'), { year: 2026, month: 10, day: 19 });
+	assert.deepEqual(parseCalendarDate('2026-11-19T23:59:59.000+05:30'), {
+		year: 2026,
+		month: 10,
+		day: 19
+	});
+	assert.equal(parseCalendarDate('2026-02-29'), undefined);
+	assert.equal(parseCalendarDate('2026-02-30'), undefined);
+	assert.equal(parseCalendarDate('2026-02-30T00:00:00Z'), undefined);
+	assert.equal(parseCalendarDate('2026-11-19T25:00:00Z'), undefined);
+	assert.equal(parseCalendarDate('10/22/2026'), undefined);
+	assert.equal(parseCalendarDate('soon'), undefined);
+	assert.equal(parseCalendarDate(''), undefined);
+});
+
+test('overdue meals enforce a today floor while keeping today-expiring, ISO, and blank lots usable', () => {
+	const tomatoRecipe = recipe({
+		servings: 2,
+		ingredients: [{ name: 'tomato', quantity: 50, unit: 'g' }]
+	});
+	const now = new Date(2026, 9, 22, 12);
+
+	const expiredAndInvalidSkipped = buildShoppingList(
+		[tomatoRecipe],
+		[
+			pantry('tomato', 50, 'g', '2026-10-21'),
+			{ ...pantry('tomato', 50, 'g'), id: 'invalid-feb', expires: '2026-02-30' },
+			{ ...pantry('tomato', 50, 'g'), id: 'invalid-text', expires: 'next week' }
+		],
+		[{ id: 'overdue', date: '2026-10-20', slot: 'Dinner', recipeId: 'pasta', servings: 2 }],
+		now
+	);
+	assert.equal(expiredAndInvalidSkipped.length, 1);
+	assert.equal(expiredAndInvalidSkipped[0].quantity, 50);
+
+	const todayFloorAllocation = buildShoppingList(
+		[tomatoRecipe],
+		[
+			{ ...pantry('tomato', 50, 'g'), id: 'today-lot', expires: '2026-10-22' },
+			{ ...pantry('tomato', 25, 'g'), id: 'blank-lot', expires: '' }
+		],
+		[
+			{ id: 'future', date: '2026-10-25', slot: 'Dinner', recipeId: 'pasta', servings: 2 },
+			{ id: 'overdue', date: '2026-10-20', slot: 'Dinner', recipeId: 'pasta', servings: 2 }
+		],
+		now
+	);
+	assert.equal(todayFloorAllocation.length, 1);
+	assert.equal(todayFloorAllocation[0].quantity, 25);
+
+	const isoUtcSameDay = buildShoppingList(
+		[tomatoRecipe],
+		[pantry('tomato', 50, 'g', '2026-11-19T00:00:00Z')],
+		[{ id: 'same-day', date: '2026-11-19', slot: 'Dinner', recipeId: 'pasta', servings: 2 }],
+		new Date(2026, 10, 19, 20)
+	);
+	assert.deepEqual(isoUtcSameDay, []);
+
+	const invalidNow = buildShoppingList(
+		[tomatoRecipe],
+		[pantry('tomato', 50, 'g', '2000-01-01')],
+		undefined,
+		new Date(Number.NaN)
+	);
+	assert.equal(invalidNow.length, 1);
+	assert.equal(invalidNow[0].quantity, 50);
 });
 
 test('a blank recipe serving baseline cannot use pantry stock to claim the recipe is covered', () => {
