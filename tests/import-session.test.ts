@@ -11,10 +11,11 @@ import {
 	hasUnsavedImportContent,
 	isReviewingImportDraft,
 	MAX_IMPORT_TEXT_LENGTH,
-	replaceImportSessionWithText,
+	replaceImportSessionWithUrl,
 	type ImportSession
 } from '#lib/import-session.ts';
 import { MAX_RECIPES } from '#lib/recipe-collection.ts';
+import { createDraftBaseline } from '#lib/recipe-draft.ts';
 import type { Recipe } from '#lib/types.ts';
 
 process.env.FLAVORITHM_DB_PATH = ':memory:';
@@ -30,37 +31,43 @@ test('online search import over an empty session loads the link without offering
 	const initial = emptyImportSession();
 	assert.equal(hasUnsavedImportContent(initial), false);
 
-	const { session, previous } = replaceImportSessionWithText(
+	const { session, previous } = replaceImportSessionWithUrl(
 		initial,
 		'https://example.com/recipes/lemon-pasta'
 	);
-	assert.equal(session.text, 'https://example.com/recipes/lemon-pasta');
+	assert.equal(session.url, 'https://example.com/recipes/lemon-pasta');
+	assert.equal(session.text, '');
 	assert.equal(session.photo, '');
 	assert.equal(session.draft, null);
 	assert.equal(session.reviewingDraft, false);
 	assert.equal(previous, null);
 
-	const repeated = replaceImportSessionWithText(session, 'https://example.com/recipes/lemon-pasta');
+	const repeated = replaceImportSessionWithUrl(session, 'https://example.com/recipes/lemon-pasta');
 	assert.equal(repeated.previous, null);
 });
 
-test('online search import over active draft/photo offers undo restoring text, photo, draft, notes, and view', () => {
-	const draft = makeRecipe('draft-1', { title: 'Roasted Cauliflower Tacos' });
+test('online search import over active draft/photo offers undo restoring url, text, photo, draft, notes, and view', () => {
+	const draft = makeRecipe('draft-1', { title: 'Roasted Cauliflower Tacos', servings: 4 });
+	const baseline = createDraftBaseline(draft);
+	draft.servings = 6;
 	const activeReview: ImportSession = {
+		url: 'https://example.com/recipes/cauliflower-tacos',
 		text: 'cauliflower, lime, warm tortillas',
 		photo:
 			'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg==',
 		photoName: 'tacos-card.png',
 		draft,
+		baseline,
 		assumptions: ['Assumed 2 tsp cumin', 'Estimated 4 servings'],
 		reviewingDraft: true
 	};
 
-	const replaced = replaceImportSessionWithText(
+	const replaced = replaceImportSessionWithUrl(
 		activeReview,
 		'https://example.com/recipes/tomato-soup'
 	);
-	assert.equal(replaced.session.text, 'https://example.com/recipes/tomato-soup');
+	assert.equal(replaced.session.url, 'https://example.com/recipes/tomato-soup');
+	assert.equal(replaced.session.text, '');
 	assert.equal(replaced.session.photo, '');
 	assert.equal(replaced.session.draft, null);
 	assert.equal(isReviewingImportDraft(replaced.session), false);
@@ -69,16 +76,19 @@ test('online search import over active draft/photo offers undo restoring text, p
 	// Mutating the original draft after replacement cannot corrupt the undo snapshot.
 	draft.title = 'Mutated title';
 	const restoredReview = cloneImportSession(replaced.previous);
+	assert.equal(restoredReview.url, 'https://example.com/recipes/cauliflower-tacos');
 	assert.equal(restoredReview.text, 'cauliflower, lime, warm tortillas');
 	assert.equal(restoredReview.photoName, 'tacos-card.png');
 	assert.equal(restoredReview.photo.startsWith('data:image/png;base64,'), true);
 	assert.equal(restoredReview.draft?.title, 'Roasted Cauliflower Tacos');
+	assert.equal(restoredReview.draft?.servings, 6);
+	assert.equal(restoredReview.baseline?.servings, 4);
 	assert.deepEqual(restoredReview.assumptions, ['Assumed 2 tsp cumin', 'Estimated 4 servings']);
 	assert.equal(isReviewingImportDraft(restoredReview), true);
 
 	// Also preserves source-screen view when user had navigated Back before importing from search.
 	const activeSourceView: ImportSession = { ...restoredReview, reviewingDraft: false };
-	const replacedFromSource = replaceImportSessionWithText(
+	const replacedFromSource = replaceImportSessionWithUrl(
 		activeSourceView,
 		'https://example.com/recipes/chili'
 	);
@@ -111,11 +121,14 @@ test('import workspace remembers source screen vs review screen across closes an
 });
 
 test('voice dictation appends on source view even with a draft and ignores late transcripts on review or close', () => {
+	const voiceDraft = makeRecipe('draft-voice');
 	const session: ImportSession = {
+		url: '',
 		text: '2 cups chickpeas',
 		photo: '',
 		photoName: '',
-		draft: makeRecipe('draft-voice'),
+		draft: voiceDraft,
+		baseline: createDraftBaseline(voiceDraft),
 		assumptions: ['Assumed cooked chickpeas'],
 		reviewingDraft: false
 	};
@@ -188,11 +201,15 @@ test('voice dictation appends on source view even with a draft and ignores late 
 });
 
 test('clearing source removes only text and photo while preserving draft, estimate notes, and session identity', () => {
+	const keptDraft = makeRecipe('draft-keep', { title: 'Shakshuka', servings: 4 });
+	const keptBaseline = createDraftBaseline(keptDraft);
 	const session: ImportSession = {
+		url: 'https://example.com/shakshuka',
 		text: 'old pasted notes',
 		photo: 'data:image/jpeg;base64,/9j/4AAQSkZJRg==',
 		photoName: 'notes.jpg',
-		draft: makeRecipe('draft-keep', { title: 'Shakshuka' }),
+		draft: keptDraft,
+		baseline: keptBaseline,
 		assumptions: ['Assumed 4 large eggs'],
 		reviewingDraft: false
 	};
@@ -200,20 +217,24 @@ test('clearing source removes only text and photo while preserving draft, estima
 
 	clearImportSourceInPlace(session);
 	assert.equal(session, originalReference);
+	assert.equal(session.url, '');
 	assert.equal(session.text, '');
 	assert.equal(session.photo, '');
 	assert.equal(session.photoName, '');
 	assert.equal(session.draft?.title, 'Shakshuka');
+	assert.deepEqual(session.baseline, keptBaseline);
 	assert.deepEqual(session.assumptions, ['Assumed 4 large eggs']);
 	assert.equal(isReviewingImportDraft(session), false);
 
 	// Discard draft resets everything.
 	const discarded = emptyImportSession();
 	assert.deepEqual(discarded, {
+		url: '',
 		text: '',
 		photo: '',
 		photoName: '',
 		draft: null,
+		baseline: null,
 		assumptions: [],
 		reviewingDraft: false
 	});
@@ -222,21 +243,28 @@ test('clearing source removes only text and photo while preserving draft, estima
 test('saving an imported recipe offers undo restoring prior recipes, replaced entries, and review draft', () => {
 	const kitchen = createNewUserState();
 	const originalTarget = structuredClone(kitchen.recipes[2]);
+	const replacementBaseline = createDraftBaseline(
+		makeRecipe(originalTarget.id, { servings: 2, ingredients: originalTarget.ingredients })
+	);
 	const replacementDraft = makeRecipe(originalTarget.id, {
 		title: 'Accidentally Replaced Soup',
+		servings: 6,
 		importNotes: ['Estimated 1 tbsp olive oil'],
 		saved: true
 	});
 	const session: ImportSession = {
-		text: 'https://example.com/soup',
+		url: 'https://example.com/soup',
+		text: 'make it extra garlicky',
 		photo: '',
 		photoName: '',
 		draft: replacementDraft,
+		baseline: replacementBaseline,
 		assumptions: ['Estimated 1 tbsp olive oil'],
 		reviewingDraft: true
 	};
 
 	const applied = applyImportedRecipeSave(kitchen, session, replacementDraft);
+	assert.equal(applied.saved.nutritionStale, true);
 	assert.equal(applied.nextRecipes.length, kitchen.recipes.length);
 	assert.equal(applied.nextRecipes[0].id, originalTarget.id);
 	assert.equal(applied.nextRecipes[0].title, 'Accidentally Replaced Soup');
@@ -253,7 +281,9 @@ test('saving an imported recipe offers undo restoring prior recipes, replaced en
 		assert.equal(rolledBack.kitchen.recipes[2].id, originalTarget.id);
 		assert.equal(rolledBack.kitchen.recipes[2].title, originalTarget.title);
 		assert.equal(rolledBack.session.draft?.title, 'Accidentally Replaced Soup');
-		assert.equal(rolledBack.session.text, 'https://example.com/soup');
+		assert.equal(rolledBack.session.baseline?.servings, 2);
+		assert.equal(rolledBack.session.url, 'https://example.com/soup');
+		assert.equal(rolledBack.session.text, 'make it extra garlicky');
 		assert.deepEqual(rolledBack.session.assumptions, ['Estimated 1 tbsp olive oil']);
 		assert.equal(isReviewingImportDraft(rolledBack.session), true);
 	}
@@ -263,10 +293,12 @@ test('save undo keeps newer kitchen edits when the kitchen changes before undo',
 	const kitchen = createNewUserState();
 	const imported = makeRecipe('new-import', { title: 'Crispy Tofu Bowl', saved: true });
 	const session: ImportSession = {
+		url: '',
 		text: 'tofu, rice, cucumber',
 		photo: '',
 		photoName: '',
 		draft: imported,
+		baseline: createDraftBaseline(imported),
 		assumptions: [],
 		reviewingDraft: true
 	};
