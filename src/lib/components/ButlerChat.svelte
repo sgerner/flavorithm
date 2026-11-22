@@ -14,13 +14,16 @@
 	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
-	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
+	import {
+		createButlerChat,
+		type ButlerChatAction as Action,
+		type ButlerChatMessage as Message,
+		type ButlerChatResult,
+		type ButlerTurn as Turn
+	} from '#lib/butler-chat.ts';
 	import { focusTrap } from '#lib/focus.ts';
 	import type { AppState, Recipe } from '#lib/types.ts';
 
-	type Turn = { role: 'user' | 'assistant'; content: string };
-	type Action = ButlerAction & { status: 'pending' | 'applied' | 'dismissed' };
-	type Message = Turn & { id: number; actions?: Action[]; snapshot?: string };
 	let {
 		kitchen,
 		owner,
@@ -42,7 +45,7 @@
 			history: Turn[],
 			signal?: AbortSignal,
 			recipeDrafts?: Recipe[]
-		) => Promise<{ reply: string; commands: unknown[] }>;
+		) => Promise<ButlerChatResult>;
 		apply: (commands: unknown[], expectedSnapshot: string) => string | Promise<string>;
 	} = $props();
 	let recipeDrafts = $state<Recipe[]>([]);
@@ -73,12 +76,7 @@
 	let input = $state<HTMLTextAreaElement>();
 	let transcript = $state<HTMLDivElement>();
 	let launcher = $state<HTMLButtonElement>();
-	let sequence = 0;
-	let generation = 0;
 	let currentOwner = '';
-	let alive = true;
-	let controller: AbortController | undefined;
-	let requestTimer: ReturnType<typeof setTimeout> | undefined;
 	let reaction = $state<'idle' | 'speaking' | 'pleased'>('idle');
 	let reactionTimer: ReturnType<typeof setTimeout> | undefined;
 	const working = $derived(busy || !!applying);
@@ -105,18 +103,41 @@
 		{ label: 'Create a recipe', prompt: 'Help me build a recipe from scratch.' },
 		{ label: 'Review my recipes', prompt: 'Review my recipes. Be honest.' }
 	];
-	function cancelRequest() {
-		controller?.abort();
-		clearTimeout(requestTimer);
-		controller = undefined;
-		generation++;
-		busy = false;
-		resetReaction();
-	}
+	const chat = createButlerChat({
+		getKitchen: () => kitchen,
+		getOwner: () => owner,
+		isWorking: () => working,
+		getDraft: () => draft,
+		setDraft: (value) => {
+			draft = value;
+		},
+		getMessages: () => messages,
+		setMessages: (value) => {
+			messages = value;
+		},
+		getRecipeDrafts: () => recipeDrafts,
+		setRecipeDrafts: (value) => {
+			recipeDrafts = value;
+		},
+		setBusy: (value) => {
+			busy = value;
+		},
+		setError: (value) => {
+			error = value;
+		},
+		getFailedPrompt: () => failedPrompt,
+		setFailedPrompt: (value) => {
+			failedPrompt = value;
+		},
+		request: (prompt, history, signal, drafts) => request(prompt, history, signal, drafts),
+		onSpeak: (duration) => react('speaking', duration),
+		onResetReaction: resetReaction,
+		onScroll: () => void scroll()
+	});
 	$effect(() => {
 		if (owner !== currentOwner) {
 			currentOwner = owner;
-			cancelRequest();
+			chat.cancelRequest();
 			messages = [];
 			recipeDrafts = [];
 			draft = '';
@@ -127,8 +148,7 @@
 		}
 	});
 	onDestroy(() => {
-		alive = false;
-		cancelRequest();
+		chat.destroy();
 	});
 	async function scroll() {
 		await tick();
@@ -154,99 +174,30 @@
 		}
 	}
 	function clear() {
-		cancelRequest();
-		messages = [];
-		recipeDrafts = [];
-		error = '';
-		failedPrompt = '';
+		chat.clear();
 		input?.focus();
 	}
-	async function send(prompt = draft.trim(), retry = false) {
-		if (!prompt || working || !owner) return;
-		resetReaction();
-		const token = ++generation;
-		const history = messages
-			.slice(retry ? -21 : -20, retry ? -1 : undefined)
-			.map(({ role, content, actions }) => {
-				const applied = actions
-					?.filter((action) => action.status === 'applied')
-					.map((action) => action.title);
-				return {
-					role,
-					content: applied?.length ? `${content}\n\n[User applied: ${applied.join('; ')}]` : content
-				};
-			});
-		for (const message of messages)
-			for (const action of message.actions ?? [])
-				if (action.status === 'pending') action.status = 'dismissed';
-		if (!retry) messages.push({ id: ++sequence, role: 'user', content: prompt });
-		draft = '';
-		error = '';
-		failedPrompt = '';
-		busy = true;
-		const snapshot = JSON.stringify(kitchen);
-		const currentController = new AbortController();
-		controller = currentController;
-		requestTimer = setTimeout(
-			() => currentController.abort(new Error('Basil took too long to respond. Please try again.')),
-			90000
-		);
-		void scroll();
-		try {
-			const result = await request(prompt, history, currentController.signal, recipeDrafts);
-			currentController.signal.throwIfAborted();
-			if (!alive || token !== generation) return;
-			const actions = buildButlerActions(result.commands, JSON.parse(snapshot)).map(
-				(action): Action => ({ ...action, status: 'pending' })
-			);
-			const drafts = new Map(recipeDrafts.map((recipe) => [recipe.id, recipe]));
-			for (const action of actions)
-				for (const command of action.commands)
-					if (command.type === 'recipe.upsert') drafts.set(command.recipe.id, command.recipe);
-			recipeDrafts = [...drafts.values()].slice(-10);
-			react('speaking', Math.min(12000, Math.max(2400, result.reply.length * 28)));
-			messages.push({
-				id: ++sequence,
-				role: 'assistant',
-				content: result.reply,
-				actions,
-				snapshot
-			});
-		} catch (e) {
-			if (!alive || token !== generation) return;
-			error = currentController.signal.aborted
-				? 'The request was interrupted. Please try again.'
-				: e instanceof Error
-					? e.message
-					: 'Basil could not connect. Please try again.';
-			failedPrompt = prompt;
-		} finally {
-			if (alive && token === generation) {
-				clearTimeout(requestTimer);
-				controller = undefined;
-				busy = false;
-				void scroll();
-			}
-		}
+	function send(prompt = draft.trim()) {
+		return chat.send(prompt);
 	}
-	function stop() {
-		cancelRequest();
-		error = '';
-		failedPrompt = '';
+	async function stop() {
+		chat.stop();
+		await tick();
+		input?.focus();
 	}
 	async function applyAction(message: Message, action: Action) {
 		if (working || action.status !== 'pending' || !message.snapshot) return;
-		const token = generation;
+		const token = chat.generation;
 		const activeOwner = owner;
 		applying = `${message.id}:${action.id}`;
 		error = '';
 		await tick();
-		if (!alive || token !== generation || activeOwner !== owner) return;
+		if (!chat.alive || token !== chat.generation || activeOwner !== owner) return;
 		try {
 			if (message.snapshot !== JSON.stringify(kitchen))
 				throw new Error('Your kitchen changed. Ask Basil for an updated proposal.');
 			const snapshot = await apply(action.commands, message.snapshot);
-			if (!alive || token !== generation) return;
+			if (!chat.alive || token !== chat.generation) return;
 			message.snapshot = snapshot;
 			const savedIds = action.commands.flatMap((command) =>
 				command.type === 'recipe.upsert' ? [command.recipe.id] : []
@@ -255,10 +206,10 @@
 			action.status = 'applied';
 			react('pleased', 2200);
 		} catch (e) {
-			if (alive && token === generation)
+			if (chat.alive && token === chat.generation)
 				error = e instanceof Error ? e.message : 'The changes could not be applied.';
 		} finally {
-			if (alive && token === generation) applying = '';
+			if (chat.alive && token === chat.generation) applying = '';
 		}
 	}
 	function words(value: string) {
@@ -431,6 +382,7 @@
 								</p>{/if}
 						</div>
 					{/if}
+					{#if message.warning}<p class="butler-warning" role="status">{message.warning}</p>{/if}
 				</article>
 			{/each}
 		</div>
@@ -441,8 +393,7 @@
 			</div>{/if}
 		{#if error}<div class="butler-error" role="alert">
 				<p>{error}</p>
-				{#if failedPrompt}<button onclick={() => send(failedPrompt, true)} disabled={working}
-						>Try again</button
+				{#if failedPrompt}<button onclick={() => chat.retry()} disabled={working}>Try again</button
 					>{/if}
 			</div>{/if}
 		<form
@@ -714,6 +665,11 @@
 		font-size: 11px;
 		color: var(--muted);
 		margin: 2px 0 0;
+	}
+	.butler-warning {
+		font-size: 11px;
+		color: var(--muted);
+		margin: 8px 0 0;
 	}
 	.butler-working {
 		display: flex;

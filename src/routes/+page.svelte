@@ -59,6 +59,7 @@
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
+	import { pairButlerHistory, type ButlerChatResult } from '#lib/butler-chat.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
@@ -1375,7 +1376,7 @@
 			{
 				prompt: message,
 				messages: [
-					...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
+					...pairButlerHistory(history, (turn) => turn.content.slice(0, 8000), 38),
 					{ role: 'user', content: message }
 				],
 				context
@@ -1384,7 +1385,7 @@
 		);
 		if (owner !== `${user?.id}:${user?.householdId}`)
 			throw new Error('The active kitchen changed. Ask Basil again.');
-		return result as { reply: string; commands: unknown[] };
+		return result as ButlerChatResult;
 	}
 	function applyButler(commands: unknown[], expectedSnapshot: string) {
 		if (JSON.stringify(kitchen) !== expectedSnapshot) {
