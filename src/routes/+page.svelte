@@ -63,7 +63,14 @@
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
-	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
+	import {
+		appendVoiceTranscript,
+		isVoiceTargetActive,
+		parseQuickShoppingItems,
+		VoiceCapture,
+		type VoiceState,
+		type VoiceTarget
+	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
 	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
@@ -232,7 +239,7 @@
 	let localVoiceAvailable = $state(false);
 	let voiceState = $state<VoiceState>('idle');
 	let voiceStarting = $state(false);
-	let voiceTarget = $state('');
+	let voiceTarget = $state<VoiceTarget | ''>('');
 	let voiceCapture: VoiceCapture | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
@@ -240,6 +247,8 @@
 		if (typeof window === 'undefined') return;
 		voiceCapture?.cancel();
 		voiceStarting = false;
+		voiceState = 'idle';
+		voiceTarget = '';
 		voiceApiKey = '';
 		voiceProvider = 'auto';
 		voiceModel = '';
@@ -266,13 +275,6 @@
 				.catch(() => {});
 		}
 		return () => voiceCapture?.cancel();
-	});
-	$effect(() => {
-		if (voiceTarget && modal !== voiceTarget) {
-			voiceCapture?.cancel();
-			voiceStarting = false;
-			voiceTarget = '';
-		}
 	});
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
@@ -1339,6 +1341,16 @@
 	}
 	let butlerChat = $state<ButlerChat>();
 	let butlerOpen = $state(false);
+	let voiceOverlay = $derived(
+		Boolean(butlerOpen || editingRecipe || (!modal && (selected || mobileNav)))
+	);
+	$effect(() => {
+		if (voiceTarget && !isVoiceTargetActive(voiceTarget, { modal, page, overlay: voiceOverlay })) {
+			voiceCapture?.cancel();
+			voiceStarting = false;
+			voiceTarget = '';
+		}
+	});
 	let cookingSteps = $state<Record<string, number[]>>({});
 	let selectedMealServings = $state<number | undefined>();
 	let cookingSessionKey = $derived(
@@ -1532,12 +1544,15 @@
 		}
 	}
 	function dictate() {
-		startDictation(false);
+		void startDictation('pantry');
 	}
 	function dictateRecipe() {
-		startDictation(true);
+		void startDictation('import');
 	}
-	async function startDictation(forRecipe: boolean) {
+	function dictateShopping() {
+		void startDictation('shopping');
+	}
+	async function startDictation(target: VoiceTarget) {
 		if (voiceStarting || voiceState !== 'idle') return;
 		const provider =
 			voiceProvider === 'auto'
@@ -1560,29 +1575,50 @@
 			return;
 		}
 		voiceCapture?.cancel();
+		if (target === 'import') {
+			if (modal !== 'import') openImport(importSession.draft ? '' : undefined);
+		} else if (target === 'pantry') {
+			mobileNav = false;
+			modal = 'pantry';
+		} else {
+			mobileNav = false;
+			modal = '';
+			if (page !== 'shopping') navigate('shopping');
+		}
 		voiceStarting = true;
-		voiceTarget = forRecipe ? 'import' : 'pantry';
-		if (!forRecipe) modal = 'pantry';
+		voiceTarget = target;
 		const inputSession = importSession;
 		const owner = user?.id;
 		const capture = new VoiceCapture({
 			state: (value) => {
+				if (voiceCapture !== capture) return;
 				voiceState = value;
+				if (value === 'idle') {
+					voiceStarting = false;
+					voiceTarget = '';
+				}
 			},
 			text: (text) => {
-				if (user?.id !== owner || modal !== (forRecipe ? 'import' : 'pantry')) return;
-				if (forRecipe) {
+				if (
+					voiceCapture !== capture ||
+					user?.id !== owner ||
+					voiceTarget !== target ||
+					!isVoiceTargetActive(target, { modal, page, overlay: voiceOverlay })
+				)
+					return;
+				if (target === 'import') {
 					if (importSession !== inputSession || importSession.draft) return;
-					importSession.text = [importSession.text, text]
-						.filter(Boolean)
-						.join('\n')
-						.slice(0, 20000);
-				} else {
-					pantryInput = [pantryInput, text].filter(Boolean).join(', ');
+					importSession.text = appendVoiceTranscript(importSession.text, text, '\n', 20000);
+				} else if (target === 'pantry') {
+					pantryInput = appendVoiceTranscript(pantryInput, text);
 					notify('Review your ingredients, then add them.');
+				} else {
+					shoppingText = appendVoiceTranscript(shoppingText, text);
+					notify('Review your items, then add them.');
 				}
 			},
 			error: (message) => {
+				if (voiceCapture !== capture) return;
 				notify(message);
 			}
 		});
@@ -1590,7 +1626,10 @@
 		try {
 			await capture.start({ provider, model: voiceModel, apiKey: voiceApiKey });
 		} finally {
-			if (voiceCapture === capture) voiceStarting = false;
+			if (voiceCapture === capture) {
+				voiceStarting = false;
+				if (voiceState === 'idle') voiceTarget = '';
+			}
 		}
 	}
 
@@ -2145,6 +2184,33 @@
 		}
 	}
 </script>
+
+{#snippet voiceSession()}
+	<div class="voice-session" in:revealMotion>
+		<p role="status" aria-live="polite">
+			{voiceStarting
+				? 'Opening microphone…'
+				: voiceState === 'recording'
+					? 'Listening… up to 2 minutes'
+					: 'Transcribing…'}
+		</p>
+		<div class="dialog-actions">
+			{#if voiceState === 'recording'}<button
+					type="button"
+					class="primary"
+					onclick={() => voiceCapture?.stop()}>Stop recording</button
+				>{/if}<button
+				type="button"
+				class="secondary"
+				onclick={() => {
+					voiceCapture?.cancel();
+					voiceStarting = false;
+					voiceTarget = '';
+				}}>Cancel voice</button
+			>
+		</div>
+	</div>
+{/snippet}
 
 {#if ready}
 	<div inert={!!modal || !!selected || !!editingRecipe}>
@@ -2841,18 +2907,14 @@
 									>Browse recipes <ArrowRight size={16} /></button
 								>
 							</div>{/if}
+						{#if voiceTarget === 'shopping' && (voiceState !== 'idle' || voiceStarting)}{@render voiceSession()}{/if}
 						<form
 							class="inline-add"
 							onsubmit={(e) => {
 								e.preventDefault();
-								if (shoppingText.trim()) {
-									kitchen.shopping.push({
-										id: crypto.randomUUID(),
-										name: shoppingText.trim(),
-										quantity: 1,
-										unit: 'piece',
-										checked: false
-									});
+								const additions = parseQuickShoppingItems(shoppingText);
+								if (additions.length) {
+									kitchen.shopping.push(...additions);
 									shoppingText = '';
 								}
 							}}
@@ -2861,7 +2923,13 @@
 								aria-label="Add shopping item"
 								placeholder="Anything else for the basket?"
 								bind:value={shoppingText}
-							/><button class="text-button">Add</button>
+							/><button
+								type="button"
+								class="icon-button"
+								aria-label="Dictate shopping items"
+								disabled={voiceStarting || voiceState !== 'idle'}
+								onclick={dictateShopping}><Mic size={18} /></button
+							><button type="submit" class="text-button">Add</button>
 						</form>
 						<button
 							class="text-button"
@@ -2942,27 +3010,7 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if voiceState !== 'idle' || voiceStarting}<div class="voice-session" in:revealMotion>
-						<p role="status" aria-live="polite">
-							{voiceStarting
-								? 'Opening microphone…'
-								: voiceState === 'recording'
-									? 'Listening… up to 2 minutes'
-									: 'Transcribing…'}
-						</p>
-						<div class="dialog-actions">
-							{#if voiceState === 'recording'}<button
-									class="primary"
-									onclick={() => voiceCapture?.stop()}>Stop recording</button
-								>{/if}<button
-								class="secondary"
-								onclick={() => {
-									voiceCapture?.cancel();
-									voiceStarting = false;
-								}}>Cancel voice</button
-							>
-						</div>
-					</div>{/if}
+				{#if voiceTarget === modal && (voiceState !== 'idle' || voiceStarting)}{@render voiceSession()}{/if}
 
 				<button
 					class="icon-button dialog-close"

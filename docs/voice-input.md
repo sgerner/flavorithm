@@ -1,6 +1,6 @@
 # Voice input
 
-Choose **Settings → Voice input → Transcription**. The same **Use voice** button works in the pantry and recipe import. With a transcription connection, allow microphone access, speak, then choose **Stop recording**. Review the text before submitting it. Recordings stop after two minutes. **Cancel voice**, closing the dialog, signing out, or leaving the page releases the microphone and discards the pending result.
+Choose **Settings → Voice input → Transcription**. Voice input works in the pantry, recipe import, and the shopping list. With a transcription connection, allow microphone access, speak, then choose **Stop recording**. Review the text before submitting it. Recordings stop after two minutes. **Cancel voice**, closing or opening a dialog or Basil chat, signing out, or leaving the page releases the microphone and discards the pending result.
 
 ## Options
 
@@ -51,4 +51,4 @@ Recording requires microphone permission and HTTPS (localhost is allowed for dev
 
 Audio is processed in memory and not saved by Flavorithm. Cloud providers receive recordings and language information under their own policies; local Whisper keeps the transcription within the operator's infrastructure. Cancellation stops local capture and prevents late text insertion, but an upstream service may already have processed an upload. The server returns only the transcript and generic actionable errors, not upstream payloads or credentials.
 
-Automated tests mock providers and microphone interfaces. Live cloud transcription requires your own provider key; live local transcription requires a running Whisper service. Both pantry and import transcripts remain editable.
+Automated tests mock providers and microphone interfaces. Live cloud transcription requires your own provider key; live local transcription requires a running Whisper service. Pantry, recipe import, and shopping list transcripts remain editable.

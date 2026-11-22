@@ -1,5 +1,71 @@
+import type { ShoppingItem } from './types.ts';
 import { MAX_VOICE_SECONDS, type VoiceOptions } from './voice-config.ts';
 export type VoiceState = 'idle' | 'recording' | 'transcribing';
+export type VoiceTarget = 'import' | 'pantry' | 'shopping';
+
+const QUICK_SHOPPING_ITEM_PATTERN =
+	/^(\d+(?:\.\d+)?)(?:\s*(g|grams?|kg|kilograms?|mg|oz|ounces?|lbs?|pounds?|ml|milliliters?|millilitres?|l|liters?|litres?|cups?|tbsp|tablespoons?|tsp|teaspoons?|pt|pints?|qt|quarts?|gal|gallons?|pieces?|whole|each|cans?|cloves?|bunch(?:es)?|heads?|slices?|loaf|loaves|bottles?|packs?|packages?|bags?|boxes?|jars?)\s+(?:of\s+)?|\s+)(.+)$/i;
+
+export function isVoiceTargetActive(
+	target: VoiceTarget | '',
+	view: {
+		modal: string;
+		page: string;
+		overlay?: boolean;
+	}
+): boolean {
+	if (!target || view.overlay) return false;
+	if (target === 'shopping') return view.page === 'shopping' && !view.modal;
+	return view.modal === target;
+}
+
+export function appendVoiceTranscript(
+	current: string,
+	transcript: string,
+	separator = ', ',
+	maxLength?: number
+): string {
+	const incoming = transcript.trim();
+	if (!incoming) return maxLength !== undefined ? current.slice(0, maxLength) : current;
+	const existing =
+		separator === '\n' ? current.replace(/\s+$/, '') : current.replace(/[\s,;.]+$/, '');
+	const merged = existing ? `${existing}${separator}${incoming}` : incoming;
+	return maxLength !== undefined ? merged.slice(0, maxLength) : merged;
+}
+
+export function parseQuickShoppingItems(
+	input: string,
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): ShoppingItem[] {
+	const segments = input
+		.split(/[,\n;]/)
+		.map((segment) => segment.trim())
+		.filter(Boolean);
+	const items: ShoppingItem[] = [];
+	for (let i = 0; i < segments.length; i++) {
+		let value = segments[i].replace(/\.+$/, '').trim();
+		if (segments.length > 1 && i > 0) value = value.replace(/^and\s+/i, '').trim();
+		if (!value) continue;
+		const match = value.match(QUICK_SHOPPING_ITEM_PATTERN);
+		const parsedQuantity = match ? Number(match[1]) : NaN;
+		const validQuantity = Number.isFinite(parsedQuantity) && parsedQuantity > 0;
+		const rawName = (validQuantity && match ? match[3] : value).trim().slice(0, 100);
+		if (!rawName) continue;
+		const quantity = validQuantity
+			? Math.min(1_000_000, Math.round(parsedQuantity * 100) / 100 || parsedQuantity)
+			: 1;
+		const unit = (validQuantity && match?.[2] ? match[2].toLowerCase() : 'piece').slice(0, 40);
+		items.push({
+			id: createId(),
+			name: rawName,
+			quantity,
+			unit,
+			checked: false
+		});
+	}
+	return items;
+}
+
 export function pcmWav(samples: Float32Array): Uint8Array<ArrayBuffer> {
 	const bytes = new Uint8Array(44 + samples.length * 2);
 	const view = new DataView(bytes.buffer);
