@@ -246,7 +246,8 @@ test('shopping item cards identify the shopping list and navigation labels are h
 				item: { id: 'milk', name: 'Milk', quantity: 2, unit: 'L', checked: false }
 			},
 			{ type: 'navigate', page: 'saved' },
-			{ type: 'ui', action: 'ai-settings' }
+			{ type: 'ui', action: 'ai-settings' },
+			{ type: 'ui', action: 'recipe-new' }
 		],
 		kitchen
 	);
@@ -254,6 +255,8 @@ test('shopping item cards identify the shopping list and navigation labels are h
 	assert.equal(actions[1].title, 'Recipe collection');
 	assert.equal(actions[1].label, 'Open recipe collection');
 	assert.equal(actions[2].label, 'Open AI Settings');
+	assert.equal(actions[3].title, 'New recipe');
+	assert.equal(actions[3].label, 'Open new recipe');
 });
 
 test('invalid command payloads fail validation', () => {

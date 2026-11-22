@@ -770,6 +770,12 @@ function describe(
 		}
 		case 'ui': {
 			switch (command.action) {
+				case 'recipe-new':
+					return {
+						label: 'Open new recipe',
+						title: 'New recipe',
+						summary: 'Open a blank recipe form.'
+					};
 				case 'sign-out':
 					return {
 						label: 'Sign out',
