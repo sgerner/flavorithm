@@ -588,40 +588,48 @@ export function ensureProxyBindingSession(
 	issuer: string,
 	subject: string,
 	ttlMs: number
-): { token: string; expiresAt: number } {
+): { token: string; expiresAt: number; setCookie: boolean } {
 	const now = Date.now();
 	if (currentToken && currentToken.length <= 200) {
 		const tokenHash = hashToken(currentToken);
-		const activeProxyBinding = db
-			.prepare(
-				`SELECT issuer, subject FROM sessions
-				 WHERE token_hash = ? AND auth_source = 'proxy' AND expires_at > ?`
-			)
-			.get(tokenHash, now) as { issuer: string | null; subject: string | null } | undefined;
 		const existing = db
 			.prepare(
-				`SELECT 1 AS active FROM sessions
-				 WHERE token_hash = ? AND user_id = ? AND auth_source = 'proxy'
-				   AND issuer = ? AND subject = ? AND expires_at > ?`
+				`SELECT user_id, issuer, subject, expires_at
+				 FROM sessions
+				 WHERE token_hash = ? AND auth_source = 'proxy'`
 			)
-			.get(tokenHash, user.id, issuer, subject, now) as { active: number } | undefined;
+			.get(tokenHash) as
+			| {
+					user_id: string;
+					issuer: string | null;
+					subject: string | null;
+					expires_at: number;
+			  }
+			| undefined;
 		if (existing) {
-			const expiresAt = now + ttlMs;
-			db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?').run(
-				expiresAt,
-				tokenHash
-			);
-			return { token: currentToken, expiresAt };
-		}
-		if (activeProxyBinding) {
-			// Identity changes revoke the previous binding so an outstanding OAuth
-			// callback cannot be completed under a different proxy identity.
+			if (
+				existing.user_id === user.id &&
+				existing.issuer === issuer &&
+				existing.subject === subject &&
+				existing.expires_at > now
+			) {
+				if (existing.expires_at - now >= ttlMs / 2) {
+					return { token: currentToken, expiresAt: existing.expires_at, setCookie: false };
+				}
+				const expiresAt = now + ttlMs;
+				db.prepare(
+					"UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND auth_source = 'proxy'"
+				).run(expiresAt, tokenHash);
+				return { token: currentToken, expiresAt, setCookie: true };
+			}
+			// Identity changes or expired bindings revoke the previous binding so an
+			// outstanding OAuth callback cannot be completed under a different proxy identity.
 			db.prepare("DELETE FROM sessions WHERE token_hash = ? AND auth_source = 'proxy'").run(
 				tokenHash
 			);
 		}
 	}
-	return createSession(user, 'proxy', issuer, subject, undefined, ttlMs);
+	return { ...createSession(user, 'proxy', issuer, subject, undefined, ttlMs), setCookie: true };
 }
 
 export function revokeProxyBindingSession(token: string | undefined): void {
@@ -730,6 +738,33 @@ export function resolveExternalIdentity(input: {
 		throw new ApiError(401, 'The identity provider did not provide a valid email address');
 	}
 	const now = Date.now();
+	const existingIdentity = db
+		.prepare(
+			`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at,
+			        external_identities.email AS external_email
+			 FROM external_identities JOIN users ON users.id = external_identities.user_id
+			 WHERE external_identities.issuer = ? AND external_identities.subject = ?`
+		)
+		.get(issuer, subject) as (DbUserRow & { external_email: string }) | undefined;
+	if (existingIdentity) {
+		const emailChanged = existingIdentity.email.toLowerCase() !== email;
+		const emailVerifiedAt = emailChanged
+			? input.emailVerified
+				? now
+				: null
+			: input.emailVerified
+				? (existingIdentity.email_verified_at ?? now)
+				: (existingIdentity.email_verified_at ?? null);
+		if (
+			existingIdentity.name === name &&
+			existingIdentity.email === email &&
+			existingIdentity.external_email === email &&
+			(existingIdentity.email_verified_at ?? null) === emailVerifiedAt
+		) {
+			return toUser(existingIdentity);
+		}
+	}
+
 	db.exec('BEGIN IMMEDIATE');
 	try {
 		const identity = db

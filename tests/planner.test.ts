@@ -15,10 +15,10 @@ import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
+import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import { MAX_RECIPES } from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
-import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
 
