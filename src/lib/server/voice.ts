@@ -187,7 +187,12 @@ export async function transcribeVoice(form: FormData, fetcher: typeof fetch, sig
 			provider === 'deepgram'
 				? data.results?.channels?.[0]?.alternatives?.[0]?.transcript
 				: data.text;
-		if (typeof text !== 'string' || !text.trim())
+		if (typeof text !== 'string')
+			throw new ApiError(
+				502,
+				'The voice service returned an unexpected response. Check Voice input in Settings and try again.'
+			);
+		if (!text.trim())
 			throw new ApiError(422, 'No speech was detected. Try speaking closer to the microphone.');
 		if (text.length > 20_000) throw new Error('Oversize transcript');
 		return { text: text.trim() };
