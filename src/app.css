@@ -470,7 +470,9 @@ main {
 }
 .banner-icon {
 	border: 1px solid #69816b;
-	padding: 9px;
+	min-width: 44px;
+	min-height: 44px;
+	padding: 11px;
 	display: grid;
 	place-items: center;
 }
@@ -3731,6 +3733,7 @@ html.dark[data-theme='nosh'] {
 	display: flex;
 	align-items: center;
 	justify-content: flex-end;
+	flex-wrap: wrap;
 	gap: 8px;
 	flex: 0 0 auto;
 }
@@ -4051,6 +4054,10 @@ html.dark[data-theme='nosh'] {
 		min-height: 44px;
 		padding: 8px 10px;
 		font-size: 14px;
+	}
+
+	.recipe-section .recipe-actions > .primary {
+		grid-column: 1 / -1;
 	}
 
 	.flavor-dialog.capture-dialog {
