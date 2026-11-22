@@ -1,5 +1,6 @@
 import type { AppState, Ingredient, Meal, PantryDeduction, Recipe, ShoppingItem } from './types';
-import { normalizeName, unitInfo } from './domain.ts';
+import { buildShoppingList, normalizeName, unitInfo } from './domain.ts';
+import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
@@ -138,7 +139,10 @@ export function reconcileShoppingList(
 	for (const [key, bucket] of additionBuckets) {
 		const alreadyPurchased = checkedByBucket.get(key) ?? 0;
 		const remainingBase = Math.max(0, bucket.quantityBase - alreadyPurchased);
-		const remainingQuantity = roundQuantity(remainingBase / bucket.unit.factor);
+		const remainingQuantity = Math.min(
+			MAX_SHOPPING_QUANTITY,
+			roundQuantity(remainingBase / bucket.unit.factor)
+		);
 		if (remainingQuantity <= 0) continue;
 		const reusableId = existingUncheckedIds.get(key);
 		let id: string;
@@ -159,6 +163,149 @@ export function reconcileShoppingList(
 	}
 
 	return [...retained, ...generated];
+}
+
+const MAX_SHOPPING_ITEMS = 1_000;
+
+function formatDateKey(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function nextFreeItemId(item: ShoppingItem, usedIds: Set<string>): string {
+	if (item.sourceKey) {
+		return nextFreeGeneratedId(item.sourceKey, bucketKey(item.name, item.unit), usedIds);
+	}
+	let suffix = 2;
+	let suffixText = `-${suffix}`;
+	let candidate = `${item.id.slice(0, 100 - suffixText.length)}${suffixText}`;
+	while (usedIds.has(candidate)) {
+		suffixText = `-${++suffix}`;
+		candidate = `${item.id.slice(0, 100 - suffixText.length)}${suffixText}`;
+	}
+	usedIds.add(candidate);
+	return candidate;
+}
+
+function reconcileWeekScope(
+	shopping: ShoppingItem[],
+	state: Pick<AppState, 'recipes' | 'pantry' | 'meals'>,
+	sourceKey: string | undefined,
+	now: Date
+): ShoppingItem[] {
+	const match = /^week:(\d{4}-\d{2}-\d{2})$/.exec(sourceKey ?? '');
+	if (!match) return shopping;
+	const startKey = match[1];
+	const start = new Date(`${startKey}T12:00:00`);
+	if (!Number.isFinite(start.getTime()) || formatDateKey(start) !== startKey) return shopping;
+	const dates = new Set(
+		Array.from({ length: 7 }, (_, index) => {
+			const day = new Date(start);
+			day.setDate(day.getDate() + index);
+			return formatDateKey(day);
+		})
+	);
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const meals = state.meals.filter((meal) => !meal.completedAt && dates.has(meal.date));
+	const additions = buildShoppingList(state.recipes, state.pantry, meals, safeNow);
+	return reconcileShoppingList(shopping, additions, `week:${startKey}`);
+}
+
+/**
+ * Remove one shopping row by ID and refresh its weekly meal-plan scope when a checked
+ * purchase is deleted. Unchecked deletions skip weekly reconciliation so dismissed
+ * deficits do not immediately reappear.
+ */
+export function deleteShoppingItem(
+	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'>,
+	itemId: string,
+	now: Date = new Date()
+): ShoppingItem[] {
+	const removed = state.shopping.find((item) => item.id === itemId);
+	if (!removed) return state.shopping;
+	const remaining = state.shopping.filter((item) => item.id !== itemId);
+	if (!removed.checked) return remaining;
+	const reconciled = reconcileWeekScope(remaining, state, removed.sourceKey, now);
+	return reconciled.length > MAX_SHOPPING_ITEMS ? remaining : reconciled;
+}
+
+/**
+ * Restore a deleted shopping row while preserving unique IDs, checked purchases, and the
+ * 1,000-item kitchen limit. Colliding unchecked rows in the same scope have a restored
+ * checked purchase deducted or are re-keyed, and weekly scopes are reconciled so split
+ * remainder rows do not duplicate deficits.
+ */
+export function restoreShoppingItem(
+	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'>,
+	removed: ShoppingItem,
+	now: Date = new Date()
+): ShoppingItem[] {
+	const existing = state.shopping;
+	if (existing.some((entry) => entry.id === removed.id && entry.checked)) return existing;
+
+	const collisionIndex = existing.findIndex((entry) => entry.id === removed.id);
+	const restoredItem: ShoppingItem = { ...removed };
+	let next: ShoppingItem[];
+
+	if (collisionIndex === -1) {
+		next = [...existing, restoredItem];
+	} else {
+		const colliding = existing[collisionIndex];
+		const usedIds = new Set(existing.map((entry) => entry.id));
+		usedIds.add(restoredItem.id);
+
+		const replacement: ShoppingItem[] = [restoredItem];
+		if (colliding.sourceKey === restoredItem.sourceKey) {
+			if (restoredItem.checked) {
+				if (
+					bucketKey(colliding.name, colliding.unit) ===
+					bucketKey(restoredItem.name, restoredItem.unit)
+				) {
+					const collidingUnit = unitInfo(colliding.unit);
+					const restoredUnit = unitInfo(restoredItem.unit);
+					const collidingBase =
+						Number.isFinite(colliding.quantity) && colliding.quantity > 0
+							? colliding.quantity * collidingUnit.factor
+							: 0;
+					const restoredBase =
+						Number.isFinite(restoredItem.quantity) && restoredItem.quantity > 0
+							? restoredItem.quantity * restoredUnit.factor
+							: 0;
+					const remainingQuantity = Math.min(
+						MAX_SHOPPING_QUANTITY,
+						roundQuantity(Math.max(0, collidingBase - restoredBase) / collidingUnit.factor)
+					);
+					if (remainingQuantity > 0) {
+						replacement.push({
+							...colliding,
+							id: nextFreeItemId(colliding, usedIds),
+							quantity: remainingQuantity
+						});
+					}
+				} else {
+					replacement.push({
+						...colliding,
+						id: nextFreeItemId(colliding, usedIds)
+					});
+				}
+			}
+		} else {
+			replacement.push({
+				...colliding,
+				id: nextFreeItemId(colliding, usedIds)
+			});
+		}
+
+		next = [
+			...existing.slice(0, collisionIndex),
+			...replacement,
+			...existing.slice(collisionIndex + 1)
+		];
+	}
+
+	const reconciled = restoredItem.checked
+		? reconcileWeekScope(next, state, restoredItem.sourceKey, now)
+		: next;
+	return reconciled.length > MAX_SHOPPING_ITEMS ? existing : reconciled;
 }
 
 /** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
