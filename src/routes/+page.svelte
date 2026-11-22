@@ -50,12 +50,19 @@
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
 		completeMeal,
+		deleteMeal,
+		deleteRecipe,
 		expiryStatus,
+		recipeForEdit,
+		recipeNeedsNutritionRefresh,
 		reconcileShoppingList,
-		transferPurchasedItemsToPantry
+		saveEditedRecipe as applyEditedRecipe,
+		transferPurchasedItemsToPantry,
+		upsertMeal,
+		weekStartForDate
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
-	import { insertRecipes } from '#lib/recipe-collection.ts';
+	import { insertRecipes, MAX_RECIPES } from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -444,12 +451,11 @@
 		)
 	);
 	let week = $derived.by(() => {
-		const d = new Date();
-		d.setHours(12, 0, 0, 0);
-		d.setDate(d.getDate() - ((d.getDay() + 6) % 7) + weekOffset * 7);
+		const start = new Date(`${weekStartForDate(new Date())}T12:00:00`);
+		start.setDate(start.getDate() + weekOffset * 7);
 		return Array.from({ length: 7 }, (_, i) => {
-			const date = new Date(d);
-			date.setDate(d.getDate() + i);
+			const date = new Date(start);
+			date.setDate(start.getDate() + i);
 			return date;
 		});
 	});
@@ -498,15 +504,13 @@
 	}
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
-		kitchen.meals = kitchen.meals.filter((entry) => entry.id !== meal.id);
-		refreshWeekShopping(weekStartForDate(meal.date));
+		kitchen = deleteMeal(kitchen, meal.id);
 		notify('Planned meal removed.', () => {
 			if (
 				kitchen.recipes.some((recipe) => recipe.id === removed.recipeId) &&
 				!kitchen.meals.some((entry) => entry.id === removed.id)
 			) {
-				kitchen.meals.push(removed);
-				refreshWeekShopping(weekStartForDate(removed.date));
+				kitchen = upsertMeal(kitchen, removed);
 			}
 		});
 	}
@@ -1400,7 +1404,7 @@
 			else if (effect.type === 'recipe.open') {
 				butlerChat?.close();
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
-				if (recipe && effect.mode === 'edit') editSavedRecipe(recipe);
+				if (recipe && effect.mode === 'edit') openRecipeEditor(recipe);
 				else if (recipe && effect.mode === 'cook') {
 					const meal = kitchen.meals.find(
 						(item) => item.recipeId === recipe.id && !item.completedAt
@@ -1611,36 +1615,33 @@
 				: `${recipe.title} restored to your recipe list.`
 		);
 	}
-	function editSavedRecipe(recipe: Recipe) {
-		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
-		if (!saved) return;
+	function openRecipeEditor(recipe: Recipe) {
+		const draft = recipeForEdit(kitchen, recipe.id);
+		if (!draft) return;
 		selected = null;
-		editingRecipe = {
-			...saved,
-			tags: [...saved.tags],
-			ingredients: saved.ingredients.map((item) => ({ ...item })),
-			steps: [...saved.steps],
-			nutrition: { ...saved.nutrition }
-		};
+		selectedMealServings = undefined;
+		editingRecipe = draft;
 	}
 	function saveEditedRecipe(updated: Recipe) {
 		const previous = kitchen.recipes.find((item) => item.id === updated.id);
-		if (!previous || !previous.saved) {
-			editingRecipe = null;
+		if (!previous && kitchen.recipes.length >= MAX_RECIPES) {
+			notify(
+				`Your kitchen can hold up to ${MAX_RECIPES} recipes. There isn’t enough room to save this.`
+			);
 			return;
 		}
-		const nutritionNeedsRefresh =
-			previous.servings !== updated.servings ||
-			JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
-		const saved = {
-			...updated,
-			saved: true,
-			nutritionStale: nutritionNeedsRefresh ? true : previous.nutritionStale
-		};
-		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
+		const wasSaved = Boolean(previous?.saved);
+		const nutritionNeedsRefresh = recipeNeedsNutritionRefresh(previous, updated);
+		kitchen = applyEditedRecipe(kitchen, updated);
 		editingRecipe = null;
 		notify(
-			nutritionNeedsRefresh ? 'Recipe updated. Refresh its nutrition estimate.' : 'Recipe updated.'
+			!wasSaved
+				? nutritionNeedsRefresh
+					? 'Recipe saved to your collection. Refresh its nutrition estimate.'
+					: 'Recipe saved to your collection.'
+				: nutritionNeedsRefresh
+					? 'Recipe updated. Refresh its nutrition estimate.'
+					: 'Recipe updated.'
 		);
 	}
 	function askDeleteRecipe(recipe: Recipe) {
@@ -1649,45 +1650,15 @@
 		selected = null;
 		modal = 'deleteRecipe';
 	}
-	function weekStartForDate(value: string) {
-		const date = new Date(`${value}T12:00:00`);
-		if (Number.isNaN(date.getTime())) return value;
-		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
-		return dateKey(date);
-	}
-	function refreshWeekShopping(startDate: string) {
-		const start = new Date(`${startDate}T12:00:00`);
-		if (Number.isNaN(start.getTime())) return;
-		const dates = Array.from({ length: 7 }, (_, index) => {
-			const day = new Date(start);
-			day.setDate(day.getDate() + index);
-			return dateKey(day);
-		});
-		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
-		const recipes = kitchen.recipes.filter((recipe) =>
-			meals.some((meal) => meal.recipeId === recipe.id)
-		);
-		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
-	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
 		if (!recipe) return;
-		const impactedMeals = kitchen.meals.filter((meal) => meal.recipeId === recipe.id);
-		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
-		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
-		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
-		kitchen.shopping = kitchen.shopping.filter((item) => item.sourceKey !== `recipe:${recipe.id}`);
-		if (kitchen.preferences.ratings) {
-			const ratings = { ...kitchen.preferences.ratings };
-			delete ratings[recipe.id];
-			kitchen.preferences.ratings = ratings;
-		}
-		for (const startDate of affectedWeeks) refreshWeekShopping(startDate);
+		const impactedMealCount = kitchen.meals.filter((meal) => meal.recipeId === recipe.id).length;
+		kitchen = deleteRecipe(kitchen, recipe.id);
 		recipeToDelete = null;
 		modal = '';
 		notify(
-			`${recipe.title} deleted, along with ${impactedMeals.length} planned meal${impactedMeals.length === 1 ? '' : 's'}.`
+			`${recipe.title} deleted, along with ${impactedMealCount} planned meal${impactedMealCount === 1 ? '' : 's'}.`
 		);
 	}
 	function shoppingSourceLabel(sourceKey?: string) {
@@ -1737,12 +1708,12 @@
 			notify('Choose between 1 and 24 whole servings.');
 			return;
 		}
-		const previousWeek = weekStartForDate(meal.date);
-		meal.date = mealDate;
-		meal.slot = mealSlot;
-		meal.servings = Math.round(plannedServings);
-		refreshWeekShopping(previousWeek);
-		refreshWeekShopping(weekStartForDate(meal.date));
+		kitchen = upsertMeal(kitchen, {
+			...meal,
+			date: mealDate,
+			slot: mealSlot,
+			servings: Math.round(plannedServings)
+		});
 		editingMealId = '';
 		modal = '';
 		notify('Meal plan updated.');
@@ -1766,16 +1737,15 @@
 			return;
 		}
 		const recipeId = meal.recipeId;
-		const startDate = weekStartForDate(meal.date);
+		const servings = meal.servings;
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
-		refreshWeekShopping(startDate);
 		cookingMealId = '';
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
-		selectedMealServings = meal.servings;
+		selectedMealServings = servings;
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
@@ -1795,14 +1765,13 @@
 			notify('Choose between 1 and 24 whole servings.');
 			return;
 		}
-		kitchen.meals.push({
+		kitchen = upsertMeal(kitchen, {
 			id: crypto.randomUUID(),
 			date: mealDate,
 			slot: mealSlot,
 			recipeId: selected.id,
 			servings: plannedServings
 		});
-		refreshWeekShopping(weekStartForDate(mealDate));
 		selectedMealServings = undefined;
 		selected = null;
 		modal = '';
@@ -2907,7 +2876,7 @@
 			)}
 		plan={(servings) => planRecipe(selected!, servings)}
 		nutrition={refreshNutrition}
-		edit={() => editSavedRecipe(selected!)}
+		edit={() => openRecipeEditor(selected!)}
 		remove={() => askDeleteRecipe(selected!)}
 		toggleHidden={() => toggleRecipeHidden(selected!)}
 		{busy}

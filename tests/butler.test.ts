@@ -257,3 +257,133 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 		{ id: 'manual', name: 'tea', quantity: 1, unit: 'box', checked: false }
 	]);
 });
+
+test('standalone meal.upsert populates shopping for empty weeks and updates both weeks when moving a meal', () => {
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [
+		{ name: 'carrot', quantity: 4, unit: 'each' },
+		{ name: 'garlic', quantity: 2, unit: 'cloves' }
+	];
+	current.pantry = [
+		{ id: 'carrots', name: 'carrot', quantity: 1, unit: 'each', category: 'Produce' }
+	];
+	current.meals = [];
+	current.shopping = [{ id: 'manual', name: 'coffee', quantity: 1, unit: 'bag', checked: false }];
+	const now = new Date('2026-10-22T12:00:00Z');
+
+	const scheduled = applyButlerCommands(
+		current,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'friday-dinner',
+					date: '2026-10-23',
+					slot: 'Dinner',
+					recipeId: recipe.id,
+					servings: 2
+				}
+			}
+		],
+		now
+	).state;
+	const firstWeek = scheduled.shopping.filter((item) => item.sourceKey === 'week:2026-10-19');
+	assert.deepEqual(
+		firstWeek.map(({ name, quantity, unit }) => ({ name, quantity, unit })),
+		[
+			{ name: 'carrot', quantity: 3, unit: 'each' },
+			{ name: 'garlic', quantity: 2, unit: 'clove' }
+		]
+	);
+
+	// Mark 1 carrot purchased in week:2026-10-19, then move the meal to next week (2026-10-26).
+	scheduled.shopping = scheduled.shopping.map((item) =>
+		item.sourceKey === 'week:2026-10-19' && item.name === 'carrot'
+			? { ...item, quantity: 1, checked: true }
+			: item
+	);
+	const moved = applyButlerCommands(
+		scheduled,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'friday-dinner',
+					date: '2026-10-28',
+					slot: 'Dinner',
+					recipeId: recipe.id,
+					servings: 4
+				}
+			}
+		],
+		now
+	).state;
+
+	assert.deepEqual(
+		moved.shopping
+			.filter((item) => item.sourceKey === 'week:2026-10-19')
+			.map(({ name, checked, quantity }) => ({ name, checked, quantity })),
+		[{ name: 'carrot', checked: true, quantity: 1 }]
+	);
+	assert.deepEqual(
+		moved.shopping
+			.filter((item) => item.sourceKey === 'week:2026-10-26')
+			.map(({ name, quantity, unit }) => ({ name, quantity, unit })),
+		[
+			{ name: 'carrot', quantity: 7, unit: 'each' },
+			{ name: 'garlic', quantity: 4, unit: 'clove' }
+		]
+	);
+	assert.ok(moved.shopping.some((item) => item.id === 'manual'));
+});
+
+test('recipe.upsert refreshes scheduled week and existing recipe scopes, and recipe.open supports unsaved edit mode', () => {
+	const current = createInitialState();
+	const target = structuredClone(current.recipes[0]);
+	target.saved = false;
+	target.servings = 2;
+	target.ingredients = [{ name: 'tomato', quantity: 2, unit: 'each' }];
+	current.recipes = [target];
+	current.pantry = [];
+	current.meals = [
+		{ id: 'tue', date: '2026-10-20', slot: 'Dinner', recipeId: target.id, servings: 4 }
+	];
+	current.shopping = [
+		{
+			id: 'recipe-tomato',
+			name: 'tomato',
+			quantity: 2,
+			unit: 'each',
+			checked: false,
+			sourceKey: `recipe:${target.id}`
+		}
+	];
+	const now = new Date('2026-10-20T12:00:00Z');
+
+	const result = applyButlerCommands(
+		current,
+		[
+			{
+				type: 'recipe.upsert',
+				recipe: {
+					...target,
+					ingredients: [{ name: 'tomato', quantity: 3, unit: 'each' }]
+				}
+			},
+			{ type: 'recipe.open', id: target.id, mode: 'edit' }
+		],
+		now
+	);
+
+	assert.equal(
+		result.state.shopping.find((item) => item.sourceKey === 'week:2026-10-19')?.quantity,
+		6
+	);
+	assert.equal(
+		result.state.shopping.find((item) => item.sourceKey === `recipe:${target.id}`)?.quantity,
+		3
+	);
+	assert.deepEqual(result.effects, [{ type: 'recipe.open', id: target.id, mode: 'edit' }]);
+});

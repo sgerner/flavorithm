@@ -143,7 +143,7 @@
 		tabindex="-1"
 		transition:dialogMotion|global
 	>
-		<h2 id="recipe-editor-title">Edit saved recipe</h2>
+		<h2 id="recipe-editor-title">{recipe.saved ? 'Edit saved recipe' : 'Edit recipe'}</h2>
 		<p class="muted">Changes are saved to your recipe collection.</p>
 		<form onsubmit={saveDraft}>
 			<div class="draft-summary">
