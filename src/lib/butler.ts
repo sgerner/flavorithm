@@ -59,14 +59,6 @@ const recipe = z.object({
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
-const pantry = z.object({
-	id,
-	name: z.string().trim().min(1).max(200),
-	quantity,
-	unit: z.string().max(40),
-	category: z.string().max(80),
-	expires: z.string().max(40).optional()
-});
 const date = z
 	.string()
 	.regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -74,6 +66,14 @@ const date = z
 		const d = new Date(value + 'T12:00:00Z');
 		return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === value;
 	}, 'Use a real calendar date.');
+const pantry = z.object({
+	id,
+	name: z.string().trim().min(1).max(200),
+	quantity,
+	unit: z.string().max(40),
+	category: z.string().max(80),
+	expires: z.union([date, z.literal('')]).optional()
+});
 const meal = z.object({
 	id,
 	date,
@@ -190,15 +190,20 @@ function requireId(items: { id: string }[], target: string) {
 function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
+function isUsablePantryExpiry(expires: string | undefined, now: Date): boolean {
+	const status = expiryStatus(expires, now);
+	return status !== 'expired' && (!expires?.trim() || status !== 'unknown');
+}
+
 function addedNonExpiredPantryItem(
 	previous: Ingredient | undefined,
 	next: Ingredient,
 	now: Date
 ): Ingredient | undefined {
-	if (expiryStatus(next.expires, now) === 'expired') return undefined;
+	if (!isUsablePantryExpiry(next.expires, now)) return undefined;
 	if (!Number.isFinite(next.quantity) || !(next.quantity > 0) || !next.unit.trim())
 		return undefined;
-	if (!previous || expiryStatus(previous.expires, now) === 'expired') return next;
+	if (!previous || !isUsablePantryExpiry(previous.expires, now)) return next;
 	if (
 		normalizeName(previous.name) !== normalizeName(next.name) ||
 		unitInfo(previous.unit).dimension !== unitInfo(next.unit).dimension
