@@ -363,7 +363,9 @@ function sanitizeRecipes(value: unknown, fallback: Recipe[]): Recipe[] {
 		const sourceTrimmed = typeof raw.source === 'string' ? raw.source.trim() : '';
 		const source = sourceTrimmed && isPublicHttpsUrl(sourceTrimmed) ? sourceTrimmed : undefined;
 		const provenance =
-			raw.provenance === 'web-import' || raw.provenance === 'ai-generated'
+			raw.provenance === 'web-import' ||
+			raw.provenance === 'ai-generated' ||
+			raw.provenance === 'manual'
 				? raw.provenance
 				: undefined;
 		const importNotes = Array.isArray(raw.importNotes)
