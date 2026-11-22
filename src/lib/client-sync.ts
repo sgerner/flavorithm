@@ -22,6 +22,7 @@ export type SyncStatus = {
 	pending: boolean;
 	syncing: boolean;
 	conflicts: SyncConflict[];
+	reviewedEtag: string | null;
 	error: string;
 };
 type ConfirmedKitchen = {
@@ -54,6 +55,8 @@ type ActiveContext = {
 	blockedByStorage: boolean;
 	syncing: boolean;
 	conflicts: SyncConflict[];
+	reviewedEtag: string | null;
+	reviewedState: AppState | null;
 	error: string;
 };
 
@@ -156,6 +159,7 @@ export function createKitchenSync(options: {
 		pending: !!context.pending,
 		syncing: context.syncing || context.loading,
 		conflicts: clone(context.conflicts),
+		reviewedEtag: context.reviewedEtag,
 		error: context.error
 	});
 	const isActive = (context: ActiveContext) =>
@@ -312,6 +316,8 @@ export function createKitchenSync(options: {
 			blockedByStorage: false,
 			syncing: false,
 			conflicts: [],
+			reviewedEtag: null,
+			reviewedState: null,
 			error: ''
 		};
 		active = context;
@@ -386,8 +392,12 @@ export function createKitchenSync(options: {
 		const loaded = loadJournal(context);
 		const seed = context.baseline?.state || loaded.records[0]?.pending.base || createNewUserState();
 		if (loaded.records.length) {
-			updateAggregate(context, loaded, seed, undefined, true);
+			const merged = updateAggregate(context, loaded, seed, undefined, true);
+			context.reviewedEtag = merged.conflicts.length ? (context.baseline?.etag ?? null) : null;
+			context.reviewedState = merged.conflicts.length ? clone(seed) : null;
 		} else {
+			context.reviewedEtag = null;
+			context.reviewedState = null;
 			context.viewState = clone(seed);
 			context.error = loaded.error;
 			context.blockedByStorage = loaded.blocked;
@@ -438,6 +448,8 @@ export function createKitchenSync(options: {
 			}
 		}
 		context.viewState = clone(merged.state);
+		context.reviewedEtag = merged.conflicts.length ? etag : null;
+		context.reviewedState = merged.conflicts.length ? clone(remoteState) : null;
 		setContextState(context, merged.state);
 		if (baselineError) context.error = baselineError;
 		emitStatus(context);
@@ -450,11 +462,16 @@ export function createKitchenSync(options: {
 		if (loaded.records.length) {
 			const seed =
 				context.baseline?.state || loaded.records[0].pending.base || createNewUserState();
-			updateAggregate(context, loaded, seed, undefined, true);
+			const seedEtag = context.baseline?.etag ?? loaded.records[0].pending.etag ?? null;
+			const merged = updateAggregate(context, loaded, seed, undefined, true);
+			context.reviewedEtag = merged.conflicts.length ? seedEtag : null;
+			context.reviewedState = merged.conflicts.length ? clone(seed) : null;
 			emitStatus(context);
 			return true;
 		}
 		if (context.baseline) {
+			context.reviewedEtag = null;
+			context.reviewedState = null;
 			context.viewState = clone(context.baseline.state);
 			context.error = loaded.error;
 			context.blockedByStorage = loaded.blocked;
@@ -463,6 +480,8 @@ export function createKitchenSync(options: {
 			return true;
 		}
 		const starter = createNewUserState();
+		context.reviewedEtag = null;
+		context.reviewedState = null;
 		context.viewState = clone(starter);
 		context.error = loaded.error;
 		context.blockedByStorage = loaded.blocked;
@@ -485,19 +504,32 @@ export function createKitchenSync(options: {
 		const base = clone(
 			own?.pending.base || context.viewState || context.baseline?.state || createNewUserState()
 		);
-		const seed = context.baseline?.state || loaded.records[0]?.pending.base || base;
+		const conflictSeed =
+			context.reviewedState || context.baseline?.state || loaded.records[0]?.pending.base || base;
+		const conflictSeedEtag = context.baseline?.etag ?? loaded.records[0]?.pending.etag ?? null;
+		const syncReviewedConflictSeed = (conflicts: SyncConflict[]) => {
+			if (!conflicts.length) {
+				context.reviewedEtag = null;
+				context.reviewedState = null;
+			} else if (context.reviewedEtag === null) {
+				context.reviewedEtag = conflictSeedEtag;
+				context.reviewedState = clone(conflictSeed);
+			}
+		};
 		if (own && equal(next, own.pending.local)) {
 			const previousError = context.error;
 			context.viewState = next;
-			updateAggregate(context, loaded, seed);
+			const merged = updateAggregate(context, loaded, conflictSeed);
 			if (!loaded.error && previousError) context.error = previousError;
+			syncReviewedConflictSeed(merged.conflicts);
 			emitStatus(context);
 			return;
 		}
 		if (!own && equal(next, context.viewState)) {
 			const previousError = context.error;
-			updateAggregate(context, loaded, seed);
+			const merged = updateAggregate(context, loaded, conflictSeed);
 			if (!loaded.error && previousError) context.error = previousError;
+			syncReviewedConflictSeed(merged.conflicts);
 			emitStatus(context);
 			return;
 		}
@@ -506,11 +538,12 @@ export function createKitchenSync(options: {
 				acknowledge(context, [own]);
 				const after = loadJournal(context);
 				context.viewState = next;
-				updateAggregate(
+				const merged = updateAggregate(
 					context,
 					after,
-					context.baseline?.state || after.records[0]?.pending.base || next
+					context.reviewedState || context.baseline?.state || after.records[0]?.pending.base || next
 				);
+				syncReviewedConflictSeed(merged.conflicts);
 			} catch {
 				context.error = 'The reverted offline changes could not be removed from this device.';
 			}
@@ -570,7 +603,7 @@ export function createKitchenSync(options: {
 		const aggregate = updateAggregate(
 			context,
 			after,
-			context.baseline?.state || after.records[0]?.pending.base || base
+			context.reviewedState || context.baseline?.state || after.records[0]?.pending.base || base
 		);
 		// Stage is driven by the UI's current state. Keep it as the view even if a different tab has
 		// additional queued deltas that are not reflected in this tab yet.
@@ -578,10 +611,11 @@ export function createKitchenSync(options: {
 		if (persistenceError) context.error = persistenceError;
 		else if (durable && !after.error) context.error = '';
 		if (aggregate.conflicts.length) context.conflicts = clone(aggregate.conflicts);
+		syncReviewedConflictSeed(aggregate.conflicts);
 		emitStatus(context);
 	}
 
-	async function sync(prefer?: 'local' | 'remote'): Promise<void> {
+	async function sync(prefer?: 'local' | 'remote', expectedEtag?: string | null): Promise<void> {
 		const context = active;
 		if (!context || !isActive(context) || context.syncing) return;
 		const loaded = loadJournal(context);
@@ -589,6 +623,9 @@ export function createKitchenSync(options: {
 			context.pending = null;
 			context.pendingDurable = false;
 			context.blockedByStorage = !!loaded.error;
+			context.conflicts = [];
+			context.reviewedEtag = null;
+			context.reviewedState = null;
 			context.error = loaded.error || (!context.confirmed ? context.loadError : '');
 			emitStatus(context);
 			return;
@@ -607,10 +644,18 @@ export function createKitchenSync(options: {
 			return;
 		}
 		const captured = clone(loaded.records);
+		const pinnedEtag = prefer
+			? expectedEtag !== undefined
+				? expectedEtag
+				: context.reviewedEtag
+			: undefined;
 		context.syncing = true;
 		context.error = '';
 		emitStatus(context);
 		let shouldContinue = false;
+		let saved = false;
+		let savedEtag: string | null = null;
+		let savedState: AppState | null = null;
 		try {
 			const raw = options.transport(clone(context.user));
 			if (
@@ -639,17 +684,29 @@ export function createKitchenSync(options: {
 					return raw.put(state, etag);
 				}
 			};
-			const result = await syncPendingKitchenJournal(captured, guarded, prefer);
+			const result = await syncPendingKitchenJournal(captured, guarded, prefer, pinnedEtag);
 			if (!isActive(context)) return;
 			if (!result.saved) {
 				context.conflicts = clone(result.conflicts);
+				context.reviewedEtag = result.conflicts.length ? result.etag : null;
+				context.reviewedState =
+					result.conflicts.length && result.remoteState ? clone(result.remoteState) : null;
 				context.pending = aggregatePending(context, captured, result.state);
-				context.error = 'Resolve the kitchen conflicts before syncing these changes.';
+				if (result.staleEtag) {
+					context.error = result.conflicts.length
+						? 'Your household updated while you were reviewing changes. Review the latest conflicts and choose again.'
+						: 'Your household updated before your choice could be applied. Retry sync to save your changes.';
+				} else {
+					context.error = 'Resolve the kitchen conflicts before syncing these changes.';
+				}
 				return;
 			}
 			context.confirmed = true;
 			context.loading = false;
 			context.loadError = '';
+			saved = true;
+			savedEtag = result.etag;
+			savedState = clone(result.state);
 			try {
 				saveBaseline(context, result.state, result.etag);
 			} catch {
@@ -697,10 +754,14 @@ export function createKitchenSync(options: {
 			}
 		} finally {
 			if (isActive(context)) {
+				if (saved) {
+					context.reviewedEtag = context.conflicts.length ? savedEtag : null;
+					context.reviewedState = context.conflicts.length && savedState ? clone(savedState) : null;
+				}
 				context.syncing = false;
 				emitStatus(context);
 				if (shouldContinue && context.pending && context.pendingDurable && !context.error) {
-					void sync(prefer);
+					void sync();
 				}
 			}
 		}
@@ -709,7 +770,14 @@ export function createKitchenSync(options: {
 	function clearContext(): void {
 		generation += 1;
 		active = null;
-		options.onStatus({ ready: false, pending: false, syncing: false, conflicts: [], error: '' });
+		options.onStatus({
+			ready: false,
+			pending: false,
+			syncing: false,
+			conflicts: [],
+			reviewedEtag: null,
+			error: ''
+		});
 	}
 
 	function snapshot(): PendingKitchen | null {
