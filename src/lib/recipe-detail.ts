@@ -122,6 +122,11 @@ export function starRatingLabel(stars: number): string {
 	return stars === 1 ? 'Rate 1 star' : `Rate ${stars} stars`;
 }
 
+export function ratingTabIndex(currentRating: number | undefined, star: number): 0 | -1 {
+	const selected = RATING_STARS.find((value) => value === currentRating) ?? RATING_STARS[0];
+	return star === selected ? 0 : -1;
+}
+
 export function toggleRecipeRating(
 	currentRating: number | undefined,
 	selectedStar: number

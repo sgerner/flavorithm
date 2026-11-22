@@ -12,6 +12,7 @@
 		nutritionAmountHeading,
 		nutritionMultiplierFor,
 		nutritionServingSizeLabel,
+		ratingTabIndex,
 		resolveActiveServings,
 		resolveServingsFallback,
 		scaleIngredientQuantity,
@@ -365,6 +366,7 @@
 								bind:this={starButtons[index]}
 								type="button"
 								role="radio"
+								tabindex={ratingTabIndex(recipe.rating, n)}
 								aria-checked={recipe.rating === n}
 								aria-label={starRatingLabel(n)}
 								onclick={() => rate(toggleRecipeRating(recipe.rating, n))}
@@ -379,9 +381,8 @@
 							type="button"
 							class="text-button clear-rating"
 							onclick={() => {
-								const fallback = starButtons[(recipe.rating ?? 1) - 1] ?? starButtons[0];
 								rate(undefined);
-								fallback?.focus();
+								starButtons[0]?.focus();
 							}}>Clear rating</button
 						>{/if}
 				</div>

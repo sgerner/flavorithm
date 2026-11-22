@@ -14,6 +14,7 @@ import {
 	nutritionAmountHeading,
 	nutritionMultiplierFor,
 	nutritionServingSizeLabel,
+	ratingTabIndex,
 	resolveActiveServings,
 	resolveServingsFallback,
 	scaleIngredientQuantity,
@@ -161,6 +162,12 @@ test('tab, bookmark, and rating radiogroup helpers support ARIA labels and keybo
 	assert.equal(starRatingLabel(1), 'Rate 1 star');
 	assert.equal(starRatingLabel(2), 'Rate 2 stars');
 	assert.equal(starRatingLabel(5), 'Rate 5 stars');
+	assert.deepEqual(
+		[undefined, 0, 3, 7].map((rating) =>
+			[1, 2, 3, 4, 5].filter((star) => ratingTabIndex(rating, star) === 0)
+		),
+		[[1], [1], [3], [1]]
+	);
 
 	assert.equal(nextRatingStarForKey(1, 'ArrowRight'), 2);
 	assert.equal(nextRatingStarForKey(5, 'ArrowRight'), 1);
