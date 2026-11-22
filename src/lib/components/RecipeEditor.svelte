@@ -20,11 +20,15 @@
 	let {
 		recipe,
 		liveRecipe = recipe,
+		mode = 'edit',
+		canUploadCover = false,
 		cancel,
 		save
 	}: {
 		recipe: Recipe;
 		liveRecipe?: Recipe | null;
+		mode?: 'create' | 'edit';
+		canUploadCover?: boolean;
 		cancel: () => void;
 		save: (recipe: Recipe, options?: RecipeMergeOptions) => RecipeEditorSaveResult | void;
 	} = $props();
@@ -33,10 +37,12 @@
 	let error = $state('');
 	let conflicts = $state<RecipeFieldConflict[]>([]);
 	let promptedRemoval = $state<'unsaved' | 'deleted' | null>(null);
-	let remoteRemoval = $derived(!liveRecipe ? 'deleted' : !liveRecipe.saved ? 'unsaved' : null);
-	let activeRemoval = $derived(remoteRemoval ?? promptedRemoval);
+	let remoteRemoval = $derived(
+		mode === 'edit' ? (!liveRecipe ? 'deleted' : !liveRecipe.saved ? 'unsaved' : null) : null
+	);
+	let activeRemoval = $derived(mode === 'edit' ? (remoteRemoval ?? promptedRemoval) : null);
 	let uploading = $state(false);
-	let photoInput: HTMLInputElement;
+	let photoInput = $state<HTMLInputElement>();
 	let alertBox = $state<HTMLElement>();
 	let errorBox = $state<HTMLElement>();
 	$effect(() => {
@@ -65,7 +71,7 @@
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
-		if (!file) return;
+		if (!canUploadCover || !file) return;
 		uploading = true;
 		error = '';
 		try {
@@ -95,7 +101,18 @@
 		['sugar', 'Sugar (g)'],
 		['protein', 'Protein (g)']
 	];
+	function isNutritionValid(target: Recipe): boolean {
+		return nutritionFields.every(
+			([key]) =>
+				Number.isFinite(target.nutrition[key]) &&
+				target.nutrition[key] >= 0 &&
+				target.nutrition[key] <= 1000000
+		);
+	}
+	let nutritionOpen = $state(untrack(() => !isNutritionValid(draft)));
 	function buildValidatedDraft(): Recipe | null {
+		error = '';
+		const title = draft.title.trim();
 		const tags = [
 			...new Set(
 				tagsText
@@ -121,12 +138,14 @@
 				return null;
 			}
 		}
+		const nutritionValid = isNutritionValid(draft);
 		if (
-			!draft.title.trim() ||
-			!Number.isFinite(draft.time) ||
+			!title ||
+			title.length > 200 ||
+			!Number.isInteger(draft.time) ||
 			draft.time < 1 ||
 			draft.time > 100000 ||
-			!Number.isFinite(draft.servings) ||
+			!Number.isInteger(draft.servings) ||
 			draft.servings < 1 ||
 			draft.servings > 10000 ||
 			!ingredients.length ||
@@ -134,7 +153,9 @@
 			ingredients.some(
 				(item) =>
 					!item.name ||
+					item.name.length > 200 ||
 					!item.unit ||
+					item.unit.length > 40 ||
 					!Number.isFinite(item.quantity) ||
 					item.quantity <= 0 ||
 					item.quantity > 1000000
@@ -144,25 +165,20 @@
 			steps.some((step) => step.length > 10000) ||
 			tags.length > 30 ||
 			tags.some((tag) => tag.length > 100) ||
-			!nutritionFields.every(
-				([key]) =>
-					Number.isFinite(draft.nutrition[key]) &&
-					draft.nutrition[key] >= 0 &&
-					draft.nutrition[key] <= 1000000
-			)
+			!nutritionValid
 		) {
+			if (!nutritionValid) nutritionOpen = true;
 			error =
 				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
 			return null;
 		}
-		error = '';
 		return cloneRecipe({
 			...draft,
-			title: draft.title.trim(),
-			description: draft.description.trim(),
+			title,
+			description: draft.description.trim().slice(0, 10000),
 			image,
-			cuisine: draft.cuisine.trim(),
-			difficulty: draft.difficulty.trim(),
+			cuisine: draft.cuisine.trim().slice(0, 100),
+			difficulty: draft.difficulty.trim().slice(0, 80),
 			tags,
 			ingredients,
 			steps
@@ -224,8 +240,12 @@
 		tabindex="-1"
 		transition:dialogMotion|global
 	>
-		<h2 id="recipe-editor-title">Edit saved recipe</h2>
-		<p class="muted">Changes are saved to your recipe collection.</p>
+		<h2 id="recipe-editor-title">{mode === 'create' ? 'New recipe' : 'Edit saved recipe'}</h2>
+		<p class="muted">
+			{mode === 'create'
+				? 'Add a personal recipe to your collection.'
+				: 'Changes are saved to your recipe collection.'}
+		</p>
 		{#if conflicts.length}
 			<section class="editor-alert" role="alert" bind:this={alertBox}>
 				<strong>Competing household edits need your choice</strong>
@@ -289,7 +309,7 @@
 				</div>
 			</section>
 		{/if}
-		<form onsubmit={saveDraft}>
+		<form onsubmit={saveDraft} novalidate>
 			<div class="draft-summary">
 				<label class="field draft-title"
 					>Title<input bind:value={draft.title} required maxlength="200" /></label
@@ -327,21 +347,21 @@
 						alt="Recipe cover preview"
 						onerror={(event) => recipeImageError(event, draft)}
 					/>
-					<input
-						hidden
-						type="file"
-						accept="image/jpeg,image/png,image/webp"
-						bind:this={photoInput}
-						onchange={uploadCover}
-						disabled={uploading}
-					/>
-					<button
-						type="button"
-						class="secondary"
-						disabled={uploading}
-						onclick={() => photoInput.click()}
-						>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
-					>
+					{#if canUploadCover}<input
+							hidden
+							type="file"
+							accept="image/jpeg,image/png,image/webp"
+							bind:this={photoInput}
+							onchange={uploadCover}
+							disabled={uploading}
+						/>
+						<button
+							type="button"
+							class="secondary"
+							disabled={uploading}
+							onclick={() => photoInput?.click()}
+							>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
+						>{/if}
 					{#if draft.image}<button
 							type="button"
 							class="text-button"
@@ -351,8 +371,9 @@
 							}}>Remove cover</button
 						>{/if}
 					<p class="muted">
-						JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.
-						Sign-in and an internet connection are required.
+						{canUploadCover
+							? 'JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.'
+							: 'Paste a public HTTPS image link below, or sign in while online to upload a cover photo.'}
 					</p>
 				</div>
 				{#if !COVER_PATH.test(draft.image)}<label class="field full-field"
@@ -444,7 +465,7 @@
 						><X size={18} /></button
 					>
 				</div>{/each}
-			<details class="import-notes">
+			<details class="import-notes" bind:open={nutritionOpen}>
 				<summary>Nutrition estimates</summary>
 				<p>
 					Estimated values per serving. Ingredient or serving changes will mark these values as
@@ -467,7 +488,7 @@
 			<div class="draft-footer">
 				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
 				<button class="primary" type="submit" disabled={uploading}
-					><Check size={18} />Save changes</button
+					><Check size={18} />{mode === 'create' ? 'Save recipe' : 'Save changes'}</button
 				>
 			</div>
 		</form>

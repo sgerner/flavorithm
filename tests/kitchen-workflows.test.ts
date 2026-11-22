@@ -370,6 +370,53 @@ test('purchased shopping rows merge aliases and compatible units without changin
 	assert.equal(result.find((item) => item.unit === 'package')?.quantity, 1);
 });
 
+test('pantry transfers clamp negative or null baseline stock, cap quantities at 1,000,000, and bound array size', () => {
+	const corruptedPantry: Ingredient[] = [
+		pantry('flour', -3, 'cup'),
+		pantry('sugar', null as unknown as number, 'cup'),
+		pantry('rice', 999_999.5, 'cup')
+	];
+	const transferred = transferPurchasedItemsToPantry(
+		corruptedPantry,
+		[
+			shopping('buy-flour', 'flour', 2, 'cups', true),
+			shopping('buy-sugar', 'sugar', 1.5, 'cups', true),
+			shopping('buy-rice', 'rice', 10, 'cups', true),
+			shopping('buy-salt', 'salt', 2_500_000, 'g', true),
+			shopping('buy-zero', 'pepper', 0, 'tsp', true),
+			shopping('buy-blank', '   ', 2, 'tsp', true)
+		],
+		() => 'new-salt'
+	);
+
+	assert.equal(transferred.find((item) => item.name === 'flour')?.quantity, 2);
+	assert.equal(transferred.find((item) => item.name === 'sugar')?.quantity, 1.5);
+	assert.equal(transferred.find((item) => item.name === 'rice')?.quantity, 1_000_000);
+	assert.equal(transferred.find((item) => item.name === 'salt')?.quantity, 1_000_000);
+	assert.equal(
+		transferred.find((item) => item.name === 'pepper'),
+		undefined
+	);
+
+	const fullPantry = Array.from({ length: 1_000 }, (_, index) =>
+		pantry(`item-${index}`, 1, 'piece')
+	);
+	const capped = transferPurchasedItemsToPantry(
+		fullPantry,
+		[
+			shopping('merge-existing', 'item-0', 3, 'piece', true),
+			shopping('overflow', 'brand-new-ingredient', 2, 'piece', true)
+		],
+		() => 'unused-overflow'
+	);
+	assert.equal(capped.length, 1_000);
+	assert.equal(capped[0].quantity, 4);
+	assert.equal(
+		capped.some((item) => item.name === 'brand-new-ingredient'),
+		false
+	);
+});
+
 test('completing a meal deducts compatible pantry quantities once and never goes below zero', () => {
 	const plannedRecipe = recipe({
 		id: 'soup',
@@ -697,6 +744,48 @@ test('savePlannedMealChanges and cookPlannedMeal guard concurrently completed or
 	assert.equal(rescheduled.state.meals[0].date, '2026-10-29');
 	assert.equal(rescheduled.state.meals[0].slot, 'Lunch');
 	assert.equal(rescheduled.state.meals[0].servings, 4);
+});
+
+test('transferPurchasedItemsToPantry preserves categories on new lots and merges item/bunch aliases into unexpired stock', () => {
+	const existing = [
+		{ ...pantry('avocado', 1, 'whole', '2026-10-24'), category: 'Produce' },
+		{ ...pantry('cilantro', 1, 'bunch'), category: 'Herbs' }
+	];
+	const transferred = transferPurchasedItemsToPantry(
+		existing,
+		[
+			{ ...shopping('scan-avocado', 'avocados', 2, 'items', true), category: 'Produce' },
+			{ ...shopping('scan-cilantro', 'cilantro', 1, 'bunches', true), category: 'Produce' },
+			shopping('manual-flour', 'flour', 1.5, 'cups', true)
+		],
+		(() => {
+			let n = 0;
+			return () => `new-lot-${++n}`;
+		})()
+	);
+
+	assert.equal(transferred.length, 4);
+	// Expiring avocado lot stays untouched; new unexpired avocado lot keeps Produce category.
+	assert.equal(transferred[0].quantity, 1);
+	assert.equal(transferred[0].expires, '2026-10-24');
+	const newAvocado = transferred.find((item) => item.id === 'new-lot-1');
+	assert.ok(newAvocado);
+	assert.equal(newAvocado.unit, 'each');
+	assert.equal(newAvocado.quantity, 2);
+	assert.equal(newAvocado.category, 'Produce');
+
+	// Unexpired cilantro bunch merges compatible bunches without duplicating lots.
+	const cilantro = transferred.find((item) => item.name === 'cilantro');
+	assert.ok(cilantro);
+	assert.equal(cilantro.quantity, 2);
+	assert.equal(cilantro.unit, 'bunch');
+	assert.equal(cilantro.category, 'Herbs');
+
+	// Manual lines without category default to Pantry.
+	const flour = transferred.find((item) => item.name === 'flour');
+	assert.ok(flour);
+	assert.equal(flour.category, 'Pantry');
+	assert.equal(flour.unit, 'cup');
 });
 
 test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and guards invalid now', () => {

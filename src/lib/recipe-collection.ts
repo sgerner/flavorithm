@@ -98,12 +98,12 @@ export function cloneRecipe(recipe: Recipe): Recipe {
 function normalizeEditorComparable(recipe: Recipe) {
 	return {
 		title: recipe.title.trim(),
-		description: recipe.description.trim(),
+		description: recipe.description.trim().slice(0, 10000),
 		image: recipe.image.trim(),
 		time: recipe.time,
 		servings: recipe.servings,
-		difficulty: recipe.difficulty.trim(),
-		cuisine: recipe.cuisine.trim(),
+		difficulty: recipe.difficulty.trim().slice(0, 80),
+		cuisine: recipe.cuisine.trim().slice(0, 100),
 		tags: [
 			...new Set(
 				recipe.tags
@@ -134,6 +134,53 @@ const nutritionConflictLabels: [keyof Recipe['nutrition'], string][] = [
 	['protein', 'Protein']
 ];
 
+export function hasZeroNutrition(nutrition: Recipe['nutrition']): boolean {
+	return (
+		nutrition.calories === 0 &&
+		nutrition.fat === 0 &&
+		nutrition.saturatedFat === 0 &&
+		nutrition.sodium === 0 &&
+		nutrition.carbs === 0 &&
+		nutrition.fiber === 0 &&
+		nutrition.sugar === 0 &&
+		nutrition.protein === 0
+	);
+}
+
+export function createBlankRecipe(id: string = crypto.randomUUID()): Recipe {
+	return {
+		id,
+		title: '',
+		description: '',
+		image: '',
+		time: 30,
+		servings: 2,
+		difficulty: '',
+		cuisine: '',
+		tags: [],
+		ingredients: [{ name: '', quantity: 1, unit: 'piece' }],
+		steps: [''],
+		nutrition: {
+			calories: 0,
+			fat: 0,
+			saturatedFat: 0,
+			sodium: 0,
+			carbs: 0,
+			fiber: 0,
+			sugar: 0,
+			protein: 0
+		}
+	};
+}
+
+export function finalizeManualRecipe(draft: Recipe): Recipe {
+	return {
+		...draft,
+		saved: true,
+		provenance: 'manual',
+		nutritionStale: hasZeroNutrition(draft.nutrition)
+	};
+}
 /** Apply a batch atomically, preserving existing recipes when it cannot fit. */
 export function insertRecipes(existing: Recipe[], incoming: Recipe[]): Recipe[] {
 	const additions = new Map(incoming.map((recipe) => [recipe.id, recipe]));
@@ -165,7 +212,16 @@ export function mergeEditedRecipe(
 	if (!live) {
 		const nutritionNeedsRefresh =
 			base.servings !== draft.servings || !equal(base.ingredients, draft.ingredients);
-		const nutritionStale = nutritionNeedsRefresh ? true : base.nutritionStale;
+		const nutritionChanged = !equal(base.nutrition, draft.nutrition);
+		const zeroNutrition = hasZeroNutrition(draft.nutrition);
+		const provenance = draft.provenance ?? base.provenance;
+		const nutritionStale = nutritionNeedsRefresh
+			? true
+			: provenance === 'manual' && zeroNutrition
+				? true
+				: nutritionChanged && !zeroNutrition
+					? false
+					: base.nutritionStale;
 		const candidate = cloneRecipe({
 			...base,
 			...draft,
@@ -178,14 +234,14 @@ export function mergeEditedRecipe(
 				status: 'deleted',
 				recipe: candidate,
 				conflicts: [],
-				nutritionNeedsRefresh: Boolean(nutritionStale)
+				nutritionNeedsRefresh
 			};
 		}
 		return {
 			status: 'merged',
 			recipe: candidate,
 			conflicts: [],
-			nutritionNeedsRefresh: Boolean(nutritionStale)
+			nutritionNeedsRefresh
 		};
 	}
 
@@ -322,7 +378,16 @@ export function mergeEditedRecipe(
 		(base.servings !== servings || !equal(base.ingredients, ingredients)) &&
 		equal(nutrition, base.nutrition);
 	const nutritionNeedsRefresh = changedFromLive || changedFromBaseWithoutNewNutrition;
-	const nutritionStale = nutritionNeedsRefresh ? true : live.nutritionStale;
+	const nutritionChanged =
+		!equal(live.nutrition, nutrition) || !equal(base.nutrition, draft.nutrition);
+	const zeroNutrition = hasZeroNutrition(nutrition);
+	const nutritionStale = nutritionNeedsRefresh
+		? true
+		: live.provenance === 'manual' && zeroNutrition
+			? true
+			: nutritionChanged && !zeroNutrition
+				? false
+				: live.nutritionStale;
 
 	const merged: Recipe = cloneRecipe({
 		...live,
