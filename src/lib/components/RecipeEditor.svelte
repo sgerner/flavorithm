@@ -8,9 +8,17 @@
 	import type { Recipe } from '#lib/types.ts';
 	let {
 		recipe,
+		mode = 'edit',
+		canUploadCover = false,
 		cancel,
 		save
-	}: { recipe: Recipe; cancel: () => void; save: (recipe: Recipe) => void } = $props();
+	}: {
+		recipe: Recipe;
+		mode?: 'create' | 'edit';
+		canUploadCover?: boolean;
+		cancel: () => void;
+		save: (recipe: Recipe) => void;
+	} = $props();
 	let draft = $state<Recipe>(
 		untrack(() => ({
 			...recipe,
@@ -23,11 +31,11 @@
 	let tagsText = $state(draft.tags.join(', '));
 	let error = $state('');
 	let uploading = $state(false);
-	let photoInput: HTMLInputElement;
+	let photoInput = $state<HTMLInputElement>();
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
-		if (!file) return;
+		if (!canUploadCover || !file) return;
 		uploading = true;
 		error = '';
 		try {
@@ -100,10 +108,10 @@
 		if (
 			!title ||
 			title.length > 200 ||
-			!Number.isFinite(draft.time) ||
+			!Number.isInteger(draft.time) ||
 			draft.time < 1 ||
 			draft.time > 100000 ||
-			!Number.isFinite(draft.servings) ||
+			!Number.isInteger(draft.servings) ||
 			draft.servings < 1 ||
 			draft.servings > 10000 ||
 			!ingredients.length ||
@@ -130,17 +138,21 @@
 				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
 			return;
 		}
-		save({
-			...draft,
-			title,
-			description: draft.description.trim().slice(0, 10000),
-			image,
-			cuisine: draft.cuisine.trim().slice(0, 100),
-			difficulty: draft.difficulty.trim().slice(0, 80),
-			tags,
-			ingredients,
-			steps
-		});
+		try {
+			save({
+				...draft,
+				title,
+				description: draft.description.trim().slice(0, 10000),
+				image,
+				cuisine: draft.cuisine.trim().slice(0, 100),
+				difficulty: draft.difficulty.trim().slice(0, 80),
+				tags,
+				ingredients,
+				steps
+			});
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not save this recipe.';
+		}
 	}
 </script>
 
@@ -154,8 +166,14 @@
 		tabindex="-1"
 		transition:dialogMotion|global
 	>
-		<h2 id="recipe-editor-title">{recipe.saved ? 'Edit saved recipe' : 'Edit recipe'}</h2>
-		<p class="muted">Changes are saved to your recipe collection.</p>
+		<h2 id="recipe-editor-title">
+			{mode === 'create' ? 'New recipe' : recipe.saved ? 'Edit saved recipe' : 'Edit recipe'}
+		</h2>
+		<p class="muted">
+			{mode === 'create'
+				? 'Add a personal recipe to your collection.'
+				: 'Changes are saved to your recipe collection.'}
+		</p>
 		<form onsubmit={saveDraft} novalidate>
 			<div class="draft-summary">
 				<label class="field draft-title"
@@ -194,21 +212,21 @@
 						alt="Recipe cover preview"
 						onerror={(event) => recipeImageError(event, draft)}
 					/>
-					<input
-						hidden
-						type="file"
-						accept="image/jpeg,image/png,image/webp"
-						bind:this={photoInput}
-						onchange={uploadCover}
-						disabled={uploading}
-					/>
-					<button
-						type="button"
-						class="secondary"
-						disabled={uploading}
-						onclick={() => photoInput.click()}
-						>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
-					>
+					{#if canUploadCover}<input
+							hidden
+							type="file"
+							accept="image/jpeg,image/png,image/webp"
+							bind:this={photoInput}
+							onchange={uploadCover}
+							disabled={uploading}
+						/>
+						<button
+							type="button"
+							class="secondary"
+							disabled={uploading}
+							onclick={() => photoInput?.click()}
+							>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
+						>{/if}
 					{#if draft.image}<button
 							type="button"
 							class="text-button"
@@ -218,8 +236,9 @@
 							}}>Remove cover</button
 						>{/if}
 					<p class="muted">
-						JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.
-						Sign-in and an internet connection are required.
+						{canUploadCover
+							? 'JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.'
+							: 'Paste a public HTTPS image link below, or sign in while online to upload a cover photo.'}
 					</p>
 				</div>
 				{#if !COVER_PATH.test(draft.image)}<label class="field full-field"
@@ -334,7 +353,7 @@
 			<div class="draft-footer">
 				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
 				<button class="primary" type="submit" disabled={uploading}
-					><Check size={18} />Save changes</button
+					><Check size={18} />{mode === 'create' ? 'Save recipe' : 'Save changes'}</button
 				>
 			</div>
 		</form>

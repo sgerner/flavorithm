@@ -7,6 +7,7 @@ import {
 	unitInfo
 } from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
+import { hasZeroNutrition } from './recipe-collection.ts';
 export {
 	normalizeName,
 	normalizeName as normalizeIngredientName,
@@ -588,15 +589,41 @@ export function recipeForEdit(state: AppState, recipeId: string): Recipe | null 
 	return target ? cloneRecipe(target) : null;
 }
 
+const NUTRITION_KEYS: (keyof Recipe['nutrition'])[] = [
+	'calories',
+	'fat',
+	'saturatedFat',
+	'sodium',
+	'carbs',
+	'fiber',
+	'sugar',
+	'protein'
+];
+
 /**
- * Insert or update a recipe, track nutrition staleness and ratings, and refresh affected weekly
- * and existing single-recipe shopping scopes.
+ * Insert or update a recipe, track provenance, nutrition staleness, and ratings, and refresh
+ * affected weekly and existing single-recipe shopping scopes.
  */
 export function upsertRecipe(state: AppState, recipe: Recipe, now: Date = new Date()): AppState {
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const previous = state.recipes.find((item) => item.id === recipe.id);
 	const updated = cloneRecipe(recipe);
-	if (recipeNeedsNutritionRefresh(previous, updated) || previous?.nutritionStale) {
+	if (previous?.provenance === 'manual') updated.provenance = 'manual';
+	else if (updated.provenance === undefined && previous?.provenance) {
+		updated.provenance = previous.provenance;
+	}
+	const nutritionNeedsRefresh = recipeNeedsNutritionRefresh(previous, updated);
+	const nutritionChanged = Boolean(
+		previous && NUTRITION_KEYS.some((key) => previous.nutrition[key] !== updated.nutrition[key])
+	);
+	const zeroNutrition = hasZeroNutrition(updated.nutrition);
+	if (nutritionNeedsRefresh) {
+		updated.nutritionStale = true;
+	} else if (updated.provenance === 'manual' && zeroNutrition) {
+		updated.nutritionStale = true;
+	} else if (nutritionChanged && !zeroNutrition) {
+		updated.nutritionStale = false;
+	} else if (previous?.nutritionStale) {
 		updated.nutritionStale = true;
 	}
 	const recipes = previous

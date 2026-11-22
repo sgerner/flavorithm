@@ -53,7 +53,7 @@ const recipe = z.object({
 	steps: z.array(text).max(200),
 	nutrition,
 	source: z.string().max(4000).optional(),
-	provenance: z.enum(['web-import', 'ai-generated']).optional(),
+	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
 	importNotes: z.array(z.string().max(1000)).max(50).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
