@@ -7,6 +7,7 @@ import {
 	fetchCaptureRecipePage,
 	fetchRecipePage,
 	getSupportedModels,
+	resetPublicModelCatalogCache,
 	runAIRequest,
 	transformModelCatalog,
 	validateCaptureRecipeUrl,
@@ -1415,7 +1416,9 @@ test('import routes Anthropic requests with text-only content, import schema, an
 	assert.equal(result.recipes[0].provenance, 'web-import');
 });
 
-test('token budgets apply action tiers, reasoning reserves, provider keys, and keep Google distinct', async () => {
+test('token budgets apply action tiers, reasoning reserves, provider keys, and keep Google distinct', async (t) => {
+	resetPublicModelCatalogCache();
+	t.after(() => resetPublicModelCatalogCache());
 	const catalog = {
 		openai: {
 			name: 'OpenAI',
