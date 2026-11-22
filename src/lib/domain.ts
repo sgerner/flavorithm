@@ -31,6 +31,8 @@ addUnits('volume', 3785.411784, 'gal', ['gal', 'gallon', 'gallons']);
 addUnits('count', 1, 'each', [
 	'ea',
 	'each',
+	'item',
+	'items',
 	'piece',
 	'pieces',
 	'whole',
@@ -40,6 +42,7 @@ addUnits('count', 1, 'each', [
 	'medium',
 	'large'
 ]);
+addUnits('count:bunch', 1, 'bunch', ['bunch', 'bunches']);
 addUnits('count:clove', 1, 'clove', ['clove', 'cloves']);
 addUnits('count:head', 1, 'head', [
 	'head',
@@ -55,7 +58,6 @@ addUnits('count:slice', 1, 'slice', ['slice', 'slices']);
 addUnits('count:can', 1, 'can', ['can', 'cans']);
 addUnits('count:pinch', 1, 'pinch', ['pinch', 'pinches']);
 addUnits('count:dash', 1, 'dash', ['dash', 'dashes']);
-addUnits('count:bunch', 1, 'bunch', ['bunch', 'bunches']);
 
 const containerUnits: Record<string, string> = {
 	package: 'package',
@@ -72,21 +74,39 @@ const containerUnits: Record<string, string> = {
 	jars: 'jar'
 };
 
-const unicodeFractions: Record<string, number> = {
-	'¼': 0.25,
-	'½': 0.5,
-	'¾': 0.75,
-	'⅓': 1 / 3,
-	'⅔': 2 / 3,
-	'⅛': 0.125,
-	'⅜': 0.375,
-	'⅝': 0.625,
-	'⅞': 0.875
-};
-
 const parsableUnitTokens = [...Object.keys(unitAliases), ...Object.keys(containerUnits)].sort(
 	(a, b) => b.length - a.length
 );
+
+const sortedUnitAliases = Object.keys(unitAliases).sort((a, b) => b.length - a.length);
+
+const unicodeFractions: Record<string, number> = {
+	'¼': 1 / 4,
+	'½': 1 / 2,
+	'¾': 3 / 4,
+	'⅐': 1 / 7,
+	'⅑': 1 / 9,
+	'⅒': 1 / 10,
+	'⅓': 1 / 3,
+	'⅔': 2 / 3,
+	'⅕': 1 / 5,
+	'⅖': 2 / 5,
+	'⅗': 3 / 5,
+	'⅘': 4 / 5,
+	'⅙': 1 / 6,
+	'⅚': 5 / 6,
+	'⅛': 1 / 8,
+	'⅜': 3 / 8,
+	'⅝': 5 / 8,
+	'⅞': 7 / 8
+};
+
+export type ParsedIngredient = {
+	name: string;
+	quantity: number;
+	unit: string;
+	category: string;
+};
 
 const ingredientAliases: Record<string, string> = {
 	avocadoes: 'avocado',
@@ -152,48 +172,58 @@ export function unitInfo(unit: string): UnitInfo {
 	return unitAliases[cleaned] ?? { dimension: `unit:${cleaned}`, factor: 1, display: cleaned };
 }
 
+function roundParsedQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
+	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
 function parseLeadingQuantity(text: string): { quantity: number; rest: string } | undefined {
-	const mixed = /^(\d+)\s+(\d+)\s*\/\s*(\d+)(?=\s|[a-zA-Z]|$)/.exec(text);
-	if (mixed) {
-		const denom = Number(mixed[3]);
-		if (denom > 0) {
-			return {
-				quantity: Number(mixed[1]) + Number(mixed[2]) / denom,
-				rest: text.slice(mixed[0].length)
-			};
-		}
+	const mixedAscii = /^(\d+)(?:\s+|-)(\d+)\s*[\/⁄]\s*(\d+)(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
+	if (mixedAscii) {
+		const whole = Number(mixedAscii[1]);
+		const num = Number(mixedAscii[2]);
+		const den = Number(mixedAscii[3]);
+		const rest = mixedAscii[4].trim();
+		if (!rest) return undefined;
+		if (den <= 0) return { quantity: 0, rest };
+		return { quantity: roundParsedQuantity(whole + num / den), rest };
 	}
-	const mixedUnicode = /^(\d+)\s*([¼½¾⅓⅔⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)/.exec(text);
+
+	const mixedUnicode = /^(\d+)(?:\s+|-)?([¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
 	if (mixedUnicode) {
-		return {
-			quantity: Number(mixedUnicode[1]) + unicodeFractions[mixedUnicode[2]],
-			rest: text.slice(mixedUnicode[0].length)
-		};
+		const whole = Number(mixedUnicode[1]);
+		const frac = unicodeFractions[mixedUnicode[2]] ?? 0;
+		const rest = mixedUnicode[3].trim();
+		if (!rest) return undefined;
+		return { quantity: roundParsedQuantity(whole + frac), rest };
 	}
-	const singleUnicode = /^([¼½¾⅓⅔⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)/.exec(text);
+
+	const asciiFraction = /^(\d+)\s*[\/⁄]\s*(\d+)(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
+	if (asciiFraction) {
+		const num = Number(asciiFraction[1]);
+		const den = Number(asciiFraction[2]);
+		const rest = asciiFraction[3].trim();
+		if (!rest) return undefined;
+		if (den <= 0) return { quantity: 0, rest };
+		return { quantity: roundParsedQuantity(num / den), rest };
+	}
+
+	const singleUnicode = /^([¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
 	if (singleUnicode) {
-		return {
-			quantity: unicodeFractions[singleUnicode[1]],
-			rest: text.slice(singleUnicode[0].length)
-		};
+		const frac = unicodeFractions[singleUnicode[1]] ?? 0;
+		const rest = singleUnicode[2].trim();
+		if (!rest) return undefined;
+		return { quantity: roundParsedQuantity(frac), rest };
 	}
-	const fraction = /^(\d+)\s*\/\s*(\d+)(?=\s|[a-zA-Z]|$)/.exec(text);
-	if (fraction) {
-		const denom = Number(fraction[2]);
-		if (denom > 0) {
-			return {
-				quantity: Number(fraction[1]) / denom,
-				rest: text.slice(fraction[0].length)
-			};
-		}
-	}
-	const decimal = /^(\d+(?:\.\d+)?|\.\d+)(?=\s|[a-zA-Z]|$)/.exec(text);
+
+	const decimal = /^(\d+(?:\.\d+)?|\.\d+)(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
 	if (decimal) {
-		return {
-			quantity: Number(decimal[1]),
-			rest: text.slice(decimal[0].length)
-		};
+		const quantity = Number(decimal[1]);
+		const rest = decimal[2].trim();
+		if (!rest || !Number.isFinite(quantity)) return undefined;
+		return { quantity: roundParsedQuantity(quantity), rest };
 	}
+
 	return undefined;
 }
 
@@ -231,8 +261,9 @@ export function parseIngredientInput(raw: string): {
 				const afterToken = restTrimmed.slice(token.length);
 				const sepMatch = /^\.?\s+/.exec(afterToken);
 				if (!sepMatch) continue;
-				const afterUnit = afterToken
-					.slice(sepMatch[0].length)
+				const rawAfter = afterToken.slice(sepMatch[0].length).trim();
+				if (/^of$/i.test(rawAfter)) continue;
+				const afterUnit = rawAfter
 					.replace(/^of\s+/i, '')
 					.replace(/[.,;:]$/, '')
 					.trim();
@@ -268,6 +299,71 @@ export function parseIngredientInput(raw: string): {
 		hasExplicitQuantity: false,
 		hasExplicitUnit: false
 	};
+}
+
+export function parseIngredientLine(raw: string): ParsedIngredient | undefined {
+	let working = raw.trim().replace(/\s+/g, ' ');
+	working = working.replace(/^[-*•]\s+/, '').trim();
+	working = working.replace(/[.,;:]$/, '').trim();
+	if (!working || /^\[[^\[\]]*\]$/.test(working)) return undefined;
+
+	let category = 'Pantry';
+	const categoryMatch = /^(.*?)\s*\[([^\[\]]*)\]\s*$/.exec(working);
+	if (categoryMatch && categoryMatch[1].trim()) {
+		working = categoryMatch[1]
+			.trim()
+			.replace(/[.,;:]$/, '')
+			.trim();
+		const parsedCategory = categoryMatch[2].trim().replace(/\s+/g, ' ').slice(0, 60);
+		if (parsedCategory) category = parsedCategory;
+	}
+	if (!working || /^[\d\s\/⁄.\-¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞]+$/.test(working)) return undefined;
+
+	const leading = parseLeadingQuantity(working);
+	if (!leading) {
+		const name = working.slice(0, 100).trim();
+		return name ? { name, quantity: 1, unit: 'each', category } : undefined;
+	}
+	if (!(leading.quantity > 0)) return undefined;
+
+	const { quantity, rest } = leading;
+	const lowerRest = rest.toLowerCase();
+	for (const alias of sortedUnitAliases) {
+		if (!lowerRest.startsWith(alias)) continue;
+		const afterAlias = rest.slice(alias.length);
+		if (!/^\.?\s+/.test(afterAlias)) continue;
+		let candidateName = afterAlias.replace(/^\.?\s+/, '').trim();
+		if (/^of$/i.test(candidateName)) candidateName = '';
+		else candidateName = candidateName.replace(/^of\s+/i, '').trim();
+		candidateName = candidateName
+			.replace(/[.,;:]$/, '')
+			.trim()
+			.slice(0, 100)
+			.trim();
+		if (candidateName) {
+			return {
+				name: candidateName,
+				quantity,
+				unit: unitAliases[alias].display,
+				category
+			};
+		}
+	}
+
+	const fallbackName = rest
+		.replace(/^of\s+/i, '')
+		.replace(/[.,;:]$/, '')
+		.trim()
+		.slice(0, 100)
+		.trim();
+	return fallbackName ? { name: fallbackName, quantity, unit: 'each', category } : undefined;
+}
+
+export function parseIngredientLines(input: string): ParsedIngredient[] {
+	return input
+		.split(/[,;\r\n]+(?![^\[\]]*\])/)
+		.map((segment) => parseIngredientLine(segment))
+		.filter((item): item is ParsedIngredient => item !== undefined);
 }
 
 function roundQuantity(value: number): number {

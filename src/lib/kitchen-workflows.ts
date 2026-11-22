@@ -12,7 +12,10 @@ export {
 	normalizeName,
 	normalizeName as normalizeIngredientName,
 	parseIngredientInput,
-	unitInfo
+	parseIngredientLine,
+	parseIngredientLines,
+	unitInfo,
+	type ParsedIngredient
 } from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
@@ -281,7 +284,7 @@ export function reconcileShoppingList(
 		});
 	}
 
-	return [...uncheckedRetained, ...generated, ...checkedRetained];
+	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
 /** Check whether a shopping row is a valid checked purchase that can be transferred to pantry. */
@@ -452,7 +455,7 @@ export function transferPurchasedItemsToPantry(
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category?: string }
 	>();
 	for (const item of purchases) {
 		if (!isTransferablePurchase(item)) continue;
@@ -471,11 +474,21 @@ export function transferPurchasedItemsToPantry(
 				resolvedUnit = parsed.unit;
 			}
 		}
-		const normalizedName = normalizeName(resolvedName);
+		const clampedName = resolvedName.trim().slice(0, 200);
+		if (!clampedName) continue;
+		const normalizedName = normalizeName(clampedName);
 		const unit = unitInfo(resolvedUnit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		const bucket = buckets.get(key) ?? { name: resolvedName, unit, quantityBase: 0 };
+		const bucket = buckets.get(key) ?? {
+			name: clampedName,
+			unit,
+			quantityBase: 0
+		};
 		bucket.quantityBase += resolvedQuantity * unit.factor;
+		const category = item.category?.trim();
+		if (category && (!bucket.category || (bucket.category === 'Pantry' && category !== 'Pantry'))) {
+			bucket.category = category;
+		}
 		buckets.set(key, bucket);
 	}
 
@@ -491,11 +504,16 @@ export function transferPurchasedItemsToPantry(
 		if (destination) {
 			const destinationUnit = destination.unit.trim() || 'each';
 			if (!destination.unit.trim()) destination.unit = 'each';
-			destination.quantity = roundPantryQuantity(
-				destination.quantity + bucket.quantityBase / unitInfo(destinationUnit).factor
+			const baseline = Number.isFinite(destination.quantity)
+				? Math.max(0, destination.quantity)
+				: 0;
+			destination.quantity = Math.min(
+				1_000_000,
+				roundPantryQuantity(baseline + bucket.quantityBase / unitInfo(destinationUnit).factor)
 			);
 			continue;
 		}
+		if (result.length >= 1_000) continue;
 
 		const baseId = createId();
 		let id = baseId;
@@ -505,9 +523,9 @@ export function transferPurchasedItemsToPantry(
 		result.push({
 			id,
 			name: bucket.name,
-			quantity: roundPantryQuantity(bucket.quantityBase / bucket.unit.factor),
-			unit: bucket.unit.display,
-			category: 'Pantry'
+			quantity: Math.min(1_000_000, roundPantryQuantity(bucket.quantityBase / bucket.unit.factor)),
+			unit: bucket.unit.display.slice(0, 40),
+			category: bucket.category?.slice(0, 100) || 'Pantry'
 		});
 	}
 	return result;

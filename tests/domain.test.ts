@@ -1,13 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState, seedRecipes } from '../src/lib/data.ts';
+import { rankRecipes } from '../src/lib/discovery.ts';
 import {
 	buildShoppingList,
+	normalizeName,
 	parseCalendarDate,
 	parseIngredientInput,
+	parseIngredientLine,
+	parseIngredientLines,
 	preferenceSummary,
 	unitInfo
 } from '../src/lib/domain.ts';
+import { completeMeal, transferPurchasedItemsToPantry } from '../src/lib/kitchen-workflows.ts';
 import type { Ingredient, Meal, Recipe } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -322,4 +327,274 @@ test('parses typed quantities, fractions, culinary units, and unitless entries',
 		hasExplicitUnit: false
 	});
 	assert.deepEqual(unitInfo(''), unitInfo('each'));
+});
+
+test('parseIngredientLines parses fractions, connectors, categories, and trailing-name unit rules', () => {
+	const parsed = parseIngredientLines(
+		[
+			'3 item avocado [Produce]',
+			'2 tablespoons olive oil',
+			'500 grams chicken breast',
+			'2 cups of basmati rice',
+			'1/2 cup milk',
+			'1 1/2 cups flour',
+			'2 eggs'
+		].join('\n')
+	);
+
+	assert.deepEqual(parsed, [
+		{ name: 'avocado', quantity: 3, unit: 'each', category: 'Produce' },
+		{ name: 'olive oil', quantity: 2, unit: 'tbsp', category: 'Pantry' },
+		{ name: 'chicken breast', quantity: 500, unit: 'g', category: 'Pantry' },
+		{ name: 'basmati rice', quantity: 2, unit: 'cup', category: 'Pantry' },
+		{ name: 'milk', quantity: 0.5, unit: 'cup', category: 'Pantry' },
+		{ name: 'flour', quantity: 1.5, unit: 'cup', category: 'Pantry' },
+		{ name: 'eggs', quantity: 2, unit: 'each', category: 'Pantry' }
+	]);
+
+	assert.deepEqual(parseIngredientLine('½ tsp kosher salt'), {
+		name: 'kosher salt',
+		quantity: 0.5,
+		unit: 'tsp',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('1½ cups of rolled oats [Grains]'), {
+		name: 'rolled oats',
+		quantity: 1.5,
+		unit: 'cup',
+		category: 'Grains'
+	});
+	assert.deepEqual(parseIngredientLine('1-1/2 bunches cilantro [Produce]'), {
+		name: 'cilantro',
+		quantity: 1.5,
+		unit: 'bunch',
+		category: 'Produce'
+	});
+	assert.deepEqual(parseIngredientLine('1 large head of broccoli'), {
+		name: 'broccoli',
+		quantity: 1,
+		unit: 'head',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('2 fluid ounces lemon juice'), {
+		name: 'lemon juice',
+		quantity: 2,
+		unit: 'fl oz',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('2 green onions'), {
+		name: 'green onions',
+		quantity: 2,
+		unit: 'each',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('2 cupcakes'), {
+		name: 'cupcakes',
+		quantity: 2,
+		unit: 'each',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLines('spinach, 200g pasta; 2 eggs [Dairy, eggs]'), [
+		{ name: 'spinach', quantity: 1, unit: 'each', category: 'Pantry' },
+		{ name: 'pasta', quantity: 200, unit: 'g', category: 'Pantry' },
+		{ name: 'eggs', quantity: 2, unit: 'each', category: 'Dairy, eggs' }
+	]);
+	assert.equal(parseIngredientLine('   '), undefined);
+	assert.equal(parseIngredientLine('[Produce]'), undefined);
+	assert.equal(parseIngredientLine('0 eggs'), undefined);
+	assert.equal(parseIngredientLine('1/0 cup milk'), undefined);
+});
+
+test('parseIngredientLine recognizes all 77 registered unit aliases', () => {
+	const allAliases = [
+		'g',
+		'gram',
+		'grams',
+		'kg',
+		'kilogram',
+		'kilograms',
+		'mg',
+		'milligram',
+		'milligrams',
+		'oz',
+		'ounce',
+		'ounces',
+		'lb',
+		'lbs',
+		'pound',
+		'pounds',
+		'ml',
+		'milliliter',
+		'milliliters',
+		'millilitre',
+		'millilitres',
+		'l',
+		'liter',
+		'liters',
+		'litre',
+		'litres',
+		'tsp',
+		'teaspoon',
+		'teaspoons',
+		'tbsp',
+		'tablespoon',
+		'tablespoons',
+		'cup',
+		'cups',
+		'fl oz',
+		'fl. oz',
+		'fluid oz',
+		'fluid ounce',
+		'fluid ounces',
+		'pt',
+		'pint',
+		'pints',
+		'qt',
+		'quart',
+		'quarts',
+		'gal',
+		'gallon',
+		'gallons',
+		'ea',
+		'each',
+		'item',
+		'items',
+		'piece',
+		'pieces',
+		'whole',
+		'egg',
+		'eggs',
+		'small',
+		'medium',
+		'large',
+		'bunch',
+		'bunches',
+		'clove',
+		'cloves',
+		'head',
+		'heads',
+		'small head',
+		'medium head',
+		'large head',
+		'slice',
+		'slices',
+		'can',
+		'cans',
+		'pinch',
+		'pinches',
+		'dash',
+		'dashes'
+	];
+	assert.equal(allAliases.length, 77);
+	for (const alias of allAliases) {
+		const parsed = parseIngredientLine(`2 ${alias} test ingredient`);
+		assert.ok(parsed, `expected ${alias} to parse`);
+		assert.equal(parsed.quantity, 2);
+		assert.equal(parsed.unit, unitInfo(alias).display);
+		assert.equal(parsed.name, 'test ingredient');
+	}
+});
+
+test('quick-add, dictated, and scanned lines match in rankRecipes, buildShoppingList, and completeMeal', () => {
+	const quickAddText = '2 tablespoons extra virgin olive oil, 1 1/2 cups of basmati rice';
+	const dictatedText = '500 grams boneless chicken breast, 2 bunches fresh parsley';
+	const visionItems = [
+		{ name: 'avocadoes', quantity: 3, unit: 'items', category: 'Produce' },
+		{ name: 'roma tomatoes', quantity: 4, unit: 'each', category: 'Produce' }
+	];
+	const scannedText = visionItems
+		.map((i) => `${i.quantity} ${unitInfo(i.unit).display} ${i.name} [${i.category}]`)
+		.join('\n');
+
+	const combinedInput = [[quickAddText, dictatedText].filter(Boolean).join(', '), scannedText].join(
+		'\n'
+	);
+	const parsed = parseIngredientLines(combinedInput);
+	const stockedPantry = transferPurchasedItemsToPantry(
+		[],
+		parsed.map((item, idx) => ({
+			id: `add-${idx}`,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit,
+			category: item.category,
+			checked: true
+		})),
+		(() => {
+			let n = 0;
+			return () => `lot-${++n}`;
+		})()
+	);
+
+	assert.equal(
+		stockedPantry.find((item) => normalizeName(item.name) === 'avocado')?.category,
+		'Produce'
+	);
+	assert.equal(
+		stockedPantry.find((item) => normalizeName(item.name) === 'olive oil')?.category,
+		'Pantry'
+	);
+
+	const stockedBowl = recipe({
+		id: 'stocked-bowl',
+		title: 'Chicken avocado rice bowl',
+		ingredients: [
+			{ name: 'chicken breast', quantity: 400, unit: 'g' },
+			{ name: 'basmati rice', quantity: 1, unit: 'cup' },
+			{ name: 'avocado', quantity: 2, unit: 'whole' },
+			{ name: 'tomato', quantity: 2, unit: 'pieces' },
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'parsley', quantity: 1, unit: 'bunch' }
+		]
+	});
+	const unstockedStew = recipe({
+		id: 'unstocked-stew',
+		title: 'Beef barley stew',
+		ingredients: [
+			{ name: 'beef chuck', quantity: 500, unit: 'g' },
+			{ name: 'pearl barley', quantity: 1, unit: 'cup' }
+		]
+	});
+
+	const initial = createInitialState();
+	const ranked = rankRecipes(
+		[unstockedStew, stockedBowl],
+		stockedPantry,
+		initial.preferences,
+		new Date('2026-10-22T12:00:00Z')
+	);
+	assert.equal(ranked[0].id, 'stocked-bowl');
+
+	const shopping = buildShoppingList(
+		[stockedBowl],
+		stockedPantry,
+		undefined,
+		new Date('2026-10-22T12:00:00Z')
+	);
+	assert.deepEqual(shopping, []);
+
+	const afterCooking = completeMeal(
+		{
+			...initial,
+			pantry: stockedPantry,
+			recipes: [stockedBowl],
+			meals: [
+				{ id: 'm1', date: '2026-10-22', slot: 'Dinner', recipeId: 'stocked-bowl', servings: 2 }
+			]
+		},
+		'm1',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-22T18:00:00Z')
+	);
+	assert.equal(
+		afterCooking.pantry.find((i) => normalizeName(i.name) === 'chicken breast')?.quantity,
+		100
+	);
+	assert.equal(
+		afterCooking.pantry.find((i) => normalizeName(i.name) === 'basmati rice')?.quantity,
+		0.5
+	);
+	assert.equal(afterCooking.pantry.find((i) => normalizeName(i.name) === 'avocado')?.quantity, 1);
+	assert.equal(afterCooking.pantry.find((i) => normalizeName(i.name) === 'olive oil')?.quantity, 1);
+	assert.equal(afterCooking.pantry.find((i) => normalizeName(i.name) === 'parsley')?.quantity, 1);
 });
