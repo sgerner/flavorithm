@@ -1,5 +1,11 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
-import { buildShoppingList, normalizeName, unitInfo } from './domain.ts';
+import {
+	buildShoppingList,
+	normalizeName,
+	resolveShoppingQuantity,
+	unitInfo,
+	type UnitInfo
+} from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
 
@@ -107,12 +113,15 @@ export function reconcileShoppingList(
 	sourceKey: string
 ): ShoppingItem[] {
 	const checked = existing.filter((item) => item.sourceKey === sourceKey && item.checked);
-	const checkedByBucket = new Map<string, number>();
+	const checkedByBucket = new Map<string, { quantityBase: number; units: UnitInfo[] }>();
 	for (const item of checked) {
 		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
 		const key = bucketKey(item.name, item.unit);
 		const unit = unitInfo(item.unit);
-		checkedByBucket.set(key, (checkedByBucket.get(key) ?? 0) + item.quantity * unit.factor);
+		const bucket = checkedByBucket.get(key) ?? { quantityBase: 0, units: [] };
+		bucket.quantityBase += item.quantity * unit.factor;
+		bucket.units.push(unit);
+		checkedByBucket.set(key, bucket);
 	}
 	const existingUncheckedIds = new Map<string, string>();
 	for (const item of existing) {
@@ -127,26 +136,26 @@ export function reconcileShoppingList(
 	const usedIds = new Set(retained.map((item) => item.id));
 	const additionBuckets = new Map<
 		string,
-		{ item: ShoppingItem; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		{ item: ShoppingItem; units: UnitInfo[]; quantityBase: number }
 	>();
 	for (const addition of additions) {
 		if (!Number.isFinite(addition.quantity) || addition.quantity <= 0) continue;
 		const key = bucketKey(addition.name, addition.unit);
 		const unit = unitInfo(addition.unit);
-		const bucket = additionBuckets.get(key) ?? { item: addition, unit, quantityBase: 0 };
+		const bucket = additionBuckets.get(key) ?? { item: addition, units: [], quantityBase: 0 };
 		bucket.quantityBase += addition.quantity * unit.factor;
+		bucket.units.push(unit);
 		additionBuckets.set(key, bucket);
 	}
 
 	const generated: ShoppingItem[] = [];
 	for (const [key, bucket] of additionBuckets) {
-		const alreadyPurchased = checkedByBucket.get(key) ?? 0;
-		const remainingBase = Math.max(0, bucket.quantityBase - alreadyPurchased);
-		const remainingQuantity = Math.min(
-			MAX_SHOPPING_QUANTITY,
-			roundQuantity(remainingBase / bucket.unit.factor)
+		const checkedBucket = checkedByBucket.get(key);
+		const resolved = resolveShoppingQuantity(
+			bucket.quantityBase - (checkedBucket?.quantityBase ?? 0),
+			[...bucket.units, ...(checkedBucket?.units ?? [])]
 		);
-		if (remainingQuantity <= 0) continue;
+		if (!resolved) continue;
 		const reusableId = existingUncheckedIds.get(key);
 		let id: string;
 		if (reusableId && !usedIds.has(reusableId)) {
@@ -158,8 +167,8 @@ export function reconcileShoppingList(
 		generated.push({
 			...bucket.item,
 			id,
-			quantity: remainingQuantity,
-			unit: bucket.unit.display,
+			quantity: Math.min(MAX_SHOPPING_QUANTITY, resolved.quantity),
+			unit: resolved.unit.display,
 			checked: false,
 			sourceKey
 		});

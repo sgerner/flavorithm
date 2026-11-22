@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { rankRecipes } from '../src/lib/discovery.ts';
 import {
+	buildShoppingList,
 	normalizeName as normalizeDomainName,
 	unitInfo as domainUnitInfo
 } from '../src/lib/domain.ts';
@@ -330,6 +331,81 @@ test('undoing a checked split purchase reconciles -2 week rows and deducts or re
 	);
 });
 
+test('reconcileShoppingList preserves sequential tbsp offsets and 0.000001 precision across refreshes', () => {
+	const key = 'week:2026-10-19';
+	const desiredGallon = buildShoppingList(
+		[
+			recipe({
+				servings: 2,
+				ingredients: [{ name: 'broth', quantity: 1, unit: 'gal' }]
+			})
+		],
+		[]
+	);
+	const afterOneTbsp = reconcileShoppingList(
+		[shopping('tbsp-1', 'broth', 1, 'tbsp', true, key)],
+		desiredGallon,
+		key
+	);
+	const remainingAfterOne = afterOneTbsp.find((item) => !item.checked);
+	assert.ok(remainingAfterOne);
+	assert.equal(remainingAfterOne.unit, 'gal');
+	assert.equal(remainingAfterOne.quantity, 0.996094);
+	assert.deepEqual(reconcileShoppingList(afterOneTbsp, desiredGallon, key), afterOneTbsp);
+
+	const afterTwoTbsp = reconcileShoppingList(
+		[
+			shopping('tbsp-1', 'broth', 1, 'tbsp', true, key),
+			shopping('tbsp-2', 'broth', 1, 'tbsp', true, key)
+		],
+		desiredGallon,
+		key
+	);
+	const remainingAfterTwo = afterTwoTbsp.find((item) => !item.checked);
+	assert.ok(remainingAfterTwo);
+	assert.equal(remainingAfterTwo.unit, 'gal');
+	assert.equal(remainingAfterTwo.quantity, 0.992188);
+	assert.ok(remainingAfterTwo.quantity < remainingAfterOne.quantity);
+
+	const after255Tbsp = reconcileShoppingList(
+		[shopping('tbsp-255', 'broth', 255, 'tbsp', true, key)],
+		desiredGallon,
+		key
+	);
+	const remainingLastTbsp = after255Tbsp.find((item) => !item.checked);
+	assert.ok(remainingLastTbsp);
+	assert.equal(remainingLastTbsp.unit, 'tbsp');
+	assert.equal(remainingLastTbsp.quantity, 1);
+
+	const after256Tbsp = reconcileShoppingList(
+		[shopping('tbsp-256', 'broth', 256, 'tbsp', true, key)],
+		desiredGallon,
+		key
+	);
+	assert.equal(
+		after256Tbsp.some((item) => !item.checked),
+		false
+	);
+
+	const microOffsetAdditions = buildShoppingList(
+		[recipe({ ingredients: [{ name: 'salt', quantity: 1, unit: 'kg' }] })],
+		[pantry('salt', 1, 'g')]
+	);
+	const microRefreshed = reconcileShoppingList([], microOffsetAdditions, key);
+	assert.equal(microRefreshed[0]?.unit, 'kg');
+	assert.equal(microRefreshed[0]?.quantity, 0.999);
+
+	const downscaledRemainder = reconcileShoppingList(
+		[shopping('bought-flour', 'flour', 0.996, 'kg', true, key)],
+		[shopping('desired-flour', 'flour', 1, 'kg', false)],
+		key
+	);
+	const remainingFlour = downscaledRemainder.find((item) => !item.checked);
+	assert.ok(remainingFlour);
+	assert.equal(remainingFlour.unit, 'g');
+	assert.equal(remainingFlour.quantity, 4);
+});
+
 test('purchased shopping rows merge aliases and compatible units without changing an expiring lot', () => {
 	const merged = transferPurchasedItemsToPantry(
 		[pantry('olive oil', 0.25, 'cup')],
@@ -455,6 +531,14 @@ test('completion preserves small quantities in large pantry units and handles in
 	assert.ok(Math.abs((completed.pantry[0].quantity ?? 0) - 0.999) < 0.000001);
 	assert.ok(Number.isFinite(new Date(completed.meals[0].completedAt ?? '').getTime()));
 	assert.equal(expiryStatus('2026-10-25', invalidNow), 'unknown');
+
+	const fractionalLeftover = completeMeal(
+		input,
+		'dinner',
+		{ deductPantry: false, leftoverServings: 1.234 },
+		new Date(2026, 9, 22)
+	);
+	assert.equal(fractionalLeftover.meals[0].leftoverServings, 1.23);
 });
 
 test('expiry uses local calendar dates and treats the next three days as soon', () => {
