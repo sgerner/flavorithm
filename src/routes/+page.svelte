@@ -144,6 +144,7 @@
 	let sendingSync = $state(false);
 	let syncErrors = $state('');
 	let conflicts = $state<SyncConflict[]>([]);
+	let reviewedEtag = $state<string | null>(null);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
 	let kitchenPersistence: ReturnType<typeof createKitchenPersistence> | undefined;
 	const cleanSections = new WeakSet<object>();
@@ -816,6 +817,7 @@
 				pendingSync = status.pending;
 				sendingSync = status.syncing;
 				conflicts = status.conflicts;
+				reviewedEtag = status.reviewedEtag;
 				syncErrors = status.error;
 			},
 			onFlush: () => {
@@ -1040,11 +1042,11 @@
 			markKitchenClean();
 		}
 	}
-	async function retrySync(prefer?: 'local' | 'remote') {
+	async function retrySync(prefer?: 'local' | 'remote', expectedEtag?: string | null) {
 		kitchenPersistence?.flush();
 		if (!online || !user || !kitchenSync) return;
 		try {
-			await kitchenSync.sync(prefer);
+			await kitchenSync.sync(prefer, prefer ? (expectedEtag ?? reviewedEtag) : undefined);
 		} catch (e) {
 			syncErrors = (e as Error).message;
 			if (managedAuth) {
@@ -2830,7 +2832,7 @@
 						void reconnectKitchen();
 					}}
 					resolve={(choice) => {
-						void retrySync(choice);
+						void retrySync(choice, reviewedEtag);
 					}}
 					exportPending={exportPendingChanges}
 				/>{/if}
