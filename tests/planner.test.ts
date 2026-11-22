@@ -16,6 +16,7 @@ import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
+const { MAX_RECIPES } = recipeCollectionMod;
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
@@ -164,14 +165,15 @@ function createModuleMap() {
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
-		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
-		'#lib/components/ButlerChat.svelte': { default: noopComponent },
-		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
-		'#lib/components/SyncStatus.svelte': { default: noopComponent },
-		'#lib/components/ToggleButton.svelte': { default: noopComponent },
-		'#lib/components/AIConnection.svelte': { default: noopComponent },
-		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
+		'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/SyncStatus.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ToggleButton.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/AIConnection.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/VoiceSettings.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
+			__esModule: true,
 			default: noopComponent,
 			emptyImportSession: () => ({
 				text: '',
