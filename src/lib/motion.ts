@@ -11,7 +11,7 @@ type MotionOptions = {
 const easeOutCubic = (t: number) => 1 - (1 - t) ** 3;
 
 /** Check the preference when a transition starts so changes made while the app is open take effect. */
-function prefersReducedMotion() {
+export function prefersReducedMotion() {
 	return (
 		typeof window !== 'undefined' &&
 		typeof window.matchMedia === 'function' &&
