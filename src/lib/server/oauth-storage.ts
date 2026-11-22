@@ -203,18 +203,6 @@ export function consumeHostedOAuthTransaction(
 	};
 }
 
-export function storeChatGPTPairing(
-	userId: string,
-	id: string,
-	payload: string,
-	expiresAt: number
-) {
-	db.prepare('DELETE FROM chatgpt_oauth_pairings WHERE expires_at <= ?').run(Date.now());
-	db.prepare(
-		'INSERT INTO chatgpt_oauth_pairings(id, user_id, expires_at, envelope) VALUES (?, ?, ?, ?)'
-	).run(id, userId, expiresAt, encryptHostedPending(userId, id, payload, 'local'));
-}
-
 export function consumeChatGPTPairing(userId: string, id: string): string | null {
 	const row = db
 		.prepare(
