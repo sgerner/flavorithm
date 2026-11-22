@@ -379,11 +379,13 @@ export function restockDepletedPantryItems(
 ): { pantry: Ingredient[]; shopping: ShoppingItem[]; restockedCount: number; addedCount: number } {
 	const selection = selectedIds ? new Set(selectedIds) : undefined;
 	const nextPantry: Ingredient[] = [];
-	const nextShopping = shopping.map((item) => ({ ...item }));
-	const usedIds = new Set(nextShopping.map((item) => item.id));
+	const uncheckedShopping = shopping.filter((item) => !item.checked).map((item) => ({ ...item }));
+	const checkedShopping = shopping.filter((item) => item.checked).map((item) => ({ ...item }));
+	const addedShopping: ShoppingItem[] = [];
+	const usedIds = new Set(shopping.map((item) => item.id));
 	const uncheckedKeys = new Set<string>();
-	for (const entry of nextShopping) {
-		if (entry.checked || !entry.name.trim()) continue;
+	for (const entry of uncheckedShopping) {
+		if (!entry.name.trim()) continue;
 		uncheckedKeys.add(bucketKey(entry.name, entry.unit.trim() || 'piece'));
 	}
 
@@ -401,7 +403,10 @@ export function restockDepletedPantryItems(
 		const unit = item.unit.trim() || 'piece';
 		const key = bucketKey(name, unit);
 		if (!uncheckedKeys.has(key)) {
-			if (nextShopping.length >= 1000) {
+			if (
+				uncheckedShopping.length + checkedShopping.length + addedShopping.length >=
+				MAX_SHOPPING_ITEMS
+			) {
 				nextPantry.push({ ...item });
 				continue;
 			}
@@ -411,7 +416,7 @@ export function restockDepletedPantryItems(
 			let suffix = 2;
 			while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
 			usedIds.add(id);
-			nextShopping.push({
+			addedShopping.push({
 				id,
 				name,
 				quantity: 1,
@@ -423,7 +428,12 @@ export function restockDepletedPantryItems(
 		restockedCount++;
 	}
 
-	return { pantry: nextPantry, shopping: nextShopping, restockedCount, addedCount };
+	return {
+		pantry: nextPantry,
+		shopping: [...uncheckedShopping, ...addedShopping, ...checkedShopping],
+		restockedCount,
+		addedCount
+	};
 }
 
 function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {

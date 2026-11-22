@@ -615,6 +615,7 @@ test('restockDepletedPantryItems deduplicates compatible unchecked entries and s
 	assert.equal(result.addedCount, 2);
 	assert.equal(result.shopping.length, 5);
 	assert.deepEqual(result.shopping[0], existingShopping[0]);
+	assert.equal(result.shopping.at(-1)?.id, 'bought-oil');
 	const addedOil = result.shopping.find((item) => item.id === 'restock-1');
 	assert.deepEqual(addedOil, {
 		id: 'restock-1',
