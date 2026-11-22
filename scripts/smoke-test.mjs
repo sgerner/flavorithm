@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { setTimeout as pause } from 'node:timers/promises';
 import { createInitialState } from '../src/lib/data.ts';
+
+const composeYaml = readFileSync(new URL('../compose.yml', import.meta.url), 'utf8');
+const healthcheckMatch = composeYaml.match(/fetch\('([^']+)'\)/);
+assert.equal(healthcheckMatch?.[1], 'http://127.0.0.1:3000/api/auth');
 
 // Exercise the built server against a disposable, in-memory database.
 const origin = 'http://127.0.0.1:5187';
@@ -42,6 +47,54 @@ try {
 	assert.equal(manifest.status, 200);
 	assert.equal((await manifest.json()).orientation, 'any');
 	assert.equal((await fetch(`${origin}/service-worker.js`)).status, 200);
+	const healthProbe = await fetch(`${origin}/api/auth`);
+	assert.equal(healthProbe.status, 200);
+	assert.match(healthProbe.headers.get('cache-control'), /no-store/);
+	assert.deepEqual(await healthProbe.json(), {
+		user: null,
+		authMode: 'local',
+		loginUrl: null,
+		logoutUrl: null,
+		capabilities: { emailDelivery: false, recipeSearch: false }
+	});
+	const brokenOrigin = 'http://127.0.0.1:5189';
+	const brokenServer = spawn(process.execPath, ['server.mjs'], {
+		env: {
+			...process.env,
+			HOST: '127.0.0.1',
+			PORT: '5189',
+			ORIGIN: brokenOrigin,
+			FLAVORITHM_DB_PATH: ':memory:',
+			FLAVORITHM_AUTH_MODE: 'proxy',
+			FLAVORITHM_PROXY_SHARED_SECRET: '',
+			RESEND_API_KEY: '',
+			BRAVE_SEARCH_API_KEY: ''
+		},
+		stdio: ['ignore', 'pipe', 'pipe']
+	});
+	let brokenOutput = '';
+	brokenServer.stdout.on('data', (chunk) => (brokenOutput += chunk));
+	brokenServer.stderr.on('data', (chunk) => (brokenOutput += chunk));
+	try {
+		let brokenProbe;
+		for (let i = 0; i < 100; i++) {
+			if (brokenServer.exitCode !== null)
+				throw new Error(`Broken-auth test server stopped: ${brokenOutput}`);
+			try {
+				brokenProbe = await fetch(`${brokenOrigin}/api/auth`);
+				break;
+			} catch {}
+			if (i === 99) throw new Error('Broken-auth test server did not start');
+			await pause(100);
+		}
+		assert.equal(brokenProbe.status, 503);
+		assert.equal((await fetch(`${brokenOrigin}/manifest.webmanifest`)).status, 200);
+	} finally {
+		if (brokenServer.exitCode === null && brokenServer.signalCode === null) {
+			brokenServer.kill('SIGTERM');
+			await new Promise((resolve) => brokenServer.once('exit', resolve));
+		}
+	}
 	let anonymous = await fetch(`${origin}/api/state`);
 	assert.equal(anonymous.status, 401);
 	assert.match(anonymous.headers.get('cache-control'), /no-store/);
