@@ -56,6 +56,20 @@
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
+	import {
+		applyEditedRecipe,
+		beginDeleteSavedRecipe,
+		beginEditSavedRecipe,
+		beginPlanRecipe,
+		cancelEditSavedRecipe,
+		clearRecipeSubflowState,
+		closeModalDialog,
+		completePlanMeal,
+		confirmDeleteSavedRecipe,
+		dismissEscapeLayer,
+		isRecipeDetailInert,
+		pickRecipeForPlan
+	} from '#lib/recipe-subflows.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -163,9 +177,18 @@
 		}
 		modal = 'auth';
 	}
+	function resetRecipeSubflows() {
+		const cleared = clearRecipeSubflowState();
+		selected = cleared.selected;
+		selectedMealServings = cleared.selectedMealServings;
+		editingRecipe = cleared.editingRecipe;
+		recipeToDelete = cleared.recipeToDelete;
+		plannedRecipe = cleared.plannedRecipe;
+	}
 	function clearManagedIdentity() {
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
+		resetRecipeSubflows();
 		user = null;
 		kitchen = createInitialState();
 		kitchenLoaded = false;
@@ -219,6 +242,7 @@
 	let selected = $state<Recipe | null>(null);
 	let editingRecipe = $state<Recipe | null>(null);
 	let recipeToDelete = $state<Recipe | null>(null);
+	let plannedRecipe = $state<Recipe | null>(null);
 	let pantryInput = $state('');
 	let authMode = $state('register');
 	let name = $state('');
@@ -369,6 +393,7 @@
 			renewManagedSession({ status: 401 });
 		}
 		if (changedIdentity) {
+			resetRecipeSubflows();
 			if (user) {
 				const latest = await request('/api/state');
 				adoptKitchen(latest.state || createNewUserState());
@@ -845,6 +870,7 @@
 	}
 
 	function freshKitchen() {
+		resetRecipeSubflows();
 		kitchen.pantry = [];
 		kitchen.meals = [];
 		kitchen.shopping = [];
@@ -956,6 +982,7 @@
 			await request('/api/auth', { action: 'logout' });
 			kitchenSync?.clearContext();
 			localStorage.removeItem('flavorithm-last-account');
+			resetRecipeSubflows();
 			user = null;
 			inviteCode = '';
 			currentInviteId = '';
@@ -1605,6 +1632,7 @@
 			item.id === recipe.id ? { ...item, hidden } : item
 		);
 		selected = null;
+		selectedMealServings = undefined;
 		notify(
 			hidden
 				? `${recipe.title} hidden. Show hidden recipes to find it again.`
@@ -1612,42 +1640,29 @@
 		);
 	}
 	function editSavedRecipe(recipe: Recipe) {
-		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
-		if (!saved) return;
-		selected = null;
-		editingRecipe = {
-			...saved,
-			tags: [...saved.tags],
-			ingredients: saved.ingredients.map((item) => ({ ...item })),
-			steps: [...saved.steps],
-			nutrition: { ...saved.nutrition }
-		};
+		const next = beginEditSavedRecipe(kitchen.recipes, selected, recipe);
+		if (!next) return;
+		selected = next.selected;
+		editingRecipe = next.editingRecipe;
 	}
 	function saveEditedRecipe(updated: Recipe) {
-		const previous = kitchen.recipes.find((item) => item.id === updated.id);
-		if (!previous || !previous.saved) {
-			editingRecipe = null;
-			return;
-		}
-		const nutritionNeedsRefresh =
-			previous.servings !== updated.servings ||
-			JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
-		const saved = {
-			...updated,
-			saved: true,
-			nutritionStale: nutritionNeedsRefresh ? true : previous.nutritionStale
-		};
-		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
-		editingRecipe = null;
+		const next = applyEditedRecipe(kitchen.recipes, selected, updated);
+		editingRecipe = next.editingRecipe;
+		if (!next.saved) return;
+		kitchen.recipes = next.recipes;
+		selected = next.selected;
 		notify(
-			nutritionNeedsRefresh ? 'Recipe updated. Refresh its nutrition estimate.' : 'Recipe updated.'
+			next.nutritionNeedsRefresh
+				? 'Recipe updated. Refresh its nutrition estimate.'
+				: 'Recipe updated.'
 		);
 	}
 	function askDeleteRecipe(recipe: Recipe) {
-		if (!recipe.saved) return;
-		recipeToDelete = recipe;
-		selected = null;
-		modal = 'deleteRecipe';
+		const next = beginDeleteSavedRecipe(selected, recipe);
+		if (!next) return;
+		selected = next.selected;
+		recipeToDelete = next.recipeToDelete;
+		modal = next.modal;
 	}
 	function weekStartForDate(value: string) {
 		const date = new Date(`${value}T12:00:00`);
@@ -1671,23 +1686,25 @@
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
 	}
 	function confirmDeleteRecipe() {
-		const recipe = recipeToDelete;
-		if (!recipe) return;
-		const impactedMeals = kitchen.meals.filter((meal) => meal.recipeId === recipe.id);
-		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
-		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
-		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
-		kitchen.shopping = kitchen.shopping.filter((item) => item.sourceKey !== `recipe:${recipe.id}`);
-		if (kitchen.preferences.ratings) {
-			const ratings = { ...kitchen.preferences.ratings };
-			delete ratings[recipe.id];
-			kitchen.preferences.ratings = ratings;
-		}
-		for (const startDate of affectedWeeks) refreshWeekShopping(startDate);
-		recipeToDelete = null;
-		modal = '';
+		const next = confirmDeleteSavedRecipe(
+			kitchen,
+			selected,
+			selectedMealServings,
+			recipeToDelete,
+			weekStartForDate
+		);
+		if (!next) return;
+		kitchen.meals = next.meals;
+		kitchen.recipes = next.recipes;
+		kitchen.shopping = next.shopping;
+		kitchen.preferences.ratings = next.ratings;
+		for (const startDate of next.affectedWeeks) refreshWeekShopping(startDate);
+		selected = next.selected;
+		selectedMealServings = next.selectedMealServings;
+		recipeToDelete = next.recipeToDelete;
+		modal = next.modal;
 		notify(
-			`${recipe.title} deleted, along with ${impactedMeals.length} planned meal${impactedMeals.length === 1 ? '' : 's'}.`
+			`${next.deletedRecipe.title} deleted, along with ${next.impactedMealsCount} planned meal${next.impactedMealsCount === 1 ? '' : 's'}.`
 		);
 	}
 	function shoppingSourceLabel(sourceKey?: string) {
@@ -1709,6 +1726,7 @@
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
+		selectedMealServings = undefined;
 		page = 'shopping';
 		notify(
 			additions.length
@@ -1717,10 +1735,12 @@
 		);
 	}
 	function planRecipe(r: Recipe, servings = r.servings) {
-		plannedServings = servings;
-		selected = r;
-		mealDate = dateKey(new Date());
-		modal = 'plan';
+		const next = beginPlanRecipe(selected, r, servings, dateKey(new Date()));
+		selected = next.selected;
+		plannedRecipe = next.plannedRecipe;
+		plannedServings = next.plannedServings;
+		mealDate = next.mealDate;
+		modal = next.modal;
 	}
 	function editPlannedMeal(meal: Meal) {
 		if (meal.completedAt) return;
@@ -1790,23 +1810,18 @@
 		await generate();
 	}
 	function addMeal() {
-		if (!selected || !mealDate) return;
-		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
-			notify('Choose between 1 and 24 whole servings.');
+		const result = completePlanMeal(plannedRecipe, mealDate, mealSlot, plannedServings);
+		if (!result.ok) {
+			if (result.reason === 'invalidServings') notify('Choose between 1 and 24 whole servings.');
 			return;
 		}
-		kitchen.meals.push({
-			id: crypto.randomUUID(),
-			date: mealDate,
-			slot: mealSlot,
-			recipeId: selected.id,
-			servings: plannedServings
-		});
+		kitchen.meals.push(result.meal);
 		refreshWeekShopping(weekStartForDate(mealDate));
-		selectedMealServings = undefined;
-		selected = null;
-		modal = '';
-		page = 'planner';
+		plannedRecipe = result.plannedRecipe;
+		selectedMealServings = result.selectedMealServings;
+		selected = result.selected;
+		modal = result.modal;
+		page = result.page;
 		notify('Meal scheduled.');
 	}
 	async function refreshHousehold() {
@@ -1911,6 +1926,7 @@
 			currentInviteId = '';
 			await refreshAuth();
 			const data = await request('/api/state');
+			resetRecipeSubflows();
 			adoptKitchen(data.state || createNewUserState());
 			await refreshHousehold();
 			syncing = false;
@@ -1938,22 +1954,36 @@
 			busy = false;
 		}
 	}
-	function closeDialog() {
-		if (modal === 'plan') selected = null;
-		if (modal === 'editMeal') editingMealId = '';
-		if (modal === 'cookMeal') cookingMealId = '';
-		if (modal === 'deleteRecipe') recipeToDelete = null;
-		if (modal === 'removeMember') memberToRemove = null;
-		if (modal === 'household') {
-			inviteCode = '';
-			currentInviteId = '';
-		}
-		if (modal === 'onboarding') dismissOnboarding();
-		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
-			resumeImport = false;
-			modal = 'import';
-		} else modal = '';
+	function applyClosedModalState(next: ReturnType<typeof closeModalDialog<HouseholdMember>>) {
+		plannedRecipe = next.plannedRecipe;
+		editingMealId = next.editingMealId;
+		cookingMealId = next.cookingMealId;
+		recipeToDelete = next.recipeToDelete;
+		memberToRemove = next.memberToRemove;
+		inviteCode = next.inviteCode;
+		currentInviteId = next.currentInviteId;
+		resumeImport = next.resumeImport;
+		if (next.onboardingStatus) kitchen.preferences.onboardingStatus = next.onboardingStatus;
+		modal = next.modal;
 		error = '';
+	}
+	function closeDialog() {
+		applyClosedModalState(
+			closeModalDialog({
+				modal,
+				selected,
+				selectedMealServings,
+				plannedRecipe,
+				recipeToDelete,
+				editingMealId,
+				cookingMealId,
+				memberToRemove,
+				inviteCode,
+				currentInviteId,
+				resumeImport,
+				onboardingStatus: kitchen.preferences.onboardingStatus
+			})
+		);
 	}
 	function openImport(text?: string) {
 		resumeImport = false;
@@ -2018,6 +2048,7 @@
 			}
 			kitchenSync?.clearContext();
 			localStorage.removeItem('flavorithm-last-account');
+			resetRecipeSubflows();
 			user = null;
 			inviteCode = '';
 			currentInviteId = '';
@@ -2099,6 +2130,7 @@
 			memberToRemove = null;
 			await refreshAuth();
 			const data = await request('/api/state');
+			resetRecipeSubflows();
 			adoptKitchen(data.state || createNewUserState());
 			await refreshHousehold();
 			syncing = false;
@@ -2168,10 +2200,31 @@
 >
 <svelte:window
 	onkeydown={(e) => {
-		if (e.key === 'Escape') {
-			mobileNav = false;
-			closeDialog();
-			selected = null;
+		const result = dismissEscapeLayer(e, {
+			modal,
+			editingRecipe,
+			selected,
+			selectedMealServings,
+			mobileNav,
+			plannedRecipe,
+			recipeToDelete,
+			editingMealId,
+			cookingMealId,
+			memberToRemove,
+			inviteCode,
+			currentInviteId,
+			resumeImport,
+			onboardingStatus: kitchen.preferences.onboardingStatus
+		});
+		if (result.dismissed === 'modal') {
+			applyClosedModalState(result.state);
+		} else if (result.dismissed === 'editingRecipe') {
+			editingRecipe = result.state.editingRecipe;
+		} else if (result.dismissed === 'selected') {
+			selected = result.state.selected;
+			selectedMealServings = result.state.selectedMealServings;
+		} else if (result.dismissed === 'mobileNav') {
+			mobileNav = result.state.mobileNav;
 		}
 	}}
 />
@@ -2587,6 +2640,7 @@
 						class="primary"
 						onclick={() => {
 							selected = null;
+							plannedRecipe = null;
 							modal = 'pickRecipe';
 						}}><Plus size={17} /> Plan a meal</button
 					>
@@ -2681,6 +2735,7 @@
 												</div>{/if}{/each}<button
 											class="add-meal"
 											onclick={() => {
+												plannedRecipe = null;
 												mealDate = dateKey(day);
 												mealSlot = slot;
 												modal = 'pickRecipe';
@@ -2885,42 +2940,48 @@
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
-{#if selected && !modal}<RecipeDetail
-		recipe={selected}
-		initialServings={selectedMealServings ?? selected.servings}
-		bind:completedSteps={
-			() => cookingSteps[cookingSessionKey] ?? [],
-			(steps) => {
-				cookingSteps[cookingSessionKey] = steps;
+{#if selected}<div inert={isRecipeDetailInert(modal, editingRecipe)}>
+		<RecipeDetail
+			recipe={selected}
+			initialServings={selectedMealServings ?? selected.servings}
+			bind:completedSteps={
+				() => cookingSteps[cookingSessionKey] ?? [],
+				(steps) => {
+					cookingSteps[cookingSessionKey] = steps;
+				}
 			}
-		}
-		close={() => {
-			selected = null;
-			selectedMealServings = undefined;
-		}}
-		save={() => saveRecipe(selected!)}
-		shop={(servings) =>
-			shoppingFor(
-				[selected!],
-				[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }],
-				`recipe:${selected!.id}`
-			)}
-		plan={(servings) => planRecipe(selected!, servings)}
-		nutrition={refreshNutrition}
-		edit={() => editSavedRecipe(selected!)}
-		remove={() => askDeleteRecipe(selected!)}
-		toggleHidden={() => toggleRecipeHidden(selected!)}
-		{busy}
-		rate={(n) => {
-			selected!.rating = n;
-			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
-			kitchen.recipes = [...kitchen.recipes];
-			notify('Rating saved. Future recipes will use your feedback.');
-		}}
-	/>{/if}
+			close={() => {
+				selected = null;
+				selectedMealServings = undefined;
+			}}
+			save={() => saveRecipe(selected!)}
+			shop={(servings) =>
+				shoppingFor(
+					[selected!],
+					[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }],
+					`recipe:${selected!.id}`
+				)}
+			plan={(servings) => planRecipe(selected!, servings)}
+			nutrition={refreshNutrition}
+			edit={() => editSavedRecipe(selected!)}
+			remove={() => askDeleteRecipe(selected!)}
+			toggleHidden={() => toggleRecipeHidden(selected!)}
+			{busy}
+			rate={(n) => {
+				selected!.rating = n;
+				kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
+				kitchen.recipes = [...kitchen.recipes];
+				notify('Rating saved. Future recipes will use your feedback.');
+			}}
+		/>
+	</div>{/if}
 {#if editingRecipe}<RecipeEditor
 		recipe={editingRecipe}
-		cancel={() => (editingRecipe = null)}
+		cancel={() => {
+			const next = cancelEditSavedRecipe(selected);
+			selected = next.selected;
+			editingRecipe = next.editingRecipe;
+		}}
 		save={saveEditedRecipe}
 	/>{/if}
 {#if modal}<div class="modal-backdrop" transition:backdropMotion|global>
@@ -3559,7 +3620,7 @@
 					</div>
 				{:else if modal === 'plan'}
 					<h2>Schedule a recipe</h2>
-					<p class="muted">{selected?.title}</p>
+					<p class="muted">{plannedRecipe?.title}</p>
 					<label class="field"
 						>When are we cooking?<input type="date" required bind:value={mealDate} /></label
 					><label class="field"
@@ -3578,10 +3639,12 @@
 					<div class="pick-list">
 						{#each kitchen.recipes as recipe}<button
 								onclick={() => {
-									selected = recipe;
-									plannedServings = recipe.servings;
-									if (!mealDate) mealDate = dateKey(new Date());
-									modal = 'plan';
+									const next = pickRecipeForPlan(selected, recipe, mealDate, dateKey(new Date()));
+									selected = next.selected;
+									plannedRecipe = next.plannedRecipe;
+									plannedServings = next.plannedServings;
+									mealDate = next.mealDate;
+									modal = next.modal;
 								}}
 								><img
 									src={recipe.image || recipePlaceholder(recipe)}

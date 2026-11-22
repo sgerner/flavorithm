@@ -1,22 +1,53 @@
 /** Keep keyboard focus in a modal and return it to its trigger on close. */
-let activeTraps = 0;
+type TrapEntry = {
+	node: HTMLElement;
+	returnFocus: HTMLElement | null;
+};
+
+const FOCUSABLE_SELECTOR =
+	'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex="0"]';
+
+const trapStack: TrapEntry[] = [];
 let originalOverflow = '';
-let originalFocus: HTMLElement | null = null;
+let pendingReturnFocus: HTMLElement | null = null;
+let hasPendingReturn = false;
+let restoreGeneration = 0;
+
+function focusableControls(node: HTMLElement) {
+	return Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+		(el) => el.offsetParent !== null && !el.closest('[inert]')
+	);
+}
+
+function focusFirstControl(node: HTMLElement) {
+	if (!node.isConnected || node.closest('[inert]')) return;
+	(focusableControls(node)[0] || node).focus();
+}
 
 export function focusTrap(node: HTMLElement) {
-	const previous = document.activeElement as HTMLElement | null;
-	const controls = () =>
-		Array.from(
-			node.querySelectorAll<HTMLElement>(
-				'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex="0"]'
-			)
-		).filter((el) => el.offsetParent !== null);
+	const returnFocus = hasPendingReturn
+		? pendingReturnFocus
+		: (document.activeElement as HTMLElement | null);
+	hasPendingReturn = false;
+	pendingReturnFocus = null;
+	restoreGeneration += 1;
+
+	const entry: TrapEntry = { node, returnFocus };
+	if (trapStack.length === 0) {
+		originalOverflow = document.body.style.overflow;
+	}
+	trapStack.push(entry);
+	document.body.style.overflow = 'hidden';
+
 	queueMicrotask(() => {
-		(controls()[0] || node).focus();
+		if (trapStack[trapStack.length - 1] !== entry) return;
+		focusFirstControl(node);
 	});
+
 	function keydown(event: KeyboardEvent) {
 		if (event.key !== 'Tab') return;
-		const elements = controls();
+		if (trapStack[trapStack.length - 1]?.node !== node) return;
+		const elements = focusableControls(node);
 		if (!elements.length) {
 			event.preventDefault();
 			node.focus();
@@ -32,25 +63,51 @@ export function focusTrap(node: HTMLElement) {
 			first.focus();
 		}
 	}
+
 	node.addEventListener('keydown', keydown);
-	if (activeTraps === 0) {
-		originalOverflow = document.body.style.overflow;
-		originalFocus = previous;
-	}
-	activeTraps += 1;
-	document.body.style.overflow = 'hidden';
+
 	return {
 		destroy() {
 			node.removeEventListener('keydown', keydown);
-			activeTraps -= 1;
-			if (activeTraps === 0) {
-				document.body.style.overflow = originalOverflow;
-				const returnTarget = originalFocus;
-				queueMicrotask(() => {
-					if (activeTraps === 0 && returnTarget?.isConnected && !returnTarget.closest('[inert]'))
-						returnTarget.focus();
-				});
+			const index = trapStack.indexOf(entry);
+			if (index === -1) return;
+			const wasTop = index === trapStack.length - 1;
+			if (!wasTop) {
+				const next = trapStack[index + 1];
+				if (
+					next &&
+					(!next.returnFocus || !next.returnFocus.isConnected || node.contains(next.returnFocus))
+				) {
+					next.returnFocus = entry.returnFocus;
+				}
+				trapStack.splice(index, 1);
+				return;
 			}
+			trapStack.splice(index, 1);
+			if (trapStack.length === 0) {
+				document.body.style.overflow = originalOverflow;
+			}
+			const target = entry.returnFocus;
+			hasPendingReturn = true;
+			pendingReturnFocus = target;
+			const generation = ++restoreGeneration;
+			queueMicrotask(() => {
+				if (generation !== restoreGeneration) return;
+				hasPendingReturn = false;
+				pendingReturnFocus = null;
+				const top = trapStack[trapStack.length - 1];
+				if (
+					target?.isConnected &&
+					!target.closest('[inert]') &&
+					(!top || top.node.contains(target))
+				) {
+					target.focus();
+					return;
+				}
+				if (top) {
+					focusFirstControl(top.node);
+				}
+			});
 		}
 	};
 }
