@@ -73,6 +73,7 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
+	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -103,6 +104,11 @@
 	let toastVersion = 0;
 	let busy = $state(false);
 	let mobileNav = $state(false);
+	let mobileCalendar = $state(
+		typeof window !== 'undefined' &&
+			typeof window.matchMedia === 'function' &&
+			window.matchMedia('(max-width: 650px)').matches
+	);
 	let modal = $state('');
 	const dialogNames: Record<string, string> = {
 		onboarding: 'Recipe preferences',
@@ -385,6 +391,7 @@
 			emailDelivery: Boolean(data.capabilities?.emailDelivery),
 			recipeSearch: Boolean(data.capabilities?.recipeSearch)
 		};
+		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
 		return data;
 	}
 	const nav = [
@@ -432,7 +439,7 @@
 				(filter !== 'Quick & easy' || r.time <= 30) &&
 				(filter !== 'Plant-powered' || r.tags.some((t) => /vegetarian|vegan|plant/i.test(t))) &&
 				(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
-				(filter !== 'High protein' || r.nutrition.protein >= 25)
+				(filter !== 'High protein' || (!r.nutritionStale && r.nutrition.protein >= 25))
 		);
 		return filter === 'For you'
 			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
@@ -764,6 +771,13 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
+		const calendarMedia =
+			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
+		const calendarMediaChanged = () => {
+			mobileCalendar = Boolean(calendarMedia?.matches);
+		};
+		calendarMediaChanged();
+		calendarMedia?.addEventListener('change', calendarMediaChanged);
 		const releaseSyncLease = () => {
 			kitchenSync?.releaseLease();
 		};
@@ -783,6 +797,7 @@
 		window.addEventListener('pageshow', restoreSyncLease);
 		document.addEventListener('visibilitychange', refreshSyncLease);
 		return () => {
+			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
@@ -1188,7 +1203,12 @@
 
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else if (importSession.text || importSession.photo || importSession.draft) {
+			else if (
+				importSession.url ||
+				importSession.text ||
+				importSession.photo ||
+				importSession.draft
+			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
 				window.location.assign(result.authorizationUrl);
@@ -1497,7 +1517,12 @@
 				modal = 'generate';
 				break;
 			case 'search':
-				modal = 'search';
+				if (capabilities.recipeSearch) {
+					modal = 'search';
+					error = '';
+				} else {
+					openImport();
+				}
 				break;
 			case 'taste':
 				modal = 'taste';
@@ -1754,8 +1779,8 @@
 	function saveMealChanges() {
 		const meal = kitchen.meals.find((item) => item.id === editingMealId);
 		if (!meal || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
-		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
-			notify('Choose between 1 and 24 whole servings.');
+		if (!isValidServings(plannedServings)) {
+			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			return;
 		}
 		const previousWeek = weekStartForDate(meal.date);
@@ -1812,8 +1837,8 @@
 	}
 	function addMeal() {
 		if (!selected || !mealDate) return;
-		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
-			notify('Choose between 1 and 24 whole servings.');
+		if (!isValidServings(plannedServings)) {
+			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			return;
 		}
 		kitchen.meals.push({
@@ -1984,9 +2009,13 @@
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
-		openImport(url);
+		importSession = { ...emptyImportSession(), url };
+		openImport();
 	}
-	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
+	async function captureImport(
+		input: { url?: string; prompt: string; image?: string },
+		signal: AbortSignal
+	) {
 		if (!needAI()) {
 			resumeImport = true;
 			return null;
@@ -1994,7 +2023,9 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const saved = { ...recipe, saved: true };
+		const nutritionStale =
+			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
+		const saved = { ...recipe, saved: true, nutritionStale };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
 		importSession = emptyImportSession();
 		resumeImport = false;
@@ -2003,7 +2034,11 @@
 		page = 'saved';
 		query = '';
 		filter = 'For you';
-		notify('Recipe saved to your collection.');
+		notify(
+			nutritionStale
+				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
+				: 'Recipe saved to your collection.'
+		);
 	}
 	async function exportKitchen() {
 		try {
@@ -2081,6 +2116,11 @@
 		event.preventDefault();
 		if (managedAuth) {
 			openAuthentication();
+			return;
+		}
+		if (modal !== 'reset' && !capabilities.emailDelivery) {
+			error =
+				'Password recovery is unavailable. Ask the server operator to configure email delivery.';
 			return;
 		}
 		busy = true;
@@ -2321,7 +2361,7 @@
 							<span class="desktop-title"
 								>{page === 'saved' ? 'Your recipe collection' : 'Discover recipes'}</span
 							><span class="mobile-title">{page === 'saved' ? 'Saved recipes' : 'Recipes'}</span
-							><span class="heading-spark">✴</span>
+							><span class="heading-spark" aria-hidden="true">✴</span>
 						</h1>
 					</div>
 					<button
@@ -2487,18 +2527,18 @@
 									? 'Tap the bookmark on any recipe to keep it close.'
 									: 'Try another search or generate recipes.'}
 							</p>
-						</div>{/if}<button
-						class="browse-link"
-						onclick={() => {
-							modal = 'search';
-							error = '';
-						}}>Find recipes online <ArrowUpRight size={16} /></button
-					>
+						</div>{/if}{#if capabilities.recipeSearch}<button
+							class="browse-link"
+							onclick={() => {
+								modal = 'search';
+								error = '';
+							}}>Find recipes online <ArrowUpRight size={16} /></button
+						>{/if}
 				</section>
 			{:else if page === 'pantry'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Your pantry<span class="heading-spark">✳</span></h1>
+						<h1>Your pantry<span class="heading-spark" aria-hidden="true">✳</span></h1>
 						<p>Track ingredients and quantities you have on hand.</p>
 					</div>
 					<button class="primary" onclick={() => (modal = 'pantry')}
@@ -2601,7 +2641,7 @@
 			{:else if page === 'planner'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Meal planner<span class="heading-spark">✷</span></h1>
+						<h1>Meal planner<span class="heading-spark" aria-hidden="true">✷</span></h1>
 						<p>Schedule meals and build your weekly shopping list.</p>
 					</div>
 					<button
@@ -2673,11 +2713,15 @@
 															selectedMealServings = meal.servings;
 															selected = recipe;
 														}}
-														><img
-															src={recipe.image || recipePlaceholder(recipe)}
-															onerror={(event) => recipeImageError(event, recipe)}
-															alt=""
-														/><b>{recipe.title}</b><small
+														>{#if !mobileCalendar}<img
+																src={recipe.image || recipePlaceholder(recipe)}
+																onerror={(event) => recipeImageError(event, recipe)}
+																alt=""
+																width="180"
+																height="65"
+																loading="lazy"
+																decoding="async"
+															/>{/if}<b>{recipe.title}</b><small
 															>{recipe.time} min · {meal.servings} servings</small
 														></button
 													>
@@ -2730,6 +2774,10 @@
 											src={recipe.image || recipePlaceholder(recipe)}
 											onerror={(event) => recipeImageError(event, recipe)}
 											alt=""
+											width="54"
+											height="48"
+											loading="lazy"
+											decoding="async"
 										/>
 										<div>
 											<b>{recipe.title}</b><span
@@ -2767,7 +2815,7 @@
 			{:else if page === 'shopping'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Shopping list<span class="heading-spark">✴</span></h1>
+						<h1>Shopping list<span class="heading-spark" aria-hidden="true">✴</span></h1>
 						<p>
 							Generated rows show their recipe or meal-plan source. Editing a row keeps your changes
 							visible until that source is refreshed.
@@ -3133,7 +3181,7 @@
 							/></label
 						>
 						<p class="field-help">Use at least 10 characters.</p>
-						{#if authMode === 'login'}<button
+						{#if authMode === 'login' && capabilities.emailDelivery}<button
 								type="button"
 								class="text-button"
 								onclick={() => {
@@ -3250,18 +3298,11 @@
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
 									>{#if !capabilities.emailDelivery}<p class="field-help">
-											Email delivery is unavailable. Set RESEND_API_KEY and EMAIL_FROM to enable it.
+											Email delivery is unavailable. Ask the server operator to configure email
+											delivery.
 										</p>{/if}{/if}
 							{/if}
 						</div>{/if}
-					<div class="settings-section">
-						<h3>Web recipe search</h3>
-						{#if capabilities.recipeSearch}<p class="muted">
-								Available for this installation.
-							</p>{:else}<p class="muted">
-								Unavailable. Set BRAVE_SEARCH_API_KEY on this installation to enable search.
-							</p>{/if}
-					</div>
 					<div class="settings-section">
 						<VoiceSettings
 							bind:provider={voiceProvider}
@@ -3470,7 +3511,7 @@
 							disabled={busy}>Permanently delete my account</button
 						>
 					</form>
-				{:else if (modal === 'recover' || modal === 'reset') && !managedAuth}<span
+				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
 						class="dialog-spark">✳</span
 					>
 					<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
@@ -3536,7 +3577,7 @@
 						>Servings<input
 							type="number"
 							min="1"
-							max="24"
+							max={MAX_SERVINGS}
 							step="1"
 							required
 							bind:value={plannedServings}
@@ -3567,7 +3608,7 @@
 						>Leftover servings<input
 							type="number"
 							min="0"
-							max={cookingMeal?.servings ?? 24}
+							max={cookingMeal?.servings ?? MAX_SERVINGS}
 							step="1"
 							bind:value={leftoverServings}
 						/><small class="field-help">Enter 0 if there are no leftovers.</small></label
@@ -3588,7 +3629,13 @@
 							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
 						></label
 					><label class="field"
-						>Servings<input type="number" min="1" max="24" bind:value={plannedServings} /></label
+						>Servings<input
+							type="number"
+							min="1"
+							max={MAX_SERVINGS}
+							step="1"
+							bind:value={plannedServings}
+						/></label
 					><button
 						class="primary full"
 						disabled={!mealDate || !plannedServings || plannedServings < 1}
@@ -3608,6 +3655,10 @@
 									src={recipe.image || recipePlaceholder(recipe)}
 									onerror={(event) => recipeImageError(event, recipe)}
 									alt=""
+									width="75"
+									height="60"
+									loading="lazy"
+									decoding="async"
 								/><span
 									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
 								><Plus size={17} /></button
@@ -3629,7 +3680,7 @@
 						Search real recipes across the web, with links to the original creators.
 					</p>
 					{#if !capabilities.recipeSearch}<p class="field-help">
-							Web search is unavailable. Set BRAVE_SEARCH_API_KEY on this installation.
+							Web search is unavailable. Ask the server operator to enable online recipe search.
 						</p>{/if}
 					<label class="field"
 						>What are you craving?<input
