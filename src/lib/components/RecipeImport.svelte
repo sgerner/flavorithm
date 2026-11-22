@@ -36,7 +36,8 @@
 		session = $bindable(),
 		capture,
 		save,
-		dictate
+		dictate,
+		voiceBusy = false
 	}: {
 		session: ImportSession;
 		capture: (
@@ -45,6 +46,7 @@
 		) => Promise<{ recipe: Recipe; assumptions: string[] } | null>;
 		save: (recipe: Recipe) => void;
 		dictate: () => void;
+		voiceBusy?: boolean;
 	} = $props();
 	let busy = $state(false);
 	let reading = $state(false);
@@ -70,7 +72,7 @@
 	});
 
 	async function attachPhoto(file?: File) {
-		if (!file || busy || reading) return;
+		if (!file || busy || reading || voiceBusy) return;
 		if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
 			error = 'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.';
 			return;
@@ -126,7 +128,7 @@
 	function drop(event: DragEvent) {
 		event.preventDefault();
 		dragging = false;
-		if (busy || reading) return;
+		if (busy || reading || voiceBusy) return;
 		const file = event.dataTransfer?.files[0];
 		if (file) {
 			void attachPhoto(file);
@@ -143,7 +145,8 @@
 	async function prepare(event: SubmitEvent) {
 		event.preventDefault();
 		const url = session.url.trim();
-		if (busy || reading || !alive || (!url && !session.text.trim() && !session.photo)) return;
+		if (busy || reading || voiceBusy || !alive || (!url && !session.text.trim() && !session.photo))
+			return;
 		error = '';
 		retryAvailable = false;
 		busy = true;
@@ -195,6 +198,7 @@
 	}
 	function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
+		if (voiceBusy) return;
 		const draft = session.draft;
 		if (!draft) return;
 		const validation = validateRecipeDraft(draft, {
@@ -260,32 +264,32 @@
 					onchange={(e) => attachPhoto(e.currentTarget.files?.[0])}
 					tabindex="-1"
 					aria-label="Recipe photo"
-					disabled={busy || reading}
+					disabled={busy || reading || voiceBusy}
 				/>
 				<button
 					class="secondary"
 					type="button"
 					onclick={() => {
-						if (!busy && !reading) photoInput?.click();
+						if (!busy && !reading && !voiceBusy) photoInput?.click();
 					}}
-					use:busyAction={busy || reading}
+					use:busyAction={busy || reading || voiceBusy}
 					><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
 				>
 				<button
 					class="secondary"
 					type="button"
 					onclick={() => {
-						if (!busy && !reading) dictate();
+						if (!busy && !reading && !voiceBusy) dictate();
 					}}
-					use:busyAction={busy || reading}><Mic size={18} />Use voice</button
+					use:busyAction={busy || reading || voiceBusy}><Mic size={18} />Use voice</button
 				>
 				{#if session.url || session.text || session.photo}<button
 						type="button"
 						class="text-button"
-						use:busyAction={busy || reading}
+						use:busyAction={busy || reading || voiceBusy}
 						use:focusHandoff={{ within: '.recipe-dropzone', target: 'textarea' }}
 						onclick={() => {
-							if (busy || reading) return;
+							if (busy || reading || voiceBusy) return;
 							session = emptyImportSession();
 							error = '';
 							retryAvailable = false;
@@ -297,10 +301,10 @@
 						type="button"
 						class="icon-button"
 						aria-label="Remove recipe photo"
-						use:busyAction={busy}
+						use:busyAction={busy || voiceBusy}
 						use:focusHandoff={{ within: '.recipe-dropzone', target: '.capture-tools button' }}
 						onclick={() => {
-							if (busy) return;
+							if (busy || voiceBusy) return;
 							session.photo = '';
 							session.photoName = '';
 						}}><X size={18} /></button
@@ -324,7 +328,7 @@
 				class="primary full"
 				type="submit"
 				disabled={!session.url.trim() && !session.text.trim() && !session.photo}
-				use:busyAction={busy || reading}
+				use:busyAction={busy || reading || voiceBusy}
 				aria-busy={busy}
 				>{busy ? 'Making your draft…' : retryAvailable ? 'Try again' : 'Create recipe draft'}<Check
 					size={18}
@@ -334,8 +338,10 @@
 		{#if session.draft}<button
 				class="text-button"
 				type="button"
+				use:busyAction={voiceBusy}
 				use:focusHandoff={{ target: '#recipe-import-title' }}
 				onclick={() => {
+					if (voiceBusy) return;
 					error = '';
 					reviewingDraft = true;
 				}}>Return to reviewed draft</button
@@ -534,7 +540,9 @@
 					reviewingDraft = false;
 					error = '';
 				}}><ChevronLeft size={18} />Back</button
-			><button class="primary" type="submit"><Check size={18} />Save recipe</button>
+			><button class="primary" type="submit" use:busyAction={voiceBusy}
+				><Check size={18} />Save recipe</button
+			>
 		</div>
 	</form>
 {/if}

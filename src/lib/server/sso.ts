@@ -21,7 +21,7 @@ export type RuntimeAuthMode = AuthMode | 'invalid';
 export const SESSION_COOKIE = 'flavorithm_session';
 const OIDC_TRANSACTION_COOKIE_PREFIX = 'flavorithm_oidc_txn_';
 const OIDC_TRANSACTION_TTL_SECONDS = 10 * 60;
-const PROXY_BINDING_TTL_MS = 30 * 60 * 1000;
+export const PROXY_BINDING_TTL_MS = 30 * 60 * 1000;
 const DEFAULT_PROXY_ISSUER = 'flavorithm:proxy';
 const HTTP_TOKEN_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
@@ -403,7 +403,7 @@ export function ensureProxyRequestBinding(input: {
 	user: User;
 	issuer: string;
 	subject: string;
-}): { token: string; expiresAt: number } {
+}): { token: string; expiresAt: number; setCookie: boolean } {
 	return ensureProxyBindingSession(
 		input.currentToken,
 		input.user,
