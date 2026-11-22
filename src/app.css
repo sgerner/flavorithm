@@ -470,7 +470,9 @@ main {
 }
 .banner-icon {
 	border: 1px solid #69816b;
-	padding: 9px;
+	min-width: 44px;
+	min-height: 44px;
+	padding: 11px;
 	display: grid;
 	place-items: center;
 }
