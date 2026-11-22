@@ -17,12 +17,13 @@ import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
-import { MAX_RECIPES } from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
+
+const { MAX_RECIPES } = recipeCollectionMod;
 
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
@@ -187,10 +188,12 @@ function createModuleMap() {
 			__esModule: true,
 			default: noopComponent,
 			emptyImportSession: () => ({
+				url: '',
 				text: '',
 				photo: '',
 				photoName: '',
 				draft: null,
+				baseline: null,
 				assumptions: []
 			})
 		}
