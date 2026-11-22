@@ -97,7 +97,9 @@ test('converts compatible units and rejects cross-dimension conversions', () => 
 test('shopping refresh is idempotent, accounts for checked purchases, and preserves other rows', () => {
 	const key = 'recipe:pasta';
 	const existing = [
+		shopping('manual-bought', 'pepper', 1, 'tsp', true),
 		shopping('manual', 'salt', 1, 'tsp', false),
+		shopping('other-bought', 'beans', 1, 'can', true, 'plan:week-1'),
 		shopping('other', 'rice', 2, 'cups', false, 'plan:week-1'),
 		shopping('stale', 'olive oil', 4, 'cups', false, key),
 		shopping('bought', 'extra virgin olive oil', 1, 'tbsp', true, key)
@@ -106,7 +108,11 @@ test('shopping refresh is idempotent, accounts for checked purchases, and preser
 	const refreshed = reconcileShoppingList(existing, desired, key);
 	assert.deepEqual(
 		refreshed.map((item) => item.id),
-		['manual', 'other', 'bought', 'stale']
+		['manual', 'other', 'stale', 'manual-bought', 'other-bought', 'bought']
+	);
+	assert.deepEqual(
+		refreshed.map((item) => item.checked),
+		[false, false, false, true, true, true]
 	);
 	const remainingOil = refreshed.find((item) => item.id === 'stale');
 	assert.ok(remainingOil);
@@ -137,14 +143,18 @@ test('a checked generated row keeps its id when a larger requirement creates a r
 	const refreshed = reconcileShoppingList([purchased], twoCups, key);
 	assert.equal(refreshed.length, 2);
 	assert.equal(new Set(refreshed.map((item) => item.id)).size, refreshed.length);
-	assert.equal(refreshed.find((item) => item.checked)?.id, purchased.id);
-	assert.equal(refreshed.find((item) => !item.checked)?.quantity, 1);
-	assert.notEqual(refreshed.find((item) => !item.checked)?.id, purchased.id);
+	assert.deepEqual(
+		refreshed.map((item) => item.checked),
+		[false, true]
+	);
+	assert.equal(refreshed[1].id, purchased.id);
+	assert.equal(refreshed[0].quantity, 1);
+	assert.notEqual(refreshed[0].id, purchased.id);
 
 	const repeated = reconcileShoppingList(refreshed, twoCups, key);
 	assert.deepEqual(repeated, refreshed);
 	assert.equal(new Set(repeated.map((item) => item.id)).size, repeated.length);
-	assert.equal(repeated.find((item) => !item.checked)?.quantity, 1);
+	assert.equal(repeated[0].quantity, 1);
 });
 
 test('purchased shopping rows merge aliases and compatible units without changing an expiring lot', () => {

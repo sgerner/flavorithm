@@ -37,6 +37,7 @@
 		LogOut,
 		Copy,
 		Download,
+		Share2,
 		Leaf,
 		SlidersHorizontal,
 		Flame,
@@ -339,6 +340,7 @@
 	let deductPantry = $state(false);
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
+	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
 	let deletePassword = $state('');
@@ -442,6 +444,12 @@
 		kitchen.pantry.filter(
 			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
 		)
+	);
+	let checkedCount = $derived(kitchen.shopping.filter((item) => item.checked).length);
+	let visibleShopping = $derived(
+		shoppingFilter === 'unpurchased'
+			? kitchen.shopping.filter((item) => !item.checked)
+			: kitchen.shopping
 	);
 	let week = $derived.by(() => {
 		const d = new Date();
@@ -1448,7 +1456,7 @@
 				void exportKitchen();
 				break;
 			case 'export-shopping':
-				exportList();
+				void exportList();
 				break;
 			case 'export-pending':
 				exportPendingChanges();
@@ -2113,16 +2121,39 @@
 		}
 	}
 
-	function exportList() {
+	async function exportList() {
+		if (!kitchen.shopping.length) return;
 		const text = kitchen.shopping
 			.map((i) => `${i.checked ? '✓' : '☐'} ${i.quantity} ${i.unit} ${i.name}`)
 			.join('\n');
-		const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = 'flavorithm-shopping.txt';
-		a.click();
-		URL.revokeObjectURL(url);
+		const shareData = { title: 'Shopping list', text };
+		if (
+			typeof navigator.share === 'function' &&
+			(typeof navigator.canShare !== 'function' || navigator.canShare(shareData))
+		) {
+			try {
+				await navigator.share(shareData);
+				return;
+			} catch (e) {
+				if ((e as { name?: string })?.name === 'AbortError') return;
+			}
+		}
+		if (typeof navigator.clipboard?.writeText === 'function') {
+			try {
+				await navigator.clipboard.writeText(text);
+				notify('Shopping list copied.');
+				return;
+			} catch {
+				/* Fall back to file download when clipboard access is unavailable. */
+			}
+		}
+		download(text, 'flavorithm-shopping.txt', 'text/plain');
+	}
+	function movePurchasedToPantry() {
+		const checked = kitchen.shopping.filter((i) => i.checked);
+		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
+		kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
+		notify(`${checked.length} purchased items moved to your pantry.`);
 	}
 	async function internetSearch() {
 		if (!capabilities.recipeSearch) {
@@ -2752,22 +2783,66 @@
 							visible until that source is refreshed.
 						</p>
 					</div>
-					<button class="secondary" onclick={exportList}><Download size={17} /> Export list</button>
+					<button class="secondary" disabled={!kitchen.shopping.length} onclick={exportList}
+						><Share2 size={17} /> Share list</button
+					>
 				</section>
 				<div class="shopping-layout">
 					<div>
 						<div class="section-line">
 							<h2>Items to buy</h2>
-							<span class="muted"
-								>{kitchen.shopping.filter((i) => i.checked).length} of {kitchen.shopping.length} purchased</span
-							>
+							<span class="muted">{checkedCount} of {kitchen.shopping.length} purchased</span>
 						</div>
-						<div class="shopping-progress">
+						<div
+							class="shopping-progress"
+							role="progressbar"
+							aria-label="Shopping progress"
+							aria-valuemin={0}
+							aria-valuemax={kitchen.shopping.length}
+							aria-valuenow={checkedCount}
+						>
 							<span
-								style={`width:${kitchen.shopping.length ? (kitchen.shopping.filter((i) => i.checked).length / kitchen.shopping.length) * 100 : 0}%`}
+								style={`width:${kitchen.shopping.length ? (checkedCount / kitchen.shopping.length) * 100 : 0}%`}
 							></span>
 						</div>
-						{#each kitchen.shopping as item (item.id)}<div
+						<div class="shopping-filters" role="group" aria-label="Filter shopping list">
+							{#each [{ id: 'all' as const, label: 'Show all', count: kitchen.shopping.length }, { id: 'unpurchased' as const, label: 'Hide purchased', count: checkedCount }] as option}<button
+									type="button"
+									class:active={shoppingFilter === option.id}
+									aria-pressed={shoppingFilter === option.id}
+									onclick={() => (shoppingFilter = option.id)}
+									>{option.label}<span>{option.count}</span></button
+								>{/each}
+						</div>
+						<form
+							class="inline-add"
+							onsubmit={(e) => {
+								e.preventDefault();
+								if (shoppingText.trim()) {
+									const newItem = {
+										id: crypto.randomUUID(),
+										name: shoppingText.trim(),
+										quantity: 1,
+										unit: 'piece',
+										checked: false
+									};
+									const firstCheckedIndex = kitchen.shopping.findIndex((item) => item.checked);
+									if (firstCheckedIndex === -1) {
+										kitchen.shopping.push(newItem);
+									} else {
+										kitchen.shopping.splice(firstCheckedIndex, 0, newItem);
+									}
+									shoppingText = '';
+								}
+							}}
+						>
+							<Plus size={18} /><input
+								aria-label="Add shopping item"
+								placeholder="Anything else for the basket?"
+								bind:value={shoppingText}
+							/><button class="text-button">Add</button>
+						</form>
+						{#each visibleShopping as item (item.id)}<div
 								class:checked={item.checked}
 								class="shopping-row"
 								animate:flip={{ duration: motionDuration(200) }}
@@ -2840,38 +2915,20 @@
 								<button class="secondary" onclick={() => navigate('discover')}
 									>Browse recipes <ArrowRight size={16} /></button
 								>
+							</div>{:else if !visibleShopping.length}<div class="shopping-complete">
+								<p>
+									<Check size={16} />All {checkedCount}
+									{checkedCount === 1 ? 'item' : 'items'} purchased.
+								</p>
+								<button class="text-button" onclick={movePurchasedToPantry}
+									>Put purchased items in my pantry <ArrowRight size={16} /></button
+								>
 							</div>{/if}
-						<form
-							class="inline-add"
-							onsubmit={(e) => {
-								e.preventDefault();
-								if (shoppingText.trim()) {
-									kitchen.shopping.push({
-										id: crypto.randomUUID(),
-										name: shoppingText.trim(),
-										quantity: 1,
-										unit: 'piece',
-										checked: false
-									});
-									shoppingText = '';
-								}
-							}}
-						>
-							<Plus size={18} /><input
-								aria-label="Add shopping item"
-								placeholder="Anything else for the basket?"
-								bind:value={shoppingText}
-							/><button class="text-button">Add</button>
-						</form>
-						<button
-							class="text-button"
-							onclick={() => {
-								const checked = kitchen.shopping.filter((i) => i.checked);
-								kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
-								kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
-								notify(`${checked.length} purchased items moved to your pantry.`);
-							}}>Put purchased items in my pantry <ArrowRight size={16} /></button
-						>
+						{#if !kitchen.shopping.length || visibleShopping.length}<button
+								class="text-button shopping-transfer"
+								onclick={movePurchasedToPantry}
+								>Put purchased items in my pantry <ArrowRight size={16} /></button
+							>{/if}
 					</div>
 				</div>
 			{/if}
