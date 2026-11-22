@@ -157,6 +157,9 @@ export async function runOpenSettingsWorkflow(options: {
 	const authReloadedState =
 		authResult.status === 'fulfilled' && Boolean(authResult.value.stateLoaded);
 	if (!initialCatalogTask || authReloadedState || currentUserId !== options.initialUserId) {
+		if (options.onReadyToFocus) {
+			await options.onReadyToFocus();
+		}
 		try {
 			await options.loadConnectionsAndCatalog();
 		} catch (error) {
