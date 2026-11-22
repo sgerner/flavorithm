@@ -239,6 +239,7 @@
 		generate: 'Generate recipes',
 		settings: 'Settings',
 		household: 'Your household',
+		confirmJoin: 'Replace personal kitchen',
 		removeMember: 'Remove household member',
 		leave: 'Leave household',
 		delete: 'Delete account',
@@ -699,7 +700,8 @@
 				notify('Your household changed in another tab. Checking for updates.');
 			}
 			throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), {
-				status: response.status
+				status: response.status,
+				code: data.code
 			});
 		}
 		if (url === '/api/state') stateEtag = data.state ? response.headers.get('etag') : null;
@@ -1628,7 +1630,7 @@
 				else void openSettings();
 				break;
 			case 'leave-household':
-				modal = 'leave';
+				void openLeaveHousehold();
 				break;
 			case 'scan':
 				imageInput?.click();
@@ -2070,13 +2072,42 @@
 			householdBusy = false;
 		}
 	}
-	async function join() {
+	async function openLeaveHousehold() {
+		mobileNav = false;
+		if (!user) {
+			openAuthentication();
+			return;
+		}
+		error = '';
 		householdBusy = true;
+		try {
+			const data = await refreshHousehold();
+			if ((data.members ?? []).length <= 1) {
+				modal = 'household';
+				notify('You already have your own personal kitchen.');
+			} else {
+				modal = 'leave';
+			}
+		} catch (e) {
+			modal = 'household';
+			error = (e as Error).message;
+		} finally {
+			householdBusy = false;
+		}
+	}
+	async function join(confirmReplace = false) {
+		const confirmed = confirmReplace === true;
+		householdBusy = true;
+		error = '';
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
-			await request('/api/household', { action: 'join', code: joinCode.trim() });
+			await request('/api/household', {
+				action: 'join',
+				code: joinCode.trim(),
+				...(confirmed ? { confirmReplace: true } : {})
+			});
 			joinCode = '';
 			inviteCode = '';
 			currentInviteId = '';
@@ -2084,11 +2115,18 @@
 			const data = await request('/api/state');
 			adoptKitchen(data.state || createNewUserState());
 			await refreshHousehold();
+			modal = 'household';
 			syncing = false;
 			notify('Welcome to your shared kitchen.');
 		} catch (e) {
 			syncing = false;
-			error = (e as Error).message;
+			const err = e as Error & { status?: number; code?: string };
+			if (!confirmed && err.status === 409 && err.code === 'confirm_replace') {
+				error = '';
+				modal = 'confirmJoin';
+				return;
+			}
+			error = err.message;
 		} finally {
 			syncing = false;
 			householdBusy = false;
@@ -3600,18 +3638,52 @@
 							autocomplete="off"
 						/></label
 					>
-					<button class="secondary full" disabled={householdBusy || !joinCode.trim()} onclick={join}
-						>Join household <ArrowRight size={17} /></button
+					<button
+						class="secondary full"
+						disabled={householdBusy || !joinCode.trim()}
+						onclick={() => join()}>Join household <ArrowRight size={17} /></button
 					>
 					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<button
-						class="text-button danger full"
-						disabled={householdBusy}
-						onclick={() => {
-							modal = 'leave';
-							error = '';
-						}}>Leave this household</button
+					{#if members.length > 1}
+						<button
+							class="text-button danger full"
+							disabled={householdBusy}
+							onclick={() => {
+								modal = 'leave';
+								error = '';
+							}}>Leave this household</button
+						>
+					{:else if members.length === 1 || !householdBusy}
+						<p class="field-help">
+							You already have your own personal kitchen. Invite someone above to share it, or enter
+							an invite code to join another household.
+						</p>
+					{/if}
+				{:else if modal === 'confirmJoin'}
+					<h2>Replace your personal kitchen?</h2>
+					<p class="muted">
+						Joining this household will replace your current personal kitchen, including any saved
+						recipes, cover photos, pantry items, planned meals, and shopping list. Download a backup
+						first if you want to keep a copy.
+					</p>
+					<button class="secondary full" disabled={householdBusy} onclick={exportKitchen}
+						><Download size={17} /> Export backup</button
 					>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="dialog-actions">
+						<button
+							class="secondary"
+							disabled={householdBusy}
+							onclick={() => {
+								error = '';
+								modal = 'household';
+							}}>Cancel</button
+						><button
+							class="primary danger-action"
+							disabled={householdBusy}
+							onclick={() => join(true)}>{householdBusy ? 'Joining…' : 'Replace kitchen'}</button
+						>
+					</div>
 				{:else if modal === 'removeMember'}
 					<h2>Remove household member?</h2>
 					<p class="muted">
@@ -3625,6 +3697,7 @@
 							disabled={householdBusy}
 							onclick={() => {
 								memberToRemove = null;
+								error = '';
 								modal = 'household';
 							}}>Keep member</button
 						><button
@@ -3634,16 +3707,35 @@
 						>
 					</div>
 				{:else if modal === 'leave'}
+					{@const nextHouseholdOwner = canManageHousehold
+						? members.find((member) => member.id !== user?.id)
+						: undefined}
 					<h2>Leave this household?</h2>
 					<p class="muted">
 						Leaving gives you a new personal kitchen. The shared pantry and recipes stay with your
 						household. You can rejoin with a new invitation.
 					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-						class="primary full"
-						onclick={leaveHousehold}
-						disabled={busy}>Leave household</button
-					>
+					{#if nextHouseholdOwner}
+						<p class="field-help">
+							Ownership of this household will transfer to <b>{nextHouseholdOwner.name}</b>.
+						</p>
+					{/if}
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="dialog-actions">
+						<button
+							class="secondary"
+							disabled={busy || householdBusy}
+							onclick={() => {
+								error = '';
+								modal = 'household';
+							}}>Stay in household</button
+						><button
+							class="primary danger-action"
+							disabled={busy || householdBusy}
+							onclick={leaveHousehold}
+							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
+						>
+					</div>
 				{:else if modal === 'delete' && !managedAuth}
 					<h2>Delete your account?</h2>
 					<p class="muted">
