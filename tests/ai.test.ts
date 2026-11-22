@@ -627,11 +627,12 @@ test('malformed HTML token scans stay linear for repeated unclosed tags and angl
 		]) await capture(malformed);
 		await capture('<'.repeat(100_000) + '<main><h1>Tomato pasta</h1><p>Ingredients: tomatoes.</p><p>Simmer the sauce.</p></main>', true);
 	`;
-	const child = spawnSync(
-		process.execPath,
-		['--experimental-strip-types', '--input-type=module', '-e', childScript],
-		{ cwd: process.cwd(), encoding: 'utf8', timeout: 4_000, maxBuffer: 2_000_000 }
-	);
+	const child = spawnSync(process.execPath, ['--input-type=module', '-e', childScript], {
+		cwd: process.cwd(),
+		encoding: 'utf8',
+		timeout: 4_000,
+		maxBuffer: 2_000_000
+	});
 
 	assert.equal(
 		child.status,

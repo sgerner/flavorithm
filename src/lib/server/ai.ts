@@ -36,7 +36,7 @@ export class AIRequestError extends Error {
 
 const IngredientInputSchema = z.object({
 	name: z.string().trim().min(1).max(200),
-	quantity: z.number().finite().nonnegative(),
+	quantity: z.number().nonnegative(),
 	unit: z.string().max(40),
 	category: z.string().max(100),
 	expires: z.string().max(50).optional()
@@ -45,7 +45,7 @@ const IngredientInputSchema = z.object({
 const PreferencesInputSchema = z.object({
 	diet: z.string().max(200),
 	allergies: z.string().max(500),
-	maxTime: z.number().finite().nonnegative().max(100_000),
+	maxTime: z.number().nonnegative().max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
 	theme: z.string().max(100),
@@ -59,8 +59,8 @@ const RecipeInputSchema = z.object({
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
 	image: z.string().max(4_000).optional().default(''),
-	time: z.number().finite().nonnegative().max(100_000),
-	servings: z.number().finite().min(1).max(10_000),
+	time: z.number().nonnegative().max(100_000),
+	servings: z.number().min(1).max(10_000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -68,24 +68,24 @@ const RecipeInputSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().nonnegative().max(1_000_000),
+				quantity: z.number().nonnegative().max(1_000_000),
 				unit: z.string().max(40)
 			})
 		)
 		.max(250),
 	steps: z.array(z.string().max(10_000)).max(200),
 	nutrition: z.object({
-		calories: z.number().finite().nonnegative().max(1_000_000),
-		fat: z.number().finite().nonnegative().max(1_000_000),
-		saturatedFat: z.number().finite().nonnegative().max(1_000_000),
-		sodium: z.number().finite().nonnegative().max(1_000_000),
-		carbs: z.number().finite().nonnegative().max(1_000_000),
-		fiber: z.number().finite().nonnegative().max(1_000_000),
-		sugar: z.number().finite().nonnegative().max(1_000_000),
-		protein: z.number().finite().nonnegative().max(1_000_000)
+		calories: z.number().nonnegative().max(1_000_000),
+		fat: z.number().nonnegative().max(1_000_000),
+		saturatedFat: z.number().nonnegative().max(1_000_000),
+		sodium: z.number().nonnegative().max(1_000_000),
+		carbs: z.number().nonnegative().max(1_000_000),
+		fiber: z.number().nonnegative().max(1_000_000),
+		sugar: z.number().nonnegative().max(1_000_000),
+		protein: z.number().nonnegative().max(1_000_000)
 	}),
 	source: z.string().max(4_000).optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional()
 });
 
@@ -135,22 +135,22 @@ const AIRequestSchema = z
 	});
 
 const NutritionSchema = z.object({
-	calories: z.number().finite().nonnegative().max(1_000_000),
-	fat: z.number().finite().nonnegative().max(1_000_000),
-	saturatedFat: z.number().finite().nonnegative().max(1_000_000),
-	sodium: z.number().finite().nonnegative().max(1_000_000),
-	carbs: z.number().finite().nonnegative().max(1_000_000),
-	fiber: z.number().finite().nonnegative().max(1_000_000),
-	sugar: z.number().finite().nonnegative().max(1_000_000),
-	protein: z.number().finite().nonnegative().max(1_000_000)
+	calories: z.number().nonnegative().max(1_000_000),
+	fat: z.number().nonnegative().max(1_000_000),
+	saturatedFat: z.number().nonnegative().max(1_000_000),
+	sodium: z.number().nonnegative().max(1_000_000),
+	carbs: z.number().nonnegative().max(1_000_000),
+	fiber: z.number().nonnegative().max(1_000_000),
+	sugar: z.number().nonnegative().max(1_000_000),
+	protein: z.number().nonnegative().max(1_000_000)
 });
 
 const RecipeDraftSchema = z.object({
 	title: z.string().trim().min(1).max(160),
 	description: z.string().trim().min(1).max(600),
 	image: z.string().trim().max(2_000),
-	time: z.number().finite().int().positive().max(600),
-	servings: z.number().finite().int().positive().max(100),
+	time: z.number().int().positive().max(600),
+	servings: z.number().int().positive().max(100),
 	difficulty: z.string().trim().min(1).max(60),
 	cuisine: z.string().trim().min(1).max(80),
 	tags: z.array(z.string().trim().min(1).max(40)).max(20),
@@ -158,7 +158,7 @@ const RecipeDraftSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().positive().max(1_000_000),
+				quantity: z.number().positive().max(1_000_000),
 				unit: z.string().trim().min(1).max(40)
 			})
 		)
@@ -174,7 +174,7 @@ const ImportedRecipeDraftSchema = RecipeDraftSchema.extend({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().nonnegative().max(1_000_000),
+				quantity: z.number().nonnegative().max(1_000_000),
 				unit: z.string().trim().min(1).max(40)
 			})
 		)
@@ -248,7 +248,7 @@ const VisionResultSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().positive(),
+				quantity: z.number().positive(),
 				unit: z.string().trim().min(1).max(40),
 				category: z.string().trim().min(1).max(60)
 			})

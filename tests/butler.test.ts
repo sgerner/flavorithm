@@ -132,6 +132,117 @@ test('unsupported actions, unsafe images, invalid calendar dates and preference 
 	assert.doesNotThrow(() => z.toJSONSchema(ButlerResponseSchema));
 });
 
+test('ButlerResponseSchema produces expected JSON Schema and rejects non-finite numbers and invalid datetimes', () => {
+	const schema = z.toJSONSchema(ButlerResponseSchema) as Record<string, any>;
+	assert.equal(schema.$schema, 'https://json-schema.org/draft/2020-12/schema');
+	assert.equal(schema.type, 'object');
+	assert.deepEqual(schema.required, ['reply', 'commands']);
+	assert.equal(schema.additionalProperties, false);
+	assert.deepEqual(schema.properties.reply, {
+		type: 'string',
+		minLength: 1,
+		maxLength: 12000
+	});
+	assert.equal(schema.properties.commands.type, 'array');
+	assert.equal(schema.properties.commands.maxItems, 50);
+
+	const variants = schema.properties.commands.items.oneOf as Array<Record<string, any>>;
+	assert.equal(variants.length, 14);
+
+	const recipeUpsert = variants.find((item) => item.properties.type.const === 'recipe.upsert')!;
+	assert.deepEqual(recipeUpsert.properties.recipe.properties.servings, {
+		type: 'number',
+		minimum: 1,
+		maximum: 10000
+	});
+	assert.deepEqual(recipeUpsert.properties.recipe.properties.nutrition.properties.calories, {
+		type: 'number',
+		minimum: 0,
+		maximum: 1000000
+	});
+
+	const mealUpsert = variants.find((item) => item.properties.type.const === 'meal.upsert')!;
+	assert.deepEqual(mealUpsert.properties.meal.properties.servings, {
+		type: 'number',
+		minimum: 1,
+		maximum: 10000
+	});
+	const completedAtSchema = mealUpsert.properties.meal.properties.completedAt;
+	assert.equal(completedAtSchema.type, 'string');
+	assert.equal(completedAtSchema.format, 'date-time');
+	assert.equal(new RegExp(completedAtSchema.pattern).test('2026-10-22T12:00:00Z'), true);
+	assert.equal(new RegExp(completedAtSchema.pattern).test('2026-10-22 12:00:00'), false);
+
+	const preferencesUpdate = variants.find(
+		(item) => item.properties.type.const === 'preferences.update'
+	)!;
+	assert.deepEqual(preferencesUpdate.properties.preferences.properties.maxTime, {
+		type: 'number',
+		minimum: 0,
+		maximum: 100000
+	});
+	assert.equal(preferencesUpdate.properties.preferences.additionalProperties, false);
+
+	assert.equal(
+		ButlerResponseSchema.safeParse({
+			reply: 'Planned dinner.',
+			commands: [
+				{
+					type: 'meal.upsert',
+					meal: {
+						id: 'dinner',
+						date: '2026-10-23',
+						slot: 'Dinner',
+						recipeId: 'soup',
+						servings: 2,
+						completedAt: '2026-10-23T18:30:00.000Z'
+					}
+				}
+			]
+		}).success,
+		true
+	);
+	assert.equal(
+		ButlerResponseSchema.safeParse({
+			reply: 'Bad timestamp.',
+			commands: [
+				{
+					type: 'meal.upsert',
+					meal: {
+						id: 'dinner',
+						date: '2026-10-23',
+						slot: 'Dinner',
+						recipeId: 'soup',
+						servings: 2,
+						completedAt: '2026-10-23 18:30:00'
+					}
+				}
+			]
+		}).success,
+		false
+	);
+	for (const badValue of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+		assert.equal(
+			ButlerResponseSchema.safeParse({
+				reply: 'Non-finite pantry quantity.',
+				commands: [
+					{
+						type: 'pantry.upsert',
+						item: {
+							id: 'salt',
+							name: 'Salt',
+							quantity: badValue,
+							unit: 'tsp',
+							category: 'Spices'
+						}
+					}
+				]
+			}).success,
+			false
+		);
+	}
+});
+
 test('weekly shopping ignores cooked meals and expired pantry and shares the UI scope', () => {
 	const current = createInitialState();
 	const recipe = current.recipes[0];
