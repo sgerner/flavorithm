@@ -5,8 +5,7 @@ import { ApiError } from '#lib/server/db.ts';
 import type { RequestHandler } from './$types';
 import { AIRequestError, getPublicModelCatalog } from '#lib/server/ai.ts';
 
-export const GET: RequestHandler = async ({ locals, fetch: eventFetch, url, route }) => {
-	const catalogFetch = route ? fetch : eventFetch;
+export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
 
 	try {
@@ -17,11 +16,11 @@ export const GET: RequestHandler = async ({ locals, fetch: eventFetch, url, rout
 			const connection = await getChatGPTConnection(
 				host?.userId ?? locals.user.id,
 				host?.accountId ?? accountId,
-				eventFetch
+				fetch
 			);
 			const result = await listChatGPTModels(connection.accessToken, connection.fetcher);
 			try {
-				const catalog = await getPublicModelCatalog(catalogFetch);
+				const catalog = await getPublicModelCatalog(fetch);
 				const openai = catalog.providers.find((provider) => provider.id === 'openai');
 				for (const model of result.providers[0].models) {
 					const metadata = openai?.models.find((candidate) => candidate.id === model.id);
@@ -35,7 +34,7 @@ export const GET: RequestHandler = async ({ locals, fetch: eventFetch, url, rout
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return Response.json(await getPublicModelCatalog(catalogFetch), {
+		return Response.json(await getPublicModelCatalog(fetch), {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {
