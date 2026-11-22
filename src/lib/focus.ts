@@ -8,7 +8,7 @@ export function focusTrap(node: HTMLElement) {
 	const controls = () =>
 		Array.from(
 			node.querySelectorAll<HTMLElement>(
-				'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex="0"]'
+				'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
 			)
 		).filter((el) => el.offsetParent !== null);
 	queueMicrotask(() => {
