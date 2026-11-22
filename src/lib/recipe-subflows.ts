@@ -1,3 +1,4 @@
+import { hasZeroNutrition } from '#lib/recipe-collection.ts';
 import { isValidServings } from '#lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe } from '#lib/types.ts';
 import { resolveClosedDialog, type ResumeDialog } from '#lib/voice-capture.ts';
@@ -6,6 +7,7 @@ export type RecipeSubflowReset = {
 	selected: null;
 	selectedMealServings: undefined;
 	editingRecipe: null;
+	editingRecipeMode: 'edit';
 	recipeToDelete: null;
 	plannedRecipe: null;
 };
@@ -27,6 +29,7 @@ export type ModalDialogState<TMember = unknown> = {
 
 export type EscapeLayerState<TMember = unknown> = ModalDialogState<TMember> & {
 	editingRecipe: Recipe | null;
+	editingRecipeMode?: 'create' | 'edit';
 	mobileNav: boolean;
 };
 
@@ -39,6 +42,7 @@ export function clearRecipeSubflowState(): RecipeSubflowReset {
 		selected: null,
 		selectedMealServings: undefined,
 		editingRecipe: null,
+		editingRecipeMode: 'edit',
 		recipeToDelete: null,
 		plannedRecipe: null
 	};
@@ -58,22 +62,25 @@ export function beginEditSavedRecipe(
 	recipes: Recipe[],
 	selected: Recipe | null,
 	recipe: Recipe
-): { selected: Recipe | null; editingRecipe: Recipe } | null {
+): { selected: Recipe | null; editingRecipe: Recipe; editingRecipeMode: 'edit' } | null {
 	const saved = recipes.find((item) => item.id === recipe.id && item.saved);
 	if (!saved) return null;
 	return {
 		selected,
-		editingRecipe: cloneRecipeDraft(saved)
+		editingRecipe: cloneRecipeDraft(saved),
+		editingRecipeMode: 'edit'
 	};
 }
 
 export function cancelEditSavedRecipe(selected: Recipe | null): {
 	selected: Recipe | null;
 	editingRecipe: null;
+	editingRecipeMode: 'edit';
 } {
 	return {
 		selected,
-		editingRecipe: null
+		editingRecipe: null,
+		editingRecipeMode: 'edit'
 	};
 }
 
@@ -85,6 +92,7 @@ export function applyEditedRecipe(
 	recipes: Recipe[];
 	selected: Recipe | null;
 	editingRecipe: null;
+	editingRecipeMode: 'edit';
 	saved: Recipe | null;
 	nutritionNeedsRefresh: boolean;
 } {
@@ -94,6 +102,7 @@ export function applyEditedRecipe(
 			recipes,
 			selected,
 			editingRecipe: null,
+			editingRecipeMode: 'edit',
 			saved: null,
 			nutritionNeedsRefresh: false
 		};
@@ -101,15 +110,24 @@ export function applyEditedRecipe(
 	const nutritionNeedsRefresh =
 		previous.servings !== updated.servings ||
 		JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
+	const nutritionChanged = JSON.stringify(previous.nutrition) !== JSON.stringify(updated.nutrition);
+	const zeroNutrition = hasZeroNutrition(updated.nutrition);
 	const saved: Recipe = {
 		...updated,
 		saved: true,
-		nutritionStale: nutritionNeedsRefresh ? true : previous.nutritionStale
+		nutritionStale: nutritionNeedsRefresh
+			? true
+			: updated.provenance === 'manual' && zeroNutrition
+				? true
+				: nutritionChanged && !zeroNutrition
+					? false
+					: previous.nutritionStale
 	};
 	return {
 		recipes: recipes.map((item) => (item.id === saved.id ? saved : item)),
 		selected: saved,
 		editingRecipe: null,
+		editingRecipeMode: 'edit',
 		saved,
 		nutritionNeedsRefresh
 	};
@@ -310,7 +328,8 @@ export function dismissEscapeLayer<TMember = unknown>(
 			dismissed: 'editingRecipe',
 			state: {
 				...state,
-				editingRecipe: null
+				editingRecipe: null,
+				editingRecipeMode: 'edit'
 			}
 		};
 	}

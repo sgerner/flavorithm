@@ -99,6 +99,7 @@ test('editing an open saved recipe preserves selected on cancel and updates sele
 	const started = beginEditSavedRecipe(recipes, original, original);
 	assert.ok(started);
 	assert.equal(started.selected, original);
+	assert.equal(started.editingRecipeMode, 'edit');
 	assert.notEqual(started.editingRecipe, original);
 	assert.equal(isRecipeDetailInert('', started.editingRecipe), true);
 
@@ -111,6 +112,7 @@ test('editing an open saved recipe preserves selected on cancel and updates sele
 	const canceled = cancelEditSavedRecipe(started.selected);
 	assert.equal(canceled.selected, original);
 	assert.equal(canceled.editingRecipe, null);
+	assert.equal(canceled.editingRecipeMode, 'edit');
 	assert.equal(isRecipeDetailInert('', canceled.editingRecipe), false);
 
 	// Saving non-ingredient/non-serving changes updates selected without marking nutrition stale.
@@ -129,10 +131,41 @@ test('editing an open saved recipe preserves selected on cancel and updates sele
 		servings: 6
 	});
 	assert.equal(rescaled.editingRecipe, null);
+	assert.equal(rescaled.editingRecipeMode, 'edit');
 	assert.equal(rescaled.nutritionNeedsRefresh, true);
 	assert.equal(rescaled.selected?.servings, 6);
 	assert.equal(rescaled.selected?.nutritionStale, true);
 	assert.equal(rescaled.recipes[0], rescaled.selected);
+
+	// Manual recipes with zero nutrition keep nutritionStale true until non-zero nutrition is entered.
+	const manualZero = makeRecipe({
+		id: 'manual-stew',
+		provenance: 'manual',
+		nutritionStale: true,
+		nutrition: {
+			calories: 0,
+			fat: 0,
+			saturatedFat: 0,
+			sodium: 0,
+			carbs: 0,
+			fiber: 0,
+			sugar: 0,
+			protein: 0
+		}
+	});
+	const manualRenamed = applyEditedRecipe([manualZero], manualZero, {
+		...manualZero,
+		title: 'Hearty Manual Stew'
+	});
+	assert.equal(manualRenamed.nutritionNeedsRefresh, false);
+	assert.equal(manualRenamed.selected?.nutritionStale, true);
+
+	const manualWithNutrition = applyEditedRecipe(manualRenamed.recipes, manualRenamed.selected, {
+		...manualRenamed.saved!,
+		nutrition: { ...manualRenamed.saved!.nutrition, calories: 420, protein: 28 }
+	});
+	assert.equal(manualWithNutrition.nutritionNeedsRefresh, false);
+	assert.equal(manualWithNutrition.selected?.nutritionStale, false);
 });
 
 test('Basil edit subflow with selected === null keeps selected null on cancel and opens saved recipe on save', () => {
@@ -411,6 +444,7 @@ test('settings, onboarding, resumeDialog, and identity reset helpers preserve or
 		selected: null,
 		selectedMealServings: undefined,
 		editingRecipe: null,
+		editingRecipeMode: 'edit',
 		recipeToDelete: null,
 		plannedRecipe: null
 	});
@@ -424,6 +458,7 @@ test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe
 		modal: 'deleteRecipe',
 		recipeToDelete: activeRecipe,
 		editingRecipe: draft,
+		editingRecipeMode: 'create',
 		selected: activeRecipe,
 		selectedMealServings: 6,
 		mobileNav: true
@@ -447,11 +482,12 @@ test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe
 	assert.equal(state.selectedMealServings, 6);
 	assert.equal(state.mobileNav, true);
 
-	// 2nd Escape dismisses editingRecipe only.
+	// 2nd Escape dismisses editingRecipe only and resets editingRecipeMode.
 	step = dismissEscapeLayer({ key: 'Escape' }, state);
 	assert.equal(step.dismissed, 'editingRecipe');
 	state = step.state;
 	assert.equal(state.editingRecipe, null);
+	assert.equal(state.editingRecipeMode, 'edit');
 	assert.equal(state.selected, activeRecipe);
 	assert.equal(state.selectedMealServings, 6);
 	assert.equal(state.mobileNav, true);
