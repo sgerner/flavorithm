@@ -472,6 +472,7 @@ test('import estimates survive household storage, with bounded notes', async () 
 	];
 	state.recipes[0].provenance = 'web-import';
 	state.recipes[1].provenance = 'ai-generated';
+	state.recipes[2].provenance = 'manual';
 	backend.saveState(account.user, state, {
 		ifMatch: backend.getStateEtag(account.user),
 		ifNoneMatch: null
@@ -480,11 +481,13 @@ test('import estimates survive household storage, with bounded notes', async () 
 	assert.deepEqual(saved.recipes[0].importNotes, state.recipes[0].importNotes);
 	assert.equal(saved.recipes[0].provenance, 'web-import');
 	assert.equal(saved.recipes[1].provenance, 'ai-generated');
+	assert.equal(saved.recipes[2].provenance, 'manual');
 
 	const exportedResponse = await exportRoute.GET({ locals: { user: account.user } } as never);
 	const exported = (await exportedResponse.json()) as { state: typeof state };
 	assert.equal(exported.state.recipes[0].provenance, 'web-import');
 	assert.equal(exported.state.recipes[1].provenance, 'ai-generated');
+	assert.equal(exported.state.recipes[2].provenance, 'manual');
 	assert.deepEqual(exported.state.recipes[0].importNotes, state.recipes[0].importNotes);
 
 	const invalid = structuredClone(state);
