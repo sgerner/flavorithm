@@ -1,3 +1,4 @@
+import { createNewUserState } from '#lib/data.ts';
 import type { AppState, User } from '#lib/types.ts';
 import {
 	clearPendingJournalRecords,
@@ -16,7 +17,13 @@ import {
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> &
 	Partial<Pick<Storage, 'key' | 'length'>>;
-type SyncStatus = { pending: boolean; syncing: boolean; conflicts: SyncConflict[]; error: string };
+export type SyncStatus = {
+	ready: boolean;
+	pending: boolean;
+	syncing: boolean;
+	conflicts: SyncConflict[];
+	error: string;
+};
 type ConfirmedKitchen = {
 	userId: string;
 	householdId: string;
@@ -38,6 +45,9 @@ type ActiveContext = {
 	key: string;
 	generation: number;
 	baseline: ConfirmedKitchen | null;
+	confirmed: boolean;
+	loading: boolean;
+	loadError: string;
 	viewState: AppState | null;
 	pending: PendingKitchen | null;
 	pendingDurable: boolean;
@@ -50,7 +60,13 @@ type ActiveContext = {
 const confirmedKey = (identity: Identity) =>
 	`flavorithm-confirmed:v1:${encodeURIComponent(identity.userId)}:${encodeURIComponent(identity.householdId)}`;
 const identityKey = (identity: Identity) => `${identity.userId}\u0000${identity.householdId}`;
-const clone = <T>(value: T): T => structuredClone(value);
+const clone = <T>(value: T): T => {
+	try {
+		return structuredClone(value);
+	} catch {
+		return JSON.parse(JSON.stringify(value)) as T;
+	}
+};
 const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const enumerableStorage = (storage: StorageLike) =>
 	typeof storage.length === 'number' && typeof storage.key === 'function';
@@ -136,8 +152,9 @@ export function createKitchenSync(options: {
 	const baselines = new Map<string, ConfirmedKitchen>();
 
 	const statusOf = (context: ActiveContext): SyncStatus => ({
+		ready: context.confirmed && !context.loading,
 		pending: !!context.pending,
-		syncing: context.syncing,
+		syncing: context.syncing || context.loading,
 		conflicts: clone(context.conflicts),
 		error: context.error
 	});
@@ -231,9 +248,9 @@ export function createKitchenSync(options: {
 		return {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
-			base: clone(context.baseline?.state || first.base),
+			base: clone(context.baseline?.state || first.base || createNewUserState()),
 			local: clone(local),
-			etag: context.baseline?.etag || first.etag,
+			etag: context.baseline?.etag ?? first.etag ?? null,
 			updatedAt: Math.max(...records.map((record) => record.pending.updatedAt))
 		};
 	}
@@ -246,15 +263,20 @@ export function createKitchenSync(options: {
 		setUI = false
 	): { state: AppState; conflicts: SyncConflict[] } {
 		const merged = mergePendingKitchenJournal(loaded.records, seed, prefer);
-		context.pending = aggregatePending(context, loaded.records, merged.state);
+		const localState =
+			!prefer && merged.conflicts.length
+				? mergePendingKitchenJournal(loaded.records, seed, 'local').state
+				: merged.state;
+		context.pending = aggregatePending(context, loaded.records, localState);
 		context.pendingDurable = loaded.durable;
 		context.blockedByStorage = loaded.blocked;
 		context.conflicts = clone(merged.conflicts);
-		if (setUI) context.viewState = clone(merged.state);
-		if (!loaded.error) context.error = '';
-		else context.error = loaded.error;
-		if (setUI) setContextState(context, merged.state);
-		return merged;
+		if (setUI) context.viewState = clone(localState);
+		if (loaded.error) context.error = loaded.error;
+		else if (context.confirmed || loaded.records.length) context.error = '';
+		else context.error = context.loadError;
+		if (setUI) setContextState(context, localState);
+		return { state: localState, conflicts: merged.conflicts };
 	}
 
 	function saveBaseline(context: ActiveContext, state: AppState, etag: string): void {
@@ -281,6 +303,9 @@ export function createKitchenSync(options: {
 			key,
 			generation,
 			baseline: baselines.get(key) || readConfirmed(options.storage, identity),
+			confirmed: false,
+			loading: false,
+			loadError: '',
 			viewState: null,
 			pending: null,
 			pendingDurable: false,
@@ -352,9 +377,43 @@ export function createKitchenSync(options: {
 		return '';
 	}
 
+	function prepare(user: User): boolean {
+		const context = activate(user);
+		if (!context) return false;
+		context.loading = true;
+		context.confirmed = false;
+		context.loadError = '';
+		const loaded = loadJournal(context);
+		const seed = context.baseline?.state || loaded.records[0]?.pending.base || createNewUserState();
+		if (loaded.records.length) {
+			updateAggregate(context, loaded, seed, undefined, true);
+		} else {
+			context.viewState = clone(seed);
+			context.error = loaded.error;
+			context.blockedByStorage = loaded.blocked;
+			setContextState(context, seed);
+		}
+		emitStatus(context);
+		return true;
+	}
+
+	function failLoad(message = 'Could not load your kitchen.'): void {
+		const context = active;
+		if (!context || !isActive(context)) return;
+		context.loading = false;
+		context.confirmed = false;
+		const nextError = message.trim() || 'Could not load your kitchen.';
+		context.loadError = nextError;
+		context.error = nextError;
+		emitStatus(context);
+	}
+
 	function initialize(user: User, remoteState: AppState, etag: string): void {
 		const context = activate(user);
 		if (!context) return;
+		context.confirmed = true;
+		context.loading = false;
+		context.loadError = '';
 		let baselineError = '';
 		try {
 			saveBaseline(context, remoteState, etag);
@@ -388,28 +447,26 @@ export function createKitchenSync(options: {
 		const context = activate(user);
 		if (!context) return false;
 		const loaded = loadJournal(context);
-		if (!context.baseline && loaded.records.length) {
-			const first = loaded.records[0].pending;
-			context.baseline = {
-				userId: context.identity.userId,
-				householdId: context.identity.householdId,
-				state: clone(first.base),
-				etag: first.etag || '',
-				updatedAt: first.createdAt ?? first.updatedAt
-			};
-		}
-		if (loaded.records.length && context.baseline) {
-			const merged = updateAggregate(context, loaded, context.baseline.state, undefined, true);
+		if (loaded.records.length) {
+			const seed =
+				context.baseline?.state || loaded.records[0].pending.base || createNewUserState();
+			updateAggregate(context, loaded, seed, undefined, true);
 			emitStatus(context);
 			return true;
 		}
 		if (context.baseline) {
 			context.viewState = clone(context.baseline.state);
+			context.error = loaded.error;
+			context.blockedByStorage = loaded.blocked;
 			setContextState(context, context.baseline.state);
 			emitStatus(context);
 			return true;
 		}
+		const starter = createNewUserState();
+		context.viewState = clone(starter);
 		context.error = loaded.error;
+		context.blockedByStorage = loaded.blocked;
+		setContextState(context, starter);
 		emitStatus(context);
 		return false;
 	}
@@ -417,7 +474,6 @@ export function createKitchenSync(options: {
 	function stage(state: AppState): void {
 		const context = active;
 		if (!context || !isActive(context)) return;
-		context.error = '';
 		const next = clone(state);
 		if (!isState(next)) {
 			context.error = 'The kitchen state is invalid and was not saved.';
@@ -426,20 +482,22 @@ export function createKitchenSync(options: {
 		}
 		const loaded = loadJournal(context);
 		const own = loaded.records.find((record) => record.writerId === writerId);
-		const base = own?.pending.base || context.viewState || context.baseline?.state;
-		if (!base) {
-			context.error = 'The kitchen has not loaded, so offline changes cannot be saved yet.';
-			emitStatus(context);
-			return;
-		}
+		const base = clone(
+			own?.pending.base || context.viewState || context.baseline?.state || createNewUserState()
+		);
+		const seed = context.baseline?.state || loaded.records[0]?.pending.base || base;
 		if (own && equal(next, own.pending.local)) {
+			const previousError = context.error;
 			context.viewState = next;
-			updateAggregate(context, loaded, context.baseline?.state || base);
+			updateAggregate(context, loaded, seed);
+			if (!loaded.error && previousError) context.error = previousError;
 			emitStatus(context);
 			return;
 		}
 		if (!own && equal(next, context.viewState)) {
-			updateAggregate(context, loaded, context.baseline?.state || base);
+			const previousError = context.error;
+			updateAggregate(context, loaded, seed);
+			if (!loaded.error && previousError) context.error = previousError;
 			emitStatus(context);
 			return;
 		}
@@ -448,7 +506,11 @@ export function createKitchenSync(options: {
 				acknowledge(context, [own]);
 				const after = loadJournal(context);
 				context.viewState = next;
-				updateAggregate(context, after, context.baseline?.state || next);
+				updateAggregate(
+					context,
+					after,
+					context.baseline?.state || after.records[0]?.pending.base || next
+				);
 			} catch {
 				context.error = 'The reverted offline changes could not be removed from this device.';
 			}
@@ -466,7 +528,7 @@ export function createKitchenSync(options: {
 		const pending: PendingKitchen = {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
-			base: clone(own?.pending.base || context.viewState || context.baseline!.state),
+			base,
 			local: next,
 			etag: own?.pending.etag ?? (context.baseline?.etag || null),
 			createdAt: own?.pending.createdAt ?? now,
@@ -505,7 +567,11 @@ export function createKitchenSync(options: {
 		if (durable) rememberRecord(context, ownRecord, true);
 		else rememberRecord(context, ownRecord, false);
 		const after = loadJournal(context);
-		const aggregate = updateAggregate(context, after, context.baseline?.state || base);
+		const aggregate = updateAggregate(
+			context,
+			after,
+			context.baseline?.state || after.records[0]?.pending.base || base
+		);
 		// Stage is driven by the UI's current state. Keep it as the view even if a different tab has
 		// additional queued deltas that are not reflected in this tab yet.
 		context.viewState = next;
@@ -523,17 +589,15 @@ export function createKitchenSync(options: {
 			context.pending = null;
 			context.pendingDurable = false;
 			context.blockedByStorage = !!loaded.error;
-			context.error = loaded.error;
+			context.error = loaded.error || (!context.confirmed ? context.loadError : '');
 			emitStatus(context);
 			return;
 		}
+		const seed = context.baseline?.state || loaded.records[0].pending.base || createNewUserState();
 		context.pending = aggregatePending(
 			context,
 			loaded.records,
-			mergePendingKitchenJournal(
-				loaded.records,
-				context.baseline?.state || loaded.records[0].pending.base
-			).state
+			mergePendingKitchenJournal(loaded.records, seed).state
 		);
 		context.pendingDurable = loaded.durable;
 		context.blockedByStorage = loaded.blocked;
@@ -583,6 +647,9 @@ export function createKitchenSync(options: {
 				context.error = 'Resolve the kitchen conflicts before syncing these changes.';
 				return;
 			}
+			context.confirmed = true;
+			context.loading = false;
+			context.loadError = '';
 			try {
 				saveBaseline(context, result.state, result.etag);
 			} catch {
@@ -642,17 +709,17 @@ export function createKitchenSync(options: {
 	function clearContext(): void {
 		generation += 1;
 		active = null;
-		options.onStatus({ pending: false, syncing: false, conflicts: [], error: '' });
+		options.onStatus({ ready: false, pending: false, syncing: false, conflicts: [], error: '' });
 	}
 
 	function snapshot(): PendingKitchen | null {
 		if (!active || !isActive(active)) return null;
 		const loaded = loadJournal(active);
 		if (!loaded.records.length) return null;
-		const seed = active.baseline?.state || loaded.records[0].pending.base;
-		const merged = mergePendingKitchenJournal(loaded.records, seed);
+		const seed = active.baseline?.state || loaded.records[0].pending.base || createNewUserState();
+		const merged = mergePendingKitchenJournal(loaded.records, seed, 'local');
 		return aggregatePending(active, loaded.records, merged.state);
 	}
 
-	return { initialize, restore, stage, sync, snapshot, clearContext };
+	return { prepare, failLoad, initialize, restore, stage, sync, snapshot, clearContext };
 }
