@@ -222,7 +222,7 @@ export function reconcileShoppingList(
 		});
 	}
 
-	return [...uncheckedRetained, ...generated, ...checkedRetained];
+	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
 const MAX_SHOPPING_ITEMS = 1_000;
@@ -384,13 +384,18 @@ export function transferPurchasedItemsToPantry(
 			!item.checked ||
 			!Number.isFinite(item.quantity) ||
 			!(item.quantity > 0) ||
+			!item.name.trim() ||
 			!item.unit.trim()
 		)
 			continue;
 		const normalizedName = normalizeName(item.name);
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		const bucket = buckets.get(key) ?? { name: item.name.trim(), unit, quantityBase: 0 };
+		const bucket = buckets.get(key) ?? {
+			name: item.name.trim().slice(0, 200),
+			unit,
+			quantityBase: 0
+		};
 		bucket.quantityBase += item.quantity * unit.factor;
 		buckets.set(key, bucket);
 	}
@@ -405,11 +410,16 @@ export function transferPurchasedItemsToPantry(
 				!item.expires?.trim()
 		);
 		if (destination) {
-			destination.quantity = roundPantryQuantity(
-				destination.quantity + bucket.quantityBase / unitInfo(destination.unit).factor
+			const baseline = Number.isFinite(destination.quantity)
+				? Math.max(0, destination.quantity)
+				: 0;
+			destination.quantity = Math.min(
+				1_000_000,
+				roundPantryQuantity(baseline + bucket.quantityBase / unitInfo(destination.unit).factor)
 			);
 			continue;
 		}
+		if (result.length >= 1_000) continue;
 
 		const baseId = createId();
 		let id = baseId;
@@ -419,8 +429,8 @@ export function transferPurchasedItemsToPantry(
 		result.push({
 			id,
 			name: bucket.name,
-			quantity: roundPantryQuantity(bucket.quantityBase / bucket.unit.factor),
-			unit: bucket.unit.display,
+			quantity: Math.min(1_000_000, roundPantryQuantity(bucket.quantityBase / bucket.unit.factor)),
+			unit: bucket.unit.display.slice(0, 40),
 			category: 'Pantry'
 		});
 	}

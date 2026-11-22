@@ -370,6 +370,53 @@ test('purchased shopping rows merge aliases and compatible units without changin
 	assert.equal(result.find((item) => item.unit === 'package')?.quantity, 1);
 });
 
+test('pantry transfers clamp negative or null baseline stock, cap quantities at 1,000,000, and bound array size', () => {
+	const corruptedPantry: Ingredient[] = [
+		pantry('flour', -3, 'cup'),
+		pantry('sugar', null as unknown as number, 'cup'),
+		pantry('rice', 999_999.5, 'cup')
+	];
+	const transferred = transferPurchasedItemsToPantry(
+		corruptedPantry,
+		[
+			shopping('buy-flour', 'flour', 2, 'cups', true),
+			shopping('buy-sugar', 'sugar', 1.5, 'cups', true),
+			shopping('buy-rice', 'rice', 10, 'cups', true),
+			shopping('buy-salt', 'salt', 2_500_000, 'g', true),
+			shopping('buy-zero', 'pepper', 0, 'tsp', true),
+			shopping('buy-blank', '   ', 2, 'tsp', true)
+		],
+		() => 'new-salt'
+	);
+
+	assert.equal(transferred.find((item) => item.name === 'flour')?.quantity, 2);
+	assert.equal(transferred.find((item) => item.name === 'sugar')?.quantity, 1.5);
+	assert.equal(transferred.find((item) => item.name === 'rice')?.quantity, 1_000_000);
+	assert.equal(transferred.find((item) => item.name === 'salt')?.quantity, 1_000_000);
+	assert.equal(
+		transferred.find((item) => item.name === 'pepper'),
+		undefined
+	);
+
+	const fullPantry = Array.from({ length: 1_000 }, (_, index) =>
+		pantry(`item-${index}`, 1, 'piece')
+	);
+	const capped = transferPurchasedItemsToPantry(
+		fullPantry,
+		[
+			shopping('merge-existing', 'item-0', 3, 'piece', true),
+			shopping('overflow', 'brand-new-ingredient', 2, 'piece', true)
+		],
+		() => 'unused-overflow'
+	);
+	assert.equal(capped.length, 1_000);
+	assert.equal(capped[0].quantity, 4);
+	assert.equal(
+		capped.some((item) => item.name === 'brand-new-ingredient'),
+		false
+	);
+});
+
 test('completing a meal deducts compatible pantry quantities once and never goes below zero', () => {
 	const plannedRecipe = recipe({
 		id: 'soup',
