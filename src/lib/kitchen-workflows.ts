@@ -1,5 +1,6 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
 import { normalizeName, parseIngredientInput, unitInfo } from './domain.ts';
+import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 export {
 	normalizeName,
 	normalizeName as normalizeIngredientName,
@@ -219,7 +220,7 @@ export function reconcileShoppingList(
 	) => {
 		const alreadyPurchased = checkedByBucket.get(key) ?? 0;
 		const remainingBase = Math.max(0, bucket.quantityBase - alreadyPurchased);
-		return roundQuantity(remainingBase / bucket.unit.factor);
+		return Math.min(MAX_SHOPPING_QUANTITY, roundQuantity(remainingBase / bucket.unit.factor));
 	};
 
 	const existingUncheckedIds = new Map<string, string>();
