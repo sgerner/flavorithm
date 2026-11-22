@@ -1,4 +1,16 @@
+import {
+	MAX_COOKING_TIME,
+	MAX_DRAFT_INGREDIENTS,
+	MAX_DRAFT_STEPS,
+	MAX_INGREDIENT_QUANTITY,
+	MAX_NUTRITION_VALUE,
+	MAX_SERVINGS,
+	NUTRITION_FIELDS,
+	isValidServings
+} from './recipe-draft.ts';
 import type { Recipe } from './types.ts';
+
+export { NUTRITION_FIELDS };
 
 export type FieldIds = {
 	id: string;
@@ -84,18 +96,36 @@ export function validateMealDate(value: string): string {
 }
 
 export function validatePlannedServings(value: unknown): string {
-	if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 24) {
-		return 'Enter a whole number from 1 to 24 servings.';
+	if (!isValidServings(value)) {
+		return `Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`;
 	}
 	return '';
 }
 
 export function validateLeftoverServings(value: unknown, plannedServings: number): string {
-	const max = Number.isInteger(plannedServings) && plannedServings >= 0 ? plannedServings : 24;
+	const max =
+		Number.isInteger(plannedServings) && plannedServings >= 0 ? plannedServings : MAX_SERVINGS;
 	if (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > max) {
-		return `Enter a whole number from 0 to ${max} servings.`;
+		return `Enter a whole number from 0 to ${max.toLocaleString('en-US')} servings.`;
 	}
 	return '';
+}
+
+export function validateRecipeLink(value: string): string {
+	const trimmed = value.trim();
+	if (!trimmed) return '';
+	if (trimmed.length > 2_048) {
+		return 'Keep the recipe link under 2,048 characters.';
+	}
+	try {
+		const parsed = new URL(trimmed);
+		if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+			return '';
+		}
+	} catch {
+		// Fall through to validation error.
+	}
+	return 'Enter a valid http:// or https:// recipe link, or leave it blank.';
 }
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -145,17 +175,6 @@ export function validatePantryInput(value: string): string {
 export function validateInviteCode(value: string): string {
 	return value.trim() ? '' : 'Enter an invitation code to join a household.';
 }
-
-export const NUTRITION_FIELDS: readonly [keyof Recipe['nutrition'], string][] = [
-	['calories', 'Calories (kcal)'],
-	['fat', 'Fat (g)'],
-	['saturatedFat', 'Saturated fat (g)'],
-	['sodium', 'Sodium (mg)'],
-	['carbs', 'Carbohydrates (g)'],
-	['fiber', 'Fiber (g)'],
-	['sugar', 'Sugar (g)'],
-	['protein', 'Protein (g)']
-];
 
 export type IngredientFieldErrors = {
 	name?: string;
@@ -233,21 +252,16 @@ export function validateRecipeDraftFields(
 
 	if (
 		typeof draft.time !== 'number' ||
-		!Number.isFinite(draft.time) ||
+		!Number.isInteger(draft.time) ||
 		draft.time < 1 ||
-		draft.time > 100_000
+		draft.time > MAX_COOKING_TIME
 	) {
-		result.time = 'Enter a cooking time between 1 and 100,000 minutes.';
+		result.time = 'Enter a whole cooking time between 1 and 100,000 minutes.';
 		record('Time (minutes)');
 	}
 
-	if (
-		typeof draft.servings !== 'number' ||
-		!Number.isFinite(draft.servings) ||
-		draft.servings < 1 ||
-		draft.servings > 10_000
-	) {
-		result.servings = 'Enter servings between 1 and 10,000.';
+	if (!isValidServings(draft.servings)) {
+		result.servings = 'Enter whole servings between 1 and 10,000.';
 		record('Servings');
 	}
 
@@ -307,8 +321,8 @@ export function validateRecipeDraftFields(
 	if (!draft.ingredients.length) {
 		result.ingredientsList = 'Add at least one ingredient.';
 		record('Ingredients');
-	} else if (draft.ingredients.length > 60) {
-		result.ingredientsList = 'Use 60 ingredients or fewer.';
+	} else if (draft.ingredients.length > MAX_DRAFT_INGREDIENTS) {
+		result.ingredientsList = `Use ${MAX_DRAFT_INGREDIENTS} ingredients or fewer.`;
 		record('Ingredients');
 	}
 
@@ -327,7 +341,7 @@ export function validateRecipeDraftFields(
 			typeof item.quantity !== 'number' ||
 			!Number.isFinite(item.quantity) ||
 			item.quantity <= 0 ||
-			item.quantity > 1_000_000
+			item.quantity > MAX_INGREDIENT_QUANTITY
 		) {
 			row.quantity = `Enter a quantity above 0 (up to 1,000,000) for ingredient ${index + 1}.`;
 			record(`Quantity for ingredient ${index + 1}`);
@@ -345,8 +359,8 @@ export function validateRecipeDraftFields(
 	if (!draft.steps.length) {
 		result.stepsList = 'Add at least one cooking step.';
 		record('Steps');
-	} else if (draft.steps.length > 40) {
-		result.stepsList = 'Use 40 cooking steps or fewer.';
+	} else if (draft.steps.length > MAX_DRAFT_STEPS) {
+		result.stepsList = `Use ${MAX_DRAFT_STEPS} cooking steps or fewer.`;
 		record('Steps');
 	}
 
@@ -367,7 +381,12 @@ export function validateRecipeDraftFields(
 
 	for (const [key, label] of NUTRITION_FIELDS) {
 		const value = draft.nutrition[key];
-		if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1_000_000) {
+		if (
+			typeof value !== 'number' ||
+			!Number.isFinite(value) ||
+			value < 0 ||
+			value > MAX_NUTRITION_VALUE
+		) {
 			result.nutrition[key] = `Enter ${label.toLowerCase()} between 0 and 1,000,000.`;
 			result.hasNutritionErrors = true;
 			record(label);

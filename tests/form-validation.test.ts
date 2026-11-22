@@ -15,6 +15,7 @@ import {
 	validatePassword,
 	validatePlannedServings,
 	validateRecipeDraftFields,
+	validateRecipeLink,
 	validateRegistrationName
 } from '../src/lib/form-validation.ts';
 
@@ -65,16 +66,23 @@ test('meal, leftover, pantry, invite, and auth validators enforce exact bounds',
 
 	assert.equal(validatePlannedServings(1), '');
 	assert.equal(validatePlannedServings(24), '');
-	assert.match(validatePlannedServings(0), /1 to 24/);
-	assert.match(validatePlannedServings(25), /1 to 24/);
-	assert.match(validatePlannedServings(2.5), /1 to 24/);
-	assert.match(validatePlannedServings(null), /1 to 24/);
+	assert.equal(validatePlannedServings(10_000), '');
+	assert.match(validatePlannedServings(0), /1 to 10,000/);
+	assert.match(validatePlannedServings(10_001), /1 to 10,000/);
+	assert.match(validatePlannedServings(2.5), /1 to 10,000/);
+	assert.match(validatePlannedServings(null), /1 to 10,000/);
 
 	assert.equal(validateLeftoverServings(0, 4), '');
 	assert.equal(validateLeftoverServings(4, 4), '');
 	assert.match(validateLeftoverServings(-1, 4), /0 to 4/);
 	assert.match(validateLeftoverServings(5, 4), /0 to 4/);
 	assert.match(validateLeftoverServings(1.5, 4), /0 to 4/);
+
+	assert.equal(validateRecipeLink(''), '');
+	assert.equal(validateRecipeLink('https://example.com/recipe'), '');
+	assert.equal(validateRecipeLink('http://example.com/recipe'), '');
+	assert.match(validateRecipeLink('ftp://example.com/recipe'), /http:\/\/ or https:\/\//);
+	assert.match(validateRecipeLink('not-a-link'), /http:\/\/ or https:\/\//);
 
 	assert.equal(validateRegistrationName('Ada Lovelace'), '');
 	assert.match(validateRegistrationName('A'), /2 to 80/);

@@ -1,17 +1,28 @@
 <script module lang="ts">
+	import {
+		createDraftBaseline,
+		MAX_SERVINGS,
+		NUTRITION_FIELDS,
+		validateRecipeDraft,
+		type RecipeDraftBaseline
+	} from '#lib/recipe-draft.ts';
 	import type { Recipe } from '#lib/types.ts';
 	export type ImportSession = {
+		url: string;
 		text: string;
 		photo: string;
 		photoName: string;
 		draft: Recipe | null;
+		baseline: RecipeDraftBaseline | null;
 		assumptions: string[];
 	};
 	export const emptyImportSession = (): ImportSession => ({
+		url: '',
 		text: '',
 		photo: '',
 		photoName: '',
 		draft: null,
+		baseline: null,
 		assumptions: []
 	});
 </script>
@@ -21,10 +32,10 @@
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
 	import { focusFirstInvalid } from '#lib/focus.ts';
 	import {
-		NUTRITION_FIELDS,
 		emptyRecipeDraftValidation,
 		fieldAria,
-		validateRecipeDraftFields
+		validateRecipeDraftFields,
+		validateRecipeLink
 	} from '#lib/form-validation.ts';
 	import { revealMotion } from '#lib/motion.ts';
 	import FormField from './FormField.svelte';
@@ -36,7 +47,7 @@
 	}: {
 		session: ImportSession;
 		capture: (
-			input: { prompt: string; image?: string },
+			input: { url?: string; prompt: string; image?: string },
 			signal: AbortSignal
 		) => Promise<{ recipe: Recipe; assumptions: string[] } | null>;
 		save: (recipe: Recipe) => void;
@@ -47,6 +58,7 @@
 	let reviewingDraft = $state(untrack(() => session.draft !== null));
 	let retryAvailable = $state(false);
 	let error = $state('');
+	let captureSubmitted = $state(false);
 	let draftSubmitted = $state(false);
 	let moreDetailsOpen = $state(false);
 	let nutritionOpen = $state(false);
@@ -57,14 +69,18 @@
 	let draftFormEl = $state<HTMLFormElement>();
 	let addIngredientButton = $state<HTMLButtonElement>();
 	let addStepButton = $state<HTMLButtonElement>();
+	let urlError = $derived(captureSubmitted ? validateRecipeLink(session.url) : '');
 	let draftValidation = $derived(
 		draftSubmitted && session.draft
 			? validateRecipeDraftFields(session.draft)
 			: emptyRecipeDraftValidation()
 	);
 	let showLinkFallbackHelp = $derived(
-		Boolean(error && /^https?:\/\/\S+$/.test(session.text.trim()))
+		Boolean(error && (session.url.trim() || /^https?:\/\/\S+$/i.test(session.text.trim())))
 	);
+	if (untrack(() => session.draft !== null && session.baseline === null)) {
+		session.baseline = untrack(() => createDraftBaseline(session.draft!));
+	}
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
@@ -113,6 +129,21 @@
 			void attachPhoto(photo);
 		}
 	}
+	function firstDroppedUrl(uriList: string): string {
+		for (const rawLine of uriList.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (!line || line.startsWith('#')) continue;
+			try {
+				const parsed = new URL(line);
+				if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+					return line.slice(0, 2048);
+				}
+			} catch {
+				// Ignore invalid lines in text/uri-list payloads.
+			}
+		}
+		return '';
+	}
 	function drop(event: DragEvent) {
 		event.preventDefault();
 		dragging = false;
@@ -122,21 +153,33 @@
 			void attachPhoto(file);
 			return;
 		}
-		const text =
-			event.dataTransfer?.getData('text/plain') ||
-			event.dataTransfer?.getData('text/uri-list') ||
-			'';
+		const droppedUrl = firstDroppedUrl(event.dataTransfer?.getData('text/uri-list') ?? '');
+		if (droppedUrl) {
+			session.url = droppedUrl;
+			return;
+		}
+		const text = event.dataTransfer?.getData('text/plain') || '';
 		if (text) session.text = [session.text, text].filter(Boolean).join('\n').slice(0, 20_000);
 	}
 	async function prepare(event: SubmitEvent) {
 		event.preventDefault();
 		if (busy || reading || !alive) return;
-		if (!session.text.trim() && !session.photo) {
-			error = 'Paste recipe text, a link, or add a photo before creating a draft.';
+		const url = session.url.trim();
+		const linkCheck = validateRecipeLink(url);
+		if (linkCheck) {
+			captureSubmitted = true;
+			error = '';
 			await tick();
 			focusFirstInvalid(captureFormEl);
 			return;
 		}
+		if (!url && !session.text.trim() && !session.photo) {
+			error = 'Add a recipe link, paste recipe text, or attach a photo before creating a draft.';
+			await tick();
+			focusFirstInvalid(captureFormEl);
+			return;
+		}
+		captureSubmitted = false;
 		error = '';
 		retryAvailable = false;
 		busy = true;
@@ -145,11 +188,16 @@
 		controller = currentController;
 		try {
 			const result = await capture(
-				{ prompt: session.text, ...(session.photo ? { image: session.photo } : {}) },
+				{
+					...(url ? { url } : {}),
+					prompt: session.text,
+					...(session.photo ? { image: session.photo } : {})
+				},
 				currentController.signal
 			);
 			if (alive && generation === captureGeneration && result) {
 				session.draft = result.recipe;
+				session.baseline = createDraftBaseline(result.recipe);
 				session.assumptions = result.assumptions;
 				draftSubmitted = false;
 				moreDetailsOpen = false;
@@ -206,24 +254,22 @@
 			}
 			return;
 		}
+		const validation = validateRecipeDraft(draft, {
+			baseline: session.baseline,
+			assumptions: session.assumptions
+		});
+		if (!validation.ok) {
+			if (validation.nutritionInvalid) nutritionOpen = true;
+			error = validation.error;
+			return;
+		}
 		draftSubmitted = false;
-		const ingredients = draft.ingredients.map((i) => ({
-			...i,
-			name: i.name.trim(),
-			unit: i.unit.trim()
-		}));
-		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
 		try {
 			save({
-				...draft,
-				title: draft.title.trim(),
+				...validation.recipe,
 				description: draft.description.trim(),
 				cuisine: draft.cuisine.trim(),
-				difficulty: draft.difficulty.trim(),
-				ingredients,
-				steps,
-				importNotes: [...session.assumptions],
-				saved: true
+				difficulty: draft.difficulty.trim()
 			});
 		} catch (e) {
 			error = (e as Error).message;
@@ -233,7 +279,9 @@
 
 {#if !reviewingDraft || !session.draft}
 	<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Import a recipe</h2>
-	<p class="muted capture-help">Paste a recipe, link, or rough ingredient notes.</p>
+	<p class="muted capture-help">
+		Add an optional recipe link to fetch, or paste a recipe and notes.
+	</p>
 	<form novalidate bind:this={captureFormEl} onsubmit={prepare}>
 		<div
 			class="recipe-dropzone"
@@ -248,11 +296,33 @@
 			ondrop={drop}
 		>
 			<FormField
-				id="import-recipe-text"
-				label="Recipe text or link"
+				id="import-recipe-url"
+				label="Recipe link (optional)"
 				helpIds={['import-source-help', showLinkFallbackHelp ? 'import-link-help' : undefined]}
-				errorId={error ? 'import-capture-error' : undefined}
-				invalid={Boolean(error)}
+				error={urlError}
+				errorId={!urlError && error && Boolean(session.url.trim())
+					? 'import-capture-error'
+					: undefined}
+				invalid={Boolean(urlError || (error && session.url.trim()))}
+				alert={!error}
+			>
+				{#snippet children(field)}
+					<input
+						type="url"
+						bind:value={session.url}
+						maxlength="2048"
+						placeholder="https://example.com/recipe"
+						disabled={busy}
+						{...field}
+					/>
+				{/snippet}
+			</FormField>
+			<FormField
+				id="import-recipe-text"
+				label="Recipe text or notes"
+				helpIds={['import-source-help', showLinkFallbackHelp ? 'import-link-help' : undefined]}
+				errorId={error && !session.url.trim() ? 'import-capture-error' : undefined}
+				invalid={Boolean(error && !session.url.trim())}
 			>
 				{#snippet children(field)}
 					<textarea
@@ -260,7 +330,7 @@
 						onpaste={paste}
 						maxlength="20000"
 						rows="6"
-						placeholder={'Paste anything here…\n\nOr try: chickpeas, tomatoes, spinach. Make a quick dinner for two.'}
+						placeholder={'Paste recipe text or notes for a linked page…\n\nOr try: chickpeas, tomatoes, spinach. Make a quick dinner for two.'}
 						disabled={busy}
 						{...field}></textarea>
 				{/snippet}
@@ -286,13 +356,14 @@
 				<button class="secondary" type="button" onclick={dictate} disabled={busy || reading}
 					><Mic size={18} />Use voice</button
 				>
-				{#if session.text || session.photo}<button
+				{#if session.url || session.text || session.photo}<button
 						type="button"
 						class="text-button"
 						disabled={busy || reading}
 						onclick={() => {
 							session = emptyImportSession();
 							error = '';
+							captureSubmitted = false;
 							draftSubmitted = false;
 							retryAvailable = false;
 						}}>Clear</button
@@ -320,7 +391,9 @@
 			<button
 				class="primary full"
 				type="submit"
-				disabled={busy || reading || (!session.text.trim() && !session.photo)}
+				disabled={busy ||
+					reading ||
+					(!session.url.trim() && !session.text.trim() && !session.photo)}
 				aria-busy={busy}
 				>{busy ? 'Making your draft…' : retryAvailable ? 'Try again' : 'Create recipe draft'}<Check
 					size={18}
@@ -363,7 +436,7 @@
 						type="number"
 						bind:value={draft.servings}
 						min="1"
-						max="10000"
+						max={MAX_SERVINGS}
 						step="1"
 						{...field}
 					/>
@@ -533,6 +606,7 @@
 			onclick={() => {
 				session = emptyImportSession();
 				error = '';
+				captureSubmitted = false;
 				draftSubmitted = false;
 				moreDetailsOpen = false;
 				nutritionOpen = false;
@@ -542,6 +616,10 @@
 		>
 		{#if draft.source}<p class="muted">
 				<a href={draft.source} target="_blank" rel="noreferrer">Original source</a>
+			</p>{:else}<p class="muted">
+				{draft.provenance === 'web-import'
+					? 'Imported from a recipe webpage.'
+					: 'AI-generated from your input — no recipe webpage was fetched.'}
 			</p>{/if}
 		{#if error || draftValidation.summary}<p class="error" role="alert">
 				{error || draftValidation.summary}

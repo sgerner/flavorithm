@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
+	import { MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
@@ -137,7 +138,7 @@
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
 			<p class="field-help" id={servingsAria.helpId}>
-				Enter 1–24 whole servings to scale ingredients, plan, or shop.
+				Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} whole servings to scale ingredients, plan, or shop.
 			</p>
 			{#if servingsError}<p class="error" id={servingsAria.errorId} role="alert">
 					{servingsError}
@@ -157,7 +158,7 @@
 									aria-label="Servings"
 									type="number"
 									min="1"
-									max="24"
+									max={MAX_SERVINGS}
 									step="1"
 									bind:value={servingCount}
 									{...servingsAria.props}
@@ -294,6 +295,9 @@
 		min-height: 44px;
 		padding-inline: 12px;
 		white-space: nowrap;
+	}
+	.servings input {
+		width: 76px;
 	}
 	.nutrition-stale {
 		padding: 10px 12px;
