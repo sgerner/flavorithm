@@ -341,3 +341,45 @@ test('offscreen and mobile recipe covers lazy load, decode asynchronously, decla
 	for (const listener of listeners) listener();
 	assert.equal(withMatchMedia.mobileCalendar, true);
 });
+
+test('solo recipe covers block solo leave and unconfirmed household join without losing bytes or invites', async () => {
+	const { user: solo } = await backend.registerUser(
+		'Solo Cover Cook',
+		'solo-cover@example.com',
+		'secure solo cover password'
+	);
+	const { user: partner } = await backend.registerUser(
+		'Partner Cook',
+		'partner-cover@example.com',
+		'secure partner cover password'
+	);
+	const soloHouseholdId = solo.householdId;
+	const coverPath = await storeCover(
+		soloHouseholdId,
+		await sharp({ create: { width: 40, height: 40, channels: 3, background: '#557744' } })
+			.jpeg()
+			.toBuffer()
+	);
+	const coverId = coverPath.split('/').at(-1)!;
+	assert.ok(readCover(soloHouseholdId, coverId));
+
+	assert.throws(() => backend.leaveHousehold(solo), { status: 400 });
+	assert.ok(readCover(soloHouseholdId, coverId));
+
+	const invite = backend.createHouseholdInvite(partner);
+	assert.throws(() => backend.joinHousehold(solo, invite.inviteCode), {
+		status: 409,
+		code: 'confirm_replace'
+	});
+	assert.ok(readCover(soloHouseholdId, coverId));
+
+	const inviteRow = backend
+		.getDatabase()
+		.prepare('SELECT uses_remaining FROM household_invites WHERE invite_id = ?')
+		.get(invite.inviteId) as { uses_remaining: number };
+	assert.equal(inviteRow.uses_remaining, 1);
+
+	const joined = backend.joinHousehold(solo, invite.inviteCode, { confirmReplace: true });
+	assert.equal(joined.householdId, partner.householdId);
+	assert.equal(readCover(soloHouseholdId, coverId), undefined);
+});
