@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createNewUserState, seedRecipes } from '#lib/data.ts';
-import { insertRecipes, MAX_RECIPES } from '#lib/recipe-collection.ts';
+import {
+	createBlankRecipe,
+	finalizeManualRecipe,
+	hasZeroNutrition,
+	insertRecipes,
+	MAX_RECIPES
+} from '#lib/recipe-collection.ts';
 
 process.env.FLAVORITHM_DB_PATH = ':memory:';
 const { validateAppState } = await import('#lib/server/db.ts');
@@ -44,4 +50,49 @@ test('generation batches are atomic and replacing an existing ID needs no extra 
 	assert.equal(updated[0].title, 'Updated recipe');
 	assert.equal(updated.filter((item) => item.id === 'a').length, 1);
 	assert.ok(validateAppState({ ...createNewUserState(), recipes: updated }));
+});
+
+test('blank recipe starts with expected defaults and zeroed nutrition', () => {
+	const blank = createBlankRecipe('manual-blank');
+	assert.equal(blank.id, 'manual-blank');
+	assert.equal(blank.title, '');
+	assert.equal(blank.time, 30);
+	assert.equal(blank.servings, 2);
+	assert.deepEqual(blank.tags, []);
+	assert.deepEqual(blank.ingredients, [{ name: '', quantity: 1, unit: 'piece' }]);
+	assert.deepEqual(blank.steps, ['']);
+	assert.equal(hasZeroNutrition(blank.nutrition), true);
+});
+
+test('finalizeManualRecipe sets manual provenance, saved flag, and stale nutrition only when zeroed', () => {
+	const zeroDraft = {
+		...createBlankRecipe('grandma-stew'),
+		title: 'Grandma’s Beef Stew',
+		cuisine: 'Homestyle',
+		difficulty: 'Easy',
+		tags: ['comfort', 'family'],
+		ingredients: [{ name: 'beef chuck', quantity: 2, unit: 'lb' }],
+		steps: ['Simmer gently until tender.']
+	};
+	const savedZero = finalizeManualRecipe(zeroDraft);
+	assert.equal(savedZero.provenance, 'manual');
+	assert.equal(savedZero.saved, true);
+	assert.equal(savedZero.nutritionStale, true);
+
+	const inserted = insertRecipes(collection(2), [savedZero]);
+	assert.equal(inserted[0].id, 'grandma-stew');
+	assert.ok(validateAppState({ ...createNewUserState(), recipes: inserted }));
+
+	const withNutrition = finalizeManualRecipe({
+		...zeroDraft,
+		id: 'grandma-stew-nutrition',
+		nutrition: { ...zeroDraft.nutrition, calories: 480, protein: 38 }
+	});
+	assert.equal(withNutrition.provenance, 'manual');
+	assert.equal(withNutrition.saved, true);
+	assert.equal(withNutrition.nutritionStale, false);
+	assert.ok(validateAppState({ ...createNewUserState(), recipes: [withNutrition] }));
+
+	const full = collection(MAX_RECIPES);
+	assert.throws(() => insertRecipes(full, [savedZero]), /250 recipes/);
 });
