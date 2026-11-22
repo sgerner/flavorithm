@@ -28,6 +28,10 @@ function isPublicAuthRequest(
 	return pathname === '/api/auth' && (request.method === 'GET' || mode === 'local');
 }
 
+function isHostedChatGPTCallbackRequest(request: Request, pathname: string): boolean {
+	return pathname === '/api/connections/chatgpt/callback' && request.method === 'GET';
+}
+
 function isFrameworkAsset(pathname: string): boolean {
 	return (
 		pathname.startsWith('/_app/') ||
@@ -72,6 +76,18 @@ function ensureNoStore(response: Response): void {
 	if (!alreadyNoStore) response.headers.set('Cache-Control', 'no-store, max-age=0');
 }
 
+function hasExplicitPrivateMaxAge(pathname: string, response: Response): boolean {
+	if (pathname !== '/api/models' || !response.ok) return false;
+	const directives = (response.headers.get('Cache-Control') ?? '')
+		.split(',')
+		.map((directive) => directive.trim().toLowerCase());
+	return (
+		directives.includes('private') &&
+		!directives.includes('no-store') &&
+		directives.some((directive) => /^max-age=[1-9]\d*$/.test(directive))
+	);
+}
+
 function withSecurityHeaders(
 	response: Response,
 	request: Request,
@@ -88,13 +104,19 @@ function withSecurityHeaders(
 	if (new URL(request.url).protocol === 'https:' || forwardedProto === 'https') {
 		response.headers.set('Strict-Transport-Security', 'max-age=31536000');
 	}
+	const preservePrivateCache = hasExplicitPrivateMaxAge(pathname, response);
 	if (isApiPath(pathname)) {
-		ensureNoStore(response);
-		response.headers.set('Pragma', 'no-cache');
-		response.headers.set('Expires', '0');
+		if (preservePrivateCache) {
+			response.headers.delete('Pragma');
+			response.headers.delete('Expires');
+		} else {
+			ensureNoStore(response);
+			response.headers.set('Pragma', 'no-cache');
+			response.headers.set('Expires', '0');
+		}
 	}
 	if (pathname.startsWith('/auth/')) response.headers.set('Cache-Control', 'no-store');
-	if (authMode === 'oidc' || authMode === 'proxy') {
+	if ((authMode === 'oidc' || authMode === 'proxy') && !preservePrivateCache) {
 		ensureNoStore(response);
 	}
 	return response;
@@ -105,7 +127,9 @@ export const handle: Handle = async ({ event, resolve }) => {
 	event.locals.authMode = mode ?? 'invalid';
 	const path = event.url.pathname;
 	const api = isApiPath(path);
-	const publicAuthRequest = isPublicAuthRequest(event.request, path, event.locals.authMode);
+	const publicRequest =
+		isPublicAuthRequest(event.request, path, event.locals.authMode) ||
+		isHostedChatGPTCallbackRequest(event.request, path);
 	let response: Response;
 
 	if (!mode) {
@@ -119,6 +143,8 @@ export const handle: Handle = async ({ event, resolve }) => {
 			// The cookie name is shared for compatibility with the existing app, but
 			// only a session created for this configured issuer and client is accepted.
 			event.locals.user = getSsoUserFromSession(event.cookies.get(SESSION_COOKIE));
+		} else if (isFrameworkAsset(path)) {
+			event.locals.user = null;
 		} else {
 			const identity = authenticateProxyRequest(event.request);
 			event.locals.user = identity?.user ?? null;
@@ -129,12 +155,14 @@ export const handle: Handle = async ({ event, resolve }) => {
 					issuer: identity.issuer,
 					subject: identity.subject
 				});
-				setOidcSessionCookie(
-					event.cookies,
-					binding.token,
-					binding.expiresAt,
-					requestOriginIsSecure(event.url, event.request)
-				);
+				if (binding.setCookie) {
+					setOidcSessionCookie(
+						event.cookies,
+						binding.token,
+						binding.expiresAt,
+						requestOriginIsSecure(event.url, event.request)
+					);
+				}
 			} else {
 				// A binding cookie is never an identity credential. Removing it when
 				// the proxy assertion is absent makes that boundary explicit.
@@ -143,11 +171,11 @@ export const handle: Handle = async ({ event, resolve }) => {
 			}
 		}
 
-		if (api && !publicAuthRequest && !event.locals.user) {
+		if (api && !publicRequest && !event.locals.user) {
 			response = unauthorizedApiResponse();
 		} else if (
 			!event.locals.user &&
-			!publicAuthRequest &&
+			!publicRequest &&
 			mode === 'oidc' &&
 			!isAuthPath(path) &&
 			!isFrameworkAsset(path)
@@ -166,7 +194,7 @@ export const handle: Handle = async ({ event, resolve }) => {
 			}
 		} else if (
 			!event.locals.user &&
-			!publicAuthRequest &&
+			!publicRequest &&
 			mode === 'proxy' &&
 			!isAuthPath(path) &&
 			!isFrameworkAsset(path)

@@ -6,7 +6,7 @@ import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
-const quantity = z.number().finite().nonnegative().max(1000000);
+const quantity = z.number().nonnegative().max(1000000);
 const nutrition = z.object({
 	calories: quantity,
 	fat: quantity,
@@ -33,7 +33,7 @@ const recipe = z.object({
 			'Use an HTTP image URL or a recipe cover.'
 		),
 	time: quantity,
-	servings: z.number().finite().min(1).max(10000),
+	servings: z.number().min(1).max(10000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -52,14 +52,6 @@ const recipe = z.object({
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
-const pantry = z.object({
-	id,
-	name: z.string().trim().min(1).max(200),
-	quantity,
-	unit: z.string().max(40),
-	category: z.string().max(80),
-	expires: z.string().max(40).optional()
-});
 const date = z
 	.string()
 	.regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -67,13 +59,21 @@ const date = z
 		const d = new Date(value + 'T12:00:00Z');
 		return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === value;
 	}, 'Use a real calendar date.');
+const pantry = z.object({
+	id,
+	name: z.string().trim().min(1).max(200),
+	quantity,
+	unit: z.string().max(40),
+	category: z.string().max(80),
+	expires: z.union([date, z.literal('')]).optional()
+});
 const meal = z.object({
 	id,
 	date,
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
-	servings: z.number().finite().min(1).max(10000),
-	completedAt: z.string().datetime().optional(),
+	servings: z.number().min(1).max(10000),
+	completedAt: z.iso.datetime().optional(),
 	leftoverServings: quantity.optional()
 });
 const shopping = z.object({
@@ -88,7 +88,7 @@ const preferences = z
 	.object({
 		diet: z.string().max(200),
 		allergies: z.string().max(500),
-		maxTime: z.number().finite().nonnegative().max(100000),
+		maxTime: z.number().nonnegative().max(100000),
 		complexity: z.string().max(80),
 		cuisines: z.array(z.string().max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
@@ -184,6 +184,8 @@ function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
 function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
+	const start = new Date(startKey + 'T12:00:00');
+	if (!Number.isFinite(start.getTime()) || calendarKey(start) !== startKey) return;
 	const end = new Date(startKey + 'T12:00:00');
 	end.setDate(end.getDate() + 6);
 	const endKey = calendarKey(end);
@@ -206,6 +208,7 @@ export function applyButlerCommands(
 	const commands = z.array(ButlerCommandSchema).max(50).parse(input);
 	let state = structuredClone(current);
 	const effects: ButlerEffect[] = [];
+	const deletedCheckedWeeks = new Set<string>();
 	for (const command of commands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
@@ -230,7 +233,9 @@ export function applyButlerCommands(
 				requireId(state.recipes, command.id);
 				state.recipes = state.recipes.filter((item) => item.id !== command.id);
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
-				state.shopping = state.shopping.filter((item) => item.sourceKey !== `recipe:${command.id}`);
+				state.shopping = state.shopping.filter(
+					(item) => item.sourceKey !== `recipe:${command.id}` || item.checked
+				);
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
 				break;
 			case 'pantry.upsert':
@@ -272,10 +277,16 @@ export function applyButlerCommands(
 			case 'shopping.upsert':
 				state.shopping = upsert(state.shopping, command.item);
 				break;
-			case 'shopping.delete':
+			case 'shopping.delete': {
 				requireId(state.shopping, command.id);
+				const removed = state.shopping.find((item) => item.id === command.id);
+				const week = removed?.checked
+					? removed.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1]
+					: undefined;
+				if (week) deletedCheckedWeeks.add(week);
 				state.shopping = state.shopping.filter((item) => item.id !== command.id);
 				break;
+			}
 			case 'shopping.generate': {
 				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
@@ -295,6 +306,7 @@ export function applyButlerCommands(
 				break;
 		}
 	}
+	const weeks = new Set(deletedCheckedWeeks);
 	if (
 		commands.some(
 			(command) =>
@@ -302,13 +314,12 @@ export function applyButlerCommands(
 				command.type.startsWith('meal.')
 		)
 	) {
-		const weeks = new Set(
-			state.shopping.flatMap(
-				(item) => item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1] ?? []
-			)
-		);
-		for (const week of weeks) refreshShoppingWeek(state, week, now);
+		for (const item of state.shopping) {
+			const week = item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1];
+			if (week) weeks.add(week);
+		}
 	}
+	for (const week of weeks) refreshShoppingWeek(state, week, now);
 	if (
 		state.recipes.length > MAX_RECIPES ||
 		state.pantry.length > 1000 ||

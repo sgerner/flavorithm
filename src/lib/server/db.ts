@@ -2,6 +2,7 @@ import { randomBytes, scrypt as scryptCallback, createHash, timingSafeEqual } fr
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { createNewUserState } from '#lib/data.ts';
 import { COVER_PATH } from '#lib/cover-upload.ts';
@@ -78,6 +79,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
   CREATE TABLE IF NOT EXISTS external_identities (
     issuer TEXT NOT NULL,
@@ -105,6 +107,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS password_reset_user_idx ON password_reset_tokens(user_id);
   CREATE INDEX IF NOT EXISTS password_reset_expiry_idx ON password_reset_tokens(expires_at);
   CREATE TABLE IF NOT EXISTS household_invites (
     code_hash TEXT PRIMARY KEY,
@@ -114,6 +117,8 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     uses_remaining INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS household_invites_household_expiry_idx ON household_invites(household_id, expires_at);
+  CREATE INDEX IF NOT EXISTS household_invites_created_by_idx ON household_invites(created_by);
   CREATE INDEX IF NOT EXISTS household_invites_expiry_idx ON household_invites(expires_at);
   CREATE TABLE IF NOT EXISTS email_verification_tokens (
     token_hash TEXT PRIMARY KEY,
@@ -121,6 +126,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS email_verification_user_idx ON email_verification_tokens(user_id);
   CREATE INDEX IF NOT EXISTS email_verification_expiry_idx ON email_verification_tokens(expires_at);
 `);
 
@@ -184,19 +190,19 @@ function deriveScrypt(password: string, salt: Buffer, length: number): Promise<B
 }
 
 const nutritionSchema = z.object({
-	calories: z.number().finite().min(0).max(1_000_000),
-	fat: z.number().finite().min(0).max(1_000_000),
-	saturatedFat: z.number().finite().min(0).max(1_000_000),
-	sodium: z.number().finite().min(0).max(1_000_000),
-	carbs: z.number().finite().min(0).max(1_000_000),
-	fiber: z.number().finite().min(0).max(1_000_000),
-	sugar: z.number().finite().min(0).max(1_000_000),
-	protein: z.number().finite().min(0).max(1_000_000)
+	calories: z.number().min(0).max(1_000_000),
+	fat: z.number().min(0).max(1_000_000),
+	saturatedFat: z.number().min(0).max(1_000_000),
+	sodium: z.number().min(0).max(1_000_000),
+	carbs: z.number().min(0).max(1_000_000),
+	fiber: z.number().min(0).max(1_000_000),
+	sugar: z.number().min(0).max(1_000_000),
+	protein: z.number().min(0).max(1_000_000)
 });
 
 const recipeIngredientSchema = z.object({
 	name: z.string().trim().min(1).max(200),
-	quantity: z.number().finite().min(0).max(1_000_000),
+	quantity: z.number().min(0).max(1_000_000),
 	unit: z.string().max(40)
 });
 
@@ -218,8 +224,8 @@ const recipeSchema = z.object({
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
 	image: z.union([publicUrlSchema, z.string().regex(COVER_PATH)]),
-	time: z.number().finite().min(0).max(100_000),
-	servings: z.number().finite().min(1).max(10_000),
+	time: z.number().min(0).max(100_000),
+	servings: z.number().min(1).max(10_000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -230,7 +236,7 @@ const recipeSchema = z.object({
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -238,7 +244,7 @@ const recipeSchema = z.object({
 const preferencesSchema = z.object({
 	diet: z.string().max(200),
 	allergies: z.string().max(2_000),
-	maxTime: z.number().finite().min(0).max(100_000),
+	maxTime: z.number().min(0).max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
 	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
@@ -257,7 +263,7 @@ const preferencesSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
-	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
+	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
 const appStateSchema = z.object({
@@ -266,7 +272,7 @@ const appStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				category: z.string().max(100),
 				expires: z.string().max(50).optional()
@@ -281,9 +287,9 @@ const appStateSchema = z.object({
 				date: z.string().max(50),
 				slot: z.string().max(100),
 				recipeId: z.string().max(100),
-				servings: z.number().finite().min(1).max(10_000),
+				servings: z.number().min(1).max(10_000),
 				completedAt: z.string().max(50).optional(),
-				leftoverServings: z.number().finite().min(0).max(10_000).optional()
+				leftoverServings: z.number().min(0).max(10_000).optional()
 			})
 		)
 		.max(1_000),
@@ -292,7 +298,7 @@ const appStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				checked: z.boolean(),
 				sourceKey: z.string().max(200).optional()
@@ -324,11 +330,13 @@ export async function readJson(request: Request): Promise<unknown> {
 
 export class ApiError extends Error {
 	readonly status: number;
+	readonly code?: string;
 
-	constructor(status: number, message: string) {
+	constructor(status: number, message: string, code?: string) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
+		if (code) this.code = code;
 	}
 }
 
@@ -336,13 +344,27 @@ export function errorResponse(error: unknown): Response {
 	const status = error instanceof ApiError ? error.status : 500;
 	const message = error instanceof ApiError ? error.message : 'An unexpected server error occurred';
 	if (status === 500) console.error('API request failed:', error);
-	return Response.json({ error: message }, { status });
+	return Response.json(
+		error instanceof ApiError && error.code
+			? { error: message, code: error.code }
+			: { error: message },
+		{ status }
+	);
 }
 
 export function assertSameOrigin(request: Request): void {
 	const origin = request.headers.get('origin');
 	if (origin && origin !== new URL(request.url).origin)
 		throw new ApiError(403, 'Cross-origin request rejected');
+}
+
+export function clientAddress(event: { getClientAddress?: () => string }): string | null {
+	try {
+		const address = event.getClientAddress?.().trim();
+		return address ? address : null;
+	} catch {
+		return null;
+	}
 }
 
 type DbUserRow = {
@@ -563,40 +585,48 @@ export function ensureProxyBindingSession(
 	issuer: string,
 	subject: string,
 	ttlMs: number
-): { token: string; expiresAt: number } {
+): { token: string; expiresAt: number; setCookie: boolean } {
 	const now = Date.now();
 	if (currentToken && currentToken.length <= 200) {
 		const tokenHash = hashToken(currentToken);
-		const activeProxyBinding = db
-			.prepare(
-				`SELECT issuer, subject FROM sessions
-				 WHERE token_hash = ? AND auth_source = 'proxy' AND expires_at > ?`
-			)
-			.get(tokenHash, now) as { issuer: string | null; subject: string | null } | undefined;
 		const existing = db
 			.prepare(
-				`SELECT 1 AS active FROM sessions
-				 WHERE token_hash = ? AND user_id = ? AND auth_source = 'proxy'
-				   AND issuer = ? AND subject = ? AND expires_at > ?`
+				`SELECT user_id, issuer, subject, expires_at
+				 FROM sessions
+				 WHERE token_hash = ? AND auth_source = 'proxy'`
 			)
-			.get(tokenHash, user.id, issuer, subject, now) as { active: number } | undefined;
+			.get(tokenHash) as
+			| {
+					user_id: string;
+					issuer: string | null;
+					subject: string | null;
+					expires_at: number;
+			  }
+			| undefined;
 		if (existing) {
-			const expiresAt = now + ttlMs;
-			db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?').run(
-				expiresAt,
-				tokenHash
-			);
-			return { token: currentToken, expiresAt };
-		}
-		if (activeProxyBinding) {
-			// Identity changes revoke the previous binding so an outstanding OAuth
-			// callback cannot be completed under a different proxy identity.
+			if (
+				existing.user_id === user.id &&
+				existing.issuer === issuer &&
+				existing.subject === subject &&
+				existing.expires_at > now
+			) {
+				if (existing.expires_at - now >= ttlMs / 2) {
+					return { token: currentToken, expiresAt: existing.expires_at, setCookie: false };
+				}
+				const expiresAt = now + ttlMs;
+				db.prepare(
+					"UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND auth_source = 'proxy'"
+				).run(expiresAt, tokenHash);
+				return { token: currentToken, expiresAt, setCookie: true };
+			}
+			// Identity changes or expired bindings revoke the previous binding so an
+			// outstanding OAuth callback cannot be completed under a different proxy identity.
 			db.prepare("DELETE FROM sessions WHERE token_hash = ? AND auth_source = 'proxy'").run(
 				tokenHash
 			);
 		}
 	}
-	return createSession(user, 'proxy', issuer, subject, undefined, ttlMs);
+	return { ...createSession(user, 'proxy', issuer, subject, undefined, ttlMs), setCookie: true };
 }
 
 export function revokeProxyBindingSession(token: string | undefined): void {
@@ -701,10 +731,37 @@ export function resolveExternalIdentity(input: {
 	if (!issuer || issuer.length > 2_000 || !subject || subject.length > 500) {
 		throw new ApiError(401, 'The identity provider returned an invalid identity');
 	}
-	if (email.length > 254 || !z.string().email().safeParse(email).success) {
+	if (email.length > 254 || !z.email().safeParse(email).success) {
 		throw new ApiError(401, 'The identity provider did not provide a valid email address');
 	}
 	const now = Date.now();
+	const existingIdentity = db
+		.prepare(
+			`SELECT users.id, users.name, users.email, users.household_id, users.email_verified_at,
+			        external_identities.email AS external_email
+			 FROM external_identities JOIN users ON users.id = external_identities.user_id
+			 WHERE external_identities.issuer = ? AND external_identities.subject = ?`
+		)
+		.get(issuer, subject) as (DbUserRow & { external_email: string }) | undefined;
+	if (existingIdentity) {
+		const emailChanged = existingIdentity.email.toLowerCase() !== email;
+		const emailVerifiedAt = emailChanged
+			? input.emailVerified
+				? now
+				: null
+			: input.emailVerified
+				? (existingIdentity.email_verified_at ?? now)
+				: (existingIdentity.email_verified_at ?? null);
+		if (
+			existingIdentity.name === name &&
+			existingIdentity.email === email &&
+			existingIdentity.external_email === email &&
+			(existingIdentity.email_verified_at ?? null) === emailVerifiedAt
+		) {
+			return toUser(existingIdentity);
+		}
+	}
+
 	db.exec('BEGIN IMMEDIATE');
 	try {
 		const identity = db
@@ -1240,15 +1297,59 @@ export function revokeHouseholdInvite(user: User, inviteId: string): void {
 	if (Number(result.changes) === 0) throw new ApiError(404, 'Invitation not found');
 }
 
-function makePersonalHousehold(user: User): string {
+const starterRecipesById = new Map(
+	createNewUserState().recipes.map((recipe) => {
+		const { rating: _rating, ...rest } = recipe;
+		return [recipe.id, rest];
+	})
+);
+
+function isPopulatedHousehold(householdId: string): boolean {
+	const hasCoversTable = Boolean(
+		db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recipe_covers'").get()
+	);
+	if (
+		hasCoversTable &&
+		db.prepare('SELECT 1 FROM recipe_covers WHERE household_id = ? LIMIT 1').get(householdId)
+	) {
+		return true;
+	}
+	const row = db
+		.prepare('SELECT state_json FROM household_state WHERE household_id = ?')
+		.get(householdId) as { state_json: string } | undefined;
+	if (!row) return false;
+	try {
+		const shared = JSON.parse(row.state_json) as Omit<AppState, 'preferences'>;
+		if ((shared.pantry?.length ?? 0) > 0) return true;
+		if ((shared.meals?.length ?? 0) > 0) return true;
+		if ((shared.shopping?.length ?? 0) > 0) return true;
+		for (const recipe of shared.recipes ?? []) {
+			if (recipe.saved) return true;
+			const starter = starterRecipesById.get(recipe.id);
+			if (!starter) return true;
+			const { rating: _rating, ...comparable } = recipe;
+			if (!isDeepStrictEqual({ ...comparable, saved: false }, starter)) return true;
+		}
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+function makePersonalHousehold(user: Pick<User, 'id' | 'name'>): string {
 	const householdId = id();
+	const now = Date.now();
+	const { preferences: _preferences, ...initialSharedState } = createNewUserState();
 	db.prepare('INSERT INTO households(id, name, owner_id, created_at) VALUES (?, ?, ?, ?)').run(
 		householdId,
 		`${user.name}’s household`,
 		user.id,
-		Date.now()
+		now
 	);
 	db.prepare('UPDATE users SET household_id = ? WHERE id = ?').run(householdId, user.id);
+	db.prepare(
+		'INSERT INTO household_state(household_id, state_json, version, updated_at) VALUES (?, ?, 1, ?)'
+	).run(householdId, JSON.stringify(initialSharedState), now);
 	return householdId;
 }
 
@@ -1266,7 +1367,12 @@ function removeUserFromOldHousehold(user: User, oldHouseholdId: string): void {
 	else db.prepare('DELETE FROM households WHERE id = ?').run(oldHouseholdId);
 }
 
-export function joinHousehold(user: User, rawCode: string): User {
+export function joinHousehold(
+	user: User,
+	rawCode: string,
+	options: boolean | { confirmReplace?: boolean } = false
+): User {
+	const confirmReplace = typeof options === 'boolean' ? options : Boolean(options?.confirmReplace);
 	const code = rawCode.trim();
 	if (code.length < 8 || code.length > 100)
 		throw new ApiError(400, 'Invalid or expired invite code');
@@ -1285,6 +1391,18 @@ export function joinHousehold(user: User, rawCode: string): User {
 		if (invite.household_id === user.householdId)
 			throw new ApiError(409, 'You are already in this household');
 		const oldHouseholdId = user.householdId;
+		const memberCount = (
+			db
+				.prepare('SELECT COUNT(*) AS count FROM users WHERE household_id = ?')
+				.get(oldHouseholdId) as { count: number }
+		).count;
+		if (memberCount <= 1 && !confirmReplace && isPopulatedHousehold(oldHouseholdId)) {
+			throw new ApiError(
+				409,
+				'Joining another household will replace your personal kitchen. Export a backup or confirm to continue.',
+				'confirm_replace'
+			);
+		}
 		db.prepare('UPDATE users SET household_id = ? WHERE id = ?').run(invite.household_id, user.id);
 		db.prepare(
 			'UPDATE household_invites SET uses_remaining = uses_remaining - 1 WHERE code_hash = ?'
@@ -1302,8 +1420,16 @@ export function leaveHousehold(user: User): User {
 	const oldHouseholdId = user.householdId;
 	db.exec('BEGIN IMMEDIATE');
 	try {
-		assertCurrentHousehold(user);
-		makePersonalHousehold(user);
+		const current = assertCurrentHousehold(user);
+		const memberCount = (
+			db
+				.prepare('SELECT COUNT(*) AS count FROM users WHERE household_id = ?')
+				.get(oldHouseholdId) as { count: number }
+		).count;
+		if (memberCount <= 1) {
+			throw new ApiError(400, 'You already have your own personal kitchen');
+		}
+		makePersonalHousehold({ id: current.id, name: current.name });
 		removeUserFromOldHousehold(user, oldHouseholdId);
 		db.exec('COMMIT');
 	} catch (error) {

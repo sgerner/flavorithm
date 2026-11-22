@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { generateKeyPair } from 'jose';
 import { exportJWK, SignJWT } from 'jose';
 import { test } from 'node:test';
@@ -10,9 +11,11 @@ process.env.ORIGIN = 'https://kitchen.example.test';
 const dbPath = '../src/lib/server/db.ts';
 const ssoPath = '../src/lib/server/sso.ts';
 const hooksPath = '../src/hooks.server.ts';
+const authRoutePath = '../src/routes/api/auth/+server.ts';
 const backend = await import(dbPath);
 const sso = await import(ssoPath);
 const { handle } = await import(hooksPath);
+const authRoute = await import(authRoutePath);
 
 const proxySecret = 'sso-test-shared-secret-long-enough-for-timing-safe-checks';
 const oidcIssuer = 'https://idp.example.test/application/o/flavorithm/';
@@ -515,11 +518,21 @@ test('OIDC ignores local cookies, redirects HTML to login, and returns JSON 401 
 	assert.equal(api.response.status, 401);
 	assert.match(api.response.headers.get('content-type') ?? '', /application\/json/);
 
+	const oidcProbe = await runHook({ url: 'https://kitchen.example.test/api/auth' });
+	assert.equal(oidcProbe.response.status, 200);
+	assert.deepEqual(await oidcProbe.response.json(), {
+		user: null,
+		authMode: 'oidc'
+	});
+
 	process.env.FLAVORITHM_AUTH_MODE = '';
 	assert.equal(sso.getAuthMode(), null, 'an explicitly empty auth mode is invalid');
 	const invalid = await runHook({ url: 'https://kitchen.example.test/api/state' });
 	assert.equal(invalid.response.status, 503);
 	assert.equal(invalid.event.locals.authMode, 'invalid');
+	const invalidProbe = await runHook({ url: 'https://kitchen.example.test/api/auth' });
+	assert.equal(invalidProbe.response.status, 503);
+	assert.equal(invalidProbe.event.locals.authMode, 'invalid');
 });
 
 test('SSO configuration fails closed for missing secrets, insecure origins, and invalid bounds', () => {
@@ -550,5 +563,493 @@ test('SSO configuration fails closed for missing secrets, insecure origins, and 
 		sso.isAuthModeConfigured('oidc'),
 		false,
 		'session bounds must stay between 5 minutes and 24 hours'
+	);
+});
+
+test('container healthcheck targets GET /api/auth, returns 200 in valid modes, and returns 503 when auth is broken', async () => {
+	const composeYaml = readFileSync(new URL('../compose.yml', import.meta.url), 'utf8');
+	const probeMatch = composeYaml.match(/fetch\('([^']+)'\)/);
+	assert.ok(probeMatch, 'compose.yml must define a fetch-based healthcheck probe');
+	const probeUrl = new URL(probeMatch[1]);
+	assert.equal(probeUrl.href, 'http://127.0.0.1:3000/api/auth');
+	assert.ok(!composeYaml.includes('/manifest.webmanifest'));
+
+	async function runHealthcheckProbe(): Promise<Response> {
+		const jar = cookieJar();
+		const request = new Request(`https://kitchen.example.test${probeUrl.pathname}`, {
+			method: 'GET'
+		});
+		const event = {
+			request,
+			url: new URL(request.url),
+			cookies: jar.cookies,
+			locals: { user: null as unknown, authMode: 'invalid' }
+		};
+		return handle({
+			event,
+			resolve: (resolvedEvent: typeof event) => authRoute.GET(resolvedEvent as never)
+		} as never);
+	}
+
+	process.env.ORIGIN = 'https://kitchen.example.test';
+	process.env.FLAVORITHM_AUTH_MODE = 'local';
+	const localProbe = await runHealthcheckProbe();
+	assert.equal(localProbe.status, 200);
+	assert.equal((await localProbe.json()).authMode, 'local');
+
+	process.env.FLAVORITHM_AUTH_MODE = 'oidc';
+	process.env.FLAVORITHM_OIDC_ISSUER = oidcIssuer;
+	process.env.FLAVORITHM_OIDC_CLIENT_ID = oidcClientId;
+	process.env.FLAVORITHM_OIDC_CLIENT_SECRET = '';
+	process.env.FLAVORITHM_OIDC_CLIENT_AUTH_METHOD = 'none';
+	process.env.FLAVORITHM_OIDC_SESSION_TTL_SECONDS = '3600';
+	process.env.FLAVORITHM_OIDC_REDIRECT_URI = 'https://kitchen.example.test/auth/callback';
+	const oidcProbe = await runHealthcheckProbe();
+	assert.equal(oidcProbe.status, 200);
+	assert.equal((await oidcProbe.json()).authMode, 'oidc');
+
+	process.env.FLAVORITHM_AUTH_MODE = 'proxy';
+	process.env.FLAVORITHM_PROXY_SHARED_SECRET = proxySecret;
+	delete process.env.FLAVORITHM_PROXY_SECRET_HEADER;
+	const proxyProbe = await runHealthcheckProbe();
+	assert.equal(proxyProbe.status, 200);
+	const proxyData = await proxyProbe.json();
+	assert.equal(proxyData.authMode, 'proxy');
+	assert.equal(proxyData.user, null);
+
+	process.env.FLAVORITHM_AUTH_MODE = 'invalid-mode';
+	assert.equal((await runHealthcheckProbe()).status, 503);
+
+	process.env.FLAVORITHM_AUTH_MODE = 'proxy';
+	process.env.FLAVORITHM_PROXY_SHARED_SECRET = 'short';
+	assert.equal((await runHealthcheckProbe()).status, 503);
+
+	process.env.FLAVORITHM_AUTH_MODE = 'oidc';
+	process.env.FLAVORITHM_OIDC_CLIENT_ID = '';
+	assert.equal((await runHealthcheckProbe()).status, 503);
+});
+
+const stateRoute = await import('../src/routes/api/state/+server.ts');
+const logoutRoute = await import('../src/routes/auth/logout/+server.ts');
+const coverRoute = await import('../src/routes/api/recipe-covers/[id]/+server.ts');
+
+async function captureSql<T>(fn: () => Promise<T> | T): Promise<{
+	result: T;
+	statements: string[];
+	writes: string[];
+	selects: string[];
+}> {
+	const db = backend.getDatabase();
+	const originalExec = db.exec.bind(db);
+	const originalPrepare = db.prepare.bind(db);
+	const statements: string[] = [];
+	const record = (sql: string) => {
+		statements.push(sql.replace(/\s+/g, ' ').trim());
+	};
+	db.exec = ((sql: string) => {
+		record(sql);
+		return originalExec(sql);
+	}) as typeof db.exec;
+	db.prepare = ((sql: string) => {
+		const stmt = originalPrepare(sql);
+		return new Proxy(stmt, {
+			get(target, prop, receiver) {
+				const value = Reflect.get(target, prop, receiver);
+				if (typeof value !== 'function') return value;
+				if (prop === 'get' || prop === 'all' || prop === 'run' || prop === 'iterate') {
+					return (...args: unknown[]) => {
+						record(sql);
+						return (value as (...params: unknown[]) => unknown).apply(target, args);
+					};
+				}
+				return value.bind(target);
+			}
+		});
+	}) as typeof db.prepare;
+	try {
+		const result = await fn();
+		const writes = statements.filter((sql) =>
+			/^(BEGIN\b|COMMIT\b|ROLLBACK\b|INSERT\b|UPDATE\b|DELETE\b|REPLACE\b|ALTER\b|CREATE\b|DROP\b)/i.test(
+				sql
+			)
+		);
+		const selects = statements.filter((sql) => /^SELECT\b/i.test(sql));
+		return { result, statements, writes, selects };
+	} finally {
+		db.exec = originalExec;
+		db.prepare = originalPrepare;
+	}
+}
+
+function configureProxyTestEnv(): void {
+	process.env.ORIGIN = 'https://kitchen.example.test';
+	process.env.FLAVORITHM_AUTH_MODE = 'proxy';
+	process.env.FLAVORITHM_PROXY_SHARED_SECRET = proxySecret;
+	process.env.FLAVORITHM_PROXY_SECRET_HEADER = 'x-flavorithm-proxy-secret';
+	process.env.FLAVORITHM_PROXY_SUBJECT_HEADER = 'x-authentik-uid';
+	process.env.FLAVORITHM_PROXY_EMAIL_HEADER = 'x-authentik-email';
+	process.env.FLAVORITHM_PROXY_NAME_HEADER = 'x-authentik-name';
+	process.env.FLAVORITHM_PROXY_ISSUER = 'https://authentik.example.test/';
+	process.env.FLAVORITHM_PROXY_LOGOUT_URL =
+		'https://authentik.example.test/outpost.goauthentik.io/sign_out';
+}
+
+async function runProxyRoute(input: {
+	url: string;
+	headers?: HeadersInit;
+	cookies?: CookieJar;
+	handler: (event: never) => Promise<Response> | Response;
+	params?: Record<string, string>;
+}): Promise<{
+	response: Response;
+	event: { locals: { user: unknown; authMode: string } };
+	jar: CookieJar;
+}> {
+	const headers = new Headers(input.headers);
+	const jar = input.cookies ?? cookieJar();
+	if (!input.cookies) {
+		for (const pair of (headers.get('cookie') ?? '').split(';')) {
+			const separator = pair.indexOf('=');
+			if (separator > 0) {
+				jar.values.set(pair.slice(0, separator).trim(), pair.slice(separator + 1).trim());
+			}
+		}
+	}
+	const request = new Request(input.url, { method: 'GET', headers });
+	const event = {
+		request,
+		url: new URL(request.url),
+		cookies: jar.cookies,
+		params: input.params ?? {},
+		locals: { user: null as unknown, authMode: 'invalid' }
+	};
+	const response = await handle({
+		event,
+		resolve: async (resolvedEvent: typeof event) => input.handler(resolvedEvent as never)
+	} as never);
+	return { response, event, jar };
+}
+
+test('steady-state proxy requests execute zero SQLite writes and consolidate session lookup', async () => {
+	configureProxyTestEnv();
+
+	const initial = await captureSql(() =>
+		runProxyRoute({
+			url: 'https://kitchen.example.test/api/auth',
+			headers: proxyHeaders('steady-proxy-user'),
+			handler: authRoute.GET as never
+		})
+	);
+	assert.equal(initial.result.response.status, 200);
+	const initialSetCookie = initial.result.jar.setCalls.find(
+		(entry) => entry.name === 'flavorithm_session'
+	);
+	assert.ok(initialSetCookie, 'new proxy bindings emit Set-Cookie');
+	const bindingToken = initialSetCookie.value;
+	assert.ok(backend.getSessionBinding(bindingToken));
+
+	const steadyHeaders = {
+		...proxyHeaders('steady-proxy-user'),
+		Cookie: `flavorithm_session=${bindingToken}`
+	};
+
+	const repeatedAuth = await captureSql(() =>
+		runProxyRoute({
+			url: 'https://kitchen.example.test/api/auth',
+			headers: steadyHeaders,
+			handler: authRoute.GET as never
+		})
+	);
+	assert.equal(repeatedAuth.result.response.status, 200);
+	assert.equal(
+		(await repeatedAuth.result.response.json()).user.email,
+		'steady-proxy-user@example.test'
+	);
+	assert.deepEqual(
+		repeatedAuth.writes,
+		[],
+		'repeated /api/auth with unchanged headers and fresh cookie must run zero SQLite writes'
+	);
+	assert.equal(
+		repeatedAuth.selects.length,
+		2,
+		'steady-state proxy auth must run exactly one identity SELECT and one session token_hash SELECT'
+	);
+	assert.equal(
+		repeatedAuth.result.jar.setCalls.length,
+		0,
+		'fresh proxy bindings do not re-emit Set-Cookie on every request'
+	);
+
+	const repeatedState = await captureSql(() =>
+		runProxyRoute({
+			url: 'https://kitchen.example.test/api/state',
+			headers: steadyHeaders,
+			handler: stateRoute.GET as never
+		})
+	);
+	assert.equal(repeatedState.result.response.status, 200);
+	assert.equal((await repeatedState.result.response.json()).state.recipes.length, 8);
+	assert.deepEqual(
+		repeatedState.writes,
+		[],
+		'repeated /api/state with unchanged headers and fresh cookie must run zero SQLite writes'
+	);
+	assert.equal(repeatedState.result.jar.setCalls.length, 0);
+	assert.ok(backend.getSessionBinding(bindingToken));
+});
+
+test('proxy framework asset requests execute zero SQLite queries while preserving security headers and active bindings', async () => {
+	configureProxyTestEnv();
+
+	const seeded = await runHook({
+		url: 'https://kitchen.example.test/api/auth',
+		headers: proxyHeaders('asset-proxy-user')
+	});
+	const token =
+		seeded.jar.setCalls.find((entry) => entry.name === 'flavorithm_session')?.value ?? '';
+	assert.notEqual(token, '');
+
+	for (const assetPath of ['/_app/immutable/entry/start.js', '/favicon.ico']) {
+		const withCookieAndHeaders = await captureSql(() =>
+			runHook({
+				url: `https://kitchen.example.test${assetPath}`,
+				headers: {
+					...proxyHeaders('asset-proxy-user'),
+					Cookie: `flavorithm_session=${token}`
+				}
+			})
+		);
+		assert.equal(withCookieAndHeaders.result.response.status, 200);
+		assert.deepEqual(
+			withCookieAndHeaders.statements,
+			[],
+			`${assetPath} must execute zero SQLite queries in proxy mode`
+		);
+		assert.equal(withCookieAndHeaders.result.jar.setCalls.length, 0);
+		assert.equal(withCookieAndHeaders.result.jar.deleteCalls.length, 0);
+		assert.ok(
+			backend.getSessionBinding(token),
+			`${assetPath} must not revoke an active proxy binding cookie`
+		);
+		const headers = withCookieAndHeaders.result.response.headers;
+		assert.equal(headers.get('x-content-type-options'), 'nosniff');
+		assert.equal(headers.get('x-frame-options'), 'DENY');
+		assert.equal(headers.get('referrer-policy'), 'strict-origin-when-cross-origin');
+		assert.equal(
+			headers.get('permissions-policy'),
+			'camera=(self), microphone=(self), geolocation=()'
+		);
+		assert.equal(headers.get('cross-origin-resource-policy'), 'same-origin');
+		assert.equal(headers.get('x-flavorithm-auth-mode'), 'proxy');
+		assert.equal(headers.get('strict-transport-security'), 'max-age=31536000');
+		assert.match(headers.get('cache-control') ?? '', /no-store/);
+
+		const withoutHeaders = await captureSql(() =>
+			runHook({
+				url: `https://kitchen.example.test${assetPath}`,
+				headers: { Cookie: `flavorithm_session=${token}` }
+			})
+		);
+		assert.equal(withoutHeaders.result.response.status, 200);
+		assert.deepEqual(withoutHeaders.statements, []);
+		assert.ok(backend.getSessionBinding(token));
+	}
+
+	const unauthCover = await runProxyRoute({
+		url: `https://kitchen.example.test/api/recipe-covers/${'a'.repeat(64)}`,
+		handler: coverRoute.GET as never,
+		params: { id: 'a'.repeat(64) }
+	});
+	assert.equal(unauthCover.response.status, 401, 'recipe cover routes still enforce proxy auth');
+
+	const authCover = await runProxyRoute({
+		url: `https://kitchen.example.test/api/recipe-covers/${'a'.repeat(64)}`,
+		headers: {
+			...proxyHeaders('asset-proxy-user'),
+			Cookie: `flavorithm_session=${token}`
+		},
+		handler: coverRoute.GET as never,
+		params: { id: 'a'.repeat(64) }
+	});
+	assert.equal(
+		authCover.response.status,
+		404,
+		'authenticated recipe cover route resolves user and checks household cover storage'
+	);
+	assert.ok(authCover.event.locals.user);
+});
+
+test('changing proxy profile headers updates users and external_identities inside BEGIN IMMEDIATE and preserves collision checks', async () => {
+	configureProxyTestEnv();
+
+	const first = await runHook({
+		url: 'https://kitchen.example.test/api/auth',
+		headers: proxyHeaders('mutable-proxy-user', 'mutable-initial@example.test')
+	});
+	const token = first.jar.setCalls.find((entry) => entry.name === 'flavorithm_session')?.value!;
+	const userId = (first.event.locals.user as { id: string }).id;
+
+	const renamed = await captureSql(() =>
+		runHook({
+			url: 'https://kitchen.example.test/api/auth',
+			headers: {
+				'x-flavorithm-proxy-secret': proxySecret,
+				'x-authentik-uid': 'mutable-proxy-user',
+				'x-authentik-email': 'mutable-initial@example.test',
+				'x-authentik-name': 'Renamed Proxy Chef',
+				Cookie: `flavorithm_session=${token}`
+			}
+		})
+	);
+	assert.equal(renamed.result.response.status, 200);
+	assert.equal((renamed.result.event.locals.user as { name: string }).name, 'Renamed Proxy Chef');
+	assert.ok(renamed.writes.some((sql) => /^BEGIN IMMEDIATE$/i.test(sql)));
+	assert.ok(renamed.writes.some((sql) => /^UPDATE users\b/i.test(sql)));
+	assert.ok(renamed.writes.some((sql) => /^UPDATE external_identities\b/i.test(sql)));
+	assert.ok(renamed.writes.some((sql) => /^COMMIT$/i.test(sql)));
+
+	const afterRenameSteady = await captureSql(() =>
+		runHook({
+			url: 'https://kitchen.example.test/api/auth',
+			headers: {
+				'x-flavorithm-proxy-secret': proxySecret,
+				'x-authentik-uid': 'mutable-proxy-user',
+				'x-authentik-email': 'mutable-initial@example.test',
+				'x-authentik-name': 'Renamed Proxy Chef',
+				Cookie: `flavorithm_session=${token}`
+			}
+		})
+	);
+	assert.deepEqual(afterRenameSteady.writes, []);
+
+	const reemailed = await captureSql(() =>
+		runHook({
+			url: 'https://kitchen.example.test/api/auth',
+			headers: {
+				'x-flavorithm-proxy-secret': proxySecret,
+				'x-authentik-uid': 'mutable-proxy-user',
+				'x-authentik-email': 'mutable-updated@example.test',
+				'x-authentik-name': 'Renamed Proxy Chef',
+				Cookie: `flavorithm_session=${token}`
+			}
+		})
+	);
+	assert.equal(reemailed.result.response.status, 200);
+	assert.equal(
+		(reemailed.result.event.locals.user as { email: string }).email,
+		'mutable-updated@example.test'
+	);
+	assert.ok(reemailed.writes.some((sql) => /^BEGIN IMMEDIATE$/i.test(sql)));
+	assert.ok(reemailed.writes.some((sql) => /^UPDATE users\b/i.test(sql)));
+	assert.ok(reemailed.writes.some((sql) => /^UPDATE external_identities\b/i.test(sql)));
+	assert.equal(
+		backend
+			.getDatabase()
+			.prepare('SELECT email FROM external_identities WHERE user_id = ?')
+			.get(userId)?.email,
+		'mutable-updated@example.test'
+	);
+
+	await backend.registerUser(
+		'Existing Local Target',
+		'taken-target@example.test',
+		'a sufficiently strong local password'
+	);
+	assert.throws(
+		() =>
+			backend.resolveExternalIdentity({
+				issuer: 'https://authentik.example.test/',
+				subject: 'mutable-proxy-user',
+				email: 'taken-target@example.test',
+				name: 'Renamed Proxy Chef',
+				emailVerified: false
+			}),
+		{ status: 409 }
+	);
+});
+
+test('proxy binding renews only below half TTL and revokes immediately on logout, missing headers, or identity switch', async () => {
+	configureProxyTestEnv();
+
+	const created = await runHook({
+		url: 'https://kitchen.example.test/api/auth',
+		headers: proxyHeaders('ttl-proxy-user')
+	});
+	const token = created.jar.setCalls.find((entry) => entry.name === 'flavorithm_session')?.value!;
+	const tokenHash = createHash('sha256').update(token).digest('hex');
+	const initialBindingHash = backend.getSessionBinding(token);
+	assert.equal(initialBindingHash, tokenHash);
+
+	const aboveHalfExpiry = Date.now() + Math.floor(sso.PROXY_BINDING_TTL_MS / 2) + 60_000;
+	backend
+		.getDatabase()
+		.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND auth_source = 'proxy'")
+		.run(aboveHalfExpiry, tokenHash);
+
+	const notYetHalfExpired = await captureSql(() =>
+		runHook({
+			url: 'https://kitchen.example.test/api/auth',
+			headers: { ...proxyHeaders('ttl-proxy-user'), Cookie: `flavorithm_session=${token}` }
+		})
+	);
+	assert.deepEqual(notYetHalfExpired.writes, []);
+	assert.equal(notYetHalfExpired.result.jar.setCalls.length, 0);
+	assert.equal(
+		backend
+			.getDatabase()
+			.prepare('SELECT expires_at FROM sessions WHERE token_hash = ?')
+			.get(tokenHash)?.expires_at,
+		aboveHalfExpiry
+	);
+
+	const belowHalfExpiry = Date.now() + Math.floor(sso.PROXY_BINDING_TTL_MS / 2) - 5_000;
+	backend
+		.getDatabase()
+		.prepare("UPDATE sessions SET expires_at = ? WHERE token_hash = ? AND auth_source = 'proxy'")
+		.run(belowHalfExpiry, tokenHash);
+
+	const renewed = await captureSql(() =>
+		runHook({
+			url: 'https://kitchen.example.test/api/auth',
+			headers: { ...proxyHeaders('ttl-proxy-user'), Cookie: `flavorithm_session=${token}` }
+		})
+	);
+	assert.equal(renewed.writes.length, 1);
+	assert.match(renewed.writes[0] ?? '', /^UPDATE sessions SET expires_at = \?/i);
+	assert.equal(renewed.result.jar.setCalls.length, 1);
+	assert.equal(renewed.result.jar.setCalls[0]?.value, token);
+	assert.equal(
+		backend.getSessionBinding(token),
+		initialBindingHash,
+		'renewing a half-expired binding keeps the session hash stable for OAuth callbacks'
+	);
+	const renewedExpiresAt = backend
+		.getDatabase()
+		.prepare('SELECT expires_at FROM sessions WHERE token_hash = ?')
+		.get(tokenHash)?.expires_at as number;
+	assert.ok(renewedExpiresAt > aboveHalfExpiry);
+
+	const loggedOut = await runProxyRoute({
+		url: 'https://kitchen.example.test/auth/logout',
+		headers: { ...proxyHeaders('ttl-proxy-user'), Cookie: `flavorithm_session=${token}` },
+		handler: logoutRoute.GET as never
+	});
+	assert.equal(loggedOut.response.status, 303);
+	assert.equal(
+		loggedOut.response.headers.get('location'),
+		'https://authentik.example.test/outpost.goauthentik.io/sign_out'
+	);
+	assert.equal(
+		backend.getSessionBinding(token),
+		null,
+		'/auth/logout immediately revokes the proxy binding'
+	);
+	assert.equal(
+		backend
+			.getDatabase()
+			.prepare('SELECT COUNT(*) AS count FROM sessions WHERE token_hash = ?')
+			.get(tokenHash)?.count,
+		0
 	);
 });

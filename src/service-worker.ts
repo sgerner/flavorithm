@@ -11,9 +11,14 @@ const apiPath = new URL(resolve('/api'), origin).pathname.replace(/\/$/, '');
 
 // Navigation HTML can contain an authenticated identity, including when identity is supplied by a
 // reverse proxy rather than a browser cookie. Keep only static assets in Cache Storage.
+const immutableUrls = new Set(
+	immutable
+		.map(({ path }) => toUrl(resolve(path.replace(/^\/+/, ''))))
+		.filter((url) => !isApiUrl(new URL(url)))
+);
 const staticUrls = new Set(
 	[
-		...immutable.map(({ path }) => toUrl(resolve(path.replace(/^\/+/, '')))),
+		...immutableUrls,
 		...staticAssets.map(({ path }) => toUrl(asset(path))),
 		...prerendered.map(({ path }) => toUrl(resolve(path)))
 	].filter((url) => !isApiUrl(new URL(url)))
@@ -42,9 +47,33 @@ function authMode(response: Response): Promise<string | null> {
 		.catch(() => null);
 }
 
+let pendingShellRefresh: Promise<void> | null = null;
+let shellGeneration = 0;
+
+function hasSameOrigin(rawUrl: string): boolean {
+	try {
+		return new URL(rawUrl, origin).origin === origin;
+	} catch {
+		return false;
+	}
+}
+
 async function clearOfflineShell(): Promise<void> {
+	shellGeneration += 1;
 	const cache = await caches.open(cacheName);
 	await cache.delete(cacheKey(offlineUrl));
+}
+
+function shouldEvictOfflineShell(response: Response): boolean {
+	if (response.type === 'opaque' || response.type === 'opaqueredirect') return true;
+	if (response.url && !hasSameOrigin(response.url)) return true;
+	const location = response.headers.get('location');
+	if (location && response.status >= 300 && response.status < 400 && !hasSameOrigin(location)) {
+		return true;
+	}
+	const mode = response.headers.get('x-flavorithm-auth-mode');
+	if (mode !== null) return mode !== 'local';
+	return response.redirected || response.status < 500;
 }
 
 function isCacheableStaticResponse(response: Response, expectedUrl: string): boolean {
@@ -66,6 +95,7 @@ function isCacheableStaticResponse(response: Response, expectedUrl: string): boo
 			contentType === 'application/ecmascript' ||
 			contentType === 'text/ecmascript' ||
 			contentType === 'application/wasm' ||
+			contentType === 'application/manifest+json' ||
 			contentType.startsWith('image/') ||
 			contentType.startsWith('font/') ||
 			contentType.startsWith('application/font-') ||
@@ -75,12 +105,12 @@ function isCacheableStaticResponse(response: Response, expectedUrl: string): boo
 
 function isCacheableLocalShell(response: Response, expectedUrl: string): boolean {
 	if (
-		!response.ok ||
+		response.status !== 200 ||
 		response.type === 'opaque' ||
 		response.redirected ||
-		(response.url && new URL(response.url).origin !== origin) ||
+		(response.url && !hasSameOrigin(response.url)) ||
 		response.headers.get('x-flavorithm-auth-mode') !== 'local' ||
-		!response.headers.get('content-type')?.includes('text/html') ||
+		!response.headers.get('content-type')?.toLowerCase().includes('text/html') ||
 		response.headers.has('set-cookie')
 	) {
 		return false;
@@ -89,38 +119,63 @@ function isCacheableLocalShell(response: Response, expectedUrl: string): boolean
 	if (vary.split(',').some((value) => ['cookie', 'authorization'].includes(value.trim())))
 		return false;
 	const cacheControl = response.headers.get('cache-control')?.toLowerCase() || '';
-	return !/\b(private|no-store)\b/.test(cacheControl) && new URL(expectedUrl).origin === origin;
+	return !/\b(private|no-store)\b/.test(cacheControl) && hasSameOrigin(expectedUrl);
 }
 
-async function fetchAndCacheStatic(url: string): Promise<Response> {
-	const response = await fetch(new Request(url, { credentials: 'same-origin', cache: 'no-store' }));
+async function fetchAndCacheStatic(
+	url: string,
+	options: { event?: ExtendableEvent; required?: boolean } = {}
+): Promise<Response> {
+	const response = await fetch(
+		new Request(
+			url,
+			immutableUrls.has(url)
+				? { credentials: 'same-origin' }
+				: { credentials: 'same-origin', cache: 'no-cache' }
+		)
+	);
 	if (isCacheableStaticResponse(response, url)) {
-		const cache = await caches.open(cacheName);
-		await cache.put(cacheKey(url), response.clone());
+		const copy = response.clone();
+		const write = caches.open(cacheName).then((cache) => cache.put(cacheKey(url), copy));
+		if (options.event) {
+			options.event.waitUntil(write);
+		} else {
+			await write;
+		}
+		return response;
+	}
+	if (options.required) {
+		throw new Error(`Required static asset could not be cached: ${url}`);
 	}
 	return response;
 }
 
-async function cacheLocalOfflineShell(): Promise<void> {
-	const authResponse = await fetch(
-		new Request(new URL(resolve('/api/auth'), origin).href, {
-			credentials: 'same-origin',
-			cache: 'no-store'
-		})
-	);
-	if (!authResponse.ok || (await authMode(authResponse)) !== 'local') return;
+async function fetchAndCacheLocalShell(required: boolean): Promise<void> {
+	const generation = shellGeneration;
 	const response = await fetch(new Request(offlineUrl, { credentials: 'omit', cache: 'no-store' }));
-	if (
-		!response.ok ||
-		response.type === 'opaque' ||
-		response.redirected ||
-		(response.url && new URL(response.url).origin !== origin) ||
-		!isCacheableLocalShell(response, offlineUrl)
-	) {
+	if (!isCacheableLocalShell(response, offlineUrl)) {
+		if (shouldEvictOfflineShell(response)) await clearOfflineShell();
+		if (required) {
+			throw new Error('Required offline shell could not be cached');
+		}
 		return;
 	}
+	if (!required && generation !== shellGeneration) return;
 	const cache = await caches.open(cacheName);
 	await cache.put(cacheKey(offlineUrl), response);
+}
+
+function refreshLocalOfflineShell(): Promise<void> {
+	if (!pendingShellRefresh) {
+		pendingShellRefresh = fetchAndCacheLocalShell(false)
+			.catch(() => {
+				// Navigation shell refreshes are best-effort and retried on the next local visit.
+			})
+			.finally(() => {
+				pendingShellRefresh = null;
+			});
+	}
+	return pendingShellRefresh;
 }
 
 function offlineResponse(): Response {
@@ -136,13 +191,42 @@ function offlineResponse(): Response {
 worker.addEventListener('install', (event: ExtendableEvent) => {
 	event.waitUntil(
 		(async () => {
-			await Promise.allSettled([...staticUrls].map((url) => fetchAndCacheStatic(url)));
 			try {
-				await cacheLocalOfflineShell();
-			} catch {
-				// The public shell is optional. Authenticated HTML is never cached as a fallback.
+				const authResponse = await fetch(
+					new Request(new URL(resolve('/api/auth'), origin).href, {
+						credentials: 'same-origin',
+						cache: 'no-store'
+					})
+				);
+				if (
+					authResponse.status !== 200 ||
+					authResponse.type === 'opaque' ||
+					authResponse.redirected ||
+					(authResponse.url && !hasSameOrigin(authResponse.url))
+				) {
+					throw new Error('Failed to verify authentication mode during install');
+				}
+				const mode = await authMode(authResponse);
+				if (!mode || mode === 'invalid') {
+					throw new Error('Unavailable authentication mode during install');
+				}
+				if (mode === 'local') {
+					const results = await Promise.allSettled([
+						...[...staticUrls].map((url) => fetchAndCacheStatic(url, { required: true })),
+						fetchAndCacheLocalShell(true)
+					]);
+					const failure = results.find(
+						(result): result is PromiseRejectedResult => result.status === 'rejected'
+					);
+					if (failure) throw failure.reason;
+				} else {
+					await Promise.allSettled([...staticUrls].map((url) => fetchAndCacheStatic(url)));
+				}
+				await worker.skipWaiting();
+			} catch (error) {
+				await caches.delete(cacheName);
+				throw error;
 			}
-			await worker.skipWaiting();
 		})()
 	);
 });
@@ -182,19 +266,16 @@ worker.addEventListener('fetch', (event: FetchEvent) => {
 			(async () => {
 				try {
 					const response = await fetch(request);
-					const mode = response.headers.get('x-flavorithm-auth-mode');
-					if (mode && mode !== 'local') await clearOfflineShell();
-					if (response.redirected || (response.url && new URL(response.url).origin !== origin)) {
+					if (shouldEvictOfflineShell(response)) {
 						await clearOfflineShell();
+						return response;
 					}
-					if (
-						mode === 'local' &&
-						request.credentials === 'omit' &&
-						!request.headers.has('authorization') &&
-						isCacheableLocalShell(response, url.href)
-					) {
+					if (response.headers.get('x-flavorithm-auth-mode') === 'local') {
 						const cache = await caches.open(cacheName);
-						await cache.put(cacheKey(request.url), response.clone());
+						const shell = await cache.match(cacheKey(offlineUrl));
+						if (shell?.headers.get('x-flavorithm-auth-mode') !== 'local') {
+							event.waitUntil(refreshLocalOfflineShell());
+						}
 					}
 					return response;
 				} catch {
@@ -211,11 +292,22 @@ worker.addEventListener('fetch', (event: FetchEvent) => {
 	if (!staticUrls.has(url.href)) return;
 	event.respondWith(
 		(async () => {
+			const cache = await caches.open(cacheName);
+			const cached = await cache.match(cacheKey(url.href));
+			if (cached) {
+				if (!immutableUrls.has(url.href)) {
+					event.waitUntil(
+						fetchAndCacheStatic(url.href).catch(() => {
+							// Keep serving the cached asset when offline revalidation fails.
+						})
+					);
+				}
+				return cached;
+			}
 			try {
-				return await fetchAndCacheStatic(url.href);
+				return await fetchAndCacheStatic(url.href, { event });
 			} catch {
-				const cache = await caches.open(cacheName);
-				return (await cache.match(cacheKey(url.href))) ?? new Response(null, { status: 504 });
+				return new Response(null, { status: 504 });
 			}
 		})()
 	);

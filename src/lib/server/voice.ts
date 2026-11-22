@@ -1,6 +1,8 @@
 import { ApiError } from './db.ts';
 import { MAX_WAV_BYTES, voiceProviders } from '../voice-config.ts';
 
+const WHISPER_PROBE_TIMEOUT_MS = 2_500;
+
 export function localWhisperUrl(): URL | null {
 	try {
 		const url = new URL(process.env.WHISPER_TRANSCRIPTION_URL || '');
@@ -9,6 +11,50 @@ export function localWhisperUrl(): URL | null {
 		return url;
 	} catch {
 		return null;
+	}
+}
+
+export async function probeLocalWhisper(
+	fetcher: typeof fetch = fetch,
+	signal?: AbortSignal
+): Promise<boolean> {
+	const url = localWhisperUrl();
+	if (!url) return false;
+	const headers = new Headers();
+	const token = process.env.WHISPER_API_KEY?.trim();
+	if (token && !/[\r\n]/.test(token)) headers.set('Authorization', `Bearer ${token}`);
+	const probeSignal = AbortSignal.any([
+		AbortSignal.timeout(WHISPER_PROBE_TIMEOUT_MS),
+		...(signal ? [signal] : [])
+	]);
+	const healthUrl = new URL('/health', url);
+	try {
+		if (healthUrl.href !== url.href) {
+			const health = await fetcher(healthUrl, {
+				method: 'GET',
+				headers,
+				redirect: 'error',
+				signal: probeSignal
+			});
+			void health.body?.cancel().catch(() => {});
+			if (health.ok) return true;
+			if (health.status !== 404 && health.status !== 405) return false;
+		}
+		const response = await fetcher(url, {
+			method: 'GET',
+			headers,
+			redirect: 'error',
+			signal: probeSignal
+		});
+		void response.body?.cancel().catch(() => {});
+		return (
+			response.ok ||
+			(response.status >= 400 &&
+				response.status < 500 &&
+				![401, 403, 404].includes(response.status))
+		);
+	} catch {
+		return false;
 	}
 }
 
@@ -141,7 +187,12 @@ export async function transcribeVoice(form: FormData, fetcher: typeof fetch, sig
 			provider === 'deepgram'
 				? data.results?.channels?.[0]?.alternatives?.[0]?.transcript
 				: data.text;
-		if (typeof text !== 'string' || !text.trim())
+		if (typeof text !== 'string')
+			throw new ApiError(
+				502,
+				'The voice service returned an unexpected response. Check Voice input in Settings and try again.'
+			);
+		if (!text.trim())
 			throw new ApiError(422, 'No speech was detected. Try speaking closer to the microphone.');
 		if (text.length > 20_000) throw new Error('Oversize transcript');
 		return { text: text.trim() };
