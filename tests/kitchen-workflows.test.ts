@@ -722,12 +722,14 @@ test('legacy backfill tags only exact pantry and bookmark seeds and preserves am
 	);
 
 	const cleaned = clearSampleData(backfilled);
-	assert.deepEqual(cleaned.pantry.map((item) => item.id), [
-		'pantry-olive-oil',
-		'pantry-garlic',
-		'custom-basil'
-	]);
-	assert.deepEqual(cleaned.meals.map((meal) => meal.id), legacy.meals.map((meal) => meal.id));
+	assert.deepEqual(
+		cleaned.pantry.map((item) => item.id),
+		['pantry-olive-oil', 'pantry-garlic', 'custom-basil']
+	);
+	assert.deepEqual(
+		cleaned.meals.map((meal) => meal.id),
+		legacy.meals.map((meal) => meal.id)
+	);
 	assert.equal(cleaned.recipes.find((item) => item.id === 'tomato-butter-beans')?.saved, true);
 	assert.equal(cleaned.recipes.find((item) => item.id === 'sesame-salmon-bowls')?.saved, true);
 });

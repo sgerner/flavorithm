@@ -121,6 +121,7 @@
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
+	let hasSampleRecords = $state(true);
 	let user = $state<User | null>(null);
 	let ready = $state(false);
 	let kitchenLoaded = $state(false);
@@ -300,6 +301,7 @@
 		kitchenSync?.clearContext();
 		user = null;
 		kitchen = createInitialState();
+		hasSampleRecords = true;
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
 		showStarter = false;
@@ -513,6 +515,7 @@
 				clearManagedIdentity();
 			} else {
 				kitchen = createInitialState();
+				hasSampleRecords = true;
 				localStorage.removeItem('flavorithm-last-account');
 				kitchenLoaded = true;
 			}
@@ -580,7 +583,6 @@
 			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
 		)
 	);
-	let hasSampleRecords = $derived(hasSampleData(kitchen));
 	let checkedCount = $derived(kitchen.shopping.filter((item) => item.checked).length);
 	let visibleShopping = $derived(
 		shoppingFilter === 'unpurchased'
@@ -757,6 +759,7 @@
 			getState: () => JSON.parse(JSON.stringify(kitchen)),
 			setState: (state) => {
 				kitchen = state;
+				hasSampleRecords = hasSampleData(state);
 			},
 			onStatus: (status) => {
 				pendingSync = status.pending;
@@ -806,6 +809,7 @@
 			localStorage.removeItem('flavorithm-last-account');
 			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			showStarter = false;
 		} else {
 			const started = localStorage.getItem('flavorithm-started') === 'yes';
@@ -816,6 +820,7 @@
 				if (local) {
 					const parsed = JSON.parse(local) as AppState;
 					kitchen = started ? parsed : backfillSampleData(parsed);
+					hasSampleRecords = hasSampleData(kitchen);
 					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
 				}
 			} catch {}
@@ -847,6 +852,7 @@
 					localStorage.removeItem('flavorithm-last-account');
 					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
+					hasSampleRecords = true;
 					kitchenLoaded = false;
 					showStarter = false;
 				}
@@ -951,6 +957,7 @@
 		};
 	});
 	function adoptKitchen(state: AppState) {
+		hasSampleRecords = hasSampleData(state);
 		if (user && kitchenSync) {
 			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), state, stateEtag || '');
 			if (!managedAuth) {
@@ -1024,6 +1031,7 @@
 	}
 	function freshKitchen() {
 		if (!hasSampleData(kitchen)) {
+			hasSampleRecords = false;
 			showStarter = false;
 			if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
 			return;
@@ -1033,6 +1041,7 @@
 		const previousStarted =
 			!user && !managedAuth ? localStorage.getItem('flavorithm-started') : null;
 		kitchen = clearSampleData(previousKitchen);
+		hasSampleRecords = hasSampleData(kitchen);
 		const appliedSnapshot = JSON.stringify(kitchen);
 		showStarter = false;
 		if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
@@ -1040,6 +1049,7 @@
 		notify('Sample data cleared.', () => {
 			if (JSON.stringify(kitchen) === appliedSnapshot) {
 				kitchen = previousKitchen;
+				hasSampleRecords = hasSampleData(previousKitchen);
 				if (wasShowingStarter && !user && !managedAuth) {
 					showStarter = true;
 					if (previousStarted === null) localStorage.removeItem('flavorithm-started');
@@ -1105,11 +1115,13 @@
 			if (guestKitchen) {
 				adoptKitchen(saved.state || createNewUserState());
 				kitchen = guestKitchen;
+				hasSampleRecords = hasSampleData(guestKitchen);
 				kitchenSync?.stage(guestKitchen);
 				await kitchenSync?.sync();
 			} else if (saved.state) adoptKitchen(saved.state);
 			else {
 				kitchen = guestKitchen ?? createNewUserState();
+				hasSampleRecords = hasSampleData(kitchen);
 				await request('/api/state', { state: kitchen }, 'PUT');
 				adoptKitchen(kitchen);
 			}
@@ -1164,6 +1176,7 @@
 			importSession = emptyImportSession();
 			resumeImport = false;
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
@@ -2385,6 +2398,7 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
