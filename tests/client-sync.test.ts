@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createNewUserState } from '../src/lib/data.ts';
-import { createKitchenSync } from '../src/lib/client-sync.ts';
+import { createKitchenPersistence, createKitchenSync } from '../src/lib/client-sync.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import type { KitchenTransport } from '../src/lib/offline-sync.ts';
 
@@ -502,4 +502,424 @@ test('an acknowledgement retires only captured journal versions, preserving a pe
 		['peer']
 	);
 	assert.equal(storage.getItem(peerKey), null);
+});
+
+function eventBus() {
+	const listeners = new Map<string, Set<() => void>>();
+	return {
+		addEventListener: (type: string, listener: () => void) => {
+			let set = listeners.get(type);
+			if (!set) {
+				set = new Set();
+				listeners.set(type, set);
+			}
+			set.add(listener);
+		},
+		removeEventListener: (type: string, listener: () => void) => {
+			listeners.get(type)?.delete(listener);
+		},
+		emit: (type: string) => {
+			for (const listener of [...(listeners.get(type) || [])]) listener();
+		}
+	};
+}
+
+test('coalesced rapid edits emit pending immediately, skip synchronous storage writes while typing, and stage one snapshot after pause', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	let journalWrites = 0;
+	const originalSet = storage.setItem;
+	storage.setItem = (key, value) => {
+		if (key.startsWith('flavorithm-pending-journal:')) journalWrites += 1;
+		originalSet(key, value);
+	};
+	let currentState = structuredClone(base);
+	currentState.shopping.push({
+		id: 'item-1',
+		name: '',
+		quantity: 1,
+		unit: 'piece',
+		checked: false
+	});
+	const statuses: Array<{ pending: boolean }> = [];
+	const controller = createKitchenSync({
+		storage,
+		getUser: () => user,
+		getState: () => currentState,
+		setState: (state) => {
+			currentState = structuredClone(state);
+		},
+		onStatus: (status) => statuses.push({ pending: status.pending }),
+		transport: () => transportFor(user, base),
+		coalesceMs: 40
+	});
+	controller.initialize(user, structuredClone(currentState), 'v1');
+	statuses.length = 0;
+
+	const typed = 'Strawberries';
+	assert.equal(typed.length, 12);
+	for (let index = 1; index <= typed.length; index += 1) {
+		currentState.shopping[0].name = typed.slice(0, index);
+		controller.scheduleStage();
+		if (index === 1) {
+			assert.equal(statuses.at(-1)?.pending, true);
+		}
+	}
+	assert.equal(
+		journalWrites,
+		0,
+		'zero synchronous journal writes while continuous typing is active'
+	);
+	assert.equal(statuses.length, 1, 'pending status is emitted once at the start of the burst');
+
+	await new Promise((resolve) => setTimeout(resolve, 70));
+	assert.equal(journalWrites, 1, 'exactly one snapshot is staged after typing pauses');
+	assert.equal(controller.snapshot()?.local.shopping[0].name, 'Strawberries');
+});
+
+test('visibilitychange, pagehide, and beforeunload flush pending guest and journal snapshots synchronously', () => {
+	for (const eventName of ['visibilitychange', 'pagehide', 'beforeunload'] as const) {
+		const guestStorage = memoryStorage();
+		const guestState = createNewUserState();
+		const win = eventBus();
+		const doc = eventBus();
+		const noopSync = createKitchenSync({
+			storage: guestStorage,
+			getUser: () => null,
+			getState: () => guestState,
+			setState: () => {},
+			onStatus: () => {},
+			transport: () => {
+				throw new Error('unused');
+			},
+			coalesceMs: 5000
+		});
+		const guestPersistence = createKitchenPersistence({
+			storage: guestStorage,
+			getState: () => guestState,
+			getUser: () => null,
+			sync: noopSync,
+			coalesceMs: 5000
+		});
+		const unbindGuest = guestPersistence.bindLifecycle(win, doc);
+		guestState.pantry.push({
+			id: `guest-${eventName}`,
+			name: 'olive oil',
+			quantity: 2,
+			unit: 'tbsp',
+			category: 'Pantry'
+		});
+		guestPersistence.schedule();
+		assert.equal(guestStorage.getItem('flavorithm-guest-kitchen'), null);
+		if (eventName === 'visibilitychange') doc.emit('visibilitychange');
+		else win.emit(eventName);
+		const savedGuest = JSON.parse(guestStorage.getItem('flavorithm-guest-kitchen') || 'null');
+		assert.equal(savedGuest?.pantry[0]?.id, `guest-${eventName}`);
+		unbindGuest();
+		guestPersistence.cancel();
+
+		const user = makeUser(`user-${eventName}`, 'home');
+		const accountStorage = memoryStorage();
+		let accountState = createNewUserState();
+		const syncController = createKitchenSync({
+			storage: accountStorage,
+			getUser: () => user,
+			getState: () => accountState,
+			setState: (next) => {
+				accountState = structuredClone(next);
+			},
+			onStatus: () => {},
+			transport: () => transportFor(user, accountState),
+			coalesceMs: 5000
+		});
+		syncController.initialize(user, structuredClone(accountState), 'v1');
+		const accountPersistence = createKitchenPersistence({
+			storage: accountStorage,
+			getState: () => accountState,
+			getUser: () => user,
+			sync: syncController,
+			coalesceMs: 5000
+		});
+		const accountWin = eventBus();
+		const accountDoc = eventBus();
+		const unbindAccount = accountPersistence.bindLifecycle(accountWin, accountDoc);
+		accountState.preferences.allergies = `sesame-${eventName}`;
+		accountPersistence.schedule();
+		assert.equal(
+			[...accountStorage.values.keys()].filter((key) =>
+				key.startsWith('flavorithm-pending-journal:')
+			).length,
+			0
+		);
+		if (eventName === 'visibilitychange') accountDoc.emit('visibilitychange');
+		else accountWin.emit(eventName);
+
+		const reloaded = harness({ user, storage: accountStorage });
+		assert.equal(reloaded.controller.restore(user), true);
+		assert.equal(reloaded.state.preferences.allergies, `sesame-${eventName}`);
+		unbindAccount();
+		accountPersistence.cancel();
+	}
+});
+
+test('stage reads peer journal storage once per flush and avoids structuredClone after JSON.parse', () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const singleWriterStorage = memoryStorage();
+	let singleState = structuredClone(base);
+	const singleController = createKitchenSync({
+		storage: singleWriterStorage,
+		getUser: () => user,
+		getState: () => singleState,
+		setState: (next) => {
+			singleState = structuredClone(next);
+		},
+		onStatus: () => {},
+		transport: () => transportFor(user, base)
+	});
+	singleController.initialize(user, base, 'v1');
+
+	singleState = structuredClone(base);
+	singleState.pantry.push({
+		id: 'single-item',
+		name: 'lentils',
+		quantity: 1,
+		unit: 'bag',
+		category: 'Pantry'
+	});
+	const singleParsed = JSON.parse(JSON.stringify(singleState)) as AppState;
+	let clonesOnSingleFlush = 0;
+	const originalStructuredClone = globalThis.structuredClone;
+	globalThis.structuredClone = (<T>(value: T): T => {
+		if ((value as unknown) === singleParsed) clonesOnSingleFlush += 1;
+		return originalStructuredClone(value);
+	}) as typeof structuredClone;
+	try {
+		singleController.stage(singleParsed, { clone: false });
+	} finally {
+		globalThis.structuredClone = originalStructuredClone;
+	}
+	assert.equal(
+		clonesOnSingleFlush,
+		0,
+		'parsed snapshot is not cloned a second time with structuredClone'
+	);
+
+	const peerStorage = memoryStorage();
+	const peer = harness({ user, storage: peerStorage });
+	peer.controller.initialize(user, base, 'v1');
+	const peerEdit = structuredClone(base);
+	peerEdit.shopping.push({
+		id: 'peer-item',
+		name: 'garlic',
+		quantity: 3,
+		unit: 'cloves',
+		checked: false
+	});
+	peer.controller.stage(peerEdit);
+
+	let peerJournalReads = 0;
+	const originalGetItem = peerStorage.getItem;
+	peerStorage.getItem = (key) => {
+		if (key.startsWith('flavorithm-pending-journal:')) peerJournalReads += 1;
+		return originalGetItem(key);
+	};
+
+	let currentState = structuredClone(base);
+	const controller = createKitchenSync({
+		storage: peerStorage,
+		getUser: () => user,
+		getState: () => currentState,
+		setState: (next) => {
+			currentState = structuredClone(next);
+		},
+		onStatus: () => {},
+		transport: () => transportFor(user, base)
+	});
+	controller.initialize(user, base, 'v1');
+
+	currentState = structuredClone(base);
+	currentState.pantry.push({
+		id: 'own-item',
+		name: 'chickpeas',
+		quantity: 2,
+		unit: 'can',
+		category: 'Pantry'
+	});
+	const parsedSnapshot = JSON.parse(JSON.stringify(currentState)) as AppState;
+
+	peerJournalReads = 0;
+	controller.stage(parsedSnapshot, { clone: false });
+	assert.equal(
+		peerJournalReads,
+		1,
+		'stored peer journal entries are read once during stage rather than twice'
+	);
+});
+
+test('finishing sync skips setState when server state matches active kitchen and flushes coalesced in-flight edits before rebasing', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const firstEdit = structuredClone(base);
+	firstEdit.preferences.maxTime = 25;
+	let server = structuredClone(base);
+	const syncMatching = harness({
+		user,
+		initial: base,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				server = structuredClone(state);
+				return { state: structuredClone(server), etag: 'v2' };
+			}
+		})
+	});
+	syncMatching.controller.initialize(user, base, 'v1');
+	syncMatching.setStates.length = 0;
+	syncMatching.state = firstEdit;
+	syncMatching.controller.stage(firstEdit);
+	await syncMatching.controller.sync();
+	assert.equal(
+		syncMatching.setStates.length,
+		0,
+		'setState is skipped when synced state already matches active kitchen'
+	);
+
+	// Verify setState IS called when the server has an independent remote delta.
+	server.shopping.push({
+		id: 'remote-item',
+		name: 'milk',
+		quantity: 1,
+		unit: 'carton',
+		checked: false
+	});
+	const secondLocal = structuredClone(syncMatching.state);
+	secondLocal.preferences.allergies = 'hazelnuts';
+	syncMatching.state = secondLocal;
+	syncMatching.controller.stage(secondLocal);
+	await syncMatching.controller.sync();
+	assert.equal(syncMatching.setStates.length, 1);
+	assert.equal(syncMatching.state.shopping[0]?.id, 'remote-item');
+	assert.equal(syncMatching.state.preferences.allergies, 'hazelnuts');
+
+	// Now verify an in-flight coalesced (unflushed) edit is flushed before post-sync rebasing and never overwritten.
+	const firstPutEntered = deferred<void>();
+	const firstPut = deferred<{ state: AppState; etag: string }>();
+	const secondPut = deferred<void>();
+	let putCount = 0;
+	let inFlightServer = structuredClone(base);
+	let liveState = structuredClone(base);
+	const setStateCalls: AppState[] = [];
+	const controller = createKitchenSync({
+		storage: memoryStorage(),
+		getUser: () => user,
+		getState: () => liveState,
+		setState: (next) => {
+			liveState = structuredClone(next);
+			setStateCalls.push(structuredClone(next));
+		},
+		onStatus: () => {},
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(inFlightServer),
+				etag: putCount === 0 ? 'v1' : 'v2',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				putCount += 1;
+				inFlightServer = structuredClone(state);
+				if (putCount === 1) {
+					firstPutEntered.resolve();
+					return firstPut.promise;
+				}
+				secondPut.resolve();
+				return { state: structuredClone(inFlightServer), etag: 'v3' };
+			}
+		}),
+		coalesceMs: 5000
+	});
+	controller.initialize(user, base, 'v1');
+	setStateCalls.length = 0;
+	liveState.preferences.maxTime = 30;
+	controller.stage(structuredClone(liveState));
+	const activeSync = controller.sync();
+	await firstPutEntered.promise;
+
+	// User types while PUT #1 is in flight; coalesce timer (5000 ms) has NOT fired yet.
+	liveState.preferences.allergies = 'pistachios';
+	controller.scheduleStage();
+	assert.equal(controller.hasUnflushed(), true);
+
+	firstPut.resolve({ state: structuredClone(inFlightServer), etag: 'v2' });
+	await activeSync;
+	await secondPut.promise;
+	for (let attempt = 0; attempt < 10 && controller.snapshot(); attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+	}
+	assert.equal(putCount, 2);
+	assert.equal(liveState.preferences.maxTime, 30);
+	assert.equal(liveState.preferences.allergies, 'pistachios');
+	assert.equal(inFlightServer.preferences.allergies, 'pistachios');
+	assert.equal(
+		setStateCalls.length,
+		0,
+		'live kitchen proxy was never overwritten during rebase or completion'
+	);
+});
+
+test('snapshot flushes pending edits for export and clearContext cancels pending timers on auth changes', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	let liveState = structuredClone(base);
+	const controller = createKitchenSync({
+		storage,
+		getUser: () => user,
+		getState: () => liveState,
+		setState: (next) => {
+			liveState = structuredClone(next);
+		},
+		onStatus: () => {},
+		transport: () => transportFor(user, base),
+		coalesceMs: 5000
+	});
+	controller.initialize(user, base, 'v1');
+	liveState.preferences.diet = 'vegan';
+	controller.scheduleStage();
+	assert.equal(controller.snapshot()?.local.preferences.diet, 'vegan');
+
+	// Schedule another edit, then clearContext as on logout before coalesceMs elapses.
+	const storage2 = memoryStorage();
+	let currentUser: User | null = user;
+	let state2 = structuredClone(base);
+	const controller2 = createKitchenSync({
+		storage: storage2,
+		getUser: () => currentUser,
+		getState: () => state2,
+		setState: () => {},
+		onStatus: () => {},
+		transport: () => transportFor(user, base),
+		coalesceMs: 30
+	});
+	controller2.initialize(user, base, 'v1');
+	state2.preferences.allergies = 'shellfish';
+	controller2.scheduleStage();
+	currentUser = null;
+	controller2.clearContext();
+	await new Promise((resolve) => setTimeout(resolve, 60));
+	assert.equal(
+		[...storage2.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0,
+		'cancelled coalesce timer never writes after logout'
+	);
 });

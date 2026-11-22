@@ -31,6 +31,12 @@ type LoadedJournal = {
 	durable: boolean;
 	blocked: boolean;
 	error: string;
+	readError: string;
+};
+type StageOptions = { clone?: boolean };
+type EventTargetLike = {
+	addEventListener: (type: string, listener: () => void) => void;
+	removeEventListener: (type: string, listener: () => void) => void;
 };
 type ActiveContext = {
 	user: User;
@@ -42,10 +48,13 @@ type ActiveContext = {
 	pending: PendingKitchen | null;
 	pendingDurable: boolean;
 	blockedByStorage: boolean;
+	dirty: boolean;
 	syncing: boolean;
 	conflicts: SyncConflict[];
 	error: string;
 };
+
+export const DEFAULT_PERSISTENCE_COALESCE_MS = 250;
 
 const confirmedKey = (identity: Identity) =>
 	`flavorithm-confirmed:v1:${encodeURIComponent(identity.userId)}:${encodeURIComponent(identity.householdId)}`;
@@ -128,15 +137,25 @@ export function createKitchenSync(options: {
 	setState: (state: AppState) => void;
 	onStatus: (status: SyncStatus) => void;
 	transport: (user: User) => KitchenTransport;
+	coalesceMs?: number;
+	onFlush?: () => void;
 }) {
 	let active: ActiveContext | null = null;
 	let generation = 0;
+	let stageTimer: ReturnType<typeof setTimeout> | undefined;
+	const coalesceDelay = Math.max(0, options.coalesceMs ?? DEFAULT_PERSISTENCE_COALESCE_MS);
 	const writerId = randomId();
 	const memoryRecords = new Map<string, Map<string, MemoryRecord>>();
 	const baselines = new Map<string, ConfirmedKitchen>();
 
+	const clearStageTimer = () => {
+		if (stageTimer !== undefined) {
+			clearTimeout(stageTimer);
+			stageTimer = undefined;
+		}
+	};
 	const statusOf = (context: ActiveContext): SyncStatus => ({
-		pending: !!context.pending,
+		pending: !!context.pending || context.dirty,
 		syncing: context.syncing,
 		conflicts: clone(context.conflicts),
 		error: context.error
@@ -148,10 +167,12 @@ export function createKitchenSync(options: {
 	const emitStatus = (context: ActiveContext) => {
 		if (isActive(context)) options.onStatus(statusOf(context));
 	};
-	const setContextState = (context: ActiveContext, state: AppState) => {
+	const setContextState = (context: ActiveContext, state: AppState, skipIfEqual = false) => {
 		if (isActive(context)) {
-			context.viewState = clone(state);
-			options.setState(clone(state));
+			const next = clone(state);
+			context.viewState = next;
+			if (skipIfEqual && equal(options.getState(), next)) return;
+			options.setState(clone(next));
 		}
 	};
 
@@ -169,7 +190,7 @@ export function createKitchenSync(options: {
 		record: PendingJournalRecord,
 		durable: boolean
 	): void {
-		writerMemory(context).set(record.writerId, { record: clone(record), durable });
+		writerMemory(context).set(record.writerId, { record, durable });
 	}
 
 	function forgetAcknowledged(context: ActiveContext, records: PendingJournalRecord[]): void {
@@ -181,12 +202,31 @@ export function createKitchenSync(options: {
 		}
 	}
 
+	function materializeJournalFromMemory(context: ActiveContext, readError: string): LoadedJournal {
+		const memory = writerMemory(context);
+		let blocked = !!readError;
+		let error = readError;
+		const entries: PendingJournalRecord[] = [];
+		for (const cached of memory.values()) {
+			entries.push(cached.record);
+			if (!cached.durable) {
+				blocked = true;
+				error ||= 'Some offline changes are only in memory and are not safe to sync yet.';
+			}
+		}
+		const records = sortRecords(entries);
+		const allDurable =
+			!blocked && records.every((record) => memory.get(record.writerId)?.durable !== false);
+		return { records, durable: allDurable, blocked, error, readError };
+	}
+
 	function loadJournal(context: ActiveContext): LoadedJournal {
 		const durable = readPendingJournal(options.storage, context.user);
+		const readError = durable.error;
 		const byWriter = new Map(durable.records.map((record) => [record.writerId, record]));
 		const memory = writerMemory(context);
-		let blocked = !!durable.error;
-		let error = durable.error;
+		let blocked = !!readError;
+		let error = readError;
 		for (const [id, cached] of memory) {
 			const stored = byWriter.get(id);
 			if (cached.durable) {
@@ -199,10 +239,10 @@ export function createKitchenSync(options: {
 					const chosen =
 						stored.pending.updatedAt >= cached.record.pending.updatedAt ? stored : cached.record;
 					byWriter.set(id, chosen);
-					memory.set(id, { record: clone(chosen), durable: true });
+					memory.set(id, { record: chosen, durable: true });
 				} else {
 					byWriter.set(id, stored);
-					memory.set(id, { record: clone(stored), durable: true });
+					memory.set(id, { record: stored, durable: true });
 				}
 			} else {
 				blocked = true;
@@ -211,13 +251,18 @@ export function createKitchenSync(options: {
 			}
 		}
 		for (const record of byWriter.values()) {
-			if (!memory.get(record.writerId))
-				memory.set(record.writerId, { record: clone(record), durable: true });
+			if (!memory.get(record.writerId)) memory.set(record.writerId, { record, durable: true });
 		}
 		const records = sortRecords([...byWriter.values()]);
 		const allDurable =
 			!blocked && records.every((record) => memory.get(record.writerId)?.durable !== false);
-		return { records, durable: allDurable, blocked, error };
+		return { records, durable: allDurable, blocked, error, readError };
+	}
+
+	function hasOrphanedMeals(state: AppState): boolean {
+		if (!state.meals.length) return false;
+		const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
+		return state.meals.some((meal) => !recipeIds.has(meal.recipeId));
 	}
 
 	function aggregatePending(
@@ -231,8 +276,8 @@ export function createKitchenSync(options: {
 		return {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
-			base: clone(context.baseline?.state || first.base),
-			local: clone(local),
+			base: context.baseline?.state || first.base,
+			local,
 			etag: context.baseline?.etag || first.etag,
 			updatedAt: Math.max(...records.map((record) => record.pending.updatedAt))
 		};
@@ -245,11 +290,22 @@ export function createKitchenSync(options: {
 		prefer?: 'local' | 'remote',
 		setUI = false
 	): { state: AppState; conflicts: SyncConflict[] } {
-		const merged = mergePendingKitchenJournal(loaded.records, seed, prefer);
+		let merged: { state: AppState; conflicts: SyncConflict[] };
+		if (!loaded.records.length) {
+			merged = { state: seed, conflicts: [] };
+		} else if (
+			loaded.records.length === 1 &&
+			(loaded.records[0].pending.base === seed || equal(loaded.records[0].pending.base, seed)) &&
+			!hasOrphanedMeals(loaded.records[0].pending.local)
+		) {
+			merged = { state: loaded.records[0].pending.local, conflicts: [] };
+		} else {
+			merged = mergePendingKitchenJournal(loaded.records, seed, prefer);
+		}
 		context.pending = aggregatePending(context, loaded.records, merged.state);
 		context.pendingDurable = loaded.durable;
 		context.blockedByStorage = loaded.blocked;
-		context.conflicts = clone(merged.conflicts);
+		context.conflicts = merged.conflicts.length ? clone(merged.conflicts) : [];
 		if (setUI) context.viewState = clone(merged.state);
 		if (!loaded.error) context.error = '';
 		else context.error = loaded.error;
@@ -273,6 +329,7 @@ export function createKitchenSync(options: {
 	function activate(user: User): ActiveContext | null {
 		const identity = { userId: user.id, householdId: user.householdId };
 		if (!isSameIdentity(options.getUser(), identity)) return null;
+		clearStageTimer();
 		generation += 1;
 		const key = identityKey(identity);
 		const context: ActiveContext = {
@@ -285,6 +342,7 @@ export function createKitchenSync(options: {
 			pending: null,
 			pendingDurable: false,
 			blockedByStorage: false,
+			dirty: false,
 			syncing: false,
 			conflicts: [],
 			error: ''
@@ -361,8 +419,9 @@ export function createKitchenSync(options: {
 		} catch {
 			baselineError = 'The confirmed kitchen could not be saved for offline use.';
 		}
+		const seed = context.baseline?.state || remoteState;
 		let loaded = loadJournal(context);
-		let merged = updateAggregate(context, loaded, remoteState);
+		let merged = updateAggregate(context, loaded, seed);
 		if (
 			!baselineError &&
 			loaded.records.length &&
@@ -371,15 +430,14 @@ export function createKitchenSync(options: {
 		) {
 			try {
 				acknowledge(context, loaded.records);
-				loaded = loadJournal(context);
-				merged = updateAggregate(context, loaded, remoteState);
+				loaded = materializeJournalFromMemory(context, loaded.readError);
+				merged = updateAggregate(context, loaded, seed);
 			} catch {
 				context.error =
 					'The server already has these changes, but the saved offline journal could not be cleared.';
 			}
 		}
-		context.viewState = clone(merged.state);
-		setContextState(context, merged.state);
+		setContextState(context, merged.state, true);
 		if (baselineError) context.error = baselineError;
 		emitStatus(context);
 	}
@@ -414,11 +472,13 @@ export function createKitchenSync(options: {
 		return false;
 	}
 
-	function stage(state: AppState): void {
+	function stage(state: AppState, stageOptions?: StageOptions): void {
+		clearStageTimer();
 		const context = active;
 		if (!context || !isActive(context)) return;
+		context.dirty = false;
 		context.error = '';
-		const next = clone(state);
+		const next = stageOptions?.clone === false ? state : clone(state);
 		if (!isState(next)) {
 			context.error = 'The kitchen state is invalid and was not saved.';
 			emitStatus(context);
@@ -446,7 +506,7 @@ export function createKitchenSync(options: {
 		if (own && equal(next, own.pending.base)) {
 			try {
 				acknowledge(context, [own]);
-				const after = loadJournal(context);
+				const after = materializeJournalFromMemory(context, loaded.readError);
 				context.viewState = next;
 				updateAggregate(context, after, context.baseline?.state || next);
 			} catch {
@@ -466,7 +526,7 @@ export function createKitchenSync(options: {
 		const pending: PendingKitchen = {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
-			base: clone(own?.pending.base || context.viewState || context.baseline!.state),
+			base,
 			local: next,
 			etag: own?.pending.etag ?? (context.baseline?.etag || null),
 			createdAt: own?.pending.createdAt ?? now,
@@ -502,9 +562,8 @@ export function createKitchenSync(options: {
 				}
 			]
 		};
-		if (durable) rememberRecord(context, ownRecord, true);
-		else rememberRecord(context, ownRecord, false);
-		const after = loadJournal(context);
+		rememberRecord(context, ownRecord, durable);
+		const after = materializeJournalFromMemory(context, loaded.readError);
 		const aggregate = updateAggregate(context, after, context.baseline?.state || base);
 		// Stage is driven by the UI's current state. Keep it as the view even if a different tab has
 		// additional queued deltas that are not reflected in this tab yet.
@@ -515,9 +574,51 @@ export function createKitchenSync(options: {
 		emitStatus(context);
 	}
 
+	function flushDirty(notifyFlush: boolean): boolean {
+		clearStageTimer();
+		const context = active;
+		if (!context || !isActive(context) || !context.dirty) return false;
+		context.dirty = false;
+		const raw = options.getState();
+		const snapshot =
+			raw && typeof raw === 'object'
+				? (JSON.parse(JSON.stringify(raw)) as AppState)
+				: (raw as AppState);
+		stage(snapshot, { clone: false });
+		if (notifyFlush) options.onFlush?.();
+		return true;
+	}
+
+	function flush(): boolean {
+		return flushDirty(true);
+	}
+
+	function scheduleStage(): void {
+		const context = active;
+		if (!context || !isActive(context)) return;
+		const wasPending = !!context.pending || context.dirty;
+		context.dirty = true;
+		if (!wasPending) emitStatus(context);
+		clearStageTimer();
+		stageTimer = setTimeout(() => {
+			stageTimer = undefined;
+			flushDirty(true);
+		}, coalesceDelay);
+	}
+
+	function cancelPending(): void {
+		clearStageTimer();
+		if (active) active.dirty = false;
+	}
+
+	function hasUnflushed(): boolean {
+		return !!active && isActive(active) && active.dirty;
+	}
+
 	async function sync(prefer?: 'local' | 'remote'): Promise<void> {
 		const context = active;
 		if (!context || !isActive(context) || context.syncing) return;
+		flushDirty(false);
 		const loaded = loadJournal(context);
 		if (!loaded.records.length) {
 			context.pending = null;
@@ -527,14 +628,15 @@ export function createKitchenSync(options: {
 			emitStatus(context);
 			return;
 		}
-		context.pending = aggregatePending(
-			context,
-			loaded.records,
-			mergePendingKitchenJournal(
-				loaded.records,
-				context.baseline?.state || loaded.records[0].pending.base
-			).state
-		);
+		const initialSeed = context.baseline?.state || loaded.records[0].pending.base;
+		const initialMerged =
+			loaded.records.length === 1 &&
+			(loaded.records[0].pending.base === initialSeed ||
+				equal(loaded.records[0].pending.base, initialSeed)) &&
+			!hasOrphanedMeals(loaded.records[0].pending.local)
+				? { state: loaded.records[0].pending.local, conflicts: [] }
+				: mergePendingKitchenJournal(loaded.records, initialSeed);
+		context.pending = aggregatePending(context, loaded.records, initialMerged.state);
 		context.pendingDurable = loaded.durable;
 		context.blockedByStorage = loaded.blocked;
 		if (!loaded.durable || loaded.blocked) {
@@ -577,6 +679,7 @@ export function createKitchenSync(options: {
 			};
 			const result = await syncPendingKitchenJournal(captured, guarded, prefer);
 			if (!isActive(context)) return;
+			if (context.dirty) flushDirty(false);
 			if (!result.saved) {
 				context.conflicts = clone(result.conflicts);
 				context.pending = aggregatePending(context, captured, result.state);
@@ -598,17 +701,20 @@ export function createKitchenSync(options: {
 					'The server saved these changes, but acknowledged journal entries could not be retired.';
 			}
 			let remaining = loadJournal(context);
-			afterSaveError ||= rebaseNewerWriterRecords(
-				context,
-				captured,
-				remaining.records,
-				result.state,
-				result.etag
-			);
-			remaining = loadJournal(context);
-			const merged = updateAggregate(context, remaining, result.state);
 			if (remaining.records.length) {
-				setContextState(context, merged.state);
+				afterSaveError ||= rebaseNewerWriterRecords(
+					context,
+					captured,
+					remaining.records,
+					result.state,
+					result.etag
+				);
+				remaining = loadJournal(context);
+			}
+			const seed = context.baseline?.state || result.state;
+			const merged = updateAggregate(context, remaining, seed);
+			if (remaining.records.length) {
+				setContextState(context, merged.state, true);
 				shouldContinue = remaining.durable && !remaining.blocked && merged.conflicts.length === 0;
 				if (merged.conflicts.length) {
 					context.error =
@@ -619,8 +725,10 @@ export function createKitchenSync(options: {
 				context.pendingDurable = false;
 				context.blockedByStorage = !!remaining.error;
 				context.conflicts = [];
-				context.viewState = clone(result.state);
-				setContextState(context, result.state);
+				context.viewState = seed;
+				if (!equal(options.getState(), seed)) {
+					options.setState(clone(seed));
+				}
 			}
 			if (remaining.error) context.error = remaining.error;
 			if (afterSaveError) context.error = afterSaveError;
@@ -640,6 +748,7 @@ export function createKitchenSync(options: {
 	}
 
 	function clearContext(): void {
+		clearStageTimer();
 		generation += 1;
 		active = null;
 		options.onStatus({ pending: false, syncing: false, conflicts: [], error: '' });
@@ -647,12 +756,143 @@ export function createKitchenSync(options: {
 
 	function snapshot(): PendingKitchen | null {
 		if (!active || !isActive(active)) return null;
+		flushDirty(false);
 		const loaded = loadJournal(active);
 		if (!loaded.records.length) return null;
 		const seed = active.baseline?.state || loaded.records[0].pending.base;
-		const merged = mergePendingKitchenJournal(loaded.records, seed);
-		return aggregatePending(active, loaded.records, merged.state);
+		const merged =
+			loaded.records.length === 1 &&
+			(loaded.records[0].pending.base === seed || equal(loaded.records[0].pending.base, seed)) &&
+			!hasOrphanedMeals(loaded.records[0].pending.local)
+				? { state: loaded.records[0].pending.local, conflicts: [] }
+				: mergePendingKitchenJournal(loaded.records, seed);
+		const aggregated = aggregatePending(active, loaded.records, merged.state);
+		return aggregated ? clone(aggregated) : null;
 	}
 
-	return { initialize, restore, stage, sync, snapshot, clearContext };
+	return {
+		initialize,
+		restore,
+		stage,
+		scheduleStage,
+		flush,
+		cancelPending,
+		hasUnflushed,
+		sync,
+		snapshot,
+		clearContext
+	};
+}
+
+/**
+ * Coalesces reactive kitchen mutations into delayed guest or journal snapshot writes while flushing
+ * synchronously on unload, tab hide, reconnect, explicit sync, auth transitions, and exports.
+ */
+export function createKitchenPersistence(options: {
+	storage: StorageLike;
+	getState: () => AppState;
+	getUser: () => User | null;
+	isManagedAuth?: () => boolean;
+	isGuestReady?: () => boolean;
+	isKitchenLoaded?: () => boolean;
+	sync: Pick<
+		ReturnType<typeof createKitchenSync>,
+		'scheduleStage' | 'flush' | 'cancelPending' | 'hasUnflushed'
+	>;
+	onGuestQuotaError?: () => void;
+	onAfterFlush?: () => void;
+	coalesceMs?: number;
+}) {
+	let guestDirty = false;
+	let guestTimer: ReturnType<typeof setTimeout> | undefined;
+	const coalesceDelay = Math.max(0, options.coalesceMs ?? DEFAULT_PERSISTENCE_COALESCE_MS);
+
+	function clearGuestTimer(): void {
+		if (guestTimer !== undefined) {
+			clearTimeout(guestTimer);
+			guestTimer = undefined;
+		}
+	}
+
+	function guestReady(): boolean {
+		return options.isGuestReady ? options.isGuestReady() : true;
+	}
+
+	function flush(): boolean {
+		clearGuestTimer();
+		if (options.getUser()) {
+			guestDirty = false;
+			return options.sync.flush();
+		}
+		if (guestDirty && !options.isManagedAuth?.() && guestReady()) {
+			guestDirty = false;
+			try {
+				options.storage.setItem('flavorithm-guest-kitchen', JSON.stringify(options.getState()));
+			} catch {
+				options.onGuestQuotaError?.();
+				return false;
+			}
+			options.onAfterFlush?.();
+			return true;
+		}
+		return false;
+	}
+
+	function scheduleGuestFlush(): void {
+		clearGuestTimer();
+		guestTimer = setTimeout(() => {
+			guestTimer = undefined;
+			flush();
+		}, coalesceDelay);
+	}
+
+	function schedule(): void {
+		const managed = Boolean(options.isManagedAuth?.());
+		const currentUser = options.getUser();
+		if (managed && (!currentUser || !(options.isKitchenLoaded?.() ?? true))) return;
+		if (currentUser) {
+			clearGuestTimer();
+			guestDirty = false;
+			options.sync.scheduleStage();
+			return;
+		}
+		if (!managed) {
+			guestDirty = true;
+			if (guestReady()) scheduleGuestFlush();
+		}
+	}
+
+	function onGuestReady(): void {
+		if (guestDirty && !options.getUser() && !options.isManagedAuth?.() && guestReady()) {
+			scheduleGuestFlush();
+		}
+	}
+
+	function cancel(): void {
+		clearGuestTimer();
+		guestDirty = false;
+		options.sync.cancelPending();
+	}
+
+	function hasPending(): boolean {
+		return guestDirty || options.sync.hasUnflushed();
+	}
+
+	function bindLifecycle(win?: EventTargetLike | null, doc?: EventTargetLike | null): () => void {
+		const onLifecycleFlush = () => {
+			flush();
+		};
+		doc?.addEventListener('visibilitychange', onLifecycleFlush);
+		win?.addEventListener('visibilitychange', onLifecycleFlush);
+		win?.addEventListener('pagehide', onLifecycleFlush);
+		win?.addEventListener('beforeunload', onLifecycleFlush);
+		return () => {
+			doc?.removeEventListener('visibilitychange', onLifecycleFlush);
+			win?.removeEventListener('visibilitychange', onLifecycleFlush);
+			win?.removeEventListener('pagehide', onLifecycleFlush);
+			win?.removeEventListener('beforeunload', onLifecycleFlush);
+		};
+	}
+
+	return { schedule, flush, onGuestReady, cancel, hasPending, bindLifecycle };
 }

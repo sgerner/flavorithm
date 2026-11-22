@@ -67,7 +67,7 @@
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
 	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
-	import { createKitchenSync } from '#lib/client-sync.ts';
+	import { createKitchenPersistence, createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
 		emptyImportSession,
@@ -94,6 +94,24 @@
 	let syncErrors = $state('');
 	let conflicts = $state<SyncConflict[]>([]);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
+	let kitchenPersistence: ReturnType<typeof createKitchenPersistence> | undefined;
+	const cleanSections = new WeakSet<object>();
+	function markKitchenClean() {
+		cleanSections.add(kitchen.pantry);
+		cleanSections.add(kitchen.recipes);
+		cleanSections.add(kitchen.meals);
+		cleanSections.add(kitchen.shopping);
+		cleanSections.add(kitchen.preferences);
+	}
+	function observeState(value: unknown): void {
+		if (!value || typeof value !== 'object') return;
+		if (Array.isArray(value)) {
+			for (let index = 0; index < value.length; index += 1) observeState(value[index]);
+			return;
+		}
+		const record = value as Record<string, unknown>;
+		for (const key in record) observeState(record[key]);
+	}
 	let page = $state('discover');
 	let filter = $state('For you');
 	let query = $state('');
@@ -164,10 +182,13 @@
 		modal = 'auth';
 	}
 	function clearManagedIdentity() {
+		clearTimeout(saveTimer);
+		kitchenPersistence?.cancel();
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
 		kitchen = createInitialState();
+		markKitchenClean();
 		kitchenLoaded = false;
 		showStarter = false;
 		stateEtag = null;
@@ -347,6 +368,7 @@
 	let imageInput: HTMLInputElement;
 	let deferredInstall = $state<any>(null);
 	async function refreshAuth() {
+		kitchenPersistence?.flush();
 		const data = await request('/api/auth');
 		const previousMode = installationAuthMode;
 		const previousUser = user;
@@ -360,6 +382,8 @@
 		);
 		if (modeChanged && managedAuth) clearManagedIdentity();
 		if (changedIdentity) {
+			clearTimeout(saveTimer);
+			kitchenPersistence?.cancel();
 			kitchenSync?.clearContext();
 			clearAIConnectionState();
 		}
@@ -377,6 +401,7 @@
 				clearManagedIdentity();
 			} else {
 				kitchen = createInitialState();
+				markKitchenClean();
 				localStorage.removeItem('flavorithm-last-account');
 				kitchenLoaded = true;
 			}
@@ -564,40 +589,63 @@
 	let stateEtag: string | null = null;
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
-	$effect(() => {
-		const snapshot = JSON.stringify(kitchen);
-		if (!ready) return;
-		document.documentElement.dataset.theme = kitchen.preferences.theme;
-		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
-		if (managedAuth && (!user || !kitchenLoaded)) return;
-		if (!managedAuth && !user && guestPersistenceReady) {
-			try {
-				localStorage.setItem('flavorithm-guest-kitchen', snapshot);
-			} catch {
-				notify('Device storage is full. Export your kitchen before leaving.');
-			}
-		}
-		if (user) kitchenSync?.stage(JSON.parse(snapshot));
+	function scheduleSyncRetry(delay = 250) {
 		clearTimeout(saveTimer);
-		if (user && !syncing && online)
+		if (user && !syncing && !sendingSync && online && pendingSync) {
 			saveTimer = setTimeout(() => {
 				void retrySync();
-			}, 500);
+			}, delay);
+		}
+	}
+	$effect(() => {
+		const theme = kitchen.preferences.theme;
+		const dark = kitchen.preferences.dark;
+		if (!ready) return;
+		document.documentElement.dataset.theme = theme;
+		document.documentElement.classList.toggle('dark', dark);
 	});
+	function watchKitchenSection(getSection: () => object) {
+		let initializedSection: object | null = null;
+		$effect(() => {
+			const section = getSection();
+			observeState(section);
+			if (initializedSection === null) {
+				initializedSection = section;
+				cleanSections.delete(section);
+				return;
+			}
+			if (cleanSections.has(section) && initializedSection !== section) {
+				initializedSection = section;
+				cleanSections.delete(section);
+				return;
+			}
+			initializedSection = section;
+			kitchenPersistence?.schedule();
+		});
+	}
+	watchKitchenSection(() => kitchen.pantry);
+	watchKitchenSection(() => kitchen.recipes);
+	watchKitchenSection(() => kitchen.meals);
+	watchKitchenSection(() => kitchen.shopping);
+	watchKitchenSection(() => kitchen.preferences);
 	onMount(() => {
 		online = navigator.onLine;
 		kitchenSync = createKitchenSync({
 			storage: localStorage,
 			getUser: () => user,
-			getState: () => JSON.parse(JSON.stringify(kitchen)),
+			getState: () => kitchen,
 			setState: (state) => {
 				kitchen = state;
+				markKitchenClean();
 			},
 			onStatus: (status) => {
 				pendingSync = status.pending;
 				sendingSync = status.syncing;
 				conflicts = status.conflicts;
 				syncErrors = status.error;
+			},
+			onFlush: () => {
+				scheduleSyncRetry();
 			},
 			transport: (owner) => ({
 				identity: { userId: owner.id, householdId: owner.householdId },
@@ -637,10 +685,24 @@
 				}
 			})
 		});
+		kitchenPersistence = createKitchenPersistence({
+			storage: localStorage,
+			getState: () => kitchen,
+			getUser: () => user,
+			isManagedAuth: () => managedAuth,
+			isGuestReady: () => guestPersistenceReady,
+			isKitchenLoaded: () => kitchenLoaded,
+			sync: kitchenSync,
+			onGuestQuotaError: () => {
+				notify('Device storage is full. Export your kitchen before leaving.');
+			}
+		});
+		const unbindLifecycle = kitchenPersistence.bindLifecycle(window, document);
 		if (managedAuth) {
 			localStorage.removeItem('flavorithm-last-account');
 			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
+			markKitchenClean();
 			showStarter = false;
 		} else {
 			try {
@@ -650,6 +712,7 @@
 				if (local) {
 					kitchen = JSON.parse(local);
 					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
+					markKitchenClean();
 				}
 			} catch {}
 			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
@@ -680,6 +743,7 @@
 					localStorage.removeItem('flavorithm-last-account');
 					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
+					markKitchenClean();
 					kitchenLoaded = false;
 					showStarter = false;
 				}
@@ -698,6 +762,7 @@
 					}
 				}
 				if (data.user) {
+					kitchenPersistence?.cancel();
 					const saved = await request('/api/state');
 					adoptKitchen(saved.state || createNewUserState());
 					kitchenLoaded = true;
@@ -705,6 +770,7 @@
 				user = data.user ?? null;
 				if (user) showStarter = false;
 				syncing = false;
+				if (user && pendingSync && online) scheduleSyncRetry(500);
 				if (user && returnFromChatGPT) await openSettings();
 				if (user)
 					await refreshConnections().catch(() =>
@@ -735,6 +801,7 @@
 					try {
 						const cached = JSON.parse(localStorage.getItem('flavorithm-last-account') || 'null');
 						if (cached?.id && cached?.householdId) {
+							kitchenPersistence?.cancel();
 							user = cached;
 							kitchenSync?.restore(cached);
 						}
@@ -749,6 +816,7 @@
 			})
 			.finally(() => {
 				guestPersistenceReady = true;
+				kitchenPersistence?.onGuestReady();
 			});
 		if ('serviceWorker' in navigator)
 			navigator.serviceWorker.register('/service-worker.js').catch(() => {
@@ -767,10 +835,12 @@
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
 		return () => {
+			unbindLifecycle();
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
+			kitchenPersistence?.cancel();
 			clearInterval(connectionPoll);
 			voiceCapture?.cancel();
 		};
@@ -783,9 +853,13 @@
 					localStorage.setItem('flavorithm-last-account', JSON.stringify(user));
 				} catch {}
 			}
-		} else kitchen = state;
+		} else {
+			kitchen = state;
+			markKitchenClean();
+		}
 	}
 	async function retrySync(prefer?: 'local' | 'remote') {
+		kitchenPersistence?.flush();
 		if (!online || !user || !kitchenSync) return;
 		try {
 			await kitchenSync.sync(prefer);
@@ -798,6 +872,7 @@
 		}
 	}
 	async function reconnectKitchen() {
+		kitchenPersistence?.flush();
 		try {
 			const previous = user;
 			await refreshAuth();
@@ -823,6 +898,7 @@
 		}
 	}
 	function exportPendingChanges() {
+		kitchenPersistence?.flush();
 		const snapshot = kitchenSync?.snapshot();
 		if (snapshot)
 			download(
@@ -833,9 +909,10 @@
 	}
 	async function flushKitchen() {
 		clearTimeout(saveTimer);
+		kitchenPersistence?.flush();
 		await writeChain;
 		if (user && kitchenSync) {
-			kitchenSync.stage(JSON.parse(JSON.stringify(kitchen)));
+			kitchenSync.stage(JSON.parse(JSON.stringify(kitchen)), { clone: false });
 			await kitchenSync.sync();
 			if (kitchenSync.snapshot())
 				throw new Error(
@@ -899,6 +976,8 @@
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
+			kitchenPersistence?.flush();
+			kitchenPersistence?.cancel();
 			const guestKitchen =
 				authMode === 'register' ? (JSON.parse(JSON.stringify(kitchen)) as AppState) : null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
@@ -907,13 +986,16 @@
 			if (guestKitchen) {
 				adoptKitchen(saved.state || createNewUserState());
 				kitchen = guestKitchen;
-				kitchenSync?.stage(guestKitchen);
+				markKitchenClean();
+				kitchenSync?.stage(JSON.parse(JSON.stringify(guestKitchen)), { clone: false });
 				await kitchenSync?.sync();
 			} else if (saved.state) adoptKitchen(saved.state);
 			else {
 				kitchen = guestKitchen ?? createNewUserState();
-				await request('/api/state', { state: kitchen }, 'PUT');
-				adoptKitchen(kitchen);
+				markKitchenClean();
+				const initialState = JSON.parse(JSON.stringify(kitchen)) as AppState;
+				await request('/api/state', { state: initialState }, 'PUT');
+				adoptKitchen(initialState);
 			}
 			user = result.user;
 			showStarter = false;
@@ -954,6 +1036,8 @@
 			clearTimeout(saveTimer);
 			await flushKitchen();
 			await request('/api/auth', { action: 'logout' });
+			clearTimeout(saveTimer);
+			kitchenPersistence?.cancel();
 			kitchenSync?.clearContext();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
@@ -966,6 +1050,7 @@
 			importSession = emptyImportSession();
 			resumeImport = false;
 			kitchen = createInitialState();
+			markKitchenClean();
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
 			clearInterval(connectionPoll);
@@ -2008,6 +2093,7 @@
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
+			kitchenPersistence?.cancel();
 			await writeChain;
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
 			if (user) {
@@ -2031,6 +2117,7 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
+			markKitchenClean();
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
 			modal = '';
