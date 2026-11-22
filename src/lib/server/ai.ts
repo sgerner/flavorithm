@@ -2364,7 +2364,7 @@ type PublicCatalogCacheEntry = {
 	pending: Promise<SupportedModelResponse>;
 	expiresAt: number;
 };
-const publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
 function publicCatalogKey(fetcher: Fetcher): Fetcher {
 	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
@@ -2408,6 +2408,5 @@ export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<Support
 
 /** Clear the shared catalog cache so injected-fetch tests remain isolated. */
 export function resetPublicModelCatalogCache(): void {
-	publicCatalog = undefined;
-	publicCatalogExpiresAt = 0;
+	publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 }
