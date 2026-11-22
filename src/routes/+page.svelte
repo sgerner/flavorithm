@@ -50,6 +50,7 @@
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
 		completeMeal,
+		completeRecipe,
 		expiryStatus,
 		reconcileShoppingList,
 		transferPurchasedItemsToPantry
@@ -336,7 +337,10 @@
 	let plannedServings = $state(2);
 	let editingMealId = $state('');
 	let cookingMealId = $state('');
-	let deductPantry = $state(false);
+	let cookingRecipeId = $state('');
+	let cookingServings = $state(2);
+	let completeTodaysPlan = $state(false);
+	let deductPantry = $state(true);
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
 	let shoppingText = $state('');
@@ -1341,9 +1345,10 @@
 	let butlerOpen = $state(false);
 	let cookingSteps = $state<Record<string, number[]>>({});
 	let selectedMealServings = $state<number | undefined>();
-	let cookingSessionKey = $derived(
-		`${user?.id ?? 'guest'}:${user?.householdId ?? ''}:${selected?.id ?? ''}`
-	);
+	function sessionKeyForRecipe(recipeId: string) {
+		return `${user?.id ?? 'guest'}:${user?.householdId ?? ''}:${recipeId}`;
+	}
+	let cookingSessionKey = $derived(sessionKeyForRecipe(selected?.id ?? ''));
 	$effect(() => {
 		if (selected && !cookingSteps[cookingSessionKey]) cookingSteps[cookingSessionKey] = [];
 	});
@@ -1402,11 +1407,16 @@
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
 				if (recipe && effect.mode === 'edit') editSavedRecipe(recipe);
 				else if (recipe && effect.mode === 'cook') {
-					const meal = kitchen.meals.find(
-						(item) => item.recipeId === recipe.id && !item.completedAt
+					const todaysMeal = kitchen.meals.find(
+						(item) =>
+							item.recipeId === recipe.id && !item.completedAt && item.date === dateKey(new Date())
 					);
-					if (meal) openCookDialog(meal);
-					else selected = recipe;
+					const meal =
+						todaysMeal ??
+						kitchen.meals.find((item) => item.recipeId === recipe.id && !item.completedAt);
+					if (todaysMeal) openRecipeCookDialog(recipe, todaysMeal.servings);
+					else if (meal) openCookDialog(meal);
+					else openRecipeCookDialog(recipe, recipe.servings);
 				} else selected = recipe ?? null;
 			} else if (effect.type === 'ui') {
 				butlerChat?.close();
@@ -1670,6 +1680,14 @@
 		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
 	}
+	function refreshExistingWeekShopping() {
+		const weeks = new Set(
+			kitchen.shopping.flatMap(
+				(item) => item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1] ?? []
+			)
+		);
+		for (const startDate of weeks) refreshWeekShopping(startDate);
+	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
 		if (!recipe) return;
@@ -1750,32 +1768,95 @@
 	function openCookDialog(meal: Meal) {
 		if (meal.completedAt) return;
 		cookingMealId = meal.id;
-		deductPantry = false;
+		cookingRecipeId = meal.recipeId;
+		cookingServings = meal.servings;
+		completeTodaysPlan = false;
+		deductPantry = true;
 		leftoverServings = 0;
 		modal = 'cookMeal';
 	}
+	function openRecipeCookDialog(recipe: Recipe, servings = recipe.servings) {
+		const normalizedServings =
+			Number.isInteger(servings) && servings >= 1 && servings <= 24
+				? servings
+				: Math.min(24, Math.max(1, Math.round(recipe.servings || 1)));
+		const todaysMeal = kitchen.meals.find(
+			(item) =>
+				item.recipeId === recipe.id && !item.completedAt && item.date === dateKey(new Date())
+		);
+		cookingMealId = '';
+		cookingRecipeId = recipe.id;
+		cookingServings = normalizedServings;
+		completeTodaysPlan = Boolean(todaysMeal);
+		deductPantry = true;
+		leftoverServings = 0;
+		selectedMealServings = normalizedServings;
+		modal = 'cookMeal';
+	}
 	function markMealCooked() {
-		const meal = kitchen.meals.find((item) => item.id === cookingMealId);
-		if (!meal) return;
+		const scheduledMeal = cookingMealId
+			? kitchen.meals.find((item) => item.id === cookingMealId)
+			: undefined;
+		if (cookingMealId && !scheduledMeal) return;
+
+		let recipeId = scheduledMeal?.recipeId ?? cookingRecipeId;
+		if (!recipeId) return;
+
+		const targetServings = scheduledMeal ? scheduledMeal.servings : cookingServings;
+		if (!scheduledMeal) {
+			if (!Number.isInteger(cookingServings) || cookingServings < 1 || cookingServings > 24) {
+				notify('Choose between 1 and 24 whole servings.');
+				return;
+			}
+		}
 		if (
 			!Number.isInteger(leftoverServings) ||
 			leftoverServings < 0 ||
-			leftoverServings > meal.servings
+			leftoverServings > targetServings
 		) {
-			notify(`Enter whole leftovers between 0 and ${meal.servings} servings.`);
+			notify(`Enter whole leftovers between 0 and ${targetServings} servings.`);
 			return;
 		}
-		const recipeId = meal.recipeId;
-		const startDate = weekStartForDate(meal.date);
-		kitchen = completeMeal(kitchen, meal.id, {
-			deductPantry,
-			leftoverServings: Math.round(leftoverServings)
-		});
-		refreshWeekShopping(startDate);
+
+		const todaysPlannedMeal =
+			!scheduledMeal && completeTodaysPlan
+				? kitchen.meals.find(
+						(item) =>
+							item.recipeId === recipeId && !item.completedAt && item.date === dateKey(new Date())
+					)
+				: undefined;
+		const mealToComplete = scheduledMeal ?? todaysPlannedMeal;
+
+		if (mealToComplete) {
+			if (!scheduledMeal) mealToComplete.servings = targetServings;
+			const startDate = weekStartForDate(mealToComplete.date);
+			kitchen = completeMeal(kitchen, mealToComplete.id, {
+				deductPantry,
+				leftoverServings: Math.round(leftoverServings)
+			});
+			refreshWeekShopping(startDate);
+			refreshExistingWeekShopping();
+		} else {
+			try {
+				kitchen = completeRecipe(kitchen, recipeId, {
+					servings: targetServings,
+					deductPantry,
+					leftoverServings: Math.round(leftoverServings)
+				});
+			} catch (e) {
+				notify((e as Error).message);
+				return;
+			}
+			refreshExistingWeekShopping();
+		}
+
+		cookingSteps[sessionKeyForRecipe(recipeId)] = [];
 		cookingMealId = '';
+		cookingRecipeId = '';
+		completeTodaysPlan = false;
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
-		selectedMealServings = meal.servings;
+		selectedMealServings = targetServings;
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
@@ -1793,6 +1874,10 @@
 		if (!selected || !mealDate) return;
 		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
 			notify('Choose between 1 and 24 whole servings.');
+			return;
+		}
+		if (kitchen.meals.length >= 1000) {
+			notify('This proposal exceeds the kitchen storage limit. Please make room first.');
 			return;
 		}
 		kitchen.meals.push({
@@ -1941,7 +2026,11 @@
 	function closeDialog() {
 		if (modal === 'plan') selected = null;
 		if (modal === 'editMeal') editingMealId = '';
-		if (modal === 'cookMeal') cookingMealId = '';
+		if (modal === 'cookMeal') {
+			cookingMealId = '';
+			cookingRecipeId = '';
+			completeTodaysPlan = false;
+		}
 		if (modal === 'deleteRecipe') recipeToDelete = null;
 		if (modal === 'removeMember') memberToRemove = null;
 		if (modal === 'household') {
@@ -2906,6 +2995,7 @@
 				`recipe:${selected!.id}`
 			)}
 		plan={(servings) => planRecipe(selected!, servings)}
+		cook={(servings) => openRecipeCookDialog(selected!, servings)}
 		nutrition={refreshNutrition}
 		edit={() => editSavedRecipe(selected!)}
 		remove={() => askDeleteRecipe(selected!)}
@@ -3529,16 +3619,46 @@
 						>
 					</div>
 				{:else if modal === 'cookMeal'}
-					{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
+					{@const cookingMeal = cookingMealId
+						? kitchen.meals.find((meal) => meal.id === cookingMealId)
+						: undefined}
 					{@const cookingRecipe = kitchen.recipes.find(
-						(recipe) => recipe.id === cookingMeal?.recipeId
+						(recipe) => recipe.id === (cookingMeal?.recipeId ?? cookingRecipeId)
 					)}
+					{@const todaysPlannedMeal = !cookingMeal
+						? kitchen.meals.find(
+								(meal) =>
+									meal.recipeId === cookingRecipe?.id &&
+									!meal.completedAt &&
+									meal.date === dateKey(new Date())
+							)
+						: undefined}
+					{@const activeCookServings = cookingMeal ? cookingMeal.servings : cookingServings}
 					<h2>Mark meal cooked</h2>
 					<p class="muted">{cookingRecipe?.title}</p>
+					{#if !cookingMeal}<label class="field"
+							>Servings cooked<input
+								type="number"
+								min="1"
+								max="24"
+								step="1"
+								bind:value={cookingServings}
+							/></label
+						>{/if}
+					{#if todaysPlannedMeal}<label class="cook-option"
+							><input type="checkbox" bind:checked={completeTodaysPlan} /><span
+								><b>Complete today’s planned {todaysPlannedMeal.slot.toLowerCase()}</b><small
+									>Marks your scheduled meal cooked instead of adding a duplicate history entry.</small
+								></span
+							></label
+						>{/if}
 					<label class="cook-option"
 						><input type="checkbox" bind:checked={deductPantry} /><span
 							><b>Deduct ingredients from pantry</b><small
-								>Uses the planned serving amount and available matching stock.</small
+								>Uses {cookingMeal
+									? 'the planned serving amount'
+									: `${Number.isInteger(cookingServings) && cookingServings >= 1 ? cookingServings : (cookingRecipe?.servings ?? 1)} cooked ${(Number.isInteger(cookingServings) && cookingServings >= 1 ? cookingServings : (cookingRecipe?.servings ?? 1)) === 1 ? 'serving' : 'servings'}`}
+								and available matching stock.</small
 							></span
 						></label
 					>
@@ -3546,7 +3666,9 @@
 						>Leftover servings<input
 							type="number"
 							min="0"
-							max={cookingMeal?.servings ?? 24}
+							max={Number.isInteger(activeCookServings) && activeCookServings >= 1
+								? activeCookServings
+								: 24}
 							step="1"
 							bind:value={leftoverServings}
 						/><small class="field-help">Enter 0 if there are no leftovers.</small></label

@@ -149,3 +149,35 @@ test('Basil can revise an unsaved recipe card in the same conversation', async (
 	assert.equal(updated.recipes.filter((recipe) => recipe.id === draft.id).length, 1);
 	assert.equal(updated.recipes.find((recipe) => recipe.id === draft.id)?.servings, 6);
 });
+
+test('Basil can propose recipe.complete for an unscheduled recipe', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const { applyButlerCommands } = await import('../src/lib/butler.ts');
+	const kitchen = createInitialState();
+	const result = (await runAIRequest(
+		{
+			...request,
+			messages: [{ role: 'user', content: 'I just cooked the tomato butter beans for four.' }],
+			context: JSON.stringify(kitchen)
+		},
+		provider(
+			{
+				reply: 'Logged and ready for your review.',
+				commands: [{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 4 }]
+			},
+			(body) => {
+				assert.match(body.messages[0].content, /recipe\.complete/);
+				assert.match(body.messages[0].content, /recipe\.open with mode set to cook/);
+			}
+		)
+	)) as { reply: string; commands: unknown[] };
+	const updated = applyButlerCommands(kitchen, result.commands).state;
+	assert.ok(
+		updated.meals.some(
+			(meal) =>
+				meal.recipeId === 'tomato-butter-beans' &&
+				meal.slot === 'Unscheduled' &&
+				meal.servings === 4
+		)
+	);
+});

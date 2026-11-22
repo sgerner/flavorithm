@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { AppState } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList } from './domain.ts';
-import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
+import { completeMeal, completeRecipe, reconcileShoppingList } from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
@@ -109,6 +109,13 @@ const preferences = z
 export const ButlerCommandSchema = z.discriminatedUnion('type', [
 	z.object({ type: z.literal('recipe.upsert'), recipe }),
 	z.object({ type: z.literal('recipe.delete'), id }),
+	z.object({
+		type: z.literal('recipe.complete'),
+		id,
+		servings: z.number().int().min(1).max(24).optional(),
+		leftoverServings: z.number().int().nonnegative().max(24).optional(),
+		deductPantry: z.boolean().optional()
+	}),
 	z.object({ type: z.literal('pantry.upsert'), item: pantry }),
 	z.object({ type: z.literal('pantry.delete'), id }),
 	z.object({ type: z.literal('meal.upsert'), meal }),
@@ -232,6 +239,19 @@ export function applyButlerCommands(
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
 				state.shopping = state.shopping.filter((item) => item.sourceKey !== `recipe:${command.id}`);
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
+				break;
+			case 'recipe.complete':
+				requireId(state.recipes, command.id);
+				state = completeRecipe(
+					state,
+					command.id,
+					{
+						servings: command.servings,
+						deductPantry: command.deductPantry ?? true,
+						leftoverServings: command.leftoverServings ?? 0
+					},
+					now
+				);
 				break;
 			case 'pantry.upsert':
 				state.pantry = upsert(state.pantry, command.item);

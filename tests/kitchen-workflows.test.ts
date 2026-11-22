@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createInitialState } from '../src/lib/data.ts';
 import { rankRecipes } from '../src/lib/discovery.ts';
 import {
 	normalizeName as normalizeDomainName,
@@ -7,12 +8,15 @@ import {
 } from '../src/lib/domain.ts';
 import {
 	completeMeal,
+	completeRecipe,
+	consumePantry,
 	convertCompatibleQuantity,
 	expiryStatus,
 	normalizeIngredientName,
 	reconcileShoppingList,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
+import { validateAppState } from '../src/lib/server/db.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -359,5 +363,74 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
+	);
+});
+
+test('consumePantry scales by servings while skipping expired stock and incompatible units', () => {
+	const initial = createInitialState();
+	const beans = initial.recipes.find((item) => item.id === 'tomato-butter-beans')!;
+	const now = new Date('2026-10-22T18:30:00.000Z');
+	const pantryWithExpired = [...initial.pantry, pantry('baby spinach', 5, 'cups', '2026-10-20')];
+	const remaining = consumePantry(pantryWithExpired, beans, 4, now);
+	// 4 servings of 2-serving recipe => 2 tbsp olive oil (0.125 cup) deducted from 0.5 cup -> 0.375 cup
+	assert.equal(remaining.find((item) => item.id === 'pantry-olive-oil')?.quantity, 0.375);
+	// 4 cups needed; non-expired 2 cups consumed to 0 while expired 5 cups untouched
+	assert.equal(remaining.find((item) => item.id === 'pantry-spinach')?.quantity, 0);
+	assert.equal(remaining.find((item) => item.expires === '2026-10-20')?.quantity, 5);
+	// garlic in pantry is 'head' vs recipe 'cloves' (incompatible dimension), so untouched
+	assert.equal(remaining.find((item) => item.id === 'pantry-garlic')?.quantity, 1);
+	assert.deepEqual(consumePantry(initial.pantry, beans, 0, now), initial.pantry);
+});
+
+test('completeRecipe records an Unscheduled completed meal, deducts stock, and respects the 1,000-meal limit', () => {
+	const initial = createInitialState();
+	const now = new Date(2026, 9, 22, 19, 15, 0);
+	const completed = completeRecipe(
+		initial,
+		'tomato-butter-beans',
+		{
+			servings: 4,
+			deductPantry: true,
+			leftoverServings: 6,
+			createId: () => 'spontaneous-beans'
+		},
+		now
+	);
+	assert.equal(completed.meals.length, initial.meals.length + 1);
+	const entry = completed.meals.find((meal) => meal.id === 'spontaneous-beans');
+	assert.ok(entry);
+	assert.equal(entry.slot, 'Unscheduled');
+	assert.equal(entry.date, '2026-10-22');
+	assert.equal(entry.recipeId, 'tomato-butter-beans');
+	assert.equal(entry.servings, 4);
+	assert.equal(entry.leftoverServings, 4);
+	assert.equal(entry.completedAt, now.toISOString());
+	assert.equal(completed.pantry.find((item) => item.id === 'pantry-olive-oil')?.quantity, 0.375);
+	assert.equal(completed.pantry.find((item) => item.id === 'pantry-spinach')?.quantity, 0);
+	assert.ok(validateAppState(completed));
+
+	const withoutDeduction = completeRecipe(
+		initial,
+		'tomato-butter-beans',
+		{ deductPantry: false, leftoverServings: 1 },
+		now
+	);
+	assert.deepEqual(withoutDeduction.pantry, initial.pantry);
+	assert.equal(completeRecipe(initial, 'missing-recipe', {}, now), initial);
+	assert.equal(completeRecipe(initial, 'tomato-butter-beans', { servings: 0 }, now), initial);
+
+	const fullMeals = state({
+		recipes: initial.recipes,
+		meals: Array.from({ length: 1_000 }, (_, index) => ({
+			id: `meal-${index}`,
+			date: '2026-10-22',
+			slot: 'Dinner',
+			recipeId: 'tomato-butter-beans',
+			servings: 2
+		}))
+	});
+	assert.throws(
+		() => completeRecipe(fullMeals, 'tomato-butter-beans', { deductPantry: true }, now),
+		/storage limit/
 	);
 });

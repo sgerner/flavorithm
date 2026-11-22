@@ -22,6 +22,7 @@
 		save,
 		shop,
 		plan,
+		cook,
 		rate,
 		nutrition,
 		edit,
@@ -36,6 +37,7 @@
 		save: () => void;
 		shop: (servings: number) => void;
 		plan: (servings: number) => void;
+		cook: (servings: number) => void;
 		rate: (n: number) => void;
 		nutrition: () => void;
 		edit: () => void;
@@ -116,6 +118,13 @@
 					disabled={!validServings}
 					aria-describedby={!validServings ? 'servings-help' : undefined}
 					onclick={() => {
+						if (validServings && servingCount !== undefined) cook(servingCount);
+					}}><Check size={17} /> Mark cooked</button
+				><button
+					class="secondary"
+					disabled={!validServings}
+					aria-describedby={!validServings ? 'servings-help' : undefined}
+					onclick={() => {
 						if (validServings && servingCount !== undefined) plan(servingCount);
 					}}><CalendarPlus size={17} /> Plan a meal</button
 				><button
@@ -139,7 +148,7 @@
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
 			{#if !validServings}<p class="field-help" id="servings-help">
-					Enter 1–24 servings to plan or shop.
+					Enter 1–24 servings to cook, plan, or shop.
 				</p>{/if}
 			<div class="tabs">
 				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
@@ -286,6 +295,10 @@
 </div>
 
 <style>
+	.detail-actions {
+		flex-wrap: wrap;
+		align-items: center;
+	}
 	.recipe-manage-button {
 		min-height: 44px;
 		padding-inline: 12px;

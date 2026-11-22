@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createNewUserState } from '../src/lib/data.ts';
-import { completeMeal } from '../src/lib/kitchen-workflows.ts';
+import { completeMeal, completeRecipe } from '../src/lib/kitchen-workflows.ts';
 import {
 	mergeKitchenStates,
 	readPending,
@@ -334,4 +334,44 @@ test('sync rechecks its identity after GET before PUT', async () => {
 		{ status: 409 }
 	);
 	assert.equal(writes, 0);
+});
+
+test('three-way merge preserves unscheduled completed recipes and detects concurrent pantry deductions', () => {
+	const base = createNewUserState();
+	const recipe = base.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'olive oil', quantity: 1, unit: 'tbsp' }];
+	base.pantry = [{ id: 'oil', name: 'olive oil', quantity: 4, unit: 'tbsp', category: 'Pantry' }];
+
+	const local = completeRecipe(
+		structuredClone(base),
+		recipe.id,
+		{ servings: 2, deductPantry: true, createId: () => 'cook-local' },
+		new Date('2026-10-22T18:00:00.000Z')
+	);
+	const remote = completeRecipe(
+		structuredClone(base),
+		recipe.id,
+		{ servings: 2, deductPantry: true, createId: () => 'cook-remote' },
+		new Date('2026-10-23T18:00:00.000Z')
+	);
+	const merged = mergeKitchenStates(base, local, remote);
+	assert.deepEqual(
+		merged.state.meals
+			.map((meal) => ({ id: meal.id, slot: meal.slot }))
+			.sort((a, b) => a.id.localeCompare(b.id)),
+		[
+			{ id: 'cook-local', slot: 'Unscheduled' },
+			{ id: 'cook-remote', slot: 'Unscheduled' }
+		]
+	);
+	assert.ok(merged.conflicts.some((item) => item.path === 'kitchen.pantry[oil].quantity'));
+
+	const remoteDeletedRecipe = structuredClone(base);
+	remoteDeletedRecipe.recipes = [];
+	const orphanCheck = mergeKitchenStates(base, local, remoteDeletedRecipe);
+	assert.ok(
+		orphanCheck.conflicts.some((item) => item.path === 'kitchen.meals[cook-local].recipeId')
+	);
+	assert.ok(orphanCheck.state.recipes.some((item) => item.id === recipe.id));
 });

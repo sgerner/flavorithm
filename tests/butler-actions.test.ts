@@ -259,3 +259,48 @@ test('invalid command payloads fail validation', () => {
 	);
 	assert.throws(() => buildButlerActions([{ type: 'ui', action: 'execute' }], kitchen));
 });
+
+test('recipe.complete and cook-mode recipe.open produce clear action cards and group related updates', () => {
+	const kitchen = createInitialState();
+	const [single] = buildButlerActions(
+		[{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 4, leftoverServings: 1 }],
+		kitchen
+	);
+	assert.equal(single.label, 'Mark cooked');
+	assert.equal(single.title, 'Tomato butter beans with garlicky toast');
+	assert.equal(single.summary, '4 servings · 1 leftover · deduct pantry');
+	assert.equal(single.destructive, false);
+
+	const [openCook] = buildButlerActions(
+		[{ type: 'recipe.open', id: 'tomato-butter-beans', mode: 'cook' }],
+		kitchen
+	);
+	assert.equal(openCook.label, 'Cook recipe');
+	assert.equal(openCook.summary, 'Open cook completion');
+
+	const groupedWithPantryAndRating = buildButlerActions(
+		[
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'extra-spinach',
+					name: 'baby spinach',
+					quantity: 2,
+					unit: 'cups',
+					category: 'Produce'
+				}
+			},
+			{ type: 'recipe.complete', id: 'tomato-butter-beans' },
+			{ type: 'preferences.update', preferences: { ratings: { 'tomato-butter-beans': 5 } } }
+		],
+		kitchen
+	);
+	assert.equal(groupedWithPantryAndRating.length, 1);
+	const applied = applyButlerCommands(kitchen, groupedWithPantryAndRating[0].commands).state;
+	assert.equal(applied.preferences.ratings?.['tomato-butter-beans'], 5);
+	assert.ok(
+		applied.meals.some(
+			(meal) => meal.recipeId === 'tomato-butter-beans' && meal.slot === 'Unscheduled'
+		)
+	);
+});

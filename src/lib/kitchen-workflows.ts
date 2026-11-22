@@ -231,14 +231,24 @@ function expiryPriority(expires: string | undefined, now: Date): number {
 	return dateOrdinal(expiry) - dateOrdinal(today);
 }
 
-function consumePantry(
+const MAX_MEALS = 1_000;
+
+function localCalendarKey(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+/** Deduct compatible non-expired pantry stock for a recipe scaled to cooked servings. */
+export function consumePantry(
 	pantry: Ingredient[],
 	recipe: Recipe,
 	servings: number,
-	now: Date
+	now: Date = new Date()
 ): Ingredient[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const remaining = pantry.map((item) => ({ ...item }));
-	const scale = recipe.servings > 0 && servings > 0 ? servings / recipe.servings : 1;
+	if (!Number.isFinite(servings) || servings <= 0) return remaining;
+	const scale =
+		Number.isFinite(recipe.servings) && recipe.servings > 0 ? servings / recipe.servings : 1;
 
 	for (const ingredient of recipe.ingredients) {
 		if (
@@ -251,10 +261,10 @@ function consumePantry(
 		const candidates = remaining
 			.map((item, index) => ({ item, index }))
 			.filter(({ item }) => normalizeName(item.name) === normalizeName(ingredient.name))
-			.filter(({ item }) => expiryStatus(item.expires, now) !== 'expired')
+			.filter(({ item }) => expiryStatus(item.expires, safeNow) !== 'expired')
 			.sort(
 				(a, b) =>
-					expiryPriority(a.item.expires, now) - expiryPriority(b.item.expires, now) ||
+					expiryPriority(a.item.expires, safeNow) - expiryPriority(b.item.expires, safeNow) ||
 					a.index - b.index
 			);
 
@@ -304,6 +314,65 @@ export function completeMeal(
 		options.deductPantry && recipe
 			? consumePantry(state.pantry, recipe, target.servings, safeNow)
 			: state.pantry;
+
+	return { ...state, meals, pantry };
+}
+
+/** Record an unscheduled cooked recipe and optionally deduct its ingredient quantities from pantry. */
+export function completeRecipe(
+	state: AppState,
+	recipeId: string,
+	options: {
+		servings?: number;
+		deductPantry?: boolean;
+		leftoverServings?: number;
+		createId?: () => string;
+	} = {},
+	now: Date = new Date()
+): AppState {
+	const recipe = state.recipes.find((item) => item.id === recipeId);
+	if (!recipe) return state;
+	if (
+		options.servings !== undefined &&
+		(!Number.isFinite(options.servings) || options.servings < 1)
+	) {
+		return state;
+	}
+	if (state.meals.length >= MAX_MEALS) {
+		throw new Error('This proposal exceeds the kitchen storage limit. Please make room first.');
+	}
+
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const rawServings = options.servings ?? recipe.servings;
+	const servings =
+		Number.isFinite(rawServings) && rawServings >= 1
+			? roundQuantity(Math.min(10_000, rawServings))
+			: 1;
+	const leftoverServings = Number.isFinite(options.leftoverServings)
+		? roundQuantity(Math.min(servings, Math.max(0, options.leftoverServings!)))
+		: 0;
+	const deductPantry = options.deductPantry ?? true;
+	const createId = options.createId ?? (() => globalThis.crypto.randomUUID());
+
+	const usedIds = new Set(state.meals.map((meal) => meal.id));
+	const baseId = (createId().trim() || globalThis.crypto.randomUUID()).slice(0, 90);
+	let id = baseId;
+	let suffix = 2;
+	while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+
+	const completedMeal: Meal = {
+		id,
+		date: localCalendarKey(safeNow),
+		slot: 'Unscheduled',
+		recipeId: recipe.id,
+		servings,
+		completedAt: safeNow.toISOString(),
+		leftoverServings
+	};
+	const meals = [...state.meals, completedMeal];
+	const pantry = deductPantry
+		? consumePantry(state.pantry, recipe, servings, safeNow)
+		: state.pantry;
 
 	return { ...state, meals, pantry };
 }

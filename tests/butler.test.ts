@@ -257,3 +257,62 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 		{ id: 'manual', name: 'tea', quantity: 1, unit: 'box', checked: false }
 	]);
 });
+
+test('butler completes unscheduled recipes, refreshes active week:* shopping scopes, and emits cook effects', () => {
+	const current = createInitialState();
+	const now = new Date('2026-10-23T18:00:00Z');
+	const weekStart = current.meals[0].date;
+	const monday = new Date(`${weekStart}T12:00:00`);
+	monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+	const mondayKey = `${monday.getFullYear()}-${String(monday.getMonth() + 1).padStart(2, '0')}-${String(monday.getDate()).padStart(2, '0')}`;
+
+	const withShopping = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: mondayKey }],
+		now
+	).state;
+	const spinachBefore =
+		withShopping.shopping.find(
+			(item) => item.sourceKey === `week:${mondayKey}` && item.name === 'baby spinach'
+		)?.quantity ?? 0;
+
+	const opened = applyButlerCommands(
+		withShopping,
+		[{ type: 'recipe.open', id: 'tomato-butter-beans', mode: 'cook' }],
+		now
+	);
+	assert.deepEqual(opened.effects, [
+		{ type: 'recipe.open', id: 'tomato-butter-beans', mode: 'cook' }
+	]);
+
+	const completed = applyButlerCommands(
+		withShopping,
+		[{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2, leftoverServings: 1 }],
+		now
+	);
+	const spontaneous = completed.state.meals.find((meal) => meal.recipeId === 'tomato-butter-beans');
+	assert.ok(spontaneous);
+	assert.equal(spontaneous.slot, 'Unscheduled');
+	assert.equal(spontaneous.servings, 2);
+	assert.equal(spontaneous.leftoverServings, 1);
+	assert.equal(spontaneous.completedAt, now.toISOString());
+	assert.equal(
+		completed.state.pantry.find((item) => item.id === 'pantry-olive-oil')?.quantity,
+		0.4375
+	);
+	assert.equal(completed.state.pantry.find((item) => item.id === 'pantry-spinach')?.quantity, 0);
+	const spinachAfter =
+		completed.state.shopping.find(
+			(item) => item.sourceKey === `week:${mondayKey}` && item.name === 'baby spinach'
+		)?.quantity ?? 0;
+	assert.ok(spinachAfter > spinachBefore);
+
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 1.5 }
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [{ type: 'recipe.complete', id: 'nonexistent-recipe' }])
+	);
+});
