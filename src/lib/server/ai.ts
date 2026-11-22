@@ -366,7 +366,8 @@ export async function runAIRequest(
 			reasoning: request.reasoning
 		},
 		connection,
-		requestFetcher
+		requestFetcher,
+		requestSignal
 	);
 	request.reasoning = validated.reasoning;
 	const { provider, selectedModel, selectedApiKey } = validated;
@@ -420,7 +421,8 @@ async function validateProviderAndReasoning(
 		reasoning?: ReasoningSettings;
 	},
 	connection: { accessToken: string; codex?: boolean } | undefined,
-	requestFetcher: Fetcher
+	requestFetcher: Fetcher,
+	requestSignal?: AbortSignal
 ): Promise<{
 	provider: AIProvider;
 	selectedModel: string;
@@ -444,6 +446,7 @@ async function validateProviderAndReasoning(
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
 			: await getPublicModelCatalog(requestFetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2604,14 +2607,17 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
-type CachedModelCatalog = {
+const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+type PublicCatalogCacheEntry = {
 	pending: Promise<SupportedModelResponse>;
 	expiresAt: number;
 };
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
-const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let publicCatalog: CachedModelCatalog | undefined;
-const customFetcherCatalogs = new WeakMap<Fetcher, CachedModelCatalog>();
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	const baseFetcher = underlyingFetchers.get(fetcher) ?? fetcher;
+	return baseFetcher.name === 'server_fetch' ? globalThis.fetch : baseFetcher;
+}
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2633,39 +2639,23 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const baseFetcher = underlyingFetchers.get(fetcher) ?? fetcher;
-	const useGlobalCache = baseFetcher === fetch || baseFetcher.name === 'server_fetch';
+	const key = publicCatalogKey(fetcher);
+	const cached = publicCatalogCache.get(key);
 	const now = Date.now();
+	if (cached && now < cached.expiresAt) return cached.pending;
 
-	if (useGlobalCache) {
-		if (!publicCatalog || now >= publicCatalog.expiresAt) {
-			const entry: CachedModelCatalog = {
-				expiresAt: now + PUBLIC_MODEL_CATALOG_TTL_MS,
-				pending: getSupportedModels(fetcher).catch((error) => {
-					if (publicCatalog === entry) {
-						publicCatalog = undefined;
-					}
-					throw error;
-				})
-			};
-			publicCatalog = entry;
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const pending = getSupportedModels(fetcher).catch((error) => {
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
 		}
-		return publicCatalog.pending;
-	}
+		throw error;
+	});
+	publicCatalogCache.set(key, { pending, expiresAt });
+	return pending;
+}
 
-	const existing = customFetcherCatalogs.get(baseFetcher);
-	if (existing && now < existing.expiresAt) {
-		return existing.pending;
-	}
-	const entry: CachedModelCatalog = {
-		expiresAt: now + PUBLIC_MODEL_CATALOG_TTL_MS,
-		pending: getSupportedModels(fetcher).catch((error) => {
-			if (customFetcherCatalogs.get(baseFetcher) === entry) {
-				customFetcherCatalogs.delete(baseFetcher);
-			}
-			throw error;
-		})
-	};
-	customFetcherCatalogs.set(baseFetcher, entry);
-	return entry.pending;
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 }
