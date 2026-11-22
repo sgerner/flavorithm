@@ -83,21 +83,25 @@ class MockElement {
 		return null;
 	}
 
-	private matchesFocusable(): boolean {
+	private matchesFocusable(selector: string): boolean {
 		if (this.tagName === 'button' && !this.disabled) return true;
 		if (this.tagName === 'a' && Boolean(this.href)) return true;
 		if (this.tagName === 'input' && !this.disabled) return true;
 		if (this.tagName === 'select' && !this.disabled) return true;
 		if (this.tagName === 'textarea' && !this.disabled) return true;
-		if (this.tabIndex === 0 && !this.disabled) return true;
+		if (selector.includes('[tabindex]:not([tabindex="-1"])')) {
+			if (this.tabIndex !== -1 && !this.disabled) return true;
+		} else if (this.tabIndex === 0 && !this.disabled) {
+			return true;
+		}
 		return false;
 	}
 
-	querySelectorAll(): MockElement[] {
+	querySelectorAll(selector = ''): MockElement[] {
 		const found: MockElement[] = [];
 		const visit = (parent: MockElement) => {
 			for (const child of parent.children) {
-				if (child.matchesFocusable()) found.push(child);
+				if (child.matchesFocusable(selector)) found.push(child);
 				visit(child);
 			}
 		};
@@ -390,4 +394,30 @@ test('animated {#key modal} replacement skips focus restore when outgoing trap f
 	assert.equal(doc.body.style.overflow, 'scroll');
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, plannerTrigger);
+});
+
+test('includes focusable scroll regions with non-negative tabindex while skipping tabindex="-1"', async (t) => {
+	const doc = installDom(t);
+
+	const dialog = doc.el('div', 'chat-dialog', { tabIndex: -1 });
+	const closeBtn = doc.el('button', 'close-chat');
+	const skippedNote = doc.el('div', 'programmatic-only', { tabIndex: -1 });
+	const scrollRegion = doc.el('div', 'transcript-region', { tabIndex: 0 });
+	const customOrder = doc.el('div', 'custom-tabindex', { tabIndex: 1 });
+	dialog.append(closeBtn, skippedNote, scrollRegion, customOrder);
+	doc.body.append(dialog);
+
+	const trap = focusTrap(dialog as unknown as HTMLElement);
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, closeBtn);
+
+	customOrder.focus();
+	assert.equal(dialog.dispatchTab(false), true);
+	assert.equal(doc.activeElement, closeBtn);
+
+	assert.equal(dialog.dispatchTab(true), true);
+	assert.equal(doc.activeElement, customOrder);
+
+	dialog.remove();
+	trap.destroy();
 });
