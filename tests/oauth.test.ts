@@ -1,13 +1,14 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { createHash, createCipheriv, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, writeFile, stat, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
+import type { CompanionConfig } from '../src/lib/server/chatgpt-companion.ts';
 
-process.env.FLAVORITHM_DB_PATH = ':memory:';
+const tempDir = await mkdtemp(join(tmpdir(), 'flavorithm-oauth-test-'));
+process.env.FLAVORITHM_DB_PATH = join(tempDir, 'test.sqlite');
 process.env.ORIGIN = 'http://127.0.0.1:3000';
 
 const backend = await import('../src/lib/server/db.ts');
@@ -136,8 +137,10 @@ globalThis.fetch = async (input, init) => {
 	throw new Error(`Unexpected fetch in OAuth test: ${url}`);
 };
 
-after(() => {
+after(async () => {
 	globalThis.fetch = nativeFetch;
+	backend.getDatabase().close();
+	await rm(tempDir, { recursive: true, force: true });
 });
 
 async function createLocalUser(email: string) {
@@ -387,15 +390,74 @@ test('the callback refuses to save credentials after its initiating app session 
 });
 
 test('hosted OAuth uses the exact configured callback and encrypted server credentials', async () => {
+	const storage = await import('../src/lib/server/oauth-storage.ts');
 	const user = await createLocalUser('oauth-hosted@example.com');
-	process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = Buffer.alloc(32, 9).toString('base64');
+	const validKeyBytes = Buffer.alloc(32, 9);
+	const canonicalKey = validKeyBytes.toString('base64');
+	process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = canonicalKey;
 	process.env.OPENAI_OAUTH_CLIENT_ID = 'flavorithm-hosted-client';
 	process.env.OPENAI_OAUTH_CLIENT_SECRET = 'hosted:secret with + chars';
 	process.env.OPENAI_OAUTH_CLIENT_AUTH_METHOD = 'client_secret_basic';
 	process.env.OPENAI_OAUTH_REDIRECT_URI =
 		'https://flavorithm.example/api/connections/chatgpt/callback';
 	try {
+		assert.deepEqual(storage.decodeHostedEncryptionKey(), validKeyBytes);
+		process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = `  ${canonicalKey} \n`;
+		assert.deepEqual(storage.decodeHostedEncryptionKey(), validKeyBytes);
 		const appUrl = new URL('https://flavorithm.example/settings');
+		for (const invalidKey of [
+			'',
+			'   ',
+			Buffer.alloc(31, 9).toString('base64'),
+			Buffer.alloc(33, 9).toString('base64'),
+			canonicalKey.replace(/=+$/, ''),
+			Buffer.alloc(32, 0xfb).toString('base64url'),
+			`${canonicalKey.slice(0, 10)} ${canonicalKey.slice(10)}`
+		]) {
+			process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = invalidKey;
+			assert.equal(storage.decodeHostedEncryptionKey(), null);
+			assert.equal(
+				oauth.getChatGPTOAuthAvailability({ url: appUrl, clientAddress: '203.0.113.10' }).mode,
+				'device'
+			);
+			assert.throws(
+				() =>
+					storage.encryptChatGPTCredentials(user.user.id, 'acct-invalid-key', 'hosted', {
+						accessToken: 'a',
+						refreshToken: 'r',
+						idToken: 'i'
+					}),
+				/Hosted OAuth encryption is unavailable\./
+			);
+		}
+		process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = canonicalKey;
+
+		const roundTripEnvelope = storage.encryptChatGPTCredentials(
+			user.user.id,
+			'acct-roundtrip',
+			'hosted',
+			{
+				accessToken: 'access-rt',
+				refreshToken: null,
+				idToken: 'id-rt',
+				codexAccountId: 'codex-rt'
+			}
+		);
+		assert.deepEqual(
+			storage.decryptChatGPTCredentials(
+				user.user.id,
+				'acct-roundtrip',
+				'hosted',
+				roundTripEnvelope
+			),
+			{
+				accessToken: 'access-rt',
+				refreshToken: null,
+				idToken: 'id-rt',
+				codexAccountId: 'codex-rt'
+			}
+		);
+
 		const availability = oauth.getChatGPTOAuthAvailability({
 			url: appUrl,
 			clientAddress: '203.0.113.10'
@@ -502,6 +564,60 @@ test('hosted OAuth uses the exact configured callback and encrypted server crede
 				.get(expiredHash),
 			undefined
 		);
+
+		// Malformed stored envelopes fail before keyFor(mode) runs or creates oauth.key on disk.
+		const now = Date.now();
+		backend
+			.getDatabase()
+			.prepare(
+				'INSERT INTO chatgpt_oauth_pending(state_hash, user_id, created_at, expires_at, envelope) VALUES (?, ?, ?, ?, ?)'
+			)
+			.run('malformed-pending-fields', user.user.id, now, now + 60_000, '{"iv":"only-iv"}');
+		backend
+			.getDatabase()
+			.prepare(
+				'INSERT INTO chatgpt_oauth_pending(state_hash, user_id, created_at, expires_at, envelope) VALUES (?, ?, ?, ?, ?)'
+			)
+			.run('malformed-pending-json', user.user.id, now, now + 60_000, 'not-json');
+		delete process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY;
+		assert.equal(storage.decodeHostedEncryptionKey(), null);
+		assert.throws(
+			() => storage.consumeHostedOAuthTransaction('malformed-pending-fields', now + 1),
+			/OAuth transaction is unavailable\./
+		);
+		assert.throws(
+			() => storage.consumeHostedOAuthTransaction('malformed-pending-json', now + 1),
+			SyntaxError
+		);
+		for (const malformed of [
+			'{}',
+			'{"iv":"a","tag":"b"}',
+			'null',
+			'{"iv":1,"tag":"b","data":"c"}'
+		]) {
+			assert.throws(
+				() => storage.decryptChatGPTCredentials(user.user.id, account.id, 'hosted', malformed),
+				/OAuth credentials are unavailable\./
+			);
+		}
+		assert.throws(
+			() => storage.decryptChatGPTCredentials(user.user.id, account.id, 'hosted', '{bad-json'),
+			SyntaxError
+		);
+		const emptyKeyDir = await mkdtemp(join(tmpdir(), 'flavorithm-no-key-'));
+		const previousDbPath = process.env.FLAVORITHM_DB_PATH;
+		process.env.FLAVORITHM_DB_PATH = join(emptyKeyDir, 'test.sqlite');
+		try {
+			assert.throws(
+				() => storage.decryptChatGPTCredentials(user.user.id, account.id, 'local', '{}'),
+				/OAuth credentials are unavailable\./
+			);
+			await assert.rejects(stat(join(emptyKeyDir, 'oauth.key')), { code: 'ENOENT' });
+		} finally {
+			if (previousDbPath === undefined) delete process.env.FLAVORITHM_DB_PATH;
+			else process.env.FLAVORITHM_DB_PATH = previousDbPath;
+			await rm(emptyKeyDir, { recursive: true, force: true });
+		}
 	} finally {
 		delete process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY;
 		delete process.env.OPENAI_OAUTH_CLIENT_ID;
@@ -568,77 +684,49 @@ test('an older refresh failure cannot clear a newly reauthorized credential set'
 	assert.equal(await oauth.getChatGPTAccessToken(user.user.id, account.id), 'newly-authorized');
 });
 
-test('self-hosted connector completes local PKCE OAuth and imports encrypted credentials through the signed-in session', async () => {
-	const user = await createLocalUser('companion-integration@example.com');
-	const sessionBinding = backend.getSessionBinding(user.token)!;
-	const appUrl = new URL('https://flavorithm.example/');
-	assert.equal(
-		oauth.getChatGPTOAuthAvailability({ url: appUrl, clientAddress: '203.0.113.1' }).mode,
-		'device'
-	);
-	const storage = await import('../src/lib/server/oauth-storage.ts');
-	const vmHost = storage.ensureChatGPTHostId();
-	const result = oauth.startChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl });
-	const directory = await mkdtemp(join(tmpdir(), 'flavorithm-connector-'));
-	try {
-		const scriptPath = join(directory, result.filename);
-		await writeFile(scriptPath, result.script, { mode: 0o600 });
-		const helper = await import(pathToFileURL(scriptPath).href);
-		const completed = await helper.authorize(undefined, {
-			fetcher: globalThis.fetch,
-			settingsDir: join(directory, 'settings'),
-			outputDir: directory,
-			openBrowser: async (value: string) => {
-				const authorization = new URL(value);
-				assert.equal(authorization.searchParams.get('client_id'), 'dynamic_agent_client');
-				assert.equal(authorization.searchParams.get('agent_name_hint'), 'Flavorithm');
-				assert.notEqual(authorization.searchParams.get('ext_agent_host_id'), vmHost);
-				const invalidState = new URL(authorization.searchParams.get('redirect_uri')!);
-				invalidState.searchParams.set('state', 'incorrect-state');
-				assert.equal((await nativeFetch(invalidState)).status, 400);
-				assert.equal((await callbackFor(authorization)).response.status, 200);
-			}
-		});
-		const file = await readFile(completed.filename, 'utf8');
-		assert.doesNotMatch(file, /access-oaiapp|refresh-oaiapp|id_token|email|subject/);
-		assert.equal((await stat(completed.filename)).mode & 0o777, 0o600);
-		const bundle = JSON.parse(file);
-		const stranger = await createLocalUser('companion-stranger@example.com');
-		await assert.rejects(
-			oauth.finishChatGPTCompanion({
-				userId: stranger.user.id,
-				sessionBinding: backend.getSessionBinding(stranger.token)!,
-				appUrl,
-				bundle
-			}),
-			{ code: 'chatgpt_pairing_expired' }
-		);
-		await oauth.finishChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl, bundle });
-		const account = oauth.listChatGPTAccounts(user.user.id)[0];
-		assert.equal(account.planEnabled, true);
-		assert.equal(account.connected, true);
-		assert.equal(
-			await oauth.getChatGPTAccessToken(user.user.id, account.id),
-			`access-${storage.getChatGPTAccount(user.user.id, account.id)!.clientId}`
-		);
-		assert.equal(storage.ensureChatGPTHostId(), vmHost);
-		await assert.rejects(
-			oauth.finishChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl, bundle }),
-			{ code: 'chatgpt_pairing_expired' }
-		);
-	} finally {
-		await rm(directory, { recursive: true, force: true });
-	}
-});
-
 async function companionBundle(
 	user: Awaited<ReturnType<typeof createLocalUser>>,
 	options: { wrongNonce?: boolean; scopes?: string[] } = {}
 ) {
 	const sessionBinding = backend.getSessionBinding(user.token)!;
 	const appUrl = new URL('https://flavorithm.example/');
-	const result = oauth.startChatGPTCompanion({ userId: user.user.id, sessionBinding, appUrl });
-	const setup = JSON.parse(result.script.split('\n')[0].slice('const config = '.length, -1));
+	const keyPath = join(tempDir, 'oauth.key');
+	try {
+		await writeFile(keyPath, randomBytes(32), { flag: 'wx', mode: 0o600 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+	}
+	const localKey = await readFile(keyPath);
+	const setup: CompanionConfig = {
+		pairingId: randomBytes(32).toString('base64url'),
+		pairingKey: randomBytes(32).toString('base64url'),
+		nonce: randomBytes(32).toString('base64url'),
+		origin: appUrl.origin,
+		expiresAt: Date.now() + 10 * 60 * 1000,
+		clientId: 'dynamic_agent_client',
+		newRegistration: true,
+		reconsent: false
+	};
+	const pairingIv = randomBytes(12);
+	const pairingCipher = createCipheriv('aes-256-gcm', localKey, pairingIv);
+	pairingCipher.setAAD(
+		Buffer.from(`flavorithm:chatgpt:local-pending:${user.user.id}:${setup.pairingId}`)
+	);
+	const pairingData = Buffer.concat([
+		pairingCipher.update(JSON.stringify({ ...setup, sessionBinding }), 'utf8'),
+		pairingCipher.final()
+	]);
+	const envelope = JSON.stringify({
+		iv: pairingIv.toString('base64url'),
+		tag: pairingCipher.getAuthTag().toString('base64url'),
+		data: pairingData.toString('base64url')
+	});
+	backend
+		.getDatabase()
+		.prepare(
+			'INSERT INTO chatgpt_oauth_pairings(id, user_id, expires_at, envelope) VALUES (?, ?, ?, ?)'
+		)
+		.run(setup.pairingId, user.user.id, setup.expiresAt, envelope);
 	const token = {
 		access_token: 'sensitive-access',
 		refresh_token: 'sensitive-refresh',
@@ -674,7 +762,7 @@ async function companionBundle(
 	};
 }
 
-test('companion import rejects forged identity, session swaps, tampering, expired attempts, and insecure origins', async () => {
+test('companion import rejects forged identity, session swaps, cross-user bundles, tampering, replays, and expired attempts', async () => {
 	const user = await createLocalUser('companion-validation@example.com');
 	await assert.rejects(
 		oauth.finishChatGPTCompanion(await companionBundle(user, { wrongNonce: true })),
@@ -688,22 +776,67 @@ test('companion import rejects forged identity, session swaps, tampering, expire
 	);
 	const tampered = await companionBundle(user);
 	tampered.bundle.tag = randomBytes(16).toString('base64url');
-	await assert.rejects(oauth.finishChatGPTCompanion(tampered), { code: 'chatgpt_pairing_invalid' });
+	await assert.rejects(oauth.finishChatGPTCompanion(tampered), (error: unknown) => {
+		return (
+			error instanceof oauth.ChatGPTOAuthError &&
+			error.status === 400 &&
+			error.code === 'chatgpt_pairing_invalid'
+		);
+	});
+	const missingField = await companionBundle(user);
+	missingField.bundle.data = '';
+	await assert.rejects(oauth.finishChatGPTCompanion(missingField), (error: unknown) => {
+		return (
+			error instanceof oauth.ChatGPTOAuthError &&
+			error.status === 400 &&
+			error.code === 'chatgpt_pairing_invalid'
+		);
+	});
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const rawKey = randomBytes(32);
+	const rawIv = randomBytes(12);
+	const rawAad = Buffer.from('flavorithm:companion:https://flavorithm.example:pairing-check');
+	const rawCipher = createCipheriv('aes-256-gcm', rawKey, rawIv);
+	rawCipher.setAAD(rawAad);
+	const rawData = Buffer.concat([rawCipher.update('{"ok":true}', 'utf8'), rawCipher.final()]);
+	const rawEnvelope = {
+		iv: rawIv.toString('base64url'),
+		tag: rawCipher.getAuthTag().toString('base64url'),
+		data: rawData.toString('base64url')
+	};
+	assert.equal(storage.decipherOAuthEnvelope(rawEnvelope, rawKey, rawAad), '{"ok":true}');
+	assert.throws(() => storage.decipherOAuthEnvelope(rawEnvelope, rawKey, Buffer.from('wrong-aad')));
+	assert.throws(
+		() => storage.decipherOAuthEnvelope({ ...rawEnvelope, iv: '' }, rawKey, rawAad),
+		/OAuth envelope is invalid\./
+	);
 	const expired = await companionBundle(user);
 	backend
 		.getDatabase()
 		.prepare('UPDATE chatgpt_oauth_pairings SET expires_at = ? WHERE id = ?')
 		.run(Date.now() - 1, expired.bundle.pairingId);
 	await assert.rejects(oauth.finishChatGPTCompanion(expired), { code: 'chatgpt_pairing_expired' });
-	assert.throws(
-		() =>
-			oauth.startChatGPTCompanion({
-				userId: user.user.id,
-				sessionBinding: backend.getSessionBinding(user.token)!,
-				appUrl: new URL('http://flavorithm.example/')
-			}),
-		{ code: 'chatgpt_https_required' }
+	assert.equal(oauth.listChatGPTAccounts(user.user.id).length, 0);
+
+	const valid = await companionBundle(user);
+	const stranger = await createLocalUser('companion-stranger@example.com');
+	await assert.rejects(
+		oauth.finishChatGPTCompanion({
+			...valid,
+			userId: stranger.user.id,
+			sessionBinding: backend.getSessionBinding(stranger.token)!
+		}),
+		{ code: 'chatgpt_pairing_expired' }
 	);
+	assert.equal(oauth.listChatGPTAccounts(stranger.user.id).length, 0);
+	const connected = await oauth.finishChatGPTCompanion(valid);
+	assert.equal(connected.connected, true);
+	assert.equal(connected.planEnabled, true);
+	assert.equal(
+		await oauth.getChatGPTAccessToken(user.user.id, connected.accountId),
+		'sensitive-access'
+	);
+	await assert.rejects(oauth.finishChatGPTCompanion(valid), { code: 'chatgpt_pairing_expired' });
 });
 
 test('companion import retains sign-in without claiming plan access when the provider declines plan scope', async () => {
