@@ -1,7 +1,20 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
-import { buildShoppingList, normalizeName, unitInfo } from './domain.ts';
+import {
+	buildShoppingList,
+	dateOrdinal,
+	normalizeName,
+	parseCalendarDate,
+	unitInfo
+} from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
-export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
+export {
+	normalizeName,
+	normalizeName as normalizeIngredientName,
+	parseIngredientLine,
+	parseIngredientLines,
+	unitInfo,
+	type ParsedIngredient
+} from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
 export function convertCompatibleQuantity(
@@ -59,35 +72,10 @@ function calendarDate(value: Date): { year: number; month: number; day: number }
 	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
 }
 
-function expiryDate(value: string): { year: number; month: number; day: number } | undefined {
-	const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
-	if (dateOnly) {
-		const year = Number(dateOnly[1]);
-		const month = Number(dateOnly[2]) - 1;
-		const day = Number(dateOnly[3]);
-		const parsed = new Date(0);
-		parsed.setFullYear(year, month, day);
-		parsed.setHours(0, 0, 0, 0);
-		if (parsed.getFullYear() !== year || parsed.getMonth() !== month || parsed.getDate() !== day)
-			return undefined;
-		return { year, month, day };
-	}
-
-	const parsed = new Date(value);
-	return calendarDate(parsed);
-}
-
-function dateOrdinal(date: { year: number; month: number; day: number }): number {
-	const utcDate = new Date(0);
-	utcDate.setUTCFullYear(date.year, date.month, date.day);
-	utcDate.setUTCHours(0, 0, 0, 0);
-	return Math.floor(utcDate.getTime() / 86_400_000);
-}
-
-/** Classify an expiry by local calendar day; date-only strings are never parsed as UTC. */
+/** Classify an expiry by local calendar day; date-only and ISO strings never shift by timezone. */
 export function expiryStatus(expires?: string, now: Date = new Date()): ExpiryStatus {
 	if (!expires?.trim()) return 'unknown';
-	const expiry = expiryDate(expires);
+	const expiry = parseCalendarDate(expires);
 	const today = calendarDate(now);
 	if (!expiry || !today) return 'unknown';
 	const daysUntilExpiry = dateOrdinal(expiry) - dateOrdinal(today);
@@ -165,7 +153,7 @@ export function reconcileShoppingList(
 		});
 	}
 
-	return [...uncheckedRetained, ...generated, ...checkedRetained];
+	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
 const MAX_SHOPPING_ITEMS = 1_000;
@@ -320,21 +308,30 @@ export function transferPurchasedItemsToPantry(
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category?: string }
 	>();
 	for (const item of purchases) {
 		if (
 			!item.checked ||
 			!Number.isFinite(item.quantity) ||
 			!(item.quantity > 0) ||
+			!item.name.trim() ||
 			!item.unit.trim()
 		)
 			continue;
 		const normalizedName = normalizeName(item.name);
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		const bucket = buckets.get(key) ?? { name: item.name.trim(), unit, quantityBase: 0 };
+		const bucket = buckets.get(key) ?? {
+			name: item.name.trim().slice(0, 200),
+			unit,
+			quantityBase: 0
+		};
 		bucket.quantityBase += item.quantity * unit.factor;
+		const category = item.category?.trim();
+		if (category && (!bucket.category || (bucket.category === 'Pantry' && category !== 'Pantry'))) {
+			bucket.category = category;
+		}
 		buckets.set(key, bucket);
 	}
 
@@ -348,11 +345,16 @@ export function transferPurchasedItemsToPantry(
 				!item.expires?.trim()
 		);
 		if (destination) {
-			destination.quantity = roundPantryQuantity(
-				destination.quantity + bucket.quantityBase / unitInfo(destination.unit).factor
+			const baseline = Number.isFinite(destination.quantity)
+				? Math.max(0, destination.quantity)
+				: 0;
+			destination.quantity = Math.min(
+				1_000_000,
+				roundPantryQuantity(baseline + bucket.quantityBase / unitInfo(destination.unit).factor)
 			);
 			continue;
 		}
+		if (result.length >= 1_000) continue;
 
 		const baseId = createId();
 		let id = baseId;
@@ -362,9 +364,9 @@ export function transferPurchasedItemsToPantry(
 		result.push({
 			id,
 			name: bucket.name,
-			quantity: roundPantryQuantity(bucket.quantityBase / bucket.unit.factor),
-			unit: bucket.unit.display,
-			category: 'Pantry'
+			quantity: Math.min(1_000_000, roundPantryQuantity(bucket.quantityBase / bucket.unit.factor)),
+			unit: bucket.unit.display.slice(0, 40),
+			category: bucket.category?.slice(0, 100) || 'Pantry'
 		});
 	}
 	return result;
@@ -375,7 +377,7 @@ function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
 }
 
 function expiryPriority(expires: string | undefined, now: Date): number {
-	const expiry = expires ? expiryDate(expires) : undefined;
+	const expiry = expires ? parseCalendarDate(expires) : undefined;
 	const today = calendarDate(now);
 	if (!expiry || !today) return Number.MAX_SAFE_INTEGER;
 	return dateOrdinal(expiry) - dateOrdinal(today);
@@ -387,6 +389,7 @@ function consumePantry(
 	servings: number,
 	now: Date
 ): Ingredient[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const remaining = pantry.map((item) => ({ ...item }));
 	const scale = recipe.servings > 0 && servings > 0 ? servings / recipe.servings : 1;
 
@@ -401,10 +404,13 @@ function consumePantry(
 		const candidates = remaining
 			.map((item, index) => ({ item, index }))
 			.filter(({ item }) => normalizeName(item.name) === normalizeName(ingredient.name))
-			.filter(({ item }) => expiryStatus(item.expires, now) !== 'expired')
+			.filter(({ item }) => {
+				const status = expiryStatus(item.expires, safeNow);
+				return status !== 'expired' && (!item.expires?.trim() || status !== 'unknown');
+			})
 			.sort(
 				(a, b) =>
-					expiryPriority(a.item.expires, now) - expiryPriority(b.item.expires, now) ||
+					expiryPriority(a.item.expires, safeNow) - expiryPriority(b.item.expires, safeNow) ||
 					a.index - b.index
 			);
 
