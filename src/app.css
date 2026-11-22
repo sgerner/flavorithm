@@ -1167,7 +1167,7 @@ main {
 }
 .shopping-filters button.active {
 	background: var(--green);
-	color: var(--paper);
+	color: var(--on-green);
 	border-color: var(--green);
 }
 .shopping-filters button span {
@@ -4292,6 +4292,7 @@ main {
 	.filter-tabs button.active,
 	.theme-grid button.active,
 	.expiry-filters button.active,
+	.shopping-filters button.active,
 	.steps-list li button.done,
 	.check-box.checked,
 	.quiz-options.quiz-time input:checked + span {

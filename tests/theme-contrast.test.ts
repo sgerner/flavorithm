@@ -95,13 +95,22 @@ function resolveColor(expr: string, vars: Record<string, string>, dark: boolean)
 			parseInt(hex.slice(4, 6), 16) / 255
 		];
 	}
-	const oklchMatch = value.match(/^oklch\(([\d.]+%?)\s+([\d.]+)\s+(none|[\d.]+(?:deg)?)\)$/);
-	if (oklchMatch) {
-		const rawL = oklchMatch[1];
-		const L = rawL.endsWith('%') ? parseFloat(rawL) / 100 : parseFloat(rawL);
-		const C = parseFloat(oklchMatch[2]);
-		const h = oklchMatch[3] === 'none' ? 0 : parseFloat(oklchMatch[3]);
-		return oklchToSrgb(L, C, h);
+	if (value.startsWith('oklch(') && value.endsWith(')')) {
+		const parts = value
+			.slice(6, -1)
+			.trim()
+			.split(' ')
+			.map((part) => part.trim())
+			.filter(Boolean);
+		if (parts.length === 3) {
+			const [rawL, rawC, rawH] = parts;
+			const L = rawL.endsWith('%') ? parseFloat(rawL.slice(0, -1)) / 100 : parseFloat(rawL);
+			const C = parseFloat(rawC);
+			const h = rawH === 'none' ? 0 : parseFloat(rawH.endsWith('deg') ? rawH.slice(0, -3) : rawH);
+			if (!Number.isNaN(L) && !Number.isNaN(C) && !Number.isNaN(h)) {
+				return oklchToSrgb(L, C, h);
+			}
+		}
 	}
 	throw new Error(`Unsupported color expression: ${value}`);
 }
@@ -126,8 +135,30 @@ function applyBrightness([r, g, b]: Rgb, factor: number): Rgb {
 
 function parseDeclarations(block: string): Record<string, string> {
 	const out: Record<string, string> = {};
-	for (const match of block.matchAll(/(--[\w-]+)\s*:\s*([^;]+);/g)) {
-		out[match[1]] = match[2].trim();
+	for (const rawDecl of block.split(';')) {
+		const colonIdx = rawDecl.indexOf(':');
+		if (colonIdx === -1) continue;
+		const prop = rawDecl.slice(0, colonIdx).trim();
+		if (!prop.startsWith('--')) continue;
+		const val = rawDecl.slice(colonIdx + 1).trim();
+		if (val) out[prop] = val;
+	}
+	return out;
+}
+
+function stripCssComments(css: string): string {
+	let out = '';
+	let pos = 0;
+	while (pos < css.length) {
+		const start = css.indexOf('/*', pos);
+		if (start === -1) {
+			out += css.slice(pos);
+			break;
+		}
+		out += css.slice(pos, start);
+		const end = css.indexOf('*/', start + 2);
+		if (end === -1) break;
+		pos = end + 2;
 	}
 	return out;
 }
@@ -135,13 +166,13 @@ function parseDeclarations(block: string): Record<string, string> {
 function extractTopLevelRuleBlocks(
 	css: string
 ): Array<{ selector: string; body: string; media?: string }> {
-	const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '');
+	const stripped = stripCssComments(css);
 	const rules: Array<{ selector: string; body: string; media?: string }> = [];
 
 	function walk(source: string, media?: string) {
 		let i = 0;
 		while (i < source.length) {
-			while (i < source.length && /\s/.test(source[i])) i++;
+			while (i < source.length && source.charCodeAt(i) <= 32) i++;
 			if (i >= source.length) break;
 			const openIdx = source.indexOf('{', i);
 			const semiIdx = source.indexOf(';', i);
@@ -174,24 +205,120 @@ function extractTopLevelRuleBlocks(
 
 function loadSelectableThemes(): string[] {
 	const svelte = fs.readFileSync(PAGE_SVELTE_PATH, 'utf8');
-	const match = svelte.match(/const themes = \[([\s\S]*?)\];/);
-	assert.ok(match, 'Could not locate const themes in src/routes/+page.svelte');
-	return [...match[1].matchAll(/'([a-z]+)'/g)].map((m) => m[1]);
+	const marker = 'const themes = [';
+	const start = svelte.indexOf(marker);
+	assert.notEqual(start, -1, 'Could not locate const themes in src/routes/+page.svelte');
+	const end = svelte.indexOf('];', start + marker.length);
+	assert.notEqual(end, -1, 'Could not locate closing ]; for const themes');
+	const listBody = svelte.slice(start + marker.length, end);
+	const themes: string[] = [];
+	for (const item of listBody.split(',')) {
+		const trimmed = item.trim();
+		if (trimmed.startsWith("'") && trimmed.endsWith("'") && trimmed.length > 2) {
+			themes.push(trimmed.slice(1, -1));
+		}
+	}
+	return themes;
+}
+
+function isCssIdentChar(ch: string): boolean {
+	const code = ch.charCodeAt(0);
+	return (
+		(code >= 48 && code <= 57) ||
+		(code >= 65 && code <= 90) ||
+		(code >= 97 && code <= 122) ||
+		code === 45 ||
+		code === 95
+	);
+}
+
+function normalizeSelectorForSpecificity(selector: string): string {
+	const stack: Array<'where' | 'not' | 'other'> = [];
+	let whereDepth = 0;
+	let out = '';
+	let i = 0;
+	while (i < selector.length) {
+		if (selector.startsWith(':where(', i)) {
+			stack.push('where');
+			whereDepth++;
+			i += 7;
+			continue;
+		}
+		if (selector.startsWith(':not(', i)) {
+			stack.push('not');
+			i += 5;
+			continue;
+		}
+		const ch = selector[i];
+		if (ch === '(') {
+			stack.push('other');
+			if (whereDepth === 0) out += ch;
+			i++;
+			continue;
+		}
+		if (ch === ')') {
+			const kind = stack.pop();
+			if (kind === 'where') whereDepth--;
+			else if (kind === 'other' && whereDepth === 0) out += ch;
+			i++;
+			continue;
+		}
+		if (whereDepth === 0) out += ch;
+		i++;
+	}
+	return out;
 }
 
 function selectorSpecificity(selector: string): number {
-	const withoutWhere = selector.replace(/:where\((?:[^()]+|\([^()]*\))*\)/g, '');
-	const unwrappedNot = withoutWhere.replace(/:not\(([^)]*)\)/g, '$1');
-	const ids = (unwrappedNot.match(/#[\w-]+/g) || []).length;
-	const attrsAndPseudos =
-		(unwrappedNot.match(/\[[^\]]+\]/g) || []).length +
-		(unwrappedNot.match(/:(?!:)[\w-]+/g) || []).length +
-		(unwrappedNot.match(/\.[\w-]+/g) || []).length;
-	const stripped = unwrappedNot
-		.replace(/\[[^\]]+\]/g, ' ')
-		.replace(/[#.:][\w-]+/g, ' ')
-		.trim();
-	const elements = stripped ? stripped.split(/\s+/).filter(Boolean).length : 0;
+	const normalized = normalizeSelectorForSpecificity(selector);
+	let ids = 0;
+	let attrsAndPseudos = 0;
+	let elements = 0;
+	let i = 0;
+	while (i < normalized.length) {
+		const ch = normalized[i];
+		if (ch === '[') {
+			const closeIdx = normalized.indexOf(']', i + 1);
+			if (closeIdx === -1) break;
+			if (closeIdx > i + 1) attrsAndPseudos++;
+			i = closeIdx + 1;
+			continue;
+		}
+		if (ch === '#') {
+			i++;
+			const start = i;
+			while (i < normalized.length && isCssIdentChar(normalized[i])) i++;
+			if (i > start) ids++;
+			continue;
+		}
+		if (ch === '.') {
+			i++;
+			const start = i;
+			while (i < normalized.length && isCssIdentChar(normalized[i])) i++;
+			if (i > start) attrsAndPseudos++;
+			continue;
+		}
+		if (ch === ':') {
+			if (normalized[i + 1] === ':') {
+				i += 2;
+				const start = i;
+				while (i < normalized.length && isCssIdentChar(normalized[i])) i++;
+				if (i > start) elements++;
+			} else {
+				i++;
+				const start = i;
+				while (i < normalized.length && isCssIdentChar(normalized[i])) i++;
+				if (i > start) attrsAndPseudos++;
+			}
+			continue;
+		}
+		if (isCssIdentChar(ch)) {
+			while (i < normalized.length && isCssIdentChar(normalized[i])) i++;
+			elements++;
+			continue;
+		}
+		i++;
+	}
 	return ids * 10000 + attrsAndPseudos * 100 + elements;
 }
 
@@ -241,9 +368,8 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 	assert.equal(themes.length, 24);
 
 	for (const theme of themes) {
-		assert.match(
-			appCss,
-			new RegExp(`@import '@skeletonlabs/skeleton/themes/${theme}';`),
+		assert.ok(
+			appCss.includes(`@import '@skeletonlabs/skeleton/themes/${theme}';`),
 			`Missing Skeleton theme import for ${theme}`
 		);
 	}
@@ -385,27 +511,53 @@ test('zero custom foreground declarations lack a paired or theme-verified backgr
 		return out;
 	}
 
+	function extractSvelteStyleBlocks(svelte: string): string[] {
+		const blocks: string[] = [];
+		let pos = 0;
+		while (pos < svelte.length) {
+			const openStart = svelte.indexOf('<style', pos);
+			if (openStart === -1) break;
+			const openEnd = svelte.indexOf('>', openStart + 6);
+			if (openEnd === -1) break;
+			const closeStart = svelte.indexOf('</style>', openEnd + 1);
+			if (closeStart === -1) break;
+			blocks.push(svelte.slice(openEnd + 1, closeStart));
+			pos = closeStart + 8;
+		}
+		return blocks;
+	}
+
+	function extractStyleProperties(body: string): Array<{ prop: string; value: string }> {
+		const props: Array<{ prop: string; value: string }> = [];
+		for (const rawDecl of stripCssComments(body).split(';')) {
+			const colonIdx = rawDecl.indexOf(':');
+			if (colonIdx === -1) continue;
+			const prop = rawDecl.slice(0, colonIdx).trim();
+			const value = rawDecl.slice(colonIdx + 1).trim();
+			if (prop && value) props.push({ prop, value });
+		}
+		return props;
+	}
+
 	const unpaired: string[] = [];
 	for (const file of collectStyleFiles(path.join(ROOT, 'src'))) {
 		const rel = path.relative(ROOT, file);
 		const content = fs.readFileSync(file, 'utf8');
-		const cssBlocks = file.endsWith('.css')
-			? [content]
-			: [...content.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map((m) => m[1]);
+		const cssBlocks = file.endsWith('.css') ? [content] : extractSvelteStyleBlocks(content);
 
 		for (const css of cssBlocks) {
 			for (const rule of extractTopLevelRuleBlocks(css)) {
-				const colorMatches = [...rule.body.matchAll(/(?:^|[;\s])color\s*:\s*([^;]+);/g)];
-				if (!colorMatches.length) continue;
-				const bgMatch = rule.body.match(/(?:^|[;\s])background(?:-color)?\s*:\s*([^;]+);/);
+				const props = extractStyleProperties(rule.body);
+				const colorValues = props.filter((p) => p.prop === 'color').map((p) => p.value);
+				if (!colorValues.length) continue;
+				const bgProp = props.find((p) => p.prop === 'background' || p.prop === 'background-color');
 
-				for (const match of colorMatches) {
-					const fg = match[1].trim();
+				for (const fg of colorValues) {
 					if (allowedVerifiedColorValues.has(fg)) continue;
 
 					// Allow fixed editorial containers (e.g. .inspiration-banner children) or rules that explicitly pair background + color
-					if (bgMatch) {
-						const bg = bgMatch[1].trim();
+					if (bgProp) {
+						const bg = bgProp.value;
 						if (fg.startsWith('#') && bg.startsWith('#')) {
 							const ratio = contrastRatio(resolveColor(fg, {}, false), resolveColor(bg, {}, false));
 							if (ratio < 4.5) {
@@ -442,6 +594,19 @@ test('zero custom foreground declarations lack a paired or theme-verified backgr
 	assert.deepEqual(unpaired, []);
 
 	const appCss = fs.readFileSync(APP_CSS_PATH, 'utf8');
-	assert.match(appCss, /@media\s*\(forced-colors:\s*active\)/);
-	assert.match(appCss, /@media\s*\(prefers-contrast:\s*more\)/);
+	assert.ok(appCss.includes('@media (forced-colors: active)'));
+	assert.ok(appCss.includes('@media (prefers-contrast: more)'));
+});
+
+test('selectorSpecificity evaluates :where() and :not() in linear time without backtracking', () => {
+	assert.equal(selectorSpecificity(':root'), 100);
+	assert.equal(selectorSpecificity('html[data-theme]'), 101);
+	assert.equal(selectorSpecificity("html[data-theme='nosh']"), 101);
+	assert.equal(selectorSpecificity("html[data-theme]:where(:not([data-theme='nosh']))"), 101);
+	assert.equal(selectorSpecificity("html[data-theme]:not([data-theme='nosh'])"), 201);
+
+	const start = performance.now();
+	assert.equal(selectorSpecificity('html:where(' + "'".repeat(50_000)), 1);
+	assert.equal(selectorSpecificity('html' + ':where('.repeat(10_000)), 1);
+	assert.ok(performance.now() - start < 200);
 });
