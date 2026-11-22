@@ -106,22 +106,34 @@
 	<section class="sync-notice" aria-label="Kitchen synchronization" in:revealMotion|global>
 		<div role="status">
 			{#if !online}<CloudOff size={18} /><span
-					>Offline{pending && !error ? ' · Changes pending on this device' : ''}</span
+					>Offline{pending ? ' · Changes pending on this device' : ''}</span
 				>
 			{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
 			{:else if syncing}<RefreshCw size={18} /><span>Syncing your kitchen…</span>
-			{:else}<span
+			{:else if pending}<span
 					>{error
 						? 'Kitchen sync failed. Your changes are pending.'
 						: 'Changes pending on this device. Waiting to sync.'}</span
+				>
+			{:else}<span
+					>{error.includes('invalid')
+						? 'That kitchen change was rejected. No pending changes are queued.'
+						: 'Kitchen storage or sync needs attention. No pending changes are queued.'}</span
 				>{/if}
 		</div>
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
+		{#if pending && !(review && conflicts.length)}
+			<button class="secondary" type="button" onclick={exportPending}
+				><Download size={16} /> Back up my changes</button
+			>
+		{/if}
 		{#if conflicts.length}
-			<button class="secondary" onclick={() => (review = !review)}
+			<button class="secondary" type="button" onclick={() => (review = !review)}
 				>{review ? 'Hide changes' : 'Review changes'}</button
 			>
-		{:else if online && !syncing}<button class="secondary" onclick={retry}>Retry sync</button>{/if}
+		{:else if online && !syncing}<button class="secondary" type="button" onclick={retry}
+				>Retry sync</button
+			>{/if}
 		{#if review && conflicts.length}
 			<div class="sync-review">
 				<p>
@@ -146,14 +158,20 @@
 						</li>{/each}
 				</ul>
 				<div class="sync-actions">
-					<button class="secondary" onclick={exportPending}
-						><Download size={16} /> Back up my changes</button
+					{#if pending}<button class="secondary" type="button" onclick={exportPending}
+							><Download size={16} /> Back up my changes</button
+						>{/if}
+					<button
+						class="secondary"
+						type="button"
+						disabled={syncing || !online}
+						onclick={() => resolve('remote')}>Use household values</button
 					>
-					<button class="secondary" disabled={syncing || !online} onclick={() => resolve('remote')}
-						>Use household values</button
-					>
-					<button class="primary" disabled={syncing || !online} onclick={() => resolve('local')}
-						>Use my values</button
+					<button
+						class="primary"
+						type="button"
+						disabled={syncing || !online}
+						onclick={() => resolve('local')}>Use my values</button
 					>
 				</div>
 			</div>

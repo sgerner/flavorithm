@@ -257,3 +257,150 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 		{ id: 'manual', name: 'tea', quantity: 1, unit: 'box', checked: false }
 	]);
 });
+
+test('butler enforces cover paths, HTTPS URLs, importNotes, leftovers, cuisines, and effort bounds matching validateAppState', async () => {
+	process.env.FLAVORITHM_DB_PATH = ':memory:';
+	const { validateAppState } = await import('../src/lib/server/db.ts');
+	const current = createInitialState();
+	const baseRecipe = structuredClone(current.recipes[0]);
+	const coverUrl = `/api/recipe-covers/${'f'.repeat(64)}`;
+
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'recipe.upsert',
+				recipe: { ...baseRecipe, image: `/recipe-covers/${'f'.repeat(64)}` }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'recipe.upsert',
+				recipe: { ...baseRecipe, image: 'http://example.com/photo.jpg' }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'recipe.upsert',
+				recipe: { ...baseRecipe, source: 'http://example.com/recipe' }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'recipe.upsert',
+				recipe: { ...baseRecipe, source: 'https://user:secret@example.com/recipe' }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'recipe.upsert',
+				recipe: { ...baseRecipe, importNotes: ['x'.repeat(301)] }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'recipe.upsert',
+				recipe: { ...baseRecipe, importNotes: Array.from({ length: 31 }, (_, i) => `note ${i}`) }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'recipe.upsert',
+				recipe: { ...baseRecipe, time: 100_001 }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'excess-leftover',
+					date: '2026-10-23',
+					slot: 'Dinner',
+					recipeId: baseRecipe.id,
+					servings: 2,
+					leftoverServings: 3
+				}
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'meal.complete',
+				id: 'missing-or-huge',
+				leftoverServings: 10_001
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'preferences.update',
+				preferences: { reasoning: { effort: 'x-high' } }
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'preferences.update',
+				preferences: { cuisines: ['   '] }
+			}
+		])
+	);
+
+	const applied = applyButlerCommands(
+		current,
+		[
+			{
+				type: 'recipe.upsert',
+				recipe: {
+					...baseRecipe,
+					image: coverUrl,
+					source: 'https://example.com/recipes/stew',
+					time: 100_000,
+					importNotes: ['  Checked seasoning  ', 'n'.repeat(300)]
+				}
+			},
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'planned-dinner',
+					date: '2026-10-23',
+					slot: 'Dinner',
+					recipeId: baseRecipe.id,
+					servings: 4
+				}
+			},
+			{
+				type: 'meal.complete',
+				id: 'planned-dinner',
+				leftoverServings: 2,
+				deductPantry: false
+			},
+			{
+				type: 'preferences.update',
+				preferences: {
+					cuisines: ['  Mediterranean  '],
+					reasoning: { effort: 'xhigh', enabled: true, budgetTokens: 2048 }
+				}
+			}
+		],
+		new Date('2026-10-23T18:00:00Z')
+	);
+	assert.ok(validateAppState(applied.state));
+	assert.doesNotThrow(() => z.toJSONSchema(ButlerResponseSchema));
+});

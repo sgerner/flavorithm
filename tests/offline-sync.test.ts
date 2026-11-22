@@ -4,8 +4,11 @@ import { createNewUserState } from '../src/lib/data.ts';
 import { completeMeal } from '../src/lib/kitchen-workflows.ts';
 import {
 	mergeKitchenStates,
+	isKitchenState,
 	readPending,
+	readPendingJournal,
 	writePending,
+	writePendingJournal,
 	clearPending,
 	syncPendingKitchen
 } from '../src/lib/offline-sync.ts';
@@ -334,4 +337,134 @@ test('sync rechecks its identity after GET before PUT', async () => {
 		{ status: 409 }
 	);
 	assert.equal(writes, 0);
+});
+
+test('readPendingJournal quarantines unreadable or invalid slots under isolated keys and keeps valid edits', () => {
+	const values = new Map<string, string>();
+	const storage = {
+		get length() {
+			return values.size;
+		},
+		key: (index: number) => [...values.keys()][index] ?? null,
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			values.set(key, value);
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
+		}
+	};
+	const userA = { id: 'user:a', householdId: 'home:a', name: 'A', email: 'a@example.test' };
+	const userOtherHome = { ...userA, householdId: 'home:b' };
+	const base = createNewUserState();
+	const validLocal = structuredClone(base);
+	validLocal.pantry.push({
+		id: 'olive-oil',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		category: 'Pantry'
+	});
+	writePendingJournal(storage, {
+		userId: userA.id,
+		householdId: userA.householdId,
+		base,
+		local: validLocal,
+		etag: 'v1',
+		createdAt: 10,
+		updatedAt: 20,
+		writerId: 'tab-valid',
+		writeId: 'w1'
+	});
+	writePendingJournal(storage, {
+		userId: userOtherHome.id,
+		householdId: userOtherHome.householdId,
+		base,
+		local: validLocal,
+		etag: 'v1',
+		createdAt: 10,
+		updatedAt: 20,
+		writerId: 'tab-other-home',
+		writeId: 'w2'
+	});
+
+	const prefixA = `flavorithm-pending-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:`;
+	const quarantineA = `flavorithm-quarantined-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:`;
+	storage.setItem(`${prefixA}tab-corrupt`, '{broken-json');
+
+	const invalidLocal = structuredClone(base);
+	(invalidLocal.pantry as unknown[]).push({
+		id: 'bad',
+		name: 'salt',
+		quantity: null,
+		unit: 'tsp',
+		category: 'Spices'
+	});
+	storage.setItem(
+		`${prefixA}tab-invalid`,
+		JSON.stringify({
+			userId: userA.id,
+			householdId: userA.householdId,
+			base,
+			local: invalidLocal,
+			etag: 'v1',
+			updatedAt: 25,
+			writerId: 'tab-invalid'
+		})
+	);
+	storage.setItem(
+		`${prefixA}tab-mismatch`,
+		JSON.stringify({
+			userId: userA.id,
+			householdId: userA.householdId,
+			base,
+			local: validLocal,
+			etag: 'v1',
+			updatedAt: 30,
+			writerId: 'different-writer'
+		})
+	);
+
+	const loaded = readPendingJournal(storage, userA);
+	assert.equal(loaded.records.length, 1);
+	assert.equal(loaded.records[0].writerId, 'tab-valid');
+	assert.match(loaded.error, /quarantined/);
+	assert.equal(storage.getItem(`${prefixA}tab-corrupt`), null);
+	assert.equal(storage.getItem(`${prefixA}tab-invalid`), null);
+	assert.equal(storage.getItem(`${prefixA}tab-mismatch`), null);
+	assert.equal(storage.getItem(`${quarantineA}tab-corrupt`), '{broken-json');
+	assert.ok(storage.getItem(`${quarantineA}tab-invalid`)?.includes('"quantity":null'));
+	assert.ok(storage.getItem(`${quarantineA}tab-mismatch`)?.includes('different-writer'));
+
+	const otherHomeLoaded = readPendingJournal(storage, userOtherHome);
+	assert.equal(otherHomeLoaded.records.length, 1);
+	assert.equal(otherHomeLoaded.error, '');
+	assert.equal(
+		[...values.keys()].some((k) =>
+			k.startsWith(
+				`flavorithm-quarantined-journal:v1:${encodeURIComponent(userOtherHome.id)}:${encodeURIComponent(userOtherHome.householdId)}:`
+			)
+		),
+		false
+	);
+});
+
+test('isKitchenState enforces client boundary schema bounds', () => {
+	const valid = createNewUserState();
+	valid.recipes[0].image = `/api/recipe-covers/${'a'.repeat(64)}`;
+	valid.recipes[0].importNotes = ['a'.repeat(300)];
+	valid.preferences.reasoning = { effort: 'xhigh', enabled: true, budgetTokens: 1024 };
+	assert.equal(isKitchenState(valid), true);
+
+	const badCover = structuredClone(valid);
+	badCover.recipes[0].image = `/recipe-covers/${'a'.repeat(64)}`;
+	assert.equal(isKitchenState(badCover), false);
+
+	const badNote = structuredClone(valid);
+	badNote.recipes[0].importNotes = ['a'.repeat(301)];
+	assert.equal(isKitchenState(badNote), false);
+
+	const badEffort = structuredClone(valid);
+	badEffort.preferences.reasoning = { effort: 'x-high' };
+	assert.equal(isKitchenState(badEffort), false);
 });

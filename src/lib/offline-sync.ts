@@ -1,3 +1,6 @@
+import { z } from 'zod';
+import { COVER_PATH } from '#lib/cover-upload.ts';
+import { MAX_RECIPES } from '#lib/recipe-collection.ts';
 import type { AppState, User } from '#lib/types.ts';
 
 export type SyncConflict = { path: string; local: unknown; remote: unknown };
@@ -21,6 +24,8 @@ const key = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-pending:${user.id}:${user.householdId}`;
 const journalPrefix = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
+const quarantinePrefix = (user: Pick<User, 'id' | 'householdId'>) =>
+	`flavorithm-quarantined-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
 export const MAX_PENDING_JOURNAL_ENTRIES = 64;
 
 export type PendingJournalRecord = {
@@ -30,6 +35,167 @@ export type PendingJournalRecord = {
 	keys: Array<{ key: string; pending: PendingKitchen }>;
 };
 export type PendingJournalRead = { records: PendingJournalRecord[]; error: string };
+
+function isPublicHttpsUrl(value: string): boolean {
+	if (!value) return true;
+	try {
+		const url = new URL(value);
+		return url.protocol === 'https:' && !url.username && !url.password;
+	} catch {
+		return false;
+	}
+}
+
+const publicHttpsUrlSchema = z
+	.string()
+	.max(4_000)
+	.refine(isPublicHttpsUrl, 'Only public HTTPS URLs are allowed');
+
+const nutritionSchema = z.object({
+	calories: z.number().finite().min(0).max(1_000_000),
+	fat: z.number().finite().min(0).max(1_000_000),
+	saturatedFat: z.number().finite().min(0).max(1_000_000),
+	sodium: z.number().finite().min(0).max(1_000_000),
+	carbs: z.number().finite().min(0).max(1_000_000),
+	fiber: z.number().finite().min(0).max(1_000_000),
+	sugar: z.number().finite().min(0).max(1_000_000),
+	protein: z.number().finite().min(0).max(1_000_000)
+});
+
+const recipeSchema = z.object({
+	id: z.string().min(1).max(100),
+	title: z.string().trim().min(1).max(200),
+	description: z.string().max(10_000),
+	image: z.union([publicHttpsUrlSchema, z.string().regex(COVER_PATH)]),
+	time: z.number().finite().min(0).max(100_000),
+	servings: z.number().finite().min(1).max(10_000),
+	difficulty: z.string().max(80),
+	cuisine: z.string().max(100),
+	tags: z.array(z.string().max(100)).max(100),
+	ingredients: z
+		.array(
+			z.object({
+				name: z.string().trim().min(1).max(200),
+				quantity: z.number().finite().min(0).max(1_000_000),
+				unit: z.string().max(40)
+			})
+		)
+		.max(250),
+	steps: z.array(z.string().max(10_000)).max(200),
+	nutrition: nutritionSchema,
+	source: publicHttpsUrlSchema.optional(),
+	provenance: z.enum(['web-import', 'ai-generated']).optional(),
+	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
+	nutritionStale: z.boolean().optional(),
+	rating: z.number().finite().min(0).max(5).optional(),
+	saved: z.boolean().optional(),
+	hidden: z.boolean().optional()
+});
+
+const preferencesSchema = z.object({
+	diet: z.string().max(200),
+	allergies: z.string().max(2_000),
+	maxTime: z.number().finite().min(0).max(100_000),
+	complexity: z.string().max(100),
+	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
+	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
+	theme: z.string().max(100),
+	dark: z.boolean(),
+	provider: z.string().max(100),
+	model: z.string().max(200),
+	reasoning: z
+		.object({
+			effort: z
+				.string()
+				.regex(/^[a-z_]{1,24}$/)
+				.optional(),
+			enabled: z.boolean().optional(),
+			budgetTokens: z.number().int().min(0).max(32_768).optional()
+		})
+		.optional(),
+	chatgptAccountId: z.string().max(100).optional(),
+	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
+});
+
+const kitchenStateSchema = z.object({
+	pantry: z
+		.array(
+			z.object({
+				id: z.string().min(1).max(100),
+				name: z.string().trim().min(1).max(200),
+				quantity: z.number().finite().min(0).max(1_000_000),
+				unit: z.string().max(40),
+				category: z.string().max(100),
+				expires: z.string().max(50).optional()
+			})
+		)
+		.max(1_000),
+	recipes: z.array(recipeSchema).max(MAX_RECIPES),
+	meals: z
+		.array(
+			z.object({
+				id: z.string().min(1).max(100),
+				date: z.string().max(50),
+				slot: z.string().max(100),
+				recipeId: z.string().max(100),
+				servings: z.number().finite().min(1).max(10_000),
+				completedAt: z.string().max(50).optional(),
+				leftoverServings: z.number().finite().min(0).max(10_000).optional()
+			})
+		)
+		.max(1_000),
+	shopping: z
+		.array(
+			z.object({
+				id: z.string().min(1).max(100),
+				name: z.string().trim().min(1).max(200),
+				quantity: z.number().finite().min(0).max(1_000_000),
+				unit: z.string().max(40),
+				checked: z.boolean(),
+				sourceKey: z.string().max(200).optional()
+			})
+		)
+		.max(1_000),
+	preferences: preferencesSchema
+});
+
+export function isKitchenState(value: unknown): value is AppState {
+	return kitchenStateSchema.safeParse(value).success;
+}
+
+function quarantineSlot(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>,
+	activeKey: string,
+	slotId: string,
+	raw: string
+): void {
+	const safeSlot = slotId ? encodeURIComponent(slotId) : 'corrupt';
+	const baseKey = `${quarantinePrefix(user)}${safeSlot}`;
+	try {
+		let targetKey = baseKey;
+		const existing = storage.getItem(targetKey);
+		if (existing !== null && existing !== raw) {
+			let suffix = 2;
+			while (suffix <= MAX_PENDING_JOURNAL_ENTRIES) {
+				const candidate = `${baseKey}:${suffix}`;
+				const current = storage.getItem(candidate);
+				if (current === null || current === raw) {
+					targetKey = candidate;
+					break;
+				}
+				suffix += 1;
+			}
+			if (targetKey === baseKey) targetKey = `${baseKey}:${Date.now()}`;
+		}
+		if (storage.getItem(targetKey) !== raw) {
+			storage.setItem(targetKey, raw);
+		}
+		storage.removeItem(activeKey);
+	} catch {
+		// Leave the original untouched for manual recovery if storage refuses writes or removals.
+	}
+}
 
 function parsePending(value: unknown, user: User): PendingKitchen | null {
 	if (
@@ -68,12 +234,18 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 	const byWriter = new Map<string, PendingJournalRecord>();
 	let error = '';
 	if (typeof storage.length !== 'number' || typeof storage.key !== 'function') {
+		let serialized: string | null = null;
 		try {
-			const serialized = storage.getItem(key(user));
+			serialized = storage.getItem(key(user));
 			if (serialized === null) return { records: [], error: '' };
 			const pending = parsePending(JSON.parse(serialized), user);
-			if (!pending)
-				return { records: [], error: 'A saved offline snapshot could not be read safely.' };
+			if (!pending) {
+				quarantineSlot(storage, user, key(user), 'legacy-main', serialized);
+				return {
+					records: [],
+					error: 'A saved offline snapshot could not be read safely and was quarantined.'
+				};
+			}
 			return {
 				records: [
 					{
@@ -85,42 +257,63 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 				error: ''
 			};
 		} catch {
+			if (serialized !== null) quarantineSlot(storage, user, key(user), 'legacy-main', serialized);
 			return { records: [], error: 'Saved offline changes could not be read.' };
 		}
 	}
 	try {
 		const prefix = journalPrefix(user);
+		const matchingKeys: string[] = [];
 		for (let index = 0; index < storage.length; index += 1) {
 			const storageKey = storage.key(index);
-			if (!storageKey?.startsWith(prefix)) continue;
-			const writerId = decodeURIComponent(storageKey.slice(prefix.length));
-			const pending = parsePending(JSON.parse(storage.getItem(storageKey) || 'null'), user);
-			if (!writerId || !pending || pending.writerId !== writerId) {
-				error ||= 'A saved offline journal entry could not be read safely.';
-				continue;
+			if (storageKey?.startsWith(prefix)) matchingKeys.push(storageKey);
+		}
+		for (const storageKey of matchingKeys) {
+			const rawSuffix = storageKey.slice(prefix.length);
+			let raw: string | null = null;
+			try {
+				raw = storage.getItem(storageKey);
+				if (raw === null) continue;
+				const writerId = decodeURIComponent(rawSuffix);
+				const pending = parsePending(JSON.parse(raw), user);
+				if (!writerId || !pending || pending.writerId !== writerId) {
+					quarantineSlot(storage, user, storageKey, writerId || rawSuffix || 'empty', raw);
+					error ||= 'A saved offline journal entry could not be read safely and was quarantined.';
+					continue;
+				}
+				byWriter.set(writerId, {
+					writerId,
+					pending,
+					keys: [{ key: storageKey, pending }]
+				});
+			} catch {
+				if (raw !== null) quarantineSlot(storage, user, storageKey, rawSuffix || 'corrupt', raw);
+				error ||= 'A saved offline journal entry could not be read safely and was quarantined.';
 			}
-			byWriter.set(writerId, {
-				writerId,
-				pending,
-				keys: [{ key: storageKey, pending }]
-			});
 		}
 		const mainKey = key(user);
-		const serialized = storage.getItem(mainKey);
-		if (serialized !== null) {
-			const pending = parsePending(JSON.parse(serialized), user);
-			if (!pending) {
-				error ||= 'A saved offline snapshot could not be read safely.';
-			} else {
-				const writerId = pending.writerId || 'legacy-main';
-				const existing = byWriter.get(writerId);
-				if (!existing) {
-					byWriter.set(writerId, { writerId, pending, keys: [{ key: mainKey, pending }] });
+		let serialized: string | null = null;
+		try {
+			serialized = storage.getItem(mainKey);
+			if (serialized !== null) {
+				const pending = parsePending(JSON.parse(serialized), user);
+				if (!pending) {
+					quarantineSlot(storage, user, mainKey, 'legacy-main', serialized);
+					error ||= 'A saved offline snapshot could not be read safely and was quarantined.';
 				} else {
-					existing.keys.push({ key: mainKey, pending });
-					if (pending.updatedAt > existing.pending.updatedAt) existing.pending = pending;
+					const writerId = pending.writerId || 'legacy-main';
+					const existing = byWriter.get(writerId);
+					if (!existing) {
+						byWriter.set(writerId, { writerId, pending, keys: [{ key: mainKey, pending }] });
+					} else {
+						existing.keys.push({ key: mainKey, pending });
+						if (pending.updatedAt > existing.pending.updatedAt) existing.pending = pending;
+					}
 				}
 			}
+		} catch {
+			if (serialized !== null) quarantineSlot(storage, user, mainKey, 'legacy-main', serialized);
+			error ||= 'A saved offline snapshot could not be read safely and was quarantined.';
 		}
 	} catch {
 		error ||= 'Saved offline changes could not be enumerated.';
@@ -136,15 +329,7 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 }
 
 function isState(value: unknown): value is AppState {
-	if (!value || typeof value !== 'object') return false;
-	const state = value as AppState;
-	return (
-		['pantry', 'recipes', 'meals', 'shopping'].every((field) =>
-			Array.isArray(state[field as keyof AppState])
-		) &&
-		!!state.preferences &&
-		typeof state.preferences === 'object'
-	);
+	return isKitchenState(value);
 }
 
 /** One durable latest snapshot per account and household; never stores credentials. */
@@ -184,7 +369,14 @@ export function clearPendingJournalRecords(
 ): void {
 	for (const record of records) {
 		for (const captured of record.keys) {
-			const current = parsePending(JSON.parse(storage.getItem(captured.key) || 'null'), user);
+			const raw = storage.getItem(captured.key);
+			if (raw === null) continue;
+			let current: PendingKitchen | null = null;
+			try {
+				current = parsePending(JSON.parse(raw), user);
+			} catch {
+				current = null;
+			}
 			if (current && sameJournalVersion(current, captured.pending))
 				storage.removeItem(captured.key);
 		}

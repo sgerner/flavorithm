@@ -588,6 +588,7 @@
 		online = navigator.onLine;
 		kitchenSync = createKitchenSync({
 			storage: localStorage,
+			sessionStorage,
 			getUser: () => user,
 			getState: () => JSON.parse(JSON.stringify(kitchen)),
 			setState: (state) => {
@@ -866,18 +867,23 @@
 			.filter(Boolean);
 		if (!names.length) return;
 		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
-		const additions = names.map((value) => {
-			const match = value.match(
-				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
-			);
-			return {
-				id: crypto.randomUUID(),
-				name: match ? match[3] : value,
-				quantity: match ? Number(match[1]) : 1,
-				unit: match?.[2] || 'piece',
-				checked: true
-			};
-		});
+		const additions = names
+			.map((value) => {
+				const match = value.match(
+					/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
+				);
+				const parsedQuantity = match ? Number(match[1]) : 1;
+				return {
+					id: crypto.randomUUID(),
+					name: (match ? match[3] : value).trim().slice(0, 200),
+					quantity: Number.isFinite(parsedQuantity)
+						? Math.max(0, Math.min(parsedQuantity, 1_000_000))
+						: 1,
+					unit: (match?.[2] || 'piece').slice(0, 40),
+					checked: true
+				};
+			})
+			.filter((item) => item.name.length > 0);
 		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
 		const applied = JSON.stringify(kitchen.pantry);
 		pantryInput = '';
@@ -1695,11 +1701,23 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
+	function normalizePantryQuantity(value: number | null | undefined): number {
+		if (value === null || value === undefined || !Number.isFinite(value)) return 0;
+		return Math.max(0, Math.min(value, 1_000_000));
+	}
+	function normalizeShoppingQuantity(value: number | null | undefined): number {
+		if (value === null || value === undefined || !Number.isFinite(value)) return 1;
+		return Math.max(0, Math.min(value, 1_000_000));
+	}
+	function normalizeUnitInput(value: string | null | undefined): string {
+		return String(value ?? '').slice(0, 40);
+	}
 	function normalizeShoppingItem(item: AppState['shopping'][number]) {
 		item.name = item.name.trim().slice(0, 100) || 'Shopping item';
 		item.unit = item.unit.trim().slice(0, 40) || 'piece';
-		const quantity = Number(item.quantity);
-		item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1000000)) : 1;
+		const raw = item.quantity as number | null | undefined;
+		const quantity = raw === null || raw === undefined ? NaN : Number(raw);
+		item.quantity = Number.isFinite(quantity) && quantity > 0 ? Math.min(quantity, 1000000) : 1;
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
 		if (meals?.some((meal) => !Number.isFinite(meal.servings) || meal.servings <= 0)) {
@@ -2011,8 +2029,12 @@
 			await writeChain;
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
 			if (user) {
+				const encodedId = encodeURIComponent(user.id);
 				for (const key of Object.keys(localStorage)) {
-					if (key.startsWith('flavorithm-') && key.includes(`:${user.id}:`))
+					if (
+						key.startsWith('flavorithm-') &&
+						(key.includes(`:${user.id}:`) || key.includes(`:${encodedId}:`))
+					)
 						localStorage.removeItem(key);
 				}
 			}
@@ -2544,16 +2566,29 @@
 									aria-label={`Quantity of ${item.name}`}
 									type="number"
 									min="0"
+									max="1000000"
 									step="0.25"
-									bind:value={item.quantity}
+									bind:value={
+										() => item.quantity,
+										(value) => {
+											item.quantity = normalizePantryQuantity(value);
+										}
+									}
 								/><input
 									class="unit-input"
 									aria-label={`Unit for ${item.name}`}
-									bind:value={item.unit}
+									maxlength="40"
+									bind:value={
+										() => item.unit,
+										(value) => {
+											item.unit = normalizeUnitInput(value);
+										}
+									}
 								/></label
 							><input
 								aria-label={`Expiry for ${item.name}`}
 								type="date"
+								maxlength="50"
 								bind:value={item.expires}
 							/><button
 								class="icon-button"
@@ -2785,7 +2820,12 @@
 										<input
 											class="shopping-name"
 											aria-label="Shopping item name"
-											bind:value={item.name}
+											bind:value={
+												() => item.name,
+												(value) => {
+													item.name = String(value ?? '').slice(0, 100);
+												}
+											}
 											maxlength="100"
 											onblur={() => normalizeShoppingItem(item)}
 										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
@@ -2797,11 +2837,21 @@
 											min="0.01"
 											max="1000000"
 											step="0.01"
-											bind:value={item.quantity}
+											bind:value={
+												() => item.quantity,
+												(value) => {
+													item.quantity = normalizeShoppingQuantity(value);
+												}
+											}
 											onblur={() => normalizeShoppingItem(item)}
 										/><input
 											aria-label={`Unit for ${item.name}`}
-											bind:value={item.unit}
+											bind:value={
+												() => item.unit,
+												(value) => {
+													item.unit = normalizeUnitInput(value);
+												}
+											}
 											maxlength="40"
 											onblur={() => normalizeShoppingItem(item)}
 										/></span
@@ -2845,10 +2895,11 @@
 							class="inline-add"
 							onsubmit={(e) => {
 								e.preventDefault();
-								if (shoppingText.trim()) {
+								const trimmed = shoppingText.trim().slice(0, 200);
+								if (trimmed) {
 									kitchen.shopping.push({
 										id: crypto.randomUUID(),
-										name: shoppingText.trim(),
+										name: trimmed,
 										quantity: 1,
 										unit: 'piece',
 										checked: false
@@ -2860,6 +2911,7 @@
 							<Plus size={18} /><input
 								aria-label="Add shopping item"
 								placeholder="Anything else for the basket?"
+								maxlength="200"
 								bind:value={shoppingText}
 							/><button class="text-button">Add</button>
 						</form>

@@ -1,12 +1,24 @@
 import { z } from 'zod';
 import type { AppState } from './types.ts';
+import { COVER_PATH } from './cover-upload.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList } from './domain.ts';
 import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
 
+function isPublicHttpsUrl(value: string): boolean {
+	try {
+		const url = new URL(value);
+		return url.protocol === 'https:' && !url.username && !url.password;
+	} catch {
+		return false;
+	}
+}
+
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
 const quantity = z.number().finite().nonnegative().max(1000000);
+const cookingTime = z.number().finite().nonnegative().max(100000);
+const leftoverQuantity = z.number().finite().nonnegative().max(10000);
 const nutrition = z.object({
 	calories: quantity,
 	fat: quantity,
@@ -25,14 +37,10 @@ const recipe = z.object({
 		.string()
 		.max(4000)
 		.refine(
-			(value) =>
-				!value ||
-				value.startsWith('/recipe-covers/') ||
-				value.startsWith('/api/recipe-covers/') ||
-				/^https?:\/\//.test(value),
-			'Use an HTTP image URL or a recipe cover.'
+			(value) => !value || COVER_PATH.test(value) || isPublicHttpsUrl(value),
+			'Use a public HTTPS image URL or a recipe cover.'
 		),
-	time: quantity,
+	time: cookingTime,
 	servings: z.number().finite().min(1).max(10000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
@@ -44,11 +52,15 @@ const recipe = z.object({
 		.max(250),
 	steps: z.array(text).max(200),
 	nutrition,
-	source: z.string().max(4000).optional(),
+	source: z
+		.string()
+		.max(4000)
+		.refine((value) => !value || isPublicHttpsUrl(value), 'Use a public HTTPS source URL.')
+		.optional(),
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
-	importNotes: z.array(z.string().max(1000)).max(50).optional(),
+	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().min(0).max(5).optional(),
+	rating: z.number().finite().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -67,15 +79,20 @@ const date = z
 		const d = new Date(value + 'T12:00:00Z');
 		return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === value;
 	}, 'Use a real calendar date.');
-const meal = z.object({
-	id,
-	date,
-	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
-	recipeId: id,
-	servings: z.number().finite().min(1).max(10000),
-	completedAt: z.string().datetime().optional(),
-	leftoverServings: quantity.optional()
-});
+const meal = z
+	.object({
+		id,
+		date,
+		slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
+		recipeId: id,
+		servings: z.number().finite().min(1).max(10000),
+		completedAt: z.string().datetime().max(50).optional(),
+		leftoverServings: leftoverQuantity.optional()
+	})
+	.refine(
+		(value) => value.leftoverServings === undefined || value.leftoverServings <= value.servings,
+		'Leftover servings cannot exceed planned servings.'
+	);
 const shopping = z.object({
 	id,
 	name: z.string().trim().min(1).max(200),
@@ -90,18 +107,23 @@ const preferences = z
 		allergies: z.string().max(500),
 		maxTime: z.number().finite().nonnegative().max(100000),
 		complexity: z.string().max(80),
-		cuisines: z.array(z.string().max(80)).max(8),
+		cuisines: z.array(z.string().trim().min(1).max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
 		theme: z.string().max(80),
 		dark: z.boolean(),
 		provider: z.string().max(100),
 		model: z.string().max(200),
-		reasoning: z.object({
-			effort: z.string().max(24).optional(),
-			enabled: z.boolean().optional(),
-			budgetTokens: z.number().int().min(0).max(32768).optional()
-		}),
-		ratings: z.record(id, z.number().min(0).max(5)),
+		reasoning: z
+			.object({
+				effort: z
+					.string()
+					.regex(/^[a-z_]{1,24}$/)
+					.optional(),
+				enabled: z.boolean().optional(),
+				budgetTokens: z.number().int().min(0).max(32768).optional()
+			})
+			.strict(),
+		ratings: z.record(id, z.number().finite().min(0).max(5)),
 		chatgptAccountId: z.string().max(100)
 	})
 	.partial()
@@ -116,7 +138,7 @@ export const ButlerCommandSchema = z.discriminatedUnion('type', [
 	z.object({
 		type: z.literal('meal.complete'),
 		id,
-		leftoverServings: quantity.optional(),
+		leftoverServings: leftoverQuantity.optional(),
 		deductPantry: z.boolean().optional()
 	}),
 	z.object({ type: z.literal('shopping.upsert'), item: shopping }),
@@ -247,7 +269,9 @@ export function applyButlerCommands(
 					? {
 							...command.meal,
 							completedAt: previous.completedAt,
-							leftoverServings: previous.leftoverServings
+							...(previous.leftoverServings !== undefined
+								? { leftoverServings: Math.min(command.meal.servings, previous.leftoverServings) }
+								: {})
 						}
 					: command.meal;
 				state.meals = upsert(state.meals, meal);
@@ -282,9 +306,13 @@ export function applyButlerCommands(
 				refreshShoppingWeek(state, calendarKey(start), now);
 				break;
 			}
-			case 'preferences.update':
-				state.preferences = { ...state.preferences, ...command.preferences };
+			case 'preferences.update': {
+				const updates = Object.fromEntries(
+					Object.entries(command.preferences).filter(([, value]) => value !== undefined)
+				);
+				state.preferences = { ...state.preferences, ...updates };
 				break;
+			}
 			case 'recipe.open':
 				requireId(state.recipes, command.id);
 				effects.push(command);

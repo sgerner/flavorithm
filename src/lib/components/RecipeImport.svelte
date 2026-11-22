@@ -20,6 +20,11 @@
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
 	import { revealMotion } from '#lib/motion.ts';
+	import {
+		isPublicHttpsRecipeUrl,
+		prepareImportedRecipe,
+		sanitizeImportNotes
+	} from '#lib/recipe-collection.ts';
 	let {
 		session = $bindable(),
 		capture,
@@ -131,7 +136,7 @@
 			);
 			if (alive && generation === captureGeneration && result) {
 				session.draft = result.recipe;
-				session.assumptions = result.assumptions;
+				session.assumptions = sanitizeImportNotes(result.assumptions);
 				reviewingDraft = true;
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
@@ -165,37 +170,13 @@
 		event.preventDefault();
 		const draft = session.draft;
 		if (!draft) return;
-		const ingredients = draft.ingredients.map((i) => ({
-			...i,
-			name: i.name.trim(),
-			unit: i.unit.trim()
-		}));
-		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
-		if (
-			!draft.title.trim() ||
-			!ingredients.length ||
-			!steps.length ||
-			ingredients.some(
-				(i) => !i.name || !i.unit || !Number.isFinite(i.quantity) || i.quantity <= 0
-			) ||
-			!Number.isFinite(draft.time) ||
-			draft.time <= 0 ||
-			!Number.isFinite(draft.servings) ||
-			draft.servings < 1
-		) {
-			error =
-				'Add a title, time, servings, at least one ingredient with a quantity and unit, and a cooking step.';
+		const prepared = prepareImportedRecipe(draft, session.assumptions);
+		if ('error' in prepared) {
+			error = prepared.error;
 			return;
 		}
 		try {
-			save({
-				...draft,
-				title: draft.title.trim(),
-				ingredients,
-				steps,
-				importNotes: [...session.assumptions],
-				saved: true
-			});
+			save(prepared.recipe);
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -450,8 +431,8 @@
 				retryAvailable = false;
 			}}>Discard draft</button
 		>
-		{#if draft.source}<p class="field-help">
-				<a href={draft.source} target="_blank" rel="noreferrer">Original source</a>
+		{#if draft.source?.trim() && isPublicHttpsRecipeUrl(draft.source.trim())}<p class="field-help">
+				<a href={draft.source.trim()} target="_blank" rel="noreferrer">Original source</a>
 			</p>{/if}
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		<div class="draft-footer">

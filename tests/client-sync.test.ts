@@ -43,6 +43,8 @@ const makeUser = (id = 'user-a', householdId = 'home-a'): User => ({
 function harness(args: {
 	user: User | null;
 	storage?: ReturnType<typeof memoryStorage>;
+	sessionStorage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null;
+	reactiveStage?: boolean;
 	transport?: (user: User) => KitchenTransport;
 	initial?: AppState;
 }) {
@@ -58,11 +60,18 @@ function harness(args: {
 	const setStates: AppState[] = [];
 	const controller = createKitchenSync({
 		storage,
+		sessionStorage: args.sessionStorage,
 		getUser: () => currentUser,
 		getState: () => currentState,
 		setState: (state) => {
 			currentState = structuredClone(state);
 			setStates.push(structuredClone(state));
+			if (args.reactiveStage) {
+				const snapshot = JSON.stringify(currentState);
+				queueMicrotask(() => {
+					if (currentUser) controller.stage(JSON.parse(snapshot));
+				});
+			}
 		},
 		onStatus: (status) => statuses.push(status),
 		transport: (user) => {
@@ -274,18 +283,25 @@ test('unresolved conflicts retain the queue until an explicit resolution is chos
 	assert.equal(sync.statuses.at(-1)?.conflicts.length, 0);
 });
 
-test('storage failure blocks network sync and reports that the edit was not saved', async () => {
+test('storage quota failure keeps edits pending in memory for backup and online sync', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
-	const local = structuredClone(base);
-	local.preferences.maxTime = 30;
+	const firstLocal = structuredClone(base);
+	firstLocal.preferences.maxTime = 30;
+	const latestLocal = structuredClone(base);
+	latestLocal.preferences.maxTime = 20;
 	const storage = memoryStorage();
 	const originalSet = storage.setItem;
+	let quotaExceeded = false;
 	storage.setItem = (key, value) => {
-		if (key.startsWith('flavorithm-pending-journal:')) throw new Error('Storage full');
+		if (quotaExceeded && key.startsWith('flavorithm-pending-journal:')) {
+			throw Object.assign(new Error('QuotaExceededError'), { name: 'QuotaExceededError' });
+		}
 		originalSet(key, value);
 	};
 	let reads = 0;
+	let writes = 0;
+	const savedStates: AppState[] = [];
 	const sync = harness({
 		user,
 		storage,
@@ -293,16 +309,46 @@ test('storage failure blocks network sync and reports that the edit was not save
 			identity: { userId: user.id, householdId: user.householdId },
 			get: async () => {
 				reads += 1;
-				return { state: base, etag: 'v1', userId: user.id, householdId: user.householdId };
+				return {
+					state: structuredClone(base),
+					etag: 'v1',
+					userId: user.id,
+					householdId: user.householdId
+				};
 			},
-			put: async (state) => ({ state, etag: 'v2' })
+			put: async (state) => {
+				writes += 1;
+				savedStates.push(structuredClone(state));
+				return { state: structuredClone(state), etag: 'v2' };
+			}
 		})
 	});
 	sync.controller.initialize(user, base, 'v1');
-	sync.controller.stage(local);
+	sync.controller.stage(firstLocal);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		1
+	);
+
+	quotaExceeded = true;
+	sync.controller.stage(latestLocal);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.match(sync.statuses.at(-1)?.error || '', /could not be saved on this device/);
+	assert.equal(sync.controller.snapshot()?.local.preferences.maxTime, 20);
+
 	await sync.controller.sync();
-	assert.equal(reads, 0);
-	assert.match(sync.statuses.at(-1)?.error || '', /could not be saved|not safely saved/);
+	assert.equal(reads, 1);
+	assert.equal(writes, 1);
+	assert.equal(savedStates.at(-1)?.preferences.maxTime, 20);
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
 });
 
 test('separate offline writers survive destroy and reload, then sync their disjoint changes', async () => {
@@ -502,4 +548,239 @@ test('an acknowledgement retires only captured journal versions, preserving a pe
 		['peer']
 	);
 	assert.equal(storage.getItem(peerKey), null);
+});
+
+test('stage rejects malformed kitchen snapshots at the client boundary before staging or syncing', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	let requests = 0;
+	const sync = harness({
+		user,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => {
+				requests += 1;
+				return { state: base, etag: 'v1', userId: user.id, householdId: user.householdId };
+			},
+			put: async (state) => {
+				requests += 1;
+				return { state, etag: 'v2' };
+			}
+		})
+	});
+	sync.controller.initialize(user, base, 'v1');
+
+	const nullQuantity = structuredClone(base);
+	nullQuantity.pantry.push({
+		id: 'bad-qty',
+		name: 'flour',
+		quantity: null as unknown as number,
+		unit: 'cup',
+		category: 'Pantry'
+	});
+	sync.controller.stage(nullQuantity);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const longUnit = structuredClone(base);
+	longUnit.pantry.push({
+		id: 'bad-unit',
+		name: 'sugar',
+		quantity: 1,
+		unit: 'u'.repeat(41),
+		category: 'Pantry'
+	});
+	sync.controller.stage(longUnit);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const insecureImage = structuredClone(base);
+	insecureImage.recipes[0].image = 'http://example.com/insecure.jpg';
+	sync.controller.stage(insecureImage);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const badEffort = structuredClone(base);
+	badEffort.preferences.reasoning = { effort: 'x-high' };
+	sync.controller.stage(badEffort);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(
+		[...sync.storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+	await sync.controller.sync();
+	assert.equal(requests, 0);
+
+	const valid = structuredClone(base);
+	valid.pantry.push({ id: 'ok', name: 'flour', quantity: 0, unit: 'cup', category: 'Pantry' });
+	sync.controller.stage(valid);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+});
+
+test('reloading one offline tab five times reuses one writer slot in localStorage', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const sessionStorage = memoryStorage();
+
+	const initialTab = harness({ user, storage, sessionStorage });
+	initialTab.controller.initialize(user, base, 'v1');
+	const firstEdit = structuredClone(base);
+	firstEdit.preferences.maxTime = 15;
+	initialTab.controller.stage(firstEdit);
+	initialTab.controller.clearContext();
+
+	for (let reload = 1; reload <= 5; reload += 1) {
+		const tab = harness({ user, storage, sessionStorage });
+		assert.equal(tab.controller.restore(user), true);
+		const next = structuredClone(tab.state);
+		next.preferences.maxTime = 15 + reload * 5;
+		next.pantry = [{ id: 'salt', name: 'salt', quantity: reload, unit: 'tsp', category: 'Spices' }];
+		tab.controller.stage(next);
+		const journalKeys = [...storage.values.keys()].filter((key) =>
+			key.startsWith('flavorithm-pending-journal:')
+		);
+		assert.equal(journalKeys.length, 1);
+		tab.controller.clearContext();
+	}
+
+	const savedReloads: AppState[] = [];
+	const onlineTab = harness({
+		user,
+		storage,
+		sessionStorage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				savedReloads.push(structuredClone(state));
+				return { state: structuredClone(state), etag: 'v2' };
+			}
+		})
+	});
+	assert.equal(onlineTab.controller.restore(user), true);
+	await onlineTab.controller.sync();
+	assert.equal(savedReloads.at(-1)?.preferences.maxTime, 40);
+	assert.equal(savedReloads.at(-1)?.pantry[0]?.quantity, 5);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+
+	const brokenSession = {
+		getItem: () => {
+			throw new Error('SecurityError');
+		},
+		setItem: () => {
+			throw new Error('SecurityError');
+		},
+		removeItem: () => {
+			throw new Error('SecurityError');
+		}
+	};
+	const fallbackTab = harness({ user, storage, sessionStorage: brokenSession });
+	fallbackTab.controller.initialize(user, base, 'v2');
+	fallbackTab.controller.stage(firstEdit);
+	assert.equal(fallbackTab.controller.snapshot()?.local.preferences.maxTime, 15);
+});
+
+test('online sync saves valid edits and quarantines a corrupt slot under isolated keys', async () => {
+	const userA = makeUser('user-a', 'home-a');
+	const userB = makeUser('user-b', 'home-b');
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const savedQuarantine: AppState[] = [];
+	const sync = harness({
+		user: userA,
+		storage,
+		transport: () => ({
+			identity: { userId: userA.id, householdId: userA.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: userA.id,
+				householdId: userA.householdId
+			}),
+			put: async (state) => {
+				savedQuarantine.push(structuredClone(state));
+				return { state: structuredClone(state), etag: 'v2' };
+			}
+		})
+	});
+	sync.controller.initialize(userA, base, 'v1');
+	const edit = structuredClone(base);
+	edit.pantry.push({ id: 'beans', name: 'beans', quantity: 2, unit: 'can', category: 'Pantry' });
+	sync.controller.stage(edit);
+
+	const corruptKeyA = `flavorithm-pending-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:corrupt-writer`;
+	const otherUserKey = `flavorithm-pending-journal:v1:${encodeURIComponent(userB.id)}:${encodeURIComponent(userB.householdId)}:peer-writer`;
+	storage.setItem(corruptKeyA, '{not-valid-json');
+	storage.setItem(otherUserKey, '{also-corrupt-for-other-user');
+
+	await sync.controller.sync();
+	assert.deepEqual(
+		savedQuarantine.at(-1)?.pantry.map((item) => item.id),
+		['beans']
+	);
+	assert.equal(storage.getItem(corruptKeyA), null);
+	assert.equal(
+		storage.getItem(
+			`flavorithm-quarantined-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:corrupt-writer`
+		),
+		'{not-valid-json'
+	);
+	assert.equal(storage.getItem(otherUserKey), '{also-corrupt-for-other-user');
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.match(sync.statuses.at(-1)?.error || '', /quarantined/);
+});
+
+test('baselineError and afterSaveError remain visible after reactive microtasks flush', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const originalSet = storage.setItem;
+	storage.setItem = (key, value) => {
+		if (key.startsWith('flavorithm-confirmed:')) {
+			throw new Error('QuotaExceededError');
+		}
+		originalSet(key, value);
+	};
+
+	const sync = harness({
+		user,
+		storage,
+		reactiveStage: true,
+		transport: () => transportFor(user, base, 'v1')
+	});
+	sync.controller.initialize(user, base, 'v1');
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(
+		sync.statuses.at(-1)?.error,
+		'The confirmed kitchen could not be saved for offline use.'
+	);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+
+	const edited = structuredClone(base);
+	edited.preferences.maxTime = 35;
+	sync.state = edited;
+	sync.controller.stage(edited);
+	await sync.controller.sync();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(
+		sync.statuses.at(-1)?.error,
+		'The server saved these changes, but the confirmed state could not be saved on this device.'
+	);
 });
