@@ -2,18 +2,48 @@ name: Publish container
 
 on:
   workflow_run:
-    workflows: [CI]
+    workflows: [CI, Security]
     types: [completed]
     branches: [main]
 
 permissions:
   contents: read
 
+concurrency:
+  group: publish-container-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
 jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      packages: read
+    outputs:
+      ready: ${{ steps.verify.outputs.ready }}
+    steps:
+      - name: Check out gate script
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - name: Verify CI, Security, and registry gates
+        id: verify
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/verify-publish-gates.mjs
+
   publish:
-    # Only publish the exact commit verified by a push run in this repository.
-    # Pull-request runs must never reach this privileged job.
+    # Only publish the exact commit verified by passing CI and Security push runs
+    # in this repository. Pull-request runs must never reach this privileged job.
+    needs: gate
     if: >-
+      needs.gate.outputs.ready == 'true' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
       github.event.workflow_run.head_repository.full_name == github.repository
