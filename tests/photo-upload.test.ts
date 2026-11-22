@@ -17,12 +17,14 @@ type MockOptions = {
 	nullContext?: boolean;
 	blobSizeForQuality?: (quality: number) => number | null;
 	readerError?: boolean;
+	onReadStart?: () => void;
 };
 
 function installPhotoMocks(t: TestContext, options: MockOptions = {}) {
 	const state = {
 		decodeCalls: 0,
 		bitmapClosed: 0,
+		readerAborted: 0,
 		canvasWidth: 0,
 		canvasHeight: 0,
 		operations: [] as string[],
@@ -34,13 +36,25 @@ function installPhotoMocks(t: TestContext, options: MockOptions = {}) {
 		onload: (() => void) | null = null;
 		onerror: (() => void) | null = null;
 		onabort: (() => void) | null = null;
+		private aborted = false;
+
+		abort() {
+			this.aborted = true;
+			state.readerAborted += 1;
+			this.onabort?.();
+		}
 
 		readAsDataURL(blob: Blob) {
+			options.onReadStart?.();
+			if (this.aborted) return;
 			if (options.readerError) {
-				queueMicrotask(() => this.onerror?.());
+				queueMicrotask(() => {
+					if (!this.aborted) this.onerror?.();
+				});
 				return;
 			}
 			void blob.arrayBuffer().then((buffer) => {
+				if (this.aborted) return;
 				const type = blob.type || 'image/jpeg';
 				this.result = `data:${type};base64,${Buffer.from(buffer).toString('base64')}`;
 				this.onload?.();
@@ -210,6 +224,28 @@ test('prepareAIPhoto catches decode, canvas, and FileReader errors and releases 
 		/Could not read that photo\. Try another file\./
 	);
 	assert.equal(readerFailed.bitmapClosed, 1);
+});
+
+test('prepareAIPhoto honors AbortSignal before decoding and during data URL encoding', async (t) => {
+	const preAbortedState = installPhotoMocks(t);
+	const preAborted = new AbortController();
+	preAborted.abort();
+	await assert.rejects(
+		prepareAIPhoto(fakeFile(500_000, 'image/jpeg'), { signal: preAborted.signal }),
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError'
+	);
+	assert.equal(preAbortedState.decodeCalls, 0);
+
+	const controller = new AbortController();
+	const midFlightState = installPhotoMocks(t, {
+		onReadStart: () => controller.abort()
+	});
+	await assert.rejects(
+		prepareAIPhoto(fakeFile(500_000, 'image/jpeg'), { signal: controller.signal }),
+		(error: unknown) => error instanceof DOMException && error.name === 'AbortError'
+	);
+	assert.equal(midFlightState.bitmapClosed, 1);
+	assert.equal(midFlightState.readerAborted, 1);
 });
 
 test('prepareCover keeps existing 10 MB input limit, 1200px edge, and 300 KB output cap', async (t) => {
