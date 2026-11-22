@@ -47,16 +47,12 @@ function runStep(
 		if (value === undefined) delete env[key];
 		else env[key] = value;
 	}
-	const result = spawnSync(
-		process.execPath,
-		['--experimental-strip-types', '--input-type=module'],
-		{
-			cwd: new URL('..', import.meta.url),
-			input: script,
-			encoding: 'utf8',
-			env
-		}
-	);
+	const result = spawnSync(process.execPath, ['--input-type=module'], {
+		cwd: new URL('..', import.meta.url),
+		input: script,
+		encoding: 'utf8',
+		env
+	});
 	assert.equal(result.status, 0, result.stderr);
 	return JSON.parse(result.stdout);
 }
