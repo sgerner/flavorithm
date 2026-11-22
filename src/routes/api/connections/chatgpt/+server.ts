@@ -7,7 +7,7 @@ import {
 import { startCodexDevice, pollCodexDevice, cancelCodexDevice } from '#lib/server/codex-device.ts';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
-import { ApiError, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
+import { ApiError, clientAddress, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
 import {
 	ChatGPTOAuthError,
 	disconnectChatGPTAccount,
@@ -30,8 +30,8 @@ const bodySchema = z.discriminatedUnion('action', [
 		reconsent: z.boolean().optional()
 	}),
 	z.object({ action: z.literal('disconnect'), accountId: z.string().min(1).max(100) }),
-	z.object({ action: z.literal('poll'), loginId: z.string().uuid() }),
-	z.object({ action: z.literal('cancel'), loginId: z.string().uuid() }),
+	z.object({ action: z.literal('poll'), loginId: z.uuid() }),
+	z.object({ action: z.literal('cancel'), loginId: z.uuid() }),
 	z.object({
 		action: z.literal('import'),
 		bundle: z.object({
@@ -46,14 +46,6 @@ const bodySchema = z.discriminatedUnion('action', [
 		})
 	})
 ]);
-
-function requestAddress(event: Parameters<RequestHandler>[0]): string | null {
-	try {
-		return event.getClientAddress();
-	} catch {
-		return null;
-	}
-}
 
 function handleError(error: unknown): Response {
 	if (error instanceof ChatGPTOAuthError) {
@@ -70,7 +62,7 @@ function handleError(error: unknown): Response {
 export const GET: RequestHandler = async (event) => {
 	if (!event.locals.user)
 		return Response.json({ error: 'Authentication required' }, { status: 401 });
-	const address = requestAddress(event);
+	const address = clientAddress(event);
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
 	return Response.json(
 		{
@@ -106,7 +98,7 @@ export const POST: RequestHandler = async (event) => {
 		if (fetchSite && fetchSite !== 'same-origin')
 			throw new ApiError(403, 'Cross-origin request rejected');
 		if (!event.locals.user) throw new ApiError(401, 'Authentication required');
-		const address = requestAddress(event);
+		const address = clientAddress(event);
 		if (!address) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`chatgpt-connection-ip:${address}`, 600, 15 * 60 * 1000);
 

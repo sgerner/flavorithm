@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
 import { createHash, createCipheriv, randomBytes, randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
@@ -390,15 +390,74 @@ test('the callback refuses to save credentials after its initiating app session 
 });
 
 test('hosted OAuth uses the exact configured callback and encrypted server credentials', async () => {
+	const storage = await import('../src/lib/server/oauth-storage.ts');
 	const user = await createLocalUser('oauth-hosted@example.com');
-	process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = Buffer.alloc(32, 9).toString('base64');
+	const validKeyBytes = Buffer.alloc(32, 9);
+	const canonicalKey = validKeyBytes.toString('base64');
+	process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = canonicalKey;
 	process.env.OPENAI_OAUTH_CLIENT_ID = 'flavorithm-hosted-client';
 	process.env.OPENAI_OAUTH_CLIENT_SECRET = 'hosted:secret with + chars';
 	process.env.OPENAI_OAUTH_CLIENT_AUTH_METHOD = 'client_secret_basic';
 	process.env.OPENAI_OAUTH_REDIRECT_URI =
 		'https://flavorithm.example/api/connections/chatgpt/callback';
 	try {
+		assert.deepEqual(storage.decodeHostedEncryptionKey(), validKeyBytes);
+		process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = `  ${canonicalKey} \n`;
+		assert.deepEqual(storage.decodeHostedEncryptionKey(), validKeyBytes);
 		const appUrl = new URL('https://flavorithm.example/settings');
+		for (const invalidKey of [
+			'',
+			'   ',
+			Buffer.alloc(31, 9).toString('base64'),
+			Buffer.alloc(33, 9).toString('base64'),
+			canonicalKey.replace(/=+$/, ''),
+			Buffer.alloc(32, 0xfb).toString('base64url'),
+			`${canonicalKey.slice(0, 10)} ${canonicalKey.slice(10)}`
+		]) {
+			process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = invalidKey;
+			assert.equal(storage.decodeHostedEncryptionKey(), null);
+			assert.equal(
+				oauth.getChatGPTOAuthAvailability({ url: appUrl, clientAddress: '203.0.113.10' }).mode,
+				'device'
+			);
+			assert.throws(
+				() =>
+					storage.encryptChatGPTCredentials(user.user.id, 'acct-invalid-key', 'hosted', {
+						accessToken: 'a',
+						refreshToken: 'r',
+						idToken: 'i'
+					}),
+				/Hosted OAuth encryption is unavailable\./
+			);
+		}
+		process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = canonicalKey;
+
+		const roundTripEnvelope = storage.encryptChatGPTCredentials(
+			user.user.id,
+			'acct-roundtrip',
+			'hosted',
+			{
+				accessToken: 'access-rt',
+				refreshToken: null,
+				idToken: 'id-rt',
+				codexAccountId: 'codex-rt'
+			}
+		);
+		assert.deepEqual(
+			storage.decryptChatGPTCredentials(
+				user.user.id,
+				'acct-roundtrip',
+				'hosted',
+				roundTripEnvelope
+			),
+			{
+				accessToken: 'access-rt',
+				refreshToken: null,
+				idToken: 'id-rt',
+				codexAccountId: 'codex-rt'
+			}
+		);
+
 		const availability = oauth.getChatGPTOAuthAvailability({
 			url: appUrl,
 			clientAddress: '203.0.113.10'
@@ -505,6 +564,60 @@ test('hosted OAuth uses the exact configured callback and encrypted server crede
 				.get(expiredHash),
 			undefined
 		);
+
+		// Malformed stored envelopes fail before keyFor(mode) runs or creates oauth.key on disk.
+		const now = Date.now();
+		backend
+			.getDatabase()
+			.prepare(
+				'INSERT INTO chatgpt_oauth_pending(state_hash, user_id, created_at, expires_at, envelope) VALUES (?, ?, ?, ?, ?)'
+			)
+			.run('malformed-pending-fields', user.user.id, now, now + 60_000, '{"iv":"only-iv"}');
+		backend
+			.getDatabase()
+			.prepare(
+				'INSERT INTO chatgpt_oauth_pending(state_hash, user_id, created_at, expires_at, envelope) VALUES (?, ?, ?, ?, ?)'
+			)
+			.run('malformed-pending-json', user.user.id, now, now + 60_000, 'not-json');
+		delete process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY;
+		assert.equal(storage.decodeHostedEncryptionKey(), null);
+		assert.throws(
+			() => storage.consumeHostedOAuthTransaction('malformed-pending-fields', now + 1),
+			/OAuth transaction is unavailable\./
+		);
+		assert.throws(
+			() => storage.consumeHostedOAuthTransaction('malformed-pending-json', now + 1),
+			SyntaxError
+		);
+		for (const malformed of [
+			'{}',
+			'{"iv":"a","tag":"b"}',
+			'null',
+			'{"iv":1,"tag":"b","data":"c"}'
+		]) {
+			assert.throws(
+				() => storage.decryptChatGPTCredentials(user.user.id, account.id, 'hosted', malformed),
+				/OAuth credentials are unavailable\./
+			);
+		}
+		assert.throws(
+			() => storage.decryptChatGPTCredentials(user.user.id, account.id, 'hosted', '{bad-json'),
+			SyntaxError
+		);
+		const emptyKeyDir = await mkdtemp(join(tmpdir(), 'flavorithm-no-key-'));
+		const previousDbPath = process.env.FLAVORITHM_DB_PATH;
+		process.env.FLAVORITHM_DB_PATH = join(emptyKeyDir, 'test.sqlite');
+		try {
+			assert.throws(
+				() => storage.decryptChatGPTCredentials(user.user.id, account.id, 'local', '{}'),
+				/OAuth credentials are unavailable\./
+			);
+			await assert.rejects(stat(join(emptyKeyDir, 'oauth.key')), { code: 'ENOENT' });
+		} finally {
+			if (previousDbPath === undefined) delete process.env.FLAVORITHM_DB_PATH;
+			else process.env.FLAVORITHM_DB_PATH = previousDbPath;
+			await rm(emptyKeyDir, { recursive: true, force: true });
+		}
 	} finally {
 		delete process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY;
 		delete process.env.OPENAI_OAUTH_CLIENT_ID;
@@ -663,7 +776,40 @@ test('companion import rejects forged identity, session swaps, cross-user bundle
 	);
 	const tampered = await companionBundle(user);
 	tampered.bundle.tag = randomBytes(16).toString('base64url');
-	await assert.rejects(oauth.finishChatGPTCompanion(tampered), { code: 'chatgpt_pairing_invalid' });
+	await assert.rejects(oauth.finishChatGPTCompanion(tampered), (error: unknown) => {
+		return (
+			error instanceof oauth.ChatGPTOAuthError &&
+			error.status === 400 &&
+			error.code === 'chatgpt_pairing_invalid'
+		);
+	});
+	const missingField = await companionBundle(user);
+	missingField.bundle.data = '';
+	await assert.rejects(oauth.finishChatGPTCompanion(missingField), (error: unknown) => {
+		return (
+			error instanceof oauth.ChatGPTOAuthError &&
+			error.status === 400 &&
+			error.code === 'chatgpt_pairing_invalid'
+		);
+	});
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const rawKey = randomBytes(32);
+	const rawIv = randomBytes(12);
+	const rawAad = Buffer.from('flavorithm:companion:https://flavorithm.example:pairing-check');
+	const rawCipher = createCipheriv('aes-256-gcm', rawKey, rawIv);
+	rawCipher.setAAD(rawAad);
+	const rawData = Buffer.concat([rawCipher.update('{"ok":true}', 'utf8'), rawCipher.final()]);
+	const rawEnvelope = {
+		iv: rawIv.toString('base64url'),
+		tag: rawCipher.getAuthTag().toString('base64url'),
+		data: rawData.toString('base64url')
+	};
+	assert.equal(storage.decipherOAuthEnvelope(rawEnvelope, rawKey, rawAad), '{"ok":true}');
+	assert.throws(() => storage.decipherOAuthEnvelope(rawEnvelope, rawKey, Buffer.from('wrong-aad')));
+	assert.throws(
+		() => storage.decipherOAuthEnvelope({ ...rawEnvelope, iv: '' }, rawKey, rawAad),
+		/OAuth envelope is invalid\./
+	);
 	const expired = await companionBundle(user);
 	backend
 		.getDatabase()
@@ -780,4 +926,77 @@ test('connection API offers device auth, supports configured hosted OAuth, and f
 	assert.equal(oauth.listChatGPTAccounts(user.user.id)[0].connected, true);
 	const anonymous = { ...event(), locals: { user: null } };
 	assert.equal((await route.GET(anonymous as never)).status, 401);
+});
+
+test('OAuth tables index foreign-key and expiry columns and avoid table scans on cleanups and cascades', async () => {
+	await import('../src/lib/server/oauth-storage.ts');
+	const database = backend.getDatabase();
+
+	for (const [table, expectedIndexedColumns] of [
+		['chatgpt_oauth_accounts', ['user_id']],
+		['chatgpt_oauth_pending', ['user_id', 'expires_at']],
+		['chatgpt_oauth_pairings', ['user_id', 'expires_at']],
+		['codex_device_attempts', ['user_id', 'expires_at']]
+	] as const) {
+		const indexes = database.prepare(`PRAGMA index_list("${table}")`).all() as Array<{
+			name: string;
+			partial: number;
+		}>;
+		for (const columnName of expectedIndexedColumns) {
+			const hasUnconditionalLeadingIndex = indexes.some((index) => {
+				if (index.partial !== 0) return false;
+				const columns = database.prepare(`PRAGMA index_info("${index.name}")`).all() as Array<{
+					seqno: number;
+					name: string | null;
+				}>;
+				return columns.some((column) => column.seqno === 0 && column.name === columnName);
+			});
+			assert.equal(
+				hasUnconditionalLeadingIndex,
+				true,
+				`Expected unconditional leading index on ${table}.${columnName}`
+			);
+		}
+	}
+
+	const queries = [
+		'DELETE FROM users WHERE id = ?',
+		'DELETE FROM chatgpt_oauth_pending WHERE expires_at <= ?',
+		'DELETE FROM chatgpt_oauth_pairings WHERE expires_at <= ?',
+		'DELETE FROM codex_device_attempts WHERE user_id = ? OR expires_at <= ?'
+	];
+
+	for (const sql of queries) {
+		const plan = database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{
+			parent: number;
+			detail: string;
+		}>;
+		assert.ok(plan.length > 0, `Expected query plan for: ${sql}`);
+		assert.equal(
+			plan.some((step) => step.detail.startsWith('SEARCH ')),
+			true,
+			`Expected SEARCH step in plan for ${sql}: ${JSON.stringify(plan)}`
+		);
+		for (const step of plan) {
+			assert.doesNotMatch(step.detail, /\bSCAN\b/, `Unexpected SCAN in plan for: ${sql}`);
+			if (step.parent === 0) {
+				assert.match(
+					step.detail,
+					/^(SEARCH |MULTI-INDEX OR$)/,
+					`Expected SEARCH or MULTI-INDEX OR root step for: ${sql}`
+				);
+			}
+		}
+	}
+
+	const deviceCleanupPlan = database
+		.prepare(
+			'EXPLAIN QUERY PLAN DELETE FROM codex_device_attempts WHERE user_id = ? OR expires_at <= ?'
+		)
+		.all() as Array<{ detail: string }>;
+	assert.equal(
+		deviceCleanupPlan.some((step) => step.detail === 'MULTI-INDEX OR'),
+		true,
+		'Expected MULTI-INDEX OR plan for codex_device_attempts cleanup'
+	);
 });

@@ -82,7 +82,6 @@ try {
 	assert.match(homeHtml, /Flavorithm/);
 	assert.match(home.headers.get('content-security-policy'), /script-src 'self'/);
 	assert.match(home.headers.get('permissions-policy'), /microphone=\(self\)/);
-
 	// Verify wire-level br/gzip/identity compression, HEAD /, and precompressed immutable assets.
 	const rawHomeIdentity = await rawHttp('/', { headers: { 'Accept-Encoding': 'identity' } });
 	const rawHomeBr = await rawHttp('/', { headers: { 'Accept-Encoding': 'br, gzip, deflate' } });
@@ -134,7 +133,9 @@ try {
 	assert.equal(rawAuthSmall.headers['content-encoding'], undefined);
 	assert.ok(rawAuthSmall.body.byteLength < 1024);
 
-	assert.equal((await fetch(`${origin}/manifest.webmanifest`)).status, 200);
+	const manifest = await fetch(`${origin}/manifest.webmanifest`);
+	assert.equal(manifest.status, 200);
+	assert.equal((await manifest.json()).orientation, 'any');
 	assert.equal((await fetch(`${origin}/service-worker.js`)).status, 200);
 	const healthProbe = await fetch(`${origin}/api/auth`);
 	assert.equal(healthProbe.status, 200);
