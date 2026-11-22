@@ -19,6 +19,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
+import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
 
 const { MAX_RECIPES } = recipeCollectionMod;
@@ -170,7 +171,7 @@ function createModuleMap() {
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
-		'#lib/voice-capture.ts': { VoiceCapture: class {} },
+		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
