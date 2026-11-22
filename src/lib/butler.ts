@@ -192,6 +192,8 @@ function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
 function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
+	const start = new Date(startKey + 'T12:00:00');
+	if (!Number.isFinite(start.getTime()) || calendarKey(start) !== startKey) return;
 	const end = new Date(startKey + 'T12:00:00');
 	end.setDate(end.getDate() + 6);
 	const endKey = calendarKey(end);
@@ -256,7 +258,9 @@ export function applyButlerCommands(
 				markActiveWeeksDirty();
 				state.recipes = state.recipes.filter((item) => item.id !== command.id);
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
-				state.shopping = state.shopping.filter((item) => item.sourceKey !== `recipe:${command.id}`);
+				state.shopping = state.shopping.filter(
+					(item) => item.sourceKey !== `recipe:${command.id}` || item.checked
+				);
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
 				break;
 			case 'pantry.upsert':
@@ -338,12 +342,22 @@ export function applyButlerCommands(
 				state.shopping = upsert(state.shopping, nextItem);
 				break;
 			}
-			case 'shopping.delete':
+			case 'shopping.delete': {
 				flushDirtyWeeks();
 				requireId(state.shopping, command.id);
-				explicitDeletedShoppingIds.add(command.id);
+				const removed = state.shopping.find((item) => item.id === command.id);
+				const week = removed?.checked
+					? removed.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1]
+					: undefined;
 				state.shopping = state.shopping.filter((item) => item.id !== command.id);
+				if (week) {
+					explicitDeletedShoppingIds.delete(command.id);
+					dirtyWeeks.add(week);
+				} else if (!removed?.checked) {
+					explicitDeletedShoppingIds.add(command.id);
+				}
 				break;
+			}
 			case 'shopping.generate': {
 				explicitDeletedShoppingIds.clear();
 				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
