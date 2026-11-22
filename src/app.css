@@ -353,12 +353,12 @@ main {
 	width: calc(100% - 246px);
 }
 .topbar {
-	height: 78px;
+	min-height: 78px;
 	border-bottom: 1px solid var(--line);
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
-	padding: 0 43px;
+	padding: 8px 43px;
 }
 .breadcrumb {
 	font-size: 14px;
@@ -379,6 +379,7 @@ main {
 	display: flex;
 	align-items: center;
 	gap: 22px;
+	flex-shrink: 0;
 }
 .season {
 	font-size: 14px;
@@ -939,6 +940,9 @@ main {
 .pantry-row label {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap;
+	gap: 4px;
+	min-width: 0;
 }
 .pantry-row input {
 	padding: 7px 5px;
@@ -952,7 +956,10 @@ main {
 	border-bottom: 1px solid var(--line);
 }
 .pantry-row .unit-input {
-	width: 65px;
+	flex: 1 1 12ch;
+	width: auto;
+	max-width: 100%;
+	min-width: 0;
 }
 .pantry-footer {
 	display: flex;
@@ -1718,7 +1725,7 @@ main {
 		padding: 30px 28px 0;
 	}
 	.topbar {
-		padding: 0 28px;
+		padding: 8px 28px;
 	}
 	.recipe-toolbar {
 		flex-wrap: wrap;
@@ -1819,7 +1826,7 @@ main {
 		width: calc(100% - 190px);
 	}
 	.topbar {
-		height: 65px;
+		min-height: 65px;
 	}
 	.season {
 		display: none;
@@ -1945,8 +1952,8 @@ main {
 		width: 100%;
 	}
 	.topbar {
-		padding: 0 20px;
-		height: 62px;
+		padding: 8px 20px;
+		min-height: 62px;
 		gap: 12px;
 	}
 	.mobile-menu {
@@ -2189,7 +2196,8 @@ main {
 		width: 38px;
 	}
 	.pantry-row .unit-input {
-		width: 45px;
+		flex: 1 1 12ch;
+		width: auto;
 	}
 	.pantry-footer {
 		align-items: flex-start;
@@ -2678,7 +2686,7 @@ html.dark[data-theme='nosh'] {
 		display: flex;
 		gap: 0;
 		overflow-x: auto;
-		overflow-y: hidden;
+		overflow-y: visible;
 		overscroll-behavior-x: contain;
 		scroll-snap-type: x mandatory;
 		-webkit-overflow-scrolling: touch;
@@ -2792,9 +2800,8 @@ html.dark[data-theme='nosh'] {
 
 	.breadcrumb {
 		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
+		white-space: normal;
+		overflow-wrap: break-word;
 	}
 
 	.main-content {
@@ -2946,7 +2953,8 @@ html.dark[data-theme='nosh'] {
 	}
 
 	.pantry-row .unit-input {
-		width: 70px;
+		flex: 1 1 12ch;
+		width: auto;
 	}
 
 	.pantry-row > input[type='date'] {
@@ -3532,13 +3540,15 @@ html.dark[data-theme='nosh'] {
 	inset: auto;
 	max-width: 690px;
 }
-.calendar-grid {
-	grid-template-rows: auto repeat(3, minmax(155px, auto));
-}
-.calendar-day {
-	display: grid;
-	grid-row: span 4;
-	grid-template-rows: subgrid;
+@media (min-width: 901px) {
+	.calendar-grid {
+		grid-template-rows: auto repeat(3, minmax(155px, auto));
+	}
+	.calendar-day {
+		display: grid;
+		grid-row: span 4;
+		grid-template-rows: subgrid;
+	}
 }
 .connection-actions {
 	display: flex;

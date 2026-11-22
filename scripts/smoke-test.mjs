@@ -38,7 +38,9 @@ try {
 	assert.match(await home.text(), /Flavorithm/);
 	assert.match(home.headers.get('content-security-policy'), /script-src 'self'/);
 	assert.match(home.headers.get('permissions-policy'), /microphone=\(self\)/);
-	assert.equal((await fetch(`${origin}/manifest.webmanifest`)).status, 200);
+	const manifest = await fetch(`${origin}/manifest.webmanifest`);
+	assert.equal(manifest.status, 200);
+	assert.equal((await manifest.json()).orientation, 'any');
 	assert.equal((await fetch(`${origin}/service-worker.js`)).status, 200);
 	let anonymous = await fetch(`${origin}/api/state`);
 	assert.equal(anonymous.status, 401);
