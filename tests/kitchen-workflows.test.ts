@@ -8,9 +8,11 @@ import {
 import {
 	completeMeal,
 	convertCompatibleQuantity,
+	deleteShoppingItem,
 	expiryStatus,
 	normalizeIngredientName,
 	reconcileShoppingList,
+	restoreShoppingItem,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -145,6 +147,177 @@ test('a checked generated row keeps its id when a larger requirement creates a r
 	assert.deepEqual(repeated, refreshed);
 	assert.equal(new Set(repeated.map((item) => item.id)).size, repeated.length);
 	assert.equal(repeated.find((item) => !item.checked)?.quantity, 1);
+});
+
+test('deleting checked week rows refreshes deficits, skips unchecked dismissals, and restores undo cleanly', () => {
+	const now = new Date('2026-10-20T12:00:00Z');
+	const weekKey = 'week:2026-10-19';
+	const plannedRecipe = recipe({
+		id: 'stew',
+		servings: 2,
+		ingredients: [
+			{ name: 'carrot', quantity: 4, unit: 'each' },
+			{ name: 'onion', quantity: 2, unit: 'each' }
+		]
+	});
+	const baseState = state({
+		recipes: [plannedRecipe],
+		meals: [{ id: 'dinner', date: '2026-10-21', slot: 'Dinner', recipeId: 'stew', servings: 2 }]
+	});
+
+	// Generate initial weekly items: carrot (4) and onion (2)
+	const initial = reconcileShoppingList(
+		[],
+		[
+			shopping('req-carrot', 'carrot', 4, 'each', false),
+			shopping('req-onion', 'onion', 2, 'each', false)
+		],
+		weekKey
+	);
+	const carrotRow = initial.find((item) => item.name === 'carrot')!;
+	const onionRow = initial.find((item) => item.name === 'onion')!;
+
+	// Dismissing an unchecked week:* row does not immediately regenerate the dismissed deficit
+	const afterDismissOnion = deleteShoppingItem(
+		{ ...baseState, shopping: initial },
+		onionRow.id,
+		now
+	);
+	assert.deepEqual(afterDismissOnion, [carrotRow]);
+
+	// Restoring an unchecked dismissed row brings it back without resurrecting other dismissed rows
+	const afterUndoOnion = restoreShoppingItem({ ...baseState, shopping: [] }, carrotRow, now);
+	assert.deepEqual(afterUndoOnion, [carrotRow]);
+
+	// Checking carrot and deleting it refreshes week:2026-10-19 so the 4-carrot deficit returns
+	const checkedCarrot: ShoppingItem = { ...carrotRow, checked: true };
+	const afterDeleteChecked = deleteShoppingItem(
+		{ ...baseState, shopping: [checkedCarrot] },
+		checkedCarrot.id,
+		now
+	);
+	const regeneratedCarrot = afterDeleteChecked.find((item) => item.name === 'carrot');
+	assert.ok(regeneratedCarrot);
+	assert.equal(regeneratedCarrot.id, checkedCarrot.id);
+	assert.equal(regeneratedCarrot.checked, false);
+	assert.equal(regeneratedCarrot.quantity, 4);
+
+	// Undoing that checked deletion restores the checked row and removes the colliding unchecked deficit
+	const afterUndoChecked = restoreShoppingItem(
+		{ ...baseState, shopping: afterDeleteChecked },
+		checkedCarrot,
+		now
+	);
+	assert.equal(new Set(afterUndoChecked.map((item) => item.id)).size, afterUndoChecked.length);
+	assert.equal(afterUndoChecked.filter((item) => item.name === 'carrot').length, 1);
+	assert.deepEqual(
+		afterUndoChecked.find((item) => item.name === 'carrot'),
+		checkedCarrot
+	);
+});
+
+test('undoing a checked split purchase reconciles -2 week rows and deducts or re-keys recipe collisions', () => {
+	const now = new Date('2026-10-20T12:00:00Z');
+	const weekKey = 'week:2026-10-19';
+	const riceRecipe = recipe({
+		id: 'risotto',
+		servings: 2,
+		ingredients: [{ name: 'rice', quantity: 2, unit: 'cup' }]
+	});
+	const splitInitial = reconcileShoppingList(
+		[],
+		[shopping('req-one', 'rice', 1, 'cup', false)],
+		weekKey
+	);
+	const purchasedOne: ShoppingItem = { ...splitInitial[0], checked: true };
+	const splitList = reconcileShoppingList(
+		[purchasedOne],
+		[shopping('req-two', 'rice', 2, 'cup', false)],
+		weekKey
+	);
+	assert.equal(splitList.length, 2);
+
+	const weekState = state({
+		recipes: [riceRecipe],
+		meals: [{ id: 'dinner', date: '2026-10-21', slot: 'Dinner', recipeId: 'risotto', servings: 2 }],
+		shopping: splitList
+	});
+
+	// Deleting the checked 1-cup row updates the remaining -2 row to the full 2-cup deficit
+	const afterSplitDelete = deleteShoppingItem(weekState, purchasedOne.id, now);
+	assert.equal(afterSplitDelete.length, 1);
+	assert.equal(afterSplitDelete[0].checked, false);
+	assert.equal(afterSplitDelete[0].quantity, 2);
+
+	// Undoing restores the 1-cup checked row and shrinks the -2 row back to 1 cup (not 3 cups total)
+	const afterSplitUndo = restoreShoppingItem(
+		{ ...weekState, shopping: afterSplitDelete },
+		purchasedOne,
+		now
+	);
+	assert.deepEqual(afterSplitUndo, splitList);
+	assert.equal(new Set(afterSplitUndo.map((item) => item.id)).size, afterSplitUndo.length);
+
+	// Recipe scope: partial checked purchase deleted, recipe re-shopped with colliding generated-* ID, then undone
+	const recipeKey = 'recipe:pasta';
+	const recipeInitial = reconcileShoppingList(
+		[],
+		[shopping('req-oil', 'olive oil', 2, 'cup', false)],
+		recipeKey
+	);
+	const partialOil: ShoppingItem = { ...recipeInitial[0], quantity: 0.5, checked: true };
+	const reshoppedOil = reconcileShoppingList(
+		[],
+		[shopping('req-oil', 'olive oil', 2, 'cup', false)],
+		recipeKey
+	);
+	assert.equal(reshoppedOil[0].id, partialOil.id);
+
+	const restoredPartial = restoreShoppingItem(state({ shopping: reshoppedOil }), partialOil, now);
+	assert.equal(restoredPartial.length, 2);
+	assert.equal(new Set(restoredPartial.map((item) => item.id)).size, 2);
+	assert.deepEqual(
+		restoredPartial.find((item) => item.checked),
+		partialOil
+	);
+	assert.equal(restoredPartial.find((item) => !item.checked)?.quantity, 1.5);
+	assert.equal(restoredPartial.find((item) => !item.checked)?.id, `${partialOil.id}-2`);
+
+	// Edited bucket mismatch on colliding ID keeps both rows with unique IDs
+	const editedChecked: ShoppingItem = {
+		...recipeInitial[0],
+		name: 'garlic',
+		quantity: 3,
+		unit: 'clove',
+		checked: true
+	};
+	const restoredEdited = restoreShoppingItem(state({ shopping: reshoppedOil }), editedChecked, now);
+	assert.equal(restoredEdited.length, 2);
+	assert.equal(new Set(restoredEdited.map((item) => item.id)).size, 2);
+	assert.deepEqual(
+		restoredEdited.find((item) => item.checked),
+		editedChecked
+	);
+	assert.equal(restoredEdited.find((item) => !item.checked)?.quantity, 2);
+
+	// Guard: identical checked ID already present or restoring past 1,000 items leaves shopping unchanged
+	const withCheckedDuplicate = [partialOil];
+	assert.equal(
+		restoreShoppingItem(state({ shopping: withCheckedDuplicate }), partialOil, now),
+		withCheckedDuplicate
+	);
+
+	const fullShopping = Array.from({ length: 1_000 }, (_, index) =>
+		shopping(`item-${index}`, 'apple', 1, 'each', false)
+	);
+	assert.equal(
+		restoreShoppingItem(
+			state({ shopping: fullShopping }),
+			shopping('item-overflow', 'pear', 1, 'each', true),
+			now
+		),
+		fullShopping
+	);
 });
 
 test('purchased shopping rows merge aliases and compatible units without changing an expiring lot', () => {
