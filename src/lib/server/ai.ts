@@ -363,6 +363,7 @@ export async function runAIRequest(
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
 			: await awaitWithRequestSignal(getPublicModelCatalog(fetcher), requestSignal);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2378,10 +2379,15 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let publicCatalogCache = new WeakMap<
-	Fetcher,
-	{ promise: Promise<SupportedModelResponse>; expiresAt: number }
->();
+type PublicCatalogCacheEntry = {
+	pending: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
+
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
+}
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2407,19 +2413,19 @@ export function resolvePublicFetcher(event: { fetch: Fetcher; isSubRequest?: boo
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	const key = publicCatalogKey(fetcher);
+	const cached = publicCatalogCache.get(key);
 	const now = Date.now();
-	const cached = publicCatalogCache.get(fetcher);
-	if (cached && now < cached.expiresAt) {
-		return cached.promise;
-	}
+	if (cached && now < cached.expiresAt) return cached.pending;
+
 	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		if (publicCatalogCache.get(fetcher)?.promise === pending) {
-			publicCatalogCache.delete(fetcher);
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
 		}
 		throw error;
 	});
-	publicCatalogCache.set(fetcher, { promise: pending, expiresAt });
+	publicCatalogCache.set(key, { pending, expiresAt });
 	return pending;
 }
 
