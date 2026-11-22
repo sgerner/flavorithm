@@ -31,8 +31,8 @@ const bodySchema = z.discriminatedUnion('action', [
 		reconsent: z.boolean().optional()
 	}),
 	z.object({ action: z.literal('disconnect'), accountId: z.string().min(1).max(100) }),
-	z.object({ action: z.literal('poll'), loginId: z.string().uuid() }),
-	z.object({ action: z.literal('cancel'), loginId: z.string().uuid() }),
+	z.object({ action: z.literal('poll'), loginId: z.uuid() }),
+	z.object({ action: z.literal('cancel'), loginId: z.uuid() }),
 	z.object({
 		action: z.literal('import'),
 		bundle: z.object({

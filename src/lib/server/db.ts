@@ -184,19 +184,19 @@ function deriveScrypt(password: string, salt: Buffer, length: number): Promise<B
 }
 
 const nutritionSchema = z.object({
-	calories: z.number().finite().min(0).max(1_000_000),
-	fat: z.number().finite().min(0).max(1_000_000),
-	saturatedFat: z.number().finite().min(0).max(1_000_000),
-	sodium: z.number().finite().min(0).max(1_000_000),
-	carbs: z.number().finite().min(0).max(1_000_000),
-	fiber: z.number().finite().min(0).max(1_000_000),
-	sugar: z.number().finite().min(0).max(1_000_000),
-	protein: z.number().finite().min(0).max(1_000_000)
+	calories: z.number().min(0).max(1_000_000),
+	fat: z.number().min(0).max(1_000_000),
+	saturatedFat: z.number().min(0).max(1_000_000),
+	sodium: z.number().min(0).max(1_000_000),
+	carbs: z.number().min(0).max(1_000_000),
+	fiber: z.number().min(0).max(1_000_000),
+	sugar: z.number().min(0).max(1_000_000),
+	protein: z.number().min(0).max(1_000_000)
 });
 
 const recipeIngredientSchema = z.object({
 	name: z.string().trim().min(1).max(200),
-	quantity: z.number().finite().min(0).max(1_000_000),
+	quantity: z.number().min(0).max(1_000_000),
 	unit: z.string().max(40)
 });
 
@@ -218,8 +218,8 @@ const recipeSchema = z.object({
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
 	image: z.union([publicUrlSchema, z.string().regex(COVER_PATH)]),
-	time: z.number().finite().min(0).max(100_000),
-	servings: z.number().finite().min(1).max(10_000),
+	time: z.number().min(0).max(100_000),
+	servings: z.number().min(1).max(10_000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -230,7 +230,7 @@ const recipeSchema = z.object({
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -238,7 +238,7 @@ const recipeSchema = z.object({
 const preferencesSchema = z.object({
 	diet: z.string().max(200),
 	allergies: z.string().max(2_000),
-	maxTime: z.number().finite().min(0).max(100_000),
+	maxTime: z.number().min(0).max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
 	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
@@ -257,7 +257,7 @@ const preferencesSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
-	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
+	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
 const appStateSchema = z.object({
@@ -266,7 +266,7 @@ const appStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				category: z.string().max(100),
 				expires: z.string().max(50).optional()
@@ -281,9 +281,9 @@ const appStateSchema = z.object({
 				date: z.string().max(50),
 				slot: z.string().max(100),
 				recipeId: z.string().max(100),
-				servings: z.number().finite().min(1).max(10_000),
+				servings: z.number().min(1).max(10_000),
 				completedAt: z.string().max(50).optional(),
-				leftoverServings: z.number().finite().min(0).max(10_000).optional()
+				leftoverServings: z.number().min(0).max(10_000).optional()
 			})
 		)
 		.max(1_000),
@@ -292,7 +292,7 @@ const appStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				checked: z.boolean(),
 				sourceKey: z.string().max(200).optional()
@@ -701,7 +701,7 @@ export function resolveExternalIdentity(input: {
 	if (!issuer || issuer.length > 2_000 || !subject || subject.length > 500) {
 		throw new ApiError(401, 'The identity provider returned an invalid identity');
 	}
-	if (email.length > 254 || !z.string().email().safeParse(email).success) {
+	if (email.length > 254 || !z.email().safeParse(email).success) {
 		throw new ApiError(401, 'The identity provider did not provide a valid email address');
 	}
 	const now = Date.now();
