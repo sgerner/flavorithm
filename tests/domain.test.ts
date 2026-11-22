@@ -1,13 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState, seedPantry, seedRecipes } from '../src/lib/data.ts';
+import { rankRecipes } from '../src/lib/discovery.ts';
 import {
 	buildShoppingList,
 	matchRecipePantry,
 	normalizeName,
+	parseCalendarDate,
+	parseIngredientLine,
+	parseIngredientLines,
 	preferenceSummary,
 	unitInfo
 } from '../src/lib/domain.ts';
+import { completeMeal, transferPurchasedItemsToPantry } from '../src/lib/kitchen-workflows.ts';
 import type { Ingredient, Meal, Recipe } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -105,13 +110,85 @@ test('shopping allocates pantry lots by meal date so expired leftovers do not co
 		[
 			{ id: 'later', date: '2026-10-26', slot: 'Dinner', recipeId: 'pasta', servings: 4 },
 			{ id: 'earlier', date: '2026-10-22', slot: 'Dinner', recipeId: 'pasta', servings: 2 }
-		]
+		],
+		new Date(2026, 9, 20, 12)
 	);
 
 	assert.equal(result.length, 1);
 	assert.equal(result[0].name, 'tomato');
 	assert.equal(result[0].quantity, 50);
 	assert.equal(result[0].unit, 'g');
+});
+
+test('parseCalendarDate validates real calendar dates and keeps ISO date prefixes across timezones', () => {
+	assert.deepEqual(parseCalendarDate('2026-10-22'), { year: 2026, month: 9, day: 22 });
+	assert.deepEqual(parseCalendarDate('2024-02-29'), { year: 2024, month: 1, day: 29 });
+	assert.deepEqual(parseCalendarDate('2026-11-19T00:00:00Z'), { year: 2026, month: 10, day: 19 });
+	assert.deepEqual(parseCalendarDate('2026-11-19T23:59:59.000+05:30'), {
+		year: 2026,
+		month: 10,
+		day: 19
+	});
+	assert.equal(parseCalendarDate('2026-02-29'), undefined);
+	assert.equal(parseCalendarDate('2026-02-30'), undefined);
+	assert.equal(parseCalendarDate('2026-02-30T00:00:00Z'), undefined);
+	assert.equal(parseCalendarDate('2026-11-19T25:00:00Z'), undefined);
+	assert.equal(parseCalendarDate('10/22/2026'), undefined);
+	assert.equal(parseCalendarDate('soon'), undefined);
+	assert.equal(parseCalendarDate(''), undefined);
+});
+
+test('overdue meals enforce a today floor while keeping today-expiring, ISO, and blank lots usable', () => {
+	const tomatoRecipe = recipe({
+		servings: 2,
+		ingredients: [{ name: 'tomato', quantity: 50, unit: 'g' }]
+	});
+	const now = new Date(2026, 9, 22, 12);
+
+	const expiredAndInvalidSkipped = buildShoppingList(
+		[tomatoRecipe],
+		[
+			pantry('tomato', 50, 'g', '2026-10-21'),
+			{ ...pantry('tomato', 50, 'g'), id: 'invalid-feb', expires: '2026-02-30' },
+			{ ...pantry('tomato', 50, 'g'), id: 'invalid-text', expires: 'next week' }
+		],
+		[{ id: 'overdue', date: '2026-10-20', slot: 'Dinner', recipeId: 'pasta', servings: 2 }],
+		now
+	);
+	assert.equal(expiredAndInvalidSkipped.length, 1);
+	assert.equal(expiredAndInvalidSkipped[0].quantity, 50);
+
+	const todayFloorAllocation = buildShoppingList(
+		[tomatoRecipe],
+		[
+			{ ...pantry('tomato', 50, 'g'), id: 'today-lot', expires: '2026-10-22' },
+			{ ...pantry('tomato', 25, 'g'), id: 'blank-lot', expires: '' }
+		],
+		[
+			{ id: 'future', date: '2026-10-25', slot: 'Dinner', recipeId: 'pasta', servings: 2 },
+			{ id: 'overdue', date: '2026-10-20', slot: 'Dinner', recipeId: 'pasta', servings: 2 }
+		],
+		now
+	);
+	assert.equal(todayFloorAllocation.length, 1);
+	assert.equal(todayFloorAllocation[0].quantity, 25);
+
+	const isoUtcSameDay = buildShoppingList(
+		[tomatoRecipe],
+		[pantry('tomato', 50, 'g', '2026-11-19T00:00:00Z')],
+		[{ id: 'same-day', date: '2026-11-19', slot: 'Dinner', recipeId: 'pasta', servings: 2 }],
+		new Date(2026, 10, 19, 20)
+	);
+	assert.deepEqual(isoUtcSameDay, []);
+
+	const invalidNow = buildShoppingList(
+		[tomatoRecipe],
+		[pantry('tomato', 50, 'g', '2000-01-01')],
+		undefined,
+		new Date(Number.NaN)
+	);
+	assert.equal(invalidNow.length, 1);
+	assert.equal(invalidNow[0].quantity, 50);
 });
 
 test('a blank recipe serving baseline cannot use pantry stock to claim the recipe is covered', () => {
@@ -326,4 +403,274 @@ test('shopping generation deducts normalized plurals, modifiers, item units, and
 	assert.ok(garlic);
 	assert.equal(garlic.quantity, 5);
 	assert.equal(garlic.unit, 'clove');
+});
+
+test('parseIngredientLines parses fractions, connectors, categories, and trailing-name unit rules', () => {
+	const parsed = parseIngredientLines(
+		[
+			'3 item avocado [Produce]',
+			'2 tablespoons olive oil',
+			'500 grams chicken breast',
+			'2 cups of basmati rice',
+			'1/2 cup milk',
+			'1 1/2 cups flour',
+			'2 eggs'
+		].join('\n')
+	);
+
+	assert.deepEqual(parsed, [
+		{ name: 'avocado', quantity: 3, unit: 'each', category: 'Produce' },
+		{ name: 'olive oil', quantity: 2, unit: 'tbsp', category: 'Pantry' },
+		{ name: 'chicken breast', quantity: 500, unit: 'g', category: 'Pantry' },
+		{ name: 'basmati rice', quantity: 2, unit: 'cup', category: 'Pantry' },
+		{ name: 'milk', quantity: 0.5, unit: 'cup', category: 'Pantry' },
+		{ name: 'flour', quantity: 1.5, unit: 'cup', category: 'Pantry' },
+		{ name: 'eggs', quantity: 2, unit: 'each', category: 'Pantry' }
+	]);
+
+	assert.deepEqual(parseIngredientLine('½ tsp kosher salt'), {
+		name: 'kosher salt',
+		quantity: 0.5,
+		unit: 'tsp',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('1½ cups of rolled oats [Grains]'), {
+		name: 'rolled oats',
+		quantity: 1.5,
+		unit: 'cup',
+		category: 'Grains'
+	});
+	assert.deepEqual(parseIngredientLine('1-1/2 bunches cilantro [Produce]'), {
+		name: 'cilantro',
+		quantity: 1.5,
+		unit: 'bunch',
+		category: 'Produce'
+	});
+	assert.deepEqual(parseIngredientLine('1 large head of broccoli'), {
+		name: 'broccoli',
+		quantity: 1,
+		unit: 'head',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('2 fluid ounces lemon juice'), {
+		name: 'lemon juice',
+		quantity: 2,
+		unit: 'fl oz',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('2 green onions'), {
+		name: 'green onions',
+		quantity: 2,
+		unit: 'each',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('2 cupcakes'), {
+		name: 'cupcakes',
+		quantity: 2,
+		unit: 'each',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLines('spinach, 200g pasta; 2 eggs [Dairy, eggs]'), [
+		{ name: 'spinach', quantity: 1, unit: 'each', category: 'Pantry' },
+		{ name: 'pasta', quantity: 200, unit: 'g', category: 'Pantry' },
+		{ name: 'eggs', quantity: 2, unit: 'each', category: 'Dairy, eggs' }
+	]);
+	assert.equal(parseIngredientLine('   '), undefined);
+	assert.equal(parseIngredientLine('[Produce]'), undefined);
+	assert.equal(parseIngredientLine('0 eggs'), undefined);
+	assert.equal(parseIngredientLine('1/0 cup milk'), undefined);
+});
+
+test('parseIngredientLine recognizes all 77 registered unit aliases', () => {
+	const allAliases = [
+		'g',
+		'gram',
+		'grams',
+		'kg',
+		'kilogram',
+		'kilograms',
+		'mg',
+		'milligram',
+		'milligrams',
+		'oz',
+		'ounce',
+		'ounces',
+		'lb',
+		'lbs',
+		'pound',
+		'pounds',
+		'ml',
+		'milliliter',
+		'milliliters',
+		'millilitre',
+		'millilitres',
+		'l',
+		'liter',
+		'liters',
+		'litre',
+		'litres',
+		'tsp',
+		'teaspoon',
+		'teaspoons',
+		'tbsp',
+		'tablespoon',
+		'tablespoons',
+		'cup',
+		'cups',
+		'fl oz',
+		'fl. oz',
+		'fluid oz',
+		'fluid ounce',
+		'fluid ounces',
+		'pt',
+		'pint',
+		'pints',
+		'qt',
+		'quart',
+		'quarts',
+		'gal',
+		'gallon',
+		'gallons',
+		'ea',
+		'each',
+		'item',
+		'items',
+		'piece',
+		'pieces',
+		'whole',
+		'egg',
+		'eggs',
+		'small',
+		'medium',
+		'large',
+		'bunch',
+		'bunches',
+		'clove',
+		'cloves',
+		'head',
+		'heads',
+		'small head',
+		'medium head',
+		'large head',
+		'slice',
+		'slices',
+		'can',
+		'cans',
+		'pinch',
+		'pinches',
+		'dash',
+		'dashes'
+	];
+	assert.equal(allAliases.length, 77);
+	for (const alias of allAliases) {
+		const parsed = parseIngredientLine(`2 ${alias} test ingredient`);
+		assert.ok(parsed, `expected ${alias} to parse`);
+		assert.equal(parsed.quantity, 2);
+		assert.equal(parsed.unit, unitInfo(alias).display);
+		assert.equal(parsed.name, 'test ingredient');
+	}
+});
+
+test('quick-add, dictated, and scanned lines match in rankRecipes, buildShoppingList, and completeMeal', () => {
+	const quickAddText = '2 tablespoons extra virgin olive oil, 1 1/2 cups of basmati rice';
+	const dictatedText = '500 grams boneless chicken breast, 2 bunches fresh parsley';
+	const visionItems = [
+		{ name: 'avocadoes', quantity: 3, unit: 'items', category: 'Produce' },
+		{ name: 'roma tomatoes', quantity: 4, unit: 'each', category: 'Produce' }
+	];
+	const scannedText = visionItems
+		.map((i) => `${i.quantity} ${unitInfo(i.unit).display} ${i.name} [${i.category}]`)
+		.join('\n');
+
+	const combinedInput = [[quickAddText, dictatedText].filter(Boolean).join(', '), scannedText].join(
+		'\n'
+	);
+	const parsed = parseIngredientLines(combinedInput);
+	const stockedPantry = transferPurchasedItemsToPantry(
+		[],
+		parsed.map((item, idx) => ({
+			id: `add-${idx}`,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit,
+			category: item.category,
+			checked: true
+		})),
+		(() => {
+			let n = 0;
+			return () => `lot-${++n}`;
+		})()
+	);
+
+	assert.equal(
+		stockedPantry.find((item) => normalizeName(item.name) === 'avocado')?.category,
+		'Produce'
+	);
+	assert.equal(
+		stockedPantry.find((item) => normalizeName(item.name) === 'olive oil')?.category,
+		'Pantry'
+	);
+
+	const stockedBowl = recipe({
+		id: 'stocked-bowl',
+		title: 'Chicken avocado rice bowl',
+		ingredients: [
+			{ name: 'chicken breast', quantity: 400, unit: 'g' },
+			{ name: 'basmati rice', quantity: 1, unit: 'cup' },
+			{ name: 'avocado', quantity: 2, unit: 'whole' },
+			{ name: 'tomato', quantity: 2, unit: 'pieces' },
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'parsley', quantity: 1, unit: 'bunch' }
+		]
+	});
+	const unstockedStew = recipe({
+		id: 'unstocked-stew',
+		title: 'Beef barley stew',
+		ingredients: [
+			{ name: 'beef chuck', quantity: 500, unit: 'g' },
+			{ name: 'pearl barley', quantity: 1, unit: 'cup' }
+		]
+	});
+
+	const initial = createInitialState();
+	const ranked = rankRecipes(
+		[unstockedStew, stockedBowl],
+		stockedPantry,
+		initial.preferences,
+		new Date('2026-10-22T12:00:00Z')
+	);
+	assert.equal(ranked[0].id, 'stocked-bowl');
+
+	const shopping = buildShoppingList(
+		[stockedBowl],
+		stockedPantry,
+		undefined,
+		new Date('2026-10-22T12:00:00Z')
+	);
+	assert.deepEqual(shopping, []);
+
+	const afterCooking = completeMeal(
+		{
+			...initial,
+			pantry: stockedPantry,
+			recipes: [stockedBowl],
+			meals: [
+				{ id: 'm1', date: '2026-10-22', slot: 'Dinner', recipeId: 'stocked-bowl', servings: 2 }
+			]
+		},
+		'm1',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-22T18:00:00Z')
+	);
+	assert.equal(
+		afterCooking.pantry.find((i) => normalizeName(i.name) === 'chicken breast')?.quantity,
+		100
+	);
+	assert.equal(
+		afterCooking.pantry.find((i) => normalizeName(i.name) === 'basmati rice')?.quantity,
+		0.5
+	);
+	assert.equal(afterCooking.pantry.find((i) => normalizeName(i.name) === 'avocado')?.quantity, 1);
+	assert.equal(afterCooking.pantry.find((i) => normalizeName(i.name) === 'olive oil')?.quantity, 1);
+	assert.equal(afterCooking.pantry.find((i) => normalizeName(i.name) === 'parsley')?.quantity, 1);
 });

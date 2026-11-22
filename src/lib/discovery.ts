@@ -112,17 +112,18 @@ export function rankRecipes(
 	preferences: Preferences,
 	now: Date = new Date()
 ): Recipe[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const rated: RatedRecipe[] = recipes.flatMap((recipe) => {
 		const rating = recipeRating(recipe, preferences);
 		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
 	});
 
-	const pantryIndex = indexUsablePantry(pantry, now);
+	const pantryIndex = indexUsablePantry(pantry, safeNow);
 	return recipes
 		.map((recipe, index) => ({
 			recipe,
 			index,
-			score: scoreRecipe(recipe, pantryIndex, preferences, rated, now)
+			score: scoreRecipe(recipe, pantryIndex, preferences, rated, safeNow)
 		}))
 		.sort((a, b) => b.score - a.score || a.index - b.index)
 		.map(({ recipe }) => recipe);
