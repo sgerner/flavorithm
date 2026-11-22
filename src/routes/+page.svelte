@@ -144,6 +144,7 @@
 	let sendingSync = $state(false);
 	let syncErrors = $state('');
 	let conflicts = $state<SyncConflict[]>([]);
+	let reviewedEtag = $state<string | null>(null);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
 	let page = $state('discover');
 	let filter = $state(DEFAULT_RECIPE_FILTER);
@@ -772,6 +773,7 @@
 				pendingSync = status.pending;
 				sendingSync = status.syncing;
 				conflicts = status.conflicts;
+				reviewedEtag = status.reviewedEtag;
 				syncErrors = status.error;
 			},
 			transport: (owner) => ({
@@ -968,10 +970,10 @@
 			}
 		} else kitchen = state;
 	}
-	async function retrySync(prefer?: 'local' | 'remote') {
+	async function retrySync(prefer?: 'local' | 'remote', expectedEtag?: string | null) {
 		if (!online || !user || !kitchenSync) return;
 		try {
-			await kitchenSync.sync(prefer);
+			await kitchenSync.sync(prefer, prefer ? (expectedEtag ?? reviewedEtag) : undefined);
 		} catch (e) {
 			syncErrors = (e as Error).message;
 			if (managedAuth) {
@@ -2765,7 +2767,7 @@
 						void reconnectKitchen();
 					}}
 					resolve={(choice) => {
-						void retrySync(choice);
+						void retrySync(choice, reviewedEtag);
 					}}
 					exportPending={exportPendingChanges}
 				/>{/if}
