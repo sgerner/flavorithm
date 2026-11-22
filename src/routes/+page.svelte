@@ -2355,8 +2355,9 @@
 					<div class="section-heading">
 						<div>
 							<h2>
-								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span class="small-spark"
-									>✷</span
+								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span
+									class="small-spark"
+									aria-hidden="true">✷</span
 								>
 							</h2>
 						</div>
@@ -2416,8 +2417,6 @@
 											alt={recipe.title}
 											loading={i > 2 ? 'lazy' : 'eager'}
 										/></button
-									><span class="recipe-badge"
-										>{recipe.hidden ? 'Hidden' : recipe.tags[0] || recipe.cuisine}</span
 									><button
 										class:saved={recipe.saved}
 										class="save-recipe"
@@ -2440,6 +2439,10 @@
 										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
 									<p>{recipe.description}</p>
+									{#if recipe.hidden || recipe.tags.length}<ul class="recipe-tags">
+											{#if recipe.hidden}<li class="recipe-badge">Hidden</li>{/if}
+											{#each recipe.tags as tag}<li class="recipe-badge">{tag}</li>{/each}
+										</ul>{/if}
 									<div class="recipe-meta">
 										<span><Clock size={14} />{recipe.time} min</span><span
 											><ChefHat size={14} />{recipe.difficulty}</span
