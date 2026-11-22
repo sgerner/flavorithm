@@ -1334,17 +1334,60 @@ main {
 	font-size: 18px;
 	font-weight: 500;
 }
+.recipe-columns .section-line {
+	flex-wrap: wrap;
+	gap: 8px 10px;
+}
 .servings {
-	font-size: 14px;
+	font-size: 16px;
 	color: var(--muted);
 	display: flex;
 	align-items: center;
-	gap: 5px;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+.servings label {
+	margin-right: 2px;
+}
+.servings button {
+	min-width: 44px;
+	min-height: 44px;
+	padding: 0;
+	border: 1px solid var(--line);
+	background: var(--surface);
+	color: var(--ink);
+	font-size: 16px;
+	font-weight: 500;
+	line-height: 1;
+	display: grid;
+	place-items: center;
+}
+.servings button:hover {
+	background: var(--wash);
 }
 .servings input {
-	width: 45px;
-	padding: 5px;
-	font-size: 14px;
+	width: 52px;
+	min-width: 44px;
+	min-height: 44px;
+	padding: 6px;
+	font-size: 16px;
+	text-align: center;
+	appearance: textfield;
+}
+.servings input::-webkit-inner-spin-button,
+.servings input::-webkit-outer-spin-button {
+	appearance: none;
+	margin: 0;
+}
+.servings-help {
+	min-height: 20px;
+	margin: 6px 0 4px;
+	font-size: 13px;
+	line-height: 20px;
+	color: var(--muted);
+}
+.recipe-columns .ingredients-list {
+	margin-top: 6px;
 }
 .ingredients-list {
 	list-style: none;
@@ -1408,16 +1451,37 @@ main {
 .rating-box p {
 	font-size: 14px;
 }
+.rating-controls {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px 12px;
+}
 .stars {
 	display: flex;
+	flex-wrap: wrap;
 	color: #a7a35c;
 	gap: 5px;
 }
 .stars button {
+	min-width: 44px;
+	min-height: 44px;
 	padding: 3px;
+	display: grid;
+	place-items: center;
 }
 .stars button:hover {
 	transform: scale(1.15) rotate(-10deg);
+}
+.clear-rating {
+	min-width: 44px;
+	min-height: 44px;
+	padding: 8px 10px;
+	font-size: 16px;
+	color: var(--muted);
+}
+.clear-rating:hover {
+	color: var(--ink);
 }
 .source-link {
 	display: flex;
@@ -2125,14 +2189,17 @@ body {
 }
 .nutrition-selector {
 	justify-content: center;
+	flex-wrap: wrap;
 	margin: 0 auto 18px;
-	gap: 12px;
-	font-size: 14px;
+	gap: 8px 12px;
+	font-size: 16px;
 }
 .nutrition-selector select {
+	min-width: 44px;
+	min-height: 44px;
 	padding: 8px 12px;
 	border: 1px solid var(--line);
-	font-size: 14px;
+	font-size: 16px;
 }
 .sync-notice {
 	display: flex;
@@ -2894,6 +2961,21 @@ html.dark[data-theme='nosh'] {
 	.steps-list li button {
 		width: 44px;
 		height: 44px;
+	}
+
+	.recipe-columns .section-line,
+	.rating-box,
+	.rating-controls {
+		flex-wrap: wrap;
+	}
+
+	.servings button,
+	.servings input,
+	.nutrition-selector select,
+	.clear-rating {
+		min-width: 44px;
+		min-height: 44px;
+		font-size: 16px;
 	}
 
 	.stars button {
