@@ -32,7 +32,7 @@
 	}
 </script>
 
-<h3>Voice input</h3>
+<h3 id="voice-settings-heading" tabindex="-1">Voice input</h3>
 <FormField
 	id="voice-provider"
 	label="Transcription"

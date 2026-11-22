@@ -43,7 +43,8 @@
 		session = $bindable(),
 		capture,
 		save,
-		dictate
+		dictate,
+		voiceBusy = false
 	}: {
 		session: ImportSession;
 		capture: (
@@ -52,6 +53,7 @@
 		) => Promise<{ recipe: Recipe; assumptions: string[] } | null>;
 		save: (recipe: Recipe) => void;
 		dictate: () => void;
+		voiceBusy?: boolean;
 	} = $props();
 	let busy = $state(false);
 	let reading = $state(false);
@@ -91,7 +93,7 @@
 	});
 
 	async function attachPhoto(file?: File) {
-		if (!file || busy || reading) return;
+		if (!file || busy || reading || voiceBusy) return;
 		if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
 			error = 'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.';
 			return;
@@ -147,7 +149,7 @@
 	function drop(event: DragEvent) {
 		event.preventDefault();
 		dragging = false;
-		if (busy || reading) return;
+		if (busy || reading || voiceBusy) return;
 		const file = event.dataTransfer?.files[0];
 		if (file) {
 			void attachPhoto(file);
@@ -163,7 +165,7 @@
 	}
 	async function prepare(event: SubmitEvent) {
 		event.preventDefault();
-		if (busy || reading || !alive) return;
+		if (busy || reading || voiceBusy || !alive) return;
 		const url = session.url.trim();
 		const linkCheck = validateRecipeLink(url);
 		if (linkCheck) {
@@ -239,6 +241,7 @@
 	}
 	async function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
+		if (voiceBusy) return;
 		const draft = session.draft;
 		if (!draft) return;
 		error = '';
@@ -344,22 +347,25 @@
 					onchange={(e) => attachPhoto(e.currentTarget.files?.[0])}
 					tabindex="-1"
 					aria-label="Recipe photo"
-					disabled={busy || reading}
+					disabled={busy || reading || voiceBusy}
 				/>
 				<button
 					class="secondary"
 					type="button"
 					onclick={() => photoInput?.click()}
-					disabled={busy || reading}
+					disabled={busy || reading || voiceBusy}
 					><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
 				>
-				<button class="secondary" type="button" onclick={dictate} disabled={busy || reading}
-					><Mic size={18} />Use voice</button
+				<button
+					class="secondary"
+					type="button"
+					onclick={dictate}
+					disabled={busy || reading || voiceBusy}><Mic size={18} />Use voice</button
 				>
 				{#if session.url || session.text || session.photo}<button
 						type="button"
 						class="text-button"
-						disabled={busy || reading}
+						disabled={busy || reading || voiceBusy}
 						onclick={() => {
 							session = emptyImportSession();
 							error = '';
@@ -374,7 +380,7 @@
 						type="button"
 						class="icon-button"
 						aria-label="Remove recipe photo"
-						disabled={busy}
+						disabled={busy || voiceBusy}
 						onclick={() => {
 							session.photo = '';
 							session.photoName = '';
@@ -393,6 +399,7 @@
 				type="submit"
 				disabled={busy ||
 					reading ||
+					voiceBusy ||
 					(!session.url.trim() && !session.text.trim() && !session.photo)}
 				aria-busy={busy}
 				>{busy ? 'Making your draft…' : retryAvailable ? 'Try again' : 'Create recipe draft'}<Check
@@ -403,6 +410,7 @@
 		{#if session.draft}<button
 				class="text-button"
 				type="button"
+				disabled={voiceBusy}
 				onclick={() => {
 					error = '';
 					draftSubmitted = false;
@@ -633,7 +641,9 @@
 					draftSubmitted = false;
 					error = '';
 				}}><ChevronLeft size={18} />Back</button
-			><button class="primary" type="submit"><Check size={18} />Save recipe</button>
+			><button class="primary" type="submit" disabled={voiceBusy}
+				><Check size={18} />Save recipe</button
+			>
 		</div>
 	</form>
 {/if}
