@@ -1,13 +1,11 @@
 import type { RequestHandler } from './$types';
-import { ApiError, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
+import { ApiError, clientAddress, consumeRateLimit, getSessionBinding } from '#lib/server/db.ts';
 import { ChatGPTOAuthError, handleHostedChatGPTCallback } from '#lib/server/chatgpt-oauth.ts';
 
 export const GET: RequestHandler = async (event) => {
 	try {
-		let address: string;
-		try {
-			address = event.getClientAddress();
-		} catch {
+		const address = clientAddress(event);
+		if (!address) {
 			return new Response('ChatGPT callback could not be accepted.', {
 				status: 403,
 				headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }

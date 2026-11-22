@@ -39,7 +39,7 @@ export const POST: RequestHandler = async (event) => {
 		}
 
 		let connection: { accessToken: string; codex?: boolean } | undefined;
-		let providerFetch = event.fetch;
+		let providerFetch = event.route ? fetch : event.fetch;
 		if (
 			body &&
 			typeof body === 'object' &&

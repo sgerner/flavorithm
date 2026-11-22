@@ -8,7 +8,8 @@
 		dialogMotion,
 		revealMotion,
 		fadeMotion,
-		motionDuration
+		motionDuration,
+		prefersReducedMotion
 	} from '#lib/motion.ts';
 	import { flip } from 'svelte/animate';
 	import {
@@ -55,7 +56,14 @@
 		transferPurchasedItemsToPantry
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
-	import { insertRecipes } from '#lib/recipe-collection.ts';
+	import {
+		DEFAULT_RECIPE_FILTER,
+		filterTabScrollTarget,
+		filterTabsOverflow,
+		hasActiveRecipeFilters,
+		insertRecipes,
+		resetRecipeFilterState
+	} from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -82,6 +90,7 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
+	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -104,12 +113,99 @@
 	let conflicts = $state<SyncConflict[]>([]);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
 	let page = $state('discover');
-	let filter = $state('For you');
+	let filter = $state(DEFAULT_RECIPE_FILTER);
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
 	let hasSearchedOnline = $state(false);
+	let lastActivePill = $state<'filter' | 'hidden'>('filter');
+	let filterTabs = $state<HTMLDivElement | null>(null);
+	let filterOverflow = $state({ left: false, right: false });
+	let activeRecipeFilters = $derived(hasActiveRecipeFilters({ filter, query, showHiddenRecipes }));
+	function syncFilterOverflow() {
+		if (!filterTabs) {
+			filterOverflow = { left: false, right: false };
+			return;
+		}
+		filterOverflow = filterTabsOverflow({
+			scrollLeft: filterTabs.scrollLeft,
+			clientWidth: filterTabs.clientWidth,
+			scrollWidth: filterTabs.scrollWidth
+		});
+	}
+	function resetRecipeFilters() {
+		const next = resetRecipeFilterState();
+		lastActivePill = 'filter';
+		filter = next.filter;
+		query = next.query;
+		showHiddenRecipes = next.showHiddenRecipes;
+		announceRecipeFilter(false);
+	}
+	$effect(() => {
+		const currentPage = page;
+		const currentFilter = filter;
+		const currentHidden = showHiddenRecipes;
+		const preferred = lastActivePill;
+		const container = filterTabs;
+		if ((currentPage !== 'discover' && currentPage !== 'saved') || !container) return;
+		let cancelled = false;
+		void tick().then(() => {
+			if (cancelled || filterTabs !== container) return;
+			const targetKey =
+				preferred === 'hidden' && currentHidden
+					? 'hidden'
+					: currentFilter !== DEFAULT_RECIPE_FILTER
+						? currentFilter
+						: currentHidden
+							? 'hidden'
+							: DEFAULT_RECIPE_FILTER;
+			const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'));
+			const pill = buttons.find((button) => button.dataset.filter === targetKey);
+			if (pill) {
+				const containerRect = container.getBoundingClientRect();
+				const pillRect = pill.getBoundingClientRect();
+				const pillLeft = pillRect.left - containerRect.left + container.scrollLeft;
+				const left = filterTabScrollTarget({
+					clientWidth: container.clientWidth,
+					scrollWidth: container.scrollWidth,
+					pillLeft,
+					pillWidth: pillRect.width
+				});
+				if (Math.abs(container.scrollLeft - left) > 1) {
+					container.scrollTo({
+						left,
+						behavior: prefersReducedMotion() ? 'instant' : 'smooth'
+					});
+				}
+			}
+			syncFilterOverflow();
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+	$effect(() => {
+		const container = filterTabs;
+		if (!container || typeof window === 'undefined') return;
+		syncFilterOverflow();
+		const observer =
+			typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => syncFilterOverflow()) : null;
+		observer?.observe(container);
+		window.addEventListener('resize', syncFilterOverflow);
+		void document.fonts?.ready?.then(() => {
+			if (filterTabs === container) syncFilterOverflow();
+		});
+		return () => {
+			observer?.disconnect();
+			window.removeEventListener('resize', syncFilterOverflow);
+		};
+	});
 	let busy = $state(false);
 	let mobileNav = $state(false);
+	let mobileCalendar = $state(
+		typeof window !== 'undefined' &&
+			typeof window.matchMedia === 'function' &&
+			window.matchMedia('(max-width: 650px)').matches
+	);
 	let modal = $state('');
 	const dialogNames: Record<string, string> = {
 		onboarding: 'Recipe preferences',
@@ -405,6 +501,7 @@
 			emailDelivery: Boolean(data.capabilities?.emailDelivery),
 			recipeSearch: Boolean(data.capabilities?.recipeSearch)
 		};
+		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
 		return data;
 	}
 	const nav = [
@@ -452,7 +549,7 @@
 				(filter !== 'Quick & easy' || r.time <= 30) &&
 				(filter !== 'Plant-powered' || r.tags.some((t) => /vegetarian|vegan|plant/i.test(t))) &&
 				(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
-				(filter !== 'High protein' || r.nutrition.protein >= 25)
+				(filter !== 'High protein' || (!r.nutritionStale && r.nutrition.protein >= 25))
 		);
 		return filter === 'For you'
 			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
@@ -467,8 +564,7 @@
 		const hasSavedRecipes = kitchen.recipes.some(
 			(r) => r.saved && (showHiddenRecipes || !r.hidden)
 		);
-		const hasFilterOrQuery = Boolean(query.trim()) || filter !== 'For you';
-		return formatRecipeStatus(recipes.length, page, hasSavedRecipes, hasFilterOrQuery);
+		return formatRecipeStatus(recipes.length, page, hasSavedRecipes, activeRecipeFilters);
 	}
 	function announceRecipeFilter(debounced = false) {
 		if (debounced) announceDeferred(() => currentRecipeStatus(), 300);
@@ -787,10 +883,18 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
+		const calendarMedia =
+			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
+		const calendarMediaChanged = () => {
+			mobileCalendar = Boolean(calendarMedia?.matches);
+		};
+		calendarMediaChanged();
+		calendarMedia?.addEventListener('change', calendarMediaChanged);
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
 		return () => {
+			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
@@ -1198,7 +1302,12 @@
 
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else if (importSession.text || importSession.photo || importSession.draft) {
+			else if (
+				importSession.url ||
+				importSession.text ||
+				importSession.photo ||
+				importSession.draft
+			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
 				window.location.assign(result.authorizationUrl);
@@ -1507,8 +1616,13 @@
 				modal = 'generate';
 				break;
 			case 'search':
-				if (!searchResults.length) hasSearchedOnline = false;
-				modal = 'search';
+				if (capabilities.recipeSearch) {
+					if (!searchResults.length) hasSearchedOnline = false;
+					modal = 'search';
+					error = '';
+				} else {
+					openImport();
+				}
 				break;
 			case 'taste':
 				modal = 'taste';
@@ -1767,8 +1881,8 @@
 	function saveMealChanges() {
 		const meal = kitchen.meals.find((item) => item.id === editingMealId);
 		if (!meal || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
-		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
-			notify('Choose between 1 and 24 whole servings.');
+		if (!isValidServings(plannedServings)) {
+			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			return;
 		}
 		const previousWeek = weekStartForDate(meal.date);
@@ -1825,8 +1939,8 @@
 	}
 	function addMeal() {
 		if (!selected || !mealDate) return;
-		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
-			notify('Choose between 1 and 24 whole servings.');
+		if (!isValidServings(plannedServings)) {
+			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			return;
 		}
 		kitchen.meals.push({
@@ -1999,9 +2113,13 @@
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
-		openImport(url);
+		importSession = { ...emptyImportSession(), url };
+		openImport();
 	}
-	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
+	async function captureImport(
+		input: { url?: string; prompt: string; image?: string },
+		signal: AbortSignal
+	) {
 		if (!needAI()) {
 			resumeImport = true;
 			return null;
@@ -2009,7 +2127,9 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const saved = { ...recipe, saved: true };
+		const nutritionStale =
+			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
+		const saved = { ...recipe, saved: true, nutritionStale };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
 		importSession = emptyImportSession();
 		resumeImport = false;
@@ -2018,7 +2138,11 @@
 		page = 'saved';
 		query = '';
 		filter = 'For you';
-		notify('Recipe saved to your collection.');
+		notify(
+			nutritionStale
+				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
+				: 'Recipe saved to your collection.'
+		);
 	}
 	async function exportKitchen() {
 		try {
@@ -2098,6 +2222,11 @@
 		event.preventDefault();
 		if (managedAuth) {
 			openAuthentication();
+			return;
+		}
+		if (modal !== 'reset' && !capabilities.emailDelivery) {
+			error =
+				'Password recovery is unavailable. Ask the server operator to configure email delivery.';
 			return;
 		}
 		busy = true;
@@ -2417,32 +2546,53 @@
 						</div>
 					</div>
 					<div class="recipe-toolbar">
-						<div class="filter-tabs">
-							{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
-									class:active={filter === item}
-									aria-pressed={filter === item}
+						<div
+							class="filter-tabs-scroll"
+							class:can-scroll-left={filterOverflow.left}
+							class:can-scroll-right={filterOverflow.right}
+						>
+							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
+								{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
+										type="button"
+										data-filter={item}
+										class:active={filter === item}
+										aria-pressed={filter === item}
+										onclick={() => {
+											lastActivePill = 'filter';
+											filter = item;
+											announceRecipeFilter(false);
+										}}
+										>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
+									>{/each}
+								<button
+									type="button"
+									data-filter="hidden"
+									class:active={showHiddenRecipes}
+									aria-pressed={showHiddenRecipes}
 									onclick={() => {
-										filter = item;
+										lastActivePill = 'hidden';
+										showHiddenRecipes = !showHiddenRecipes;
 										announceRecipeFilter(false);
-									}}
-									>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
-								>{/each}
-							<button
-								class:active={showHiddenRecipes}
-								aria-pressed={showHiddenRecipes}
-								onclick={() => {
-									showHiddenRecipes = !showHiddenRecipes;
-									announceRecipeFilter(false);
-								}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
-							>
+									}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+								>
+							</div>
 						</div>
-						<div class="search-box">
-							<Search size={17} /><input
+						<div class="search-box" class:has-clear={query.length > 0}>
+							<Search size={17} aria-hidden="true" /><input
+								type="search"
 								aria-label="Search recipes"
 								placeholder="Search recipes"
 								bind:value={query}
 								oninput={() => announceRecipeFilter(true)}
-							/>
+							/>{#if query}<button
+									type="button"
+									class="search-clear"
+									aria-label="Clear search"
+									onclick={() => {
+										query = '';
+										announceRecipeFilter(false);
+									}}><X size={16} aria-hidden="true" /></button
+								>{/if}
 						</div>
 					</div>
 					<div class="recipe-grid">
@@ -2505,24 +2655,37 @@
 								</div>
 							</article>{/each}
 					</div>
-					{#if !recipes.length}<div class="empty-state">
-							<Heart size={36} />
-							<h3>
-								{page === 'saved' ? 'No saved recipes yet' : 'No recipes found'}
-							</h3>
-							<p>
-								{page === 'saved'
-									? 'Tap the bookmark on any recipe to keep it close.'
-									: 'Try another search or generate recipes.'}
-							</p>
-						</div>{/if}<button
-						class="browse-link"
-						onclick={() => {
-							if (!searchResults.length) hasSearchedOnline = false;
-							modal = 'search';
-							error = '';
-						}}>Find recipes online <ArrowUpRight size={16} /></button
-					>
+					{#if !recipes.length}{#if page === 'saved' && !kitchen.recipes.some((r) => r.saved && !r.hidden)}<div
+								class="empty-state"
+							>
+								<Heart size={36} />
+								<h2>No saved recipes yet</h2>
+								<p>Tap the bookmark on any recipe to keep it close.</p>
+							</div>{:else if activeRecipeFilters}<div class="empty-state filtered-recipe-empty">
+								<Heart size={36} />
+								<h2>
+									{page === 'saved' ? 'No matching saved recipes' : 'No matching recipes'}
+								</h2>
+								<p>
+									{page === 'saved'
+										? 'Your current search or filters hid your saved recipes.'
+										: 'No recipes match your current search or filters.'}
+								</p>
+								<button type="button" class="secondary" onclick={resetRecipeFilters}
+									>Reset filters</button
+								>
+							</div>{:else}<div class="empty-state">
+								<Heart size={36} />
+								<h2>No recipes found</h2>
+								<p>Import a recipe or generate ideas to get started.</p>
+							</div>{/if}{/if}{#if capabilities.recipeSearch}<button
+							class="browse-link"
+							onclick={() => {
+								if (!searchResults.length) hasSearchedOnline = false;
+								modal = 'search';
+								error = '';
+							}}>Find recipes online <ArrowUpRight size={16} /></button
+						>{/if}
 				</section>
 			{:else if page === 'pantry'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
@@ -2707,11 +2870,15 @@
 															selectedMealServings = meal.servings;
 															selected = recipe;
 														}}
-														><img
-															src={recipe.image || recipePlaceholder(recipe)}
-															onerror={(event) => recipeImageError(event, recipe)}
-															alt=""
-														/><b>{recipe.title}</b><small
+														>{#if !mobileCalendar}<img
+																src={recipe.image || recipePlaceholder(recipe)}
+																onerror={(event) => recipeImageError(event, recipe)}
+																alt=""
+																width="180"
+																height="65"
+																loading="lazy"
+																decoding="async"
+															/>{/if}<b>{recipe.title}</b><small
 															>{recipe.time} min · {meal.servings} servings</small
 														></button
 													>
@@ -2764,6 +2931,10 @@
 											src={recipe.image || recipePlaceholder(recipe)}
 											onerror={(event) => recipeImageError(event, recipe)}
 											alt=""
+											width="54"
+											height="48"
+											loading="lazy"
+											decoding="async"
 										/>
 										<div>
 											<b>{recipe.title}</b><span
@@ -3161,7 +3332,7 @@
 							/></label
 						>
 						<p class="field-help">Use at least 10 characters.</p>
-						{#if authMode === 'login'}<button
+						{#if authMode === 'login' && capabilities.emailDelivery}<button
 								type="button"
 								class="text-button"
 								onclick={() => {
@@ -3281,18 +3452,11 @@
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
 									>{#if !capabilities.emailDelivery}<p class="field-help">
-											Email delivery is unavailable. Set RESEND_API_KEY and EMAIL_FROM to enable it.
+											Email delivery is unavailable. Ask the server operator to configure email
+											delivery.
 										</p>{/if}{/if}
 							{/if}
 						</div>{/if}
-					<div class="settings-section">
-						<h3>Web recipe search</h3>
-						{#if capabilities.recipeSearch}<p class="muted">
-								Available for this installation.
-							</p>{:else}<p class="muted">
-								Unavailable. Set BRAVE_SEARCH_API_KEY on this installation to enable search.
-							</p>{/if}
-					</div>
 					<div class="settings-section">
 						<VoiceSettings
 							bind:provider={voiceProvider}
@@ -3512,7 +3676,7 @@
 							aria-busy={busy}>Permanently delete my account</button
 						>
 					</form>
-				{:else if (modal === 'recover' || modal === 'reset') && !managedAuth}<span
+				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
 						class="dialog-spark">✳</span
 					>
 					<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
@@ -3579,7 +3743,7 @@
 						>Servings<input
 							type="number"
 							min="1"
-							max="24"
+							max={MAX_SERVINGS}
 							step="1"
 							required
 							bind:value={plannedServings}
@@ -3610,7 +3774,7 @@
 						>Leftover servings<input
 							type="number"
 							min="0"
-							max={cookingMeal?.servings ?? 24}
+							max={cookingMeal?.servings ?? MAX_SERVINGS}
 							step="1"
 							bind:value={leftoverServings}
 						/><small class="field-help">Enter 0 if there are no leftovers.</small></label
@@ -3631,7 +3795,13 @@
 							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
 						></label
 					><label class="field"
-						>Servings<input type="number" min="1" max="24" bind:value={plannedServings} /></label
+						>Servings<input
+							type="number"
+							min="1"
+							max={MAX_SERVINGS}
+							step="1"
+							bind:value={plannedServings}
+						/></label
 					><button
 						class="primary full"
 						disabled={!mealDate || !plannedServings || plannedServings < 1}
@@ -3651,6 +3821,10 @@
 									src={recipe.image || recipePlaceholder(recipe)}
 									onerror={(event) => recipeImageError(event, recipe)}
 									alt=""
+									width="75"
+									height="60"
+									loading="lazy"
+									decoding="async"
 								/><span
 									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
 								><Plus size={17} /></button
@@ -3672,7 +3846,7 @@
 						Search real recipes across the web, with links to the original creators.
 					</p>
 					{#if !capabilities.recipeSearch}<p class="field-help">
-							Web search is unavailable. Set BRAVE_SEARCH_API_KEY on this installation.
+							Web search is unavailable. Ask the server operator to enable online recipe search.
 						</p>{/if}
 					<label class="field"
 						>What are you craving?<input
