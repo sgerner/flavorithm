@@ -10,7 +10,8 @@
 		Plus,
 		Trash2,
 		Pencil,
-		ArrowRight
+		ArrowRight,
+		Pause
 	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
@@ -83,10 +84,37 @@
 	let alive = true;
 	let controller: AbortController | undefined;
 	let requestTimer: ReturnType<typeof setTimeout> | undefined;
+	const PAUSE_MOTION_STORAGE_KEY = 'flavorithm-butler-pause-motion';
+	function readPausedMotion(): boolean {
+		if (typeof localStorage === 'undefined') return false;
+		try {
+			const stored = localStorage.getItem(PAUSE_MOTION_STORAGE_KEY);
+			return stored === 'true' || stored === '1';
+		} catch {
+			return false;
+		}
+	}
+	let paused = $state(readPausedMotion());
 	let reaction = $state<'idle' | 'speaking' | 'pleased'>('idle');
 	let reactionTimer: ReturnType<typeof setTimeout> | undefined;
 	const working = $derived(busy || !!applying);
 	const mood = $derived(working ? 'thinking' : error ? 'concerned' : reaction);
+	const actionLabels = $derived.by(() => {
+		const counts = new Map<string, number>();
+		const labels = new Map<string, { card: string; details: string }>();
+		for (const message of messages) {
+			for (const action of message.actions ?? []) {
+				const base = action.title || 'Proposed action';
+				const next = (counts.get(base) ?? 0) + 1;
+				counts.set(base, next);
+				labels.set(`${message.id}:${action.id}`, {
+					card: next === 1 ? base : `${base} (${next})`,
+					details: next === 1 ? `${base} details` : `${base} details (${next})`
+				});
+			}
+		}
+		return labels;
+	});
 	const address = $derived(
 		userName.trim() ? `Master ${userName.trim().slice(0, 80)}` : 'master of the house'
 	);
@@ -95,6 +123,10 @@
 	);
 	function react(value: 'speaking' | 'pleased', duration: number) {
 		clearTimeout(reactionTimer);
+		if (paused) {
+			reaction = 'idle';
+			return;
+		}
 		reaction = value;
 		reactionTimer = setTimeout(() => {
 			reaction = 'idle';
@@ -103,6 +135,13 @@
 	function resetReaction() {
 		clearTimeout(reactionTimer);
 		reaction = 'idle';
+	}
+	function togglePause() {
+		paused = !paused;
+		if (paused) resetReaction();
+		try {
+			localStorage.setItem(PAUSE_MOTION_STORAGE_KEY, String(paused));
+		} catch {}
 	}
 	const starters = [
 		{ label: 'Plan my week', prompt: 'Plan dinners for the week using my pantry.' },
@@ -138,7 +177,10 @@
 		await tick();
 		transcript?.scrollTo({
 			top: transcript.scrollHeight,
-			behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'
+			behavior:
+				paused || window.matchMedia('(prefers-reduced-motion: reduce)').matches
+					? 'instant'
+					: 'smooth'
 		});
 	}
 	export async function close() {
@@ -208,7 +250,7 @@
 				for (const command of action.commands)
 					if (command.type === 'recipe.upsert') drafts.set(command.recipe.id, command.recipe);
 			recipeDrafts = [...drafts.values()].slice(-10);
-			react('speaking', Math.min(12000, Math.max(2400, result.reply.length * 28)));
+			react('speaking', Math.min(4500, Math.max(2400, result.reply.length * 28)));
 			messages.push({
 				id: ++sequence,
 				role: 'assistant',
@@ -273,6 +315,7 @@
 <button
 	class="butler-launcher"
 	class:waiting={busy || syncing}
+	class:motion-paused={paused}
 	bind:this={launcher}
 	onclick={toggle}
 	aria-expanded={open}
@@ -280,13 +323,14 @@
 	aria-label={open ? 'Close Basil chat' : 'Chat with Basil, your kitchen butler'}
 	title="Chat with Basil"
 >
-	<BasilAvatar {mood} size={32} active={open} /><span>Basil</span>
+	<BasilAvatar {mood} size={32} active={false} /><span>Basil</span>
 	{#if busy || syncing}<LoaderCircle size={13} class="spin launcher-spinner" />{/if}
 </button>
 
 {#if open}
 	<div
 		class="butler-panel"
+		class:motion-paused={paused}
 		style={viewportStyle}
 		id="butler-panel"
 		use:focusTrap
@@ -303,11 +347,19 @@
 		}}
 	>
 		<header>
-			<BasilAvatar {mood} size={46} active={open} />
+			<BasilAvatar {mood} size={46} active={open && !paused} />
 			<div class="butler-heading">
 				<h2>Basil</h2>
 				<p>{status}</p>
 			</div>
+			<button
+				type="button"
+				class="icon-button"
+				aria-pressed={paused}
+				aria-label="Pause animations"
+				title="Pause animations"
+				onclick={togglePause}><Pause size={17} /></button
+			>
 			<button
 				class="icon-button"
 				onclick={clear}
@@ -318,9 +370,11 @@
 			<button class="icon-button" onclick={close} aria-label="Close chat"><X size={20} /></button>
 		</header>
 		{#if busy || syncing}<div class="request-progress" aria-hidden="true"></div>{/if}
+		<!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable transcript needs keyboard focus.) -->
 		<div
 			class="butler-transcript"
 			bind:this={transcript}
+			tabindex="0"
 			role="log"
 			aria-label="Conversation"
 			aria-live="polite"
@@ -348,12 +402,14 @@
 						</p>{/if}
 					{#if message.actions?.length}
 						<div class="butler-actions">
-							{#each message.actions as action (action.id)}
+							{#each message.actions as action (action.id)}{@const labels = actionLabels.get(
+									`${message.id}:${action.id}`
+								)}
 								<section
 									class="action-card"
 									class:action-applied={action.status === 'applied'}
 									class:action-dismissed={action.status === 'dismissed'}
-									aria-label={action.title}
+									aria-label={labels?.card ?? action.title}
 								>
 									<div class="action-info">
 										<strong>{action.title}</strong>
@@ -361,7 +417,13 @@
 									</div>
 									<details>
 										<summary>Details</summary>
-										<div class="action-details">
+										<!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable command preview needs keyboard focus.) -->
+										<div
+											class="action-details"
+											tabindex="0"
+											role="region"
+											aria-label={labels?.details ?? `${action.title} details`}
+										>
 											{#each action.commands as command}<pre>{preview(
 														command,
 														action.commands
@@ -538,6 +600,10 @@
 	.icon-button:hover {
 		background: var(--wash);
 	}
+	.icon-button[aria-pressed='true'] {
+		background: var(--ink);
+		color: var(--surface);
+	}
 	.request-progress {
 		height: 2px;
 		flex-shrink: 0;
@@ -552,6 +618,9 @@
 		overflow-y: auto;
 		padding: 16px;
 		overscroll-behavior: contain;
+	}
+	.butler-transcript:focus-visible {
+		outline-offset: -2px;
 	}
 	.butler-introduction p {
 		font:
@@ -627,7 +696,10 @@
 		color: var(--muted);
 	}
 	summary {
-		display: inline-block;
+		display: inline-flex;
+		align-items: center;
+		min-height: 24px;
+		min-width: 24px;
 		margin-top: 8px;
 		padding: 4px 0;
 		font-size: 11px;
@@ -855,6 +927,19 @@
 		textarea {
 			font-size: 16px;
 		}
+	}
+	.butler-panel.motion-paused,
+	.motion-paused .request-progress,
+	.motion-paused .typing-dots i,
+	.butler-panel.motion-paused :global(.spin),
+	.butler-launcher.motion-paused :global(.spin) {
+		animation: none;
+	}
+	.motion-paused .request-progress {
+		background: var(--green);
+	}
+	.motion-paused .typing-dots i {
+		opacity: 0.75;
 	}
 	@media (prefers-reduced-motion: reduce) {
 		.butler-panel,
