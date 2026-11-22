@@ -1542,8 +1542,7 @@ test('client AI payloads pass validation across generate, vision, nutrition, sea
 
 		let activeAction: 'generate' | 'vision' | 'nutrition' | 'search' | 'import' = 'generate';
 		const providerFetcher: typeof fetch = async (input) => {
-			const url = String(input);
-			if (url.startsWith('https://api.search.brave.com')) {
+			if (new URL(String(input)).origin === 'https://api.search.brave.com') {
 				return jsonResponse({
 					web: {
 						results: [
