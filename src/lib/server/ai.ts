@@ -330,7 +330,7 @@ export async function runAIRequest(
 	input: unknown,
 	fetcher: Fetcher = fetch,
 	pageFetcher: SecureRecipePageFetcher = secureRecipePageFetcher,
-	connection?: { accessToken: string; codex?: boolean },
+	connection?: { accessToken?: string; codex?: boolean; usePublicCatalogCache?: boolean },
 	requestSignal?: AbortSignal
 ) {
 	const parsed = AIRequestSchema.safeParse(input);
@@ -360,9 +360,16 @@ export async function runAIRequest(
 			'This provider needs an integration that Flavorithm does not support yet.'
 		);
 	if (request.reasoning && Object.keys(request.reasoning).length) {
-		const catalog = connection?.codex
-			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher);
+		const useCachedCatalog =
+			Boolean(connection?.usePublicCatalogCache) ||
+			fetcher === fetch ||
+			fetcher === publicCatalogFetcher;
+		const catalog =
+			connection?.codex && connection.accessToken
+				? await listChatGPTModels(connection.accessToken, requestFetcher)
+				: useCachedCatalog
+					? await getPublicModelCatalog(requestFetcher)
+					: await getSupportedModels(requestFetcher);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2361,6 +2368,7 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
 let publicCatalog: Promise<SupportedModelResponse> | undefined;
 let publicCatalogExpiresAt = 0;
+let publicCatalogFetcher: Fetcher | undefined;
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2384,10 +2392,12 @@ export async function getSupportedModels(
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
 	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
 		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+		publicCatalogFetcher = fetcher;
 		const pending = getSupportedModels(fetcher).catch((error) => {
 			if (publicCatalog === pending) {
 				publicCatalog = undefined;
 				publicCatalogExpiresAt = 0;
+				publicCatalogFetcher = undefined;
 			}
 			throw error;
 		});

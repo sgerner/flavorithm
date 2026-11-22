@@ -55,7 +55,13 @@ export const POST: RequestHandler = async (event) => {
 			providerFetch = resolved.fetcher;
 		}
 		return Response.json(
-			await runAIRequest(body, providerFetch, undefined, connection, event.request.signal),
+			await runAIRequest(
+				body,
+				providerFetch,
+				undefined,
+				{ ...connection, usePublicCatalogCache: true },
+				event.request.signal
+			),
 			{
 				headers: { 'cache-control': 'no-store' }
 			}
