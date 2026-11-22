@@ -6,6 +6,7 @@ import {
 	AIRequestError,
 	fetchCaptureRecipePage,
 	fetchRecipePage,
+	getPublicModelCatalog,
 	getSupportedModels,
 	resetPublicModelCatalogCache,
 	runAIRequest,
@@ -1974,4 +1975,58 @@ test('model endpoint fetch uses the public models.dev catalog URL', async () => 
 			models: [{ id: 'openai/gpt-4.1-mini', name: 'GPT-4.1 mini', vision: true }]
 		}
 	]);
+});
+
+test('getPublicModelCatalog isolates custom fetchers while sharing cache across SvelteKit server_fetch wrappers', async (t) => {
+	let firstCalls = 0;
+	const firstFetcher: typeof fetch = async () => {
+		firstCalls += 1;
+		return jsonResponse({
+			anthropic: {
+				name: 'Anthropic',
+				models: { 'claude-only': { name: 'Claude Only', modalities: { input: ['text'] } } }
+			}
+		});
+	};
+	let secondCalls = 0;
+	const secondFetcher: typeof fetch = async () => {
+		secondCalls += 1;
+		return jsonResponse({
+			openai: {
+				name: 'OpenAI',
+				models: { 'gpt-only': { name: 'GPT Only', modalities: { input: ['text'] } } }
+			}
+		});
+	};
+
+	const first = await getPublicModelCatalog(firstFetcher);
+	const firstCached = await getPublicModelCatalog(firstFetcher);
+	const second = await getPublicModelCatalog(secondFetcher);
+	assert.equal(firstCalls, 1);
+	assert.equal(secondCalls, 1);
+	assert.equal(first.providers[0]?.id, 'anthropic');
+	assert.equal(firstCached.providers[0]?.id, 'anthropic');
+	assert.equal(second.providers[0]?.id, 'openai');
+
+	let globalCalls = 0;
+	t.mock.method(globalThis, 'fetch', async () => {
+		globalCalls += 1;
+		return jsonResponse({
+			google: {
+				name: 'Google',
+				models: { 'gemini-shared': { name: 'Gemini Shared', modalities: { input: ['text'] } } }
+			}
+		});
+	});
+	const makeServerFetch = (): typeof fetch => {
+		const server_fetch: typeof fetch = (input, init) => globalThis.fetch(input, init);
+		return server_fetch;
+	};
+	const requestOneCatalog = await getPublicModelCatalog(makeServerFetch());
+	const requestTwoCatalog = await getPublicModelCatalog(makeServerFetch());
+	const directGlobalCatalog = await getPublicModelCatalog();
+	assert.equal(globalCalls, 1);
+	assert.equal(requestOneCatalog.providers[0]?.id, 'google');
+	assert.equal(requestTwoCatalog.providers[0]?.id, 'google');
+	assert.equal(directGlobalCatalog.providers[0]?.id, 'google');
 });
