@@ -270,49 +270,43 @@ function roundQuantity(value: number): number {
 	return Object.is(rounded, -0) ? 0 : rounded;
 }
 
-function calendarDate(value: string): { year: number; month: number; day: number } | undefined {
-	const cleaned = value.trim();
-	const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(cleaned);
-	if (dateOnly) {
-		const year = Number(dateOnly[1]);
-		const month = Number(dateOnly[2]) - 1;
-		const day = Number(dateOnly[3]);
-		const parsed = new Date(0);
-		parsed.setFullYear(year, month, day);
-		parsed.setHours(0, 0, 0, 0);
-		if (parsed.getFullYear() !== year || parsed.getMonth() !== month || parsed.getDate() !== day)
-			return undefined;
-		return { year, month, day };
-	}
-	const parsed = new Date(cleaned);
-	if (!Number.isFinite(parsed.getTime())) return undefined;
-	return { year: parsed.getFullYear(), month: parsed.getMonth(), day: parsed.getDate() };
+export type CalendarDate = { year: number; month: number; day: number };
+
+const ISO_CALENDAR_DATE_RE =
+	/^(\d{4})-(\d{2})-(\d{2})(?:T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?)?$/i;
+
+export function parseCalendarDate(value: string): CalendarDate | undefined {
+	const match = ISO_CALENDAR_DATE_RE.exec(value.trim());
+	if (!match) return undefined;
+	const year = Number(match[1]);
+	const month = Number(match[2]) - 1;
+	const day = Number(match[3]);
+	const parsed = new Date(0);
+	parsed.setUTCFullYear(year, month, day);
+	parsed.setUTCHours(0, 0, 0, 0);
+	if (
+		parsed.getUTCFullYear() !== year ||
+		parsed.getUTCMonth() !== month ||
+		parsed.getUTCDate() !== day
+	)
+		return undefined;
+	return { year, month, day };
 }
 
-function dateOrdinal(date: { year: number; month: number; day: number }): number {
+export function dateOrdinal(date: CalendarDate): number {
 	const utcDate = new Date(0);
 	utcDate.setUTCFullYear(date.year, date.month, date.day);
 	utcDate.setUTCHours(0, 0, 0, 0);
 	return Math.floor(utcDate.getTime() / 86_400_000);
 }
 
-function localDateKey(value: Date): string | undefined {
-	if (!Number.isFinite(value.getTime())) return undefined;
-	return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
-}
-
-function expiredBefore(expires: string | undefined, date: string | undefined): boolean {
-	if (!expires?.trim() || !date?.trim()) return false;
-	const expiryDate = calendarDate(expires);
-	const scheduledDate = calendarDate(date);
-	return Boolean(
-		expiryDate && scheduledDate && dateOrdinal(expiryDate) < dateOrdinal(scheduledDate)
-	);
+function localCalendarDate(value: Date): CalendarDate {
+	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
 }
 
 type ShoppingRequirement = {
 	quantityBase: number;
-	mealDate?: string;
+	mealOrdinal?: number;
 	canUsePantry: boolean;
 };
 
@@ -327,25 +321,32 @@ export function buildShoppingList(
 	meals?: Meal[],
 	now: Date = new Date()
 ): ShoppingItem[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const todayOrdinal = dateOrdinal(localCalendarDate(safeNow));
 	const recipesById = new Map(recipes.map((recipe) => [recipe.id, recipe]));
-	const requested: Array<{ recipe: Recipe; servings: number; mealDate?: string }> =
+	const requested: Array<{ recipe: Recipe; servings: number; mealOrdinal?: number }> =
 		meals === undefined
 			? recipes.map((recipe) => ({
 					recipe,
 					servings: recipe.servings,
-					mealDate: localDateKey(now)
+					mealOrdinal: todayOrdinal
 				}))
 			: meals.flatMap((meal) => {
 					const recipe = recipesById.get(meal.recipeId);
-					return recipe && Number.isFinite(meal.servings) && meal.servings > 0
-						? [
-								{
-									recipe,
-									servings: meal.servings,
-									mealDate: meal.date.trim() ? meal.date : localDateKey(now)
-								}
-							]
-						: [];
+					if (!recipe || !Number.isFinite(meal.servings) || !(meal.servings > 0)) return [];
+					const trimmedDate = meal.date.trim();
+					const parsedMealDate = trimmedDate ? parseCalendarDate(trimmedDate) : undefined;
+					return [
+						{
+							recipe,
+							servings: meal.servings,
+							mealOrdinal: trimmedDate
+								? parsedMealDate
+									? Math.max(todayOrdinal, dateOrdinal(parsedMealDate))
+									: undefined
+								: todayOrdinal
+						}
+					];
 				});
 
 	const buckets = new Map<
@@ -361,7 +362,7 @@ export function buildShoppingList(
 		}
 	>();
 
-	for (const { recipe, servings, mealDate } of requested) {
+	for (const { recipe, servings, mealOrdinal } of requested) {
 		const hasServingBaseline = Number.isFinite(recipe.servings) && recipe.servings > 0;
 		const scale = hasServingBaseline ? servings / recipe.servings : 1;
 		for (const ingredient of recipe.ingredients) {
@@ -387,9 +388,9 @@ export function buildShoppingList(
 			bucket.quantityBase += quantityBase;
 			bucket.requirements.push({
 				quantityBase,
-				mealDate,
+				mealOrdinal,
 				// Without a recipe serving baseline, pantry stock cannot prove this request is covered.
-				canUsePantry: hasServingBaseline && Boolean(mealDate && calendarDate(mealDate))
+				canUsePantry: hasServingBaseline && mealOrdinal !== undefined
 			});
 			buckets.set(key, bucket);
 		}
@@ -397,10 +398,17 @@ export function buildShoppingList(
 
 	const pantryByBucket = new Map<
 		string,
-		Array<{ quantityBase: number; expires?: string; index: number }>
+		Array<{ quantityBase: number; expiryOrdinal?: number; index: number }>
 	>();
 	for (const item of pantry) {
 		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
+		const rawExpires = item.expires?.trim();
+		let expiryOrdinal: number | undefined;
+		if (rawExpires) {
+			const parsedExpiry = parseCalendarDate(rawExpires);
+			if (!parsedExpiry) continue;
+			expiryOrdinal = dateOrdinal(parsedExpiry);
+		}
 		const normalizedName = normalizeName(item.name);
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
@@ -408,7 +416,7 @@ export function buildShoppingList(
 		const lots = pantryByBucket.get(key) ?? [];
 		lots.push({
 			quantityBase: item.quantity * unit.factor,
-			expires: item.expires,
+			expiryOrdinal,
 			index: lots.length
 		});
 		pantryByBucket.set(key, lots);
@@ -416,25 +424,25 @@ export function buildShoppingList(
 
 	for (const [key, bucket] of buckets) {
 		const lots = (pantryByBucket.get(key) ?? []).sort((a, b) => {
-			const expiryA = a.expires ? calendarDate(a.expires) : undefined;
-			const expiryB = b.expires ? calendarDate(b.expires) : undefined;
-			const priorityA = expiryA ? dateOrdinal(expiryA) : Number.MAX_SAFE_INTEGER;
-			const priorityB = expiryB ? dateOrdinal(expiryB) : Number.MAX_SAFE_INTEGER;
+			const priorityA = a.expiryOrdinal ?? Number.MAX_SAFE_INTEGER;
+			const priorityB = b.expiryOrdinal ?? Number.MAX_SAFE_INTEGER;
 			return priorityA - priorityB || a.index - b.index;
 		});
 		const requirements = [...bucket.requirements].sort((a, b) => {
-			const dateA = a.mealDate ? calendarDate(a.mealDate) : undefined;
-			const dateB = b.mealDate ? calendarDate(b.mealDate) : undefined;
-			const orderA = dateA ? dateOrdinal(dateA) : Number.MAX_SAFE_INTEGER;
-			const orderB = dateB ? dateOrdinal(dateB) : Number.MAX_SAFE_INTEGER;
+			const orderA = a.mealOrdinal ?? Number.MAX_SAFE_INTEGER;
+			const orderB = b.mealOrdinal ?? Number.MAX_SAFE_INTEGER;
 			return orderA - orderB;
 		});
 		for (const requirement of requirements) {
-			if (!requirement.canUsePantry) continue;
+			if (!requirement.canUsePantry || requirement.mealOrdinal === undefined) continue;
 			let need = requirement.quantityBase;
 			for (const lot of lots) {
 				if (need <= 0) break;
-				if (!(lot.quantityBase > 0) || expiredBefore(lot.expires, requirement.mealDate)) continue;
+				if (
+					!(lot.quantityBase > 0) ||
+					(lot.expiryOrdinal !== undefined && lot.expiryOrdinal < requirement.mealOrdinal)
+				)
+					continue;
 				const used = Math.min(need, lot.quantityBase);
 				lot.quantityBase -= used;
 				need -= used;
