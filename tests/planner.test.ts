@@ -18,10 +18,11 @@ import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as collectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
+import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
+import * as voiceConfigMod from '../src/lib/voice-config.ts';
 
 const { MAX_RECIPES } = collectionMod;
-import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
-import * as voiceConfigMod from '../src/lib/voice-config.ts';
 
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
@@ -170,7 +171,7 @@ function createModuleMap() {
 		'#lib/recipe-collection.ts': collectionMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
-		'#lib/voice-capture.ts': { VoiceCapture: class {} },
+		'#lib/voice-capture.ts': voiceCaptureMod,
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
@@ -188,6 +189,7 @@ function createModuleMap() {
 				photo: '',
 				photoName: '',
 				draft: null,
+				baseline: null,
 				assumptions: []
 			})
 		}
