@@ -2364,7 +2364,7 @@ type CatalogCacheEntry = {
 	expiresAt: number;
 };
 let publicCatalog: CatalogCacheEntry | undefined;
-const customCatalogCache = new WeakMap<Fetcher, CatalogCacheEntry>();
+let customCatalogCache = new WeakMap<Fetcher, CatalogCacheEntry>();
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2413,4 +2413,10 @@ export function getPublicModelCatalog(
 		customCatalogCache.set(cacheKey, entry);
 	}
 	return entry.promise;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	customCatalogCache = new WeakMap<Fetcher, CatalogCacheEntry>();
 }
