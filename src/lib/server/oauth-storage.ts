@@ -62,6 +62,7 @@ db.exec(`
 		expires_at INTEGER NOT NULL,
 		envelope TEXT NOT NULL
 	);
+	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pending_user_idx ON chatgpt_oauth_pending(user_id);
 	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pending_expiry_idx ON chatgpt_oauth_pending(expires_at);
 	CREATE TABLE IF NOT EXISTS chatgpt_oauth_pairings (
 		id TEXT PRIMARY KEY,
@@ -69,6 +70,8 @@ db.exec(`
 		expires_at INTEGER NOT NULL,
 		envelope TEXT NOT NULL
 	);
+	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pairings_user_idx ON chatgpt_oauth_pairings(user_id);
+	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pairings_expiry_idx ON chatgpt_oauth_pairings(expires_at);
 `);
 
 type AccountRow = {
@@ -91,14 +94,20 @@ type AccountRow = {
 
 let memoryLocalKey: Buffer | undefined;
 
+export function decodeHostedEncryptionKey(): Buffer | null {
+	const configured = process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY?.trim();
+	if (!configured) return null;
+	const key = Buffer.from(configured, 'base64');
+	if (key.length !== 32 || key.toString('base64') !== configured) {
+		return null;
+	}
+	return key;
+}
+
 function keyFor(mode: OAuthMode): Buffer {
 	if (mode === 'hosted') {
-		const configured = process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY?.trim();
-		if (!configured) throw new Error('Hosted OAuth encryption is unavailable.');
-		const key = Buffer.from(configured, 'base64');
-		if (key.length !== 32 || key.toString('base64') !== configured) {
-			throw new Error('Hosted OAuth encryption is unavailable.');
-		}
+		const key = decodeHostedEncryptionKey();
+		if (!key) throw new Error('Hosted OAuth encryption is unavailable.');
 		return key;
 	}
 
@@ -110,14 +119,22 @@ function keyFor(mode: OAuthMode): Buffer {
 	const dbPath =
 		process.env.FLAVORITHM_DB_PATH ?? resolve(process.cwd(), 'data', 'flavorithm.sqlite');
 	const keyPath = resolve(dirname(dbPath), 'oauth.key');
+	if (existsSync(keyPath)) {
+		const key = readFileSync(keyPath);
+		if (key.length !== 32) throw new Error('Local OAuth encryption is unavailable.');
+		chmodSync(keyPath, 0o600);
+		return key;
+	}
+
+	const fallbackKey = decodeHostedEncryptionKey();
+	if (fallbackKey) return fallbackKey;
+
 	mkdirSync(dirname(keyPath), { recursive: true });
-	if (!existsSync(keyPath)) {
-		const freshKey = randomBytes(32);
-		try {
-			writeFileSync(keyPath, freshKey, { flag: 'wx', mode: 0o600 });
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-		}
+	const freshKey = randomBytes(32);
+	try {
+		writeFileSync(keyPath, freshKey, { flag: 'wx', mode: 0o600 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
 	}
 	const key = readFileSync(keyPath);
 	if (key.length !== 32) throw new Error('Local OAuth encryption is unavailable.');
@@ -129,15 +146,14 @@ function aad(userId: string, accountId: string, mode: OAuthMode): Buffer {
 	return Buffer.from(`flavorithm:chatgpt:${mode}:${userId}:${accountId}`);
 }
 
-function encryptHostedPending(
-	userId: string,
-	stateHash: string,
-	value: string,
-	mode: OAuthMode = 'hosted'
-): string {
+function pendingAad(userId: string, stateHash: string, mode: OAuthMode): Buffer {
+	return Buffer.from(`flavorithm:chatgpt:${mode}-pending:${userId}:${stateHash}`);
+}
+
+function encryptEnvelope(mode: OAuthMode, associatedData: Buffer, value: string): string {
 	const iv = randomBytes(12);
 	const cipher = createCipheriv('aes-256-gcm', keyFor(mode), iv);
-	cipher.setAAD(Buffer.from(`flavorithm:chatgpt:${mode}-pending:${userId}:${stateHash}`));
+	cipher.setAAD(associatedData);
 	const ciphertext = Buffer.concat([cipher.update(value, 'utf8'), cipher.final()]);
 	return JSON.stringify({
 		iv: iv.toString('base64url'),
@@ -146,26 +162,77 @@ function encryptHostedPending(
 	});
 }
 
+export function decipherOAuthEnvelope(
+	envelope: { iv: string; tag: string; data: string },
+	key: Buffer,
+	associatedData: Buffer
+): string {
+	if (
+		typeof envelope.iv !== 'string' ||
+		!envelope.iv ||
+		typeof envelope.tag !== 'string' ||
+		!envelope.tag ||
+		typeof envelope.data !== 'string' ||
+		!envelope.data
+	) {
+		throw new Error('OAuth envelope is invalid.');
+	}
+	const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(envelope.iv, 'base64url'));
+	decipher.setAAD(associatedData);
+	decipher.setAuthTag(Buffer.from(envelope.tag, 'base64url'));
+	return Buffer.concat([
+		decipher.update(Buffer.from(envelope.data, 'base64url')),
+		decipher.final()
+	]).toString('utf8');
+}
+
+function decryptEnvelope(
+	mode: OAuthMode,
+	associatedData: Buffer,
+	envelope: string,
+	unavailableMessage: string
+): string {
+	const parsed = JSON.parse(envelope) as { iv?: unknown; tag?: unknown; data?: unknown } | null;
+	if (
+		!parsed ||
+		typeof parsed !== 'object' ||
+		typeof parsed.iv !== 'string' ||
+		!parsed.iv ||
+		typeof parsed.tag !== 'string' ||
+		!parsed.tag ||
+		typeof parsed.data !== 'string' ||
+		!parsed.data
+	) {
+		throw new Error(unavailableMessage);
+	}
+	return decipherOAuthEnvelope(
+		{ iv: parsed.iv, tag: parsed.tag, data: parsed.data },
+		keyFor(mode),
+		associatedData
+	);
+}
+
+function encryptHostedPending(
+	userId: string,
+	stateHash: string,
+	value: string,
+	mode: OAuthMode = 'hosted'
+): string {
+	return encryptEnvelope(mode, pendingAad(userId, stateHash, mode), value);
+}
+
 function decryptHostedPending(
 	userId: string,
 	stateHash: string,
 	envelope: string,
 	mode: OAuthMode = 'hosted'
 ): string {
-	const parsed = JSON.parse(envelope) as { iv?: string; tag?: string; data?: string };
-	if (!parsed.iv || !parsed.tag || !parsed.data)
-		throw new Error('OAuth transaction is unavailable.');
-	const decipher = createDecipheriv(
-		'aes-256-gcm',
-		keyFor(mode),
-		Buffer.from(parsed.iv, 'base64url')
+	return decryptEnvelope(
+		mode,
+		pendingAad(userId, stateHash, mode),
+		envelope,
+		'OAuth transaction is unavailable.'
 	);
-	decipher.setAAD(Buffer.from(`flavorithm:chatgpt:${mode}-pending:${userId}:${stateHash}`));
-	decipher.setAuthTag(Buffer.from(parsed.tag, 'base64url'));
-	return Buffer.concat([
-		decipher.update(Buffer.from(parsed.data, 'base64url')),
-		decipher.final()
-	]).toString('utf8');
 }
 
 export function storeHostedOAuthTransaction(input: {
@@ -203,18 +270,6 @@ export function consumeHostedOAuthTransaction(
 	};
 }
 
-export function storeChatGPTPairing(
-	userId: string,
-	id: string,
-	payload: string,
-	expiresAt: number
-) {
-	db.prepare('DELETE FROM chatgpt_oauth_pairings WHERE expires_at <= ?').run(Date.now());
-	db.prepare(
-		'INSERT INTO chatgpt_oauth_pairings(id, user_id, expires_at, envelope) VALUES (?, ?, ?, ?)'
-	).run(id, userId, expiresAt, encryptHostedPending(userId, id, payload, 'local'));
-}
-
 export function consumeChatGPTPairing(userId: string, id: string): string | null {
 	const row = db
 		.prepare(
@@ -231,18 +286,7 @@ export function encryptChatGPTCredentials(
 	mode: OAuthMode,
 	credentials: ChatGPTCredentials
 ): string {
-	const iv = randomBytes(12);
-	const cipher = createCipheriv('aes-256-gcm', keyFor(mode), iv);
-	cipher.setAAD(aad(userId, accountId, mode));
-	const ciphertext = Buffer.concat([
-		cipher.update(JSON.stringify(credentials), 'utf8'),
-		cipher.final()
-	]);
-	return JSON.stringify({
-		iv: iv.toString('base64url'),
-		tag: cipher.getAuthTag().toString('base64url'),
-		data: ciphertext.toString('base64url')
-	});
+	return encryptEnvelope(mode, aad(userId, accountId, mode), JSON.stringify(credentials));
 }
 
 export function decryptChatGPTCredentials(
@@ -251,20 +295,12 @@ export function decryptChatGPTCredentials(
 	mode: OAuthMode,
 	envelope: string
 ): ChatGPTCredentials {
-	const parsed = JSON.parse(envelope) as { iv?: string; tag?: string; data?: string };
-	if (!parsed.iv || !parsed.tag || !parsed.data)
-		throw new Error('OAuth credentials are unavailable.');
-	const decipher = createDecipheriv(
-		'aes-256-gcm',
-		keyFor(mode),
-		Buffer.from(parsed.iv, 'base64url')
+	const plaintext = decryptEnvelope(
+		mode,
+		aad(userId, accountId, mode),
+		envelope,
+		'OAuth credentials are unavailable.'
 	);
-	decipher.setAAD(aad(userId, accountId, mode));
-	decipher.setAuthTag(Buffer.from(parsed.tag, 'base64url'));
-	const plaintext = Buffer.concat([
-		decipher.update(Buffer.from(parsed.data, 'base64url')),
-		decipher.final()
-	]).toString('utf8');
 	const credentials = JSON.parse(plaintext) as Partial<ChatGPTCredentials>;
 	if (
 		typeof credentials.accessToken !== 'string' ||
@@ -538,7 +574,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS codex_device_attempts (
  expires_at INTEGER NOT NULL, next_poll INTEGER NOT NULL, envelope TEXT NOT NULL,
  lease_token TEXT, lease_until INTEGER NOT NULL DEFAULT 0,
  exchanging INTEGER NOT NULL DEFAULT 0
-)`);
+);
+CREATE INDEX IF NOT EXISTS codex_device_attempts_user_idx ON codex_device_attempts(user_id);
+CREATE INDEX IF NOT EXISTS codex_device_attempts_expiry_idx ON codex_device_attempts(expires_at);`);
 export function storeCodexDeviceAttempt(input: {
 	id: string;
 	userId: string;

@@ -1,4 +1,4 @@
-FROM node:24-bookworm-slim AS dependencies
+FROM node:26-bookworm-slim AS dependencies
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
@@ -7,12 +7,12 @@ FROM dependencies AS build
 COPY . .
 RUN npm run build
 
-FROM node:24-bookworm-slim AS production-dependencies
+FROM node:26-bookworm-slim AS production-dependencies
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:26-bookworm-slim AS runtime
 ENV NODE_ENV=production \
 	HOST=0.0.0.0 \
 	PORT=3000
@@ -25,6 +25,7 @@ COPY --from=production-dependencies --chown=node:node /app/node_modules ./node_m
 COPY --from=production-dependencies --chown=node:node /app/package.json ./package.json
 COPY --from=build --chown=node:node /app/build ./build
 COPY --chown=node:node server.mjs ./server.mjs
+COPY --chown=node:node scripts/readiness.mjs ./scripts/readiness.mjs
 RUN mkdir -p /app/data && chown node:node /app/data
 
 USER node

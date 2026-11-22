@@ -1,4 +1,3 @@
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
 import {
@@ -20,14 +19,18 @@ const actionSchema = z.discriminatedUnion('action', [
 	z.object({ action: z.literal('createInvite') }),
 	z.object({ action: z.literal('revokeInvite'), inviteId: z.string().min(32).max(128) }),
 	z.object({ action: z.literal('removeMember'), memberId: z.string().min(1).max(100) }),
-	z.object({ action: z.literal('join'), code: z.string().min(8).max(100) }),
+	z.object({
+		action: z.literal('join'),
+		code: z.string().min(8).max(100),
+		confirmReplace: z.boolean().optional()
+	}),
 	z.object({ action: z.literal('leave') })
 ]);
 
 export const GET: RequestHandler = async ({ locals }) => {
-	if (!locals.user) return json({ error: 'Authentication required' }, { status: 401 });
+	if (!locals.user) return Response.json({ error: 'Authentication required' }, { status: 401 });
 	const members = listHouseholdMembers(locals.user);
-	return json({
+	return Response.json({
 		members,
 		invites: listHouseholdInvites(locals.user),
 		canManage: members.some((member) => member.id === locals.user?.id && member.role === 'owner')
@@ -42,18 +45,20 @@ export const POST: RequestHandler = async (event) => {
 		const parsed = actionSchema.safeParse(await readJson(event.request));
 		if (!parsed.success) throw new ApiError(400, 'Please provide a valid household action');
 		if (parsed.data.action === 'createInvite')
-			return json(createHouseholdInvite(event.locals.user));
+			return Response.json(createHouseholdInvite(event.locals.user));
 		if (parsed.data.action === 'revokeInvite') {
 			revokeHouseholdInvite(event.locals.user, parsed.data.inviteId);
 		} else if (parsed.data.action === 'removeMember') {
 			removeHouseholdMember(event.locals.user, parsed.data.memberId);
 		} else if (parsed.data.action === 'join') {
-			event.locals.user = joinHousehold(event.locals.user, parsed.data.code);
+			event.locals.user = joinHousehold(event.locals.user, parsed.data.code, {
+				confirmReplace: parsed.data.confirmReplace
+			});
 		} else {
 			event.locals.user = leaveHousehold(event.locals.user);
 		}
 		const members = listHouseholdMembers(event.locals.user);
-		return json({
+		return Response.json({
 			members,
 			invites: listHouseholdInvites(event.locals.user),
 			canManage: members.some(
