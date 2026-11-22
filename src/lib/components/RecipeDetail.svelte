@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
@@ -69,12 +70,7 @@
 			servingCount = initialServings ?? recipe.servings;
 		}
 	});
-	let validServings = $derived(
-		typeof servingCount === 'number' &&
-			Number.isInteger(servingCount) &&
-			servingCount >= 1 &&
-			servingCount <= 24
-	);
+	let validServings = $derived(isValidServings(servingCount));
 </script>
 
 <div class="modal-backdrop" transition:backdropMotion|global>
@@ -139,7 +135,7 @@
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
 			{#if !validServings}<p class="field-help" id="servings-help">
-					Enter 1–24 servings to plan or shop.
+					Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.
 				</p>{/if}
 			<div class="tabs">
 				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
@@ -156,7 +152,7 @@
 									aria-label="Servings"
 									type="number"
 									min="1"
-									max="24"
+									max={MAX_SERVINGS}
 									step="1"
 									aria-invalid={!validServings}
 									bind:value={servingCount}
@@ -290,6 +286,9 @@
 		min-height: 44px;
 		padding-inline: 12px;
 		white-space: nowrap;
+	}
+	.servings input {
+		width: 76px;
 	}
 	.nutrition-stale {
 		padding: 10px 12px;
