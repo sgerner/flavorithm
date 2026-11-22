@@ -12,6 +12,8 @@
 		retry,
 		resolve,
 		exportPending,
+		sessionExpired = false,
+		signIn,
 		error = ''
 	}: {
 		kitchen: AppState;
@@ -22,6 +24,8 @@
 		retry: () => void;
 		resolve: (choice: 'local' | 'remote') => void;
 		exportPending: () => void;
+		sessionExpired?: boolean;
+		signIn?: () => void;
 		error?: string;
 	} = $props();
 	let review = $state(false);
@@ -100,13 +104,22 @@
 	}
 </script>
 
-{#if online && !pending && !syncing && !conflicts.length && !error}
+{#if online && !sessionExpired && !pending && !syncing && !conflicts.length && !error}
 	<p class="muted" role="status">Kitchen saved</p>
 {:else}
 	<section class="sync-notice" aria-label="Kitchen synchronization" in:revealMotion|global>
 		<div role="status">
 			{#if !online}<CloudOff size={18} /><span
-					>Offline{pending && !error ? ' · Changes pending on this device' : ''}</span
+					>Offline{pending && !error
+						? ' · Changes pending on this device'
+						: sessionExpired
+							? ' · Session expired'
+							: ''}</span
+				>
+			{:else if sessionExpired}<span
+					>{pending
+						? 'Session expired. Your changes are saved on this device — sign in to sync.'
+						: 'Session expired. Sign in again to sync your kitchen.'}</span
 				>
 			{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
 			{:else if syncing}<RefreshCw size={18} /><span>Syncing your kitchen…</span>
@@ -116,8 +129,15 @@
 						: 'Changes pending on this device. Waiting to sync.'}</span
 				>{/if}
 		</div>
-		{#if error}<p class="error" role="alert">{error}</p>{/if}
-		{#if conflicts.length}
+		{#if error && (!sessionExpired || error !== 'Authentication required')}<p
+				class="error"
+				role="alert"
+			>
+				{error}
+			</p>{/if}
+		{#if sessionExpired && signIn}
+			<button class="primary" onclick={signIn}>Sign in</button>
+		{:else if conflicts.length}
 			<button class="secondary" onclick={() => (review = !review)}
 				>{review ? 'Hide changes' : 'Review changes'}</button
 			>

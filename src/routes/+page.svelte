@@ -46,7 +46,7 @@
 		RefreshCw
 	} from '@lucide/svelte';
 	import type { AppState, Meal, Recipe, User } from '#lib/types.ts';
-	import { createInitialState, createNewUserState } from '#lib/data.ts';
+	import { createInitialState, createNewUserState, themes } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
 		completeMeal,
@@ -66,7 +66,15 @@
 	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
-	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
+	import {
+		clearAccountStorage,
+		quarantineLegacyKitchen,
+		readCachedAccount,
+		resolveLocalAuthTransition,
+		resolveRegistrationGuestSeed,
+		restoreExpiredSessionAccount,
+		teardownToGuestKitchen
+	} from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
@@ -84,6 +92,8 @@
 	let managedAuth = $derived(installationAuthMode !== 'local');
 	let authMetadataLoaded = $state(false);
 	let guestPersistenceReady = $state(false);
+	let sessionExpired = $state(false);
+	let sessionExpiryNotified = false;
 	let runtimeLoginUrl = $state<string | null>(null);
 	let runtimeLogoutUrl = $state<string | null>(null);
 	let providerLoginUrl = $derived(authMetadataLoaded ? runtimeLoginUrl : data.loginUrl);
@@ -161,6 +171,11 @@
 			notify('Sign-in is unavailable because authentication is misconfigured.');
 			return;
 		}
+		if (sessionExpired) {
+			authMode = 'login';
+			if (user?.email) email = user.email;
+		}
+		error = '';
 		modal = 'auth';
 	}
 	function clearManagedIdentity() {
@@ -237,6 +252,7 @@
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
 		const owner = voiceOwner;
+		const expired = sessionExpired;
 		if (typeof window === 'undefined') return;
 		voiceCapture?.cancel();
 		voiceStarting = false;
@@ -258,12 +274,15 @@
 							: '';
 				}
 			} catch {}
-			fetch('/api/voice')
-				.then((r) => (r.ok ? r.json() : null))
-				.then((data) => {
-					if (user?.id === owner) localVoiceAvailable = Boolean(data?.localAvailable);
-				})
-				.catch(() => {});
+			if (!expired) {
+				fetch('/api/voice')
+					.then((r) => (r.ok ? r.json() : null))
+					.then((data) => {
+						if (user?.id === owner && !sessionExpired)
+							localVoiceAvailable = Boolean(data?.localAvailable);
+					})
+					.catch(() => {});
+			}
 		}
 		return () => voiceCapture?.cancel();
 	});
@@ -346,45 +365,104 @@
 	let showStarter = $state(true);
 	let imageInput: HTMLInputElement;
 	let deferredInstall = $state<any>(null);
+	const SESSION_EXPIRED_MESSAGE =
+		'Your session expired. Sign in again to sync edits saved on this device.';
+	function markSessionExpired(announce = false) {
+		if (managedAuth || !user) return;
+		clearTimeout(saveTimer);
+		clearInterval(connectionPoll);
+		connectionPopup?.close();
+		connectionBusy = false;
+		chatGPTAuthorizationUrl = '';
+		chatGPTDevice = null;
+		voiceCapture?.cancel();
+		voiceStarting = false;
+		sessionExpired = true;
+		if (announce && !sessionExpiryNotified) {
+			sessionExpiryNotified = true;
+			notify(SESSION_EXPIRED_MESSAGE);
+		}
+	}
+	function announceSessionExpired() {
+		if (!sessionExpired || sessionExpiryNotified) return;
+		sessionExpiryNotified = true;
+		notify(SESSION_EXPIRED_MESSAGE);
+	}
+	function clearSessionExpired() {
+		sessionExpired = false;
+		sessionExpiryNotified = false;
+	}
+	function restoreGuestSession(options: { preserveLastAccount?: boolean } = {}) {
+		clearTimeout(saveTimer);
+		const guest = teardownToGuestKitchen({
+			storage: localStorage,
+			preserveLastAccount: options.preserveLastAccount,
+			clearAIConnectionState,
+			clearSyncContext: () => kitchenSync?.clearContext()
+		});
+		clearSessionExpired();
+		user = null;
+		stateEtag = null;
+		inviteCode = '';
+		currentInviteId = '';
+		joinCode = '';
+		members = [];
+		householdInvites = [];
+		canManageHousehold = false;
+		memberToRemove = null;
+		importSession = emptyImportSession();
+		resumeImport = false;
+		selected = null;
+		editingRecipe = null;
+		recipeToDelete = null;
+		selectedMealServings = undefined;
+		kitchen = guest.kitchen;
+		showStarter = guest.showStarter;
+		kitchenLoaded = true;
+	}
 	async function refreshAuth() {
 		const data = await request('/api/auth');
 		const previousMode = installationAuthMode;
 		const previousUser = user;
 		updateAuthMetadata(data);
-		const modeChanged = previousMode !== installationAuthMode;
-		const changedIdentity = Boolean(
-			(previousUser &&
-				(previousUser.id !== data.user?.id ||
-					previousUser.householdId !== data.user?.householdId)) ||
-			(modeChanged && managedAuth && data.user)
-		);
-		if (modeChanged && managedAuth) clearManagedIdentity();
-		if (changedIdentity) {
-			kitchenSync?.clearContext();
-			clearAIConnectionState();
-		}
-		user = data.user ?? null;
-		if (managedAuth && !user) {
-			clearManagedIdentity();
-			renewManagedSession({ status: 401 });
-		}
-		if (changedIdentity) {
-			if (user) {
-				const latest = await request('/api/state');
-				adoptKitchen(latest.state || createNewUserState());
-				kitchenLoaded = true;
-			} else if (managedAuth) {
-				clearManagedIdentity();
-			} else {
-				kitchen = createInitialState();
-				localStorage.removeItem('flavorithm-last-account');
-				kitchenLoaded = true;
-			}
-		}
+		const transition = resolveLocalAuthTransition({
+			previousMode,
+			nextMode: installationAuthMode,
+			previousUser,
+			nextUser: (data.user as User | null | undefined) ?? null
+		});
 		capabilities = {
 			emailDelivery: Boolean(data.capabilities?.emailDelivery),
 			recipeSearch: Boolean(data.capabilities?.recipeSearch)
 		};
+		if (transition.modeChanged && managedAuth) clearManagedIdentity();
+		if (transition.localSessionExpired) {
+			markSessionExpired();
+			return data;
+		}
+		if (transition.changedIdentity) {
+			kitchenSync?.clearContext();
+			clearAIConnectionState();
+		}
+		user = data.user ?? null;
+		if (user) clearSessionExpired();
+		if (managedAuth && !user) {
+			clearManagedIdentity();
+			renewManagedSession({ status: 401 });
+			return data;
+		}
+		if (transition.changedIdentity) {
+			if (user) {
+				const latest = await request('/api/state');
+				adoptKitchen(latest.state || createNewUserState());
+				showStarter = false;
+				kitchenLoaded = true;
+			} else if (managedAuth) {
+				clearManagedIdentity();
+			} else {
+				restoreGuestSession();
+			}
+		}
 		return data;
 	}
 	const nav = [
@@ -393,32 +471,6 @@
 		{ id: 'planner', name: 'Meal planner', icon: CalendarDays },
 		{ id: 'shopping', name: 'Shopping list', icon: ShoppingBasket },
 		{ id: 'saved', name: 'Recipe collection', icon: Heart }
-	];
-	const themes = [
-		'catppuccin',
-		'cerberus',
-		'concord',
-		'crimson',
-		'dracula',
-		'fennec',
-		'hamlindigo',
-		'legacy',
-		'mint',
-		'modern',
-		'mona',
-		'nosh',
-		'nouveau',
-		'pine',
-		'reign',
-		'rocket',
-		'rose',
-		'rosepine',
-		'sahara',
-		'seafoam',
-		'terminus',
-		'vintage',
-		'vox',
-		'wintry'
 	];
 	let recipes = $derived.by(() => {
 		const matches = kitchen.recipes.filter(
@@ -542,6 +594,13 @@
 			if (response.status === 401 && managedAuth) {
 				clearManagedIdentity();
 				renewManagedSession({ status: 401 });
+			} else if (
+				response.status === 401 &&
+				!managedAuth &&
+				user &&
+				(url !== '/api/auth' || data?.error === 'Authentication required')
+			) {
+				markSessionExpired(true);
 			}
 			if (response.status === 412 || response.status === 428) {
 				clearTimeout(saveTimer);
@@ -570,7 +629,7 @@
 		document.documentElement.dataset.theme = kitchen.preferences.theme;
 		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
 		if (managedAuth && (!user || !kitchenLoaded)) return;
-		if (!managedAuth && !user && guestPersistenceReady) {
+		if (!managedAuth && !user && !sessionExpired && guestPersistenceReady) {
 			try {
 				localStorage.setItem('flavorithm-guest-kitchen', snapshot);
 			} catch {
@@ -579,7 +638,7 @@
 		}
 		if (user) kitchenSync?.stage(JSON.parse(snapshot));
 		clearTimeout(saveTimer);
-		if (user && !syncing && online)
+		if (user && !sessionExpired && !syncing && online)
 			saveTimer = setTimeout(() => {
 				void retrySync();
 			}, 500);
@@ -604,10 +663,19 @@
 				get: async () => {
 					const response = await fetch('/api/state');
 					const data = await response.json();
-					if (!response.ok)
+					if (!response.ok) {
+						if (response.status === 401) {
+							if (managedAuth) {
+								clearManagedIdentity();
+								renewManagedSession({ status: 401 });
+							} else if (user) {
+								markSessionExpired(true);
+							}
+						}
 						throw Object.assign(new Error(data.error || 'Could not load your kitchen.'), {
 							status: response.status
 						});
+					}
 					return {
 						state: data.state || createNewUserState(),
 						etag: response.headers.get('etag') || '',
@@ -629,10 +697,19 @@
 						})
 					});
 					const data = await response.json();
-					if (!response.ok)
+					if (!response.ok) {
+						if (response.status === 401) {
+							if (managedAuth) {
+								clearManagedIdentity();
+								renewManagedSession({ status: 401 });
+							} else if (user) {
+								markSessionExpired(true);
+							}
+						}
 						throw Object.assign(new Error(data.error || 'Could not sync your kitchen.'), {
 							status: response.status
 						});
+					}
 					return { state: data.state, etag: response.headers.get('etag') || '' };
 				}
 			})
@@ -643,17 +720,7 @@
 			kitchen = createInitialState();
 			showStarter = false;
 		} else {
-			try {
-				// The legacy key could contain a signed-in household. Preserve it separately without loading it.
-				quarantineLegacyKitchen(localStorage);
-				const local = localStorage.getItem('flavorithm-guest-kitchen');
-				if (local) {
-					kitchen = JSON.parse(local);
-					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
-				}
-			} catch {}
-			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
-			kitchenLoaded = true;
+			restoreGuestSession({ preserveLastAccount: true });
 		}
 		ready = true;
 		const pageUrl = new URL(window.location.href);
@@ -688,25 +755,32 @@
 					recipeSearch: Boolean(data.capabilities?.recipeSearch)
 				};
 				syncing = true;
-				user = data.user ?? null;
-				if (!user) {
-					kitchenSync?.clearContext();
-					localStorage.removeItem('flavorithm-last-account');
-					if (managedAuth) {
-						clearManagedIdentity();
-						renewManagedSession({ status: 401 });
-					}
-				}
 				if (data.user) {
+					clearSessionExpired();
+					user = data.user;
 					const saved = await request('/api/state');
 					adoptKitchen(saved.state || createNewUserState());
 					kitchenLoaded = true;
+					showStarter = false;
+				} else if (managedAuth) {
+					user = null;
+					clearManagedIdentity();
+					renewManagedSession({ status: 401 });
+				} else {
+					const expiredUser = restoreExpiredSessionAccount(localStorage);
+					if (expiredUser) {
+						user = expiredUser;
+						markSessionExpired(true);
+						kitchenSync?.restore(expiredUser);
+						showStarter = false;
+						kitchenLoaded = true;
+					} else {
+						restoreGuestSession();
+					}
 				}
-				user = data.user ?? null;
-				if (user) showStarter = false;
 				syncing = false;
 				if (user && returnFromChatGPT) await openSettings();
-				if (user)
+				if (user && !sessionExpired)
 					await refreshConnections().catch(() =>
 						notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 					);
@@ -732,13 +806,16 @@
 					clearManagedIdentity();
 					renewManagedSession(error);
 				} else {
-					try {
-						const cached = JSON.parse(localStorage.getItem('flavorithm-last-account') || 'null');
-						if (cached?.id && cached?.householdId) {
-							user = cached;
-							kitchenSync?.restore(cached);
+					const cached = readCachedAccount(localStorage);
+					if (cached) {
+						user = cached;
+						if (kitchenSync?.restore(cached)) {
+							showStarter = false;
+							kitchenLoaded = true;
+						} else {
+							restoreGuestSession({ preserveLastAccount: true });
 						}
-					} catch {}
+					}
 				}
 				syncing = false;
 				notify(
@@ -786,7 +863,7 @@
 		} else kitchen = state;
 	}
 	async function retrySync(prefer?: 'local' | 'remote') {
-		if (!online || !user || !kitchenSync) return;
+		if (!online || !user || sessionExpired || !kitchenSync) return;
 		try {
 			await kitchenSync.sync(prefer);
 		} catch (e) {
@@ -801,12 +878,16 @@
 		try {
 			const previous = user;
 			await refreshAuth();
+			if (sessionExpired) {
+				announceSessionExpired();
+				return;
+			}
 			if (!user) {
 				kitchenSync?.clearContext();
 				if (managedAuth) {
 					clearManagedIdentity();
 					renewManagedSession({ status: 401 });
-				} else notify('Sign in again to sync the edits saved on this device.');
+				}
 				return;
 			}
 			if (previous?.id !== user.id || previous?.householdId !== user.householdId)
@@ -899,25 +980,48 @@
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
+			const previousUser = user;
+			const wasSessionExpired = sessionExpired;
+			if (previousUser && wasSessionExpired) {
+				kitchenSync?.stage(JSON.parse(JSON.stringify(kitchen)));
+			}
 			const guestKitchen =
-				authMode === 'register' ? (JSON.parse(JSON.stringify(kitchen)) as AppState) : null;
+				authMode === 'register'
+					? resolveRegistrationGuestSeed(
+							localStorage,
+							JSON.parse(JSON.stringify(kitchen)) as AppState,
+							{ sessionExpired: wasSessionExpired, user: previousUser }
+						)
+					: null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
+			const switchedIdentity = Boolean(
+				previousUser &&
+				(previousUser.id !== result.user?.id ||
+					previousUser.householdId !== result.user?.householdId)
+			);
+			if (switchedIdentity) {
+				kitchenSync?.clearContext();
+				clearAIConnectionState();
+			}
+			clearSessionExpired();
 			user = result.user;
 			const saved = await request('/api/state');
 			if (guestKitchen) {
 				adoptKitchen(saved.state || createNewUserState());
 				kitchen = guestKitchen;
 				kitchenSync?.stage(guestKitchen);
-				await kitchenSync?.sync();
-			} else if (saved.state) adoptKitchen(saved.state);
-			else {
-				kitchen = guestKitchen ?? createNewUserState();
-				await request('/api/state', { state: kitchen }, 'PUT');
-				adoptKitchen(kitchen);
+			} else if (saved.state) {
+				adoptKitchen(saved.state);
+			} else {
+				const initial = createNewUserState();
+				await request('/api/state', { state: initial }, 'PUT');
+				adoptKitchen(initial);
 			}
 			user = result.user;
 			showStarter = false;
+			kitchenLoaded = true;
 			syncing = false;
+			await retrySync();
 			await refreshConnections().catch(() =>
 				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 			);
@@ -952,33 +1056,28 @@
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
-			await flushKitchen();
-			await request('/api/auth', { action: 'logout' });
-			kitchenSync?.clearContext();
-			localStorage.removeItem('flavorithm-last-account');
-			user = null;
-			inviteCode = '';
-			currentInviteId = '';
-			joinCode = '';
-			members = [];
-			householdInvites = [];
-			canManageHousehold = false;
-			importSession = emptyImportSession();
-			resumeImport = false;
-			kitchen = createInitialState();
-			quarantineLegacyKitchen(localStorage);
-			clearAIConnectionState();
-			clearInterval(connectionPoll);
-			connectionBusy = false;
-			chatGPTAuthorizationUrl = '';
-			chatGPTDevice = null;
-			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
-			stateEtag = null;
-			syncing = false;
+			let preservedPending = false;
+			if (sessionExpired) {
+				if (user) {
+					kitchenSync?.stage(JSON.parse(JSON.stringify(kitchen)));
+					preservedPending = Boolean(kitchenSync?.snapshot());
+				}
+				await request('/api/auth', { action: 'logout' }).catch(() => {});
+			} else {
+				await flushKitchen();
+				await request('/api/auth', { action: 'logout' });
+			}
+			restoreGuestSession();
 			modal = '';
-			notify('Signed out. Your household is safely saved.');
+			notify(
+				preservedPending
+					? 'Signed out. Pending edits stay saved on this device for your account.'
+					: 'Signed out. Your household is safely saved.'
+			);
 		} catch (e) {
 			notify((e as Error).message);
+		} finally {
+			syncing = false;
 		}
 	}
 
@@ -998,7 +1097,7 @@
 		chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 	}
 	async function loadModelCatalog() {
-		if (!user) return;
+		if (!user || sessionExpired) return;
 		const version = ++catalogVersion;
 		const owner = user.id;
 		const accountId = kitchen.preferences.chatgptAccountId;
@@ -1026,7 +1125,7 @@
 		catalogLoading = false;
 	}
 	async function refreshConnections() {
-		if (!user) return;
+		if (!user || sessionExpired) return;
 		const owner = user.id;
 		const result = await request('/api/connections/chatgpt');
 		if (user?.id !== owner) return;
@@ -1041,6 +1140,11 @@
 				chatGPT.accounts.find((a) => a.connected && a.planEnabled)?.id || chatGPT.accounts[0]?.id;
 	}
 	async function refreshAISettings() {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to refresh AI settings.');
+			return;
+		}
 		error = '';
 		try {
 			await refreshConnections();
@@ -1058,12 +1162,13 @@
 		} catch {
 			// Keep the last known account state while showing Settings offline.
 		}
+		if (sessionExpired) announceSessionExpired();
 		if (focusAI) {
 			await tick();
 			document.getElementById('ai-connection-heading')?.focus();
 		}
 		try {
-			if (user) {
+			if (user && !sessionExpired) {
 				await refreshConnections();
 				await loadModelCatalog();
 			}
@@ -1088,15 +1193,18 @@
 		accountModels = [];
 		error = '';
 		try {
-			await refreshConnections();
-			await loadModelCatalog();
+			if (user && !sessionExpired) {
+				await refreshConnections();
+				await loadModelCatalog();
+			}
 		} catch (e) {
 			error = (e as Error).message;
 		}
 	}
 	async function connectChatGPT(accountId?: string, reconsent = false) {
-		if (!user) {
+		if (!user || sessionExpired) {
 			openAuthentication();
+			if (sessionExpired) notify('Sign in again to connect ChatGPT.');
 			return;
 		}
 		const attempt = ++connectionAttempt;
@@ -1262,6 +1370,11 @@
 	}
 
 	async function disconnectChatGPT() {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to manage your ChatGPT connection.');
+			return;
+		}
 		if (!activeChatGPTAccount) return;
 		connectionBusy = true;
 		error = '';
@@ -1288,12 +1401,14 @@
 		}
 	}
 	function needAI() {
-		if (!user) {
+		if (!user || sessionExpired) {
 			openAuthentication();
 			notify(
 				managedAuth
 					? 'Sign in through your organization to use your AI connection.'
-					: 'Create an account to use your AI connection.'
+					: sessionExpired
+						? 'Sign in again to use your AI connection.'
+						: 'Create an account to use your AI connection.'
 			);
 			return false;
 		}
@@ -1460,11 +1575,17 @@
 				void logout();
 				break;
 			case 'delete-account':
-				if (!managedAuth) modal = 'delete';
+				if (!user || sessionExpired) {
+					openAuthentication();
+					if (sessionExpired) notify('Sign in again before deleting your account.');
+				} else if (!managedAuth) modal = 'delete';
 				else void openSettings();
 				break;
 			case 'leave-household':
-				modal = 'leave';
+				if (!user || sessionExpired) {
+					openAuthentication();
+					if (sessionExpired) notify('Sign in again to manage your household.');
+				} else modal = 'leave';
 				break;
 			case 'scan':
 				imageInput?.click();
@@ -1541,12 +1662,13 @@
 		if (voiceStarting || voiceState !== 'idle') return;
 		const provider =
 			voiceProvider === 'auto'
-				? localVoiceAvailable && user
+				? localVoiceAvailable && user && !sessionExpired
 					? 'local'
 					: 'browser'
 				: voiceProvider;
-		if (provider !== 'browser' && !user) {
+		if (provider !== 'browser' && (!user || sessionExpired)) {
 			openAuthentication();
+			if (sessionExpired) notify('Sign in again to use server voice transcription.');
 			return;
 		}
 		if ((provider === 'groq' || provider === 'deepgram') && !voiceApiKey.trim()) {
@@ -1825,8 +1947,9 @@
 	}
 	async function household() {
 		mobileNav = false;
-		if (!user) {
+		if (!user || sessionExpired) {
 			openAuthentication();
+			if (sessionExpired) notify('Sign in again to manage your household.');
 			return;
 		}
 		modal = 'household';
@@ -1841,6 +1964,11 @@
 		}
 	}
 	async function invite() {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to manage your household.');
+			return;
+		}
 		if (!canManageHousehold) return;
 		householdBusy = true;
 		error = '';
@@ -1857,6 +1985,11 @@
 		}
 	}
 	async function revokeInvite(inviteId: string) {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to manage your household.');
+			return;
+		}
 		if (!canManageHousehold) return;
 		householdBusy = true;
 		error = '';
@@ -1881,6 +2014,11 @@
 		error = '';
 	}
 	async function confirmRemoveMember() {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to manage your household.');
+			return;
+		}
 		if (!canManageHousehold || !memberToRemove) return;
 		householdBusy = true;
 		error = '';
@@ -1900,6 +2038,11 @@
 		}
 	}
 	async function join() {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to manage your household.');
+			return;
+		}
 		householdBusy = true;
 		try {
 			syncing = true;
@@ -1985,6 +2128,11 @@
 		notify('Recipe saved to your collection.');
 	}
 	async function exportKitchen() {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to export your account and shared kitchen.');
+			return;
+		}
 		try {
 			const data = await request('/api/export');
 			download(JSON.stringify(data, null, 2), 'flavorithm-kitchen.json', 'application/json');
@@ -2003,6 +2151,12 @@
 	async function deleteAccount(event: SubmitEvent) {
 		event.preventDefault();
 		if (managedAuth) return;
+		if (!user || sessionExpired) {
+			deletePassword = '';
+			openAuthentication();
+			notify('Sign in again before deleting your account.');
+			return;
+		}
 		busy = true;
 		error = '';
 		try {
@@ -2010,40 +2164,25 @@
 			clearTimeout(saveTimer);
 			await writeChain;
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
-			if (user) {
-				for (const key of Object.keys(localStorage)) {
-					if (key.startsWith('flavorithm-') && key.includes(`:${user.id}:`))
-						localStorage.removeItem(key);
-				}
-			}
-			kitchenSync?.clearContext();
-			localStorage.removeItem('flavorithm-last-account');
-			user = null;
-			inviteCode = '';
-			currentInviteId = '';
-			joinCode = '';
-			members = [];
-			householdInvites = [];
-			canManageHousehold = false;
-			importSession = emptyImportSession();
-			resumeImport = false;
-			apiKey = '';
+			clearAccountStorage(localStorage, user.id);
 			deletePassword = '';
-			stateEtag = null;
-			kitchen = createInitialState();
-			quarantineLegacyKitchen(localStorage);
-			syncing = false;
+			restoreGuestSession();
 			modal = '';
 			notify('Your account and personal data have been deleted.');
 		} catch (e) {
 			error = (e as Error).message;
-			syncing = false;
 		} finally {
+			syncing = false;
 			busy = false;
 		}
 	}
 	async function sendEmailVerification() {
 		if (!user || user.emailVerified || !capabilities.emailDelivery) return;
+		if (sessionExpired) {
+			openAuthentication();
+			notify('Sign in again to verify your email.');
+			return;
+		}
 		verificationBusy = true;
 		error = '';
 		try {
@@ -2085,6 +2224,11 @@
 		}
 	}
 	async function leaveHousehold() {
+		if (!user || sessionExpired) {
+			openAuthentication();
+			if (sessionExpired) notify('Sign in again to manage your household.');
+			return;
+		}
 		busy = true;
 		householdBusy = true;
 		error = '';
@@ -2129,8 +2273,9 @@
 			error = 'Web recipe search is not configured for this kitchen.';
 			return;
 		}
-		if (!user) {
+		if (!user || sessionExpired) {
 			openAuthentication();
+			if (sessionExpired) notify('Sign in again to search recipes online.');
 			return;
 		}
 		busy = true;
@@ -2234,7 +2379,9 @@
 			><span class="profile-avatar">{user ? user.name.slice(0, 1).toUpperCase() : 'Y'}</span><span
 				><b>{user?.name || (managedAuth ? 'Managed by provider' : 'Sign in')}</b><small
 					>{user
-						? 'Account settings'
+						? sessionExpired
+							? 'Session expired · Sign in'
+							: 'Account settings'
 						: managedAuth
 							? 'Organization access'
 							: 'Save your pantry and recipes'}</small
@@ -2270,10 +2417,12 @@
 			{#if user}<SyncStatus
 					{kitchen}
 					{online}
+					{sessionExpired}
 					pending={pendingSync}
 					syncing={sendingSync}
 					{conflicts}
 					error={syncErrors}
+					signIn={openAuthentication}
 					retry={() => {
 						void reconnectKitchen();
 					}}
@@ -3218,7 +3367,9 @@
 							<p class="muted">
 								{user.email}{managedAuth
 									? ' · Managed by your identity provider'
-									: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
+									: sessionExpired
+										? ' · Session expired'
+										: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
 							</p>
 							{#if !managedAuth}
 								{#if user.emailVerified}<p class="field-help">
@@ -3258,7 +3409,7 @@
 							{accountModels}
 							{chatGPT}
 							activeAccount={activeChatGPTAccount}
-							signedIn={Boolean(user)}
+							signedIn={Boolean(user) && !sessionExpired}
 							{managedAuth}
 							busy={connectionBusy}
 							loading={catalogLoading}
@@ -3289,6 +3440,11 @@
 								>{#if !managedAuth}<button
 										class="text-button danger"
 										onclick={() => {
+											if (sessionExpired) {
+												openAuthentication();
+												notify('Sign in again before deleting your account.');
+												return;
+											}
 											modal = 'delete';
 											error = '';
 										}}>Delete account</button
@@ -3296,7 +3452,10 @@
 							</div>
 						</div>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<div class="dialog-actions">
-						{#if user && (!managedAuth || providerLogoutUrl)}<button
+						{#if user && sessionExpired && !managedAuth}<button
+								class="secondary"
+								onclick={openAuthentication}>Sign in</button
+							>{/if}{#if user && (!managedAuth || providerLogoutUrl)}<button
 								class="text-button"
 								onclick={logout}><LogOut size={16} /> Sign out</button
 							>{:else if user && managedAuth}<span class="field-help"
