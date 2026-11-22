@@ -10,32 +10,26 @@ const seedScriptPath = resolve('scripts/seed-dev.mjs');
 const resetScriptPath = resolve('scripts/reset-password.mjs');
 
 function runReset(args: string[], input?: string) {
-	return spawnSync(process.execPath, ['--experimental-strip-types', resetScriptPath, ...args], {
+	return spawnSync(process.execPath, [resetScriptPath, ...args], {
 		encoding: 'utf8',
 		input
 	});
 }
 
 function runInlineWithDb(databasePath: string, code: string) {
-	return spawnSync(
-		process.execPath,
-		['--experimental-strip-types', '--input-type=module', '-e', code],
-		{
-			encoding: 'utf8',
-			env: { ...process.env, FLAVORITHM_DB_PATH: databasePath }
-		}
-	);
+	return spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+		encoding: 'utf8',
+		env: { ...process.env, FLAVORITHM_DB_PATH: databasePath }
+	});
 }
 
 test('CLI password reset rotates seeded passwords, revokes sessions, and unblocks account deletion', () => {
 	const directory = mkdtempSync(join(tmpdir(), 'flavorithm-reset-cli-'));
 	const databasePath = join(directory, 'dev-reset.sqlite');
 	try {
-		const seeded = spawnSync(
-			process.execPath,
-			['--experimental-strip-types', seedScriptPath, '--db', databasePath],
-			{ encoding: 'utf8' }
-		);
+		const seeded = spawnSync(process.execPath, [seedScriptPath, '--db', databasePath], {
+			encoding: 'utf8'
+		});
 		assert.equal(seeded.status, 0, seeded.stderr);
 		const initialPassword = seeded.stdout.match(/Generated password \(shown once\): ([^\s]+)/)?.[1];
 		assert.ok(initialPassword);
