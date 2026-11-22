@@ -150,22 +150,35 @@ mkdir -p /home/skynet/opt/appdata/flavorithm
 chown 1000:1000 /home/skynet/opt/appdata/flavorithm
 ```
 
-After configuration is ready, build the app and launch the GitHub updater from
-the repository root:
+After configuration is ready, build the app, initialize the updater state, and
+launch the GitHub updater from the repository root:
 
 ```sh
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml build --pull flavorithm
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml up -d flavorithm
 mkdir -p /home/skynet/opt/appdata/flavorithm-updater
 git rev-parse HEAD > /home/skynet/opt/appdata/flavorithm-updater/deployed-sha
+docker inspect --format '{{.Image}}' flavorithm > /home/skynet/opt/appdata/flavorithm-updater/deployed-image
+docker tag flavorithm:local flavorithm:rollback
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml up -d flavorithm-updater
 ```
 
-The updater checks the public `main` branch every 15 minutes, fast-forwards the
-checkout, rebuilds the image, and records a commit only after the health check
-passes. If an update fails its health check, it restores the previous image.
-The updater needs the Docker socket to build and replace the app container, so
-keep its compose file and host checkout writable only by trusted administrators.
+The updater copies itself to `/tmp/flavorithm-update.sh` at startup and checks
+the public `main` branch every 15 minutes without requiring GitHub credentials
+(private forks can optionally set `FLAVORITHM_GITHUB_TOKEN` in `.env`). When a
+new commit differs from `deployed-sha` and `failed-sha`, it queries GitHub's
+Check Runs API and deploys only after the GitHub Actions `CI` `verify`
+check-run completes with `success`. It then fetches and checks out the verified
+commit, validates Compose syntax with `docker compose config --quiet`, rebuilds
+`flavorithm:local`, and updates `deployed-sha`, `deployed-image`, and
+`flavorithm:rollback` only after the health check passes (re-executing its
+`/tmp` copy if `deploy/skynet/update.sh` changed). If Compose validation, image
+build, or the health check fails, it resets `/app` to `deployed-sha` before
+retagging `flavorithm:rollback` to `flavorithm:local`, recreates `flavorithm`,
+verifies recovery health, and records `failed-sha` to skip the broken commit
+(retrying recovery on subsequent polls if rollback fails). The updater needs
+the Docker socket to build and replace the app container, so keep its compose
+file and host checkout writable only by trusted administrators.
 
 ## Acceptance checks
 
