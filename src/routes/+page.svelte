@@ -50,8 +50,10 @@
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
 		completeMeal,
+		deleteShoppingItem,
 		expiryStatus,
 		reconcileShoppingList,
+		restoreShoppingItem,
 		transferPurchasedItemsToPantry
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
@@ -490,10 +492,10 @@
 	}
 	function removeShoppingItem(item: AppState['shopping'][number]) {
 		const removed = structuredClone($state.snapshot(item));
-		kitchen.shopping = kitchen.shopping.filter((entry) => entry.id !== item.id);
+		if (editingShoppingId === removed.id) editingShoppingId = '';
+		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
 		notify(`${item.name} removed.`, () => {
-			if (!kitchen.shopping.some((entry) => entry.id === removed.id))
-				kitchen.shopping.push(removed);
+			kitchen.shopping = restoreShoppingItem(kitchen, removed);
 		});
 	}
 	function removePlannedMeal(meal: Meal) {
@@ -1677,7 +1679,9 @@
 		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
 		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
 		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
-		kitchen.shopping = kitchen.shopping.filter((item) => item.sourceKey !== `recipe:${recipe.id}`);
+		kitchen.shopping = kitchen.shopping.filter(
+			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
+		);
 		if (kitchen.preferences.ratings) {
 			const ratings = { ...kitchen.preferences.ratings };
 			delete ratings[recipe.id];
