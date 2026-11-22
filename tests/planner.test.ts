@@ -18,7 +18,6 @@ import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import { MAX_RECIPES, insertRecipes } from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
-import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
 
@@ -164,7 +163,6 @@ function createModuleMap() {
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
-		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': { insertRecipes },
 		'#lib/recipe-draft.ts': recipeDraftMod,
