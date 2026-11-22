@@ -57,7 +57,7 @@ const recipe = z.object({
 		.max(4000)
 		.refine((value) => !value || isPublicHttpsUrl(value), 'Use a public HTTPS source URL.')
 		.optional(),
-	provenance: z.enum(['web-import', 'ai-generated']).optional(),
+	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
@@ -236,6 +236,9 @@ export function applyButlerCommands(
 			case 'recipe.upsert': {
 				const previous = state.recipes.find((item) => item.id === command.recipe.id);
 				const updated = { ...command.recipe };
+				if (previous?.provenance === 'manual') updated.provenance = 'manual';
+				else if (updated.provenance === undefined && previous?.provenance)
+					updated.provenance = previous.provenance;
 				if (
 					previous &&
 					(previous.servings !== updated.servings ||

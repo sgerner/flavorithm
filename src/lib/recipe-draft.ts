@@ -130,7 +130,8 @@ export function validateRecipeDraft(
 	const optionalFlagsValid =
 		(draft.provenance === undefined ||
 			draft.provenance === 'web-import' ||
-			draft.provenance === 'ai-generated') &&
+			draft.provenance === 'ai-generated' ||
+			draft.provenance === 'manual') &&
 		(draft.hidden === undefined || typeof draft.hidden === 'boolean');
 	const ingredients = Array.isArray(draft.ingredients)
 		? draft.ingredients.map((item) => ({
@@ -213,7 +214,10 @@ export function validateRecipeDraft(
 			...rest,
 			id,
 			title,
+			description: draft.description.trim().slice(0, 10_000),
 			image,
+			cuisine: draft.cuisine.trim().slice(0, 100),
+			difficulty: draft.difficulty.trim().slice(0, 80),
 			tags,
 			ingredients,
 			steps,
