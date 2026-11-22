@@ -362,7 +362,8 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher);
+			: await getPublicModelCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2364,10 +2365,11 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-const publicCatalogCache = new WeakMap<
-	Fetcher,
-	{ promise: Promise<SupportedModelResponse>; expiresAt: number }
->();
+type PublicCatalogCacheEntry = {
+	pending: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
 function resolvePublicCatalogKey(fetcher: Fetcher): Fetcher {
 	const base = (fetcher as TaggedFetcher)[BASE_FETCHER] ?? fetcher;
@@ -2396,16 +2398,21 @@ export async function getSupportedModels(
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
 	const key = resolvePublicCatalogKey(fetcher);
 	const cached = publicCatalogCache.get(key);
-	if (cached && Date.now() < cached.expiresAt) {
-		return cached.promise;
-	}
-	const expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const now = Date.now();
+	if (cached && now < cached.expiresAt) return cached.pending;
+
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		if (publicCatalogCache.get(key)?.promise === pending) {
+		if (publicCatalogCache.get(key)?.pending === pending) {
 			publicCatalogCache.delete(key);
 		}
 		throw error;
 	});
-	publicCatalogCache.set(key, { promise: pending, expiresAt });
+	publicCatalogCache.set(key, { pending, expiresAt });
 	return pending;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 }
