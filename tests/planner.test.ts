@@ -11,6 +11,7 @@ import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
+import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
@@ -163,7 +164,7 @@ function createModuleMap() {
 			revealMotion: () => ({}),
 			fadeMotion: () => ({}),
 			motionDuration: () => 0,
-			prefersReducedMotion: () => false
+			prefersReducedMotion: () => true
 		},
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
@@ -171,9 +172,10 @@ function createModuleMap() {
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/butler.ts': butlerMod,
-		'#lib/voice-capture.ts': voiceCaptureMod,
+		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
+		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
