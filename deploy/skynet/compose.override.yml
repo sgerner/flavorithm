@@ -11,7 +11,7 @@ services:
       - voice
 
   flavorithm-whisper:
-    image: ghcr.io/ggml-org/whisper.cpp@sha256:7a4e5f481192899f6c3853ff181ea6347b219ca2f388e1d84870b84ad80f6b7f
+    image: ghcr.io/ggml-org/whisper.cpp:main@sha256:4a1a2842de36b5a9c605395ee97fd7ffce504cb78a9b005749b34d564c4663fe
     container_name: flavorithm-whisper
     restart: unless-stopped
     entrypoint: ['whisper-server']
@@ -51,7 +51,7 @@ services:
       diun.enable: 'false'
 
   flavorithm-updater:
-    image: docker:cli
+    image: docker:29.10.0-cli@sha256:34507eb5069d8be82c95dd3b6987d4250fd5fee49b82e2509b7d7a7030740d6d
     container_name: flavorithm-updater
     restart: unless-stopped
     working_dir: /app

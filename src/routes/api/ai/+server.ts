@@ -2,7 +2,6 @@ import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 import { ChatGPTOAuthError, withChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { clearChatGPTCredentials } from '#lib/server/oauth-storage.ts';
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
@@ -28,7 +27,7 @@ export const POST: RequestHandler = async (event) => {
 	try {
 		assertSameOrigin(event.request);
 		user = event.locals.user;
-		if (!user) return json({ error: 'Unauthorized.' }, { status: 401 });
+		if (!user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
 		const currentUser = user;
 		consumeRateLimit(`ai-user:${currentUser.id}`, 30, 60 * 60 * 1000);
 
@@ -68,7 +67,7 @@ export const POST: RequestHandler = async (event) => {
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
 			if (!usingHostAI && accountId === HOST_CONNECTION_ID) {
 				usingHostAI = true;
-				return json(
+				return Response.json(
 					{ error: HOST_UNAVAILABLE_MESSAGE, code: 'host_ai_unavailable' },
 					{ status: 503, headers: { 'cache-control': 'no-store' } }
 				);
@@ -87,13 +86,16 @@ export const POST: RequestHandler = async (event) => {
 						event.request.signal
 					)
 			);
-			return json(result, {
+			return Response.json(result, {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return json(await runAIRequest(body, event.fetch, undefined, undefined, event.request.signal), {
-			headers: { 'cache-control': 'no-store' }
-		});
+		return Response.json(
+			await runAIRequest(body, event.fetch, undefined, undefined, event.request.signal),
+			{
+				headers: { 'cache-control': 'no-store' }
+			}
+		);
 	} catch (error) {
 		if (
 			error instanceof ChatGPTOAuthError ||
@@ -107,7 +109,7 @@ export const POST: RequestHandler = async (event) => {
 				(error.status === 401 || (code !== undefined && HOST_UNRECOVERABLE_CODES.has(code)))
 			) {
 				if (hostTarget) clearChatGPTCredentials(hostTarget.userId, hostTarget.accountId);
-				return json(
+				return Response.json(
 					{ error: HOST_UNAVAILABLE_MESSAGE, code: 'host_ai_unavailable' },
 					{ status: 503, headers: { 'cache-control': 'no-store' } }
 				);
@@ -116,14 +118,17 @@ export const POST: RequestHandler = async (event) => {
 				if (user && personalAccountId && code === 'subscription_sharing_invalid_user') {
 					clearChatGPTCredentials(user.id, personalAccountId);
 				}
-				return json(
+				return Response.json(
 					{ error: error.message, code: 'chatgpt_reauth_required' },
 					{ status: 422, headers: { 'cache-control': 'no-store' } }
 				);
 			}
-			return json({ error: error.message, ...(code ? { code } : {}) }, { status: error.status });
+			return Response.json(
+				{ error: error.message, ...(code ? { code } : {}) },
+				{ status: error.status }
+			);
 		}
-		return json({ error: 'The AI request could not be completed.' }, { status: 500 });
+		return Response.json({ error: 'The AI request could not be completed.' }, { status: 500 });
 	}
 };
 

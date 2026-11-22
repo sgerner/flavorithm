@@ -3,7 +3,6 @@ import { ChatGPTOAuthError, withChatGPTConnection } from '#lib/server/chatgpt-oa
 import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { clearChatGPTCredentials } from '#lib/server/oauth-storage.ts';
 import { ApiError } from '#lib/server/db.ts';
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { AIRequestError, getSupportedModels } from '#lib/server/ai.ts';
 
@@ -34,7 +33,7 @@ function publicCatalog(fetcher: typeof fetch) {
 }
 
 export const GET: RequestHandler = async ({ locals, fetch, url }) => {
-	if (!locals.user) return json({ error: 'Unauthorized.' }, { status: 401 });
+	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
 	const currentUser = locals.user;
 	let usingHostAI = false;
 	let hostTarget: { userId: string; accountId: string } | null = null;
@@ -48,7 +47,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 				usingHostAI = true;
 				const host = getHostAI();
 				if (!host) {
-					return json(
+					return Response.json(
 						{ error: HOST_UNAVAILABLE_MESSAGE, code: 'host_ai_unavailable' },
 						{ status: 503, headers: { 'cache-control': 'no-store' } }
 					);
@@ -74,11 +73,11 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 			} catch {
 				/* An unavailable public catalog must not hide entitled account models. */
 			}
-			return json(result, {
+			return Response.json(result, {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return json(await publicCatalog(fetch), {
+		return Response.json(await publicCatalog(fetch), {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {
@@ -94,7 +93,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 				(error.status === 401 || (code !== undefined && HOST_UNRECOVERABLE_CODES.has(code)))
 			) {
 				if (hostTarget) clearChatGPTCredentials(hostTarget.userId, hostTarget.accountId);
-				return json(
+				return Response.json(
 					{ error: HOST_UNAVAILABLE_MESSAGE, code: 'host_ai_unavailable' },
 					{ status: 503, headers: { 'cache-control': 'no-store' } }
 				);
@@ -103,13 +102,16 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 				if (personalAccountId && code === 'subscription_sharing_invalid_user') {
 					clearChatGPTCredentials(currentUser.id, personalAccountId);
 				}
-				return json(
+				return Response.json(
 					{ error: error.message, code: 'chatgpt_reauth_required' },
 					{ status: 422, headers: { 'cache-control': 'no-store' } }
 				);
 			}
-			return json({ error: error.message, ...(code ? { code } : {}) }, { status: error.status });
+			return Response.json(
+				{ error: error.message, ...(code ? { code } : {}) },
+				{ status: error.status }
+			);
 		}
-		return json({ error: 'The model catalog could not be loaded.' }, { status: 500 });
+		return Response.json({ error: 'The model catalog could not be loaded.' }, { status: 500 });
 	}
 };
