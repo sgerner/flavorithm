@@ -238,7 +238,7 @@ export function completePlanMeal(
 			modal: '';
 			page: 'planner';
 	  } {
-	if (!plannedRecipe || !mealDate) {
+	if (!plannedRecipe || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) {
 		return { ok: false, reason: 'missing' };
 	}
 	if (!isValidServings(plannedServings)) {

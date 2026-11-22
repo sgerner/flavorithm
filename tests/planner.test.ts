@@ -55,6 +55,11 @@ function injectPlannerHook(svelteSource: string): string {
 		get week() { return week; },
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
+		get modal() { return modal; },
+		get selected() { return selected; },
+		set selected(value: Recipe | null) { selected = value; },
+		get plannedRecipe() { return plannedRecipe; },
+		get deductPantry() { return deductPantry; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
 		get recipesById() { return recipesById; },
@@ -65,6 +70,12 @@ function injectPlannerHook(svelteSource: string): string {
 		dateKey,
 		mealSlotKey,
 		formatCompletedDate,
+		openRecipePicker,
+		choosePickedRecipe,
+		planRecipe,
+		addMeal,
+		closeDialog,
+		openCookDialog,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
 		saveMealChanges,
@@ -112,6 +123,10 @@ type PlannerHarnessApi = {
 	authMetadataLoaded: boolean;
 	readonly week: Date[];
 	weekOffset: number;
+	readonly modal: string;
+	selected: Recipe | null;
+	readonly plannedRecipe: Recipe | null;
+	readonly deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
 	readonly mealsByDateSlot: Map<string, Meal[]>;
@@ -125,6 +140,12 @@ type PlannerHarnessApi = {
 		formatter: Intl.DateTimeFormat,
 		fallback?: string
 	) => string;
+	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
+	choosePickedRecipe: (recipe: Recipe) => void;
+	planRecipe: (recipe: Recipe, servings?: number) => void;
+	addMeal: (event?: SubmitEvent) => void;
+	closeDialog: () => void;
+	openCookDialog: (meal: Meal) => void;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
 	saveMealChanges: () => void;
@@ -752,6 +773,104 @@ test('editing a planned meal updates mealsByDateSlot reactively', () => {
 		const moved = api.mealsByDateSlot.get(api.mealSlotKey(wednesday, 'Dinner'));
 		assert.equal(moved?.length, 1);
 		assert.equal(moved?.[0].servings, 4);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('choosing a recipe for a planner slot keeps valid servings above 24', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-large-pot', 'Large Pot Pasta');
+		recipe.servings = 250;
+		const scheduledDate = '2026-11-23';
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [] };
+
+		api.openRecipePicker({ date: scheduledDate, slot: 'Lunch' });
+		api.choosePickedRecipe(recipe);
+
+		assert.equal(api.kitchen.meals.length, 1);
+		assert.equal(api.kitchen.meals[0].date, scheduledDate);
+		assert.equal(api.kitchen.meals[0].slot, 'Lunch');
+		assert.equal(api.kitchen.meals[0].recipeId, recipe.id);
+		assert.equal(api.kitchen.meals[0].servings, 250);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('marking a meal cooked keeps pantry deduction opt-in', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-cook', 'Weeknight Pasta');
+		const meal: Meal = {
+			id: 'meal-cook',
+			date: '2026-11-23',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: recipe.servings
+		};
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
+
+		api.openCookDialog(meal);
+
+		assert.equal(api.deductPantry, false);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('plan dialog preserves open recipe on cancel and keeps selected null when opened from recipe picker', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const activeRecipe = makeRecipe('r-active', 'Active Pasta');
+		const pickedRecipe = makeRecipe('r-picked', 'Picked Curry');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [activeRecipe, pickedRecipe],
+			meals: []
+		};
+
+		// Plan from an open RecipeDetail, then cancel: selected stays open and plannedRecipe clears.
+		api.selected = activeRecipe;
+		api.planRecipe(activeRecipe, 6);
+		assert.equal(api.modal, 'plan');
+		assert.equal(api.selected?.id, activeRecipe.id);
+		assert.equal(api.plannedRecipe?.id, activeRecipe.id);
+
+		api.closeDialog();
+		assert.equal(api.modal, '');
+		assert.equal(api.selected?.id, activeRecipe.id);
+		assert.equal(api.plannedRecipe, null);
+
+		// Open recipe picker from planner without slotTarget, choose recipe, then cancel: selected stays null.
+		api.openRecipePicker();
+		assert.equal(api.modal, 'pickRecipe');
+		assert.equal(api.selected, null);
+		api.choosePickedRecipe(pickedRecipe);
+		assert.equal(api.modal, 'plan');
+		assert.equal(api.selected, null);
+		assert.equal((api.plannedRecipe as Recipe | null)?.id, pickedRecipe.id);
+
+		api.closeDialog();
+		assert.equal(api.modal, '');
+		assert.equal(api.selected, null);
+		assert.equal(api.plannedRecipe, null);
+
+		// Confirming addMeal schedules plannedRecipe and closes open RecipeDetail.
+		api.selected = activeRecipe;
+		api.planRecipe(activeRecipe, 5);
+		api.setPlannedDraft('2026-11-24', 'Dinner', 5);
+		api.addMeal();
+		assert.equal(api.modal, '');
+		assert.equal(api.selected, null);
+		assert.equal(api.plannedRecipe, null);
+		assert.equal(api.kitchen.meals.length, 1);
+		assert.equal(api.kitchen.meals[0].recipeId, activeRecipe.id);
+		assert.equal(api.kitchen.meals[0].servings, 5);
 	} finally {
 		harness.dispose();
 	}

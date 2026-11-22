@@ -277,6 +277,13 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 	assert.equal(canceledFromDetail.selectedMealServings, 5);
 
 	// Confirming addMeal intentionally closes RecipeDetail and schedules plannedRecipe.
+	assert.deepEqual(
+		completePlanMeal(openRecipe, '2026-11-21', 'Snack', 4, () => 'meal-1'),
+		{
+			ok: false,
+			reason: 'missing'
+		}
+	);
 	for (const badServings of [0, 2.5, MAX_SERVINGS + 1]) {
 		assert.deepEqual(
 			completePlanMeal(openRecipe, '2026-11-21', 'Dinner', badServings, () => 'meal-1'),
