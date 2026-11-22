@@ -277,7 +277,9 @@ test('/api/models preserves private max-age caching, enforces no-store on errors
 	assert.equal(catalogFetchCount, 2);
 
 	configureMode('local');
-	// runAIRequest with reasoning (including a per-request AbortSignal) reuses the cached public catalog without fetching models.dev again.
+	// runAIRequest with reasoning reuses the same cached public catalog without fetching models.dev again,
+	// even when a request abort signal wraps the provider fetcher, while isolating distinct custom fetchers.
+	const activeController = new AbortController();
 	await ai.runAIRequest(
 		{
 			action: 'vision',
@@ -290,34 +292,50 @@ test('/api/models preserves private max-age caching, enforces no-store on errors
 		mockFetcher,
 		undefined,
 		undefined,
-		new AbortController().signal
+		activeController.signal
 	);
 	assert.equal(catalogFetchCount, 2);
 
-	// Distinct custom fetchers isolate their own catalog without polluting mockFetcher's cache.
-	let isolatedCatalogFetches = 0;
-	const isolatedFetcher: typeof fetch = async (input) => {
+	let alternateCatalogFetchCount = 0;
+	const alternateFetcher: typeof fetch = async (input) => {
 		if (String(input) === 'https://models.dev/api.json') {
-			isolatedCatalogFetches += 1;
+			alternateCatalogFetchCount += 1;
 			return Response.json({
-				google: {
-					name: 'Google',
+				anthropic: {
+					name: 'Anthropic',
 					models: {
-						'gemini-isolated': {
-							name: 'Gemini Isolated',
+						'claude-alt': {
 							reasoning: true,
-							reasoning_options: [{ type: 'effort', values: ['high'] }],
-							modalities: { input: ['text'], output: ['text'] }
+							reasoning_options: [{ type: 'effort', values: ['low', 'high'] }],
+							modalities: { input: ['text', 'image'], output: ['text'] }
 						}
 					}
 				}
 			});
 		}
-		throw new Error(`Unexpected isolated fetch URL: ${String(input)}`);
+		return Response.json({
+			content: [
+				{
+					type: 'text',
+					text: JSON.stringify({
+						ingredients: [{ name: 'Eggs', quantity: 2, unit: 'item', category: 'Dairy & eggs' }]
+					})
+				}
+			]
+		});
 	};
-	const isolatedCatalog = await ai.getPublicModelCatalog(isolatedFetcher);
-	assert.equal(isolatedCatalogFetches, 1);
-	assert.equal(isolatedCatalog.providers[0]?.id, 'google');
+	await ai.runAIRequest(
+		{
+			action: 'vision',
+			provider: 'anthropic',
+			model: 'claude-alt',
+			apiKey: 'sk-alt-key',
+			image: 'data:image/png;base64,aGVsbG8=',
+			reasoning: { effort: 'high' }
+		},
+		alternateFetcher
+	);
+	assert.equal(alternateCatalogFetchCount, 1);
 	assert.equal(catalogFetchCount, 2);
 
 	// Missing accountId on ?connection=chatgpt returns 400 with no-store headers.
