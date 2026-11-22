@@ -362,7 +362,7 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher, fetcher);
+			: await getPublicModelCatalog(requestFetcher);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2358,15 +2358,9 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
-type CachedModelCatalog = {
-	promise: Promise<SupportedModelResponse>;
-	expiresAt: number;
-};
-
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-const nativeFetch: Fetcher = globalThis.fetch;
-let defaultPublicCatalog: CachedModelCatalog | undefined;
-const customPublicCatalogs = new WeakMap<Fetcher, CachedModelCatalog>();
+let publicCatalog: Promise<SupportedModelResponse> | undefined;
+let publicCatalogExpiresAt = 0;
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2387,27 +2381,23 @@ export async function getSupportedModels(
 	return transformModelCatalog(body);
 }
 
-export function getPublicModelCatalog(
-	fetcher: Fetcher = fetch,
-	cacheKey: Fetcher = fetcher
-): Promise<SupportedModelResponse> {
-	const effectiveKey = cacheKey.name === 'server_fetch' ? globalThis.fetch : cacheKey;
-	const useDefaultCache = effectiveKey === nativeFetch;
-	const cached = useDefaultCache ? defaultPublicCatalog : customPublicCatalogs.get(effectiveKey);
-	if (cached && Date.now() < cached.expiresAt) {
-		return cached.promise;
+export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
+		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+		const pending = getSupportedModels(fetcher).catch((error) => {
+			if (publicCatalog === pending) {
+				publicCatalog = undefined;
+				publicCatalogExpiresAt = 0;
+			}
+			throw error;
+		});
+		publicCatalog = pending;
 	}
-	const expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
-	const promise = getSupportedModels(fetcher).catch((error) => {
-		if (useDefaultCache) {
-			if (defaultPublicCatalog?.promise === promise) defaultPublicCatalog = undefined;
-		} else if (customPublicCatalogs.get(effectiveKey)?.promise === promise) {
-			customPublicCatalogs.delete(effectiveKey);
-		}
-		throw error;
-	});
-	const entry: CachedModelCatalog = { promise, expiresAt };
-	if (useDefaultCache) defaultPublicCatalog = entry;
-	else customPublicCatalogs.set(effectiveKey, entry);
-	return promise;
+	return publicCatalog;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
 }
