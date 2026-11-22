@@ -1,4 +1,3 @@
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
 import { localWhisperUrl, transcribeVoice } from '#lib/server/voice.ts';
@@ -6,8 +5,8 @@ import { MAX_WAV_BYTES } from '#lib/voice-config.ts';
 const headers = { 'cache-control': 'no-store' };
 export const GET: RequestHandler = ({ locals }) => {
 	if (!locals.user)
-		return json({ error: 'Sign in to configure voice input.' }, { status: 401, headers });
-	return json({ localAvailable: Boolean(localWhisperUrl()) }, { headers });
+		return Response.json({ error: 'Sign in to configure voice input.' }, { status: 401, headers });
+	return Response.json({ localAvailable: Boolean(localWhisperUrl()) }, { headers });
 };
 export const POST: RequestHandler = async ({ request, locals, fetch }) => {
 	try {
@@ -46,9 +45,9 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
 		} catch {
 			throw new ApiError(400, 'Could not read the recording.');
 		}
-		return json(await transcribeVoice(form, fetch, request.signal), { headers });
+		return Response.json(await transcribeVoice(form, fetch, request.signal), { headers });
 	} catch (error) {
-		return json(
+		return Response.json(
 			{
 				error:
 					error instanceof ApiError ? error.message : 'Voice transcription could not be completed.'

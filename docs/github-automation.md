@@ -4,12 +4,13 @@ CI checks types, tests, the production build, the container build, and both
 server and SSO smoke tests on pushes and pull requests. Runs use Ubuntu 24.04
 and Node 24, have a 20-minute timeout, and cancel superseded runs.
 
-Dependabot checks npm packages, GitHub Actions, and the Dockerfile weekly.
-Minor and patch npm updates are grouped; major npm updates remain separate
-for review. GitHub Actions updates are grouped. Dependency updates run the
-same CI as other pull requests. GitHub's Dependabot alerts and automated
-security-fix pull requests should also be enabled in repository settings.
-GitGuardian already checks this repository for secrets.
+Dependabot checks npm packages, GitHub Actions, the Dockerfile, and
+`deploy/skynet/compose.override.yml` weekly. Minor and patch npm updates are
+grouped; major npm updates remain separate for review. GitHub Actions updates
+are grouped. Dependency updates run the same CI as other pull requests.
+GitHub's Dependabot alerts and automated security-fix pull requests should also
+be enabled in repository settings. GitGuardian already checks this repository
+for secrets.
 
 The Security workflow runs CodeQL for JavaScript/TypeScript and Actions, plus
 a production dependency audit, on pull requests, main pushes, and weekly.
@@ -31,7 +32,9 @@ separately in GitHub Packages; publishing does not make a package public.
 
 The Skynet deployment continues to use its existing source updater and health
 check rollback described in [Docker deployment](docker-deployment.md).
-Publishing a registry image does not deploy it to Skynet.
+Publishing a registry image does not deploy it to Skynet. Sidecar image updates
+in `deploy/skynet/compose.override.yml` require manual pulls on Skynet because
+`deploy/skynet/update.sh` restarts only `flavorithm`.
 
 Workflow and Dependabot files take effect after they are reviewed and merged
 to the default branch. These workflows do not merge dependency PRs or perform

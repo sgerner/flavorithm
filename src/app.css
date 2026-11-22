@@ -1,7 +1,6 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=Manrope:wght@400;500;600;650;700;750;800&display=swap');
 @import 'tailwindcss';
 @import '@skeletonlabs/skeleton';
-@import '@skeletonlabs/skeleton-svelte';
 @import '@skeletonlabs/skeleton/themes/catppuccin';
 @import '@skeletonlabs/skeleton/themes/cerberus';
 @import '@skeletonlabs/skeleton/themes/concord';
@@ -179,41 +178,6 @@ a svg {
 	margin-left: 2px;
 	color: #78914c;
 }
-.kitchen-switch {
-	display: flex;
-	align-items: center;
-	gap: 10px;
-	margin: 39px 0 32px;
-	padding: 13px 7px;
-	border-top: 1px solid var(--line);
-	border-bottom: 1px solid var(--line);
-}
-.kitchen-avatar {
-	width: 32px;
-	height: 36px;
-	display: grid;
-	place-items: center;
-	background: #e2e8d4;
-	color: #365a3c;
-}
-.kitchen-switch b {
-	font-size: 14px;
-	display: block;
-	font-weight: 600;
-}
-.kitchen-switch div > span {
-	font-size: 14px;
-	color: var(--muted);
-	display: block;
-	margin-top: 3px;
-}
-.nav-label {
-	font-size: 14px;
-	letter-spacing: 1.65px;
-	padding-left: 12px;
-	color: var(--muted);
-	margin-bottom: 17px;
-}
 nav {
 	display: flex;
 	flex-direction: column;
@@ -247,34 +211,6 @@ nav button.current:before {
 nav small {
 	margin-left: auto;
 	font-size: 14px;
-}
-.sidebar-note {
-	margin: 46px 11px 25px;
-	position: relative;
-}
-.note-spark {
-	font-size: 32px;
-	color: #7e9359;
-	display: block;
-	transform: rotate(15deg);
-	margin-bottom: 11px;
-}
-.sidebar-note p {
-	font-size: 14px;
-	line-height: 1.9;
-	color: var(--muted);
-}
-.sidebar-note em {
-	font-family: Georgia, serif;
-	color: var(--ink);
-	font-size: 14px;
-}
-.note-line {
-	width: 60px;
-	height: 7px;
-	border-bottom: 1px solid #8a9a6e;
-	transform: rotate(-5deg);
-	margin: 6px 0 0 45px;
 }
 .bottom-nav {
 	margin-top: auto;
@@ -380,19 +316,6 @@ main {
 	align-items: center;
 	gap: 22px;
 }
-.season {
-	font-size: 14px;
-	color: var(--muted);
-	display: flex;
-	align-items: center;
-	gap: 8px;
-}
-.season > span {
-	height: 5px;
-	width: 5px;
-	background: #899f67;
-	border-radius: 50%;
-}
 .top-avatar {
 	border-radius: 50%;
 	width: 29px;
@@ -430,10 +353,6 @@ main {
 	display: flex;
 	align-items: center;
 	gap: 8px;
-}
-.tiny-spark {
-	font-size: 14px;
-	color: #849763;
 }
 .page-heading h1 {
 	font-size: clamp(35px, 3.25vw, 52px);
@@ -552,13 +471,6 @@ main {
 	background: #456348;
 	transform: rotate(-7deg);
 }
-.banner-footnote {
-	display: block;
-	font-size: 14px;
-	letter-spacing: 1.4px;
-	color: #aabda5;
-	margin-top: 17px;
-}
 .banner-visual {
 	position: relative;
 	isolation: isolate;
@@ -578,28 +490,6 @@ main {
 	inset: 0;
 	filter: saturate(0.8);
 }
-.float-sticker {
-	position: absolute;
-	right: 17px;
-	bottom: 28px;
-	display: block;
-	background: #e6e9a0;
-	color: #314632;
-	transform: rotate(-9deg);
-	z-index: 2;
-	padding: 15px 18px;
-	font-size: 14px;
-	line-height: 1.6;
-	box-shadow: 0 5px 25px #0002;
-}
-.float-sticker em {
-	font-family: Georgia;
-	font-size: 18px;
-}
-.float-sticker span {
-	font-size: 27px;
-	padding-left: 11px;
-}
 .visual-spark {
 	position: absolute;
 	z-index: 2;
@@ -608,15 +498,6 @@ main {
 	top: 20px;
 	color: #e6e9a0;
 	transform: rotate(12deg);
-}
-.orbit-text {
-	position: absolute;
-	color: #f7f8df;
-	z-index: 2;
-	bottom: 28px;
-	left: 5%;
-	font: italic 19px Georgia;
-	transform: rotate(-10deg);
 }
 .recipe-section {
 	margin-top: 37px;
@@ -858,30 +739,6 @@ main {
 }
 .browse-link:hover {
 	color: var(--ink);
-}
-.app-footer {
-	display: flex;
-	justify-content: space-between;
-	align-items: center;
-	margin-top: 45px;
-	border-top: 1px solid var(--line);
-	padding: 23px 0;
-	font-size: 14px;
-	color: var(--muted);
-	gap: 20px;
-}
-.app-footer > span:first-child {
-	display: flex;
-	align-items: center;
-	gap: 9px;
-}
-.app-footer > span:first-child > span {
-	font-size: 15px;
-	color: #8c9d65;
-}
-.app-footer > span:last-child {
-	font-size: 14px;
-	letter-spacing: 1.3px;
 }
 .muted {
 	color: var(--muted);
@@ -1182,36 +1039,6 @@ main {
 	padding: 10px 0;
 	font-size: 14px;
 }
-.market-note {
-	margin-top: 10px;
-	background: var(--wash);
-	padding: 28px;
-	align-self: start;
-}
-.market-note > span {
-	font-size: 50px;
-	color: #8b9a61;
-}
-.market-note .eyebrow {
-	font-size: 14px;
-	margin-top: 20px;
-	line-height: 1.8;
-}
-.market-note h3 {
-	font-size: 23px;
-	font-weight: 500;
-	letter-spacing: -0.8px;
-	line-height: 1.45;
-	margin: 17px 0;
-}
-.market-note p {
-	font-size: 14px;
-	color: var(--muted);
-}
-.market-note .text-button {
-	font-size: 14px;
-	margin-top: 15px;
-}
 .modal-backdrop {
 	position: fixed;
 	inset: 0;
@@ -1475,16 +1302,6 @@ main {
 	right: 18px;
 	top: 18px;
 	background: var(--paper);
-}
-.photo-label {
-	position: absolute;
-	bottom: 20px;
-	left: 35px;
-	font-size: 12px;
-	letter-spacing: 1.5px;
-	background: #f4f2d9;
-	color: #294b37;
-	padding: 8px 12px;
 }
 .detail-body {
 	padding: 35px;
@@ -1787,13 +1604,6 @@ main {
 		grid-template-columns: 1.15fr 1fr;
 		min-height: 280px;
 	}
-	.banner-footnote {
-		font-size: 14px;
-	}
-	.float-sticker {
-		font-size: 14px;
-		padding: 12px;
-	}
 	.recipe-kicker span {
 		display: none;
 	}
@@ -1826,15 +1636,6 @@ main {
 	.brand img {
 		width: 24px;
 	}
-	.nav-label {
-		font-size: 14px;
-	}
-	.kitchen-switch {
-		margin-top: 30px;
-	}
-	.kitchen-switch div > span {
-		font-size: 14px;
-	}
 	nav button {
 		font-size: 14px;
 		padding: 12px 10px;
@@ -1843,18 +1644,12 @@ main {
 	.profile-button small {
 		display: none;
 	}
-	.sidebar-note {
-		margin-top: 30px;
-	}
 	main {
 		margin-left: 190px;
 		width: calc(100% - 190px);
 	}
 	.topbar {
 		height: 65px;
-	}
-	.season {
-		display: none;
 	}
 	.page-heading h1 {
 		font-size: 36px;
@@ -1877,12 +1672,6 @@ main {
 	.banner-visual .visual-spark {
 		font-size: 45px;
 		left: 5%;
-	}
-	.orbit-text {
-		display: none;
-	}
-	.banner-footnote {
-		line-height: 1.8;
 	}
 	.banner-actions {
 		flex-wrap: wrap;
@@ -1909,9 +1698,6 @@ main {
 	.shopping-layout {
 		grid-template-columns: 1fr;
 	}
-	.market-note {
-		display: none;
-	}
 	.pantry-summary {
 		align-items: flex-start;
 		gap: 20px;
@@ -1922,9 +1708,6 @@ main {
 	.calendar-toolbar {
 		align-items: flex-start;
 		flex-direction: column;
-	}
-	.app-footer > span:last-child {
-		display: none;
 	}
 	.table-head,
 	.pantry-row {
@@ -1956,15 +1739,6 @@ main {
 	}
 	.brand {
 		font-size: 25px;
-	}
-	.nav-label {
-		font-size: 14px;
-	}
-	.kitchen-switch div > span {
-		font-size: 14px;
-	}
-	.sidebar-note {
-		display: none;
 	}
 	.sidebar nav button {
 		font-size: 14px;
@@ -2021,61 +1795,6 @@ main {
 		right: -48px;
 		font-size: 40px;
 	}
-	.inspiration-banner {
-		grid-template-columns: 1.2fr 0.8fr;
-		min-height: 305px;
-	}
-	.banner-copy {
-		padding: 24px 17px;
-	}
-	.banner-copy h2 {
-		font-size: 24px;
-		line-height: 1.4;
-	}
-	.banner-copy .eyebrow {
-		font-size: 14px;
-		line-height: 1.8;
-		letter-spacing: 1px;
-	}
-	.banner-copy p {
-		font-size: 16px;
-	}
-	.banner-actions {
-		gap: 8px;
-		margin-top: 17px;
-	}
-	.banner-actions .cream-button {
-		font-size: 14px;
-		padding: 10px 7px;
-		gap: 6px;
-	}
-	.banner-icon {
-		padding: 7px;
-	}
-	.banner-icon svg {
-		height: 16px;
-		width: 16px;
-	}
-	.banner-footnote {
-		font-size: 14px;
-		letter-spacing: 1px;
-	}
-	.float-sticker {
-		right: 7px;
-		bottom: 35px;
-		padding: 10px;
-		font-size: 14px;
-	}
-	.float-sticker em {
-		font-size: 14px;
-	}
-	.float-sticker span {
-		display: none;
-	}
-	.visual-spark {
-		left: 0;
-		font-size: 40px;
-	}
 	.recipe-section {
 		margin-top: 28px;
 	}
@@ -2120,10 +1839,6 @@ main {
 	}
 	.recipe-image {
 		height: 160px;
-	}
-	.recipe-badge {
-		font-size: 12px;
-		padding: 5px 6px;
 	}
 	.save-recipe {
 		top: 7px;
@@ -2177,11 +1892,6 @@ main {
 		font-size: 14px;
 		line-height: 1.7;
 		text-align: left;
-	}
-	.app-footer {
-		font-size: 14px;
-		margin-top: 30px;
-		padding: 20px 0;
 	}
 	.pantry-summary {
 		flex-direction: column;
@@ -2327,9 +2037,6 @@ main {
 		flex-direction: column;
 		align-items: flex-start;
 	}
-	.photo-label {
-		left: 22px;
-	}
 	.steps-list p {
 		font-size: 16px;
 	}
@@ -2432,13 +2139,6 @@ body {
 	overflow-y: auto;
 }
 @media (max-height: 800px) {
-	.sidebar-note {
-		display: none;
-	}
-	.kitchen-switch {
-		margin-top: 28px;
-		margin-bottom: 24px;
-	}
 	.sidebar {
 		padding-top: 28px;
 	}
@@ -2509,39 +2209,6 @@ html.dark[data-theme='nosh'] {
 }
 
 /* Shared onboarding layouts keep the preference check compact at every width. */
-.onboarding-note {
-	display: flex;
-	align-items: center;
-	justify-content: space-between;
-	gap: 16px;
-	padding: 18px 22px;
-	margin-bottom: 24px;
-	background: var(--wash);
-	border: 1px solid var(--line);
-}
-
-.onboarding-note > div {
-	flex: 1 1 auto;
-	min-width: 0;
-}
-
-.onboarding-note h3 {
-	font:
-		600 18px/1.4 'Manrope',
-		sans-serif;
-	margin-top: 5px;
-}
-
-.onboarding-note p {
-	font-size: 14px;
-	color: var(--muted);
-	margin-top: 3px;
-}
-
-.onboarding-note button {
-	min-height: 44px;
-}
-
 .onboarding-dialog {
 	max-width: 560px;
 }
@@ -2741,25 +2408,6 @@ html.dark[data-theme='nosh'] {
 		overflow: hidden;
 		overflow-wrap: anywhere;
 	}
-
-	.market-note {
-		display: block;
-		padding: 18px;
-		margin-top: 16px;
-	}
-
-	.market-note > span {
-		font-size: 34px;
-	}
-
-	.market-note .eyebrow {
-		margin-top: 8px;
-	}
-
-	.market-note h3 {
-		font-size: 20px;
-		margin: 10px 0;
-	}
 }
 
 @media (max-width: 650px) {
@@ -2849,7 +2497,6 @@ html.dark[data-theme='nosh'] {
 	.secondary,
 	.cream-button,
 	.text-button,
-	.banner-icon,
 	.icon-button,
 	.save-recipe,
 	.check-box,
@@ -2861,17 +2508,12 @@ html.dark[data-theme='nosh'] {
 	}
 
 	.icon-button,
-	.banner-icon,
 	.save-recipe,
 	.check-box,
 	.remove-meal,
 	.dialog-close,
 	.close-detail {
 		min-width: 44px;
-	}
-
-	.banner-icon {
-		padding: 10px;
 	}
 
 	.recipe-toolbar {
@@ -3304,31 +2946,11 @@ html.dark[data-theme='nosh'] {
 		flex: 0 0 44px;
 	}
 
-	.onboarding-note {
-		display: flex;
-		flex-wrap: wrap;
-		align-items: flex-start;
-		gap: 10px;
-		padding: 14px;
-	}
-
-	.onboarding-note > div {
-		flex: 1 1 100%;
-		min-width: 0;
-	}
-
-	.onboarding-note h2,
-	.onboarding-note h3,
 	.onboarding-intro {
 		font-size: 16px;
 		line-height: 1.4;
 	}
 
-	.onboarding-note p {
-		font-size: 14px;
-	}
-
-	.onboarding-note button,
 	.quiz-actions button {
 		min-height: 46px;
 	}
@@ -3419,58 +3041,6 @@ html.dark[data-theme='nosh'] {
 		font-size: 32px;
 	}
 
-	.inspiration-banner {
-		grid-template-columns: minmax(0, 1fr);
-		min-height: 0;
-	}
-
-	.banner-copy {
-		padding: 20px 16px;
-	}
-
-	.banner-copy h2 {
-		font-size: 23px;
-	}
-
-	.banner-copy .eyebrow {
-		font-size: 14px;
-		letter-spacing: 1.1px;
-	}
-
-	.banner-copy p {
-		font-size: 16px;
-	}
-
-	.banner-actions {
-		flex-wrap: nowrap;
-	}
-
-	.banner-actions .cream-button {
-		flex: 1 1 auto;
-		min-width: 0;
-		min-height: 46px;
-		font-size: 14px;
-		padding-inline: 9px;
-	}
-
-	.banner-footnote {
-		font-size: 14px;
-		line-height: 1.7;
-	}
-
-	.banner-visual {
-		height: 150px;
-	}
-
-	.banner-visual:before {
-		background: linear-gradient(0deg, #294b37 0%, transparent 38%);
-	}
-
-	.float-sticker {
-		bottom: 14px;
-		font-size: 14px;
-	}
-
 	.recipe-grid {
 		gap: 24px;
 	}
@@ -3478,11 +3048,6 @@ html.dark[data-theme='nosh'] {
 	.recipe-image {
 		height: auto;
 		aspect-ratio: 16 / 10;
-	}
-
-	.recipe-badge {
-		font-size: 12px;
-		padding: 6px 8px;
 	}
 
 	.recipe-title {
@@ -3733,8 +3298,7 @@ html.dark[data-theme='nosh'] {
 		justify-content: space-between;
 	}
 
-	.page-heading .taste-note,
-	.page-heading .preferences-action {
+	.page-heading .taste-note {
 		display: inline-flex;
 		align-items: center;
 		justify-content: center;
@@ -4048,10 +3612,6 @@ html.dark[data-theme='nosh'] {
 	max-width: 690px;
 }
 
-.capture-dialog .capture-intro {
-	margin-bottom: 22px;
-}
-
 .capture-dialog .capture-help {
 	font-size: 14px;
 	color: var(--muted);
@@ -4157,8 +3717,7 @@ html.dark[data-theme='nosh'] {
 	grid-column: 1 / -1;
 }
 
-.capture-dialog .draft-summary .field,
-.capture-dialog .draft-section .field {
+.capture-dialog .draft-summary .field {
 	min-width: 0;
 }
 
@@ -4181,17 +3740,7 @@ html.dark[data-theme='nosh'] {
 	line-height: 1.65;
 }
 
-.draft-section {
-	margin: 20px 0 24px;
-}
-
-.draft-section + .draft-section {
-	border-top: 1px solid var(--line);
-	padding-top: 20px;
-}
-
-.draft-section-heading,
-.draft-section > .section-heading {
+.draft-section-heading {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
@@ -4199,13 +3748,11 @@ html.dark[data-theme='nosh'] {
 	margin-bottom: 10px;
 }
 
-.draft-section-heading h3,
-.draft-section > .section-heading h3 {
+.draft-section-heading h3 {
 	font-size: 18px;
 }
 
-.draft-section-heading button,
-.draft-section > .section-heading button {
+.draft-section-heading button {
 	min-height: 44px;
 }
 
