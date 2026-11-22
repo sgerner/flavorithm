@@ -79,6 +79,8 @@ class MockElement {
 		if (selector === 'textarea:not([disabled])')
 			return this.tagName === 'TEXTAREA' && !this.disabled;
 		if (selector === '[tabindex="0"]') return this.attributes.get('tabindex') === '0';
+		if (selector === '[tabindex]:not([tabindex="-1"])')
+			return this.attributes.has('tabindex') && this.attributes.get('tabindex') !== '-1';
 		if (selector === 'details > summary:first-of-type') {
 			if (this.tagName !== 'SUMMARY' || this.parentElement?.tagName !== 'DETAILS') return false;
 			const firstSummary = this.parentElement.children.find((child) => child.tagName === 'SUMMARY');
@@ -211,8 +213,10 @@ test(
 		const visibleInput = doc.el('input');
 		openDetails.append(openSummary, visibleInput);
 
+		const scrollRegion = doc.el('div', { tabindex: '0', role: 'region' });
+		const programmaticTarget = doc.el('div', { tabindex: '-1' });
 		const saveBtn = doc.el('button');
-		dialog.append(closeBtn, closedDetails, openDetails, saveBtn);
+		dialog.append(closeBtn, closedDetails, openDetails, scrollRegion, programmaticTarget, saveBtn);
 		doc.body.append(dialog);
 
 		assert.deepEqual(focusableControls(dialog as unknown as HTMLElement), [
@@ -220,6 +224,7 @@ test(
 			closedSummary,
 			openSummary,
 			visibleInput,
+			scrollRegion,
 			saveBtn
 		]);
 
@@ -231,8 +236,9 @@ test(
 		await flushMicrotasks();
 		assert.equal(doc.activeElement, closeBtn);
 
-		// Shift+Tab from first wraps to saveBtn; if saveBtn is hidden, wraps to closedSummary when it is last
+		// Shift+Tab from first wraps to saveBtn; if saveBtn/scrollRegion/openDetails are hidden, wraps to closedSummary
 		saveBtn.hidden = true;
+		scrollRegion.hidden = true;
 		openDetails.hidden = true;
 		const backWrap = tabEvent(true);
 		dialog.dispatchEvent(backWrap);

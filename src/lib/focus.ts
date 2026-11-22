@@ -17,7 +17,7 @@ type TrapEntry = {
 };
 
 const FOCUSABLE_SELECTOR =
-	'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),details > summary:first-of-type,[tabindex="0"]';
+	'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),details > summary:first-of-type,[tabindex]:not([tabindex="-1"])';
 
 const activeTraps: TrapEntry[] = [];
 let originalOverflow = '';

@@ -384,6 +384,7 @@
 			emailDelivery: Boolean(data.capabilities?.emailDelivery),
 			recipeSearch: Boolean(data.capabilities?.recipeSearch)
 		};
+		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
 		return data;
 	}
 	const nav = [
@@ -1483,7 +1484,12 @@
 				modal = 'generate';
 				break;
 			case 'search':
-				modal = 'search';
+				if (capabilities.recipeSearch) {
+					modal = 'search';
+					error = '';
+				} else {
+					openImport();
+				}
 				break;
 			case 'taste':
 				modal = 'taste';
@@ -2078,6 +2084,11 @@
 			openAuthentication();
 			return;
 		}
+		if (modal !== 'reset' && !capabilities.emailDelivery) {
+			error =
+				'Password recovery is unavailable. Ask the server operator to configure email delivery.';
+			return;
+		}
 		busy = true;
 		error = '';
 		try {
@@ -2320,7 +2331,7 @@
 							<span class="desktop-title"
 								>{page === 'saved' ? 'Your recipe collection' : 'Discover recipes'}</span
 							><span class="mobile-title">{page === 'saved' ? 'Saved recipes' : 'Recipes'}</span
-							><span class="heading-spark">✴</span>
+							><span class="heading-spark" aria-hidden="true">✴</span>
 						</h1>
 					</div>
 					<button
@@ -2486,18 +2497,18 @@
 									? 'Tap the bookmark on any recipe to keep it close.'
 									: 'Try another search or generate recipes.'}
 							</p>
-						</div>{/if}<button
-						class="browse-link"
-						onclick={() => {
-							modal = 'search';
-							error = '';
-						}}>Find recipes online <ArrowUpRight size={16} /></button
-					>
+						</div>{/if}{#if capabilities.recipeSearch}<button
+							class="browse-link"
+							onclick={() => {
+								modal = 'search';
+								error = '';
+							}}>Find recipes online <ArrowUpRight size={16} /></button
+						>{/if}
 				</section>
 			{:else if page === 'pantry'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Your pantry<span class="heading-spark">✳</span></h1>
+						<h1>Your pantry<span class="heading-spark" aria-hidden="true">✳</span></h1>
 						<p>Track ingredients and quantities you have on hand.</p>
 					</div>
 					<button class="primary" onclick={() => (modal = 'pantry')}
@@ -2600,7 +2611,7 @@
 			{:else if page === 'planner'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Meal planner<span class="heading-spark">✷</span></h1>
+						<h1>Meal planner<span class="heading-spark" aria-hidden="true">✷</span></h1>
 						<p>Schedule meals and build your weekly shopping list.</p>
 					</div>
 					<button
@@ -2766,7 +2777,7 @@
 			{:else if page === 'shopping'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Shopping list<span class="heading-spark">✴</span></h1>
+						<h1>Shopping list<span class="heading-spark" aria-hidden="true">✴</span></h1>
 						<p>
 							Generated rows show their recipe or meal-plan source. Editing a row keeps your changes
 							visible until that source is refreshed.
@@ -3121,7 +3132,7 @@
 					/></label
 				>
 				<p class="field-help">Use at least 10 characters.</p>
-				{#if authMode === 'login'}<button
+				{#if authMode === 'login' && capabilities.emailDelivery}<button
 						type="button"
 						class="text-button"
 						onclick={() => {
@@ -3240,18 +3251,11 @@
 								onclick={sendEmailVerification}
 								>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
 							>{#if !capabilities.emailDelivery}<p class="field-help">
-									Email delivery is unavailable. Set RESEND_API_KEY and EMAIL_FROM to enable it.
+									Email delivery is unavailable. Ask the server operator to configure email
+									delivery.
 								</p>{/if}{/if}
 					{/if}
 				</div>{/if}
-			<div class="settings-section">
-				<h3>Web recipe search</h3>
-				{#if capabilities.recipeSearch}<p class="muted">
-						Available for this installation.
-					</p>{:else}<p class="muted">
-						Unavailable. Set BRAVE_SEARCH_API_KEY on this installation to enable search.
-					</p>{/if}
-			</div>
 			<div class="settings-section">
 				<VoiceSettings
 					bind:provider={voiceProvider}
@@ -3454,8 +3458,8 @@
 					disabled={busy}>Permanently delete my account</button
 				>
 			</form>
-		{:else if (modal === 'recover' || modal === 'reset') && !managedAuth}<span class="dialog-spark"
-				>✳</span
+		{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
+				class="dialog-spark">✳</span
 			>
 			<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
 			<p class="muted">
@@ -3604,7 +3608,7 @@
 			<h2>Find recipes online</h2>
 			<p class="muted">Search real recipes across the web, with links to the original creators.</p>
 			{#if !capabilities.recipeSearch}<p class="field-help">
-					Web search is unavailable. Set BRAVE_SEARCH_API_KEY on this installation.
+					Web search is unavailable. Ask the server operator to enable online recipe search.
 				</p>{/if}
 			<label class="field"
 				>What are you craving?<input
