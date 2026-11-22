@@ -34,20 +34,16 @@ test('device login survives process restarts with encrypted grants, durable comp
  ${operation}
  db.getDatabase().close();
  `;
-		const result = spawnSync(
-			process.execPath,
-			['--experimental-strip-types', '--input-type=module'],
-			{
-				cwd: new URL('..', import.meta.url),
-				input: script,
-				encoding: 'utf8',
-				env: {
-					...process.env,
-					FLAVORITHM_DB_PATH: join(dir, 'test.sqlite'),
-					ORIGIN: 'https://flavorithm.example'
-				}
+		const result = spawnSync(process.execPath, ['--input-type=module'], {
+			cwd: new URL('..', import.meta.url),
+			input: script,
+			encoding: 'utf8',
+			env: {
+				...process.env,
+				FLAVORITHM_DB_PATH: join(dir, 'test.sqlite'),
+				ORIGIN: 'https://flavorithm.example'
 			}
-		);
+		});
 		assert.equal(result.status, 0, result.stderr);
 		return JSON.parse(result.stdout);
 	};

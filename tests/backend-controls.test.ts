@@ -8,7 +8,12 @@ const backend = await import(backendModulePath);
 const householdRoute = await import('../src/routes/api/household/+server.ts');
 const authRoute = await import('../src/routes/api/auth/+server.ts');
 
-function postEvent(path: string, locals: Record<string, unknown>, body: unknown) {
+function postEvent(
+	path: string,
+	locals: Record<string, unknown>,
+	body: unknown,
+	clientAddress = '192.0.2.10'
+) {
 	return {
 		request: new Request(`https://flavorithm.example${path}`, {
 			method: 'POST',
@@ -16,7 +21,7 @@ function postEvent(path: string, locals: Record<string, unknown>, body: unknown)
 			body: JSON.stringify(body)
 		}),
 		locals,
-		getClientAddress: () => '192.0.2.10',
+		getClientAddress: () => clientAddress,
 		cookies: {
 			get: () => undefined,
 			set: () => undefined,
@@ -374,4 +379,153 @@ test('household endpoint blocks solo leave and requires confirmReplace before re
 		) as never
 	);
 	assert.equal(reuseResponse.status, 400);
+});
+
+test('auth endpoint trims valid padded emails and rejects malformed or oversized emails', async () => {
+	const registerResponse = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{},
+			{
+				action: 'register',
+				name: '  Padded User  ',
+				email: '  Padded-User@Example.com \t\n ',
+				password: 'a secure padded email password'
+			},
+			'192.0.2.21'
+		) as never
+	);
+	assert.equal(registerResponse.status, 201);
+	const registered = (await registerResponse.json()) as {
+		user: { id: string; name: string; email: string };
+	};
+	assert.equal(registered.user.email, 'padded-user@example.com');
+	assert.equal(registered.user.name, 'Padded User');
+
+	const maxEmailLocal = `${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.${'d'.repeat(59)}`;
+	const maxValidEmail = `${maxEmailLocal}@example.com`;
+	assert.equal(maxValidEmail.length, 254);
+	const maxRegisterResponse = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{},
+			{
+				action: 'register',
+				name: 'Max Email User',
+				email: `   ${maxValidEmail}   `,
+				password: 'a secure max length password'
+			},
+			'192.0.2.21'
+		) as never
+	);
+	assert.equal(maxRegisterResponse.status, 201);
+	assert.equal(
+		((await maxRegisterResponse.json()) as { user: { email: string } }).user.email,
+		maxValidEmail
+	);
+
+	const loginResponse = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{},
+			{
+				action: 'login',
+				email: '  PADDED-USER@example.com  ',
+				password: 'a secure padded email password'
+			},
+			'192.0.2.21'
+		) as never
+	);
+	assert.equal(loginResponse.status, 200);
+	assert.equal(
+		((await loginResponse.json()) as { user: { email: string } }).user.email,
+		'padded-user@example.com'
+	);
+
+	const previousResendKey = process.env.RESEND_API_KEY;
+	const previousEmailFrom = process.env.EMAIL_FROM;
+	process.env.RESEND_API_KEY = 'test-resend-key';
+	process.env.EMAIL_FROM = 'Flavorithm <kitchen@example.com>';
+	try {
+		const resetResponse = await authRoute.POST(
+			postEvent(
+				'/api/auth',
+				{},
+				{
+					action: 'requestPasswordReset',
+					email: '  nonexistent-padded@example.com  '
+				},
+				'192.0.2.21'
+			) as never
+		);
+		assert.equal(resetResponse.status, 200);
+	} finally {
+		if (previousResendKey === undefined) delete process.env.RESEND_API_KEY;
+		else process.env.RESEND_API_KEY = previousResendKey;
+		if (previousEmailFrom === undefined) delete process.env.EMAIL_FROM;
+		else process.env.EMAIL_FROM = previousEmailFrom;
+	}
+
+	const oversizedEmail = `  ${maxValidEmail}x  `;
+	for (const body of [
+		{
+			action: 'register',
+			name: 'Invalid Email',
+			email: '  not-an-email  ',
+			password: 'a secure invalid email password'
+		},
+		{
+			action: 'register',
+			name: 'Oversized Email',
+			email: oversizedEmail,
+			password: 'a secure oversized email password'
+		},
+		{
+			action: 'login',
+			email: '  missing-domain@  ',
+			password: 'a secure invalid email password'
+		},
+		{
+			action: 'login',
+			email: oversizedEmail,
+			password: 'a secure oversized email password'
+		},
+		{
+			action: 'requestPasswordReset',
+			email: '  invalid-reset-email  '
+		},
+		{
+			action: 'requestPasswordReset',
+			email: oversizedEmail
+		}
+	]) {
+		const rejected = await authRoute.POST(postEvent('/api/auth', {}, body, '192.0.2.22') as never);
+		assert.equal(rejected.status, 400);
+	}
+
+	const validState = backend.getState(registered.user)!;
+	const nanPantryState = structuredClone(validState);
+	nanPantryState.pantry.push({
+		id: 'nan-item',
+		name: 'Salt',
+		quantity: Number.NaN,
+		unit: 'tsp',
+		category: 'Spices'
+	});
+	assert.equal(backend.validateAppState(nanPantryState), null);
+
+	const infiniteCaloriesState = structuredClone(validState);
+	infiniteCaloriesState.recipes[0].nutrition.calories = Number.POSITIVE_INFINITY;
+	assert.equal(backend.validateAppState(infiniteCaloriesState), null);
+
+	const { AIRequestError, runAIRequest } = await import('../src/lib/server/ai.ts');
+	for (const badQuantity of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+		await assert.rejects(
+			runAIRequest({
+				action: 'generate',
+				pantry: [{ name: 'Salt', quantity: badQuantity, unit: 'tsp', category: 'Spices' }]
+			}),
+			(error: unknown) => error instanceof AIRequestError && error.status === 400
+		);
+	}
 });

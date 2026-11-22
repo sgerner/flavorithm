@@ -209,3 +209,138 @@ test('recipe generation uses the server-resolved ChatGPT token and includes actu
 	assert.equal(result.recipes[0].title, favorite.title);
 	assert.notEqual(result.recipes[0].id, favorite.id);
 });
+
+function rawByteStream(chunks: Uint8Array[], onCancel?: () => void) {
+	let index = 0;
+	return new Response(
+		new ReadableStream({
+			pull(controller) {
+				if (index >= chunks.length) {
+					controller.close();
+					return;
+				}
+				controller.enqueue(chunks[index++]);
+			},
+			cancel() {
+				onCancel?.();
+			}
+		}),
+		{ headers: { 'content-type': 'text/event-stream' } }
+	);
+}
+
+function sliceBytes(bytes: Uint8Array, chunkSize: number): Uint8Array[] {
+	const out: Uint8Array[] = [];
+	for (let offset = 0; offset < bytes.byteLength; offset += chunkSize) {
+		out.push(bytes.subarray(offset, offset + chunkSize));
+	}
+	return out;
+}
+
+test('ChatGPT SSE scanner handles 1-byte and multi-byte chunks across split CRLF, LF, multi-line data, and UTF-8 boundaries', async () => {
+	const encoder = new TextEncoder();
+	const crlfPayload =
+		'data:\r\nevent: keepalive\r\n\r\n' +
+		'event: delta\r\n' +
+		'data: {"type":"response.output_text.delta",\r\n' +
+		'data: "delta":"Crème "}\r\n\r\n' +
+		'data: {"type":"response.output_text.delta",\r\n' +
+		'data: "delta":"brûlée 🍲"}\r\n\r\n' +
+		'data: [DONE]\r\nevent: ignored\r\n\r\n' +
+		'data: {"type":"response.completed","response":{"status":"completed"}}\r\n\r\n';
+
+	const lfPayload =
+		'\n\n' +
+		'data: {"type":"response.output_text.delta",\n' +
+		'data: "delta":"Crème brûlée 🍲"}\n\n\n' +
+		'data: {"type":"response.completed","response":{"status":"completed"}}\n\n';
+
+	for (const payload of [crlfPayload, lfPayload]) {
+		const bytes = encoder.encode(payload);
+		for (const chunkSize of [1, 2, 3, 5, 7, 13, 64]) {
+			const chunks = sliceBytes(bytes, chunkSize);
+			const result = await chatGPTResponse(options, async () => rawByteStream(chunks));
+			assert.equal(result, 'Crème brûlée 🍲');
+		}
+	}
+
+	// Explicit lone-\r and empty Uint8Array chunks between split delimiters and data lines
+	const manualChunks = [
+		'data:\r',
+		'',
+		'\nevent: ping\r',
+		'\n\r',
+		'',
+		'\ndata: {"type":"response.output_text.delta",\r',
+		'\ndata: "delta":"ok"}\r\n',
+		'\r',
+		'\ndata: {"type":"response.completed","response":{"status":"completed"}}\r',
+		'\n\r',
+		'\n'
+	].map((part) => encoder.encode(part));
+	const manualResult = await chatGPTResponse(options, async () => rawByteStream(manualChunks));
+	assert.equal(manualResult, 'ok');
+});
+
+test('ChatGPT SSE scanner flushes trailing EOF frames without a final event delimiter', async () => {
+	const encoder = new TextEncoder();
+	for (const suffix of ['', '\r', '\r\n', '\n']) {
+		const eofStream =
+			'data: {"type":"response.output_text.delta","delta":"{\\"ok\\":"}\r\n\r\n' +
+			`data: {"type":"response.completed","response":{"status":"completed","output":[{"content":[{"type":"output_text","text":"{\\"ok\\":true}"}]}]}}${suffix}`;
+		const bytes = encoder.encode(eofStream);
+		for (const chunkSize of [1, 4, 17]) {
+			const result = await chatGPTResponse(options, async () =>
+				rawByteStream(sliceBytes(bytes, chunkSize))
+			);
+			assert.equal(result, '{"ok":true}');
+		}
+	}
+});
+
+test('ChatGPT SSE scanner rejects streams exceeding MAX_RESPONSE_BYTES and cancels the reader', async () => {
+	let cancelled = false;
+	const chunk = new Uint8Array(250_000).fill(0x61); // 'a'
+	const oversizedChunks = Array.from({ length: 16 }, () => chunk); // 4,000,000 bytes > 3,000,000
+	let responseStream: Response | undefined;
+	await assert.rejects(
+		() =>
+			chatGPTResponse(options, async () => {
+				responseStream = rawByteStream(oversizedChunks, () => {
+					cancelled = true;
+				});
+				return responseStream;
+			}),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError && /oversized response/i.test(error.message)
+	);
+	assert.equal(cancelled, true);
+	assert.equal(responseStream?.body?.locked, false);
+});
+
+test('ChatGPT SSE scanner parses multi-megabyte response.completed streams in linear time', async () => {
+	const largeText = '{"recipe":"' + 'x'.repeat(2_750_000) + '"}';
+	const sse =
+		'data: {"type":"response.output_text.delta","delta":"{}"}\r\n\r\n' +
+		`data: ${JSON.stringify({
+			type: 'response.completed',
+			response: {
+				status: 'completed',
+				output: [{ content: [{ type: 'output_text', text: largeText }] }]
+			}
+		})}\r\n\r\n` +
+		'data: [DONE]\r\n\r\n';
+	const encoded = new TextEncoder().encode(sse);
+	assert.ok(encoded.byteLength > 2_750_000 && encoded.byteLength < 3_000_000);
+
+	const chunks = sliceBytes(encoded, 512);
+	const start = performance.now();
+	const result = await chatGPTResponse(options, async () => rawByteStream(chunks));
+	const elapsedMs = performance.now() - start;
+
+	assert.equal(result, largeText);
+	assert.ok(
+		elapsedMs < 750,
+		`Expected incremental SSE scan under 750ms for 2.75MB in 512B chunks, got ${elapsedMs.toFixed(2)}ms`
+	);
+});
