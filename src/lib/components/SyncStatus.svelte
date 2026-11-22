@@ -25,6 +25,15 @@
 	} = $props();
 	let review = $state(false);
 	let saved = $derived(online && !pending && !syncing && !conflicts.length && !error);
+	let conflictLabels = $derived.by(() => {
+		const counts = new Map<string, number>();
+		return conflicts.map((conflict) => {
+			const base = describe(conflict.path);
+			const next = (counts.get(base) ?? 0) + 1;
+			counts.set(base, next);
+			return next === 1 ? base : `${base} (${next})`;
+		});
+	});
 	function describe(path: string): string {
 		const match = /^kitchen\.(recipes|pantry|shopping|meals)(?:\[([^\]]+)\])?(?:\.(.*))?$/.exec(
 			path
@@ -138,23 +147,40 @@
 					Your edits are kept on this device until you choose. Independent changes will be kept
 					either way.
 				</p>
-				<ul>
-					{#each conflicts as conflict}<li>
-							<strong>{describe(conflict.path)}</strong>
-							<div>Your value: {valueText(conflict.local)?.slice(0, 180)}</div>
-							<div>
-								Household value: {valueText(conflict.remote)?.slice(0, 180)}
-							</div>
-							{#if (valueText(conflict.local)?.length || 0) > 180 || (valueText(conflict.remote)?.length || 0) > 180}<details
-								>
-									<summary>Show complete values</summary>
-									<p>Your value</p>
-									<pre>{valueText(conflict.local)}</pre>
-									<p>Household value</p>
-									<pre>{valueText(conflict.remote)}</pre>
-								</details>{/if}
-						</li>{/each}
-				</ul>
+				<!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable conflict list needs keyboard focus.) -->
+				<div
+					class="sync-review-list"
+					tabindex="0"
+					role="region"
+					aria-label="Conflicting kitchen changes"
+				>
+					<ul>
+						{#each conflicts as conflict, i}{@const label =
+								conflictLabels[i] ?? describe(conflict.path)}
+							<li>
+								<strong>{describe(conflict.path)}</strong>
+								<div>Your value: {valueText(conflict.local)?.slice(0, 180)}</div>
+								<div>
+									Household value: {valueText(conflict.remote)?.slice(0, 180)}
+								</div>
+								{#if (valueText(conflict.local)?.length || 0) > 180 || (valueText(conflict.remote)?.length || 0) > 180}<details
+									>
+										<summary>Show complete values</summary>
+										<p>Your value</p>
+										<!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable conflict value needs keyboard focus.) -->
+										<pre tabindex="0" role="region" aria-label={`${label}: your value`}>{valueText(
+												conflict.local
+											)}</pre>
+										<p>Household value</p>
+										<!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable conflict value needs keyboard focus.) -->
+										<pre
+											tabindex="0"
+											role="region"
+											aria-label={`${label}: household value`}>{valueText(conflict.remote)}</pre>
+									</details>{/if}
+							</li>{/each}
+					</ul>
+				</div>
 				<div class="sync-actions">
 					<button class="secondary" onclick={exportPending}
 						><Download size={16} /> Back up my changes</button
@@ -196,14 +222,25 @@
 		flex-basis: 100%;
 		font-size: 1rem;
 	}
-	.sync-review ul {
-		padding-inline-start: 1.25rem;
+	.sync-review-list {
 		max-height: 20rem;
 		overflow: auto;
+		margin-block: 0.75rem;
+	}
+	.sync-review ul {
+		margin: 0;
+		padding-inline-start: 1.25rem;
 	}
 	.sync-review li {
 		padding-block: 0.5rem;
 		overflow-wrap: anywhere;
+	}
+	.sync-review summary {
+		display: inline-flex;
+		align-items: center;
+		min-height: 24px;
+		min-width: 24px;
+		cursor: pointer;
 	}
 	pre {
 		white-space: pre-wrap;
