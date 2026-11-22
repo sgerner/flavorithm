@@ -363,6 +363,7 @@ export async function runAIRequest(
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
 			: await getPublicModelCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2358,15 +2359,16 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
-type CachedCatalogEntry = {
+const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+type PublicCatalogCacheEntry = {
 	pending: Promise<SupportedModelResponse>;
 	expiresAt: number;
 };
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
-const defaultFetch: Fetcher = fetch;
-const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let defaultPublicCatalog: CachedCatalogEntry | undefined;
-const customPublicCatalogs = new WeakMap<Fetcher, CachedCatalogEntry>();
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
+}
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2388,28 +2390,23 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const useDefaultSlot = fetcher === defaultFetch || fetcher.name === 'server_fetch';
-	const existing = useDefaultSlot ? defaultPublicCatalog : customPublicCatalogs.get(fetcher);
+	const key = publicCatalogKey(fetcher);
+	const cached = publicCatalogCache.get(key);
 	const now = Date.now();
-	if (existing && now < existing.expiresAt) return existing.pending;
+	if (cached && now < cached.expiresAt) return cached.pending;
 
 	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		const current = useDefaultSlot ? defaultPublicCatalog : customPublicCatalogs.get(fetcher);
-		if (current?.pending === pending) {
-			if (useDefaultSlot) {
-				defaultPublicCatalog = undefined;
-			} else {
-				customPublicCatalogs.delete(fetcher);
-			}
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
 		}
 		throw error;
 	});
-	const entry: CachedCatalogEntry = { pending, expiresAt };
-	if (useDefaultSlot) {
-		defaultPublicCatalog = entry;
-	} else {
-		customPublicCatalogs.set(fetcher, entry);
-	}
+	publicCatalogCache.set(key, { pending, expiresAt });
 	return pending;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalogCache = new WeakMap();
 }
