@@ -198,7 +198,7 @@ Copy `.env.example` to `.env`. No provider key is needed for the basic local app
 | `FLAVORITHM_PROXY_ISSUER`             | `flavorithm:proxy`                                        | Stable namespace identifying the proxy identity source.                                                                                                                             |
 | `FLAVORITHM_PROXY_LOGOUT_URL`         | unset                                                     | Gateway logout redirect; setting it enables the proxy-mode sign-out action. Must use HTTPS, or loopback HTTP in development.                                                        |
 | `BRAVE_SEARCH_API_KEY`                | unset                                                     | Enables online recipe search. This is a server-side key.                                                                                                                            |
-| `RESEND_API_KEY`                      | unset                                                     | Enables password-reset email delivery through Resend.                                                                                                                               |
+| `RESEND_API_KEY`                      | unset                                                     | Enables password-reset and verification email delivery through Resend. Without it, operators can reset local passwords with `npm run auth:reset-password`.                          |
 | `EMAIL_FROM`                          | placeholder in `.env.example`                             | Verified Resend sender used for password recovery. Replace the example value before enabling delivery.                                                                              |
 | `OPENAI_OAUTH_CLIENT_ID`              | unset                                                     | Issued/approved client ID for a hosted ChatGPT integration. Local dynamic registration does not use this value.                                                                     |
 | `OPENAI_OAUTH_REDIRECT_URI`           | unset                                                     | Exact hosted callback URI, ending in `/api/connections/chatgpt/callback`.                                                                                                           |
@@ -212,6 +212,21 @@ Copy `.env.example` to `.env`. No provider key is needed for the basic local app
 Provider API keys are entered in Settings and are not configured through environment variables. For hosted OAuth requirements and token handling details, see the [ChatGPT connection guide](docs/chatgpt-oauth.md).
 
 Authentication mode is selected by the server operator. See [SSO and trusted proxy setup](docs/sso.md) for provider setup, identity mapping, and logout behavior.
+
+In `local` authentication mode, signed-in users can update their display name, change their email address (after confirming their current password), and rotate their password from **Settings**. Changing a password rotates the active browser session and revokes sessions on other devices plus pending reset links. When Resend is not configured, operators can recover a locked-out local account from a host or container terminal:
+
+```sh
+# Print a one-time generated replacement password and revoke active sessions:
+npm run auth:reset-password -- --email cook@example.com
+
+# Or read a chosen password (10–128 characters) from standard input without putting secrets in shell arguments:
+printf '%s\n' 'a-new-secure-passphrase' | npm run auth:reset-password -- --email cook@example.com --password-stdin
+
+# In Docker Compose:
+docker exec -i flavorithm npm run auth:reset-password -- --email cook@example.com
+```
+
+Pass `--db /path/to/flavorithm.sqlite` when targeting a non-default database file (such as `data/flavorithm.dev.sqlite` from `npm run seed:dev`).
 
 ## Storage, synchronization, and backups
 
@@ -244,7 +259,7 @@ The app hashes passwords with scrypt and stores session-token hashes. Session co
 
 ChatGPT access and refresh tokens are encrypted on the server with AES-256-GCM. Local credentials and previously imported connections use an owner-only key file beside the database; registered hosted OAuth credentials use a stable `FLAVORITHM_OAUTH_ENCRYPTION_KEY`. API-key values stay in tab memory but are sent to the selected provider through the Flavorithm server for each requested operation. Pantry data, preferences, photos, and prompts included in an AI request are sent to that selected provider. Review the provider's current data policy before connecting it.
 
-These controls are not a security audit. Email verification is available from Settings with one-use expiring links; it does not block existing accounts from signing in. Password recovery is unavailable until Resend is configured with a verified sender. Household invites are codes to share privately, not emailed invitations. The operator of a public deployment is responsible for access control, backups, privacy disclosures, and data-retention policy.
+These controls are not a security audit. Email verification is available from Settings with one-use expiring links; it does not block existing accounts from signing in. Emailed password recovery requires Resend with a verified sender; without it, local passwords can still be rotated in Settings while signed in or reset by an operator with `npm run auth:reset-password`. Household invites are codes to share privately, not emailed invitations. The operator of a public deployment is responsible for access control, backups, privacy disclosures, and data-retention policy.
 
 ## Deploy
 
@@ -256,19 +271,20 @@ Give the process a persistent writable volume for `FLAVORITHM_DB_PATH`; the defa
 
 ## Commands and checks
 
-| Command                | Description                                                                                               |
-| ---------------------- | --------------------------------------------------------------------------------------------------------- |
-| `npm run dev`          | Start the Vite development server.                                                                        |
-| `npm run check`        | Sync SvelteKit types and run `svelte-check`.                                                              |
-| `npm test`             | Run the Node test suite.                                                                                  |
-| `npm run test:sso`     | Run the SSO and trusted-proxy integration tests.                                                          |
-| `npm run build`        | Build the SvelteKit Node adapter app.                                                                     |
-| `npm start`            | Run the built app with `server.mjs`.                                                                      |
-| `npm run test:smoke`   | Start the built app with an isolated in-memory database and exercise production HTTP routes. Build first. |
-| `npm run seed:dev`     | Create a disposable prefilled local demo account; see [development fixtures](docs/dev-fixtures.md).       |
-| `npm run readiness`    | Check deployment configuration without printing credentials.                                              |
-| `npm run format:check` | Check Prettier formatting without changing files.                                                         |
-| `npm run format`       | Format the repository with Prettier.                                                                      |
+| Command                       | Description                                                                                               |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `npm run dev`                 | Start the Vite development server.                                                                        |
+| `npm run check`               | Sync SvelteKit types and run `svelte-check`.                                                              |
+| `npm test`                    | Run the Node test suite.                                                                                  |
+| `npm run test:sso`            | Run the SSO and trusted-proxy integration tests.                                                          |
+| `npm run build`               | Build the SvelteKit Node adapter app.                                                                     |
+| `npm start`                   | Run the built app with `server.mjs`.                                                                      |
+| `npm run test:smoke`          | Start the built app with an isolated in-memory database and exercise production HTTP routes. Build first. |
+| `npm run seed:dev`            | Create a disposable prefilled local demo account; see [development fixtures](docs/dev-fixtures.md).       |
+| `npm run auth:reset-password` | Reset a local account password from the terminal and revoke active sessions.                              |
+| `npm run readiness`           | Check deployment configuration without printing credentials.                                              |
+| `npm run format:check`        | Check Prettier formatting without changing files.                                                         |
+| `npm run format`              | Format the repository with Prettier.                                                                      |
 
 The automated tests cover application logic and use mocked provider/network responses. They do not make live AI, Brave Search, Resend, or ChatGPT requests. Browser behavior such as camera selection, speech recognition, installation prompts, and a real reverse-proxy deployment depends on the user's browser and hosting environment.
 
@@ -282,7 +298,7 @@ The automated tests cover application logic and use mocked provider/network resp
 | Hosted ChatGPT OAuth is unavailable                      | For device-code login, enable the grant in ChatGPT security settings or ask your workspace admin. For registered SIWC, check the issued client, callback, and encryption key. See the [OAuth guide](docs/chatgpt-oauth.md). |
 | Model catalog or AI operation fails                      | Check the selected connection, model support, account consent or API key, provider availability, network access, and provider quota. Image recognition requires a vision-capable model.                                     |
 | Online recipe search returns no results                  | Configure `BRAVE_SEARCH_API_KEY`; search also requires a signed-in account and internet access.                                                                                                                             |
-| Password recovery reports it is not configured           | Set `RESEND_API_KEY`, `EMAIL_FROM` to a verified sender, and a valid public `ORIGIN`.                                                                                                                                       |
+| Password recovery reports it is not configured           | Set `RESEND_API_KEY`, `EMAIL_FROM` to a verified sender, and a valid public `ORIGIN`, or run `npm run auth:reset-password -- --email <user@example.com>` on the server.                                                     |
 | Pantry dictation does not start                          | Grant microphone access on HTTPS or localhost. In Settings → Voice input, choose local Whisper or a cloud transcription provider for browsers without SpeechRecognition.                                                    |
 | Purchased list does not subtract an item from the pantry | Automatic subtraction requires a recognized compatible ingredient name and unit. Review and edit the generated list as needed.                                                                                              |
 

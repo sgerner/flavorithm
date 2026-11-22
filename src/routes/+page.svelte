@@ -277,6 +277,43 @@
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
 	let verificationBusy = $state(false);
+	let profileName = $state('');
+	let profileEmail = $state('');
+	let profileCurrentPassword = $state('');
+	let profileBusy = $state(false);
+	let profileError = $state('');
+	let currentPassword = $state('');
+	let newPassword = $state('');
+	let confirmNewPassword = $state('');
+	let passwordBusy = $state(false);
+	let passwordError = $state('');
+	let profileEmailChanged = $derived(
+		Boolean(user && profileEmail.trim().toLowerCase() !== user.email.toLowerCase())
+	);
+	let profileDirty = $derived(
+		Boolean(user && (profileName.trim() !== user.name || profileEmailChanged))
+	);
+	let lastProfileUserKey = '';
+	$effect(() => {
+		const nextKey = user ? `${user.id}:${user.name}:${user.email}` : '';
+		if (nextKey !== lastProfileUserKey) {
+			lastProfileUserKey = nextKey;
+			profileName = user?.name ?? '';
+			profileEmail = user?.email ?? '';
+			profileCurrentPassword = '';
+			profileError = '';
+		}
+	});
+	function resetAccountForms(account: User | null = user) {
+		profileName = account?.name ?? '';
+		profileEmail = account?.email ?? '';
+		profileCurrentPassword = '';
+		profileError = '';
+		currentPassword = '';
+		newPassword = '';
+		confirmNewPassword = '';
+		passwordError = '';
+	}
 	type ChatGPTAccount = {
 		id: string;
 		label: string;
@@ -957,6 +994,7 @@
 			kitchenSync?.clearContext();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
+			resetAccountForms(null);
 			inviteCode = '';
 			currentInviteId = '';
 			joinCode = '';
@@ -1053,8 +1091,10 @@
 		mobileNav = false;
 		modal = 'settings';
 		error = '';
+		resetAccountForms(user);
 		try {
 			await refreshAuth();
+			resetAccountForms(user);
 		} catch {
 			// Keep the last known account state while showing Settings offline.
 		}
@@ -1948,6 +1988,7 @@
 			inviteCode = '';
 			currentInviteId = '';
 		}
+		if (modal === 'settings') resetAccountForms(user);
 		if (modal === 'onboarding') dismissOnboarding();
 		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
 			resumeImport = false;
@@ -2029,6 +2070,7 @@
 			resumeImport = false;
 			apiKey = '';
 			deletePassword = '';
+			resetAccountForms(null);
 			stateEtag = null;
 			kitchen = createInitialState();
 			quarantineLegacyKitchen(localStorage);
@@ -2056,10 +2098,78 @@
 			verificationBusy = false;
 		}
 	}
+	async function saveAccountProfile(event: SubmitEvent) {
+		event.preventDefault();
+		if (!user || managedAuth) return;
+		const nextName = profileName.trim();
+		const nextEmail = profileEmail.trim();
+		const emailChanged = nextEmail.toLowerCase() !== user.email.toLowerCase();
+		if (emailChanged && !profileCurrentPassword) {
+			profileError = 'Enter your current password to change your email address.';
+			return;
+		}
+		profileBusy = true;
+		profileError = '';
+		error = '';
+		try {
+			const result = await request('/api/auth', {
+				action: 'updateAccountProfile',
+				name: nextName,
+				email: nextEmail,
+				...(emailChanged ? { currentPassword: profileCurrentPassword } : {})
+			});
+			user = result.user;
+			try {
+				localStorage.setItem('flavorithm-last-account', JSON.stringify(result.user));
+			} catch {}
+			resetAccountForms(result.user);
+			notify(
+				emailChanged
+					? 'Account email updated. Verification has been reset for the new address.'
+					: 'Display name updated.'
+			);
+		} catch (e) {
+			profileError = (e as Error).message;
+		} finally {
+			profileBusy = false;
+		}
+	}
+	async function submitPasswordChange(event: SubmitEvent) {
+		event.preventDefault();
+		if (!user || managedAuth) return;
+		if (newPassword !== confirmNewPassword) {
+			passwordError = 'New passwords do not match.';
+			return;
+		}
+		passwordBusy = true;
+		passwordError = '';
+		error = '';
+		try {
+			const result = await request('/api/auth', {
+				action: 'changePassword',
+				currentPassword,
+				newPassword
+			});
+			user = result.user;
+			currentPassword = '';
+			newPassword = '';
+			confirmNewPassword = '';
+			notify('Password updated. Other sessions have been signed out.');
+		} catch (e) {
+			passwordError = (e as Error).message;
+		} finally {
+			passwordBusy = false;
+		}
+	}
 	async function recover(event: SubmitEvent) {
 		event.preventDefault();
 		if (managedAuth) {
 			openAuthentication();
+			return;
+		}
+		if (modal !== 'reset' && !capabilities.emailDelivery) {
+			error =
+				'Email recovery is unavailable on this server. Reset the password with npm run auth:reset-password.';
 			return;
 		}
 		busy = true;
@@ -3118,7 +3228,10 @@
 								onclick={() => {
 									modal = 'recover';
 									error = '';
-								}}>Forgot your password?</button
+								}}
+								>{capabilities.emailDelivery
+									? 'Forgot your password?'
+									: 'Forgot your password? CLI recovery'}</button
 							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary full"
 							disabled={busy}
@@ -3213,17 +3326,18 @@
 							>Edit my taste preferences <SlidersHorizontal size={16} /></button
 						>
 					</div>
-					{#if user}<div class="settings-section">
-							<h3>{managedAuth ? 'Organization account' : 'Account email'}</h3>
-							<p class="muted">
-								{user.email}{managedAuth
-									? ' · Managed by your identity provider'
-									: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
-							</p>
-							{#if !managedAuth}
+					{#if user}{#if managedAuth}<div class="settings-section">
+								<h3>Organization account</h3>
+								<p class="muted">{user.email} · Managed by your identity provider</p>
+							</div>{:else}<div class="settings-section account-controls">
+								<h3>Account profile</h3>
+								<p class="muted">
+									{user.email} · {user.emailVerified ? 'Verified' : 'Not verified'}
+								</p>
 								{#if user.emailVerified}<p class="field-help">
 										Email verification is optional for using your kitchen.
 									</p>{:else}<button
+										type="button"
 										class="secondary"
 										disabled={!capabilities.emailDelivery || verificationBusy}
 										onclick={sendEmailVerification}
@@ -3231,8 +3345,87 @@
 									>{#if !capabilities.emailDelivery}<p class="field-help">
 											Email delivery is unavailable. Set RESEND_API_KEY and EMAIL_FROM to enable it.
 										</p>{/if}{/if}
-							{/if}
-						</div>{/if}
+								<form class="account-form" onsubmit={saveAccountProfile}>
+									<label class="field"
+										>Display name<input
+											required
+											minlength="2"
+											maxlength="80"
+											autocomplete="name"
+											bind:value={profileName}
+										/></label
+									>
+									<label class="field"
+										>Email address<input
+											type="email"
+											required
+											maxlength="254"
+											autocomplete="email"
+											bind:value={profileEmail}
+										/></label
+									>
+									<label class="field"
+										>Current password<input
+											type="password"
+											required={profileEmailChanged}
+											maxlength="128"
+											autocomplete="current-password"
+											bind:value={profileCurrentPassword}
+										/></label
+									>
+									<p class="field-help">
+										{profileEmailChanged
+											? 'Confirm with your current password to update your email. Verification status resets for a new address.'
+											: 'Required only when changing your email address.'}
+									</p>
+									{#if profileError}<p class="error" role="alert">{profileError}</p>{/if}
+									<button type="submit" class="secondary" disabled={profileBusy || !profileDirty}
+										>{profileBusy ? 'Saving profile…' : 'Save profile'}</button
+									>
+								</form>
+							</div>
+							<div class="settings-section account-controls">
+								<h3>Change password</h3>
+								<p class="muted">
+									Keeps this browser signed in and signs out sessions on other devices.
+								</p>
+								<form class="account-form" onsubmit={submitPasswordChange}>
+									<label class="field"
+										>Current password<input
+											type="password"
+											required
+											maxlength="128"
+											autocomplete="current-password"
+											bind:value={currentPassword}
+										/></label
+									>
+									<label class="field"
+										>New password<input
+											type="password"
+											required
+											minlength="10"
+											maxlength="128"
+											autocomplete="new-password"
+											bind:value={newPassword}
+										/></label
+									>
+									<label class="field"
+										>Confirm new password<input
+											type="password"
+											required
+											minlength="10"
+											maxlength="128"
+											autocomplete="new-password"
+											bind:value={confirmNewPassword}
+										/></label
+									>
+									<p class="field-help">Use between 10 and 128 characters.</p>
+									{#if passwordError}<p class="error" role="alert">{passwordError}</p>{/if}
+									<button type="submit" class="secondary" disabled={passwordBusy}
+										>{passwordBusy ? 'Updating password…' : 'Update password'}</button
+									>
+								</form>
+							</div>{/if}{/if}
 					<div class="settings-section">
 						<h3>Web recipe search</h3>
 						{#if capabilities.recipeSearch}<p class="muted">
@@ -3453,13 +3646,10 @@
 						class="dialog-spark">✳</span
 					>
 					<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
-					<p class="muted">
-						{modal === 'reset'
-							? 'Choose a new password to open your kitchen again.'
-							: 'We’ll email a link to reset your password.'}
-					</p>
-					<form onsubmit={recover}>
-						{#if modal === 'reset'}<label class="field"
+					{#if modal === 'reset'}
+						<p class="muted">Choose a new password to open your kitchen again.</p>
+						<form onsubmit={recover}>
+							<label class="field"
 								>New password<input
 									type="password"
 									required
@@ -3468,23 +3658,68 @@
 									autocomplete="new-password"
 									bind:value={password}
 								/></label
-							>{:else}<label class="field"
+							>{#if error}<p class="error" role="alert">{error}</p>{/if}<button
+								class="primary full"
+								disabled={busy}
+								>{busy ? 'One moment…' : 'Reset password'}<ArrowRight size={17} /></button
+							>
+						</form>
+					{:else if capabilities.emailDelivery}
+						<p class="muted">We’ll email a link to reset your password.</p>
+						<form onsubmit={recover}>
+							<label class="field"
 								>Email address<input
 									type="email"
 									required
 									autocomplete="email"
 									bind:value={email}
 								/></label
-							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-							class="primary full"
-							disabled={busy}
-							>{busy
-								? 'One moment…'
-								: modal === 'reset'
-									? 'Reset password'
-									: 'Send reset link'}<ArrowRight size={17} /></button
+							>{#if error}<p class="error" role="alert">{error}</p>{/if}<button
+								class="primary full"
+								disabled={busy}
+								>{busy ? 'One moment…' : 'Send reset link'}<ArrowRight size={17} /></button
+							>
+						</form>
+						<button
+							type="button"
+							class="text-button full"
+							onclick={() => {
+								modal = 'auth';
+								authMode = 'login';
+								error = '';
+							}}>Back to sign in</button
 						>
-					</form>
+					{:else}
+						<p class="muted">
+							Email delivery is not configured on this server, so reset links cannot be sent by
+							email.
+						</p>
+						<div class="cli-recovery-box">
+							<p class="field-help">
+								A server operator can reset a local account password and revoke active sessions from
+								the host or container terminal:
+							</p>
+							<div class="invite-code">
+								<code
+									>npm run auth:reset-password -- --email {email.trim() || 'you@example.com'}</code
+								>
+							</div>
+							<p class="field-help">
+								Add <code>--password-stdin</code> to pipe a chosen password, or set
+								<code>RESEND_API_KEY</code> and <code>EMAIL_FROM</code> to enable emailed reset links.
+							</p>
+						</div>
+						{#if error}<p class="error" role="alert">{error}</p>{/if}
+						<button
+							type="button"
+							class="secondary full"
+							onclick={() => {
+								modal = 'auth';
+								authMode = 'login';
+								error = '';
+							}}>Back to sign in</button
+						>
+					{/if}
 				{:else if modal === 'deleteRecipe'}<span class="dialog-spark">✳</span>
 					<h2>Delete saved recipe?</h2>
 					<p class="muted">

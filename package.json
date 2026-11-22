@@ -10,6 +10,7 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"test": "node --experimental-strip-types --test tests/*.test.ts",
 		"seed:dev": "node --experimental-strip-types scripts/seed-dev.mjs",
+		"auth:reset-password": "node --env-file-if-exists=.env --experimental-strip-types scripts/reset-password.mjs",
 		"catalog:update": "node scripts/update-provider-endpoints.mjs",
 		"format": "prettier --write .",
 		"format:check": "prettier --check .",

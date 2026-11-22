@@ -4,6 +4,7 @@ import { z } from 'zod';
 import {
 	ApiError,
 	assertSameOrigin,
+	changePassword,
 	consumeRateLimit,
 	deleteUserAccount,
 	deleteSession,
@@ -16,6 +17,7 @@ import {
 	resetUserPassword,
 	sendEmailVerificationEmail,
 	sendPasswordResetEmail,
+	updateAccountProfile,
 	verifyEmailToken
 } from '#lib/server/db.ts';
 import { getAuthMetadata, getAuthMode } from '#lib/server/sso.ts';
@@ -35,6 +37,17 @@ const authActionSchema = z.discriminatedUnion('action', [
 	}),
 	z.object({ action: z.literal('logout') }),
 	z.object({ action: z.literal('deleteAccount'), password: z.string().min(1).max(128) }),
+	z.object({
+		action: z.literal('changePassword'),
+		currentPassword: z.string().min(1).max(128),
+		newPassword: z.string().min(10).max(128)
+	}),
+	z.object({
+		action: z.literal('updateAccountProfile'),
+		name: z.string().trim().min(2).max(80).optional(),
+		email: z.string().trim().email().max(254).optional(),
+		currentPassword: z.string().max(128).optional()
+	}),
 	z.object({
 		action: z.literal('requestPasswordReset'),
 		email: z.string().trim().email().max(254)
@@ -121,6 +134,27 @@ export const POST: RequestHandler = async (event) => {
 			await deleteUserAccount(event.locals.user.id, payload.password);
 			event.cookies.delete('flavorithm_session', { path: '/' });
 			return json({ user: null });
+		}
+		if (payload.action === 'changePassword') {
+			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
+			consumeRateLimit(`change-password:${event.locals.user.id}`, 5, 15 * 60 * 1000);
+			const result = await changePassword(
+				event.locals.user.id,
+				payload.currentPassword,
+				payload.newPassword
+			);
+			setSessionCookie(event.cookies, event.request, result.token, result.expiresAt);
+			return json({ user: result.user });
+		}
+		if (payload.action === 'updateAccountProfile') {
+			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
+			consumeRateLimit(`account-profile:${event.locals.user.id}`, 10, 15 * 60 * 1000);
+			const user = await updateAccountProfile(event.locals.user.id, {
+				name: payload.name,
+				email: payload.email,
+				currentPassword: payload.currentPassword
+			});
+			return json({ user });
 		}
 		if (payload.action === 'requestPasswordReset') {
 			const apiKey = process.env.RESEND_API_KEY?.trim();

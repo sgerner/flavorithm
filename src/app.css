@@ -4435,3 +4435,26 @@ html.dark[data-theme='nosh'] {
 .shopping-row.checked .shopping-name {
 	text-decoration: line-through;
 }
+
+.flavor-dialog .primary,
+.flavor-dialog .secondary,
+.flavor-dialog .text-button,
+.flavor-dialog .theme-grid button,
+.flavor-dialog .dialog-close {
+	min-height: 44px;
+}
+.flavor-dialog .dialog-close {
+	min-width: 44px;
+}
+.account-controls > button {
+	margin-top: 12px;
+}
+.account-form {
+	margin-top: 16px;
+}
+.cli-recovery-box .field-help {
+	margin: 12px 0;
+}
+.cli-recovery-box .invite-code {
+	margin: 12px 0;
+}

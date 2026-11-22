@@ -344,3 +344,147 @@ test('reasoning preferences survive persistence and reject invalid budgets', asy
 	state.preferences.reasoning.budgetTokens = -1;
 	assert.equal(backend.validateAppState(state), null);
 });
+
+test('local password rotation keeps a rotated session while revoking other sessions and reset tokens', async () => {
+	const firstDevice = await backend.registerUser(
+		'Nadia Cook',
+		'nadia@example.com',
+		'initial-local-password'
+	);
+	const secondDevice = await backend.loginUser('nadia@example.com', 'initial-local-password');
+	const pendingReset = backend.issuePasswordReset('nadia@example.com')!;
+
+	await assert.rejects(
+		() =>
+			backend.changePassword(firstDevice.user.id, 'wrong-password', 'rotated-local-password-123'),
+		{ status: 401 }
+	);
+	await assert.rejects(
+		() => backend.changePassword(firstDevice.user.id, 'initial-local-password', 'short'),
+		{ status: 400 }
+	);
+	await assert.rejects(
+		() => backend.changePassword(firstDevice.user.id, 'initial-local-password', 'x'.repeat(129)),
+		{ status: 400 }
+	);
+
+	const rotated = await backend.changePassword(
+		firstDevice.user.id,
+		'initial-local-password',
+		'rotated-local-password-123'
+	);
+	assert.notEqual(rotated.token, firstDevice.token);
+	assert.notEqual(rotated.token, secondDevice.token);
+	assert.equal(backend.getUserFromSession(firstDevice.token), null);
+	assert.equal(backend.getUserFromSession(secondDevice.token), null);
+	assert.equal(backend.getUserFromSession(rotated.token)?.id, firstDevice.user.id);
+	await assert.rejects(
+		() => backend.resetUserPassword(pendingReset.token, 'another-valid-password-123'),
+		{ status: 400 }
+	);
+	await assert.rejects(() => backend.loginUser('nadia@example.com', 'initial-local-password'), {
+		status: 401
+	});
+	assert.equal(
+		(await backend.loginUser('nadia@example.com', 'rotated-local-password-123')).user.id,
+		firstDevice.user.id
+	);
+
+	const ssoUser = backend.resolveExternalIdentity({
+		issuer: 'https://idp.example.com',
+		subject: 'sso-nadia',
+		email: 'sso-nadia@example.com',
+		name: 'SSO Nadia',
+		emailVerified: true
+	});
+	await assert.rejects(
+		() => backend.changePassword(ssoUser.id, 'anything', 'rotated-local-password-123'),
+		{ status: 403 }
+	);
+});
+
+test('local profile updates validate passwords on email changes, clear verification, and block collisions', async () => {
+	const account = await backend.registerUser(
+		'Original Name',
+		'profile-user@example.com',
+		'profile-secure-password'
+	);
+	await backend.registerUser('Existing Neighbor', 'taken@example.com', 'neighbor-secure-password');
+
+	const initialVerify = backend.issueEmailVerification(account.user.id)!;
+	const verifiedUser = backend.verifyEmailToken(initialVerify.token);
+	assert.equal(verifiedUser.emailVerified, true);
+
+	const renamed = await backend.updateAccountProfile(account.user.id, {
+		name: '  Updated Chef  ',
+		email: 'PROFILE-USER@example.com'
+	});
+	assert.equal(renamed.name, 'Updated Chef');
+	assert.equal(renamed.email, 'profile-user@example.com');
+	assert.equal(renamed.emailVerified, true);
+	assert.equal(backend.getUserFromSession(account.token)?.name, 'Updated Chef');
+
+	await assert.rejects(
+		() => backend.updateAccountProfile(account.user.id, { email: 'new-address@example.com' }),
+		{ status: 401 }
+	);
+	await assert.rejects(
+		() =>
+			backend.updateAccountProfile(account.user.id, {
+				email: 'new-address@example.com',
+				currentPassword: 'wrong-password'
+			}),
+		{ status: 401 }
+	);
+	await assert.rejects(
+		() =>
+			backend.updateAccountProfile(account.user.id, {
+				email: 'TAKEN@EXAMPLE.COM',
+				currentPassword: 'profile-secure-password'
+			}),
+		{ status: 409 }
+	);
+
+	const reEmail = await backend.updateAccountProfile(account.user.id, {
+		name: 'Chef Deux',
+		email: 'New-Address@Example.com',
+		currentPassword: 'profile-secure-password'
+	});
+	assert.equal(reEmail.name, 'Chef Deux');
+	assert.equal(reEmail.email, 'new-address@example.com');
+	assert.equal(reEmail.emailVerified, false);
+
+	const pendingNewVerify = backend.issueEmailVerification(account.user.id)!;
+	const pendingReset = backend.issuePasswordReset('new-address@example.com')!;
+	const thirdEmail = await backend.updateAccountProfile(account.user.id, {
+		email: 'third-address@example.com',
+		currentPassword: 'profile-secure-password'
+	});
+	assert.equal(thirdEmail.email, 'third-address@example.com');
+	assert.equal(thirdEmail.emailVerified, false);
+	assert.throws(() => backend.verifyEmailToken(pendingNewVerify.token), { status: 400 });
+	await assert.rejects(
+		() => backend.resetUserPassword(pendingReset.token, 'replacement-password-123'),
+		{ status: 400 }
+	);
+
+	const ssoUser = backend.resolveExternalIdentity({
+		issuer: 'https://idp.example.com',
+		subject: 'sso-profile',
+		email: 'sso-profile@example.com',
+		name: 'SSO Profile',
+		emailVerified: true
+	});
+	await assert.rejects(
+		() => backend.updateAccountProfile(ssoUser.id, { name: 'Attempted Local Edit' }),
+		{ status: 403 }
+	);
+	await assert.rejects(
+		() => backend.resetLocalUserPassword('sso-profile@example.com', 'operator-password-123'),
+		{ status: 403 }
+	);
+	await assert.rejects(
+		() => backend.resetLocalUserPassword('unknown@example.com', 'operator-password-123'),
+		{ status: 404 }
+	);
+});

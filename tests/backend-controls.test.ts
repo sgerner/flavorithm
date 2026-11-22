@@ -285,3 +285,176 @@ test('auth and household endpoints expose status, hashed invites, and one-use ve
 	assert.equal(typeof authStatusData.capabilities.recipeSearch, 'boolean');
 	assert.equal(JSON.stringify(authStatusData).includes(verification.token), false);
 });
+
+test('auth endpoint rotates session cookies on password change, updates profiles, and enforces guards', async () => {
+	const userAccount = await backend.registerUser(
+		'Control User',
+		'control-user@example.com',
+		'control-initial-password'
+	);
+	await backend.registerUser(
+		'Collision User',
+		'collision-route@example.com',
+		'collision-initial-password'
+	);
+
+	assert.equal(
+		(
+			await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{},
+					{
+						action: 'changePassword',
+						currentPassword: 'control-initial-password',
+						newPassword: 'control-rotated-password'
+					}
+				) as never
+			)
+		).status,
+		401
+	);
+
+	const crossOriginEvent = {
+		...postEvent(
+			'/api/auth',
+			{ user: userAccount.user },
+			{ action: 'updateAccountProfile', name: 'Cross Origin' }
+		),
+		request: new Request('https://flavorithm.example/api/auth', {
+			method: 'POST',
+			headers: { origin: 'https://evil.example', 'content-type': 'application/json' },
+			body: JSON.stringify({ action: 'updateAccountProfile', name: 'Cross Origin' })
+		})
+	};
+	assert.equal((await authRoute.POST(crossOriginEvent as never)).status, 403);
+
+	assert.equal(
+		(
+			await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{ user: userAccount.user, authMode: 'oidc' },
+					{ action: 'updateAccountProfile', name: 'Blocked In OIDC' }
+				) as never
+			)
+		).status,
+		403
+	);
+
+	const verifyToken = backend.issueEmailVerification(userAccount.user.id)!;
+	backend.verifyEmailToken(verifyToken.token);
+	const currentVerified = backend.getUserFromSession(userAccount.token)!;
+	assert.equal(currentVerified.emailVerified, true);
+
+	const nameOnlyResponse = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{ user: currentVerified },
+			{ action: 'updateAccountProfile', name: 'Renamed Control User' }
+		) as never
+	);
+	assert.equal(nameOnlyResponse.status, 200);
+	const nameOnlyPayload = (await nameOnlyResponse.json()) as {
+		user: { name: string; email: string; emailVerified: boolean };
+	};
+	assert.equal(nameOnlyPayload.user.name, 'Renamed Control User');
+	assert.equal(nameOnlyPayload.user.emailVerified, true);
+
+	assert.equal(
+		(
+			await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{ user: currentVerified },
+					{
+						action: 'updateAccountProfile',
+						email: 'COLLISION-ROUTE@example.com',
+						currentPassword: 'control-initial-password'
+					}
+				) as never
+			)
+		).status,
+		409
+	);
+
+	const emailChangeResponse = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{ user: currentVerified },
+			{
+				action: 'updateAccountProfile',
+				name: 'Renamed Control User',
+				email: 'control-updated@example.com',
+				currentPassword: 'control-initial-password'
+			}
+		) as never
+	);
+	assert.equal(emailChangeResponse.status, 200);
+	const emailChangePayload = (await emailChangeResponse.json()) as {
+		user: { email: string; emailVerified: boolean };
+	};
+	assert.equal(emailChangePayload.user.email, 'control-updated@example.com');
+	assert.equal(emailChangePayload.user.emailVerified, false);
+
+	let setCookieCall: { name: string; value: string; options: Record<string, unknown> } | undefined;
+	const rotateEvent = {
+		...postEvent(
+			'/api/auth',
+			{ user: backend.getUserFromSession(userAccount.token) },
+			{
+				action: 'changePassword',
+				currentPassword: 'control-initial-password',
+				newPassword: 'control-rotated-password'
+			}
+		),
+		getClientAddress: () => '192.0.2.99',
+		cookies: {
+			get: () => userAccount.token,
+			set: (name: string, value: string, options: Record<string, unknown>) => {
+				setCookieCall = { name, value, options };
+			},
+			delete: () => undefined
+		}
+	};
+	const rotateResponse = await authRoute.POST(rotateEvent as never);
+	assert.equal(rotateResponse.status, 200);
+	assert.equal(setCookieCall?.name, 'flavorithm_session');
+	assert.ok(setCookieCall?.value);
+	assert.notEqual(setCookieCall?.value, userAccount.token);
+	assert.equal(setCookieCall?.options.httpOnly, true);
+	assert.equal(setCookieCall?.options.sameSite, 'lax');
+	assert.equal(setCookieCall?.options.secure, true);
+	assert.equal(backend.getUserFromSession(userAccount.token), null);
+	const activeAfterRotate = backend.getUserFromSession(setCookieCall?.value);
+	assert.equal(activeAfterRotate?.id, userAccount.user.id);
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const wrongAttempt = await authRoute.POST({
+			...postEvent(
+				'/api/auth',
+				{ user: activeAfterRotate },
+				{
+					action: 'changePassword',
+					currentPassword: 'wrong-password',
+					newPassword: 'another-rotated-password'
+				}
+			),
+			getClientAddress: () => `192.0.2.${120 + attempt}`
+		} as never);
+		assert.equal(wrongAttempt.status, 401);
+	}
+	const rateLimited = await authRoute.POST({
+		...postEvent(
+			'/api/auth',
+			{ user: activeAfterRotate },
+			{
+				action: 'changePassword',
+				currentPassword: 'wrong-password',
+				newPassword: 'another-rotated-password'
+			}
+		),
+		getClientAddress: () => '192.0.2.150'
+	} as never);
+	assert.equal(rateLimited.status, 429);
+});

@@ -105,6 +105,8 @@ try {
 	for (const action of [
 		'login',
 		'register',
+		'changePassword',
+		'updateAccountProfile',
 		'requestPasswordReset',
 		'resetPassword',
 		'requestEmailVerification',
