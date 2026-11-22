@@ -565,3 +565,101 @@ test('personal preferences survive Host AI cycles, never persist host-chatgpt, a
 
 	delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
 });
+
+test('client workflow reconciliation and kitchen state sanitization preserve personal AI preferences and usePersonalAI override', async () => {
+	const { createNewUserState, defaultPreferences } = await import('../src/lib/data.ts');
+	const { entitledChatGPTAccountId, reconcileChatGPTPreferences } =
+		await import('../src/lib/client-workflows.ts');
+	const { sanitizeKitchenState } = await import('../src/lib/guest-storage.ts');
+
+	// 1. reconcileChatGPTPreferences leaves personal provider, model, account, and reasoning intact when Host AI is active.
+	const personalPrefs = {
+		...defaultPreferences,
+		provider: 'anthropic',
+		model: 'claude-sonnet-4',
+		chatgptAccountId: 'acct-personal',
+		reasoning: { enabled: true, budgetTokens: 4096 }
+	};
+	const hostSummary = {
+		host: { model: 'gpt-5-codex' },
+		accounts: [
+			{ id: 'host-chatgpt', connected: true, planEnabled: true },
+			{ id: 'acct-personal', connected: true, planEnabled: true }
+		]
+	};
+	reconcileChatGPTPreferences(personalPrefs, hostSummary);
+	assert.equal(personalPrefs.provider, 'anthropic');
+	assert.equal(personalPrefs.model, 'claude-sonnet-4');
+	assert.equal(personalPrefs.chatgptAccountId, 'acct-personal');
+	assert.deepEqual(personalPrefs.reasoning, { enabled: true, budgetTokens: 4096 });
+
+	// 2. Legacy host-chatgpt cached in client preferences is cleared without touching reasoning.
+	const legacyPrefs = {
+		...defaultPreferences,
+		provider: 'chatgpt',
+		model: 'gpt-5-codex',
+		chatgptAccountId: 'host-chatgpt',
+		reasoning: { effort: 'high' }
+	};
+	reconcileChatGPTPreferences(legacyPrefs, {
+		host: { model: 'gpt-5-codex' },
+		accounts: [{ id: 'host-chatgpt', connected: true, planEnabled: true }]
+	});
+	assert.equal(legacyPrefs.chatgptAccountId, undefined);
+	assert.equal(legacyPrefs.model, '');
+	assert.deepEqual(legacyPrefs.reasoning, { effort: 'high' });
+
+	// 3. entitledChatGPTAccountId skips account catalog queries while Host AI is active by default, unlocks on usePersonalAI, and never returns host-chatgpt.
+	assert.equal(
+		entitledChatGPTAccountId(
+			{ provider: 'chatgpt', chatgptAccountId: 'acct-personal' },
+			hostSummary.accounts,
+			hostSummary.host
+		),
+		null
+	);
+	assert.equal(
+		entitledChatGPTAccountId(
+			{ provider: 'chatgpt', chatgptAccountId: 'acct-personal', usePersonalAI: true },
+			hostSummary.accounts,
+			hostSummary.host
+		),
+		'acct-personal'
+	);
+	assert.equal(
+		entitledChatGPTAccountId(
+			{ provider: 'chatgpt', chatgptAccountId: 'host-chatgpt', usePersonalAI: true },
+			hostSummary.accounts,
+			hostSummary.host
+		),
+		null
+	);
+
+	// 4. sanitizeKitchenState preserves usePersonalAI across sync staging/adoption and strips legacy host-chatgpt.
+	const overrideState = createNewUserState();
+	overrideState.preferences = {
+		...defaultPreferences,
+		provider: 'anthropic',
+		model: 'claude-sonnet-4',
+		usePersonalAI: true,
+		reasoning: { enabled: true, budgetTokens: 4096 }
+	};
+	const sanitizedOverride = sanitizeKitchenState(overrideState);
+	assert.equal(sanitizedOverride.preferences.usePersonalAI, true);
+	assert.equal(sanitizedOverride.preferences.provider, 'anthropic');
+	assert.equal(sanitizedOverride.preferences.model, 'claude-sonnet-4');
+	assert.deepEqual(sanitizedOverride.preferences.reasoning, { enabled: true, budgetTokens: 4096 });
+
+	const legacyHostState = createNewUserState();
+	legacyHostState.preferences = {
+		...defaultPreferences,
+		provider: 'chatgpt',
+		model: 'gpt-5-codex',
+		chatgptAccountId: 'host-chatgpt',
+		reasoning: { effort: 'medium' }
+	};
+	const sanitizedLegacy = sanitizeKitchenState(legacyHostState);
+	assert.equal(sanitizedLegacy.preferences.chatgptAccountId, undefined);
+	assert.equal(sanitizedLegacy.preferences.model, '');
+	assert.deepEqual(sanitizedLegacy.preferences.reasoning, { effort: 'medium' });
+});

@@ -234,7 +234,7 @@ const recipeSchema = z.object({
 	steps: z.array(z.string().max(10_000)).max(200),
 	nutrition: nutritionSchema,
 	source: publicUrlSchema.optional(),
-	provenance: z.enum(['web-import', 'ai-generated']).optional(),
+	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),

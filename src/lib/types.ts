@@ -32,7 +32,7 @@ export type Recipe = {
 		protein: number;
 	};
 	source?: string;
-	provenance?: 'web-import' | 'ai-generated';
+	provenance?: 'web-import' | 'ai-generated' | 'manual';
 	importNotes?: string[];
 	nutritionStale?: boolean;
 	rating?: number;
@@ -54,6 +54,7 @@ export type ShoppingItem = {
 	quantity: number;
 	unit: string;
 	checked: boolean;
+	category?: string;
 	sourceKey?: string;
 };
 export type Preferences = {

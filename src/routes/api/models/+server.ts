@@ -20,22 +20,21 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 					{ headers: { 'cache-control': 'no-store' } }
 				);
 			}
+			const catalogPromise = getPublicModelCatalog(fetch).catch(() => null);
 			const connection = await getChatGPTConnection(
 				host ? host.userId : locals.user.id,
 				host ? host.accountId : accountId,
 				fetch
 			);
-			const result = await listChatGPTModels(connection.accessToken, connection.fetcher);
-			try {
-				const catalog = await getPublicModelCatalog(fetch);
-				const openai = catalog.providers.find((provider) => provider.id === 'openai');
-				for (const model of result.providers[0].models) {
-					const metadata = openai?.models.find((candidate) => candidate.id === model.id);
-					if (metadata?.reasoning && !model.reasoning)
-						Object.assign(model, { reasoning: metadata.reasoning });
-				}
-			} catch {
-				/* An unavailable public catalog must not hide entitled account models. */
+			const [result, catalogData] = await Promise.all([
+				listChatGPTModels(connection.accessToken, connection.fetcher),
+				catalogPromise
+			]);
+			const openai = catalogData?.providers.find((provider) => provider.id === 'openai');
+			for (const model of result.providers[0].models) {
+				const metadata = openai?.models.find((candidate) => candidate.id === model.id);
+				if (metadata?.reasoning && !model.reasoning)
+					Object.assign(model, { reasoning: metadata.reasoning });
 			}
 			return Response.json(result, {
 				headers: { 'cache-control': 'no-store' }

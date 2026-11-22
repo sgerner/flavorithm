@@ -45,20 +45,12 @@ const recipe = z.object({
 	steps: z.array(text).max(200),
 	nutrition,
 	source: z.string().max(4000).optional(),
-	provenance: z.enum(['web-import', 'ai-generated']).optional(),
+	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
 	importNotes: z.array(z.string().max(1000)).max(50).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
-});
-const pantry = z.object({
-	id,
-	name: z.string().trim().min(1).max(200),
-	quantity,
-	unit: z.string().max(40),
-	category: z.string().max(80),
-	expires: z.string().max(40).optional()
 });
 const date = z
 	.string()
@@ -67,6 +59,14 @@ const date = z
 		const d = new Date(value + 'T12:00:00Z');
 		return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === value;
 	}, 'Use a real calendar date.');
+const pantry = z.object({
+	id,
+	name: z.string().trim().min(1).max(200),
+	quantity,
+	unit: z.string().max(40),
+	category: z.string().max(80),
+	expires: z.union([date, z.literal('')]).optional()
+});
 const meal = z.object({
 	id,
 	date,
@@ -215,6 +215,9 @@ export function applyButlerCommands(
 			case 'recipe.upsert': {
 				const previous = state.recipes.find((item) => item.id === command.recipe.id);
 				const updated = { ...command.recipe };
+				if (previous?.provenance === 'manual') updated.provenance = 'manual';
+				else if (updated.provenance === undefined && previous?.provenance)
+					updated.provenance = previous.provenance;
 				if (
 					previous &&
 					(previous.servings !== updated.servings ||
