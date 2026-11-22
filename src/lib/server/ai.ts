@@ -2361,7 +2361,7 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
 type CatalogCacheEntry = { promise?: Promise<SupportedModelResponse>; expiresAt: number };
 const sharedPublicCatalogCache: CatalogCacheEntry = { expiresAt: 0 };
-const customFetcherCatalogCache = new WeakMap<Fetcher, CatalogCacheEntry>();
+let customFetcherCatalogCache = new WeakMap<Fetcher, CatalogCacheEntry>();
 
 function catalogCacheFor(fetcher: Fetcher): CatalogCacheEntry {
 	if (fetcher === globalThis.fetch || fetcher.name === 'server_fetch') {
@@ -2408,4 +2408,11 @@ export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<Support
 		cache.promise = pending;
 	}
 	return cache.promise;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	sharedPublicCatalogCache.promise = undefined;
+	sharedPublicCatalogCache.expiresAt = 0;
+	customFetcherCatalogCache = new WeakMap<Fetcher, CatalogCacheEntry>();
 }

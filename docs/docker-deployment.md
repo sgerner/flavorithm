@@ -37,9 +37,11 @@ project.
 The online backup command uses Node 24's SQLite backup API against the running
 database, so committed changes in the WAL are included. It writes a temporary
 backup into `/app/data`, copies it out of the container, and removes the
-temporary file. The local `oauth.key` is copied separately when present; if you
-use hosted OAuth, preserve the matching `FLAVORITHM_OAUTH_ENCRYPTION_KEY` from
-the private deployment configuration instead.
+temporary file. Always copy `oauth.key` separately when present (Codex
+device-code connections, host-wide ChatGPT sharing, and local OAuth encrypt
+tokens with `oauth.key` when that file exists), and also preserve any
+configured `FLAVORITHM_OAUTH_ENCRYPTION_KEY` from `.env` (required for
+registered hosted OAuth and used as the fallback when `oauth.key` is absent).
 
 ```sh
 mkdir -p backups
@@ -67,23 +69,30 @@ Backups contain private kitchen data and may contain OAuth credentials. Keep
 the files and any hosted encryption key access restricted. Test restores before
 relying on the backups.
 
-To restore, stop the app gracefully first and keep its stopped Compose
-container in place. The helper below uses that container's mounts and writes
-as the image's runtime user (UID 1000), so the named volume and Skynet bind
-mount retain the expected ownership. It also removes stale WAL and shared-memory
-sidecars after replacing the database.
+To restore, stop the updater (on Skynet) and app gracefully first, then ensure
+the `flavorithm:local` image and stopped `flavorithm` container exist before
+copying files in. On a fresh Skynet host, create `/home/skynet/opt/appdata/flavorithm`
+with `chown 1000:1000` first as shown below. The helper uses the container's
+mounts and writes as the image's runtime user (UID 1000), so the named volume
+and Skynet bind mount retain the expected ownership, and removes stale WAL and
+shared-memory sidecars after replacing the database.
 
 ```sh
+if docker compose config --services | grep -qx flavorithm-updater; then
+  docker compose stop flavorithm-updater
+fi
+docker compose stop --timeout 30 flavorithm
+docker compose up --no-start --build flavorithm
 container_id="$(docker compose ps -aq flavorithm)"
 test -n "$container_id"
-docker compose stop --timeout 30 flavorithm
+
 docker run --rm --volumes-from "$container_id" --user 1000:1000 --entrypoint sh flavorithm:local -c '
   cat > /app/data/flavorithm.sqlite
   chmod 600 /app/data/flavorithm.sqlite
   rm -f /app/data/flavorithm.sqlite-wal /app/data/flavorithm.sqlite-shm
 ' < backups/flavorithm.sqlite
 
-# Only when the backup uses local OAuth encryption and includes oauth.key.
+# Restore oauth.key whenever present (including Codex device-code and host-AI setups).
 if [ -f backups/oauth.key ]; then
   docker run --rm --volumes-from "$container_id" --user 1000:1000 --entrypoint sh flavorithm:local -c '
     cat > /app/data/oauth.key
@@ -92,12 +101,16 @@ if [ -f backups/oauth.key ]; then
 fi
 
 docker compose up -d flavorithm
+# On Skynet, restart flavorithm-updater only after flavorithm starts with the restored database and key:
+# docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml up -d flavorithm-updater
 ```
 
-For hosted OAuth, restore the matching `FLAVORITHM_OAUTH_ENCRYPTION_KEY` in
-`.env` before starting the app. Do not copy a database by itself while the app
-is running: SQLite may have committed data in its WAL that is not in the main
-database file.
+If the deployment configures `FLAVORITHM_OAUTH_ENCRYPTION_KEY` (for registered
+hosted OAuth or Codex fallback when `oauth.key` is absent), restore that
+matching value in `.env` before starting `flavorithm`. Preserve `oauth.key`
+whenever the backup includes it so existing Codex and host-AI credentials still
+decrypt. Do not copy a database by itself while the app is running: SQLite may
+have committed data in its WAL that is not in the main database file.
 
 ## Deploy on Skynet with Authentik
 
@@ -113,8 +126,14 @@ existing services:
   forwards sign-in checks to Authentik, copies the authenticated identity, and
   injects the proxy assertion only after Authentik accepts the request.
 - [`deploy/skynet/compose.override.yml`](../deploy/skynet/compose.override.yml)
-  removes the public host port, uses the persistent app-data bind mount, and
-  starts the GitHub source updater.
+  removes the public host port, uses the persistent app-data bind mount,
+  connects `flavorithm` to the private `flavorithm-whisper` CPU transcription
+  service on the internal `voice` network, and defines the `flavorithm-updater`
+  GitHub source updater.
+- [`deploy/skynet/setup-whisper.sh`](../deploy/skynet/setup-whisper.sh)
+  downloads `ggml-base.bin` into `/home/skynet/opt/appdata/flavorithm-whisper`,
+  pulls and starts `flavorithm-whisper` alongside `flavorithm`, and waits for
+  its `/health` check to pass.
 
 Generate a random shared secret with `openssl rand -hex 32` and store the same
 value in the app's `.env` and the Caddy-only environment file. Keep both files
@@ -150,16 +169,24 @@ mkdir -p /home/skynet/opt/appdata/flavorithm
 chown 1000:1000 /home/skynet/opt/appdata/flavorithm
 ```
 
-After configuration is ready, build the app and launch the GitHub updater from
-the repository root:
+After configuration is ready, build the app, provision local Whisper with
+`deploy/skynet/setup-whisper.sh`, and launch the GitHub updater from the
+repository root:
 
 ```sh
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml build --pull flavorithm
-docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml up -d flavorithm
+./deploy/skynet/setup-whisper.sh
 mkdir -p /home/skynet/opt/appdata/flavorithm-updater
 git rev-parse HEAD > /home/skynet/opt/appdata/flavorithm-updater/deployed-sha
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml up -d flavorithm-updater
 ```
+
+`setup-whisper.sh` downloads `ggml-base.bin` once under
+`/home/skynet/opt/appdata/flavorithm-whisper`, starts `flavorithm-whisper` and
+`flavorithm`, and waits until `flavorithm-whisper` reports healthy. If you start
+`flavorithm` without `flavorithm-whisper`, `/api/voice` detects that Whisper is
+unreachable and keeps `Automatic` voice input on browser dictation until
+`setup-whisper.sh` completes.
 
 The updater checks the public `main` branch every 15 minutes, fast-forwards the
 checkout, rebuilds the image, and records a commit only after the health check

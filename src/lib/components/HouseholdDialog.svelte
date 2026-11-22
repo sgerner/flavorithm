@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { ArrowRight, Copy, Plus } from '@lucide/svelte';
+	import { ArrowRight, Copy, Download, Plus } from '@lucide/svelte';
 
 	export type HouseholdMember = { id: string; name: string; email: string; role: string };
 	export type HouseholdInvite = { inviteId: string; expiresAt: number };
@@ -22,11 +22,15 @@
 		oncancelremove,
 		onconfirmremove,
 		onjoin,
+		onconfirmjoin,
+		oncanceljoin,
+		onexportkitchen,
 		onaskleave,
+		onstay,
 		onconfirmleave,
 		onnotify
 	}: {
-		mode: 'household' | 'removeMember' | 'leave';
+		mode: 'household' | 'confirmJoin' | 'removeMember' | 'leave';
 		userId?: string;
 		members: HouseholdMember[];
 		householdInvites: HouseholdInvite[];
@@ -43,7 +47,11 @@
 		oncancelremove: () => void;
 		onconfirmremove: () => void;
 		onjoin: () => void;
+		onconfirmjoin: () => void;
+		oncanceljoin: () => void;
+		onexportkitchen: () => void;
 		onaskleave: () => void;
+		onstay: () => void;
 		onconfirmleave: () => void;
 		onnotify: (message: string) => void;
 	} = $props();
@@ -131,13 +139,39 @@
 			autocomplete="off"
 		/></label
 	>
-	<button class="secondary full" disabled={householdBusy || !joinCode.trim()} onclick={onjoin}
-		>Join household <ArrowRight size={17} /></button
+	<button
+		class="secondary full"
+		disabled={householdBusy || !joinCode.trim()}
+		onclick={() => onjoin()}>Join household <ArrowRight size={17} /></button
 	>
 	{#if error}<p class="error" role="alert">{error}</p>{/if}
-	<button class="text-button danger full" disabled={householdBusy} onclick={onaskleave}
-		>Leave this household</button
+	{#if members.length > 1}
+		<button class="text-button danger full" disabled={householdBusy} onclick={onaskleave}
+			>Leave this household</button
+		>
+	{:else if members.length === 1 || !householdBusy}
+		<p class="field-help">
+			You already have your own personal kitchen. Invite someone above to share it, or enter an
+			invite code to join another household.
+		</p>
+	{/if}
+{:else if mode === 'confirmJoin'}
+	<h2>Replace your personal kitchen?</h2>
+	<p class="muted">
+		Joining this household will replace your current personal kitchen, including any saved recipes,
+		cover photos, pantry items, planned meals, and shopping list. Download a backup first if you
+		want to keep a copy.
+	</p>
+	<button class="secondary full" disabled={householdBusy} onclick={onexportkitchen}
+		><Download size={17} /> Export backup</button
 	>
+	{#if error}<p class="error" role="alert">{error}</p>{/if}
+	<div class="dialog-actions">
+		<button class="secondary" disabled={householdBusy} onclick={oncanceljoin}>Cancel</button>
+		<button class="primary danger-action" disabled={householdBusy} onclick={onconfirmjoin}
+			>{householdBusy ? 'Joining…' : 'Replace kitchen'}</button
+		>
+	</div>
 {:else if mode === 'removeMember'}
 	<h2>Remove household member?</h2>
 	<p class="muted">
@@ -151,13 +185,28 @@
 		>
 	</div>
 {:else}
+	{@const nextHouseholdOwner = canManageHousehold
+		? members.find((member) => member.id !== userId)
+		: undefined}
 	<h2>Leave this household?</h2>
 	<p class="muted">
 		Leaving gives you a new personal kitchen. The shared pantry and recipes stay with your
 		household. You can rejoin with a new invitation.
 	</p>
+	{#if nextHouseholdOwner}
+		<p class="field-help">
+			Ownership of this household will transfer to <b>{nextHouseholdOwner.name}</b>.
+		</p>
+	{/if}
 	{#if error}<p class="error" role="alert">{error}</p>{/if}
-	<button class="primary full" onclick={onconfirmleave} disabled={busy}>Leave household</button>
+	<div class="dialog-actions">
+		<button class="secondary" disabled={busy || householdBusy} onclick={onstay}
+			>Stay in household</button
+		>
+		<button class="primary danger-action" disabled={busy || householdBusy} onclick={onconfirmleave}
+			>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
+		>
+	</div>
 {/if}
 
 <style>
