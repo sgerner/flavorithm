@@ -155,7 +155,9 @@ export function confirmDeleteSavedRecipe(
 	const affectedWeeks = [...new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)))];
 	const meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
 	const recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
-	const shopping = kitchen.shopping.filter((item) => item.sourceKey !== `recipe:${recipe.id}`);
+	const shopping = kitchen.shopping.filter(
+		(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
+	);
 	let ratings = kitchen.preferences.ratings;
 	if (ratings) {
 		ratings = { ...ratings };

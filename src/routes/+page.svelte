@@ -81,8 +81,10 @@
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
 		completeMeal,
+		deleteShoppingItem,
 		expiryStatus,
 		reconcileShoppingList,
+		restoreShoppingItem,
 		transferPurchasedItemsToPantry
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
@@ -663,10 +665,10 @@
 	}
 	function removeShoppingItem(item: AppState['shopping'][number]) {
 		const removed = structuredClone($state.snapshot(item));
-		kitchen.shopping = kitchen.shopping.filter((entry) => entry.id !== item.id);
+		if (editingShoppingId === removed.id) editingShoppingId = '';
+		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
 		notify(`${item.name} removed.`, () => {
-			if (!kitchen.shopping.some((entry) => entry.id === removed.id))
-				kitchen.shopping.push(removed);
+			kitchen.shopping = restoreShoppingItem(kitchen, removed);
 		});
 	}
 	function removePlannedMeal(meal: Meal) {

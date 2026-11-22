@@ -182,6 +182,14 @@ test('delete subflow keeps selected on Keep recipe and clears selected + kitchen
 				sourceKey: `recipe:${target.id}`
 			},
 			{
+				id: 's1-checked',
+				name: 'lemon',
+				quantity: 2,
+				unit: 'whole',
+				checked: true,
+				sourceKey: `recipe:${target.id}`
+			},
+			{
 				id: 's2',
 				name: 'tomatoes',
 				quantity: 4,
@@ -239,7 +247,7 @@ test('delete subflow keeps selected on Keep recipe and clears selected + kitchen
 	);
 	assert.deepEqual(
 		deleted.shopping.map((s) => s.id),
-		['s2']
+		['s1-checked', 's2']
 	);
 	assert.deepEqual(deleted.ratings, { [keptRecipe.id]: 4 });
 });
