@@ -362,7 +362,8 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher);
+			: await getPublicModelCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2359,8 +2360,15 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let publicCatalog: Promise<SupportedModelResponse> | undefined;
-let publicCatalogExpiresAt = 0;
+type PublicCatalogCacheEntry = {
+	pending: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+const publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
+
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
+}
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2382,16 +2390,18 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
-		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
-		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (publicCatalog === pending) {
-				publicCatalog = undefined;
-				publicCatalogExpiresAt = 0;
-			}
-			throw error;
-		});
-		publicCatalog = pending;
-	}
-	return publicCatalog;
+	const key = publicCatalogKey(fetcher);
+	const cached = publicCatalogCache.get(key);
+	const now = Date.now();
+	if (cached && now < cached.expiresAt) return cached.pending;
+
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const pending = getSupportedModels(fetcher).catch((error) => {
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
+		}
+		throw error;
+	});
+	publicCatalogCache.set(key, { pending, expiresAt });
+	return pending;
 }
