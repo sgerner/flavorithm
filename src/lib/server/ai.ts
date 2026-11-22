@@ -2360,16 +2360,14 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-const DEFAULT_CATALOG_FETCH = globalThis.fetch;
-let publicCatalog: Promise<SupportedModelResponse> | undefined;
-let publicCatalogExpiresAt = 0;
-let publicCatalogKey: Fetcher | undefined;
+type PublicCatalogCacheEntry = {
+	pending: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
-function catalogCacheKey(fetcher: Fetcher): Fetcher {
-	return fetcher === DEFAULT_CATALOG_FETCH ||
-		Function.prototype.toString.call(fetcher).includes('server_fetch(')
-		? DEFAULT_CATALOG_FETCH
-		: fetcher;
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
 }
 
 export async function getSupportedModels(
@@ -2392,26 +2390,23 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const key = catalogCacheKey(fetcher);
-	if (!publicCatalog || publicCatalogKey !== key || Date.now() >= publicCatalogExpiresAt) {
-		publicCatalogKey = key;
-		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
-		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (publicCatalog === pending) {
-				publicCatalog = undefined;
-				publicCatalogKey = undefined;
-				publicCatalogExpiresAt = 0;
-			}
-			throw error;
-		});
-		publicCatalog = pending;
-	}
-	return publicCatalog;
+	const key = publicCatalogKey(fetcher);
+	const cached = publicCatalogCache.get(key);
+	const now = Date.now();
+	if (cached && now < cached.expiresAt) return cached.pending;
+
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const pending = getSupportedModels(fetcher).catch((error) => {
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
+		}
+		throw error;
+	});
+	publicCatalogCache.set(key, { pending, expiresAt });
+	return pending;
 }
 
 /** Clear the shared catalog cache so injected-fetch tests remain isolated. */
 export function resetPublicModelCatalogCache(): void {
-	publicCatalog = undefined;
-	publicCatalogKey = undefined;
-	publicCatalogExpiresAt = 0;
+	publicCatalogCache = new WeakMap();
 }
