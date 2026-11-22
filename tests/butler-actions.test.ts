@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState } from '../src/lib/data.ts';
 import { applyButlerCommands } from '../src/lib/butler.ts';
-import { buildButlerActions } from '../src/lib/butler-actions.ts';
+import {
+	buildButlerActions,
+	reconcileButlerUndoViews,
+	resolveButlerControlTarget
+} from '../src/lib/butler-actions.ts';
 
 test('independent recipe and pantry changes become readable individual cards', () => {
 	const kitchen = createInitialState();
@@ -258,4 +262,286 @@ test('invalid command payloads fail validation', () => {
 		buildButlerActions([{ type: 'recipe.upsert', recipe: { id: 'bad' } }], kitchen)
 	);
 	assert.throws(() => buildButlerActions([{ type: 'ui', action: 'execute' }], kitchen));
+});
+
+test('frozen details keep target names and explicit verbs for meal, pantry, recipe, and shopping deletions before and after apply', () => {
+	const kitchen = createInitialState();
+	const recipe = kitchen.recipes[0];
+	const pantryItem = kitchen.pantry[0];
+	kitchen.meals = [
+		{ id: 'meal-1', date: '2026-10-25', slot: 'Dinner', recipeId: recipe.id, servings: 3 }
+	];
+	kitchen.shopping = [
+		{ id: 'shop-1', name: 'Olive Oil', quantity: 500, unit: 'ml', checked: false }
+	];
+
+	const actions = buildButlerActions(
+		[
+			{ type: 'meal.delete', id: 'meal-1' },
+			{ type: 'pantry.delete', id: pantryItem.id },
+			{ type: 'shopping.delete', id: 'shop-1' },
+			{ type: 'shopping.generate' },
+			{ type: 'recipe.delete', id: kitchen.recipes[1].id }
+		],
+		structuredClone(kitchen)
+	);
+	assert.equal(actions.length, 1);
+	const [planCard] = actions;
+	assert.equal(planCard.details.length, 5);
+	for (const line of planCard.details) {
+		assert.doesNotMatch(line, /Kitchen update/);
+	}
+	assert.match(
+		planCard.details[0],
+		new RegExp(`^Remove meal: .*${recipe.title}.*Dinner.*2026-10-25`)
+	);
+	assert.match(planCard.details[1], new RegExp(`^Remove pantry item: ${pantryItem.name}`));
+	assert.match(planCard.details[2], /^Remove shopping item: Olive Oil · 500 ml$/);
+	assert.match(planCard.details[3], /^Update shopping list: Current week/);
+	assert.match(planCard.details[4], new RegExp(`^Remove recipe: ${kitchen.recipes[1].title}`));
+
+	// Mutate live kitchen state by applying the deletions; frozen details remain intact.
+	const applied = applyButlerCommands(kitchen, planCard.commands, new Date('2026-10-23T12:00:00Z'));
+	assert.equal(applied.state.meals.length, 0);
+	assert.equal(
+		applied.state.pantry.some((item) => item.id === pantryItem.id),
+		false
+	);
+	assert.equal(
+		applied.state.shopping.some((item) => item.id === 'shop-1'),
+		false
+	);
+	assert.match(
+		planCard.details[0],
+		new RegExp(`^Remove meal: .*${recipe.title}.*Dinner.*2026-10-25`)
+	);
+	assert.match(planCard.details[1], new RegExp(`^Remove pantry item: ${pantryItem.name}`));
+	assert.match(planCard.details[2], /^Remove shopping item: Olive Oil/);
+	assert.match(planCard.details[4], new RegExp(`^Remove recipe: ${kitchen.recipes[1].title}`));
+});
+
+test('multi-action cards prefix every line with explicit verbs separating removals, additions, and updates', () => {
+	const kitchen = createInitialState();
+	const existingPantry = kitchen.pantry[0];
+	const existingRecipe = kitchen.recipes[0];
+	const newRecipe = { ...existingRecipe, id: 'herb-pasta', title: 'Herb Pasta' };
+	kitchen.meals = [
+		{
+			id: 'old-dinner',
+			date: '2026-10-24',
+			slot: 'Dinner',
+			recipeId: existingRecipe.id,
+			servings: 2
+		}
+	];
+	const [card] = buildButlerActions(
+		[
+			{ type: 'recipe.upsert', recipe: newRecipe },
+			{ type: 'pantry.upsert', item: { ...existingPantry, quantity: existingPantry.quantity + 1 } },
+			{
+				type: 'pantry.upsert',
+				item: { id: 'capers', name: 'Capers', quantity: 1, unit: 'jar', category: 'Pantry' }
+			},
+			{ type: 'pantry.delete', id: kitchen.pantry[1].id },
+			{ type: 'meal.delete', id: 'old-dinner' },
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'new-dinner',
+					date: '2026-10-26',
+					slot: 'Dinner',
+					recipeId: 'herb-pasta',
+					servings: 4
+				}
+			},
+			{ type: 'shopping.generate', weekStart: '2026-10-26' }
+		],
+		kitchen
+	);
+
+	assert.match(card.details[0], /^Add recipe: Herb Pasta/);
+	assert.match(card.details[1], new RegExp(`^Update pantry item: ${existingPantry.name}`));
+	assert.match(card.details[2], /^Add pantry item: Capers/);
+	assert.match(card.details[3], new RegExp(`^Remove pantry item: ${kitchen.pantry[1].name}`));
+	assert.match(
+		card.details[4],
+		new RegExp(`^Remove meal: ${existingRecipe.title} · Dinner · 2026-10-24`)
+	);
+	assert.match(card.details[5], /^Schedule meal: Herb Pasta · Dinner · 2026-10-26 · 4 servings$/);
+	assert.match(card.details[6], /^Update shopping list: Week of 2026-10-26/);
+	for (const detail of card.details) {
+		assert.equal(detail.includes('\n'), false);
+		assert.doesNotMatch(detail, /Kitchen update/);
+	}
+});
+
+test('meal completion cards show pantry deductions and leftover counts in summary and details', () => {
+	const kitchen = createInitialState();
+	const recipe = kitchen.recipes[0];
+	kitchen.meals = [
+		{ id: 'lunch-1', date: '2026-10-24', slot: 'Lunch', recipeId: recipe.id, servings: 4 },
+		{ id: 'dinner-1', date: '2026-10-24', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+
+	const [withDeduction, withoutDeduction] = buildButlerActions(
+		[
+			{ type: 'meal.complete', id: 'lunch-1', deductPantry: true, leftoverServings: 2 },
+			{ type: 'meal.complete', id: 'dinner-1', deductPantry: false }
+		],
+		kitchen
+	);
+
+	assert.equal(withDeduction.label, 'Complete meal');
+	assert.equal(withDeduction.title, recipe.title);
+	assert.match(withDeduction.summary, /Lunch · 2026-10-24/);
+	assert.match(withDeduction.summary, /deducts pantry stock/);
+	assert.match(withDeduction.summary, /2 leftover servings/);
+	assert.match(
+		withDeduction.details[0],
+		new RegExp(
+			`^Complete meal: ${recipe.title} · Lunch · 2026-10-24 · 4 servings · deducts pantry stock · 2 leftover servings$`
+		)
+	);
+
+	assert.match(withoutDeduction.summary, /Dinner · 2026-10-24/);
+	assert.match(withoutDeduction.summary, /no pantry deduction/);
+	assert.match(withoutDeduction.summary, /no leftovers/);
+	assert.match(
+		withoutDeduction.details[0],
+		new RegExp(
+			`^Complete meal: ${recipe.title} · Dinner · 2026-10-24 · 2 servings · no pantry deduction · 0 leftover servings$`
+		)
+	);
+});
+
+test('account departure and sign-out cards are destructive while export cards use explicit export verbs and confirmation routing', () => {
+	const kitchen = createInitialState();
+	const actions = buildButlerActions(
+		[
+			{ type: 'ui', action: 'sign-out' },
+			{ type: 'ui', action: 'delete-account' },
+			{ type: 'ui', action: 'leave-household' },
+			{ type: 'ui', action: 'export-kitchen' },
+			{ type: 'ui', action: 'export-shopping' },
+			{ type: 'ui', action: 'export-pending' }
+		],
+		kitchen
+	);
+
+	assert.equal(actions[0].label, 'Sign out');
+	assert.equal(actions[0].destructive, true);
+	assert.match(actions[0].details[0], /^Sign out:/);
+
+	assert.equal(actions[1].label, 'Delete account');
+	assert.equal(actions[1].destructive, true);
+	assert.match(actions[1].details[0], /^Delete account:/);
+
+	assert.equal(actions[2].label, 'Leave household');
+	assert.equal(actions[2].destructive, true);
+	assert.match(actions[2].details[0], /^Leave household:/);
+
+	assert.equal(actions[3].label, 'Export kitchen data');
+	assert.equal(actions[3].destructive, false);
+	assert.doesNotMatch(actions[3].label, /^Open /);
+	assert.match(actions[3].details[0], /^Export kitchen data:/);
+
+	assert.equal(actions[4].label, 'Export shopping list');
+	assert.equal(actions[4].destructive, false);
+	assert.doesNotMatch(actions[4].label, /^Open /);
+	assert.match(actions[4].details[0], /^Export shopping list:/);
+
+	assert.equal(actions[5].label, 'Export pending changes');
+	assert.equal(actions[5].destructive, false);
+	assert.doesNotMatch(actions[5].label, /^Open /);
+	assert.match(actions[5].details[0], /^Export pending changes:/);
+
+	assert.deepEqual(resolveButlerControlTarget('sign-out'), { kind: 'confirm-sign-out' });
+	assert.deepEqual(resolveButlerControlTarget('export-kitchen'), {
+		kind: 'confirm-export',
+		exportKind: 'kitchen'
+	});
+	assert.deepEqual(resolveButlerControlTarget('export-shopping'), {
+		kind: 'confirm-export',
+		exportKind: 'shopping'
+	});
+	assert.deepEqual(resolveButlerControlTarget('export-pending'), {
+		kind: 'confirm-export',
+		exportKind: 'pending'
+	});
+	assert.deepEqual(resolveButlerControlTarget('delete-account'), {
+		kind: 'confirm-delete-account'
+	});
+	assert.deepEqual(resolveButlerControlTarget('leave-household'), {
+		kind: 'confirm-leave-household'
+	});
+	assert.deepEqual(resolveButlerControlTarget('settings'), { kind: 'open', target: 'settings' });
+});
+
+test('undo reconciliation omits undo for navigation/dialog actions and closes stale recipe, editor, and cooking prompts', () => {
+	const previous = createInitialState();
+	const navResult = applyButlerCommands(previous, [{ type: 'navigate', page: 'planner' }]);
+	const navCleanup = reconcileButlerUndoViews(
+		previous,
+		navResult.state,
+		{ selectedId: previous.recipes[0].id },
+		navResult.effects
+	);
+	assert.equal(navCleanup.changedKitchen, false);
+	assert.equal(navCleanup.closeSelected, false);
+
+	// Compound recipe upsert + open closes open RecipeDetail on undo while sparing unrelated recipes.
+	const newRecipe = {
+		...previous.recipes[0],
+		id: 'basil-risotto',
+		title: 'Mushroom Risotto',
+		saved: true
+	};
+	const compoundResult = applyButlerCommands(previous, [
+		{ type: 'recipe.upsert', recipe: newRecipe },
+		{
+			type: 'meal.upsert',
+			meal: {
+				id: 'risotto-dinner',
+				date: '2026-10-27',
+				slot: 'Dinner',
+				recipeId: 'basil-risotto',
+				servings: 2
+			}
+		},
+		{ type: 'recipe.open', id: 'basil-risotto', mode: 'detail' }
+	]);
+
+	const detailCleanup = reconcileButlerUndoViews(
+		previous,
+		compoundResult.state,
+		{ selectedId: 'basil-risotto' },
+		compoundResult.effects
+	);
+	assert.equal(detailCleanup.changedKitchen, true);
+	assert.equal(detailCleanup.closeSelected, true);
+
+	const editorCleanup = reconcileButlerUndoViews(
+		previous,
+		compoundResult.state,
+		{ editingRecipeId: 'basil-risotto' },
+		compoundResult.effects
+	);
+	assert.equal(editorCleanup.closeEditor, true);
+
+	const cookCleanup = reconcileButlerUndoViews(
+		previous,
+		compoundResult.state,
+		{ modal: 'cookMeal', cookingMealId: 'risotto-dinner' },
+		compoundResult.effects
+	);
+	assert.equal(cookCleanup.clearCookingMeal, true);
+	assert.equal(cookCleanup.closeModal, true);
+
+	const unrelatedCleanup = reconcileButlerUndoViews(
+		previous,
+		compoundResult.state,
+		{ selectedId: previous.recipes[1].id },
+		[]
+	);
+	assert.equal(unrelatedCleanup.closeSelected, false);
 });

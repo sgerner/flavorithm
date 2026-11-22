@@ -58,7 +58,12 @@
 	import { insertRecipes } from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
-	import { applyButlerCommands } from '#lib/butler.ts';
+	import { applyButlerCommands, type ButlerCommand } from '#lib/butler.ts';
+	import {
+		reconcileButlerUndoViews,
+		resolveButlerControlTarget,
+		type ButlerExportKind
+	} from '#lib/butler-actions.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
@@ -114,6 +119,8 @@
 		household: 'Your household',
 		removeMember: 'Remove household member',
 		leave: 'Leave household',
+		signOut: 'Sign out',
+		export: 'Export data',
 		delete: 'Delete account',
 		recover: 'Recover your account',
 		reset: 'Reset password',
@@ -342,6 +349,7 @@
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
 	let deletePassword = $state('');
+	let pendingExport = $state<ButlerExportKind | null>(null);
 	let resetToken = $state('');
 	let showStarter = $state(true);
 	let imageInput: HTMLInputElement;
@@ -830,6 +838,7 @@
 				'flavorithm-pending-kitchen.json',
 				'application/json'
 			);
+		else notify('There are no pending changes to export.');
 	}
 	async function flushKitchen() {
 		clearTimeout(saveTimer);
@@ -1395,6 +1404,8 @@
 		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
+		const appliedKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
+		let requiresConfirmation = false;
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
@@ -1410,18 +1421,77 @@
 				} else selected = recipe ?? null;
 			} else if (effect.type === 'ui') {
 				butlerChat?.close();
-				openButlerControl(effect.action);
+				if (openButlerControl(effect.action)) requiresConfirmation = true;
 			}
 		}
 		const appliedSnapshot = JSON.stringify(kitchen);
-		notify('Basil’s changes applied.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) kitchen = previousKitchen;
-			else notify('Your kitchen changed again. Review the current values before editing.');
-		});
+		if (appliedSnapshot !== expectedSnapshot) {
+			notify('Basil’s changes applied.', () => {
+				if (JSON.stringify(kitchen) !== appliedSnapshot) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				const cleanup = reconcileButlerUndoViews(
+					previousKitchen,
+					appliedKitchen,
+					{
+						selectedId: selected?.id,
+						editingRecipeId: editingRecipe?.id,
+						recipeToDeleteId: recipeToDelete?.id,
+						modal,
+						cookingMealId,
+						editingMealId,
+						editingShoppingId
+					},
+					result.effects
+				);
+				kitchen = previousKitchen;
+				if (cleanup.closeSelected) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				if (cleanup.closeEditor) editingRecipe = null;
+				if (cleanup.clearRecipeToDelete) recipeToDelete = null;
+				if (cleanup.clearCookingMeal) cookingMealId = '';
+				if (cleanup.clearEditingMeal) editingMealId = '';
+				if (cleanup.clearEditingShopping) editingShoppingId = '';
+				if (cleanup.closeModal) modal = '';
+				const sessionPrefix = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}:`;
+				for (const recipeId of cleanup.revertedRecipeIds) {
+					if (!previousKitchen.recipes.some((item) => item.id === recipeId))
+						delete cookingSteps[`${sessionPrefix}${recipeId}`];
+				}
+			});
+		} else {
+			notify(requiresConfirmation ? 'Confirm this action to continue.' : 'Opened in your kitchen.');
+		}
 		return appliedSnapshot;
 	}
-	function openButlerControl(target: string) {
-		switch (target) {
+	function openButlerControl(target: Extract<ButlerCommand, { type: 'ui' }>['action']): boolean {
+		const resolution = resolveButlerControlTarget(target);
+		if (resolution.kind === 'confirm-sign-out') {
+			error = '';
+			modal = 'signOut';
+			return true;
+		}
+		if (resolution.kind === 'confirm-export') {
+			pendingExport = resolution.exportKind;
+			error = '';
+			modal = 'export';
+			return true;
+		}
+		if (resolution.kind === 'confirm-delete-account') {
+			error = '';
+			if (!managedAuth) modal = 'delete';
+			else void openSettings();
+			return true;
+		}
+		if (resolution.kind === 'confirm-leave-household') {
+			error = '';
+			modal = 'leave';
+			return true;
+		}
+		switch (resolution.target) {
 			case 'settings':
 			case 'voice-settings':
 				void openSettings();
@@ -1444,27 +1514,8 @@
 			case 'join-household':
 				void household();
 				break;
-			case 'export-kitchen':
-				void exportKitchen();
-				break;
-			case 'export-shopping':
-				exportList();
-				break;
-			case 'export-pending':
-				exportPendingChanges();
-				break;
 			case 'sign-in':
 				openAuthentication();
-				break;
-			case 'sign-out':
-				void logout();
-				break;
-			case 'delete-account':
-				if (!managedAuth) modal = 'delete';
-				else void openSettings();
-				break;
-			case 'leave-household':
-				modal = 'leave';
 				break;
 			case 'scan':
 				imageInput?.click();
@@ -1482,6 +1533,17 @@
 				modal = 'taste';
 				break;
 		}
+		return false;
+	}
+	async function confirmPendingExport() {
+		const kind = pendingExport;
+		if (!kind) return;
+		pendingExport = null;
+		modal = '';
+		error = '';
+		if (kind === 'kitchen') await exportKitchen();
+		else if (kind === 'shopping') exportList();
+		else if (kind === 'pending') exportPendingChanges();
 	}
 
 	async function generate() {
@@ -1943,6 +2005,7 @@
 		if (modal === 'editMeal') editingMealId = '';
 		if (modal === 'cookMeal') cookingMealId = '';
 		if (modal === 'deleteRecipe') recipeToDelete = null;
+		if (modal === 'export') pendingExport = null;
 		if (modal === 'removeMember') memberToRemove = null;
 		if (modal === 'household') {
 			inviteCode = '';
@@ -3429,6 +3492,68 @@
 						onclick={leaveHousehold}
 						disabled={busy}>Leave household</button
 					>
+				{:else if modal === 'signOut'}
+					<h2>Sign out of your kitchen?</h2>
+					{#if user && (!managedAuth || providerLogoutUrl)}
+						<p class="muted">
+							Pending kitchen changes will sync before your session ends on this device.
+						</p>
+						{#if error}<p class="error" role="alert">{error}</p>{/if}
+						<div class="dialog-actions">
+							<button class="secondary" onclick={closeDialog} disabled={syncing}
+								>Stay signed in</button
+							><button class="primary danger-action" onclick={logout} disabled={syncing}
+								><LogOut size={16} /> Sign out</button
+							>
+						</div>
+					{:else if user && managedAuth}
+						<p class="muted">Sign-out is managed by your organization's access proxy.</p>
+						<div class="dialog-actions">
+							<button class="secondary" onclick={closeDialog}>Close</button>
+						</div>
+					{:else}
+						<p class="muted">You are already signed out on this device.</p>
+						<div class="dialog-actions">
+							<button class="secondary" onclick={closeDialog}>Close</button>
+						</div>
+					{/if}
+				{:else if modal === 'export'}
+					{@const hasPendingChanges = pendingSync || conflicts.length > 0}
+					<h2>
+						{pendingExport === 'shopping'
+							? 'Export shopping list?'
+							: pendingExport === 'pending'
+								? 'Export pending changes?'
+								: 'Export kitchen data?'}
+					</h2>
+					<p class="muted">
+						{#if pendingExport === 'shopping'}
+							Download your current shopping list ({kitchen.shopping.length} item{kitchen.shopping
+								.length === 1
+								? ''
+								: 's'}) as plain text (<code>flavorithm-shopping.txt</code>).
+						{:else if pendingExport === 'pending'}
+							{hasPendingChanges
+								? 'Download your unsynced local kitchen changes as JSON (flavorithm-pending-kitchen.json).'
+								: 'There are no unsynced pending changes to export right now.'}
+						{:else}
+							Download a JSON backup of your account, recipes, pantry, meal plan, and shopping list
+							(<code>flavorithm-kitchen.json</code>).
+						{/if}
+					</p>
+					<div class="dialog-actions">
+						<button class="secondary" onclick={closeDialog}>Cancel</button><button
+							class="primary"
+							disabled={pendingExport === 'pending' && !hasPendingChanges}
+							onclick={confirmPendingExport}
+							><Download size={16} />
+							{pendingExport === 'shopping'
+								? 'Export shopping list'
+								: pendingExport === 'pending'
+									? 'Export pending changes'
+									: 'Export kitchen data'}</button
+						>
+					</div>
 				{:else if modal === 'delete' && !managedAuth}
 					<h2>Delete your account?</h2>
 					<p class="muted">
