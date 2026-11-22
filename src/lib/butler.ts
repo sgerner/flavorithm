@@ -11,10 +11,10 @@ import {
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
-const quantity = z.number().finite().nonnegative().max(1000000);
-const cookingTime = z.number().finite().nonnegative().max(100000);
+const quantity = z.number().nonnegative().max(1000000);
+const cookingTime = z.number().nonnegative().max(100000);
 const servings = z.number().int().min(1).max(24);
-const leftoverServings = z.number().finite().nonnegative().max(10000);
+const leftoverServings = z.number().nonnegative().max(10000);
 const publicUrl = z
 	.string()
 	.max(4000)
@@ -58,7 +58,7 @@ const recipe = z.object({
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -83,7 +83,7 @@ const meal = z.object({
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
 	servings,
-	completedAt: z.string().datetime().max(50).optional(),
+	completedAt: z.iso.datetime().max(50).optional(),
 	leftoverServings: leftoverServings.optional()
 });
 const shopping = z.object({
@@ -104,7 +104,7 @@ const preferences = z
 		onboardingStatus: z.enum(['completed', 'skipped']),
 		theme: z.string().max(80),
 		dark: z.boolean(),
-		ratings: z.record(id, z.number().finite().min(0).max(5))
+		ratings: z.record(id, z.number().min(0).max(5))
 	})
 	.partial()
 	.strict();

@@ -9,11 +9,7 @@ import { test } from 'node:test';
 const scriptPath = resolve('scripts/seed-dev.mjs');
 
 function runSeed(databasePath: string) {
-	return spawnSync(
-		process.execPath,
-		['--experimental-strip-types', scriptPath, '--db', databasePath],
-		{ encoding: 'utf8' }
-	);
+	return spawnSync(process.execPath, [scriptPath, '--db', databasePath], { encoding: 'utf8' });
 }
 
 function countRows(db: DatabaseSync, table: string): number {
