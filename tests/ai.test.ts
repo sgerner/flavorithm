@@ -1,18 +1,20 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { ChatGPTInferenceError } from '../src/lib/server/chatgpt-inference.ts';
 import {
 	AIRequestError,
 	fetchCaptureRecipePage,
 	fetchRecipePage,
 	getSupportedModels,
-	resetPublicModelCatalogForTests,
+	resetPublicModelCatalogCache,
 	runAIRequest,
 	transformModelCatalog,
 	validateCaptureRecipeUrl,
 	validateRecipeUrl
 } from '../src/lib/server/ai.ts';
+
+beforeEach(() => resetPublicModelCatalogCache());
 
 const nutrition = {
 	calories: 420,
@@ -1368,7 +1370,6 @@ test('import routes Anthropic requests with text-only content, import schema, an
 			}
 		}
 	};
-	resetPublicModelCatalogForTests();
 	let observedUrl = '';
 	let observedHeaders: Headers | undefined;
 	let observedBody: any;
@@ -1417,9 +1418,7 @@ test('import routes Anthropic requests with text-only content, import schema, an
 	assert.equal(result.recipes[0].provenance, 'web-import');
 });
 
-test('token budgets apply action tiers, reasoning reserves, provider keys, and keep Google distinct', async (t) => {
-	resetPublicModelCatalogForTests();
-	t.after(() => resetPublicModelCatalogForTests());
+test('token budgets apply action tiers, reasoning reserves, provider keys, and keep Google distinct', async () => {
 	const catalog = {
 		openai: {
 			name: 'OpenAI',
