@@ -98,7 +98,8 @@ export function expiryStatus(expires?: string, now: Date = new Date()): ExpirySt
 
 /**
  * Replace one generated shopping-list scope while retaining manual entries, other scopes,
- * and checked purchases. Checked purchases reduce matching quantities in the refreshed list.
+ * and checked purchases. Checked purchases reduce matching quantities in the refreshed list
+ * and follow unchecked items.
  */
 export function reconcileShoppingList(
 	existing: ShoppingItem[],
@@ -121,6 +122,8 @@ export function reconcileShoppingList(
 	}
 
 	const retained = existing.filter((item) => item.sourceKey !== sourceKey || item.checked);
+	const uncheckedRetained = retained.filter((item) => !item.checked);
+	const checkedRetained = retained.filter((item) => item.checked);
 	const usedIds = new Set(retained.map((item) => item.id));
 	const additionBuckets = new Map<
 		string,
@@ -162,7 +165,7 @@ export function reconcileShoppingList(
 		});
 	}
 
-	return [...retained, ...generated].slice(0, 1_000);
+	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
 const MAX_SHOPPING_ITEMS = 1_000;
