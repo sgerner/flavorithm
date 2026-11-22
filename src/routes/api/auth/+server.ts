@@ -23,20 +23,20 @@ const authActionSchema = z.discriminatedUnion('action', [
 	z.object({
 		action: z.literal('register'),
 		name: z.string().trim().min(2).max(80),
-		email: z.string().trim().email().max(254),
+		email: z.string().trim().max(254).pipe(z.email()),
 		password: z.string().min(10).max(128)
 	}),
 	z.object({
 		action: z.literal('login'),
 		name: z.string().optional(),
-		email: z.string().trim().email().max(254),
+		email: z.string().trim().max(254).pipe(z.email()),
 		password: z.string().min(1).max(128)
 	}),
 	z.object({ action: z.literal('logout') }),
 	z.object({ action: z.literal('deleteAccount'), password: z.string().min(1).max(128) }),
 	z.object({
 		action: z.literal('requestPasswordReset'),
-		email: z.string().trim().email().max(254)
+		email: z.string().trim().max(254).pipe(z.email())
 	}),
 	z.object({
 		action: z.literal('resetPassword'),
@@ -52,7 +52,7 @@ function passwordResetOrigin(request: Request): string {
 	if (!configuredOrigin && !request.headers.get('origin')) {
 		throw new ApiError(
 			503,
-			'Set ORIGIN to enable password recovery requests without a browser origin.'
+			'Email links require a public site address. Ask the server operator to configure this installation.'
 		);
 	}
 	try {
@@ -127,7 +127,7 @@ export const POST: RequestHandler = async (event) => {
 			if (!apiKey || !from) {
 				throw new ApiError(
 					503,
-					'Password recovery is not configured. Set RESEND_API_KEY and EMAIL_FROM to enable it.'
+					'Password recovery is not configured on this installation. Ask the server operator to configure email delivery.'
 				);
 			}
 			const email = payload.email.toLowerCase();
@@ -152,7 +152,7 @@ export const POST: RequestHandler = async (event) => {
 			if (!apiKey || !from) {
 				throw new ApiError(
 					503,
-					'Email verification is not configured. Set RESEND_API_KEY and EMAIL_FROM to enable it.'
+					'Email verification is not configured on this installation. Ask the server operator to configure email delivery.'
 				);
 			}
 			consumeRateLimit(`email-verify-ip:${ip}`, 5, 60 * 60 * 1000);

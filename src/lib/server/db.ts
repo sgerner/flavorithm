@@ -78,6 +78,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
   CREATE TABLE IF NOT EXISTS external_identities (
     issuer TEXT NOT NULL,
@@ -105,6 +106,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS password_reset_user_idx ON password_reset_tokens(user_id);
   CREATE INDEX IF NOT EXISTS password_reset_expiry_idx ON password_reset_tokens(expires_at);
   CREATE TABLE IF NOT EXISTS household_invites (
     code_hash TEXT PRIMARY KEY,
@@ -114,6 +116,8 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     uses_remaining INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS household_invites_household_expiry_idx ON household_invites(household_id, expires_at);
+  CREATE INDEX IF NOT EXISTS household_invites_created_by_idx ON household_invites(created_by);
   CREATE INDEX IF NOT EXISTS household_invites_expiry_idx ON household_invites(expires_at);
   CREATE TABLE IF NOT EXISTS email_verification_tokens (
     token_hash TEXT PRIMARY KEY,
@@ -121,6 +125,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS email_verification_user_idx ON email_verification_tokens(user_id);
   CREATE INDEX IF NOT EXISTS email_verification_expiry_idx ON email_verification_tokens(expires_at);
 `);
 
@@ -184,19 +189,19 @@ function deriveScrypt(password: string, salt: Buffer, length: number): Promise<B
 }
 
 const nutritionSchema = z.object({
-	calories: z.number().finite().min(0).max(1_000_000),
-	fat: z.number().finite().min(0).max(1_000_000),
-	saturatedFat: z.number().finite().min(0).max(1_000_000),
-	sodium: z.number().finite().min(0).max(1_000_000),
-	carbs: z.number().finite().min(0).max(1_000_000),
-	fiber: z.number().finite().min(0).max(1_000_000),
-	sugar: z.number().finite().min(0).max(1_000_000),
-	protein: z.number().finite().min(0).max(1_000_000)
+	calories: z.number().min(0).max(1_000_000),
+	fat: z.number().min(0).max(1_000_000),
+	saturatedFat: z.number().min(0).max(1_000_000),
+	sodium: z.number().min(0).max(1_000_000),
+	carbs: z.number().min(0).max(1_000_000),
+	fiber: z.number().min(0).max(1_000_000),
+	sugar: z.number().min(0).max(1_000_000),
+	protein: z.number().min(0).max(1_000_000)
 });
 
 const recipeIngredientSchema = z.object({
 	name: z.string().trim().min(1).max(200),
-	quantity: z.number().finite().min(0).max(1_000_000),
+	quantity: z.number().min(0).max(1_000_000),
 	unit: z.string().max(40)
 });
 
@@ -218,8 +223,8 @@ const recipeSchema = z.object({
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
 	image: z.union([publicUrlSchema, z.string().regex(COVER_PATH)]),
-	time: z.number().finite().min(0).max(100_000),
-	servings: z.number().finite().min(1).max(10_000),
+	time: z.number().min(0).max(100_000),
+	servings: z.number().min(1).max(10_000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -230,7 +235,7 @@ const recipeSchema = z.object({
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -238,7 +243,7 @@ const recipeSchema = z.object({
 const preferencesSchema = z.object({
 	diet: z.string().max(200),
 	allergies: z.string().max(2_000),
-	maxTime: z.number().finite().min(0).max(100_000),
+	maxTime: z.number().min(0).max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
 	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
@@ -257,7 +262,7 @@ const preferencesSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
-	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
+	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
 const appStateSchema = z.object({
@@ -266,7 +271,7 @@ const appStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				category: z.string().max(100),
 				expires: z.string().max(50).optional()
@@ -281,9 +286,9 @@ const appStateSchema = z.object({
 				date: z.string().max(50),
 				slot: z.string().max(100),
 				recipeId: z.string().max(100),
-				servings: z.number().finite().min(1).max(10_000),
+				servings: z.number().min(1).max(10_000),
 				completedAt: z.string().max(50).optional(),
-				leftoverServings: z.number().finite().min(0).max(10_000).optional()
+				leftoverServings: z.number().min(0).max(10_000).optional()
 			})
 		)
 		.max(1_000),
@@ -292,7 +297,7 @@ const appStateSchema = z.object({
 			z.object({
 				id: z.string().min(1).max(100),
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().min(0).max(1_000_000),
+				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				checked: z.boolean(),
 				sourceKey: z.string().max(200).optional()
@@ -701,7 +706,7 @@ export function resolveExternalIdentity(input: {
 	if (!issuer || issuer.length > 2_000 || !subject || subject.length > 500) {
 		throw new ApiError(401, 'The identity provider returned an invalid identity');
 	}
-	if (email.length > 254 || !z.string().email().safeParse(email).success) {
+	if (email.length > 254 || !z.email().safeParse(email).success) {
 		throw new ApiError(401, 'The identity provider did not provide a valid email address');
 	}
 	const now = Date.now();

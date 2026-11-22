@@ -7,8 +7,8 @@ import {
 } from './codex-device.ts';
 import { ChatGPTInferenceError } from './chatgpt-inference.ts';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { createDecipheriv, createHash, randomBytes, randomUUID } from 'node:crypto';
-import { buildCompanionScript, type CompanionConfig } from './chatgpt-companion.ts';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import type { CompanionConfig } from './chatgpt-companion.ts';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createRemoteJWKSet, customFetch, jwtVerify, type JWTPayload } from 'jose';
 import { ApiError, consumeRateLimit } from '#lib/server/db.ts';
@@ -17,6 +17,8 @@ import {
 	clearChatGPTCredentials,
 	consumeHostedOAuthTransaction,
 	consumeChatGPTPairing,
+	decipherOAuthEnvelope,
+	decodeHostedEncryptionKey,
 	decryptChatGPTCredentials,
 	ensureChatGPTHostId,
 	getChatGPTAccount,
@@ -26,7 +28,6 @@ import {
 	releaseChatGPTRefreshLease,
 	saveChatGPTAccount,
 	storeHostedOAuthTransaction,
-	storeChatGPTPairing,
 	type ChatGPTAccount,
 	type ChatGPTCredentials,
 	type OAuthMode
@@ -142,13 +143,6 @@ function isLoopbackOrigin(value: string): boolean {
 	} catch {
 		return false;
 	}
-}
-
-function decodeHostedEncryptionKey(): boolean {
-	const raw = process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY?.trim();
-	if (!raw) return false;
-	const value = Buffer.from(raw, 'base64');
-	return value.length === 32 && value.toString('base64') === raw;
 }
 
 function hostedClientConfig(): HostedClient | null {
@@ -500,52 +494,6 @@ export async function startChatGPTOAuth(input: {
 	return { authorizationUrl: authorizationUrl.toString() };
 }
 
-export function startChatGPTCompanion(input: {
-	userId: string;
-	sessionBinding: string;
-	appUrl: URL;
-	accountId?: string;
-	reconsent?: boolean;
-}): { kind: 'companion'; script: string; filename: string; expiresAt: number } {
-	if (!isSessionBindingActive(input.userId, input.sessionBinding))
-		throw new ChatGPTOAuthError(
-			401,
-			'Your Flavorithm session has expired.',
-			'chatgpt_session_expired'
-		);
-	if (input.appUrl.protocol !== 'https:')
-		throw new ChatGPTOAuthError(
-			403,
-			'Use HTTPS to transfer a ChatGPT connection.',
-			'chatgpt_https_required'
-		);
-	const account = validateAccountForReauthorization(input.userId, input.accountId, 'local');
-	ensureChatGPTHostId(); // Keep the VM's identity separate from the computer completing OAuth.
-	const setup: CompanionConfig = {
-		pairingId: randomValue(),
-		pairingKey: randomValue(),
-		nonce: randomValue(),
-		origin: input.appUrl.origin,
-		expiresAt: Date.now() + TRANSACTION_TTL_MS,
-		clientId: account.clientId,
-		newRegistration: account.newRegistration,
-		...(account.account?.email ? { loginHint: account.account.email } : {}),
-		reconsent: input.reconsent ?? false
-	};
-	storeChatGPTPairing(
-		input.userId,
-		setup.pairingId,
-		JSON.stringify({ ...setup, sessionBinding: input.sessionBinding, accountId: input.accountId }),
-		setup.expiresAt
-	);
-	return {
-		kind: 'companion',
-		script: buildCompanionScript(setup),
-		filename: `flavorithm-chatgpt-connect-${setup.pairingId.slice(0, 8)}.mjs`,
-		expiresAt: setup.expiresAt
-	};
-}
-
 export async function finishChatGPTCompanion(input: {
 	userId: string;
 	sessionBinding: string;
@@ -575,18 +523,12 @@ export async function finishChatGPTCompanion(input: {
 		);
 	let imported: { clientId: string; token: Record<string, unknown>; receivedAt: number };
 	try {
-		const decipher = createDecipheriv(
-			'aes-256-gcm',
-			Buffer.from(setup.pairingKey, 'base64url'),
-			Buffer.from(input.bundle.iv, 'base64url')
-		);
-		decipher.setAAD(Buffer.from(`flavorithm:companion:${setup.origin}:${setup.pairingId}`));
-		decipher.setAuthTag(Buffer.from(input.bundle.tag, 'base64url'));
 		imported = JSON.parse(
-			Buffer.concat([
-				decipher.update(Buffer.from(input.bundle.data, 'base64url')),
-				decipher.final()
-			]).toString('utf8')
+			decipherOAuthEnvelope(
+				input.bundle,
+				Buffer.from(setup.pairingKey, 'base64url'),
+				Buffer.from(`flavorithm:companion:${setup.origin}:${setup.pairingId}`)
+			)
 		);
 	} catch {
 		throw new ChatGPTOAuthError(
