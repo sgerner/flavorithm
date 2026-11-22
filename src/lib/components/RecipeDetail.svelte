@@ -2,6 +2,7 @@
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
+	import { fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
 	import type { Recipe } from '#lib/types.ts';
 	import {
@@ -69,12 +70,9 @@
 			servingCount = initialServings ?? recipe.servings;
 		}
 	});
-	let validServings = $derived(
-		typeof servingCount === 'number' &&
-			Number.isInteger(servingCount) &&
-			servingCount >= 1 &&
-			servingCount <= 24
-	);
+	let servingsError = $derived(validatePlannedServings(servingCount));
+	let validServings = $derived(!servingsError);
+	let servingsAria = $derived(fieldAria('servings', { hasHelp: true, error: servingsError }));
 </script>
 
 <div class="modal-backdrop" transition:backdropMotion|global>
@@ -138,8 +136,11 @@
 				{#if recipe.saved}<button class="secondary recipe-manage-button" onclick={edit}>Edit</button
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
-			{#if !validServings}<p class="field-help" id="servings-help">
-					Enter 1–24 servings to plan or shop.
+			<p class="field-help" id={servingsAria.helpId}>
+				Enter 1–24 whole servings to scale ingredients, plan, or shop.
+			</p>
+			{#if servingsError}<p class="error" id={servingsAria.errorId} role="alert">
+					{servingsError}
 				</p>{/if}
 			<div class="tabs">
 				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
@@ -151,15 +152,15 @@
 					<div>
 						<div class="section-line">
 							<h3>Ingredients</h3>
-							<label class="servings"
+							<label class="servings" for={servingsAria.id}
 								><input
 									aria-label="Servings"
 									type="number"
 									min="1"
 									max="24"
 									step="1"
-									aria-invalid={!validServings}
 									bind:value={servingCount}
+									{...servingsAria.props}
 								/> servings</label
 							>
 						</div>
@@ -201,8 +202,11 @@
 					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
 							Ingredients or servings changed. Refresh this estimate before relying on it.
 						</p>{/if}
-					<label class="servings nutrition-selector"
-						>Show nutrition for<select bind:value={nutritionMode}
+					<label class="servings nutrition-selector" for="recipe-nutrition-mode"
+						>Show nutrition for<select
+							id="recipe-nutrition-mode"
+							aria-invalid="false"
+							bind:value={nutritionMode}
 							><option value="serving">One serving</option><option value="recipe"
 								>Whole recipe</option
 							></select

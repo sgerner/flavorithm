@@ -17,6 +17,7 @@
 		value = '',
 		fallback = '',
 		disabled = false,
+		describedBy,
 		onselect
 	}: {
 		label: string;
@@ -25,6 +26,7 @@
 		value?: string;
 		fallback?: string;
 		disabled?: boolean;
+		describedBy?: string;
 		onselect: (id: string) => void;
 	} = $props();
 	const id = $props.id();
@@ -97,6 +99,8 @@
 			aria-expanded={open}
 			aria-controls={`${id}-list`}
 			aria-activedescendant={open && active >= 0 ? `${id}-option-${active}` : undefined}
+			aria-describedby={describedBy}
+			aria-invalid="false"
 			value={open ? query : options.find((option) => option.id === value)?.label || fallback}
 			{placeholder}
 			{disabled}

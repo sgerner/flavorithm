@@ -1,11 +1,18 @@
 <script lang="ts">
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
-	import { untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
+	import { tick, untrack } from 'svelte';
+	import { focusFirstInvalid, focusTrap } from '#lib/focus.ts';
+	import {
+		NUTRITION_FIELDS,
+		emptyRecipeDraftValidation,
+		fieldAria,
+		validateRecipeDraftFields
+	} from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
 	import { Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
+	import FormField from './FormField.svelte';
 	let {
 		recipe,
 		cancel,
@@ -21,15 +28,29 @@
 		}))
 	);
 	let tagsText = $state(draft.tags.join(', '));
-	let error = $state('');
+	let submitted = $state(false);
+	let uploadError = $state('');
 	let uploading = $state(false);
+	let nutritionOpen = $state(false);
 	let photoInput: HTMLInputElement;
+	let formEl = $state<HTMLFormElement>();
+	let addIngredientButton = $state<HTMLButtonElement>();
+	let addStepButton = $state<HTMLButtonElement>();
+	let validation = $derived(
+		submitted
+			? validateRecipeDraftFields(draft, {
+					tagsText,
+					checkImage: true,
+					coverPathPattern: COVER_PATH
+				})
+			: emptyRecipeDraftValidation()
+	);
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
 		if (!file) return;
 		uploading = true;
-		error = '';
+		uploadError = '';
 		try {
 			const body = await prepareCover(file);
 			const response = await fetch('/api/recipe-covers', {
@@ -41,25 +62,32 @@
 			if (!response.ok) throw new Error(result.error || 'Could not upload the cover photo.');
 			draft.image = result.image;
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not read that photo.';
+			uploadError = cause instanceof Error ? cause.message : 'Could not read that photo.';
 		} finally {
 			uploading = false;
 			input.value = '';
 		}
 	}
-	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
-		['calories', 'Calories (kcal)'],
-		['fat', 'Fat (g)'],
-		['saturatedFat', 'Saturated fat (g)'],
-		['sodium', 'Sodium (mg)'],
-		['carbs', 'Carbohydrates (g)'],
-		['fiber', 'Fiber (g)'],
-		['sugar', 'Sugar (g)'],
-		['protein', 'Protein (g)']
-	];
-	function saveDraft(event: SubmitEvent) {
+	async function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
 		if (uploading) return;
+		uploadError = '';
+		const check = validateRecipeDraftFields(draft, {
+			tagsText,
+			checkImage: true,
+			coverPathPattern: COVER_PATH
+		});
+		if (check.hasErrors) {
+			submitted = true;
+			if (check.hasNutritionErrors) nutritionOpen = true;
+			await tick();
+			if (!focusFirstInvalid(formEl)) {
+				if (check.ingredientsList) addIngredientButton?.focus();
+				else if (check.stepsList) addStepButton?.focus();
+			}
+			return;
+		}
+		submitted = false;
 		const tags = [
 			...new Set(
 				tagsText
@@ -75,50 +103,6 @@
 		}));
 		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
 		const image = draft.image.trim();
-		if (image && !COVER_PATH.test(image)) {
-			try {
-				const url = new URL(image);
-				if (url.protocol !== 'https:' || url.username || url.password)
-					throw new Error('Invalid image');
-			} catch {
-				error = 'Use a public HTTPS image URL, or leave it blank.';
-				return;
-			}
-		}
-		if (
-			!draft.title.trim() ||
-			!Number.isFinite(draft.time) ||
-			draft.time < 1 ||
-			draft.time > 100000 ||
-			!Number.isFinite(draft.servings) ||
-			draft.servings < 1 ||
-			draft.servings > 10000 ||
-			!ingredients.length ||
-			ingredients.length > 60 ||
-			ingredients.some(
-				(item) =>
-					!item.name ||
-					!item.unit ||
-					!Number.isFinite(item.quantity) ||
-					item.quantity <= 0 ||
-					item.quantity > 1000000
-			) ||
-			!steps.length ||
-			steps.length > 40 ||
-			steps.some((step) => step.length > 10000) ||
-			tags.length > 30 ||
-			tags.some((tag) => tag.length > 100) ||
-			!nutritionFields.every(
-				([key]) =>
-					Number.isFinite(draft.nutrition[key]) &&
-					draft.nutrition[key] >= 0 &&
-					draft.nutrition[key] <= 1000000
-			)
-		) {
-			error =
-				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
-			return;
-		}
 		save({
 			...draft,
 			title: draft.title.trim(),
@@ -145,38 +129,51 @@
 	>
 		<h2 id="recipe-editor-title">Edit saved recipe</h2>
 		<p class="muted">Changes are saved to your recipe collection.</p>
-		<form onsubmit={saveDraft}>
+		<form novalidate bind:this={formEl} onsubmit={saveDraft}>
 			<div class="draft-summary">
-				<label class="field draft-title"
-					>Title<input bind:value={draft.title} required maxlength="200" /></label
+				<FormField id="editor-title" class="draft-title" label="Title" error={validation.title}>
+					{#snippet children(field)}
+						<input bind:value={draft.title} maxlength="200" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="editor-time" label="Time (minutes)" error={validation.time}>
+					{#snippet children(field)}
+						<input type="number" bind:value={draft.time} min="1" max="100000" step="1" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="editor-servings" label="Servings" error={validation.servings}>
+					{#snippet children(field)}
+						<input
+							type="number"
+							bind:value={draft.servings}
+							min="1"
+							max="10000"
+							step="1"
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				<FormField id="editor-cuisine" label="Cuisine" error={validation.cuisine}>
+					{#snippet children(field)}
+						<input bind:value={draft.cuisine} maxlength="100" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="editor-difficulty" label="Difficulty" error={validation.difficulty}>
+					{#snippet children(field)}
+						<input bind:value={draft.difficulty} maxlength="80" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField
+					id="editor-description"
+					class="full-field"
+					label="Description"
+					error={validation.description}
 				>
-				<label class="field"
-					>Time (minutes)<input
-						type="number"
-						bind:value={draft.time}
-						min="1"
-						max="100000"
-						step="1"
-						required
-					/></label
-				>
-				<label class="field"
-					>Servings<input
-						type="number"
-						bind:value={draft.servings}
-						min="1"
-						max="10000"
-						step="1"
-						required
-					/></label
-				>
-				<label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label>
-				<label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label
-				>
-				<label class="field full-field"
-					>Description<textarea bind:value={draft.description} maxlength="10000" rows="2"
-					></textarea></label
-				>
+					{#snippet children(field)}
+						<textarea bind:value={draft.description} maxlength="10000" rows="2" {...field}
+						></textarea>
+					{/snippet}
+				</FormField>
 				<div class="full-field cover-picker">
 					<img
 						src={draft.image || recipePlaceholder(draft)}
@@ -187,6 +184,7 @@
 						hidden
 						type="file"
 						accept="image/jpeg,image/png,image/webp"
+						aria-label="Upload cover photo"
 						bind:this={photoInput}
 						onchange={uploadCover}
 						disabled={uploading}
@@ -194,6 +192,7 @@
 					<button
 						type="button"
 						class="secondary"
+						aria-describedby="editor-cover-help"
 						disabled={uploading}
 						onclick={() => photoInput.click()}
 						>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
@@ -206,31 +205,50 @@
 								draft.image = '';
 							}}>Remove cover</button
 						>{/if}
-					<p class="muted">
+					<p class="muted" id="editor-cover-help">
 						JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.
 						Sign-in and an internet connection are required.
 					</p>
 				</div>
-				{#if !COVER_PATH.test(draft.image)}<label class="field full-field"
-						>Image URL<input
-							bind:value={draft.image}
-							maxlength="4000"
-							type="text"
-							placeholder="https://… (optional)"
-							disabled={uploading}
-						/></label
-					>{/if}
-				<label class="field full-field"
-					>Tags<input
-						bind:value={tagsText}
-						maxlength="3029"
-						placeholder="weeknight, vegetarian"
-					/></label
+				{#if !COVER_PATH.test(draft.image)}<FormField
+						id="editor-image"
+						class="full-field"
+						label="Image URL"
+						help="Optional public HTTPS image URL."
+						error={validation.image}
+					>
+						{#snippet children(field)}
+							<input
+								bind:value={draft.image}
+								maxlength="4000"
+								type="text"
+								placeholder="https://… (optional)"
+								disabled={uploading}
+								{...field}
+							/>
+						{/snippet}
+					</FormField>{/if}
+				<FormField
+					id="editor-tags"
+					class="full-field"
+					label="Tags"
+					help="Separate tags with commas (up to 30 tags)."
+					error={validation.tags}
 				>
+					{#snippet children(field)}
+						<input
+							bind:value={tagsText}
+							maxlength="3029"
+							placeholder="weeknight, vegetarian"
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
 			</div>
 			<div class="draft-section-heading">
 				<h3>Ingredients</h3>
 				<button
+					bind:this={addIngredientButton}
 					class="text-button"
 					type="button"
 					disabled={draft.ingredients.length >= 60}
@@ -238,33 +256,44 @@
 					><Plus size={17} />Add</button
 				>
 			</div>
+			{#if validation.ingredientsList}<p class="error" id="editor-ingredients-error">
+					{validation.ingredientsList}
+				</p>{/if}
 			<div class="draft-ingredients">
-				{#each draft.ingredients as item, i}<div class="draft-ingredient">
+				{#each draft.ingredients as item, i}{@const rowError =
+						validation.ingredients[i]}{@const nameAria = fieldAria(`editor-ingredient-${i}-name`, {
+						error: rowError?.name
+					})}{@const qtyAria = fieldAria(`editor-ingredient-${i}-quantity`, {
+						error: rowError?.quantity
+					})}{@const unitAria = fieldAria(`editor-ingredient-${i}-unit`, {
+						error: rowError?.unit
+					})}
+					<div class="draft-ingredient">
 						<input
 							class="ingredient-name"
 							aria-label={`Ingredient ${i + 1}`}
 							bind:value={item.name}
-							required
 							maxlength="100"
 							placeholder="Ingredient"
+							{...nameAria.props}
 						/>
 						<input
 							class="ingredient-quantity"
 							aria-label={`Quantity for ingredient ${i + 1}`}
 							type="number"
 							bind:value={item.quantity}
-							required
 							min="0.000001"
 							max="1000000"
 							step="any"
+							{...qtyAria.props}
 						/>
 						<input
 							class="ingredient-unit"
 							aria-label={`Unit for ingredient ${i + 1}`}
 							bind:value={item.unit}
-							required
 							maxlength="40"
 							placeholder="Unit"
+							{...unitAria.props}
 						/>
 						<button
 							class="icon-button"
@@ -274,24 +303,37 @@
 								(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
 							><X size={18} /></button
 						>
-					</div>{/each}
+					</div>
+					{#if rowError?.name}<p class="error draft-row-error" id={nameAria.errorId}>
+							{rowError.name}
+						</p>{/if}{#if rowError?.quantity}<p class="error draft-row-error" id={qtyAria.errorId}>
+							{rowError.quantity}
+						</p>{/if}{#if rowError?.unit}<p class="error draft-row-error" id={unitAria.errorId}>
+							{rowError.unit}
+						</p>{/if}{/each}
 			</div>
 			<div class="draft-section-heading">
 				<h3>Steps</h3>
 				<button
+					bind:this={addStepButton}
 					class="text-button"
 					type="button"
 					disabled={draft.steps.length >= 40}
 					onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
 				>
 			</div>
-			{#each draft.steps as step, i}<div class="draft-step">
+			{#if validation.stepsList}<p class="error" id="editor-steps-error">
+					{validation.stepsList}
+				</p>{/if}
+			{#each draft.steps as step, i}{@const stepError = validation.steps[i] || ''}{@const stepAria =
+					fieldAria(`editor-step-${i}`, { error: stepError })}
+				<div class="draft-step">
 					<span>{i + 1}</span><textarea
 						aria-label={`Step ${i + 1}`}
 						bind:value={draft.steps[i]}
-						required
 						maxlength="10000"
-						rows="2"></textarea>
+						rows="2"
+						{...stepAria.props}></textarea>
 					<button
 						class="icon-button"
 						type="button"
@@ -299,27 +341,38 @@
 						onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
 						><X size={18} /></button
 					>
-				</div>{/each}
-			<details class="import-notes">
+				</div>
+				{#if stepError}<p class="error draft-row-error" id={stepAria.errorId}>
+						{stepError}
+					</p>{/if}{/each}
+			<details class="import-notes" bind:open={nutritionOpen}>
 				<summary>Nutrition estimates</summary>
 				<p>
 					Estimated values per serving. Ingredient or serving changes will mark these values as
 					stale.
 				</p>
 				<div class="draft-summary">
-					{#each nutritionFields as [key, label]}<label class="field"
-							>{label}<input
-								type="number"
-								min="0"
-								max="1000000"
-								step="any"
-								required
-								bind:value={draft.nutrition[key]}
-							/></label
-						>{/each}
+					{#each NUTRITION_FIELDS as [key, label]}<FormField
+							id={`editor-nutrition-${key}`}
+							{label}
+							error={validation.nutrition[key]}
+						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="0"
+									max="1000000"
+									step="any"
+									bind:value={draft.nutrition[key]}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>{/each}
 				</div>
 			</details>
-			{#if error}<p class="error" role="alert">{error}</p>{/if}
+			{#if uploadError || validation.summary}<p class="error" role="alert">
+					{uploadError || validation.summary}
+				</p>{/if}
 			<div class="draft-footer">
 				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
 				<button class="primary" type="submit" disabled={uploading}
@@ -342,7 +395,7 @@
 		font-size: 13px;
 		margin-top: 10px;
 	}
-	.recipe-editor-dialog .full-field {
+	.recipe-editor-dialog :global(.full-field) {
 		grid-column: 1 / -1;
 	}
 	@media (max-width: 650px) {

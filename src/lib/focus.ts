@@ -3,6 +3,22 @@ let activeTraps = 0;
 let originalOverflow = '';
 let originalFocus: HTMLElement | null = null;
 
+export function focusFirstInvalid(container: ParentNode | null | undefined): HTMLElement | null {
+	if (!container) return null;
+	const target = container.querySelector<HTMLElement>(
+		'input[aria-invalid="true"]:not([disabled]),select[aria-invalid="true"]:not([disabled]),textarea[aria-invalid="true"]:not([disabled]),[aria-invalid="true"][tabindex]:not([disabled])'
+	);
+	if (!target) return null;
+	let details = target.closest?.('details') ?? null;
+	while (details) {
+		(details as HTMLDetailsElement).open = true;
+		details = details.parentElement?.closest?.('details') ?? null;
+	}
+	target.scrollIntoView?.({ block: 'nearest' });
+	target.focus();
+	return target;
+}
+
 export function focusTrap(node: HTMLElement) {
 	const previous = document.activeElement as HTMLElement | null;
 	const controls = () =>
