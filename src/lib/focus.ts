@@ -48,7 +48,7 @@ export function focusTrap(node: HTMLElement) {
 				const returnTarget = originalFocus;
 				queueMicrotask(() => {
 					if (activeTraps === 0 && returnTarget?.isConnected && !returnTarget.closest('[inert]'))
-						returnTarget.focus();
+						returnTarget.focus({ preventScroll: true });
 				});
 			}
 		}

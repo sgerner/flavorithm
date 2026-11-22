@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
 	import { focusTrap } from '#lib/focus.ts';
 	import {
@@ -8,8 +8,10 @@
 		dialogMotion,
 		revealMotion,
 		fadeMotion,
-		motionDuration
+		motionDuration,
+		prefersReducedMotion
 	} from '#lib/motion.ts';
+	import { calendarDayScrollLeft, weekOffsetFromStarts } from '#lib/planner.ts';
 	import { flip } from 'svelte/animate';
 	import {
 		ArrowRight,
@@ -331,6 +333,10 @@
 	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
+	let calendarGrid = $state<HTMLDivElement | undefined>();
+	let previousPage = '';
+	let pendingPlannerScrollDate = '';
+	let calendarScrollToken = 0;
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
 	let plannedServings = $state(2);
@@ -560,6 +566,19 @@
 	$effect(() => {
 		page;
 		if (ready) window.scrollTo({ top: 0, behavior: 'instant' });
+	});
+	$effect(() => {
+		const currentPage = page;
+		const enteringPlanner = currentPage === 'planner' && previousPage !== 'planner';
+		previousPage = currentPage;
+		if (!enteringPlanner) return;
+		if (pendingPlannerScrollDate) {
+			pendingPlannerScrollDate = '';
+			return;
+		}
+		if (untrack(() => weekOffset === 0)) {
+			void scrollCalendarToDate(dateKey(new Date()), true);
+		}
 	});
 	let stateEtag: string | null = null;
 	let writeChain = Promise.resolve();
@@ -1655,6 +1674,56 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
+	function weekOffsetForDate(value: string, today = new Date()) {
+		return weekOffsetFromStarts(weekStartForDate(value), weekStartForDate(dateKey(today)));
+	}
+	async function scrollCalendarToDate(targetDate: string, instant = false) {
+		const token = ++calendarScrollToken;
+		await tick();
+		if (
+			token !== calendarScrollToken ||
+			page !== 'planner' ||
+			!calendarGrid?.isConnected ||
+			typeof window === 'undefined' ||
+			typeof window.matchMedia !== 'function' ||
+			!window.matchMedia('(max-width: 900px)').matches ||
+			calendarGrid.scrollWidth <= calendarGrid.clientWidth
+		) {
+			return;
+		}
+		const dayCard =
+			Array.from(calendarGrid.querySelectorAll<HTMLElement>('.calendar-day')).find(
+				(day) => day.dataset.date === targetDate
+			) ??
+			(targetDate === dateKey(new Date())
+				? calendarGrid.querySelector<HTMLElement>('.calendar-day.today')
+				: null);
+		if (!dayCard) return;
+		const gridRect = calendarGrid.getBoundingClientRect();
+		const dayRect = dayCard.getBoundingClientRect();
+		const styles = window.getComputedStyle(calendarGrid);
+		const scrollPaddingStart =
+			Number.parseFloat(styles.scrollPaddingInlineStart) ||
+			Number.parseFloat(styles.scrollPaddingLeft) ||
+			0;
+		const left = calendarDayScrollLeft({
+			dayLeft: dayRect.left,
+			gridLeft: gridRect.left,
+			clientLeft: calendarGrid.clientLeft,
+			scrollLeft: calendarGrid.scrollLeft,
+			scrollPaddingStart,
+			scrollWidth: calendarGrid.scrollWidth,
+			clientWidth: calendarGrid.clientWidth
+		});
+		calendarGrid.scrollTo({
+			left,
+			behavior: instant || prefersReducedMotion() ? 'instant' : 'smooth'
+		});
+	}
+	function showCurrentWeek() {
+		weekOffset = 0;
+		void scrollCalendarToDate(dateKey(new Date()));
+	}
 	function refreshWeekShopping(startDate: string) {
 		const start = new Date(`${startDate}T12:00:00`);
 		if (Number.isNaN(start.getTime())) return;
@@ -1743,8 +1812,10 @@
 		meal.servings = Math.round(plannedServings);
 		refreshWeekShopping(previousWeek);
 		refreshWeekShopping(weekStartForDate(meal.date));
+		weekOffset = weekOffsetForDate(meal.date);
 		editingMealId = '';
 		modal = '';
+		void scrollCalendarToDate(meal.date);
 		notify('Meal plan updated.');
 	}
 	function openCookDialog(meal: Meal) {
@@ -1795,18 +1866,22 @@
 			notify('Choose between 1 and 24 whole servings.');
 			return;
 		}
+		const targetDate = mealDate;
 		kitchen.meals.push({
 			id: crypto.randomUUID(),
-			date: mealDate,
+			date: targetDate,
 			slot: mealSlot,
 			recipeId: selected.id,
 			servings: plannedServings
 		});
-		refreshWeekShopping(weekStartForDate(mealDate));
+		refreshWeekShopping(weekStartForDate(targetDate));
+		weekOffset = weekOffsetForDate(targetDate);
+		if (page !== 'planner') pendingPlannerScrollDate = targetDate;
 		selectedMealServings = undefined;
 		selected = null;
 		modal = '';
 		page = 'planner';
+		void scrollCalendarToDate(targetDate);
 		notify('Meal scheduled.');
 	}
 	async function refreshHousehold() {
@@ -2607,7 +2682,7 @@
 						</h2>
 						<button class="icon-button" onclick={() => weekOffset++} aria-label="Next week"
 							><ChevronRight size={20} /></button
-						><button class="text-button" onclick={() => (weekOffset = 0)}>This week</button>
+						><button class="text-button" onclick={showCurrentWeek}>This week</button>
 					</div>
 					<button
 						class="secondary"
@@ -2628,10 +2703,12 @@
 					>
 				</div>
 				{#key weekOffset}<div
+						bind:this={calendarGrid}
 						class="calendar-grid"
 						in:revealMotion|global={{ y: 8, duration: 220 }}
 					>
 						{#each week as day}<div
+								data-date={dateKey(day)}
 								class:today={dateKey(day) === dateKey(new Date())}
 								class="calendar-day"
 							>
