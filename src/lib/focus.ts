@@ -105,9 +105,17 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 
 	function focusInitial() {
 		const token = ++focusGeneration;
-		queueMicrotask(() => {
-			if (!active || token !== focusGeneration || node.inert || !node.isConnected) return;
+		const applyFocus = () => {
+			if (!active || token !== focusGeneration || node.inert || !node.isConnected) return true;
 			(focusableControls(node)[0] || node).focus();
+			return node.contains(document.activeElement);
+		};
+		queueMicrotask(() => {
+			if (!applyFocus() && typeof requestAnimationFrame === 'function') {
+				requestAnimationFrame(() => {
+					if (!node.contains(document.activeElement)) applyFocus();
+				});
+			}
 		});
 	}
 

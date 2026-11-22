@@ -2,14 +2,19 @@
 	import { tick } from 'svelte';
 	import { Search, Check, ChevronDown } from '@lucide/svelte';
 	import { revealMotion } from '#lib/motion.ts';
-	export type PickerOption = {
-		id: string;
-		label: string;
-		detail?: string;
-		searchText?: string;
-		disabled?: boolean;
-		searchOnly?: boolean;
-	};
+	import {
+		PICKER_VISIBLE_LIMIT,
+		activeOptionId,
+		closePickerState,
+		escapePickerState,
+		filterPickerOptions,
+		focusPickerState,
+		inputPickerState,
+		resolvePickerValue,
+		stepPickerActive,
+		type PickerOption
+	} from '#lib/search-picker.ts';
+	export type { PickerOption } from '#lib/search-picker.ts';
 	let {
 		label,
 		placeholder,
@@ -30,60 +35,40 @@
 	const id = $props.id();
 	let list = $state<HTMLDivElement>();
 	let open = $state(false);
+	let filtering = $state(false);
 	let query = $state('');
 	let active = $state(-1);
-	let terms = $derived(query.trim().toLowerCase().split(/\s+/).filter(Boolean));
-	let matches = $derived(
-		options
-			.filter(
-				(option) =>
-					(!option.searchOnly || terms.length) &&
-					terms.every((term) =>
-						`${option.label} ${option.detail || ''} ${option.searchText || ''}`
-							.toLowerCase()
-							.includes(term)
-					)
-			)
-			.sort((a, b) =>
-				terms.length
-					? Number(terms.every((term) => `${b.label} ${b.id}`.toLowerCase().includes(term))) -
-						Number(terms.every((term) => `${a.label} ${a.id}`.toLowerCase().includes(term)))
-					: 0
-			)
-	);
-	let visible = $derived(matches.slice(0, 80));
+	let selectingOnFocus = false;
+	let matches = $derived(filterPickerOptions(options, query, filtering));
+	let visible = $derived(matches.slice(0, PICKER_VISIBLE_LIMIT));
 	function choose(option: PickerOption) {
 		if (option.disabled) return;
-		open = false;
-		query = '';
-		active = -1;
+		({ open, filtering, query, active } = closePickerState());
 		onselect(option.id);
 	}
 	async function keyboard(event: KeyboardEvent) {
+		selectingOnFocus = false;
+		if (disabled) return;
 		if (event.key === 'Escape') {
-			if (open) {
-				event.stopPropagation();
-				event.preventDefault();
-				open = false;
-				query = '';
-				active = -1;
-			}
+			const next = escapePickerState({ open, filtering });
+			if (!next.handled) return;
+			event.preventDefault();
+			event.stopPropagation();
+			({ open, filtering, query, active } = next.state);
 			return;
 		}
 		if (event.key === 'Enter') {
 			event.preventDefault();
-			if (open && active >= 0 && visible[active]) choose(visible[active]);
+			if (open && active >= 0 && visible[active] && !visible[active].disabled)
+				choose(visible[active]);
 			else open = true;
 			return;
 		}
 		if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
 		event.preventDefault();
 		open = true;
-		const step = event.key === 'ArrowDown' ? 1 : -1;
-		for (let count = 0; count < visible.length; count++) {
-			active = (active + step + visible.length) % visible.length;
-			if (!visible[active]?.disabled) break;
-		}
+		active = stepPickerActive(visible, active, event.key);
+		if (active < 0) return;
 		await tick();
 		list
 			?.querySelector(`#${CSS.escape(id)}-option-${active}`)
@@ -99,27 +84,38 @@
 			{id}
 			role="combobox"
 			aria-autocomplete="list"
-			aria-expanded={open}
-			aria-controls={`${id}-list`}
-			aria-activedescendant={open && active >= 0 ? `${id}-option-${active}` : undefined}
-			value={open ? query : options.find((option) => option.id === value)?.label || fallback}
+			aria-expanded={open && !disabled}
+			aria-controls={open && !disabled ? `${id}-list` : undefined}
+			aria-activedescendant={activeOptionId(id, open, disabled, visible, active)}
+			value={resolvePickerValue({ options, value, fallback, query, filtering })}
 			{placeholder}
 			{disabled}
 			autocomplete="off"
 			spellcheck="false"
-			onfocus={() => {
-				open = true;
-				query = '';
-				active = -1;
+			onfocus={(event) => {
+				selectingOnFocus = true;
+				({ open, filtering, query, active } = focusPickerState());
+				event.currentTarget.select();
+			}}
+			onmouseup={(event) => {
+				if (selectingOnFocus) {
+					event.preventDefault();
+					selectingOnFocus = false;
+				}
+			}}
+			onclick={() => {
+				if (!open && !disabled) {
+					open = true;
+					active = -1;
+				}
 			}}
 			onblur={() => {
-				open = false;
-				active = -1;
+				selectingOnFocus = false;
+				({ open, filtering, query, active } = closePickerState());
 			}}
 			oninput={(event) => {
-				query = event.currentTarget.value;
-				open = true;
-				active = -1;
+				selectingOnFocus = false;
+				({ open, filtering, query, active } = inputPickerState(event.currentTarget.value));
 			}}
 			onkeydown={keyboard}
 		/>
@@ -227,9 +223,12 @@
 		border-bottom: 0;
 	}
 	button:hover,
-	button.highlighted,
 	button[aria-selected='true'] {
 		background: var(--wash);
+	}
+	button.highlighted {
+		outline: 2px solid var(--ink);
+		outline-offset: -2px;
 	}
 	button.unavailable {
 		opacity: 0.6;
