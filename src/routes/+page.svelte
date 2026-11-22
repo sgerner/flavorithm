@@ -2,7 +2,7 @@
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick } from 'svelte';
 	import type { PageData } from './$types';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
 	import {
 		backdropMotion,
 		dialogMotion,
@@ -890,6 +890,7 @@
 
 	async function authenticate(event: SubmitEvent) {
 		event.preventDefault();
+		if (busy) return;
 		if (managedAuth) {
 			openAuthentication();
 			return;
@@ -1485,7 +1486,7 @@
 	}
 
 	async function generate() {
-		if (!needAI()) return;
+		if (busy || !needAI()) return;
 		busy = true;
 		error = '';
 		try {
@@ -1503,6 +1504,7 @@
 		}
 	}
 	async function scan(event: Event) {
+		if (busy) return;
 		const file = (event.target as HTMLInputElement).files?.[0];
 		if (!file || !needAI()) return;
 		if (file.size > 5 * 1024 * 1024) {
@@ -1841,7 +1843,7 @@
 		}
 	}
 	async function invite() {
-		if (!canManageHousehold) return;
+		if (!canManageHousehold || householdBusy) return;
 		householdBusy = true;
 		error = '';
 		try {
@@ -1857,7 +1859,7 @@
 		}
 	}
 	async function revokeInvite(inviteId: string) {
-		if (!canManageHousehold) return;
+		if (!canManageHousehold || householdBusy) return;
 		householdBusy = true;
 		error = '';
 		try {
@@ -1875,13 +1877,14 @@
 		}
 	}
 	function askRemoveMember(member: HouseholdMember) {
-		if (!canManageHousehold || member.role === 'owner' || member.id === user?.id) return;
+		if (householdBusy || !canManageHousehold || member.role === 'owner' || member.id === user?.id)
+			return;
 		memberToRemove = member;
 		modal = 'removeMember';
 		error = '';
 	}
 	async function confirmRemoveMember() {
-		if (!canManageHousehold || !memberToRemove) return;
+		if (householdBusy || !canManageHousehold || !memberToRemove) return;
 		householdBusy = true;
 		error = '';
 		try {
@@ -1900,6 +1903,7 @@
 		}
 	}
 	async function join() {
+		if (householdBusy || !joinCode.trim()) return;
 		householdBusy = true;
 		try {
 			syncing = true;
@@ -1924,7 +1928,7 @@
 		}
 	}
 	async function refreshNutrition() {
-		if (!selected || !needAI()) return;
+		if (busy || !selected || !needAI()) return;
 		busy = true;
 		try {
 			const result = await ai('nutrition', { recipe: selected });
@@ -2002,7 +2006,7 @@
 	}
 	async function deleteAccount(event: SubmitEvent) {
 		event.preventDefault();
-		if (managedAuth) return;
+		if (managedAuth || busy) return;
 		busy = true;
 		error = '';
 		try {
@@ -2043,7 +2047,7 @@
 		}
 	}
 	async function sendEmailVerification() {
-		if (!user || user.emailVerified || !capabilities.emailDelivery) return;
+		if (verificationBusy || !user || user.emailVerified || !capabilities.emailDelivery) return;
 		verificationBusy = true;
 		error = '';
 		try {
@@ -2058,6 +2062,7 @@
 	}
 	async function recover(event: SubmitEvent) {
 		event.preventDefault();
+		if (busy) return;
 		if (managedAuth) {
 			openAuthentication();
 			return;
@@ -2085,6 +2090,7 @@
 		}
 	}
 	async function leaveHousehold() {
+		if (busy || householdBusy) return;
 		busy = true;
 		householdBusy = true;
 		error = '';
@@ -2125,6 +2131,7 @@
 		URL.revokeObjectURL(url);
 	}
 	async function internetSearch() {
+		if (busy) return;
 		if (!capabilities.recipeSearch) {
 			error = 'Web recipe search is not configured for this kitchen.';
 			return;
@@ -2168,10 +2175,19 @@
 >
 <svelte:window
 	onkeydown={(e) => {
-		if (e.key === 'Escape') {
-			mobileNav = false;
-			closeDialog();
-			selected = null;
+		if (e.key === 'Escape' && !e.defaultPrevented) {
+			if (modal) {
+				closeDialog();
+			} else if (editingRecipe) {
+				editingRecipe = null;
+			} else if (selected) {
+				selected = null;
+				selectedMealServings = undefined;
+			} else if (butlerOpen) {
+				void butlerChat?.close();
+			} else if (mobileNav) {
+				mobileNav = false;
+			}
 		}
 	}}
 />
@@ -2193,6 +2209,7 @@
 	{#if mobileNav}<button
 			class="nav-backdrop"
 			aria-label="Dismiss navigation"
+			use:focusHandoff={{ target: '.mobile-menu', fallback: '#kitchen-content' }}
 			onclick={() => (mobileNav = false)}
 			transition:backdropMotion|global
 		></button>{/if}
@@ -2200,6 +2217,7 @@
 		<button
 			class="icon-button sidebar-close"
 			aria-label="Close navigation"
+			use:focusHandoff={{ target: '.mobile-menu', fallback: '#kitchen-content' }}
 			onclick={() => (mobileNav = false)}><X size={20} /></button
 		>
 		<a class="brand" href="/" aria-label="Flavorithm home"
@@ -2283,10 +2301,12 @@
 					exportPending={exportPendingChanges}
 				/>{/if}
 			{#if showStarter}<div class="starter-note">
-					<span><Sparkles size={14} /> Sample kitchen</span><button onclick={freshKitchen}
-						>Start fresh <ArrowRight size={13} /></button
+					<span><Sparkles size={14} /> Sample kitchen</span><button
+						use:focusHandoff={{ fallback: '#kitchen-content' }}
+						onclick={freshKitchen}>Start fresh <ArrowRight size={13} /></button
 					><button
 						aria-label="Dismiss sample kitchen notice"
+						use:focusHandoff={{ fallback: '#kitchen-content' }}
 						onclick={() => {
 							showStarter = false;
 							localStorage.setItem('flavorithm-started', 'yes');
@@ -2488,6 +2508,7 @@
 					<span><b>{kitchen.pantry.length}</b> ingredients</span>
 					{#if kitchen.pantry.some((item) => item.quantity === 0)}<button
 							class="text-button"
+							use:focusHandoff={{ within: '.pantry-summary', target: 'button' }}
 							onclick={() => {
 								kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
 							}}>Clear depleted items</button
@@ -2558,6 +2579,11 @@
 							/><button
 								class="icon-button"
 								aria-label={`Remove ${item.name}`}
+								use:focusHandoff={{
+									row: '.pantry-row',
+									target: ':scope > .icon-button',
+									fallback: '.pantry-footer button, .page-heading button'
+								}}
 								onclick={() => (kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id))}
 								><X size={16} /></button
 							>
@@ -2675,6 +2701,12 @@
 														<button
 															class="remove-meal"
 															aria-label="Remove planned meal"
+															use:focusHandoff={{
+																row: '.calendar-meal',
+																target: '.remove-meal',
+																within: '.meal-slot',
+																fallback: '.add-meal'
+															}}
 															onclick={() => removePlannedMeal(meal)}><X size={13} /></button
 														>
 													</div>
@@ -2724,6 +2756,10 @@
 										<div class="cooked-history-actions">
 											{#if meal.leftoverServings}<button
 													class="text-button"
+													use:focusHandoff={{
+														within: '.cooked-history-actions',
+														target: 'button'
+													}}
 													onclick={() => {
 														meal.leftoverServings = 0;
 														notify('Leftovers marked used.');
@@ -2808,6 +2844,10 @@
 									>
 									<button
 										class="text-button"
+										use:focusHandoff={{
+											within: '.shopping-row',
+											target: '.shopping-quantity button'
+										}}
 										onclick={() => {
 											normalizeShoppingItem(item);
 											editingShoppingId = '';
@@ -2824,6 +2864,10 @@
 										{item.unit}<button
 											class="text-button"
 											aria-label={`Edit ${item.name}`}
+											use:focusHandoff={{
+												within: '.shopping-row',
+												target: 'input.shopping-name'
+											}}
 											onclick={() => (editingShoppingId = item.id)}>Edit</button
 										></span
 									>
@@ -2831,6 +2875,11 @@
 								<button
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
+									use:focusHandoff={{
+										row: '.shopping-row',
+										target: ':scope > .icon-button',
+										fallback: '.inline-add input'
+									}}
 									onclick={() => removeShoppingItem(item)}><X size={15} /></button
 								>
 							</div>{/each}{#if !kitchen.shopping.length}<div class="empty-state">
@@ -2880,7 +2929,11 @@
 </div>
 <div class="visually-hidden" role="status" aria-atomic="true">{toast}</div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
+		<span>✳</span>{toast}{#if toastUndo}<button
+				use:focusHandoff={{ fallback: '#kitchen-content' }}
+				onclick={toastUndo}>Undo</button
+			>{/if}<button
+			use:focusHandoff={{ fallback: '#kitchen-content' }}
 			onclick={() => (toast = '')}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
@@ -2928,7 +2981,7 @@
 			<div
 				class="flavor-dialog"
 				class:onboarding-dialog={modal === 'onboarding'}
-				use:focusTrap
+				use:focusTrap={{ onEscape: closeDialog }}
 				class:wide={modal === 'settings' ||
 					modal === 'pickRecipe' ||
 					modal === 'import' ||
@@ -2953,9 +3006,11 @@
 						<div class="dialog-actions">
 							{#if voiceState === 'recording'}<button
 									class="primary"
+									use:focusHandoff={{ within: '.voice-session', target: 'button' }}
 									onclick={() => voiceCapture?.stop()}>Stop recording</button
 								>{/if}<button
 								class="secondary"
+								use:focusHandoff={{ fallback: '.dialog-close' }}
 								onclick={() => {
 									voiceCapture?.cancel();
 									voiceStarting = false;
@@ -3066,8 +3121,10 @@
 					<div class="dialog-actions">
 						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button><button
 							class="secondary"
-							onclick={() => imageInput.click()}
-							disabled={busy}><Camera size={17} /> Use photo</button
+							use:busyAction={busy}
+							onclick={() => {
+								if (!busy) imageInput.click();
+							}}><Camera size={17} /> Use photo</button
 						><button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
 							>Add ingredients <ArrowRight size={17} /></button
 						>
@@ -3121,7 +3178,7 @@
 								}}>Forgot your password?</button
 							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary full"
-							disabled={busy}
+							use:busyAction={busy}
 							>{busy
 								? 'Opening your kitchen…'
 								: authMode === 'register'
@@ -3178,7 +3235,7 @@
 					</p>
 					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 						class="primary full"
-						disabled={busy}
+						use:busyAction={busy}
 						onclick={generate}
 						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
 					>
@@ -3225,7 +3282,9 @@
 										Email verification is optional for using your kitchen.
 									</p>{:else}<button
 										class="secondary"
-										disabled={!capabilities.emailDelivery || verificationBusy}
+										disabled={!capabilities.emailDelivery}
+										use:busyAction={verificationBusy}
+										use:focusHandoff={{ fallback: '.dialog-close' }}
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
 									>{#if !capabilities.emailDelivery}<p class="field-help">
@@ -3336,7 +3395,7 @@
 								>
 								{#if canManageHousehold && member.role !== 'owner' && member.id !== user?.id}<button
 										class="text-button danger member-remove"
-										disabled={householdBusy}
+										use:busyAction={householdBusy}
 										onclick={() => askRemoveMember(member)}>Remove</button
 									>{/if}
 							</div>{/each}
@@ -3352,12 +3411,18 @@
 												})}</span
 											><button
 												class="text-button danger"
-												disabled={householdBusy}
+												use:busyAction={householdBusy}
+												use:focusHandoff={{
+													row: '.invite-row',
+													target: 'button',
+													within: '.household-invites',
+													fallback: 'button.primary'
+												}}
 												onclick={() => revokeInvite(invite.inviteId)}>Revoke</button
 											>
 										</div>{/each}
 								</div>{:else}<p class="field-help">No active invitations.</p>{/if}
-							<button class="primary full" disabled={householdBusy} onclick={invite}
+							<button class="primary full" use:busyAction={householdBusy} onclick={invite}
 								><Plus size={17} /> Create invitation</button
 							>
 							{#if inviteCode}<div class="invite-code">
@@ -3385,14 +3450,17 @@
 							autocomplete="off"
 						/></label
 					>
-					<button class="secondary full" disabled={householdBusy || !joinCode.trim()} onclick={join}
-						>Join household <ArrowRight size={17} /></button
+					<button
+						class="secondary full"
+						use:busyAction={householdBusy || !joinCode.trim()}
+						onclick={join}>Join household <ArrowRight size={17} /></button
 					>
 					{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<button
 						class="text-button danger full"
-						disabled={householdBusy}
+						use:busyAction={householdBusy}
 						onclick={() => {
+							if (householdBusy) return;
 							modal = 'leave';
 							error = '';
 						}}>Leave this household</button
@@ -3407,14 +3475,15 @@
 					<div class="dialog-actions">
 						<button
 							class="secondary"
-							disabled={householdBusy}
+							use:busyAction={householdBusy}
 							onclick={() => {
+								if (householdBusy) return;
 								memberToRemove = null;
 								modal = 'household';
 							}}>Keep member</button
 						><button
 							class="primary danger-action"
-							disabled={householdBusy}
+							use:busyAction={householdBusy}
 							onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button
 						>
 					</div>
@@ -3427,7 +3496,7 @@
 					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 						class="primary full"
 						onclick={leaveHousehold}
-						disabled={busy}>Leave household</button
+						use:busyAction={busy}>Leave household</button
 					>
 				{:else if modal === 'delete' && !managedAuth}
 					<h2>Delete your account?</h2>
@@ -3446,7 +3515,7 @@
 							/></label
 						>{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary danger-button full"
-							disabled={busy}>Permanently delete my account</button
+							use:busyAction={busy}>Permanently delete my account</button
 						>
 					</form>
 				{:else if (modal === 'recover' || modal === 'reset') && !managedAuth}<span
@@ -3477,7 +3546,7 @@
 								/></label
 							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary full"
-							disabled={busy}
+							use:busyAction={busy}
 							>{busy
 								? 'One moment…'
 								: modal === 'reset'
@@ -3617,7 +3686,8 @@
 						/></label
 					><button
 						class="primary full"
-						disabled={busy || !capabilities.recipeSearch}
+						disabled={!capabilities.recipeSearch}
+						use:busyAction={busy}
 						onclick={internetSearch}
 						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 					>{#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -3629,8 +3699,12 @@
 								<a href={result.url} target="_blank" rel="noreferrer"
 									><b>{result.title}<ArrowUpRight size={17} /></b>
 									<p>{result.description}</p></a
-								><button class="secondary" disabled={busy} onclick={() => importRecipe(result.url)}
-									><Plus size={16} /> Import recipe</button
+								><button
+									class="secondary"
+									use:busyAction={busy}
+									onclick={() => {
+										if (!busy) importRecipe(result.url);
+									}}><Plus size={16} /> Import recipe</button
 								>
 							</div>{/each}
 					</div>

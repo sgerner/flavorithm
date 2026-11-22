@@ -2,7 +2,7 @@
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
 	import { Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
@@ -24,10 +24,12 @@
 	let error = $state('');
 	let uploading = $state(false);
 	let photoInput: HTMLInputElement;
+	let addIngredientButton = $state<HTMLButtonElement>();
+	let addStepButton = $state<HTMLButtonElement>();
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
-		if (!file) return;
+		if (!file || uploading) return;
 		uploading = true;
 		error = '';
 		try {
@@ -136,7 +138,7 @@
 <div class="modal-backdrop" transition:backdropMotion|global>
 	<div
 		class="flavor-dialog wide capture-dialog recipe-editor-dialog"
-		use:focusTrap
+		use:focusTrap={{ onEscape: cancel }}
 		role="dialog"
 		aria-modal="true"
 		aria-labelledby="recipe-editor-title"
@@ -194,15 +196,18 @@
 					<button
 						type="button"
 						class="secondary"
-						disabled={uploading}
-						onclick={() => photoInput.click()}
-						>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
+						use:busyAction={uploading}
+						onclick={() => {
+							if (!uploading) photoInput.click();
+						}}>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
 					>
 					{#if draft.image}<button
 							type="button"
 							class="text-button"
-							disabled={uploading}
+							use:busyAction={uploading}
+							use:focusHandoff={{ within: '.cover-picker', target: 'button' }}
 							onclick={() => {
+								if (uploading) return;
 								draft.image = '';
 							}}>Remove cover</button
 						>{/if}
@@ -231,11 +236,14 @@
 			<div class="draft-section-heading">
 				<h3>Ingredients</h3>
 				<button
+					bind:this={addIngredientButton}
 					class="text-button"
 					type="button"
-					disabled={draft.ingredients.length >= 60}
-					onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
-					><Plus size={17} />Add</button
+					use:busyAction={draft.ingredients.length >= 60}
+					onclick={() => {
+						if (draft.ingredients.length < 60)
+							draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' });
+					}}><Plus size={17} />Add</button
 				>
 			</div>
 			<div class="draft-ingredients">
@@ -270,6 +278,11 @@
 							class="icon-button"
 							type="button"
 							aria-label={`Remove ingredient ${i + 1}`}
+							use:focusHandoff={{
+								row: '.draft-ingredient',
+								target: 'button',
+								fallback: () => addIngredientButton
+							}}
 							onclick={() =>
 								(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
 							><X size={18} /></button
@@ -279,10 +292,13 @@
 			<div class="draft-section-heading">
 				<h3>Steps</h3>
 				<button
+					bind:this={addStepButton}
 					class="text-button"
 					type="button"
-					disabled={draft.steps.length >= 40}
-					onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
+					use:busyAction={draft.steps.length >= 40}
+					onclick={() => {
+						if (draft.steps.length < 40) draft.steps.push('');
+					}}><Plus size={17} />Add</button
 				>
 			</div>
 			{#each draft.steps as step, i}<div class="draft-step">
@@ -296,6 +312,11 @@
 						class="icon-button"
 						type="button"
 						aria-label={`Remove step ${i + 1}`}
+						use:focusHandoff={{
+							row: '.draft-step',
+							target: 'button',
+							fallback: () => addStepButton
+						}}
 						onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
 						><X size={18} /></button
 					>
@@ -322,7 +343,7 @@
 			{#if error}<p class="error" role="alert">{error}</p>{/if}
 			<div class="draft-footer">
 				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
-				<button class="primary" type="submit" disabled={uploading}
+				<button class="primary" type="submit" use:busyAction={uploading}
 					><Check size={18} />Save changes</button
 				>
 			</div>

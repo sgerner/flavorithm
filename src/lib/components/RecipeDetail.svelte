@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
 	import type { Recipe } from '#lib/types.ts';
 	import {
@@ -81,7 +81,7 @@
 	<div
 		class="recipe-dialog"
 		transition:dialogMotion|global
-		use:focusTrap
+		use:focusTrap={{ onEscape: close }}
 		role="dialog"
 		aria-modal="true"
 		aria-label={recipe.title}
@@ -257,8 +257,12 @@
 							analysis.
 						</p>
 					</div>
-					<button class="text-button full" onclick={nutrition} disabled={busy}
-						>Refresh nutrition estimate with AI</button
+					<button
+						class="text-button full"
+						use:busyAction={busy}
+						onclick={() => {
+							if (!busy) nutrition();
+						}}>Refresh nutrition estimate with AI</button
 					>
 				</div>{/if}
 			<div class="rating-box">

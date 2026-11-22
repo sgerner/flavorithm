@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { CloudOff, RefreshCw, Download } from '@lucide/svelte';
+	import { busyAction, focusHandoff } from '#lib/focus.ts';
 	import { revealMotion } from '#lib/motion.ts';
 	import type { AppState } from '#lib/types.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
@@ -121,7 +122,11 @@
 			<button class="secondary" onclick={() => (review = !review)}
 				>{review ? 'Hide changes' : 'Review changes'}</button
 			>
-		{:else if online && !syncing}<button class="secondary" onclick={retry}>Retry sync</button>{/if}
+		{:else if online && !syncing}<button
+				class="secondary"
+				use:focusHandoff={{ fallback: '#kitchen-content' }}
+				onclick={retry}>Retry sync</button
+			>{/if}
 		{#if review && conflicts.length}
 			<div class="sync-review">
 				<p>
@@ -149,11 +154,23 @@
 					<button class="secondary" onclick={exportPending}
 						><Download size={16} /> Back up my changes</button
 					>
-					<button class="secondary" disabled={syncing || !online} onclick={() => resolve('remote')}
-						>Use household values</button
+					<button
+						class="secondary"
+						disabled={!online}
+						use:busyAction={syncing}
+						use:focusHandoff={{ fallback: '#kitchen-content' }}
+						onclick={() => {
+							if (!syncing && online) resolve('remote');
+						}}>Use household values</button
 					>
-					<button class="primary" disabled={syncing || !online} onclick={() => resolve('local')}
-						>Use my values</button
+					<button
+						class="primary"
+						disabled={!online}
+						use:busyAction={syncing}
+						use:focusHandoff={{ fallback: '#kitchen-content' }}
+						onclick={() => {
+							if (!syncing && online) resolve('local');
+						}}>Use my values</button
 					>
 				</div>
 			</div>

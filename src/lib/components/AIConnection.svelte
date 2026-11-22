@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { ArrowUpRight, RefreshCw, Check, Copy } from '@lucide/svelte';
 	import SearchPicker from './SearchPicker.svelte';
+	import { busyAction, focusHandoff } from '#lib/focus.ts';
 	import { revealMotion } from '#lib/motion.ts';
 	import type { Preferences } from '#lib/types.ts';
 	import {
@@ -62,8 +63,11 @@
 		onsignin: () => void;
 	} = $props();
 	let hostError = $state('');
+	let hostBusy = $state(false);
 	async function setHost(enabled: boolean) {
+		if (hostBusy || busy) return;
 		hostError = '';
+		hostBusy = true;
 		try {
 			const response = await fetch('/api/connections/chatgpt', {
 				method: 'POST',
@@ -77,6 +81,8 @@
 			onrefresh();
 		} catch (error) {
 			hostError = (error as Error).message;
+		} finally {
+			hostBusy = false;
 		}
 	}
 	let provider = $derived(providers.find((p) => p.id === preferences.provider));
@@ -138,17 +144,23 @@
 			households.
 		</p>
 		{#if chatGPT.host}<p>Host connection enabled · {chatGPT.host.model}</p>
-			<button class="secondary" onclick={() => setHost(false)}>Disable host connection</button>
+			<button
+				class="secondary"
+				use:busyAction={busy || hostBusy}
+				use:focusHandoff={{ within: '.device-login', target: 'button' }}
+				onclick={() => setHost(false)}>Disable host connection</button
+			>
 		{:else}<p class="field-help">
 				Connect ChatGPT with a device code below and choose its model, then enable sharing.
 			</p>
 			<button
 				class="secondary"
-				disabled={busy ||
-					!subscription ||
+				disabled={!subscription ||
 					!activeAccount?.connected ||
 					activeAccount.id === 'host-chatgpt' ||
 					!preferences.model}
+				use:busyAction={busy || hostBusy}
+				use:focusHandoff={{ within: '.device-login', target: 'button' }}
 				onclick={() => setHost(true)}>Use selected connection for this host</button
 			>{/if}
 		{#if hostError}<p class="error" role="alert">{hostError}</p>{/if}
@@ -204,8 +216,11 @@
 				<div class="connection-actions">
 					<button
 						class="primary"
-						disabled={busy || !signedIn || !chatGPT.configured}
-						onclick={() => onconnect(activeAccount?.id)}
+						disabled={!signedIn || !chatGPT.configured}
+						use:busyAction={busy}
+						onclick={() => {
+							if (!busy) onconnect(activeAccount?.id);
+						}}
 					>
 						{busy
 							? 'Connecting…'
@@ -215,13 +230,19 @@
 					</button>
 					{#if activeAccount}<button
 							class="secondary"
-							disabled={busy || !signedIn || !chatGPT.configured}
-							onclick={() => onconnect()}>Add account</button
+							disabled={!signedIn || !chatGPT.configured}
+							use:busyAction={busy}
+							onclick={() => {
+								if (!busy) onconnect();
+							}}>Add account</button
 						>{/if}
 					{#if activeAccount?.connected && !activeAccount.planEnabled}<button
 							class="secondary"
-							disabled={busy || !chatGPT.configured}
-							onclick={() => onconnect(activeAccount?.id, true)}>Enable plan usage</button
+							disabled={!chatGPT.configured}
+							use:busyAction={busy}
+							onclick={() => {
+								if (!busy) onconnect(activeAccount?.id, true);
+							}}>Enable plan usage</button
 						>{/if}
 				</div>
 			{/if}
@@ -241,7 +262,14 @@
 							href={device.verificationUrl}
 							target="_blank"
 							rel="noopener noreferrer">Open ChatGPT <ArrowUpRight size={17} /></a
-						><button class="secondary" onclick={oncancel}>Cancel</button>
+						><button
+							class="secondary"
+							use:focusHandoff={{
+								within: '.connection-setup',
+								target: '.connection-actions button'
+							}}
+							onclick={oncancel}>Cancel</button
+						>
 					</div>
 					<p class="field-help">Waiting for approval. This code expires in 15 minutes.</p>
 				</div>
@@ -271,8 +299,16 @@
 						target="_blank"
 						rel="noreferrer">Manage plan usage <ArrowUpRight size={15} /></a
 					>
-					<button class="text-button danger" disabled={busy} onclick={ondisconnect}
-						>Disconnect</button
+					<button
+						class="text-button danger"
+						use:busyAction={busy}
+						use:focusHandoff={{
+							within: '.connection-setup',
+							target: '.connection-actions button'
+						}}
+						onclick={() => {
+							if (!busy) ondisconnect();
+						}}>Disconnect</button
 					>
 				</div>
 			{/if}
@@ -314,8 +350,12 @@
 		onselect={selectModel}
 		disabled={!signedIn || !models.length}
 	/>
-	{#if subscription}<button class="text-button" disabled={loading || busy} onclick={onrefresh}
-			><RefreshCw size={15} /> Refresh account models</button
+	{#if subscription}<button
+			class="text-button"
+			use:busyAction={loading || busy}
+			onclick={() => {
+				if (!loading && !busy) onrefresh();
+			}}><RefreshCw size={15} /> Refresh account models</button
 		>{/if}
 	{#if selectedModel && !selectedModel.vision}<p class="field-help">
 			This model accepts text only. Choose a model with image input to import photos.

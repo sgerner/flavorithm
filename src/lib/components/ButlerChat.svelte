@@ -15,7 +15,7 @@
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
 	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
 	import type { AppState, Recipe } from '#lib/types.ts';
 
 	type Turn = { role: 'user' | 'assistant'; content: string };
@@ -140,20 +140,16 @@
 	export async function close() {
 		resetReaction();
 		open = false;
-		await tick();
-		launcher?.focus();
 	}
 	async function toggle() {
 		open = !open;
 		if (open) {
 			await tick();
 			input?.focus();
-		} else {
-			await tick();
-			launcher?.focus();
 		}
 	}
 	function clear() {
+		if (working || messages.length === 0) return;
 		cancelRequest();
 		messages = [];
 		recipeDrafts = [];
@@ -309,18 +305,11 @@
 		class="butler-panel"
 		style={viewportStyle}
 		id="butler-panel"
-		use:focusTrap
+		use:focusTrap={{ onEscape: close, fallback: () => launcher }}
 		role="dialog"
 		aria-modal="true"
 		tabindex="-1"
 		aria-label="Chat with Basil"
-		onkeydown={(event) => {
-			if (event.key === 'Escape') {
-				event.stopPropagation();
-				event.preventDefault();
-				close();
-			}
-		}}
 	>
 		<header>
 			<BasilAvatar {mood} size={46} active={open} />
@@ -331,7 +320,8 @@
 			<button
 				class="icon-button"
 				onclick={clear}
-				disabled={working || messages.length === 0}
+				disabled={messages.length === 0}
+				use:busyAction={working}
 				aria-label="Clear conversation"
 				title="Clear conversation"><RotateCcw size={17} /></button
 			>
@@ -354,7 +344,10 @@
 				<div class="butler-starters">
 					{#each starters as starter}<button
 							onclick={() => send(starter.prompt)}
-							disabled={working || !owner}>{starter.label}<ArrowRight size={14} /></button
+							disabled={!owner}
+							use:busyAction={working}
+							use:focusHandoff={{ target: '#butler-message' }}
+							>{starter.label}<ArrowRight size={14} /></button
 						>{/each}
 				</div>
 			{/if}
@@ -391,7 +384,9 @@
 												class="butler-primary action-button"
 												class:destructive={action.destructive}
 												onclick={() => applyAction(message, action)}
-												disabled={working || message.snapshot !== JSON.stringify(kitchen)}
+												disabled={message.snapshot !== JSON.stringify(kitchen)}
+												use:busyAction={working}
+												use:focusHandoff={{ target: '#butler-message' }}
 											>
 												{#if applying === `${message.id}:${action.id}`}<LoaderCircle
 														size={15}
@@ -407,13 +402,15 @@
 											<button
 												class="dismiss-action"
 												onclick={() => {
+													if (working) return;
 													action.status = 'dismissed';
 													const ids = action.commands.flatMap((command) =>
 														command.type === 'recipe.upsert' ? [command.recipe.id] : []
 													);
 													recipeDrafts = recipeDrafts.filter((recipe) => !ids.includes(recipe.id));
 												}}
-												disabled={working}
+												use:busyAction={working}
+												use:focusHandoff={{ target: '#butler-message' }}
 												aria-label={`Dismiss ${action.title}`}>Dismiss</button
 											>
 										</div>
@@ -441,8 +438,10 @@
 			</div>{/if}
 		{#if error}<div class="butler-error" role="alert">
 				<p>{error}</p>
-				{#if failedPrompt}<button onclick={() => send(failedPrompt, true)} disabled={working}
-						>Try again</button
+				{#if failedPrompt}<button
+						onclick={() => send(failedPrompt, true)}
+						use:busyAction={working}
+						use:focusHandoff={{ target: '#butler-message' }}>Try again</button
 					>{/if}
 			</div>{/if}
 		<form
@@ -459,7 +458,8 @@
 				placeholder="Your instructions…"
 				rows="2"
 				maxlength="2000"
-				disabled={working || !owner}
+				readonly={working}
+				disabled={!owner}
 				onkeydown={(event) => {
 					if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
 						event.preventDefault();
@@ -470,13 +470,16 @@
 					class="butler-primary butler-send"
 					type="button"
 					onclick={stop}
+					use:focusHandoff={{ target: '#butler-message' }}
 					aria-label="Stop reply"
 					title="Stop reply"><Square size={16} /></button
 				>
 			{:else}<button
 					class="butler-primary butler-send"
 					type="submit"
-					disabled={working || !draft.trim() || !owner}
+					disabled={!draft.trim() || !owner}
+					use:busyAction={working}
+					use:focusHandoff={{ target: '#butler-message' }}
 					aria-label="Send message"><Send size={18} /></button
 				>{/if}
 		</form>
@@ -787,6 +790,9 @@
 	}
 	textarea:focus {
 		outline: none;
+	}
+	textarea[readonly] {
+		opacity: 0.7;
 	}
 	form:focus-within {
 		outline: 2px solid var(--green);

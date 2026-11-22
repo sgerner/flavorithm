@@ -90,7 +90,8 @@ button {
 	background: none;
 	color: inherit;
 }
-button:disabled {
+button:disabled,
+button[aria-disabled='true'] {
 	opacity: 0.5;
 	cursor: wait;
 }
@@ -103,7 +104,8 @@ a {
 		opacity 0.2s;
 }
 button:focus-visible,
-a:focus-visible {
+a:focus-visible,
+summary:focus-visible {
 	outline: 2px solid var(--green);
 	outline-offset: 4px;
 }
@@ -537,8 +539,8 @@ main {
 .cream-button svg:last-child {
 	margin-left: 6px;
 }
-.cream-button:hover,
-.primary:hover {
+.cream-button:not(:disabled):not([aria-disabled='true']):hover,
+.primary:not(:disabled):not([aria-disabled='true']):hover {
 	transform: translateY(-2px);
 	filter: brightness(1.08);
 }

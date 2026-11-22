@@ -19,6 +19,7 @@
 <script lang="ts">
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
+	import { busyAction, focusHandoff } from '#lib/focus.ts';
 	import { revealMotion } from '#lib/motion.ts';
 	let {
 		session = $bindable(),
@@ -42,6 +43,8 @@
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let heading = $state<HTMLHeadingElement>();
+	let addIngredientButton = $state<HTMLButtonElement>();
+	let addStepButton = $state<HTMLButtonElement>();
 	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
 		['calories', 'Calories (kcal)'],
 		['fat', 'Fat (g)'],
@@ -225,7 +228,7 @@
 					maxlength="20000"
 					rows="6"
 					placeholder={'Paste anything here…\n\nOr try: chickpeas, tomatoes, spinach. Make a quick dinner for two.'}
-					disabled={busy}></textarea></label
+					readonly={busy}></textarea></label
 			>
 			<div class="capture-tools">
 				<input
@@ -241,18 +244,27 @@
 				<button
 					class="secondary"
 					type="button"
-					onclick={() => photoInput?.click()}
-					disabled={busy || reading}
+					onclick={() => {
+						if (!busy && !reading) photoInput?.click();
+					}}
+					use:busyAction={busy || reading}
 					><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
 				>
-				<button class="secondary" type="button" onclick={dictate} disabled={busy || reading}
-					><Mic size={18} />Use voice</button
+				<button
+					class="secondary"
+					type="button"
+					onclick={() => {
+						if (!busy && !reading) dictate();
+					}}
+					use:busyAction={busy || reading}><Mic size={18} />Use voice</button
 				>
 				{#if session.text || session.photo}<button
 						type="button"
 						class="text-button"
-						disabled={busy || reading}
+						use:busyAction={busy || reading}
+						use:focusHandoff={{ within: '.recipe-dropzone', target: 'textarea' }}
 						onclick={() => {
+							if (busy || reading) return;
 							session = emptyImportSession();
 							error = '';
 							retryAvailable = false;
@@ -264,8 +276,10 @@
 						type="button"
 						class="icon-button"
 						aria-label="Remove recipe photo"
-						disabled={busy}
+						use:busyAction={busy}
+						use:focusHandoff={{ within: '.recipe-dropzone', target: '.capture-tools button' }}
 						onclick={() => {
+							if (busy) return;
 							session.photo = '';
 							session.photoName = '';
 						}}><X size={18} /></button
@@ -277,11 +291,17 @@
 					If a website can’t be read, copy its recipe text or attach a screenshot instead.
 				</p>{/if}{/if}
 		<div class="capture-actions">
-			{#if busy}<button class="secondary" type="button" onclick={cancelPrepare}>Cancel</button>{/if}
+			{#if busy}<button
+					class="secondary"
+					type="button"
+					use:focusHandoff={{ within: '.capture-actions', target: 'button[type="submit"]' }}
+					onclick={cancelPrepare}>Cancel</button
+				>{/if}
 			<button
 				class="primary full"
 				type="submit"
-				disabled={busy || reading || (!session.text.trim() && !session.photo)}
+				disabled={!session.text.trim() && !session.photo}
+				use:busyAction={busy || reading}
 				aria-busy={busy}
 				>{busy ? 'Making your draft…' : retryAvailable ? 'Try again' : 'Create recipe draft'}<Check
 					size={18}
@@ -291,6 +311,7 @@
 		{#if session.draft}<button
 				class="text-button"
 				type="button"
+				use:focusHandoff={{ target: '#recipe-import-title' }}
 				onclick={() => {
 					error = '';
 					reviewingDraft = true;
@@ -339,6 +360,11 @@
 								class="icon-button"
 								type="button"
 								aria-label={`Dismiss estimate ${i + 1}`}
+								use:focusHandoff={{
+									row: 'li',
+									target: 'button',
+									fallback: '.draft-title input'
+								}}
 								onclick={() =>
 									(session.assumptions = session.assumptions.filter((_, index) => index !== i))}
 								><X size={16} /></button
@@ -349,11 +375,14 @@
 		<div class="draft-section-heading">
 			<h3>Ingredients</h3>
 			<button
+				bind:this={addIngredientButton}
 				class="text-button"
 				type="button"
-				disabled={draft.ingredients.length >= 60}
-				onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
-				><Plus size={17} />Add</button
+				use:busyAction={draft.ingredients.length >= 60}
+				onclick={() => {
+					if (draft.ingredients.length < 60)
+						draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' });
+				}}><Plus size={17} />Add</button
 			>
 		</div>
 		<div class="draft-ingredients">
@@ -388,6 +417,11 @@
 						class="icon-button"
 						type="button"
 						aria-label={`Remove ingredient ${i + 1}`}
+						use:focusHandoff={{
+							row: '.draft-ingredient',
+							target: 'button',
+							fallback: () => addIngredientButton
+						}}
 						onclick={() =>
 							(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
 						><X size={18} /></button
@@ -397,10 +431,13 @@
 		<div class="draft-section-heading">
 			<h3>Steps</h3>
 			<button
+				bind:this={addStepButton}
 				class="text-button"
 				type="button"
-				disabled={draft.steps.length >= 40}
-				onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
+				use:busyAction={draft.steps.length >= 40}
+				onclick={() => {
+					if (draft.steps.length < 40) draft.steps.push('');
+				}}><Plus size={17} />Add</button
 			>
 		</div>
 		{#each draft.steps as step, i}<div class="draft-step">
@@ -413,6 +450,11 @@
 					class="icon-button"
 					type="button"
 					aria-label={`Remove step ${i + 1}`}
+					use:focusHandoff={{
+						row: '.draft-step',
+						target: 'button',
+						fallback: () => addStepButton
+					}}
 					onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
 					><X size={18} /></button
 				>
@@ -443,6 +485,7 @@
 		<button
 			class="text-button"
 			type="button"
+			use:focusHandoff={{ target: '.recipe-dropzone textarea' }}
 			onclick={() => {
 				session = emptyImportSession();
 				error = '';
@@ -458,6 +501,7 @@
 			<button
 				class="secondary"
 				type="button"
+				use:focusHandoff={{ target: '.recipe-dropzone textarea' }}
 				onclick={() => {
 					reviewingDraft = false;
 					error = '';
