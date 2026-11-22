@@ -102,6 +102,11 @@
 	let mobileViewport = $state(false);
 	let mobileMenuButton = $state<HTMLButtonElement | null>(null);
 	let mobileDrawerOpen = $derived(mobileViewport && mobileNav);
+	let mobileCalendar = $state(
+		typeof window !== 'undefined' &&
+			typeof window.matchMedia === 'function' &&
+			window.matchMedia('(max-width: 650px)').matches
+	);
 	let modal = $state('');
 	const dialogNames: Record<string, string> = {
 		onboarding: 'Recipe preferences',
@@ -764,18 +769,27 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
-		const mobileMedia = window.matchMedia('(max-width: 650px)');
+		const mobileMedia =
+			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
 		const syncMobileViewport = () => {
-			mobileViewport = mobileMedia.matches;
-			if (!mobileMedia.matches && mobileNav) mobileNav = false;
+			mobileViewport = Boolean(mobileMedia?.matches);
+			if (!mobileMedia?.matches && mobileNav) mobileNav = false;
 		};
 		syncMobileViewport();
-		mobileMedia.addEventListener('change', syncMobileViewport);
+		mobileMedia?.addEventListener('change', syncMobileViewport);
+		const calendarMedia =
+			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
+		const calendarMediaChanged = () => {
+			mobileCalendar = Boolean(calendarMedia?.matches);
+		};
+		calendarMediaChanged();
+		calendarMedia?.addEventListener('change', calendarMediaChanged);
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
 		return () => {
-			mobileMedia.removeEventListener('change', syncMobileViewport);
+			mobileMedia?.removeEventListener('change', syncMobileViewport);
+			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
@@ -2699,11 +2713,15 @@
 															selectedMealServings = meal.servings;
 															selected = recipe;
 														}}
-														><img
-															src={recipe.image || recipePlaceholder(recipe)}
-															onerror={(event) => recipeImageError(event, recipe)}
-															alt=""
-														/><b>{recipe.title}</b><small
+														>{#if !mobileCalendar}<img
+																src={recipe.image || recipePlaceholder(recipe)}
+																onerror={(event) => recipeImageError(event, recipe)}
+																alt=""
+																width="180"
+																height="65"
+																loading="lazy"
+																decoding="async"
+															/>{/if}<b>{recipe.title}</b><small
 															>{recipe.time} min · {meal.servings} servings</small
 														></button
 													>
@@ -2756,6 +2774,10 @@
 											src={recipe.image || recipePlaceholder(recipe)}
 											onerror={(event) => recipeImageError(event, recipe)}
 											alt=""
+											width="54"
+											height="48"
+											loading="lazy"
+											decoding="async"
 										/>
 										<div>
 											<b>{recipe.title}</b><span
@@ -3612,6 +3634,10 @@
 							src={recipe.image || recipePlaceholder(recipe)}
 							onerror={(event) => recipeImageError(event, recipe)}
 							alt=""
+							width="75"
+							height="60"
+							loading="lazy"
+							decoding="async"
 						/><span><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
 						><Plus size={17} /></button
 					>{/each}

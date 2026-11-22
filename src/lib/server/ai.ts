@@ -362,7 +362,7 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getSupportedModels(requestFetcher);
+			: await getPublicModelCatalog(requestFetcher);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2358,6 +2358,27 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
+const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+type CatalogCacheEntry = {
+	pending?: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+const defaultPlatformFetch: Fetcher = globalThis.fetch;
+const defaultCatalogCache: CatalogCacheEntry = { expiresAt: 0 };
+const customCatalogCaches = new WeakMap<Fetcher, CatalogCacheEntry>();
+
+function resolveCatalogCache(fetcher: Fetcher): CatalogCacheEntry {
+	if (fetcher === defaultPlatformFetch || fetcher.name === 'server_fetch') {
+		return defaultCatalogCache;
+	}
+	let entry = customCatalogCaches.get(fetcher);
+	if (!entry) {
+		entry = { expiresAt: 0 };
+		customCatalogCaches.set(fetcher, entry);
+	}
+	return entry;
+}
+
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
 ): Promise<SupportedModelResponse> {
@@ -2375,4 +2396,20 @@ export async function getSupportedModels(
 	const body = await readJsonResponse(response, 'Model catalog');
 	if (!response.ok) throw upstreamError(response.status, 'Model catalog');
 	return transformModelCatalog(body);
+}
+
+export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	const cache = resolveCatalogCache(fetcher);
+	if (!cache.pending || Date.now() >= cache.expiresAt) {
+		cache.expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+		const pending = getSupportedModels(fetcher).catch((error) => {
+			if (cache.pending === pending) {
+				cache.pending = undefined;
+				cache.expiresAt = 0;
+			}
+			throw error;
+		});
+		cache.pending = pending;
+	}
+	return cache.pending;
 }
