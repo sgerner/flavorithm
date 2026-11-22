@@ -2359,10 +2359,8 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-const publicCatalogs = new WeakMap<
-	Fetcher,
-	{ pending: Promise<SupportedModelResponse>; expiresAt: number }
->();
+let publicCatalog: Promise<SupportedModelResponse> | undefined;
+let publicCatalogExpiresAt = 0;
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2384,19 +2382,22 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const cacheKey = fetcher.name === 'server_fetch' ? fetch : fetcher;
-	const now = Date.now();
-	const cached = publicCatalogs.get(cacheKey);
-	if (!cached || now >= cached.expiresAt) {
-		const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
+	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
+		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
 		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (publicCatalogs.get(cacheKey)?.pending === pending) {
-				publicCatalogs.delete(cacheKey);
+			if (publicCatalog === pending) {
+				publicCatalog = undefined;
+				publicCatalogExpiresAt = 0;
 			}
 			throw error;
 		});
-		publicCatalogs.set(cacheKey, { pending, expiresAt });
-		return pending;
+		publicCatalog = pending;
 	}
-	return cached.pending;
+	return publicCatalog;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
 }
