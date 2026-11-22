@@ -4263,14 +4263,14 @@
 		border-bottom: 2px solid var(--accent);
 	}
 	.voice-session.voice-recovery {
-		border-bottom-color: #b55439;
+		border-bottom-color: var(--danger-ink);
 	}
 	.voice-session p {
 		font-size: 16px;
 		margin: 0 0 10px;
 	}
 	.voice-session .voice-error-copy {
-		color: #b55439;
+		color: var(--danger-ink);
 		font-weight: 500;
 	}
 	.voice-session .voice-recovery-note {
