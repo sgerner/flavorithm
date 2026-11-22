@@ -1,4 +1,3 @@
-import { json } from '@sveltejs/kit';
 import { z } from 'zod';
 import type { RequestHandler } from './$types';
 import {
@@ -128,29 +127,29 @@ export const POST: RequestHandler = async (event) => {
 			event.request.signal
 		);
 
-		return json(result, {
+		return Response.json(result, {
 			headers: { 'cache-control': 'no-store' }
 		});
 	} catch (error) {
 		if (error instanceof ChatGPTInferenceError) {
-			return json(
+			return Response.json(
 				{ error: error.message, code: error.code },
 				{ status: error.status, headers: { 'cache-control': 'no-store' } }
 			);
 		}
 		if (error instanceof ApiError) {
-			return json(
+			return Response.json(
 				{ error: error.message },
 				{ status: error.status, headers: { 'cache-control': 'no-store' } }
 			);
 		}
 		if (error instanceof AIRequestError) {
-			return json(
+			return Response.json(
 				{ error: error.message },
 				{ status: error.status, headers: { 'cache-control': 'no-store' } }
 			);
 		}
-		return json(
+		return Response.json(
 			{ error: 'The recipe URL could not be imported.' },
 			{ status: 500, headers: { 'cache-control': 'no-store' } }
 		);
