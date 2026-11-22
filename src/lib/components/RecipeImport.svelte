@@ -1,10 +1,18 @@
 <script module lang="ts">
+	import {
+		createDraftBaseline,
+		MAX_SERVINGS,
+		NUTRITION_FIELDS,
+		validateRecipeDraft,
+		type RecipeDraftBaseline
+	} from '#lib/recipe-draft.ts';
 	import type { Recipe } from '#lib/types.ts';
 	export type ImportSession = {
 		text: string;
 		photo: string;
 		photoName: string;
 		draft: Recipe | null;
+		baseline: RecipeDraftBaseline | null;
 		assumptions: string[];
 	};
 	export const emptyImportSession = (): ImportSession => ({
@@ -12,6 +20,7 @@
 		photo: '',
 		photoName: '',
 		draft: null,
+		baseline: null,
 		assumptions: []
 	});
 </script>
@@ -37,21 +46,15 @@
 	let busy = $state(false);
 	let reading = $state(false);
 	let reviewingDraft = $state(untrack(() => session.draft !== null));
+	let nutritionOpen = $state(false);
 	let retryAvailable = $state(false);
 	let error = $state('');
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let heading = $state<HTMLHeadingElement>();
-	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
-		['calories', 'Calories (kcal)'],
-		['fat', 'Fat (g)'],
-		['saturatedFat', 'Saturated fat (g)'],
-		['sodium', 'Sodium (mg)'],
-		['carbs', 'Carbohydrates (g)'],
-		['fiber', 'Fiber (g)'],
-		['sugar', 'Sugar (g)'],
-		['protein', 'Protein (g)']
-	];
+	if (untrack(() => session.draft !== null && session.baseline === null)) {
+		session.baseline = untrack(() => createDraftBaseline(session.draft!));
+	}
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
@@ -131,7 +134,9 @@
 			);
 			if (alive && generation === captureGeneration && result) {
 				session.draft = result.recipe;
+				session.baseline = createDraftBaseline(result.recipe);
 				session.assumptions = result.assumptions;
+				nutritionOpen = false;
 				reviewingDraft = true;
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
@@ -165,37 +170,18 @@
 		event.preventDefault();
 		const draft = session.draft;
 		if (!draft) return;
-		const ingredients = draft.ingredients.map((i) => ({
-			...i,
-			name: i.name.trim(),
-			unit: i.unit.trim()
-		}));
-		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
-		if (
-			!draft.title.trim() ||
-			!ingredients.length ||
-			!steps.length ||
-			ingredients.some(
-				(i) => !i.name || !i.unit || !Number.isFinite(i.quantity) || i.quantity <= 0
-			) ||
-			!Number.isFinite(draft.time) ||
-			draft.time <= 0 ||
-			!Number.isFinite(draft.servings) ||
-			draft.servings < 1
-		) {
-			error =
-				'Add a title, time, servings, at least one ingredient with a quantity and unit, and a cooking step.';
+		const validation = validateRecipeDraft(draft, {
+			baseline: session.baseline,
+			assumptions: session.assumptions
+		});
+		if (!validation.ok) {
+			if (validation.nutritionInvalid) nutritionOpen = true;
+			error = validation.error;
 			return;
 		}
+		error = '';
 		try {
-			save({
-				...draft,
-				title: draft.title.trim(),
-				ingredients,
-				steps,
-				importNotes: [...session.assumptions],
-				saved: true
-			});
+			save(validation.recipe);
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -305,7 +291,7 @@
 	<div class="draft-heading" in:revealMotion>
 		<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Review your recipe</h2>
 	</div>
-	<form onsubmit={saveDraft} in:revealMotion>
+	<form onsubmit={saveDraft} novalidate in:revealMotion>
 		<div class="draft-summary">
 			<label class="field draft-title"
 				>Title<input bind:value={draft.title} required maxlength="200" /></label
@@ -325,7 +311,7 @@
 					type="number"
 					bind:value={draft.servings}
 					min="1"
-					max="10000"
+					max={MAX_SERVINGS}
 					step="1"
 					required
 				/></label
@@ -424,11 +410,11 @@
 			><label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label
 			><label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label>
 		</details>
-		<details class="import-notes">
+		<details class="import-notes" bind:open={nutritionOpen}>
 			<summary>Nutrition estimates</summary>
 			<p>Estimates per serving; re-estimate after ingredient or serving changes.</p>
 			<div class="draft-summary">
-				{#each nutritionFields as [key, label]}<label class="field"
+				{#each NUTRITION_FIELDS as [key, label]}<label class="field"
 						>{label}<input
 							type="number"
 							min="0"
@@ -446,6 +432,7 @@
 			onclick={() => {
 				session = emptyImportSession();
 				error = '';
+				nutritionOpen = false;
 				reviewingDraft = false;
 				retryAvailable = false;
 			}}>Discard draft</button
