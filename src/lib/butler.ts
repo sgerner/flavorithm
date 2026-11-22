@@ -277,10 +277,19 @@ export function applyButlerCommands(
 			case 'shopping.upsert':
 				state = { ...state, shopping: upsert(state.shopping, command.item) };
 				break;
-			case 'shopping.delete':
+			case 'shopping.delete': {
 				requireId(state.shopping, command.id);
+				const removed = state.shopping.find((item) => item.id === command.id);
+				const week = removed?.checked
+					? removed.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1]
+					: undefined;
 				state = { ...state, shopping: state.shopping.filter((item) => item.id !== command.id) };
+				if (week) {
+					touchedWeeks.add(week);
+					state = refreshWeekShopping(state, week, now);
+				}
 				break;
+			}
 			case 'shopping.generate': {
 				const startKey = command.weekStart ?? weekStartForDate(now);
 				touchedWeeks.add(startKey);
