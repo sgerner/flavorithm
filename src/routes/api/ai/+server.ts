@@ -1,7 +1,6 @@
 import { getHostAI } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
@@ -55,7 +54,7 @@ export const POST: RequestHandler = async (event) => {
 			connection = { accessToken: resolved.accessToken, codex: resolved.codex };
 			providerFetch = resolved.fetcher;
 		}
-		return json(
+		return Response.json(
 			await runAIRequest(body, providerFetch, undefined, connection, event.request.signal),
 			{
 				headers: { 'cache-control': 'no-store' }
@@ -63,14 +62,14 @@ export const POST: RequestHandler = async (event) => {
 		);
 	} catch (error) {
 		if (error instanceof ChatGPTInferenceError)
-			return json({ error: error.message, code: error.code }, { status: error.status });
+			return Response.json({ error: error.message, code: error.code }, { status: error.status });
 		if (error instanceof ApiError) {
-			return json({ error: error.message }, { status: error.status });
+			return Response.json({ error: error.message }, { status: error.status });
 		}
 		if (error instanceof AIRequestError) {
-			return json({ error: error.message }, { status: error.status });
+			return Response.json({ error: error.message }, { status: error.status });
 		}
-		return json({ error: 'The AI request could not be completed.' }, { status: 500 });
+		return Response.json({ error: 'The AI request could not be completed.' }, { status: 500 });
 	}
 };
 

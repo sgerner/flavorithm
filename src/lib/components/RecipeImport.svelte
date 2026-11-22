@@ -1,17 +1,28 @@
 <script module lang="ts">
+	import {
+		createDraftBaseline,
+		MAX_SERVINGS,
+		NUTRITION_FIELDS,
+		validateRecipeDraft,
+		type RecipeDraftBaseline
+	} from '#lib/recipe-draft.ts';
 	import type { Recipe } from '#lib/types.ts';
 	export type ImportSession = {
+		url: string;
 		text: string;
 		photo: string;
 		photoName: string;
 		draft: Recipe | null;
+		baseline: RecipeDraftBaseline | null;
 		assumptions: string[];
 	};
 	export const emptyImportSession = (): ImportSession => ({
+		url: '',
 		text: '',
 		photo: '',
 		photoName: '',
 		draft: null,
+		baseline: null,
 		assumptions: []
 	});
 </script>
@@ -29,7 +40,7 @@
 	}: {
 		session: ImportSession;
 		capture: (
-			input: { prompt: string; image?: string },
+			input: { url?: string; prompt: string; image?: string },
 			signal: AbortSignal
 		) => Promise<{ recipe: Recipe; assumptions: string[] } | null>;
 		save: (recipe: Recipe) => void;
@@ -38,6 +49,7 @@
 	let busy = $state(false);
 	let reading = $state(false);
 	let reviewingDraft = $state(untrack(() => session.draft !== null));
+	let nutritionOpen = $state(false);
 	let retryAvailable = $state(false);
 	let error = $state('');
 	let dragging = $state(false);
@@ -45,16 +57,9 @@
 	let heading = $state<HTMLHeadingElement>();
 	let addIngredientButton = $state<HTMLButtonElement>();
 	let addStepButton = $state<HTMLButtonElement>();
-	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
-		['calories', 'Calories (kcal)'],
-		['fat', 'Fat (g)'],
-		['saturatedFat', 'Saturated fat (g)'],
-		['sodium', 'Sodium (mg)'],
-		['carbs', 'Carbohydrates (g)'],
-		['fiber', 'Fiber (g)'],
-		['sugar', 'Sugar (g)'],
-		['protein', 'Protein (g)']
-	];
+	if (untrack(() => session.draft !== null && session.baseline === null)) {
+		session.baseline = untrack(() => createDraftBaseline(session.draft!));
+	}
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
@@ -103,6 +108,21 @@
 			void attachPhoto(photo);
 		}
 	}
+	function firstDroppedUrl(uriList: string): string {
+		for (const rawLine of uriList.split(/\r?\n/)) {
+			const line = rawLine.trim();
+			if (!line || line.startsWith('#')) continue;
+			try {
+				const parsed = new URL(line);
+				if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+					return line.slice(0, 2048);
+				}
+			} catch {
+				// Ignore invalid lines in text/uri-list payloads.
+			}
+		}
+		return '';
+	}
 	function drop(event: DragEvent) {
 		event.preventDefault();
 		dragging = false;
@@ -112,15 +132,18 @@
 			void attachPhoto(file);
 			return;
 		}
-		const text =
-			event.dataTransfer?.getData('text/plain') ||
-			event.dataTransfer?.getData('text/uri-list') ||
-			'';
+		const droppedUrl = firstDroppedUrl(event.dataTransfer?.getData('text/uri-list') ?? '');
+		if (droppedUrl) {
+			session.url = droppedUrl;
+			return;
+		}
+		const text = event.dataTransfer?.getData('text/plain') || '';
 		if (text) session.text = [session.text, text].filter(Boolean).join('\n').slice(0, 20_000);
 	}
 	async function prepare(event: SubmitEvent) {
 		event.preventDefault();
-		if (busy || reading || !alive || (!session.text.trim() && !session.photo)) return;
+		const url = session.url.trim();
+		if (busy || reading || !alive || (!url && !session.text.trim() && !session.photo)) return;
 		error = '';
 		retryAvailable = false;
 		busy = true;
@@ -129,12 +152,18 @@
 		controller = currentController;
 		try {
 			const result = await capture(
-				{ prompt: session.text, ...(session.photo ? { image: session.photo } : {}) },
+				{
+					...(url ? { url } : {}),
+					prompt: session.text,
+					...(session.photo ? { image: session.photo } : {})
+				},
 				currentController.signal
 			);
 			if (alive && generation === captureGeneration && result) {
 				session.draft = result.recipe;
+				session.baseline = createDraftBaseline(result.recipe);
 				session.assumptions = result.assumptions;
+				nutritionOpen = false;
 				reviewingDraft = true;
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
@@ -168,37 +197,18 @@
 		event.preventDefault();
 		const draft = session.draft;
 		if (!draft) return;
-		const ingredients = draft.ingredients.map((i) => ({
-			...i,
-			name: i.name.trim(),
-			unit: i.unit.trim()
-		}));
-		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
-		if (
-			!draft.title.trim() ||
-			!ingredients.length ||
-			!steps.length ||
-			ingredients.some(
-				(i) => !i.name || !i.unit || !Number.isFinite(i.quantity) || i.quantity <= 0
-			) ||
-			!Number.isFinite(draft.time) ||
-			draft.time <= 0 ||
-			!Number.isFinite(draft.servings) ||
-			draft.servings < 1
-		) {
-			error =
-				'Add a title, time, servings, at least one ingredient with a quantity and unit, and a cooking step.';
+		const validation = validateRecipeDraft(draft, {
+			baseline: session.baseline,
+			assumptions: session.assumptions
+		});
+		if (!validation.ok) {
+			if (validation.nutritionInvalid) nutritionOpen = true;
+			error = validation.error;
 			return;
 		}
+		error = '';
 		try {
-			save({
-				...draft,
-				title: draft.title.trim(),
-				ingredients,
-				steps,
-				importNotes: [...session.assumptions],
-				saved: true
-			});
+			save(validation.recipe);
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -207,7 +217,9 @@
 
 {#if !reviewingDraft || !session.draft}
 	<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Import a recipe</h2>
-	<p class="muted capture-help">Paste a recipe, link, or rough ingredient notes.</p>
+	<p class="muted capture-help">
+		Add an optional recipe link to fetch, or paste a recipe and notes.
+	</p>
 	<form onsubmit={prepare}>
 		<div
 			class="recipe-dropzone"
@@ -222,12 +234,21 @@
 			ondrop={drop}
 		>
 			<label class="field"
-				>Recipe text or link<textarea
+				>Recipe link (optional)<input
+					type="url"
+					bind:value={session.url}
+					maxlength="2048"
+					placeholder="https://example.com/recipe"
+					readonly={busy}
+				/></label
+			>
+			<label class="field"
+				>Recipe text or notes<textarea
 					bind:value={session.text}
 					onpaste={paste}
 					maxlength="20000"
 					rows="6"
-					placeholder={'Paste anything here…\n\nOr try: chickpeas, tomatoes, spinach. Make a quick dinner for two.'}
+					placeholder={'Paste recipe text or notes for a linked page…\n\nOr try: chickpeas, tomatoes, spinach. Make a quick dinner for two.'}
 					readonly={busy}></textarea></label
 			>
 			<div class="capture-tools">
@@ -258,7 +279,7 @@
 					}}
 					use:busyAction={busy || reading}><Mic size={18} />Use voice</button
 				>
-				{#if session.text || session.photo}<button
+				{#if session.url || session.text || session.photo}<button
 						type="button"
 						class="text-button"
 						use:busyAction={busy || reading}
@@ -287,7 +308,9 @@
 				</div>{/if}
 		</div>
 		{#if error}<p class="error" role="alert">{error}</p>
-			{#if /^https?:\/\/\S+$/.test(session.text.trim())}<p class="field-help">
+			{#if session.url.trim() || /^https?:\/\/\S+$/i.test(session.text.trim())}<p
+					class="field-help"
+				>
 					If a website can’t be read, copy its recipe text or attach a screenshot instead.
 				</p>{/if}{/if}
 		<div class="capture-actions">
@@ -300,7 +323,7 @@
 			<button
 				class="primary full"
 				type="submit"
-				disabled={!session.text.trim() && !session.photo}
+				disabled={!session.url.trim() && !session.text.trim() && !session.photo}
 				use:busyAction={busy || reading}
 				aria-busy={busy}
 				>{busy ? 'Making your draft…' : retryAvailable ? 'Try again' : 'Create recipe draft'}<Check
@@ -326,7 +349,7 @@
 	<div class="draft-heading" in:revealMotion>
 		<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Review your recipe</h2>
 	</div>
-	<form onsubmit={saveDraft} in:revealMotion>
+	<form onsubmit={saveDraft} novalidate in:revealMotion>
 		<div class="draft-summary">
 			<label class="field draft-title"
 				>Title<input bind:value={draft.title} required maxlength="200" /></label
@@ -346,7 +369,7 @@
 					type="number"
 					bind:value={draft.servings}
 					min="1"
-					max="10000"
+					max={MAX_SERVINGS}
 					step="1"
 					required
 				/></label
@@ -466,11 +489,11 @@
 			><label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label
 			><label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label>
 		</details>
-		<details class="import-notes">
+		<details class="import-notes" bind:open={nutritionOpen}>
 			<summary>Nutrition estimates</summary>
 			<p>Estimates per serving; re-estimate after ingredient or serving changes.</p>
 			<div class="draft-summary">
-				{#each nutritionFields as [key, label]}<label class="field"
+				{#each NUTRITION_FIELDS as [key, label]}<label class="field"
 						>{label}<input
 							type="number"
 							min="0"
@@ -489,12 +512,17 @@
 			onclick={() => {
 				session = emptyImportSession();
 				error = '';
+				nutritionOpen = false;
 				reviewingDraft = false;
 				retryAvailable = false;
 			}}>Discard draft</button
 		>
 		{#if draft.source}<p class="field-help">
 				<a href={draft.source} target="_blank" rel="noreferrer">Original source</a>
+			</p>{:else}<p class="field-help">
+				{draft.provenance === 'web-import'
+					? 'Imported from a recipe webpage.'
+					: 'AI-generated from your input — no recipe webpage was fetched.'}
 			</p>{/if}
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		<div class="draft-footer">
