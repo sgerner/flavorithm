@@ -36,14 +36,17 @@ addUnits('count', 1, 'each', [
 	'whole',
 	'egg',
 	'eggs',
-	'small',
-	'medium',
-	'large'
+	'item',
+	'items'
 ]);
+addUnits('count:small', 1, 'small', ['small']);
+addUnits('count:medium', 1, 'medium', ['medium']);
+addUnits('count:large', 1, 'large', ['large']);
 addUnits('count:clove', 1, 'clove', ['clove', 'cloves']);
 addUnits('count:head', 1, 'head', ['head', 'heads', 'small head', 'medium head', 'large head']);
 addUnits('count:slice', 1, 'slice', ['slice', 'slices']);
 addUnits('count:can', 1, 'can', ['can', 'cans']);
+addUnits('count:bunch', 1, 'bunch', ['bunch', 'bunches']);
 addUnits('count:pinch', 1, 'pinch', ['pinch', 'pinches']);
 addUnits('count:dash', 1, 'dash', ['dash', 'dashes']);
 
@@ -68,28 +71,81 @@ const ingredientAliases: Record<string, string> = {
 	'extra-virgin olive oil': 'olive oil',
 	'plain greek yogurt': 'greek yogurt',
 	'plain greek yoghurt': 'greek yogurt',
+	'greek yoghurt': 'greek yogurt',
+	'roma tomato': 'tomato',
 	'roma tomatoes': 'tomato',
 	tomatoes: 'tomato',
 	'baby spinach': 'spinach',
 	'boneless skinless chicken breast': 'chicken breast',
 	'boneless chicken breast': 'chicken breast',
 	'persian cucumber': 'cucumber',
-	'persian cucumbers': 'cucumber'
+	'persian cucumbers': 'cucumber',
+	'crushed garlic': 'garlic'
 };
 
-const singulars: Record<string, string> = {
-	apples: 'apple',
+const nonIdentityModifiers = new Set([
+	'fresh',
+	'freshly',
+	'baby',
+	'minced',
+	'boneless',
+	'skinless',
+	'chopped',
+	'diced',
+	'sliced',
+	'grated',
+	'shredded',
+	'peeled',
+	'trimmed',
+	'halved',
+	'quartered',
+	'drained',
+	'rinsed',
+	'finely',
+	'roughly',
+	'coarsely',
+	'thinly',
+	'thickly',
+	'ripe',
+	'organic'
+]);
+
+const uncountableWords = new Set([
+	'asparagus',
+	'citrus',
+	'couscous',
+	'greens',
+	'grits',
+	'hummus',
+	'lemongrass',
+	'molasses',
+	'oats',
+	'swiss',
+	'watercress'
+]);
+
+const irregularSingulars: Record<string, string> = {
+	avocadoes: 'avocado',
 	avocados: 'avocado',
-	beans: 'bean',
-	'broccoli florets': 'broccoli floret',
-	carrots: 'carrot',
-	cucumbers: 'cucumber',
-	eggs: 'egg',
-	lemons: 'lemon',
-	limes: 'lime',
-	onions: 'onion',
+	brioches: 'brioche',
+	brownies: 'brownie',
+	chilies: 'chili',
+	chillies: 'chilli',
+	cookies: 'cookie',
+	halves: 'half',
+	jalapenos: 'jalapeno',
+	jalapeños: 'jalapeño',
+	knives: 'knife',
+	leaves: 'leaf',
+	loaves: 'loaf',
+	mangoes: 'mango',
+	mangos: 'mango',
+	pies: 'pie',
 	potatoes: 'potato',
-	tomatoes: 'tomato'
+	quiches: 'quiche',
+	smoothies: 'smoothie',
+	tomatoes: 'tomato',
+	veggies: 'veggie'
 };
 
 function cleanText(value: string): string {
@@ -100,16 +156,63 @@ function cleanText(value: string): string {
 		.replace(/[.,;:]$/, '');
 }
 
+function stripModifiers(cleaned: string): string {
+	const tokens = cleaned
+		.split(' ')
+		.map((token) => token.replace(/^,+|,+$/g, ''))
+		.filter(Boolean);
+	const remaining = tokens.filter((token) => !nonIdentityModifiers.has(token));
+	return remaining.length > 0 ? remaining.join(' ') : tokens.join(' ');
+}
+
+function singularizeWord(word: string): string {
+	if (word.length <= 2 || uncountableWords.has(word)) return word;
+	const irregular = irregularSingulars[word];
+	if (irregular) return irregular;
+	if (word.endsWith('ss') || word.endsWith('us') || word.endsWith('is')) return word;
+	if (word.length > 3 && word.endsWith('ies') && !/[aeiou]ies$/.test(word)) {
+		return `${word.slice(0, -3)}y`;
+	}
+	if (/(?:sh|ch|x|ss|zz)es$/.test(word)) {
+		return word.slice(0, -2);
+	}
+	if (word.endsWith('s')) {
+		return word.slice(0, -1);
+	}
+	return word;
+}
+
+function singularizePhrase(phrase: string): string {
+	const words = phrase.split(' ').filter(Boolean);
+	if (words.length === 0) return phrase;
+	words[words.length - 1] = singularizeWord(words[words.length - 1]);
+	return words.join(' ');
+}
+
 export function normalizeName(name: string): string {
 	const cleaned = cleanText(name);
-	return ingredientAliases[cleaned] ?? singulars[cleaned] ?? cleaned;
+	if (!cleaned) return '';
+	if (ingredientAliases[cleaned]) return ingredientAliases[cleaned];
+	const stripped = stripModifiers(cleaned);
+	if (ingredientAliases[stripped]) return ingredientAliases[stripped];
+	const singular = singularizePhrase(stripped);
+	return ingredientAliases[singular] ?? singular;
 }
 
 export function unitInfo(unit: string): UnitInfo {
 	const cleaned = cleanText(unit);
-	return (
-		unitAliases[cleaned] ?? { dimension: `unit:${cleaned}`, factor: 1, display: cleaned || 'each' }
-	);
+	if (unitAliases[cleaned]) return unitAliases[cleaned];
+	const withoutParens = cleanText(cleaned.replace(/\s*\([^)]*\)/g, ' '));
+	if (withoutParens && /^[a-z][a-z.\s-]*$/.test(withoutParens)) {
+		return (
+			unitAliases[withoutParens] ?? {
+				dimension: `unit:${withoutParens}`,
+				factor: 1,
+				display: withoutParens
+			}
+		);
+	}
+	return { dimension: `unit:${cleaned}`, factor: 1, display: cleaned || 'each' };
 }
 
 function roundQuantity(value: number): number {
@@ -155,6 +258,139 @@ function expiredBefore(expires: string | undefined, date: string | undefined): b
 	return Boolean(
 		expiryDate && scheduledDate && dateOrdinal(expiryDate) < dateOrdinal(scheduledDate)
 	);
+}
+
+export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
+
+/** Classify an expiry by local calendar day; date-only strings are never parsed as UTC. */
+export function expiryStatus(expires?: string, now: Date = new Date()): ExpiryStatus {
+	if (!expires?.trim() || !Number.isFinite(now.getTime())) return 'unknown';
+	const expiry = calendarDate(expires);
+	if (!expiry) return 'unknown';
+	const today = { year: now.getFullYear(), month: now.getMonth(), day: now.getDate() };
+	const daysUntilExpiry = dateOrdinal(expiry) - dateOrdinal(today);
+	if (daysUntilExpiry < 0) return 'expired';
+	if (daysUntilExpiry <= 3) return 'soon';
+	return 'fresh';
+}
+
+export type IndexedPantryLot = {
+	quantityBase: number;
+	expiry: Exclude<ExpiryStatus, 'expired'>;
+	priority: number;
+	index: number;
+};
+
+export type PantryLotIndex = Map<string, IndexedPantryLot[]>;
+
+export type RecipePantryMatch = {
+	matchedCount: number;
+	available: number;
+	expiring: number;
+};
+
+/** Index positive, non-expired pantry stock by normalized name and unit dimension. */
+export function indexUsablePantry(pantry: Ingredient[], now: Date = new Date()): PantryLotIndex {
+	const index: PantryLotIndex = new Map();
+	for (const item of pantry) {
+		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
+		const expiry = expiryStatus(item.expires, now);
+		if (expiry === 'expired') continue;
+		const normalizedName = normalizeName(item.name);
+		if (!normalizedName) continue;
+		const unit = unitInfo(item.unit);
+		const key = `${normalizedName}\u0000${unit.dimension}`;
+		const parsedExpiry = item.expires?.trim() ? calendarDate(item.expires) : undefined;
+		const priority = parsedExpiry ? dateOrdinal(parsedExpiry) : Number.MAX_SAFE_INTEGER;
+		const lots = index.get(key) ?? [];
+		lots.push({
+			quantityBase: item.quantity * unit.factor,
+			expiry,
+			priority,
+			index: lots.length
+		});
+		index.set(key, lots);
+	}
+	for (const lots of index.values()) {
+		lots.sort((a, b) => a.priority - b.priority || a.index - b.index);
+	}
+	return index;
+}
+
+/**
+ * Allocate usable compatible pantry stock across a recipe's ingredients, deducting consumed
+ * lot balances so split ingredient lines never count shared stock twice.
+ */
+export function matchRecipePantry(
+	recipe: Recipe,
+	pantryOrIndex: Ingredient[] | PantryLotIndex,
+	now: Date = new Date()
+): RecipePantryMatch {
+	const ingredients = recipe.ingredients.filter(
+		(item) => Number.isFinite(item.quantity) && item.quantity > 0 && item.unit.trim()
+	);
+	if (!ingredients.length) return { matchedCount: 0, available: 0, expiring: 0 };
+
+	const index = Array.isArray(pantryOrIndex)
+		? indexUsablePantry(pantryOrIndex, now)
+		: pantryOrIndex;
+	const remainingByBucket = new Map<
+		string,
+		Array<{ remainingBase: number; expiry: Exclude<ExpiryStatus, 'expired'> }>
+	>();
+	const buckets = new Map<
+		string,
+		{ requiredBase: number; allocatedBase: number; expiringBase: number }
+	>();
+	let matchedCount = 0;
+
+	for (const ingredient of ingredients) {
+		const normalizedName = normalizeName(ingredient.name);
+		const unit = unitInfo(ingredient.unit);
+		const key = `${normalizedName}\u0000${unit.dimension}`;
+		const requiredBase = ingredient.quantity * unit.factor;
+		let lots = remainingByBucket.get(key);
+		if (!lots) {
+			lots = (index.get(key) ?? []).map((lot) => ({
+				remainingBase: lot.quantityBase,
+				expiry: lot.expiry
+			}));
+			remainingByBucket.set(key, lots);
+		}
+
+		let need = requiredBase;
+		let allocatedBase = 0;
+		let expiringBase = 0;
+		for (const lot of lots) {
+			if (need <= 0) break;
+			if (!(lot.remainingBase > 0)) continue;
+			const used = Math.min(need, lot.remainingBase);
+			lot.remainingBase -= used;
+			need -= used;
+			allocatedBase += used;
+			if (lot.expiry === 'soon') expiringBase += used;
+		}
+		if (allocatedBase > 0) matchedCount++;
+
+		const bucket = buckets.get(key) ?? { requiredBase: 0, allocatedBase: 0, expiringBase: 0 };
+		bucket.requiredBase += requiredBase;
+		bucket.allocatedBase += allocatedBase;
+		bucket.expiringBase += expiringBase;
+		buckets.set(key, bucket);
+	}
+
+	if (!buckets.size) return { matchedCount, available: 0, expiring: 0 };
+	let availabilitySum = 0;
+	let expiringSum = 0;
+	for (const bucket of buckets.values()) {
+		availabilitySum += Math.min(1, bucket.allocatedBase / bucket.requiredBase);
+		expiringSum += Math.min(1, bucket.expiringBase / bucket.requiredBase);
+	}
+	return {
+		matchedCount,
+		available: availabilitySum / buckets.size,
+		expiring: expiringSum / buckets.size
+	};
 }
 
 type ShoppingRequirement = {

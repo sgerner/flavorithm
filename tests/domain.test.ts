@@ -1,7 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createInitialState, seedRecipes } from '../src/lib/data.ts';
-import { buildShoppingList, preferenceSummary } from '../src/lib/domain.ts';
+import { createInitialState, seedPantry, seedRecipes } from '../src/lib/data.ts';
+import {
+	buildShoppingList,
+	matchRecipePantry,
+	normalizeName,
+	preferenceSummary,
+	unitInfo
+} from '../src/lib/domain.ts';
 import type { Ingredient, Meal, Recipe } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -184,4 +190,140 @@ test('starter recipes have distinct Unsplash images, complete cooking directions
 	first.pantry[0].quantity += 1;
 	assert.notEqual(first.pantry[0].quantity, second.pantry[0].quantity);
 	assert.notEqual(first.recipes[0].ingredients, second.recipes[0].ingredients);
+});
+
+test('normalizes regular plurals and prep modifiers while keeping uncountables and compound identities distinct', () => {
+	const pairs: Array<[string, string]> = [
+		['shallots', 'shallot'],
+		['green bean', 'green beans'],
+		['cherry tomato', 'cherry tomatoes'],
+		['salmon fillet', 'salmon fillets'],
+		['red onions', 'red onion'],
+		['yellow onions', 'yellow onion'],
+		['flatbreads', 'flatbread'],
+		['fresh cilantro', 'cilantro'],
+		['fresh ginger', 'ginger'],
+		['baby kale', 'kale'],
+		['minced garlic', 'garlic']
+	];
+	for (const [left, right] of pairs) {
+		assert.equal(normalizeName(left), normalizeName(right), `${left} should match ${right}`);
+	}
+
+	assert.notEqual(normalizeName('rice'), normalizeName('rice vinegar'));
+	assert.notEqual(normalizeName('butter'), normalizeName('butternut squash'));
+	assert.notEqual(normalizeName('red onion'), normalizeName('yellow onion'));
+	assert.equal(normalizeName('hummus'), 'hummus');
+	assert.equal(normalizeName('couscous'), 'couscous');
+	assert.equal(normalizeName('asparagus'), 'asparagus');
+	assert.equal(normalizeName('molasses'), 'molasses');
+	assert.equal(normalizeName('rolled oats'), 'rolled oats');
+});
+
+test('maps item units and parenthetical cans while separating size, head, and clove dimensions', () => {
+	assert.deepEqual(unitInfo('item'), { dimension: 'count', factor: 1, display: 'each' });
+	assert.deepEqual(unitInfo('items'), { dimension: 'count', factor: 1, display: 'each' });
+	assert.deepEqual(unitInfo('can (15 oz)'), { dimension: 'count:can', factor: 1, display: 'can' });
+	assert.deepEqual(unitInfo('cans (14.5 oz)'), {
+		dimension: 'count:can',
+		factor: 1,
+		display: 'can'
+	});
+
+	const distinctUnits = ['each', 'small', 'medium', 'large', 'head', 'clove', 'can', 'oz'];
+	const dimensions = distinctUnits.map((unit) => unitInfo(unit).dimension);
+	assert.equal(new Set(dimensions).size, distinctUnits.length);
+});
+
+test('shared pantry matcher excludes zero, expired, substring-only, and incompatible stock across starter recipes', () => {
+	const now = new Date(2026, 9, 22, 12);
+	const starterCounts = Object.fromEntries(
+		seedRecipes.map((item) => [item.id, matchRecipePantry(item, seedPantry, now).matchedCount])
+	);
+	assert.deepEqual(starterCounts, {
+		'lemon-herb-chicken': 1,
+		'sesame-salmon-bowls': 2,
+		'tomato-butter-beans': 2,
+		'lemon-chickpea-orzo': 3,
+		'maple-chili-tofu': 1,
+		'roasted-veg-farro': 1,
+		'chicken-shawarma-wraps': 0,
+		'coconut-red-lentil-dal': 1
+	});
+
+	const noisyPantry: Ingredient[] = [
+		pantry('rice', 2, 'cups'),
+		pantry('butter', 4, 'tbsp'),
+		pantry('garlic', 1, 'head'),
+		pantry('olive oil', 0, 'cup'),
+		pantry('olive oil', 200, 'g'),
+		pantry('baby spinach', 2, 'cups', '2026-10-20')
+	];
+	const countsWithNoisyStock = Object.fromEntries(
+		seedRecipes.map((item) => [item.id, matchRecipePantry(item, noisyPantry, now).matchedCount])
+	);
+	assert.deepEqual(countsWithNoisyStock, {
+		'lemon-herb-chicken': 1,
+		'sesame-salmon-bowls': 0,
+		'tomato-butter-beans': 0,
+		'lemon-chickpea-orzo': 0,
+		'maple-chili-tofu': 0,
+		'roasted-veg-farro': 0,
+		'chicken-shawarma-wraps': 0,
+		'coconut-red-lentil-dal': 0
+	});
+});
+
+test('shopping generation deducts normalized plurals, modifiers, item units, and canned stock without head-to-clove conversion', () => {
+	const targetRecipes = seedRecipes.filter((item) =>
+		['tomato-butter-beans', 'roasted-veg-farro', 'coconut-red-lentil-dal'].includes(item.id)
+	);
+	const result = buildShoppingList(targetRecipes, [
+		pantry('cannellini bean', 1, 'can (15 oz)'),
+		pantry('cherry tomato', 10, 'oz'),
+		pantry('shallots', 1, 'item'),
+		pantry('red onions', 1, 'item'),
+		pantry('yellow onions', 1, 'items'),
+		pantry('kale', 2, 'cups'),
+		pantry('fresh cilantro', 2, 'tbsp'),
+		pantry('ginger', 1, 'tbsp'),
+		pantry('garlic', 2, 'heads')
+	]);
+
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'cannellini bean'),
+		undefined
+	);
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'cherry tomato'),
+		undefined
+	);
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'shallot'),
+		undefined
+	);
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'red onion'),
+		undefined
+	);
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'yellow onion'),
+		undefined
+	);
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'kale'),
+		undefined
+	);
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'cilantro'),
+		undefined
+	);
+	assert.equal(
+		result.find((item) => normalizeName(item.name) === 'ginger'),
+		undefined
+	);
+	const garlic = result.find((item) => normalizeName(item.name) === 'garlic');
+	assert.ok(garlic);
+	assert.equal(garlic.quantity, 5);
+	assert.equal(garlic.unit, 'clove');
 });

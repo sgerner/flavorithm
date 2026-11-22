@@ -51,8 +51,14 @@
 	import {
 		completeMeal,
 		expiryStatus,
+		indexUsablePantry,
+		matchRecipePantry,
+		mergePantryAdditions,
+		parseManualPantryInput,
 		reconcileShoppingList,
-		transferPurchasedItemsToPantry
+		stageScannedIngredients,
+		transferPurchasedItemsToPantry,
+		type StagedPantryItem
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
@@ -179,6 +185,8 @@
 		inviteCode = '';
 		currentInviteId = '';
 		joinCode = '';
+		pantryInput = '';
+		stagedScanItems = [];
 	}
 	function renewManagedSession(error: unknown) {
 		if (!navigator.onLine || (error as { status?: number })?.status !== 401) return;
@@ -220,6 +228,15 @@
 	let editingRecipe = $state<Recipe | null>(null);
 	let recipeToDelete = $state<Recipe | null>(null);
 	let pantryInput = $state('');
+	let stagedScanItems = $state<StagedPantryItem[]>([]);
+	let hasStagedScanItems = $derived(
+		stagedScanItems.some(
+			(item) =>
+				Boolean(item.name.trim()) &&
+				Number.isFinite(Number(item.quantity)) &&
+				Number(item.quantity) > 0
+		)
+	);
 	let authMode = $state('register');
 	let name = $state('');
 	let email = $state('');
@@ -438,6 +455,7 @@
 			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
 			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
 	});
+	let usablePantryIndex = $derived(indexUsablePantry(kitchen.pantry));
 	let visiblePantry = $derived(
 		kitchen.pantry.filter(
 			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
@@ -849,6 +867,8 @@
 		kitchen.meals = [];
 		kitchen.shopping = [];
 		kitchen.recipes = kitchen.recipes.map((r) => ({ ...r, rating: undefined, saved: false }));
+		pantryInput = '';
+		stagedScanItems = [];
 		showStarter = false;
 		localStorage.setItem('flavorithm-started', 'yes');
 		page = 'pantry';
@@ -859,33 +879,41 @@
 		page = id;
 		mobileNav = false;
 	}
+	function normalizeStagedScanItem(item: StagedPantryItem) {
+		item.name = item.name.trim().slice(0, 100) || 'Ingredient';
+		item.unit = item.unit.trim().slice(0, 40) || 'each';
+		item.category = item.category.trim().slice(0, 60) || 'Pantry';
+		const quantity = Number(item.quantity);
+		item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1000000)) : 1;
+	}
+	function removeStagedScanItem(id: string) {
+		stagedScanItems = stagedScanItems.filter((item) => item.id !== id);
+	}
 	function addIngredients() {
-		const names = pantryInput
-			.split(/[,\n;]/)
-			.map((value) => value.trim())
-			.filter(Boolean);
-		if (!names.length) return;
+		const manualAdditions = parseManualPantryInput(pantryInput);
+		const scannedAdditions = stagedScanItems
+			.map((item) => ({
+				name: item.name.trim(),
+				quantity: Number(item.quantity),
+				unit: item.unit.trim() || 'each',
+				category: item.category.trim() || 'Pantry'
+			}))
+			.filter((item) => item.name && Number.isFinite(item.quantity) && item.quantity > 0);
+		const additions = [...scannedAdditions, ...manualAdditions];
+		if (!additions.length) return;
 		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
-		const additions = names.map((value) => {
-			const match = value.match(
-				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
-			);
-			return {
-				id: crypto.randomUUID(),
-				name: match ? match[3] : value,
-				quantity: match ? Number(match[1]) : 1,
-				unit: match?.[2] || 'piece',
-				checked: true
-			};
-		});
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
+		kitchen.pantry = mergePantryAdditions(kitchen.pantry, additions);
 		const applied = JSON.stringify(kitchen.pantry);
 		pantryInput = '';
+		stagedScanItems = [];
 		modal = '';
-		notify(`${names.length} ingredients added to your pantry.`, () => {
-			if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-			else notify('Your pantry changed again. Review the current quantities before editing.');
-		});
+		notify(
+			`${additions.length} ${additions.length === 1 ? 'ingredient' : 'ingredients'} added to your pantry.`,
+			() => {
+				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
+				else notify('Your pantry changed again. Review the current quantities before editing.');
+			}
+		);
 	}
 
 	async function authenticate(event: SubmitEvent) {
@@ -965,6 +993,8 @@
 			canManageHousehold = false;
 			importSession = emptyImportSession();
 			resumeImport = false;
+			pantryInput = '';
+			stagedScanItems = [];
 			kitchen = createInitialState();
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
@@ -1518,12 +1548,13 @@
 				reader.readAsDataURL(file);
 			});
 			const result = await ai('vision', { image });
-			const recognized = result.ingredients
-				.map((i: any) => `${i.quantity} ${i.unit} ${i.name}`)
-				.join('\n');
-			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n');
+			stagedScanItems = stageScannedIngredients(stagedScanItems, result.ingredients);
 			modal = 'pantry';
-			notify('Review what we spotted before adding it.');
+			notify(
+				result.ingredients.length
+					? 'Review what we spotted before adding it.'
+					: 'No ingredients spotted in that photo. Add them below or try another photo.'
+			);
 		} catch (e) {
 			notify((e as Error).message);
 		} finally {
@@ -2027,6 +2058,8 @@
 			canManageHousehold = false;
 			importSession = emptyImportSession();
 			resumeImport = false;
+			pantryInput = '';
+			stagedScanItems = [];
 			apiKey = '';
 			deletePassword = '';
 			stateEtag = null;
@@ -2444,13 +2477,8 @@
 										<span><Clock size={14} />{recipe.time} min</span><span
 											><ChefHat size={14} />{recipe.difficulty}</span
 										><span class="pantry-match"
-											><Leaf size={13} />{recipe.ingredients.filter((i) =>
-												kitchen.pantry.some(
-													(p) =>
-														i.name.toLowerCase().includes(p.name.toLowerCase()) ||
-														p.name.toLowerCase().includes(i.name.toLowerCase())
-												)
-											).length} in your pantry</span
+											><Leaf size={13} />{matchRecipePantry(recipe, usablePantryIndex).matchedCount} in
+											your pantry</span
 										>
 									</div>
 								</div>
@@ -2933,7 +2961,8 @@
 					modal === 'pickRecipe' ||
 					modal === 'import' ||
 					modal === 'editMeal' ||
-					modal === 'cookMeal'}
+					modal === 'cookMeal' ||
+					(modal === 'pantry' && stagedScanItems.length > 0)}
 				class:capture-dialog={modal === 'import'}
 				role="dialog"
 				aria-labelledby={modal === 'import' ? 'recipe-import-title' : undefined}
@@ -3054,11 +3083,61 @@
 				{:else if modal === 'pantry'}<span class="dialog-spark">✳</span>
 					<h2>Add ingredients</h2>
 
+					{#if stagedScanItems.length > 0}<div class="staged-scan-section">
+							<div class="staged-scan-header">
+								<h3>Spotted in your photo ({stagedScanItems.length})</h3>
+								<button
+									type="button"
+									class="text-button"
+									onclick={() => {
+										stagedScanItems = [];
+									}}>Clear scanned</button
+								>
+							</div>
+							<div class="staged-scan-list">
+								{#each stagedScanItems as item (item.id)}<div class="staged-scan-row">
+										<input
+											class="staged-scan-name"
+											aria-label="Scanned ingredient name"
+											bind:value={item.name}
+											maxlength="100"
+											onblur={() => normalizeStagedScanItem(item)}
+										/><input
+											class="staged-scan-qty"
+											aria-label={`Quantity of ${item.name || 'ingredient'}`}
+											type="number"
+											min="0.01"
+											max="1000000"
+											step="0.25"
+											bind:value={item.quantity}
+											onblur={() => normalizeStagedScanItem(item)}
+										/><input
+											class="staged-scan-unit"
+											aria-label={`Unit for ${item.name || 'ingredient'}`}
+											bind:value={item.unit}
+											maxlength="40"
+											onblur={() => normalizeStagedScanItem(item)}
+										/><input
+											class="staged-scan-category"
+											aria-label={`Category for ${item.name || 'ingredient'}`}
+											bind:value={item.category}
+											maxlength="60"
+											onblur={() => normalizeStagedScanItem(item)}
+										/><button
+											type="button"
+											class="icon-button"
+											aria-label={`Remove ${item.name || 'ingredient'}`}
+											onclick={() => removeStagedScanItem(item.id)}><X size={16} /></button
+										>
+									</div>{/each}
+							</div>
+						</div>{/if}
+
 					<label class="field"
-						>Ingredients<textarea
+						>{stagedScanItems.length > 0 ? 'Additional ingredients' : 'Ingredients'}<textarea
 							bind:value={pantryInput}
 							placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
-							rows="5"></textarea></label
+							rows={stagedScanItems.length > 0 ? 3 : 5}></textarea></label
 					>
 					<p class="field-help">
 						Separate with commas or new lines. Add quantities and units when you know them.
@@ -3068,8 +3147,10 @@
 							class="secondary"
 							onclick={() => imageInput.click()}
 							disabled={busy}><Camera size={17} /> Use photo</button
-						><button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
-							>Add ingredients <ArrowRight size={17} /></button
+						><button
+							class="primary"
+							disabled={!pantryInput.trim() && !hasStagedScanItems}
+							onclick={addIngredients}>Add ingredients <ArrowRight size={17} /></button
 						>
 					</div>
 				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
@@ -3969,5 +4050,55 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	.staged-scan-section {
+		margin: 18px 0 8px;
+		padding: 14px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+	}
+	.staged-scan-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 10px;
+	}
+	.staged-scan-header h3 {
+		margin: 0;
+		font-size: 14px;
+		font-weight: 600;
+	}
+	.staged-scan-list {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.staged-scan-row {
+		display: grid;
+		grid-template-columns: minmax(0, 1.8fr) 76px 86px minmax(0, 1.2fr) 36px;
+		align-items: center;
+		gap: 8px;
+	}
+	.staged-scan-row input {
+		min-width: 0;
+		padding: 8px 10px;
+		background: var(--paper);
+		border: 1px solid var(--line);
+		font-size: 14px;
+	}
+	.staged-scan-qty {
+		text-align: right;
+	}
+	@media (max-width: 650px) {
+		.staged-scan-row {
+			grid-template-columns: minmax(0, 1fr) 72px 76px 36px;
+		}
+		.staged-scan-name {
+			grid-column: 1 / -1;
+		}
+		.staged-scan-category {
+			min-width: 0;
+		}
 	}
 </style>

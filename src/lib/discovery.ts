@@ -1,9 +1,5 @@
 import type { Ingredient, Preferences, Recipe } from './types';
-import {
-	convertCompatibleQuantity,
-	expiryStatus,
-	normalizeIngredientName
-} from './kitchen-workflows.ts';
+import { indexUsablePantry, matchRecipePantry, type PantryLotIndex } from './domain.ts';
 
 function normalized(value: string): string {
 	return value.toLowerCase().trim().replace(/\s+/g, ' ');
@@ -34,35 +30,13 @@ function averageSignal(entries: RatedRecipe[], matches: (recipe: Recipe) => bool
 
 function pantryScores(
 	recipe: Recipe,
-	pantry: Map<string, { item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]>
+	pantry: PantryLotIndex,
+	now: Date
 ): { available: number; expiring: number } {
-	const ingredients = recipe.ingredients.filter(
-		(item) => Number.isFinite(item.quantity) && item.quantity > 0 && item.unit.trim()
-	);
-	if (!ingredients.length) return { available: 0, expiring: 0 };
-
-	let availability = 0;
-	let expiringAvailability = 0;
-	for (const ingredient of ingredients) {
-		let quantityAvailable = 0;
-		let quantityExpiring = 0;
-		for (const { item, expiry } of pantry.get(normalizeIngredientName(ingredient.name)) ?? []) {
-			const compatibleQuantity = convertCompatibleQuantity(
-				item.quantity,
-				item.unit,
-				ingredient.unit
-			);
-			if (compatibleQuantity === undefined || compatibleQuantity <= 0) continue;
-			quantityAvailable += compatibleQuantity;
-			if (expiry === 'soon') quantityExpiring += compatibleQuantity;
-		}
-		availability += Math.min(1, quantityAvailable / ingredient.quantity);
-		expiringAvailability += Math.min(1, quantityExpiring / ingredient.quantity);
-	}
-
+	const match = matchRecipePantry(recipe, pantry, now);
 	return {
-		available: availability / ingredients.length,
-		expiring: expiringAvailability / ingredients.length
+		available: match.available,
+		expiring: match.expiring
 	};
 }
 
@@ -78,7 +52,7 @@ function learnedTimeSignal(recipe: Recipe, rated: RatedRecipe[]): number {
 
 function scoreRecipe(
 	recipe: Recipe,
-	pantryItems: Map<string, { item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]>,
+	pantryItems: PantryLotIndex,
 	preferences: Preferences,
 	rated: RatedRecipe[],
 	now: Date
@@ -125,7 +99,7 @@ function scoreRecipe(
 		if (recipe.tags.some((tag) => normalized(tag).includes(diet))) score += 2;
 	}
 
-	const pantryMatch = pantryScores(recipe, pantryItems);
+	const pantryMatch = pantryScores(recipe, pantryItems, now);
 	score += pantryMatch.available * 9;
 	score += pantryMatch.expiring * 4;
 	return score;
@@ -143,19 +117,7 @@ export function rankRecipes(
 		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
 	});
 
-	const pantryIndex = new Map<
-		string,
-		{ item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]
-	>();
-	for (const item of pantry) {
-		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-		const expiry = expiryStatus(item.expires, now);
-		if (expiry === 'expired') continue;
-		const key = normalizeIngredientName(item.name);
-		const entries = pantryIndex.get(key) ?? [];
-		entries.push({ item, expiry });
-		pantryIndex.set(key, entries);
-	}
+	const pantryIndex = indexUsablePantry(pantry, now);
 	return recipes
 		.map((recipe, index) => ({
 			recipe,

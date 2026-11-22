@@ -9,8 +9,12 @@ import {
 	completeMeal,
 	convertCompatibleQuantity,
 	expiryStatus,
+	matchRecipePantry,
+	mergePantryAdditions,
 	normalizeIngredientName,
+	parseManualPantryInput,
 	reconcileShoppingList,
+	stageScannedIngredients,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -360,4 +364,177 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
+});
+
+test('discovery and shared matcher deduct consumed lot stock across split lines and match single-line scores', () => {
+	const now = new Date(2026, 9, 22);
+	const splitOilRecipe = recipe({
+		id: 'split-oil',
+		ingredients: [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'extra virgin olive oil', quantity: 2, unit: 'tbsp' },
+			{ name: 'lemon', quantity: 1, unit: 'whole' }
+		]
+	});
+	const singleOilRecipe = recipe({
+		id: 'single-oil',
+		ingredients: [
+			{ name: 'olive oil', quantity: 3, unit: 'tbsp' },
+			{ name: 'lemon', quantity: 1, unit: 'whole' }
+		]
+	});
+	const singleCoveredRecipe = recipe({
+		id: 'covered',
+		ingredients: [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'lemon', quantity: 1, unit: 'whole' }
+		]
+	});
+
+	const partialPantry = [pantry('olive oil', 1, 'tbsp', '2026-10-24')];
+	const splitMatch = matchRecipePantry(splitOilRecipe, partialPantry, now);
+	const singleMatch = matchRecipePantry(singleOilRecipe, partialPantry, now);
+	assert.equal(splitMatch.matchedCount, 1);
+	assert.equal(splitMatch.available, singleMatch.available);
+	assert.equal(splitMatch.expiring, singleMatch.expiring);
+
+	// Equal pantry coverage must keep original input order rather than inflating split lines.
+	assert.deepEqual(
+		rankRecipes([singleOilRecipe, splitOilRecipe], partialPantry, preferences(), now).map(
+			(item) => item.id
+		),
+		['single-oil', 'split-oil']
+	);
+	assert.deepEqual(
+		rankRecipes([splitOilRecipe, singleOilRecipe], partialPantry, preferences(), now).map(
+			(item) => item.id
+		),
+		['split-oil', 'single-oil']
+	);
+
+	// A recipe whose full oil requirement is covered outranks a split recipe whose second line starved.
+	const rankedAgainstCovered = rankRecipes(
+		[splitOilRecipe, singleCoveredRecipe],
+		partialPantry,
+		preferences(),
+		now
+	);
+	assert.equal(rankedAgainstCovered[0].id, 'covered');
+});
+
+test('meal completion deducts normalized plurals, modifiers, items, and canned stock without touching incompatible garlic heads', () => {
+	const plannedRecipe = recipe({
+		id: 'dinner-bowl',
+		servings: 2,
+		ingredients: [
+			{ name: 'salmon fillets', quantity: 10, unit: 'oz' },
+			{ name: 'minced garlic', quantity: 2, unit: 'cloves' },
+			{ name: 'fresh ginger', quantity: 1, unit: 'tbsp' },
+			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'flatbread', quantity: 2, unit: 'pieces' }
+		]
+	});
+	const input = state({
+		pantry: [
+			pantry('salmon fillet', 16, 'oz'),
+			pantry('garlic', 1, 'head'),
+			pantry('garlic', 5, 'cloves'),
+			pantry('ginger', 3, 'tsp'),
+			pantry('garbanzo beans', 2, 'cans'),
+			pantry('flatbreads', 3, 'items')
+		],
+		recipes: [plannedRecipe],
+		meals: [
+			{ id: 'dinner', date: '2026-10-22', slot: 'Dinner', recipeId: 'dinner-bowl', servings: 2 }
+		]
+	});
+	const completed = completeMeal(
+		input,
+		'dinner',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date(2026, 9, 22)
+	);
+	assert.equal(completed.pantry[0].quantity, 6);
+	assert.equal(completed.pantry[1].quantity, 1);
+	assert.equal(completed.pantry[2].quantity, 3);
+	assert.equal(completed.pantry[3].quantity, 0);
+	assert.equal(completed.pantry[4].quantity, 1);
+	assert.equal(completed.pantry[5].quantity, 1);
+});
+
+test('structured photo scan staging preserves clean names, valid units, and categories while merging compatible stock', () => {
+	let idCounter = 0;
+	const nextId = () => `scan-${++idCounter}`;
+	const firstBatch = stageScannedIngredients(
+		[],
+		[
+			{ name: 'avocado', quantity: 2, unit: 'item', category: 'Produce' },
+			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)', category: 'Canned goods' },
+			{ name: 'fresh cilantro', quantity: 1, unit: 'bunch', category: 'Produce' }
+		],
+		nextId
+	);
+	const secondBatch = stageScannedIngredients(
+		firstBatch,
+		[{ name: 'Greek yogurt', quantity: 500, unit: 'g', category: 'Dairy & eggs' }],
+		nextId
+	);
+
+	assert.equal(secondBatch.length, 4);
+	assert.deepEqual(secondBatch[0], {
+		id: 'scan-1',
+		name: 'avocado',
+		quantity: 2,
+		unit: 'each',
+		category: 'Produce'
+	});
+	assert.deepEqual(secondBatch[1], {
+		id: 'scan-2',
+		name: 'chickpeas',
+		quantity: 1,
+		unit: 'can',
+		category: 'Canned goods'
+	});
+	assert.deepEqual(secondBatch[2], {
+		id: 'scan-3',
+		name: 'fresh cilantro',
+		quantity: 1,
+		unit: 'bunch',
+		category: 'Produce'
+	});
+
+	const manual = parseManualPantryInput('1 whole avocados, 200 g pasta');
+	const initialPantry: Ingredient[] = [
+		{
+			id: 'existing-chickpeas',
+			name: 'garbanzo beans',
+			quantity: 1,
+			unit: 'can',
+			category: 'Pantry'
+		}
+	];
+	const merged = mergePantryAdditions(initialPantry, [...secondBatch, ...manual], nextId);
+
+	const avocado = merged.find((item) => item.name === 'avocado');
+	assert.ok(avocado);
+	assert.equal(avocado.quantity, 3);
+	assert.equal(avocado.unit, 'each');
+	assert.equal(avocado.category, 'Produce');
+
+	const chickpeas = merged.find((item) => item.id === 'existing-chickpeas');
+	assert.ok(chickpeas);
+	assert.equal(chickpeas.quantity, 2);
+	assert.equal(chickpeas.unit, 'can');
+	assert.equal(chickpeas.category, 'Canned goods');
+
+	const yogurt = merged.find((item) => item.name === 'Greek yogurt');
+	assert.ok(yogurt);
+	assert.equal(yogurt.unit, 'g');
+	assert.equal(yogurt.category, 'Dairy & eggs');
+
+	const pasta = merged.find((item) => item.name === 'pasta');
+	assert.ok(pasta);
+	assert.equal(pasta.quantity, 200);
+	assert.equal(pasta.unit, 'g');
+	assert.equal(pasta.category, 'Pantry');
 });

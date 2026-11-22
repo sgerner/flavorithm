@@ -1,6 +1,16 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
-import { normalizeName, unitInfo } from './domain.ts';
-export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
+import { expiryStatus, normalizeName, unitInfo } from './domain.ts';
+export {
+	expiryStatus,
+	indexUsablePantry,
+	matchRecipePantry,
+	normalizeName,
+	normalizeName as normalizeIngredientName,
+	unitInfo,
+	type ExpiryStatus,
+	type PantryLotIndex,
+	type RecipePantryMatch
+} from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
 export function convertCompatibleQuantity(
@@ -51,8 +61,6 @@ function nextFreeGeneratedId(sourceKey: string, key: string, usedIds: Set<string
 	return candidate;
 }
 
-export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
-
 function calendarDate(value: Date): { year: number; month: number; day: number } | undefined {
 	if (!Number.isFinite(value.getTime())) return undefined;
 	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
@@ -81,18 +89,6 @@ function dateOrdinal(date: { year: number; month: number; day: number }): number
 	utcDate.setUTCFullYear(date.year, date.month, date.day);
 	utcDate.setUTCHours(0, 0, 0, 0);
 	return Math.floor(utcDate.getTime() / 86_400_000);
-}
-
-/** Classify an expiry by local calendar day; date-only strings are never parsed as UTC. */
-export function expiryStatus(expires?: string, now: Date = new Date()): ExpiryStatus {
-	if (!expires?.trim()) return 'unknown';
-	const expiry = expiryDate(expires);
-	const today = calendarDate(now);
-	if (!expiry || !today) return 'unknown';
-	const daysUntilExpiry = dateOrdinal(expiry) - dateOrdinal(today);
-	if (daysUntilExpiry < 0) return 'expired';
-	if (daysUntilExpiry <= 3) return 'soon';
-	return 'fresh';
 }
 
 /**
@@ -161,30 +157,106 @@ export function reconcileShoppingList(
 	return [...retained, ...generated];
 }
 
-/** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
-export function transferPurchasedItemsToPantry(
+export type RecognizedPantryItem = {
+	name: string;
+	quantity: number;
+	unit: string;
+	category: string;
+};
+
+export type StagedPantryItem = {
+	id: string;
+	name: string;
+	quantity: number;
+	unit: string;
+	category: string;
+};
+
+export type PantryAddition = {
+	name: string;
+	quantity: number;
+	unit: string;
+	category?: string;
+};
+
+/** Stage recognized AI vision ingredients for review with clean names, units, and categories. */
+export function stageScannedIngredients(
+	existing: StagedPantryItem[],
+	recognized: RecognizedPantryItem[],
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): StagedPantryItem[] {
+	const staged = existing.map((item) => ({ ...item }));
+	const usedIds = new Set(staged.map((item) => item.id));
+	for (const item of recognized) {
+		const name = item.name.trim().slice(0, 100);
+		if (!name || !Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim())
+			continue;
+		const baseId = createId();
+		let id = baseId;
+		let suffix = 2;
+		while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+		usedIds.add(id);
+		staged.push({
+			id,
+			name,
+			quantity: roundPantryQuantity(item.quantity),
+			unit: unitInfo(item.unit).display.slice(0, 40) || 'each',
+			category: item.category.trim().slice(0, 60) || 'Pantry'
+		});
+	}
+	return staged;
+}
+
+/** Parse comma-, semicolon-, or newline-separated manual pantry entries. */
+export function parseManualPantryInput(input: string): PantryAddition[] {
+	return input
+		.split(/[,\n;]/)
+		.map((value) => value.trim())
+		.filter(Boolean)
+		.map((value) => {
+			const match = value.match(
+				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
+			);
+			return {
+				name: match ? match[3] : value,
+				quantity: match ? Number(match[1]) : 1,
+				unit: match?.[2] || 'piece',
+				category: 'Pantry'
+			};
+		});
+}
+
+/** Merge structured or manual additions into pantry stock while preserving recognized categories. */
+export function mergePantryAdditions(
 	pantry: Ingredient[],
-	purchases: ShoppingItem[],
+	additions: PantryAddition[],
 	createId: () => string = () => globalThis.crypto.randomUUID()
 ): Ingredient[] {
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category: string }
 	>();
-	for (const item of purchases) {
-		if (
-			!item.checked ||
-			!Number.isFinite(item.quantity) ||
-			!(item.quantity > 0) ||
-			!item.unit.trim()
-		)
-			continue;
-		const normalizedName = normalizeName(item.name);
-		const unit = unitInfo(item.unit);
+	for (const item of additions) {
+		const trimmedName = item.name.trim().slice(0, 100);
+		const quantity = Number(item.quantity);
+		const trimmedUnit = item.unit.trim();
+		if (!trimmedName || !Number.isFinite(quantity) || !(quantity > 0) || !trimmedUnit) continue;
+		const normalizedName = normalizeName(trimmedName);
+		if (!normalizedName) continue;
+		const unit = unitInfo(trimmedUnit);
+		const category = item.category?.trim().slice(0, 60) || 'Pantry';
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		const bucket = buckets.get(key) ?? { name: item.name.trim(), unit, quantityBase: 0 };
-		bucket.quantityBase += item.quantity * unit.factor;
+		const bucket = buckets.get(key) ?? {
+			name: trimmedName,
+			unit,
+			quantityBase: 0,
+			category
+		};
+		bucket.quantityBase += quantity * unit.factor;
+		if (bucket.category === 'Pantry' && category !== 'Pantry') {
+			bucket.category = category;
+		}
 		buckets.set(key, bucket);
 	}
 
@@ -201,6 +273,12 @@ export function transferPurchasedItemsToPantry(
 			destination.quantity = roundPantryQuantity(
 				destination.quantity + bucket.quantityBase / unitInfo(destination.unit).factor
 			);
+			if (
+				(!destination.category.trim() || destination.category === 'Pantry') &&
+				bucket.category !== 'Pantry'
+			) {
+				destination.category = bucket.category;
+			}
 			continue;
 		}
 
@@ -213,11 +291,31 @@ export function transferPurchasedItemsToPantry(
 			id,
 			name: bucket.name,
 			quantity: roundPantryQuantity(bucket.quantityBase / bucket.unit.factor),
-			unit: bucket.unit.display,
-			category: 'Pantry'
+			unit: bucket.unit.display.slice(0, 40),
+			category: bucket.category || 'Pantry'
 		});
 	}
 	return result;
+}
+
+/** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
+export function transferPurchasedItemsToPantry(
+	pantry: Ingredient[],
+	purchases: ShoppingItem[],
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): Ingredient[] {
+	return mergePantryAdditions(
+		pantry,
+		purchases
+			.filter((item) => item.checked)
+			.map((item) => ({
+				name: item.name,
+				quantity: item.quantity,
+				unit: item.unit,
+				category: 'Pantry'
+			})),
+		createId
+	);
 }
 
 function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
