@@ -171,8 +171,8 @@ function sameJournalVersion(current: PendingKitchen, expected: PendingKitchen): 
 		current.updatedAt === expected.updatedAt &&
 		current.createdAt === expected.createdAt &&
 		current.etag === expected.etag &&
-		JSON.stringify(current.base) === JSON.stringify(expected.base) &&
-		JSON.stringify(current.local) === JSON.stringify(expected.local)
+		jsonEqual(current.base, expected.base) &&
+		jsonEqual(current.local, expected.local)
 	);
 }
 
@@ -195,9 +195,97 @@ export function clearPending(storage: StorageLike, user: User): void {
 	storage.removeItem(key(user));
 }
 
-const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+export function jsonEqual(a: unknown, b: unknown): boolean {
+	if (a === b) return true;
+	if (typeof a === 'number' && !Number.isFinite(a)) a = null;
+	if (typeof b === 'number' && !Number.isFinite(b)) b = null;
+	if (a === b) return true;
+	if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+	if (Array.isArray(a) || Array.isArray(b)) {
+		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+		for (let i = 0; i < a.length; i += 1) {
+			const av = a[i] === undefined ? null : a[i];
+			const bv = b[i] === undefined ? null : b[i];
+			if (!jsonEqual(av, bv)) return false;
+		}
+		return true;
+	}
+	const aObj = a as Record<string, unknown>;
+	const bObj = b as Record<string, unknown>;
+	const aKeys = Object.keys(aObj);
+	const bKeys = Object.keys(bObj);
+	let aDefined = 0;
+	for (let i = 0; i < aKeys.length; i += 1) {
+		const k = aKeys[i];
+		const av = aObj[k];
+		if (av === undefined) continue;
+		aDefined += 1;
+		const bv = bObj[k];
+		if (bv === undefined || !jsonEqual(av, bv)) return false;
+	}
+	let bDefined = 0;
+	for (let i = 0; i < bKeys.length; i += 1) {
+		if (bObj[bKeys[i]] !== undefined) bDefined += 1;
+	}
+	return aDefined === bDefined;
+}
+
+const equal = jsonEqual;
 const object = (value: unknown): value is Record<string, unknown> =>
 	!!value && typeof value === 'object' && !Array.isArray(value);
+
+function isIdRecord(item: unknown): item is Record<string, unknown> & { id: string } {
+	return object(item) && typeof item.id === 'string';
+}
+
+function indexedById(items: unknown[]): Map<string, Record<string, unknown>> | null {
+	if (!items.every(isIdRecord)) return null;
+	if (new Set(items.map((item) => item.id)).size !== items.length) return null;
+	return new Map(items.map((item) => [item.id, item]));
+}
+
+/**
+ * True when `target` already incorporates every change between `base` and `local`, ignoring
+ * independent edits or items on untouched fields and peer collections.
+ */
+export function causallyIncludesDelta(base: AppState, local: AppState, target: AppState): boolean {
+	const includes = (old: unknown, mine: unknown, candidate: unknown): boolean => {
+		if (equal(mine, old)) return true;
+		if (equal(mine, candidate)) return true;
+		if (mine === undefined || candidate === undefined) return false;
+		if (object(mine) && object(candidate) && (old === undefined || object(old))) {
+			for (const name of new Set([
+				...Object.keys(old || {}),
+				...Object.keys(mine),
+				...Object.keys(candidate)
+			])) {
+				if (
+					!includes(
+						(old as Record<string, unknown> | undefined)?.[name],
+						mine[name],
+						candidate[name]
+					)
+				) {
+					return false;
+				}
+			}
+			return true;
+		}
+		if (Array.isArray(mine) && Array.isArray(candidate) && Array.isArray(old)) {
+			const before = indexedById(old);
+			const left = indexedById(mine);
+			const right = indexedById(candidate);
+			if (before && left && right) {
+				for (const id of new Set([...before.keys(), ...left.keys()])) {
+					if (!includes(before.get(id), left.get(id), right.get(id))) return false;
+				}
+				return true;
+			}
+		}
+		return false;
+	};
+	return includes(base, local, target);
+}
 
 function hasEqualConcurrentPantryQuantityEdit(
 	base: unknown,
@@ -411,33 +499,35 @@ export async function syncPendingKitchen(
 	throw new Error('Your household is changing quickly. Try syncing again.');
 }
 
-/** Apply independent writer snapshots in creation order while retaining conflicts between them. */
-export function mergePendingKitchenJournal(
-	records: PendingJournalRecord[],
-	remote: AppState,
-	prefer?: 'local' | 'remote'
-): { state: AppState; conflicts: SyncConflict[] } {
-	let state = structuredClone(remote);
-	const conflicts: SyncConflict[] = [];
+/** Order journal snapshots by causal inclusion first and creation order second. */
+export function orderPendingJournalRecords(
+	records: PendingJournalRecord[]
+): PendingJournalRecord[] {
 	const stableOrder = [...records].sort(
 		(a, b) =>
 			(a.pending.createdAt ?? a.pending.updatedAt) - (b.pending.createdAt ?? b.pending.updatedAt) ||
 			a.writerId.localeCompare(b.writerId)
 	);
 	// Replay a writer's ancestor before a snapshot staged from that already-updated view, even when
-	// both tabs receive the same millisecond timestamp.
+	// both tabs receive the same millisecond timestamp or carry peer collection items.
 	const dependencies = new Map(stableOrder.map((record) => [record.writerId, new Set<string>()]));
 	for (const ancestor of stableOrder) {
 		if (equal(ancestor.pending.base, ancestor.pending.local)) continue;
 		for (const dependent of stableOrder) {
 			if (ancestor === dependent) continue;
-			const probe = mergeKitchenStates(
-				ancestor.pending.base,
-				ancestor.pending.local,
-				dependent.pending.base
-			);
-			if (!probe.conflicts.length && equal(probe.state, dependent.pending.base)) {
+			if (
+				causallyIncludesDelta(ancestor.pending.base, ancestor.pending.local, dependent.pending.base)
+			) {
 				dependencies.get(dependent.writerId)?.add(ancestor.writerId);
+			}
+		}
+	}
+	for (let i = 0; i < stableOrder.length; i += 1) {
+		for (let j = i + 1; j < stableOrder.length; j += 1) {
+			const earlier = stableOrder[i].writerId;
+			const later = stableOrder[j].writerId;
+			if (dependencies.get(earlier)?.has(later) && dependencies.get(later)?.has(earlier)) {
+				dependencies.get(earlier)?.delete(later);
 			}
 		}
 	}
@@ -453,12 +543,193 @@ export function mergePendingKitchenJournal(
 		ordered.push(next);
 		remaining.delete(next.writerId);
 	}
-	for (const record of ordered) {
-		const merged = mergeKitchenStates(record.pending.base, record.pending.local, state, prefer);
-		state = merged.state;
-		conflicts.push(...merged.conflicts);
+	return ordered;
+}
+
+function composeDeltaPair(
+	firstBase: AppState,
+	firstLocal: AppState,
+	secondBase: AppState,
+	secondLocal: AppState,
+	prefer?: 'local' | 'remote'
+): { base: AppState; local: AppState; conflicts: SyncConflict[] } {
+	const conflicts: SyncConflict[] = [];
+	const chooseConflict = (
+		path: string,
+		b1: unknown,
+		l1: unknown,
+		b2: unknown,
+		l2: unknown
+	): { base: unknown; local: unknown } => {
+		conflicts.push({ path, local: l2, remote: l1 });
+		return prefer === 'local' ? { base: b2, local: l2 } : { base: b1, local: l1 };
+	};
+	const compose = (
+		b1: unknown,
+		l1: unknown,
+		b2: unknown,
+		l2: unknown,
+		path: string
+	): { base: unknown; local: unknown } => {
+		if (equal(l2, b2)) return { base: b1, local: l1 };
+		if (equal(l1, b1)) return { base: b2, local: l2 };
+		if (equal(b2, l1)) return { base: b1, local: l2 };
+
+		if (object(l1) && object(l2)) {
+			if (object(b1) && object(b2)) {
+				const nextBase: Record<string, unknown> = {};
+				const nextLocal: Record<string, unknown> = {};
+				for (const name of new Set([
+					...Object.keys(b1),
+					...Object.keys(l1),
+					...Object.keys(b2),
+					...Object.keys(l2)
+				])) {
+					const entry = compose(b1[name], l1[name], b2[name], l2[name], `${path}.${name}`);
+					if (entry.base !== undefined) nextBase[name] = entry.base;
+					if (entry.local !== undefined) nextLocal[name] = entry.local;
+				}
+				return { base: nextBase, local: nextLocal };
+			}
+			if (b1 === undefined && b2 === undefined) {
+				const nextLocal: Record<string, unknown> = {};
+				for (const name of new Set([...Object.keys(l1), ...Object.keys(l2)])) {
+					const entry = compose(undefined, l1[name], undefined, l2[name], `${path}.${name}`);
+					if (entry.local !== undefined) nextLocal[name] = entry.local;
+				}
+				return { base: undefined, local: nextLocal };
+			}
+		}
+
+		if (Array.isArray(b1) && Array.isArray(l1) && Array.isArray(b2) && Array.isArray(l2)) {
+			const b1Map = indexedById(b1);
+			const l1Map = indexedById(l1);
+			const b2Map = indexedById(b2);
+			const l2Map = indexedById(l2);
+			if (b1Map && l1Map && b2Map && l2Map) {
+				const entries = new Map<string, { base: unknown; local: unknown }>();
+				for (const id of new Set([
+					...l1Map.keys(),
+					...l2Map.keys(),
+					...b1Map.keys(),
+					...b2Map.keys()
+				])) {
+					entries.set(
+						id,
+						compose(b1Map.get(id), l1Map.get(id), b2Map.get(id), l2Map.get(id), `${path}[${id}]`)
+					);
+				}
+				const nextBase = [];
+				for (const id of new Set([
+					...b1Map.keys(),
+					...b2Map.keys(),
+					...l1Map.keys(),
+					...l2Map.keys()
+				])) {
+					const value = entries.get(id)?.base;
+					if (value !== undefined) nextBase.push(value);
+				}
+				const nextLocal = [];
+				for (const id of new Set([
+					...l1Map.keys(),
+					...l2Map.keys(),
+					...b1Map.keys(),
+					...b2Map.keys()
+				])) {
+					const value = entries.get(id)?.local;
+					if (value !== undefined) nextLocal.push(value);
+				}
+				return { base: nextBase, local: nextLocal };
+			}
+		}
+
+		const concurrentPantryQuantity =
+			path.startsWith('kitchen.pantry[') &&
+			path.endsWith('].quantity') &&
+			typeof b1 === 'number' &&
+			typeof l1 === 'number' &&
+			typeof b2 === 'number' &&
+			typeof l2 === 'number' &&
+			!equal(firstLocal, secondLocal);
+		if (equal(l1, l2) && !concurrentPantryQuantity) {
+			return { base: b1, local: l1 };
+		}
+		return chooseConflict(path, b1, l1, b2, l2);
+	};
+
+	const composed = compose(firstBase, firstLocal, secondBase, secondLocal, 'kitchen');
+	const base = structuredClone(composed.base) as AppState;
+	const local = structuredClone(composed.local) as AppState;
+	const recipeIds = new Set(local.recipes.map((recipe) => recipe.id));
+	for (const meal of local.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
+		conflicts.push({
+			path: `kitchen.meals[${meal.id}].recipeId`,
+			local: describeMealRecipe(secondLocal, meal.id, meal.recipeId),
+			remote: describeMealRecipe(firstLocal, meal.id, meal.recipeId)
+		});
+		const candidates = prefer
+			? (prefer === 'local' ? secondLocal : firstLocal).recipes
+			: [...secondLocal.recipes, ...firstLocal.recipes];
+		const recipe = candidates.find((item) => item.id === meal.recipeId);
+		if (recipe) {
+			local.recipes.push(structuredClone(recipe));
+			recipeIds.add(recipe.id);
+		}
 	}
-	return { state, conflicts };
+	local.meals = local.meals.filter((meal) => recipeIds.has(meal.recipeId));
+	return { base, local, conflicts };
+}
+
+/** Compose ordered journal records into a single (effectiveBase, effectiveLocal) delta. */
+export function composePendingKitchenJournal(
+	records: PendingJournalRecord[],
+	prefer?: 'local' | 'remote'
+): {
+	ordered: PendingJournalRecord[];
+	base: AppState;
+	local: AppState;
+	conflicts: SyncConflict[];
+} | null {
+	if (!records.length) return null;
+	const ordered = orderPendingJournalRecords(records);
+	let effectiveBase = structuredClone(ordered[0].pending.base);
+	let effectiveLocal = structuredClone(ordered[0].pending.local);
+	const conflicts: SyncConflict[] = [];
+	for (let index = 1; index < ordered.length; index += 1) {
+		const record = ordered[index];
+		const step = composeDeltaPair(
+			effectiveBase,
+			effectiveLocal,
+			record.pending.base,
+			record.pending.local,
+			prefer
+		);
+		effectiveBase = step.base;
+		effectiveLocal = step.local;
+		for (const conflict of step.conflicts) {
+			const existingIndex = conflicts.findIndex((item) => item.path === conflict.path);
+			if (existingIndex >= 0) conflicts[existingIndex] = conflict;
+			else conflicts.push(conflict);
+		}
+	}
+	return { ordered, base: effectiveBase, local: effectiveLocal, conflicts };
+}
+
+/** Compose writer snapshots into a net baseline/local delta and reconcile once against remote. */
+export function mergePendingKitchenJournal(
+	records: PendingJournalRecord[],
+	remote: AppState,
+	prefer?: 'local' | 'remote'
+): { state: AppState; conflicts: SyncConflict[] } {
+	const composed = composePendingKitchenJournal(records, prefer);
+	if (!composed) return { state: structuredClone(remote), conflicts: [] };
+	const merged = mergeKitchenStates(composed.base, composed.local, remote, prefer);
+	const mergedPaths = new Set(merged.conflicts.map((conflict) => conflict.path));
+	const conflicts = [
+		...composed.conflicts.filter((conflict) => !mergedPaths.has(conflict.path)),
+		...merged.conflicts
+	];
+	return { state: merged.state, conflicts };
 }
 
 /** Reconcile every account-scoped writer delta against current server state before the write. */

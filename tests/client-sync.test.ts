@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createNewUserState } from '../src/lib/data.ts';
+import { createNewUserState, seedRecipes } from '../src/lib/data.ts';
 import { createKitchenSync } from '../src/lib/client-sync.ts';
+import { MAX_RECIPES } from '../src/lib/recipe-collection.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import type { KitchenTransport } from '../src/lib/offline-sync.ts';
 
@@ -43,6 +44,10 @@ const makeUser = (id = 'user-a', householdId = 'home-a'): User => ({
 function harness(args: {
 	user: User | null;
 	storage?: ReturnType<typeof memoryStorage>;
+	sessionStorage?: ReturnType<typeof memoryStorage>;
+	writerId?: string;
+	now?: () => number;
+	leaseTtlMs?: number;
 	transport?: (user: User) => KitchenTransport;
 	initial?: AppState;
 }) {
@@ -58,6 +63,10 @@ function harness(args: {
 	const setStates: AppState[] = [];
 	const controller = createKitchenSync({
 		storage,
+		sessionStorage: args.sessionStorage,
+		writerId: args.writerId,
+		now: args.now,
+		leaseTtlMs: args.leaseTtlMs,
 		getUser: () => currentUser,
 		getState: () => currentState,
 		setState: (state) => {
@@ -502,4 +511,345 @@ test('an acknowledgement retires only captured journal versions, preserving a pe
 		['peer']
 	);
 	assert.equal(storage.getItem(peerKey), null);
+});
+
+function quotaMemoryStorage(maxBytes: number) {
+	const values = new Map<string, string>();
+	let peakBytes = 0;
+	const currentBytes = () =>
+		[...values.entries()].reduce(
+			(sum, [k, v]) => sum + Buffer.byteLength(k, 'utf8') + Buffer.byteLength(v, 'utf8'),
+			0
+		);
+	return {
+		values,
+		get bytes() {
+			return currentBytes();
+		},
+		get peakBytes() {
+			return peakBytes;
+		},
+		get length() {
+			return values.size;
+		},
+		key: (index: number) => [...values.keys()][index] ?? null,
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			const previous = values.get(key);
+			values.set(key, value);
+			const total = currentBytes();
+			if (total > maxBytes) {
+				if (previous === undefined) values.delete(key);
+				else values.set(key, previous);
+				throw new Error('QuotaExceededError');
+			}
+			if (total > peakBytes) peakBytes = total;
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
+		}
+	};
+}
+
+test('staging edits across 65 offline reloads keeps 1 journal entry and fits within 5 MiB for 250 recipes', () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	base.recipes = Array.from({ length: MAX_RECIPES }, (_, index) => ({
+		...structuredClone(seedRecipes[index % seedRecipes.length]),
+		id: `recipe-${index}`
+	}));
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 100, unit: 'cup', category: 'Pantry' }];
+	const fiveMiB = 5 * 1024 * 1024;
+
+	// Case 1: Reopen cycles without sessionStorage (unleased ancestor compaction)
+	const reopenStorage = quotaMemoryStorage(fiveMiB);
+	const initial = harness({ user, storage: reopenStorage, initial: base });
+	initial.controller.initialize(user, base, 'v1');
+	const firstEdit = structuredClone(base);
+	firstEdit.pantry[0].quantity = 99;
+	initial.controller.stage(firstEdit);
+	initial.controller.releaseLease();
+
+	for (let reload = 1; reload <= 65; reload += 1) {
+		const reopened = harness({ user, storage: reopenStorage });
+		assert.equal(reopened.controller.restore(user), true);
+		assert.equal(reopened.state.pantry[0].quantity, 100 - reload);
+		const next = structuredClone(reopened.state);
+		next.pantry[0].quantity = 100 - reload - 1;
+		reopened.controller.stage(next);
+		assert.equal(reopened.statuses.at(-1)?.error, '');
+		const journalKeys = [...reopenStorage.values.keys()].filter((key) =>
+			key.startsWith('flavorithm-pending-journal:')
+		);
+		assert.equal(journalKeys.length, 1);
+		reopened.controller.releaseLease();
+	}
+	assert.ok(reopenStorage.peakBytes < fiveMiB);
+
+	// Case 2: Same-tab reloads reusing sessionStorage writerId
+	const reloadStorage = quotaMemoryStorage(fiveMiB);
+	const tabSession = memoryStorage();
+	const mounted = harness({
+		user,
+		storage: reloadStorage,
+		sessionStorage: tabSession,
+		initial: base
+	});
+	mounted.controller.initialize(user, base, 'v1');
+	mounted.controller.stage(firstEdit);
+	mounted.controller.releaseLease();
+	const savedWriterId = tabSession.getItem('flavorithm-writer-id:v1');
+	assert.ok(savedWriterId);
+
+	for (let reload = 1; reload <= 65; reload += 1) {
+		const reloaded = harness({ user, storage: reloadStorage, sessionStorage: tabSession });
+		assert.equal(tabSession.getItem('flavorithm-writer-id:v1'), savedWriterId);
+		assert.equal(reloaded.controller.restore(user), true);
+		const next = structuredClone(reloaded.state);
+		next.pantry[0].quantity = 100 - reload - 1;
+		reloaded.controller.stage(next);
+		const journalKeys = [...reloadStorage.values.keys()].filter((key) =>
+			key.startsWith('flavorithm-pending-journal:')
+		);
+		assert.equal(journalKeys.length, 1);
+		reloaded.controller.releaseLease();
+	}
+	assert.ok(reloadStorage.peakBytes < fiveMiB);
+});
+
+test('duplicated tabs disambiguate cloned sessionStorage via active leases and never retire a live peer slot', () => {
+	let clock = 1_000;
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const tabASession = memoryStorage();
+
+	const tabA = harness({
+		user,
+		storage,
+		sessionStorage: tabASession,
+		now: () => clock,
+		leaseTtlMs: 10_000
+	});
+	tabA.controller.initialize(user, base, 'v1');
+	const editA = structuredClone(base);
+	editA.pantry.push({ id: 'tab-a', name: 'oats', quantity: 2, unit: 'cup', category: 'Pantry' });
+	tabA.controller.stage(editA);
+	const writerA = tabASession.getItem('flavorithm-writer-id:v1');
+	assert.ok(writerA);
+
+	// Simulate browser "Duplicate Tab" cloning sessionStorage while tabA is still mounted and leased.
+	const tabBSession = memoryStorage();
+	tabBSession.setItem('flavorithm-writer-id:v1', writerA);
+	clock += 5_000;
+	tabA.controller.refreshLease();
+	clock += 6_000; // Past original 10s window, but within refreshed lease window!
+
+	const tabB = harness({
+		user,
+		storage,
+		sessionStorage: tabBSession,
+		now: () => clock,
+		leaseTtlMs: 10_000
+	});
+	const writerB = tabBSession.getItem('flavorithm-writer-id:v1');
+	assert.ok(writerB);
+	assert.notEqual(writerB, writerA);
+
+	assert.equal(tabB.controller.restore(user), true);
+	const editB = structuredClone(tabB.state);
+	editB.shopping.push({ id: 'tab-b', name: 'tea', quantity: 1, unit: 'box', checked: false });
+	tabB.controller.stage(editB);
+
+	// Live tabA's journal slot must remain intact while tabA holds an active lease.
+	const journalKeysWhileLive = [...storage.values.keys()].filter((key) =>
+		key.startsWith('flavorithm-pending-journal:')
+	);
+	assert.equal(journalKeysWhileLive.length, 2);
+
+	// Once tabA closes (clearContext releases lease), staging in tabB compacts tabA into tabB's baseline-anchored entry.
+	tabA.controller.clearContext();
+	const editB2 = structuredClone(editB);
+	editB2.shopping[0].quantity = 2;
+	tabB.controller.stage(editB2);
+
+	const journalKeysAfterClose = [...storage.values.keys()].filter((key) =>
+		key.startsWith('flavorithm-pending-journal:')
+	);
+	assert.equal(journalKeysAfterClose.length, 1);
+	assert.deepEqual(tabB.controller.snapshot()?.base, base);
+	assert.deepEqual(
+		tabB.controller.snapshot()?.local.pantry.map((item) => item.id),
+		['tab-a']
+	);
+});
+
+test('compacted reverts remove the writer journal entry when matching baseline and sync cleanly against household changes', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 4, unit: 'cup', category: 'Pantry' }];
+	const storage = memoryStorage();
+
+	const first = harness({ user, storage });
+	first.controller.initialize(user, base, 'v1');
+	const deducted = structuredClone(base);
+	deducted.pantry[0].quantity = 3;
+	first.controller.stage(deducted);
+	first.controller.clearContext();
+
+	// Reload and revert completely back to confirmed baseline: journal entry must be removed.
+	const revertedTab = harness({ user, storage });
+	assert.equal(revertedTab.controller.restore(user), true);
+	revertedTab.controller.stage(structuredClone(base));
+	assert.equal(revertedTab.controller.snapshot(), null);
+	assert.equal(revertedTab.statuses.at(-1)?.pending, false);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+
+	// Chained 4 -> 3 (+ new item) -> 4 across reload against server 2 merges with 0 conflicts.
+	const withItem = structuredClone(deducted);
+	withItem.pantry.push({ id: 'salt', name: 'salt', quantity: 1, unit: 'box', category: 'Pantry' });
+	revertedTab.controller.stage(withItem);
+	revertedTab.controller.clearContext();
+
+	const server = structuredClone(base);
+	server.pantry[0].quantity = 2;
+	let puts = 0;
+	const secondReload = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'v2',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				puts += 1;
+				server.pantry = structuredClone(state.pantry);
+				return { state: structuredClone(server), etag: 'v3' };
+			}
+		})
+	});
+	secondReload.controller.restore(user);
+	const revertedQuantity = structuredClone(secondReload.state);
+	revertedQuantity.pantry.find((item) => item.id === 'flour')!.quantity = 4;
+	secondReload.controller.stage(revertedQuantity);
+
+	await secondReload.controller.sync();
+	assert.equal(puts, 1);
+	assert.equal(secondReload.statuses.at(-1)?.conflicts.length, 0);
+	assert.equal(server.pantry.find((item) => item.id === 'flour')?.quantity, 2);
+	assert.ok(server.pantry.some((item) => item.id === 'salt'));
+});
+
+test('chained reload edits detect intermediate household collisions and honor sync(remote)', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	base.meals = [
+		{ id: 'dinner', date: '2026-10-22', slot: 'Dinner', recipeId: base.recipes[0].id, servings: 2 }
+	];
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 4, unit: 'cup', category: 'Pantry' }];
+	const storage = memoryStorage();
+	const server = structuredClone(base);
+	server.meals[0].servings = 4;
+	server.pantry[0].quantity = 3;
+	let puts = 0;
+	const transport = () => ({
+		identity: { userId: user.id, householdId: user.householdId },
+		get: async () => ({
+			state: structuredClone(server),
+			etag: 'v2',
+			userId: user.id,
+			householdId: user.householdId
+		}),
+		put: async (state: AppState) => {
+			puts += 1;
+			server.meals = structuredClone(state.meals);
+			server.pantry = structuredClone(state.pantry);
+			return { state: structuredClone(server), etag: 'v3' };
+		}
+	});
+
+	const first = harness({ user, storage, transport });
+	first.controller.initialize(user, base, 'v1');
+	const stepOne = structuredClone(base);
+	stepOne.meals[0].servings = 4;
+	stepOne.pantry[0].quantity = 3;
+	stepOne.pantry.push({ id: 'rice', name: 'rice', quantity: 1, unit: 'bag', category: 'Pantry' });
+	first.controller.stage(stepOne);
+	first.controller.clearContext();
+
+	const second = harness({ user, storage, transport });
+	second.controller.restore(user);
+	const stepTwo = structuredClone(second.state);
+	stepTwo.meals[0].servings = 6;
+	stepTwo.pantry[0].quantity = 1;
+	second.controller.stage(stepTwo);
+
+	await second.controller.sync();
+	assert.equal(puts, 0);
+	assert.equal(second.statuses.at(-1)?.conflicts.length, 2);
+
+	await second.controller.sync('remote');
+	assert.equal(puts, 1);
+	assert.equal(server.meals[0].servings, 4);
+	assert.equal(server.pantry.find((item) => item.id === 'flour')?.quantity, 3);
+	assert.ok(server.pantry.some((item) => item.id === 'rice'));
+});
+
+test('reconnecting with a reused sessionStorage writerId preserves conflicts across reactive viewState echoes', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	base.pantry = [{ id: 'flour', name: 'Flour', quantity: 4, unit: 'cup', category: 'Pantry' }];
+	const storage = memoryStorage();
+	const tabSession = memoryStorage();
+	const server = structuredClone(base);
+	server.pantry[0].quantity = 3;
+	let puts = 0;
+	const transport = () => ({
+		identity: { userId: user.id, householdId: user.householdId },
+		get: async () => ({
+			state: structuredClone(server),
+			etag: 'v2',
+			userId: user.id,
+			householdId: user.householdId
+		}),
+		put: async (state: AppState) => {
+			puts += 1;
+			server.pantry = structuredClone(state.pantry);
+			return { state: structuredClone(server), etag: 'v3' };
+		}
+	});
+
+	const tab = harness({ user, storage, sessionStorage: tabSession, transport });
+	tab.controller.initialize(user, base, 'v1');
+	const stepOne = structuredClone(base);
+	stepOne.pantry[0].quantity = 3;
+	tab.controller.stage(stepOne);
+	tab.controller.releaseLease();
+
+	const reloaded = harness({ user, storage, sessionStorage: tabSession, transport });
+	reloaded.controller.restore(user);
+	const stepTwo = structuredClone(reloaded.state);
+	stepTwo.pantry[0].quantity = 1;
+	reloaded.controller.stage(stepTwo);
+
+	// Simulate reconnectKitchen: initialize(user, server, 'v2') sets UI state, and Svelte $effect echoes stage(reloaded.state).
+	reloaded.controller.initialize(user, server, 'v2');
+	reloaded.controller.stage(structuredClone(reloaded.state));
+	await reloaded.controller.sync();
+
+	assert.equal(puts, 0);
+	assert.equal(reloaded.statuses.at(-1)?.conflicts.length, 1);
+
+	await reloaded.controller.sync('remote');
+	assert.equal(puts, 1);
+	assert.equal(server.pantry[0].quantity, 3);
+	assert.equal(reloaded.controller.snapshot(), null);
 });

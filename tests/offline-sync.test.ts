@@ -4,10 +4,13 @@ import { createNewUserState } from '../src/lib/data.ts';
 import { completeMeal } from '../src/lib/kitchen-workflows.ts';
 import {
 	mergeKitchenStates,
+	mergePendingKitchenJournal,
 	readPending,
 	writePending,
 	clearPending,
-	syncPendingKitchen
+	syncPendingKitchen,
+	syncPendingKitchenJournal,
+	type PendingJournalRecord
 } from '../src/lib/offline-sync.ts';
 
 test('offline snapshots are isolated by both account and household', () => {
@@ -334,4 +337,180 @@ test('sync rechecks its identity after GET before PUT', async () => {
 		{ status: 409 }
 	);
 	assert.equal(writes, 0);
+});
+
+function journalRecord(
+	writerId: string,
+	base: ReturnType<typeof createNewUserState>,
+	local: ReturnType<typeof createNewUserState>,
+	createdAt: number
+): PendingJournalRecord {
+	const pending = {
+		userId: 'a',
+		householdId: 'home',
+		base: structuredClone(base),
+		local: structuredClone(local),
+		etag: 'v1',
+		createdAt,
+		updatedAt: createdAt,
+		writerId,
+		writeId: `${writerId}-${createdAt}`
+	};
+	return {
+		writerId,
+		pending,
+		keys: [{ key: `flavorithm-pending-journal:v1:a:home:${writerId}`, pending }]
+	};
+}
+
+test('sequential journal edits crossing a household value emit 1 conflict and send 0 unconfirmed PUTs', async () => {
+	const base = createNewUserState();
+	base.meals = [
+		{ id: 'dinner', date: '2026-10-22', slot: 'Dinner', recipeId: base.recipes[0].id, servings: 2 }
+	];
+	const firstStep = structuredClone(base);
+	firstStep.meals[0].servings = 4;
+	const secondStep = structuredClone(firstStep);
+	secondStep.meals[0].servings = 6;
+	const remote = structuredClone(base);
+	remote.meals[0].servings = 4;
+
+	let puts = 0;
+	const records = [
+		journalRecord('w1', base, firstStep, 10),
+		journalRecord('w2', firstStep, secondStep, 20)
+	];
+	const result = await syncPendingKitchenJournal(records, {
+		identity: { userId: 'a', householdId: 'home' },
+		get: async () => ({
+			state: structuredClone(remote),
+			etag: 'v2',
+			userId: 'a',
+			householdId: 'home'
+		}),
+		put: async (state) => {
+			puts += 1;
+			return { state, etag: 'v3' };
+		}
+	});
+	assert.equal(puts, 0);
+	assert.equal(result.saved, false);
+	assert.equal(result.conflicts.length, 1);
+	assert.deepEqual(result.conflicts[0], {
+		path: 'kitchen.meals[dinner].servings',
+		local: 6,
+		remote: 4
+	});
+});
+
+test('chained pantry deductions honor prefer = remote while preserving disjoint additions', async () => {
+	const base = createNewUserState();
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 4, unit: 'cup', category: 'Pantry' }];
+	const stepOne = structuredClone(base);
+	stepOne.pantry[0].quantity = 3;
+	stepOne.pantry.push({
+		id: 'olive-oil',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		category: 'Pantry'
+	});
+	const stepTwo = structuredClone(stepOne);
+	stepTwo.pantry[0].quantity = 1;
+
+	const server = structuredClone(base);
+	server.pantry[0].quantity = 3;
+	const records = [
+		journalRecord('w1', base, stepOne, 10),
+		journalRecord('w2', stepOne, stepTwo, 20)
+	];
+
+	const savedStates: Array<ReturnType<typeof createNewUserState>> = [];
+	const resolved = await syncPendingKitchenJournal(
+		records,
+		{
+			identity: { userId: 'a', householdId: 'home' },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'v2',
+				userId: 'a',
+				householdId: 'home'
+			}),
+			put: async (state) => {
+				savedStates.push(structuredClone(state));
+				return { state, etag: 'v3' };
+			}
+		},
+		'remote'
+	);
+	assert.equal(resolved.saved, true);
+	assert.equal(savedStates.length, 1);
+	assert.equal(savedStates[0].pantry.find((item) => item.id === 'flour')?.quantity, 3);
+	assert.ok(savedStates[0].pantry.some((item) => item.id === 'olive-oil'));
+});
+
+test('reverting an offline pantry edit alongside a new item merges cleanly against a changed server quantity', () => {
+	const base = createNewUserState();
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 4, unit: 'cup', category: 'Pantry' }];
+	const stepOne = structuredClone(base);
+	stepOne.pantry[0].quantity = 3;
+	stepOne.pantry.push({
+		id: 'garlic',
+		name: 'garlic',
+		quantity: 2,
+		unit: 'bulb',
+		category: 'Produce'
+	});
+	const stepTwo = structuredClone(stepOne);
+	stepTwo.pantry[0].quantity = 4;
+
+	const remote = structuredClone(base);
+	remote.pantry[0].quantity = 2;
+
+	const merged = mergePendingKitchenJournal(
+		[journalRecord('w1', base, stepOne, 10), journalRecord('w2', stepOne, stepTwo, 20)],
+		remote
+	);
+	assert.equal(merged.conflicts.length, 0);
+	assert.equal(merged.state.pantry.find((item) => item.id === 'flour')?.quantity, 2);
+	assert.ok(merged.state.pantry.some((item) => item.id === 'garlic'));
+});
+
+test('same-timestamp dependent pantry deductions with peer shopping items replay after ancestors', () => {
+	const ancestorBase = createNewUserState();
+	ancestorBase.pantry = [
+		{ id: 'flour', name: 'flour', quantity: 4, unit: 'cup', category: 'Pantry' }
+	];
+	const ancestorLocal = structuredClone(ancestorBase);
+	ancestorLocal.pantry[0].quantity = 3;
+
+	const dependentBase = structuredClone(ancestorLocal);
+	dependentBase.shopping = [
+		{ id: 'milk', name: 'milk', quantity: 1, unit: 'carton', checked: false }
+	];
+	const dependentLocal = structuredClone(dependentBase);
+	dependentLocal.pantry[0].quantity = 1;
+
+	// Use writerIds where dependent sorts lexicographically before ancestor at the same timestamp.
+	const records = [
+		journalRecord('a-dependent', dependentBase, dependentLocal, 1_000),
+		journalRecord('z-ancestor', ancestorBase, ancestorLocal, 1_000)
+	];
+
+	const cleanRemote = structuredClone(ancestorBase);
+	cleanRemote.shopping = structuredClone(dependentBase.shopping);
+	const cleanMerged = mergePendingKitchenJournal(records, cleanRemote);
+	assert.equal(cleanMerged.conflicts.length, 0);
+	assert.equal(cleanMerged.state.pantry[0].quantity, 1);
+	assert.equal(cleanMerged.state.shopping.length, 1);
+
+	const competingRemote = structuredClone(cleanRemote);
+	competingRemote.pantry[0].quantity = 2;
+	const unresolved = mergePendingKitchenJournal(records, competingRemote);
+	assert.equal(unresolved.conflicts.length, 1);
+	assert.equal(unresolved.conflicts[0].local, 1);
+	assert.equal(unresolved.conflicts[0].remote, 2);
+
+	const resolvedLocal = mergePendingKitchenJournal(records, competingRemote, 'local');
+	assert.equal(resolvedLocal.state.pantry[0].quantity, 1);
 });

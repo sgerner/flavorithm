@@ -588,6 +588,7 @@
 		online = navigator.onLine;
 		kitchenSync = createKitchenSync({
 			storage: localStorage,
+			sessionStorage,
 			getUser: () => user,
 			getState: () => JSON.parse(JSON.stringify(kitchen)),
 			setState: (state) => {
@@ -763,13 +764,33 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
+		const releaseSyncLease = () => {
+			kitchenSync?.releaseLease();
+		};
+		const refreshSyncLease = () => {
+			if (document.visibilityState === 'visible') kitchenSync?.refreshLease();
+		};
+		const restoreSyncLease = () => {
+			kitchenSync?.refreshLease();
+		};
+		const leaseRefreshTimer = window.setInterval(() => {
+			kitchenSync?.refreshLease();
+		}, 30_000);
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
+		window.addEventListener('pagehide', releaseSyncLease);
+		window.addEventListener('pageshow', restoreSyncLease);
+		document.addEventListener('visibilitychange', refreshSyncLease);
 		return () => {
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
+			window.removeEventListener('pagehide', releaseSyncLease);
+			window.removeEventListener('pageshow', restoreSyncLease);
+			document.removeEventListener('visibilitychange', refreshSyncLease);
+			clearInterval(leaseRefreshTimer);
+			kitchenSync?.releaseLease();
 			clearTimeout(saveTimer);
 			clearInterval(connectionPoll);
 			voiceCapture?.cancel();
