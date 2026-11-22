@@ -4,6 +4,7 @@ import {
 	createStatusStore,
 	formatPantryStatus,
 	formatRecipeStatus,
+	formatShoppingStatus,
 	formatUndoAnnouncement,
 	formatWebSearchStatus
 } from '../src/lib/status.ts';
@@ -170,6 +171,11 @@ test('formats recipe, pantry, online search, and Undo status messages clearly', 
 	);
 	assert.equal(formatPantryStatus(2, 5, 'soon'), '2 ingredients expiring soon.');
 	assert.equal(formatPantryStatus(1, 5, 'expired'), '1 expired ingredient.');
+
+	assert.equal(formatShoppingStatus(0, 0, 0, 'all'), 'Your shopping list is empty.');
+	assert.equal(formatShoppingStatus(0, 3, 3, 'unpurchased'), 'All 3 items purchased.');
+	assert.equal(formatShoppingStatus(2, 4, 2, 'unpurchased'), '2 unpurchased items shown.');
+	assert.equal(formatShoppingStatus(4, 4, 2, 'all'), '4 shopping items shown.');
 
 	assert.equal(
 		formatWebSearchStatus(0),

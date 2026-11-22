@@ -68,6 +68,24 @@ export function formatPantryStatus(
 	return `${visibleCount} ingredient${visibleCount === 1 ? '' : 's'} in your pantry.`;
 }
 
+export function formatShoppingStatus(
+	visibleCount: number,
+	totalCount: number,
+	checkedCount: number,
+	filter: string
+): string {
+	if (totalCount === 0) {
+		return 'Your shopping list is empty.';
+	}
+	if (visibleCount === 0) {
+		return `All ${checkedCount} ${checkedCount === 1 ? 'item' : 'items'} purchased.`;
+	}
+	if (filter === 'unpurchased') {
+		return `${visibleCount} unpurchased ${visibleCount === 1 ? 'item' : 'items'} shown.`;
+	}
+	return `${visibleCount} shopping ${visibleCount === 1 ? 'item' : 'items'} shown.`;
+}
+
 export function formatWebSearchStatus(count: number): string {
 	if (count === 0) {
 		return 'No online recipes found. Try another search or import a link.';
