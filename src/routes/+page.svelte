@@ -47,7 +47,13 @@
 	} from '@lucide/svelte';
 	import type { AppState, Meal, Recipe, User } from '#lib/types.ts';
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
-	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
+	import {
+		buildShoppingList,
+		normalizeName,
+		parseIngredientLines,
+		preferenceSummary,
+		unitInfo
+	} from '#lib/domain.ts';
 	import {
 		completeMeal,
 		expiryStatus,
@@ -102,6 +108,18 @@
 	let toastUndo = $state<(() => void) | null>(null);
 	let toastVersion = 0;
 	let busy = $state(false);
+	let scanBusy = $state(false);
+	let scanController: AbortController | undefined;
+	let scanGeneration = 0;
+	function cancelScan(silent = false) {
+		if (!scanBusy) return;
+		scanGeneration++;
+		scanController?.abort();
+		scanController = undefined;
+		scanBusy = false;
+		if (imageInput) imageInput.value = '';
+		if (!silent) notify('Photo scan cancelled.');
+	}
 	let mobileNav = $state(false);
 	let modal = $state('');
 	const dialogNames: Record<string, string> = {
@@ -164,6 +182,7 @@
 		modal = 'auth';
 	}
 	function clearManagedIdentity() {
+		cancelScan(true);
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
@@ -360,6 +379,7 @@
 		);
 		if (modeChanged && managedAuth) clearManagedIdentity();
 		if (changedIdentity) {
+			cancelScan(true);
 			kitchenSync?.clearContext();
 			clearAIConnectionState();
 		}
@@ -441,6 +461,19 @@
 	let visiblePantry = $derived(
 		kitchen.pantry.filter(
 			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
+		)
+	);
+	let availablePantryNames = $derived(
+		new Set(
+			kitchen.pantry
+				.filter(
+					(item) =>
+						Number.isFinite(item.quantity) &&
+						item.quantity > 0 &&
+						expiryStatus(item.expires) !== 'expired'
+				)
+				.map((item) => normalizeName(item.name))
+				.filter(Boolean)
 		)
 	);
 	let week = $derived.by(() => {
@@ -772,6 +805,7 @@
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
 			clearInterval(connectionPoll);
+			cancelScan(true);
 			voiceCapture?.cancel();
 		};
 	});
@@ -860,32 +894,28 @@
 		mobileNav = false;
 	}
 	function addIngredients() {
-		const names = pantryInput
-			.split(/[,\n;]/)
-			.map((value) => value.trim())
-			.filter(Boolean);
-		if (!names.length) return;
+		const parsed = parseIngredientLines(pantryInput);
+		if (!parsed.length) return;
 		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
-		const additions = names.map((value) => {
-			const match = value.match(
-				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
-			);
-			return {
-				id: crypto.randomUUID(),
-				name: match ? match[3] : value,
-				quantity: match ? Number(match[1]) : 1,
-				unit: match?.[2] || 'piece',
-				checked: true
-			};
-		});
+		const additions = parsed.map((item) => ({
+			id: crypto.randomUUID(),
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit,
+			category: item.category,
+			checked: true
+		}));
 		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
 		const applied = JSON.stringify(kitchen.pantry);
 		pantryInput = '';
 		modal = '';
-		notify(`${names.length} ingredients added to your pantry.`, () => {
-			if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-			else notify('Your pantry changed again. Review the current quantities before editing.');
-		});
+		notify(
+			`${parsed.length} ingredient${parsed.length === 1 ? '' : 's'} added to your pantry.`,
+			() => {
+				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
+				else notify('Your pantry changed again. Review the current quantities before editing.');
+			}
+		);
 	}
 
 	async function authenticate(event: SubmitEvent) {
@@ -938,6 +968,7 @@
 		}
 	}
 	async function logout() {
+		cancelScan(true);
 		if (managedAuth) {
 			if (!providerLogoutUrl) return;
 			try {
@@ -1467,7 +1498,7 @@
 				modal = 'leave';
 				break;
 			case 'scan':
-				imageInput?.click();
+				if (!scanBusy) imageInput?.click();
 				break;
 			case 'dictate':
 				dictateRecipe();
@@ -1503,31 +1534,88 @@
 		}
 	}
 	async function scan(event: Event) {
-		const file = (event.target as HTMLInputElement).files?.[0];
-		if (!file || !needAI()) return;
+		const input = (event.currentTarget ?? event.target) as HTMLInputElement | null;
+		const file = input?.files?.[0];
+		if (input) input.value = '';
+		if (imageInput) imageInput.value = '';
+		if (!file || scanBusy || !needAI()) return;
 		if (file.size > 5 * 1024 * 1024) {
 			notify('Choose a photo under 5 MB.');
 			return;
 		}
-		busy = true;
+		const generation = ++scanGeneration;
+		const currentController = new AbortController();
+		scanController = currentController;
+		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+		scanBusy = true;
 		try {
 			const image = await new Promise<string>((resolve, reject) => {
 				const reader = new FileReader();
-				reader.onload = () => resolve(String(reader.result));
-				reader.onerror = reject;
+				const onAbort = () => {
+					reader.abort();
+					reject(new DOMException('Scan aborted.', 'AbortError'));
+				};
+				if (currentController.signal.aborted) {
+					onAbort();
+					return;
+				}
+				currentController.signal.addEventListener('abort', onAbort, { once: true });
+				reader.onload = () => {
+					currentController.signal.removeEventListener('abort', onAbort);
+					resolve(String(reader.result));
+				};
+				reader.onerror = () => {
+					currentController.signal.removeEventListener('abort', onAbort);
+					reject(new Error('Could not read that photo. Try another file.'));
+				};
 				reader.readAsDataURL(file);
 			});
-			const result = await ai('vision', { image });
-			const recognized = result.ingredients
-				.map((i: any) => `${i.quantity} ${i.unit} ${i.name}`)
+			const result = await ai('vision', { image }, currentController.signal);
+			if (
+				generation !== scanGeneration ||
+				currentController.signal.aborted ||
+				owner !== `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`
+			)
+				return;
+			const items = Array.isArray(result?.ingredients) ? result.ingredients : [];
+			if (!items.length) {
+				notify('No ingredients detected in that photo.');
+				return;
+			}
+			const recognized = items
+				.map((i: { name: string; quantity: number; unit: string; category?: string }) => {
+					const cleanName = String(i.name ?? '')
+						.replace(/[,;\r\n]+/g, ' ')
+						.replace(/\s+/g, ' ')
+						.trim();
+					const cleanCategory = String(i.category ?? '')
+						.replace(/[\[\]\r\n]+/g, ' ')
+						.replace(/\s+/g, ' ')
+						.trim();
+					const displayUnit = unitInfo(String(i.unit ?? '')).display;
+					return cleanCategory
+						? `${i.quantity} ${displayUnit} ${cleanName} [${cleanCategory}]`
+						: `${i.quantity} ${displayUnit} ${cleanName}`;
+				})
 				.join('\n');
 			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n');
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
-			notify((e as Error).message);
+			if (generation === scanGeneration) {
+				notify(
+					currentController.signal.aborted
+						? 'Photo scan cancelled.'
+						: e instanceof Error
+							? e.message
+							: 'Could not recognize ingredients from that photo.'
+				);
+			}
 		} finally {
-			busy = false;
+			if (generation === scanGeneration) {
+				scanBusy = false;
+				scanController = undefined;
+			}
 			if (imageInput) imageInput.value = '';
 		}
 	}
@@ -2010,6 +2098,7 @@
 			clearTimeout(saveTimer);
 			await writeChain;
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
+			cancelScan(true);
 			if (user) {
 				for (const key of Object.keys(localStorage)) {
 					if (key.startsWith('flavorithm-') && key.includes(`:${user.id}:`))
@@ -2177,12 +2266,14 @@
 />
 <input
 	class="visually-hidden"
-	inert={!!modal || !!selected || !!editingRecipe || butlerOpen}
+	tabindex="-1"
+	inert={(!!modal && modal !== 'pantry') || !!selected || !!editingRecipe || butlerOpen}
 	type="file"
 	accept="image/jpeg,image/png,image/webp"
 	aria-label="Scan pantry ingredients from a photo"
 	bind:this={imageInput}
 	onchange={scan}
+	disabled={scanBusy}
 />
 <a
 	class="skip-link"
@@ -2313,16 +2404,22 @@
 					>
 				</section>
 				{#if page === 'discover'}<div class="mobile-pantry-actions">
-						<button class="secondary" onclick={() => (modal = 'pantry')}
+						<button class="secondary" type="button" onclick={() => (modal = 'pantry')}
 							><Plus size={18} />Ingredients</button
 						>
 						<button
 							class="secondary"
+							type="button"
 							aria-label="Scan ingredients from a photo"
+							aria-busy={scanBusy}
+							disabled={scanBusy}
 							onclick={() => imageInput.click()}><Camera size={19} /></button
 						>
-						<button class="secondary" aria-label="Dictate ingredients" onclick={dictate}
-							><Mic size={19} /></button
+						<button
+							class="secondary"
+							type="button"
+							aria-label="Dictate ingredients"
+							onclick={dictate}><Mic size={19} /></button
 						>
 					</div>{/if}
 				{#if page === 'discover'}<section
@@ -2333,14 +2430,20 @@
 							<h2>What’s in your kitchen?</h2>
 							<p>Add ingredients to inspire your recipes.</p>
 							<div class="banner-actions">
-								<button class="cream-button" onclick={() => (modal = 'pantry')}
+								<button class="cream-button" type="button" onclick={() => (modal = 'pantry')}
 									><Plus size={17} /> Add your ingredients <ArrowRight size={17} /></button
 								><button
 									class="banner-icon"
+									type="button"
 									aria-label="Scan ingredients from a photo"
+									aria-busy={scanBusy}
+									disabled={scanBusy}
 									onclick={() => imageInput.click()}><Camera size={20} /></button
-								><button class="banner-icon" aria-label="Dictate ingredients" onclick={dictate}
-									><Mic size={20} /></button
+								><button
+									class="banner-icon"
+									type="button"
+									aria-label="Dictate ingredients"
+									onclick={dictate}><Mic size={20} /></button
 								>
 							</div>
 						</div>
@@ -2350,7 +2453,11 @@
 								alt="A colorful bowl of fresh vegetables and greens"
 							/><span class="visual-spark">✳</span>
 						</div>
-					</section>{/if}
+					</section>
+					{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
+							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
+							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
+						</div>{/if}{/if}
 				<section class="recipe-section">
 					<div class="section-heading">
 						<div>
@@ -2445,11 +2552,7 @@
 											><ChefHat size={14} />{recipe.difficulty}</span
 										><span class="pantry-match"
 											><Leaf size={13} />{recipe.ingredients.filter((i) =>
-												kitchen.pantry.some(
-													(p) =>
-														i.name.toLowerCase().includes(p.name.toLowerCase()) ||
-														p.name.toLowerCase().includes(i.name.toLowerCase())
-												)
+												availablePantryNames.has(normalizeName(i.name))
 											).length} in your pantry</span
 										>
 									</div>
@@ -2493,13 +2596,22 @@
 							}}>Clear depleted items</button
 						>{/if}
 					<div>
-						<button class="secondary" onclick={() => imageInput.click()}
-							><Camera size={17} /> Scan a photo</button
-						><button class="secondary" onclick={dictate}
+						<button
+							class="secondary"
+							type="button"
+							aria-busy={scanBusy}
+							disabled={scanBusy}
+							onclick={() => imageInput.click()}
+							><Camera size={17} /> {scanBusy ? 'Scanning photo…' : 'Scan a photo'}</button
+						><button class="secondary" type="button" onclick={dictate}
 							><Mic size={17} /> Tell us what you have</button
 						>
 					</div>
 				</div>
+				{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
+						<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
+						<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
+					</div>{/if}
 				<div class="expiry-filters" aria-label="Filter pantry by expiry">
 					{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
 							class:active={pantryFilter === option.id}
@@ -2878,7 +2990,9 @@
 		</div>
 	</main>
 </div>
-<div class="visually-hidden" role="status" aria-atomic="true">{toast}</div>
+<div class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
+	{scanBusy ? 'Scanning photo for ingredients…' : toast}
+</div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
 		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
 			onclick={() => (toast = '')}
@@ -3053,6 +3167,10 @@
 					</form>
 				{:else if modal === 'pantry'}<span class="dialog-spark">✳</span>
 					<h2>Add ingredients</h2>
+					{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
+							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
+							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
+						</div>{/if}
 
 					<label class="field"
 						>Ingredients<textarea
@@ -3064,12 +3182,20 @@
 						Separate with commas or new lines. Add quantities and units when you know them.
 					</p>
 					<div class="dialog-actions">
-						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button><button
+						<button class="secondary" type="button" onclick={dictate}
+							><Mic size={17} /> Use voice</button
+						><button
 							class="secondary"
+							type="button"
+							aria-busy={scanBusy}
 							onclick={() => imageInput.click()}
-							disabled={busy}><Camera size={17} /> Use photo</button
-						><button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
-							>Add ingredients <ArrowRight size={17} /></button
+							disabled={scanBusy || busy}
+							><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
+						><button
+							class="primary"
+							type="button"
+							disabled={!pantryInput.trim()}
+							onclick={addIngredients}>Add ingredients <ArrowRight size={17} /></button
 						>
 					</div>
 				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
@@ -3651,6 +3777,35 @@
 	.voice-session p {
 		font-size: 17px;
 		margin: 0 0 12px;
+	}
+	.scan-status {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		flex-wrap: wrap;
+		padding: 12px 14px;
+		margin: 14px 0 16px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		border-left: 3px solid var(--green);
+		font-size: 14px;
+	}
+	.scan-status > span {
+		display: inline-flex;
+		align-items: center;
+		gap: 9px;
+		min-width: 0;
+		font-weight: 500;
+	}
+	.scan-status button {
+		min-width: 46px;
+		min-height: 46px;
+		padding: 10px 16px;
+		background: var(--surface);
+	}
+	.scan-status :global(.scan-spin) {
+		animation: gentle-turn 1.4s linear infinite;
 	}
 
 	.expiry-filters {

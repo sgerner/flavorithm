@@ -237,6 +237,64 @@ test('vision sends image bytes to Anthropic as a base64 image block and validate
 	});
 });
 
+test('vision prompt requests canonical units and forwards AbortSignal cancellation', async () => {
+	let observedPrompt = '';
+	await runAIRequest(
+		{
+			action: 'vision',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'temporary-vision-key',
+			image: 'data:image/png;base64,aGVsbG8='
+		},
+		async (_input, init) => {
+			const body = JSON.parse(String(init?.body));
+			observedPrompt = JSON.stringify(body.messages);
+			return jsonResponse({
+				choices: [
+					{
+						message: {
+							content: JSON.stringify({
+								ingredients: [{ name: 'cilantro', quantity: 1, unit: 'bunch', category: 'Produce' }]
+							})
+						}
+					}
+				]
+			});
+		}
+	);
+	for (const canonicalUnit of ['each', 'g', 'ml', 'tbsp', 'tsp', 'cup', 'bunch']) {
+		assert.ok(
+			observedPrompt.includes(canonicalUnit),
+			`expected vision prompt to request canonical unit ${canonicalUnit}`
+		);
+	}
+
+	const controller = new AbortController();
+	const pending = runAIRequest(
+		{
+			action: 'vision',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'temporary-vision-key',
+			image: 'data:image/png;base64,aGVsbG8='
+		},
+		async (_input, init) =>
+			new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener(
+					'abort',
+					() => reject(new DOMException('Aborted', 'AbortError')),
+					{ once: true }
+				);
+			}),
+		undefined,
+		undefined,
+		controller.signal
+	);
+	controller.abort();
+	await assert.rejects(() => pending);
+});
+
 test('capture turns recipe text into an unsaved validated draft and never fetches embedded links', async () => {
 	let observedBody: any;
 	let pageFetches = 0;

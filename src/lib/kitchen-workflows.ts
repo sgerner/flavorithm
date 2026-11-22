@@ -1,6 +1,19 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
-import { normalizeName, unitInfo } from './domain.ts';
-export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
+import {
+	normalizeName,
+	parseIngredientLine,
+	parseIngredientLines,
+	unitInfo,
+	type ParsedIngredient
+} from './domain.ts';
+export {
+	normalizeName,
+	normalizeName as normalizeIngredientName,
+	parseIngredientLine,
+	parseIngredientLines,
+	unitInfo,
+	type ParsedIngredient
+} from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
 export function convertCompatibleQuantity(
@@ -170,7 +183,7 @@ export function transferPurchasedItemsToPantry(
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category?: string }
 	>();
 	for (const item of purchases) {
 		if (
@@ -185,6 +198,10 @@ export function transferPurchasedItemsToPantry(
 		const key = `${normalizedName}\u0000${unit.dimension}`;
 		const bucket = buckets.get(key) ?? { name: item.name.trim(), unit, quantityBase: 0 };
 		bucket.quantityBase += item.quantity * unit.factor;
+		const category = item.category?.trim();
+		if (category && (!bucket.category || (bucket.category === 'Pantry' && category !== 'Pantry'))) {
+			bucket.category = category;
+		}
 		buckets.set(key, bucket);
 	}
 
@@ -214,7 +231,7 @@ export function transferPurchasedItemsToPantry(
 			name: bucket.name,
 			quantity: roundPantryQuantity(bucket.quantityBase / bucket.unit.factor),
 			unit: bucket.unit.display,
-			category: 'Pantry'
+			category: bucket.category || 'Pantry'
 		});
 	}
 	return result;

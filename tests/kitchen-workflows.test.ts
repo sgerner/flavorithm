@@ -361,3 +361,45 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
 });
+
+test('transferPurchasedItemsToPantry preserves categories on new lots and merges item/bunch aliases into unexpired stock', () => {
+	const existing = [
+		{ ...pantry('avocado', 1, 'whole', '2026-10-24'), category: 'Produce' },
+		{ ...pantry('cilantro', 1, 'bunch'), category: 'Herbs' }
+	];
+	const transferred = transferPurchasedItemsToPantry(
+		existing,
+		[
+			{ ...shopping('scan-avocado', 'avocados', 2, 'items', true), category: 'Produce' },
+			{ ...shopping('scan-cilantro', 'cilantro', 1, 'bunches', true), category: 'Produce' },
+			shopping('manual-flour', 'flour', 1.5, 'cups', true)
+		],
+		(() => {
+			let n = 0;
+			return () => `new-lot-${++n}`;
+		})()
+	);
+
+	assert.equal(transferred.length, 4);
+	// Expiring avocado lot stays untouched; new unexpired avocado lot keeps Produce category.
+	assert.equal(transferred[0].quantity, 1);
+	assert.equal(transferred[0].expires, '2026-10-24');
+	const newAvocado = transferred.find((item) => item.id === 'new-lot-1');
+	assert.ok(newAvocado);
+	assert.equal(newAvocado.unit, 'each');
+	assert.equal(newAvocado.quantity, 2);
+	assert.equal(newAvocado.category, 'Produce');
+
+	// Unexpired cilantro bunch merges compatible bunches without duplicating lots.
+	const cilantro = transferred.find((item) => item.name === 'cilantro');
+	assert.ok(cilantro);
+	assert.equal(cilantro.quantity, 2);
+	assert.equal(cilantro.unit, 'bunch');
+	assert.equal(cilantro.category, 'Herbs');
+
+	// Manual lines without category default to Pantry.
+	const flour = transferred.find((item) => item.name === 'flour');
+	assert.ok(flour);
+	assert.equal(flour.category, 'Pantry');
+	assert.equal(flour.unit, 'cup');
+});
