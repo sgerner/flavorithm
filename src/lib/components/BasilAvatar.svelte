@@ -84,25 +84,25 @@
 		transform-origin: center;
 	}
 	.active .eyes {
-		animation: blink 6s steps(1) infinite;
+		animation: blink 2.2s steps(1) 2;
 	}
 	.active .brow {
-		animation: eyebrow 9s steps(1) infinite;
+		animation: eyebrow 3.6s steps(1) 1;
 	}
 	.active .steam {
-		animation: steam 3s steps(3) infinite;
+		animation: steam 1.5s steps(3) 3;
 	}
 	.active[data-mood='thinking'] .head {
-		animation: ponder 1.8s steps(2) infinite;
+		animation: ponder 1.5s steps(2) 3;
 	}
 	.active[data-mood='speaking'] .mouth {
-		animation: chatter 330ms steps(2) infinite;
+		animation: chatter 330ms steps(2) 14;
 	}
 	.active[data-mood='speaking'] .moustache {
-		animation: whiskers 330ms steps(2) infinite;
+		animation: whiskers 330ms steps(2) 14;
 	}
 	.active[data-mood='speaking'] .head {
-		animation: lecture 900ms steps(2) infinite;
+		animation: lecture 900ms steps(2) 5;
 	}
 	.active[data-mood='pleased'] .head {
 		animation: nod 700ms steps(2) 2;

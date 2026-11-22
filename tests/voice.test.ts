@@ -162,6 +162,121 @@ test('voice API enforces authentication, origin and streaming upload limit; neve
 	const availability = await route.GET({ locals: { user: { id: 'voice-tester' } } } as any);
 	assert.deepEqual(Object.keys(await availability.json()), ['localAvailable']);
 });
+test('GET /api/voice probes /health and fallback transcription endpoint, rejecting network errors, auth/404, and 5xx', async () => {
+	const oldUrl = process.env.WHISPER_TRANSCRIPTION_URL,
+		oldKey = process.env.WHISPER_API_KEY;
+	const getAvailability = async (fetcher: typeof fetch, signedIn = true) => {
+		const response = await route.GET({
+			locals: { user: signedIn ? { id: 'voice-tester' } : null },
+			fetch: fetcher,
+			request: new Request('https://flavorithm.example/api/voice')
+		} as any);
+		return { status: response.status, body: await response.json() };
+	};
+	try {
+		const unauth = await getAvailability(fetch, false);
+		assert.equal(unauth.status, 401);
+
+		delete process.env.WHISPER_TRANSCRIPTION_URL;
+		delete process.env.WHISPER_API_KEY;
+		assert.deepEqual(
+			(
+				await getAvailability((async () => {
+					throw new Error('must not probe unconfigured endpoint');
+				}) as typeof fetch)
+			).body,
+			{ localAvailable: false }
+		);
+
+		process.env.WHISPER_TRANSCRIPTION_URL = 'http://flavorithm-whisper:8080/inference';
+		process.env.WHISPER_API_KEY = 'probe-secret';
+		const healthyCalls: string[] = [];
+		assert.deepEqual(
+			(
+				await getAvailability((async (input, init) => {
+					healthyCalls.push(String(input));
+					assert.equal(init?.method, 'GET');
+					assert.equal(init?.redirect, 'error');
+					assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer probe-secret');
+					return Response.json({ status: 'ok' });
+				}) as typeof fetch)
+			).body,
+			{ localAvailable: true }
+		);
+		assert.deepEqual(healthyCalls, ['http://flavorithm-whisper:8080/health']);
+
+		assert.deepEqual(
+			(
+				await getAvailability((async () => {
+					throw new TypeError('fetch failed');
+				}) as typeof fetch)
+			).body,
+			{ localAvailable: false }
+		);
+
+		for (const status of [500, 502, 503]) {
+			const calls: string[] = [];
+			assert.deepEqual(
+				(
+					await getAvailability((async (input) => {
+						calls.push(String(input));
+						return new Response('unhealthy', { status });
+					}) as typeof fetch)
+				).body,
+				{ localAvailable: false }
+			);
+			assert.deepEqual(calls, ['http://flavorithm-whisper:8080/health']);
+		}
+
+		process.env.WHISPER_TRANSCRIPTION_URL = 'http://whisper:8000/v1/audio/transcriptions';
+		for (const status of [200, 405]) {
+			const calls: string[] = [];
+			assert.deepEqual(
+				(
+					await getAvailability((async (input) => {
+						calls.push(String(input));
+						if (String(input).endsWith('/health'))
+							return new Response('not found', { status: 404 });
+						return new Response('', { status });
+					}) as typeof fetch)
+				).body,
+				{ localAvailable: true }
+			);
+			assert.deepEqual(calls, [
+				'http://whisper:8000/health',
+				'http://whisper:8000/v1/audio/transcriptions'
+			]);
+		}
+
+		for (const status of [401, 403, 404, 500, 502, 503]) {
+			assert.deepEqual(
+				(
+					await getAvailability((async (input) => {
+						if (String(input).endsWith('/health'))
+							return new Response('not found', { status: 404 });
+						return new Response('rejected', { status });
+					}) as typeof fetch)
+				).body,
+				{ localAvailable: false }
+			);
+		}
+
+		assert.deepEqual(
+			(
+				await getAvailability((async (input) => {
+					if (String(input).endsWith('/health')) return new Response('not found', { status: 404 });
+					throw new TypeError('connection reset');
+				}) as typeof fetch)
+			).body,
+			{ localAvailable: false }
+		);
+	} finally {
+		if (oldUrl === undefined) delete process.env.WHISPER_TRANSCRIPTION_URL;
+		else process.env.WHISPER_TRANSCRIPTION_URL = oldUrl;
+		if (oldKey === undefined) delete process.env.WHISPER_API_KEY;
+		else process.env.WHISPER_API_KEY = oldKey;
+	}
+});
 test('cancelling a pending microphone permission releases tracks and suppresses recording', async (t) => {
 	let allow!: (stream: any) => void;
 	let stopped = false;
