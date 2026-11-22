@@ -8,9 +8,12 @@ import {
 import {
 	completeMeal,
 	convertCompatibleQuantity,
+	cookPlannedMeal,
 	expiryStatus,
 	normalizeIngredientName,
 	reconcileShoppingList,
+	savePlannedMealChanges,
+	schedulePlannedMeal,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -360,4 +363,113 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
+});
+
+test('schedulePlannedMeal rejects missing recipes without creating orphaned meal entries', () => {
+	const existingRecipe = recipe({
+		id: 'tacos',
+		ingredients: [{ name: 'lime', quantity: 2, unit: 'each' }]
+	});
+	const initial = state({ recipes: [existingRecipe] });
+
+	const missing = schedulePlannedMeal(initial, {
+		id: 'meal-1',
+		recipeId: 'removed-recipe',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(missing.status, 'missing-recipe');
+	assert.equal(missing.state, initial);
+	assert.equal(missing.state.meals.length, 0);
+	assert.equal(missing.state.shopping.length, 0);
+
+	const scheduled = schedulePlannedMeal(initial, {
+		id: 'meal-2',
+		recipeId: 'tacos',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		servings: 4
+	});
+	assert.equal(scheduled.status, 'scheduled');
+	assert.equal(scheduled.state.meals.length, 1);
+	assert.equal(scheduled.state.meals[0].recipeId, 'tacos');
+	assert.equal(scheduled.state.shopping.length, 1);
+	assert.equal(scheduled.state.shopping[0].quantity, 4);
+});
+
+test('savePlannedMealChanges and cookPlannedMeal guard concurrently completed or removed meals', () => {
+	const plannedRecipe = recipe({
+		id: 'stew',
+		servings: 2,
+		ingredients: [{ name: 'olive oil', quantity: 2, unit: 'tbsp' }]
+	});
+	const openState = state({
+		pantry: [pantry('olive oil', 1, 'cup')],
+		recipes: [plannedRecipe],
+		meals: [{ id: 'dinner', date: '2026-10-22', slot: 'Dinner', recipeId: 'stew', servings: 2 }]
+	});
+
+	const firstCook = cookPlannedMeal(
+		openState,
+		{ mealId: 'dinner', deductPantry: true, leftoverServings: 1 },
+		new Date('2026-10-22T19:00:00.000Z')
+	);
+	assert.equal(firstCook.status, 'cooked');
+	const completedSnapshot = structuredClone(firstCook.state);
+	assert.equal(completedSnapshot.meals[0].completedAt, '2026-10-22T19:00:00.000Z');
+	assert.equal(completedSnapshot.meals[0].leftoverServings, 1);
+	assert.ok(Math.abs(completedSnapshot.pantry[0].quantity - 0.875) < 0.001);
+
+	// Concurrent edit attempt on an already-cooked meal produces zero mutations:
+	const editCompleted = savePlannedMealChanges(firstCook.state, {
+		mealId: 'dinner',
+		date: '2026-10-24',
+		slot: 'Lunch',
+		servings: 6
+	});
+	assert.equal(editCompleted.status, 'completed');
+	assert.equal(editCompleted.state, firstCook.state);
+	assert.deepEqual(editCompleted.state, completedSnapshot);
+
+	// Concurrent cook attempt on an already-cooked meal produces zero mutations:
+	const recookCompleted = cookPlannedMeal(
+		firstCook.state,
+		{ mealId: 'dinner', deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-22T20:00:00.000Z')
+	);
+	assert.equal(recookCompleted.status, 'completed');
+	assert.equal(recookCompleted.state, firstCook.state);
+	assert.deepEqual(recookCompleted.state, completedSnapshot);
+
+	// Concurrent edit/cook attempt on a deleted meal produces zero mutations:
+	const deletedMealState = { ...openState, meals: [] };
+	const editMissing = savePlannedMealChanges(deletedMealState, {
+		mealId: 'dinner',
+		date: '2026-10-23',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(editMissing.status, 'missing');
+	assert.equal(editMissing.state, deletedMealState);
+
+	const cookMissing = cookPlannedMeal(deletedMealState, {
+		mealId: 'dinner',
+		deductPantry: true,
+		leftoverServings: 0
+	});
+	assert.equal(cookMissing.status, 'missing');
+	assert.equal(cookMissing.state, deletedMealState);
+
+	// Updating an open planned meal works normally and reconciles shopping:
+	const rescheduled = savePlannedMealChanges(openState, {
+		mealId: 'dinner',
+		date: '2026-10-29',
+		slot: 'Lunch',
+		servings: 4
+	});
+	assert.equal(rescheduled.status, 'updated');
+	assert.equal(rescheduled.state.meals[0].date, '2026-10-29');
+	assert.equal(rescheduled.state.meals[0].slot, 'Lunch');
+	assert.equal(rescheduled.state.meals[0].servings, 4);
 });

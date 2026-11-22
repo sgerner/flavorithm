@@ -1,7 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createNewUserState } from '../src/lib/data.ts';
+import { createNewUserState, seedRecipes } from '../src/lib/data.ts';
 import { createKitchenSync } from '../src/lib/client-sync.ts';
+import {
+	applyEditedRecipe,
+	applyNutritionRefresh,
+	cloneRecipe,
+	rateRecipeById,
+	toggleSavedRecipe
+} from '../src/lib/recipe-collection.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import type { KitchenTransport } from '../src/lib/offline-sync.ts';
 
@@ -502,4 +509,95 @@ test('an acknowledgement retires only captured journal versions, preserving a pe
 		['peer']
 	);
 	assert.equal(storage.getItem(peerKey), null);
+});
+
+test('ID-keyed recipe actions and three-way editor merge persist cleanly after sync clones state', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	base.recipes = [{ ...structuredClone(seedRecipes[0]), id: 'risotto', saved: true, servings: 2 }];
+	let server = structuredClone(base);
+	let etag = 'v1';
+
+	const sync = harness({
+		user,
+		initial: base,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (next) => {
+				server = structuredClone(next);
+				etag = `${etag}-next`;
+				return { state: structuredClone(server), etag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	const staleSelectedReference = sync.state.recipes[0];
+	const editingRecipeBase = cloneRecipe(sync.state.recipes[0]);
+
+	// Peer household member updates servings and steps on the server while detail/editor are open:
+	server.recipes[0].servings = 6;
+	server.recipes[0].steps = [...server.recipes[0].steps, 'Fold in cold butter off the heat.'];
+	etag = 'v2';
+
+	// Background sync runs (e.g. from an unrelated theme/pantry write) and replaces sync.state via setContextState(structuredClone(...)):
+	const backgroundWrite = structuredClone(sync.state);
+	backgroundWrite.pantry.push({
+		id: 'broth',
+		name: 'vegetable broth',
+		quantity: 4,
+		unit: 'cup',
+		category: 'Pantry'
+	});
+	sync.state = backgroundWrite;
+	sync.controller.stage(sync.state);
+	await sync.controller.sync();
+	assert.notEqual(sync.state.recipes[0], staleSelectedReference);
+	assert.equal(sync.state.recipes[0].servings, 6);
+
+	// User rates, toggles save twice, refreshes nutrition, and submits a disjoint description edit:
+	const rated = rateRecipeById(sync.state.recipes, sync.state.preferences, 'risotto', 5);
+	assert.ok(rated);
+	sync.state = { ...sync.state, recipes: rated.recipes, preferences: rated.preferences };
+
+	const unsaved = toggleSavedRecipe(sync.state.recipes, 'risotto');
+	assert.ok(unsaved);
+	const resaved = toggleSavedRecipe(unsaved.recipes, 'risotto');
+	assert.ok(resaved);
+	sync.state = { ...sync.state, recipes: resaved.recipes };
+
+	const refreshed = applyNutritionRefresh(
+		sync.state.recipes,
+		'risotto',
+		{
+			servings: sync.state.recipes[0].servings,
+			ingredients: sync.state.recipes[0].ingredients
+		},
+		{ ...sync.state.recipes[0].nutrition, calories: 640 }
+	);
+	assert.ok(refreshed);
+	assert.equal(refreshed.nutritionStale, false);
+	sync.state = { ...sync.state, recipes: refreshed.recipes };
+
+	const draft = { ...cloneRecipe(editingRecipeBase), description: 'Creamy saffron finish' };
+	const edited = applyEditedRecipe(sync.state.recipes, editingRecipeBase, draft);
+	assert.equal(edited.status, 'merged');
+	sync.state = { ...sync.state, recipes: edited.recipes };
+
+	sync.controller.stage(sync.state);
+	await sync.controller.sync();
+
+	assert.equal(sync.statuses.at(-1)?.conflicts.length ?? 0, 0);
+	assert.equal(server.recipes[0].description, 'Creamy saffron finish');
+	assert.equal(server.recipes[0].servings, 6);
+	assert.equal(server.recipes[0].steps.at(-1), 'Fold in cold butter off the heat.');
+	assert.equal(server.recipes[0].rating, 5);
+	assert.equal(server.recipes[0].saved, true);
+	assert.equal(server.recipes[0].nutrition.calories, 640);
 });

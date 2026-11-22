@@ -1,29 +1,67 @@
+<script module lang="ts">
+	import type { RecipeFieldConflict, RecipeMergeOptions } from '#lib/recipe-collection.ts';
+
+	export type RecipeEditorSaveResult =
+		| { status: 'saved' }
+		| { status: 'conflict'; conflicts: RecipeFieldConflict[] }
+		| { status: 'unsaved' | 'deleted'; conflicts?: RecipeFieldConflict[] }
+		| { status: 'error'; error: string };
+</script>
+
 <script lang="ts">
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
+	import { cloneRecipe } from '#lib/recipe-collection.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
-	import { untrack } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
 	import { Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
 	let {
 		recipe,
+		liveRecipe = recipe,
 		cancel,
 		save
-	}: { recipe: Recipe; cancel: () => void; save: (recipe: Recipe) => void } = $props();
-	let draft = $state<Recipe>(
-		untrack(() => ({
-			...recipe,
-			tags: [...recipe.tags],
-			ingredients: recipe.ingredients.map((item) => ({ ...item })),
-			steps: [...recipe.steps],
-			nutrition: { ...recipe.nutrition }
-		}))
-	);
+	}: {
+		recipe: Recipe;
+		liveRecipe?: Recipe | null;
+		cancel: () => void;
+		save: (recipe: Recipe, options?: RecipeMergeOptions) => RecipeEditorSaveResult | void;
+	} = $props();
+	let draft = $state<Recipe>(untrack(() => cloneRecipe(recipe)));
 	let tagsText = $state(draft.tags.join(', '));
 	let error = $state('');
+	let conflicts = $state<RecipeFieldConflict[]>([]);
+	let promptedRemoval = $state<'unsaved' | 'deleted' | null>(null);
+	let remoteRemoval = $derived(!liveRecipe ? 'deleted' : !liveRecipe.saved ? 'unsaved' : null);
+	let activeRemoval = $derived(remoteRemoval ?? promptedRemoval);
 	let uploading = $state(false);
 	let photoInput: HTMLInputElement;
+	let alertBox = $state<HTMLElement>();
+	let errorBox = $state<HTMLElement>();
+	$effect(() => {
+		if (!remoteRemoval && promptedRemoval && liveRecipe?.saved) {
+			promptedRemoval = null;
+		}
+	});
+	function summarizeValue(value: unknown): string {
+		if (value === undefined || value === null || value === '') return 'None';
+		if (Array.isArray(value)) {
+			if (!value.length) return 'None';
+			const text = value
+				.map((entry) => {
+					if (entry && typeof entry === 'object' && 'name' in entry) {
+						const item = entry as { name: string; quantity: number; unit: string };
+						return `${item.quantity} ${item.unit} ${item.name}`;
+					}
+					return String(entry);
+				})
+				.join('; ');
+			return text.length > 180 ? `${text.slice(0, 180)}…` : text;
+		}
+		const text = String(value);
+		return text.length > 180 ? `${text.slice(0, 180)}…` : text;
+	}
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
@@ -57,9 +95,7 @@
 		['sugar', 'Sugar (g)'],
 		['protein', 'Protein (g)']
 	];
-	function saveDraft(event: SubmitEvent) {
-		event.preventDefault();
-		if (uploading) return;
+	function buildValidatedDraft(): Recipe | null {
 		const tags = [
 			...new Set(
 				tagsText
@@ -82,7 +118,7 @@
 					throw new Error('Invalid image');
 			} catch {
 				error = 'Use a public HTTPS image URL, or leave it blank.';
-				return;
+				return null;
 			}
 		}
 		if (
@@ -117,9 +153,10 @@
 		) {
 			error =
 				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
-			return;
+			return null;
 		}
-		save({
+		error = '';
+		return cloneRecipe({
 			...draft,
 			title: draft.title.trim(),
 			description: draft.description.trim(),
@@ -130,6 +167,50 @@
 			ingredients,
 			steps
 		});
+	}
+	async function submitDraft(options?: RecipeMergeOptions) {
+		if (uploading) return;
+		const validated = buildValidatedDraft();
+		if (!validated) {
+			await tick();
+			errorBox?.scrollIntoView({ block: 'nearest' });
+			return;
+		}
+		try {
+			const result = save(validated, options);
+			if (!result || result.status === 'saved') {
+				conflicts = [];
+				promptedRemoval = null;
+				error = '';
+				return;
+			}
+			if (result.status === 'error') {
+				error = result.error;
+				await tick();
+				errorBox?.scrollIntoView({ block: 'nearest' });
+				return;
+			}
+			if (result.status === 'unsaved' || result.status === 'deleted') {
+				promptedRemoval = result.status;
+				conflicts = result.conflicts ? [...result.conflicts] : [];
+				await tick();
+				alertBox?.scrollIntoView({ block: 'nearest' });
+				return;
+			}
+			if (result.status === 'conflict') {
+				conflicts = [...result.conflicts];
+				await tick();
+				alertBox?.scrollIntoView({ block: 'nearest' });
+			}
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not save changes.';
+			await tick();
+			errorBox?.scrollIntoView({ block: 'nearest' });
+		}
+	}
+	function saveDraft(event: SubmitEvent) {
+		event.preventDefault();
+		void submitDraft();
 	}
 </script>
 
@@ -145,6 +226,69 @@
 	>
 		<h2 id="recipe-editor-title">Edit saved recipe</h2>
 		<p class="muted">Changes are saved to your recipe collection.</p>
+		{#if conflicts.length}
+			<section class="editor-alert" role="alert" bind:this={alertBox}>
+				<strong>Competing household edits need your choice</strong>
+				<p>
+					A household member updated the same fields while you were editing. Independent edits on
+					other fields will be preserved either way.
+				</p>
+				<ul>
+					{#each conflicts as conflict (conflict.field)}
+						<li>
+							<b>{conflict.label}</b>
+							<div>Your draft: {summarizeValue(conflict.draft)}</div>
+							<div>Household: {summarizeValue(conflict.household)}</div>
+						</li>
+					{/each}
+				</ul>
+				<div class="editor-alert-actions">
+					<button
+						class="secondary"
+						type="button"
+						disabled={uploading}
+						onclick={() =>
+							void submitDraft({
+								prefer: 'household',
+								...(activeRemoval ? { resave: true } : {})
+							})}>Use household values</button
+					>
+					<button
+						class="primary"
+						type="button"
+						disabled={uploading}
+						onclick={() =>
+							void submitDraft({
+								prefer: 'draft',
+								...(activeRemoval ? { resave: true } : {})
+							})}><Check size={18} />Keep my draft</button
+					>
+				</div>
+			</section>
+		{:else if activeRemoval}
+			<section class="editor-alert" role="alert" bind:this={alertBox}>
+				<strong
+					>{activeRemoval === 'deleted'
+						? 'A household member deleted this recipe'
+						: 'A household member unsaved this recipe'}</strong
+				>
+				<p>
+					{activeRemoval === 'deleted'
+						? 'This recipe was removed from your household while you were editing. Your draft and cover photo are still here — re-save to keep it, or discard your draft.'
+						: 'This recipe was removed from your saved collection while you were editing. Your draft and cover photo are still here — re-save to keep it, or discard your draft.'}
+				</p>
+				<div class="editor-alert-actions">
+					<button class="secondary" type="button" onclick={cancel}>Discard draft</button>
+					<button
+						class="primary"
+						type="button"
+						disabled={uploading}
+						onclick={() => void submitDraft({ resave: true })}
+						><Check size={18} />Re-save recipe</button
+					>
+				</div>
+			</section>
+		{/if}
 		<form onsubmit={saveDraft}>
 			<div class="draft-summary">
 				<label class="field draft-title"
@@ -319,7 +463,7 @@
 						>{/each}
 				</div>
 			</details>
-			{#if error}<p class="error" role="alert">{error}</p>{/if}
+			{#if error}<p class="error" role="alert" bind:this={errorBox}>{error}</p>{/if}
 			<div class="draft-footer">
 				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
 				<button class="primary" type="submit" disabled={uploading}
@@ -331,6 +475,44 @@
 </div>
 
 <style>
+	.editor-alert {
+		padding: 14px 16px;
+		margin: 0 0 18px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		border-left: 3px solid var(--green);
+		font-size: 14px;
+	}
+	.editor-alert strong {
+		display: block;
+		font-size: 15px;
+		margin-bottom: 4px;
+	}
+	.editor-alert p {
+		color: var(--muted);
+		font-size: 14px;
+		line-height: 1.6;
+	}
+	.editor-alert ul {
+		margin: 10px 0 0;
+		padding-inline-start: 18px;
+		max-height: 14rem;
+		overflow: auto;
+	}
+	.editor-alert li {
+		padding-block: 4px;
+		overflow-wrap: anywhere;
+	}
+	.editor-alert-actions {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 8px;
+		margin-top: 12px;
+	}
+	.editor-alert-actions button {
+		min-height: 44px;
+	}
 	.cover-picker img {
 		width: 100%;
 		height: 180px;
@@ -348,6 +530,9 @@
 	@media (max-width: 650px) {
 		.recipe-editor-dialog {
 			padding: 28px 16px 20px;
+		}
+		.editor-alert-actions button {
+			width: 100%;
 		}
 	}
 </style>

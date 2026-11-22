@@ -1,5 +1,5 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
-import { normalizeName, unitInfo } from './domain.ts';
+import { buildShoppingList, normalizeName, unitInfo } from './domain.ts';
 export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
@@ -306,4 +306,140 @@ export function completeMeal(
 			: state.pantry;
 
 	return { ...state, meals, pantry };
+}
+
+function formatCalendarKey(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+export function weekStartForDate(value: string): string {
+	const date = new Date(`${value}T12:00:00`);
+	if (Number.isNaN(date.getTime())) return value;
+	date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+	return formatCalendarKey(date);
+}
+
+export function refreshWeekShoppingInState(state: AppState, startDate: string): ShoppingItem[] {
+	const start = new Date(`${startDate}T12:00:00`);
+	if (Number.isNaN(start.getTime())) return state.shopping;
+	const dates = Array.from({ length: 7 }, (_, index) => {
+		const day = new Date(start);
+		day.setDate(day.getDate() + index);
+		return formatCalendarKey(day);
+	});
+	const meals = state.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
+	const recipes = state.recipes.filter((recipe) =>
+		meals.some((meal) => meal.recipeId === recipe.id)
+	);
+	const additions = buildShoppingList(recipes, state.pantry, meals);
+	return reconcileShoppingList(state.shopping, additions, `week:${startDate}`);
+}
+
+export function schedulePlannedMeal(
+	state: AppState,
+	input: {
+		id?: string;
+		recipeId: string | null | undefined;
+		date: string;
+		slot: string;
+		servings: number;
+	}
+):
+	| { status: 'scheduled'; state: AppState; meal: Meal }
+	| { status: 'missing-recipe'; state: AppState }
+	| { status: 'invalid-date'; state: AppState }
+	| { status: 'invalid-servings'; state: AppState } {
+	if (!input.date) return { status: 'invalid-date', state };
+	const recipe = input.recipeId
+		? state.recipes.find((item) => item.id === input.recipeId)
+		: undefined;
+	if (!recipe) return { status: 'missing-recipe', state };
+	if (!Number.isInteger(input.servings) || input.servings < 1 || input.servings > 24) {
+		return { status: 'invalid-servings', state };
+	}
+	const meal: Meal = {
+		id: input.id ?? globalThis.crypto.randomUUID(),
+		date: input.date,
+		slot: input.slot,
+		recipeId: recipe.id,
+		servings: input.servings
+	};
+	const nextMeals = [...state.meals, meal];
+	const nextWithMeals = { ...state, meals: nextMeals };
+	const shopping = refreshWeekShoppingInState(nextWithMeals, weekStartForDate(input.date));
+	return { status: 'scheduled', state: { ...nextWithMeals, shopping }, meal };
+}
+
+export function savePlannedMealChanges(
+	state: AppState,
+	input: {
+		mealId: string;
+		date: string;
+		slot: string;
+		servings: number;
+	}
+):
+	| { status: 'updated'; state: AppState }
+	| { status: 'missing'; state: AppState }
+	| { status: 'completed'; state: AppState }
+	| { status: 'invalid-slot'; state: AppState }
+	| { status: 'invalid-servings'; state: AppState } {
+	const meal = state.meals.find((item) => item.id === input.mealId);
+	if (!meal) return { status: 'missing', state };
+	if (meal.completedAt) return { status: 'completed', state };
+	if (!input.date || !['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
+		return { status: 'invalid-slot', state };
+	}
+	if (!Number.isInteger(input.servings) || input.servings < 1 || input.servings > 24) {
+		return { status: 'invalid-servings', state };
+	}
+	const previousWeek = weekStartForDate(meal.date);
+	const nextWeek = weekStartForDate(input.date);
+	const meals = state.meals.map((item) =>
+		item.id === input.mealId
+			? { ...item, date: input.date, slot: input.slot, servings: Math.round(input.servings) }
+			: item
+	);
+	let nextState: AppState = { ...state, meals };
+	for (const weekStart of new Set([previousWeek, nextWeek])) {
+		nextState = { ...nextState, shopping: refreshWeekShoppingInState(nextState, weekStart) };
+	}
+	return { status: 'updated', state: nextState };
+}
+
+export function cookPlannedMeal(
+	state: AppState,
+	input: {
+		mealId: string;
+		deductPantry: boolean;
+		leftoverServings: number;
+	},
+	now: Date = new Date()
+):
+	| { status: 'cooked'; state: AppState; meal: Meal; recipe: Recipe | undefined }
+	| { status: 'missing'; state: AppState }
+	| { status: 'completed'; state: AppState }
+	| { status: 'invalid-leftovers'; state: AppState; meal: Meal } {
+	const meal = state.meals.find((item) => item.id === input.mealId);
+	if (!meal) return { status: 'missing', state };
+	if (meal.completedAt) return { status: 'completed', state };
+	if (
+		!Number.isInteger(input.leftoverServings) ||
+		input.leftoverServings < 0 ||
+		input.leftoverServings > meal.servings
+	) {
+		return { status: 'invalid-leftovers', state, meal };
+	}
+	const completed = completeMeal(
+		state,
+		meal.id,
+		{
+			deductPantry: input.deductPantry,
+			leftoverServings: Math.round(input.leftoverServings)
+		},
+		now
+	);
+	const shopping = refreshWeekShoppingInState(completed, weekStartForDate(meal.date));
+	const recipe = completed.recipes.find((item) => item.id === meal.recipeId);
+	return { status: 'cooked', state: { ...completed, shopping }, meal, recipe };
 }
