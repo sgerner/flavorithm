@@ -161,6 +161,43 @@ export function reconcileShoppingList(
 	return [...retained, ...generated];
 }
 
+export type ShoppingItemSnapshot = Pick<ShoppingItem, 'name' | 'quantity' | 'unit'>;
+
+/** Clamp and trim a shopping item's editable fields so inline edits remain valid. */
+export function normalizeShoppingItem(item: ShoppingItem): ShoppingItem {
+	item.name = item.name.trim().slice(0, 100) || 'Shopping item';
+	item.unit = item.unit.trim().slice(0, 40) || 'piece';
+	const rawQuantity = item.quantity as unknown;
+	const quantity =
+		rawQuantity === null ||
+		rawQuantity === undefined ||
+		(typeof rawQuantity === 'string' && !rawQuantity.trim())
+			? Number.NaN
+			: Number(rawQuantity);
+	item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1_000_000)) : 1;
+	return item;
+}
+
+/** Capture a shopping item's editable fields before inline editing begins. */
+export function snapshotShoppingItem(item: ShoppingItem): ShoppingItemSnapshot {
+	return {
+		name: item.name,
+		quantity: item.quantity,
+		unit: item.unit
+	};
+}
+
+/** Restore a shopping item's editable fields from a pre-edit snapshot. */
+export function revertShoppingItem(
+	item: ShoppingItem,
+	snapshot: ShoppingItemSnapshot
+): ShoppingItem {
+	item.name = snapshot.name;
+	item.quantity = snapshot.quantity;
+	item.unit = snapshot.unit;
+	return normalizeShoppingItem(item);
+}
+
 /** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
 export function transferPurchasedItemsToPantry(
 	pantry: Ingredient[],

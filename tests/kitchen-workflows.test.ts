@@ -10,7 +10,10 @@ import {
 	convertCompatibleQuantity,
 	expiryStatus,
 	normalizeIngredientName,
+	normalizeShoppingItem,
 	reconcileShoppingList,
+	revertShoppingItem,
+	snapshotShoppingItem,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -360,4 +363,54 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
+});
+
+test('normalizeShoppingItem trims, bounds lengths, and clamps or defaults quantities', () => {
+	const blank = shopping('blank', '   ', null as unknown as number, '  ', false, 'recipe:soup');
+	normalizeShoppingItem(blank);
+	assert.equal(blank.name, 'Shopping item');
+	assert.equal(blank.unit, 'piece');
+	assert.equal(blank.quantity, 1);
+
+	const oversized = shopping(
+		'long',
+		`  ${'a'.repeat(120)}  `,
+		5_000_000,
+		` ${'u'.repeat(50)} `,
+		true
+	);
+	normalizeShoppingItem(oversized);
+	assert.equal(oversized.name, 'a'.repeat(100));
+	assert.equal(oversized.unit, 'u'.repeat(40));
+	assert.equal(oversized.quantity, 1_000_000);
+
+	const tiny = shopping('tiny', ' garlic ', 0, ' cloves ', false);
+	normalizeShoppingItem(tiny);
+	assert.equal(tiny.name, 'garlic');
+	assert.equal(tiny.unit, 'cloves');
+	assert.equal(tiny.quantity, 0.01);
+
+	const nonFinite = shopping('nan', 'salt', Number.NaN, 'tsp', false);
+	normalizeShoppingItem(nonFinite);
+	assert.equal(nonFinite.quantity, 1);
+});
+
+test('snapshotShoppingItem and revertShoppingItem restore pre-edit fields while keeping row metadata', () => {
+	const item = shopping('row-1', 'Olive oil', 2, 'tbsp', false, 'week:2026-10-19');
+	const snapshot = snapshotShoppingItem(item);
+
+	item.name = '   ';
+	normalizeShoppingItem(item);
+	item.name = 'Garlic';
+	item.quantity = 12;
+	item.unit = 'cloves';
+	item.checked = true;
+
+	revertShoppingItem(item, snapshot);
+	assert.equal(item.id, 'row-1');
+	assert.equal(item.name, 'Olive oil');
+	assert.equal(item.quantity, 2);
+	assert.equal(item.unit, 'tbsp');
+	assert.equal(item.checked, true);
+	assert.equal(item.sourceKey, 'week:2026-10-19');
 });
