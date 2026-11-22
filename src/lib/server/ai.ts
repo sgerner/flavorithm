@@ -2756,18 +2756,9 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
-type CachedPublicCatalog = {
-	promise?: Promise<SupportedModelResponse>;
-	expiresAt: number;
-};
-
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-const defaultPublicCatalogCache: CachedPublicCatalog = { expiresAt: 0 };
-const customPublicCatalogCaches = new WeakMap<Fetcher, CachedPublicCatalog>();
-
-function isSharedRuntimeFetcher(fetcher: Fetcher): boolean {
-	return fetcher === globalThis.fetch || fetcher.name === 'server_fetch';
-}
+let publicCatalog: Promise<SupportedModelResponse> | undefined;
+let publicCatalogExpiresAt = 0;
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2789,28 +2780,22 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	let cache: CachedPublicCatalog;
-	if (isSharedRuntimeFetcher(fetcher)) {
-		cache = defaultPublicCatalogCache;
-	} else {
-		const existing = customPublicCatalogCaches.get(fetcher);
-		if (existing) {
-			cache = existing;
-		} else {
-			cache = { expiresAt: 0 };
-			customPublicCatalogCaches.set(fetcher, cache);
-		}
-	}
-	if (!cache.promise || Date.now() >= cache.expiresAt) {
-		cache.expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
+		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
 		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (cache.promise === pending) {
-				cache.promise = undefined;
-				cache.expiresAt = 0;
+			if (publicCatalog === pending) {
+				publicCatalog = undefined;
+				publicCatalogExpiresAt = 0;
 			}
 			throw error;
 		});
-		cache.promise = pending;
+		publicCatalog = pending;
 	}
-	return cache.promise;
+	return publicCatalog;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
 }

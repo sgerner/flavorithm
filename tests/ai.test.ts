@@ -1,17 +1,20 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { ChatGPTInferenceError } from '../src/lib/server/chatgpt-inference.ts';
 import {
 	AIRequestError,
 	fetchCaptureRecipePage,
 	fetchRecipePage,
 	getSupportedModels,
+	resetPublicModelCatalogCache,
 	runAIRequest,
 	transformModelCatalog,
 	validateCaptureRecipeUrl,
 	validateRecipeUrl
 } from '../src/lib/server/ai.ts';
+
+beforeEach(() => resetPublicModelCatalogCache());
 
 const nutrition = {
 	calories: 420,
