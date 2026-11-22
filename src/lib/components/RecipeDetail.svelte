@@ -95,7 +95,9 @@
 			>
 		</div>
 		<div class="detail-body">
-			<div class="eyebrow">{recipe.cuisine} · {recipe.difficulty}</div>
+			{#if recipe.cuisine || recipe.difficulty}<div class="eyebrow">
+					{[recipe.cuisine, recipe.difficulty].filter(Boolean).join(' · ')}
+				</div>{/if}
 			<h2>{recipe.title}</h2>
 			<p class="muted">{recipe.description}</p>
 			{#if recipe.importNotes?.length}<details class="import-notes">
@@ -107,7 +109,7 @@
 			<div class="detail-meta">
 				<span><Clock size={16} />{recipe.time} min</span><span
 					><Users size={16} />{recipe.servings} servings</span
-				><span><ChefHat size={16} />{recipe.difficulty}</span>
+				>{#if recipe.difficulty}<span><ChefHat size={16} />{recipe.difficulty}</span>{/if}
 			</div>
 			<div class="detail-actions">
 				<button
@@ -201,7 +203,9 @@
 				</div>
 			{:else}<div class="nutrition-panel" transition:revealMotion|global>
 					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
-							Ingredients or servings changed. Refresh this estimate before relying on it.
+							{Object.values(recipe.nutrition).every((value) => value === 0)
+								? 'Nutrition values have not been entered yet. Edit the recipe or refresh this estimate before relying on it.'
+								: 'Ingredients or servings changed. Refresh this estimate before relying on it.'}
 						</p>{/if}
 					<label class="servings nutrition-selector" for="recipe-nutrition-mode"
 						>Show nutrition for<select
