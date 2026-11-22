@@ -21,7 +21,7 @@ docker compose up -d --build
 docker compose logs -f flavorithm
 ```
 
-The container health check requests the PWA manifest through the app server.
+The container health check requests `GET /api/auth` through the app server.
 Recipe and account data live in the Compose-managed `flavorithm-data` volume.
 The Skynet override replaces that named volume with the bind mount
 `/home/skynet/opt/appdata/flavorithm`; the backup and restore steps below work

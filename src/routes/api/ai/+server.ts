@@ -1,7 +1,6 @@
 import { getHostAI } from '#lib/server/host-ai.ts';
 import { ChatGPTOAuthError, getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import { AIRequestError, parseAIRequest, runAIRequest, validateAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
@@ -69,7 +68,7 @@ export const POST: RequestHandler = async (event) => {
 			signal: event.request.signal,
 			requireRouteConnectionId: true
 		});
-		return json(
+		return Response.json(
 			await runAIRequest(body, providerFetch, undefined, connection, event.request.signal, () => {
 				consumeRateLimit(`ai-user:${user.id}`, 30, 60 * 60 * 1000);
 			}),
@@ -79,7 +78,7 @@ export const POST: RequestHandler = async (event) => {
 		);
 	} catch (error) {
 		if (error instanceof ChatGPTInferenceError) {
-			return json(
+			return Response.json(
 				{ error: error.message, ...(error.code ? { code: error.code } : {}) },
 				{
 					status: error.status,
@@ -88,7 +87,7 @@ export const POST: RequestHandler = async (event) => {
 			);
 		}
 		if (error instanceof ChatGPTOAuthError) {
-			return json(
+			return Response.json(
 				{ error: error.message, code: error.code },
 				{
 					status: error.status,
@@ -97,7 +96,7 @@ export const POST: RequestHandler = async (event) => {
 			);
 		}
 		if (error instanceof ApiError) {
-			return json(
+			return Response.json(
 				{ error: error.message },
 				{
 					status: error.status,
@@ -106,7 +105,7 @@ export const POST: RequestHandler = async (event) => {
 			);
 		}
 		if (error instanceof AIRequestError) {
-			return json(
+			return Response.json(
 				{ error: error.message, ...(error.code ? { code: error.code } : {}) },
 				{
 					status: error.status,
@@ -114,7 +113,7 @@ export const POST: RequestHandler = async (event) => {
 				}
 			);
 		}
-		return json(
+		return Response.json(
 			{ error: 'The AI request could not be completed.' },
 			{ status: 500, headers: { 'cache-control': 'no-store' } }
 		);

@@ -43,7 +43,7 @@ export class AIRequestError extends Error {
 const IngredientInputSchema = z.object({
 	id: z.string().min(1).max(100).optional(),
 	name: z.string().trim().min(1).max(200),
-	quantity: z.number().finite().nonnegative().max(1_000_000),
+	quantity: z.number().nonnegative().max(1_000_000),
 	unit: z.string().max(40),
 	category: z.string().max(100),
 	expires: z.string().max(50).optional()
@@ -52,7 +52,7 @@ const IngredientInputSchema = z.object({
 const PreferencesInputSchema = z.object({
 	diet: z.string().max(200),
 	allergies: z.string().max(2_000),
-	maxTime: z.number().finite().nonnegative().max(100_000),
+	maxTime: z.number().nonnegative().max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
 	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
@@ -71,7 +71,7 @@ const PreferencesInputSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
-	ratings: z.record(z.string().min(1).max(100), z.number().finite().min(0).max(5)).optional()
+	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
 const RecipeInputSchema = z.object({
@@ -79,8 +79,8 @@ const RecipeInputSchema = z.object({
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
 	image: z.string().max(4_000).optional().default(''),
-	time: z.number().finite().nonnegative().max(100_000),
-	servings: z.number().finite().min(1).max(10_000),
+	time: z.number().nonnegative().max(100_000),
+	servings: z.number().min(1).max(10_000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -88,27 +88,27 @@ const RecipeInputSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(200),
-				quantity: z.number().finite().nonnegative().max(1_000_000),
+				quantity: z.number().nonnegative().max(1_000_000),
 				unit: z.string().max(40)
 			})
 		)
 		.max(250),
 	steps: z.array(z.string().max(10_000)).max(200),
 	nutrition: z.object({
-		calories: z.number().finite().nonnegative().max(1_000_000),
-		fat: z.number().finite().nonnegative().max(1_000_000),
-		saturatedFat: z.number().finite().nonnegative().max(1_000_000),
-		sodium: z.number().finite().nonnegative().max(1_000_000),
-		carbs: z.number().finite().nonnegative().max(1_000_000),
-		fiber: z.number().finite().nonnegative().max(1_000_000),
-		sugar: z.number().finite().nonnegative().max(1_000_000),
-		protein: z.number().finite().nonnegative().max(1_000_000)
+		calories: z.number().nonnegative().max(1_000_000),
+		fat: z.number().nonnegative().max(1_000_000),
+		saturatedFat: z.number().nonnegative().max(1_000_000),
+		sodium: z.number().nonnegative().max(1_000_000),
+		carbs: z.number().nonnegative().max(1_000_000),
+		fiber: z.number().nonnegative().max(1_000_000),
+		sugar: z.number().nonnegative().max(1_000_000),
+		protein: z.number().nonnegative().max(1_000_000)
 	}),
 	source: z.string().max(4_000).optional(),
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().finite().min(0).max(5).optional(),
+	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -159,22 +159,22 @@ const AIRequestSchema = z
 	});
 
 const NutritionSchema = z.object({
-	calories: z.number().finite().nonnegative().max(1_000_000),
-	fat: z.number().finite().nonnegative().max(1_000_000),
-	saturatedFat: z.number().finite().nonnegative().max(1_000_000),
-	sodium: z.number().finite().nonnegative().max(1_000_000),
-	carbs: z.number().finite().nonnegative().max(1_000_000),
-	fiber: z.number().finite().nonnegative().max(1_000_000),
-	sugar: z.number().finite().nonnegative().max(1_000_000),
-	protein: z.number().finite().nonnegative().max(1_000_000)
+	calories: z.number().nonnegative().max(1_000_000),
+	fat: z.number().nonnegative().max(1_000_000),
+	saturatedFat: z.number().nonnegative().max(1_000_000),
+	sodium: z.number().nonnegative().max(1_000_000),
+	carbs: z.number().nonnegative().max(1_000_000),
+	fiber: z.number().nonnegative().max(1_000_000),
+	sugar: z.number().nonnegative().max(1_000_000),
+	protein: z.number().nonnegative().max(1_000_000)
 });
 
 const RecipeDraftSchema = z.object({
 	title: z.string().trim().min(1).max(160),
 	description: z.string().trim().min(1).max(600),
 	image: z.string().trim().max(2_000),
-	time: z.number().finite().int().positive().max(600),
-	servings: z.number().finite().int().positive().max(100),
+	time: z.number().int().positive().max(600),
+	servings: z.number().int().positive().max(100),
 	difficulty: z.string().trim().min(1).max(60),
 	cuisine: z.string().trim().min(1).max(80),
 	tags: z.array(z.string().trim().min(1).max(40)).max(20),
@@ -182,7 +182,7 @@ const RecipeDraftSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().positive().max(1_000_000),
+				quantity: z.number().positive().max(1_000_000),
 				unit: z.string().trim().min(1).max(40)
 			})
 		)
@@ -198,7 +198,7 @@ const ImportedRecipeDraftSchema = RecipeDraftSchema.extend({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().nonnegative().max(1_000_000),
+				quantity: z.number().nonnegative().max(1_000_000),
 				unit: z.string().trim().min(1).max(40)
 			})
 		)
@@ -272,7 +272,7 @@ const VisionResultSchema = z.object({
 		.array(
 			z.object({
 				name: z.string().trim().min(1).max(100),
-				quantity: z.number().finite().positive(),
+				quantity: z.number().positive(),
 				unit: z.string().trim().min(1).max(40),
 				category: z.string().trim().min(1).max(60)
 			})
@@ -400,7 +400,7 @@ export function validateAIRequest(
 		const searchKey = typeof process !== 'undefined' ? process.env.BRAVE_SEARCH_API_KEY : undefined;
 		if (!searchKey) {
 			throw new AIRequestError(
-				'Recipe search is not configured. Set BRAVE_SEARCH_API_KEY on the server.',
+				'Recipe search is not configured on this installation. Ask the server operator to enable online recipe search.',
 				503
 			);
 		}
@@ -583,32 +583,18 @@ export async function runAIRequest(
 	const image = request.action === 'vision' ? parseDataImage(request.image) : undefined;
 	assertRequestActive(requestSignal);
 	onValidated?.();
-	const modelResult =
-		provider === 'anthropic'
-			? await callAnthropic(
-					provider,
-					selectedModel,
-					selectedApiKey,
-					request.action,
-					prompt,
-					image,
-					requestFetcher,
-					request.reasoning,
-					reasoningActive,
-					requestSignal
-				)
-			: await callOpenAICompatible(
-					provider,
-					selectedModel,
-					selectedApiKey,
-					request.action,
-					prompt,
-					image,
-					requestFetcher,
-					request.reasoning,
-					reasoningActive,
-					requestSignal
-				);
+	const modelResult = await callProvider(
+		provider,
+		selectedModel,
+		selectedApiKey,
+		request.action,
+		prompt,
+		image,
+		requestFetcher,
+		request.reasoning,
+		reasoningActive,
+		requestSignal
+	);
 
 	return validateResult(request.action, modelResult);
 }
@@ -813,6 +799,58 @@ function truncationError(service = 'AI provider') {
 	);
 }
 
+function outputTokenBudget(
+	action: Exclude<AIAction, 'search'>,
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false)
+): number {
+	return (
+		(action === 'chat'
+			? 8192
+			: action === 'generate' || action === 'import' || action === 'capture'
+				? 4096
+				: 1200) + (reasoning?.budgetTokens ?? (reasoningActive ? 4096 : 0))
+	);
+}
+
+function callProvider(
+	provider: AIProvider,
+	model: string,
+	apiKey: string,
+	action: Exclude<AIAction, 'search'>,
+	prompt: string,
+	image: ReturnType<typeof parseDataImage> | undefined,
+	fetcher: Fetcher,
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false),
+	requestSignal?: AbortSignal
+) {
+	return provider === 'anthropic'
+		? callAnthropic(
+				provider,
+				model,
+				apiKey,
+				action,
+				prompt,
+				image,
+				fetcher,
+				reasoning,
+				reasoningActive,
+				requestSignal
+			)
+		: callOpenAICompatible(
+				provider,
+				model,
+				apiKey,
+				action,
+				prompt,
+				image,
+				fetcher,
+				reasoning,
+				reasoningActive,
+				requestSignal
+			);
+}
 async function callGoogle(
 	model: string,
 	apiKey: string,
@@ -845,7 +883,7 @@ async function callGoogle(
 				],
 				generationConfig: {
 					responseMimeType: 'application/json',
-					maxOutputTokens: 8192 + (reasoning?.budgetTokens ?? (reasoningActive ? 4096 : 0)),
+					maxOutputTokens: 8192 + (reasoning?.budgetTokens ?? 0),
 					...(hasThinkingOverrides
 						? {
 								thinkingConfig: {
@@ -950,12 +988,11 @@ async function callOpenAICompatible(
 				...(['openai', 'openrouter'].includes(provider)
 					? { response_format: { type: 'json_object' } }
 					: {}),
-				[provider === 'openai' ? 'max_completion_tokens' : 'max_tokens']:
-					(action === 'chat'
-						? 8192
-						: action === 'generate' || action === 'import' || action === 'capture'
-							? 4096
-							: 1200) + (reasoning?.budgetTokens ?? (reasoningActive ? 4096 : 0))
+				[provider === 'openai' ? 'max_completion_tokens' : 'max_tokens']: outputTokenBudget(
+					action,
+					reasoning,
+					reasoningActive
+				)
 			}),
 			signal: AbortSignal.timeout(reasoningActive ? 90_000 : PROVIDER_TIMEOUT_MS)
 		},
@@ -1025,12 +1062,7 @@ async function callAnthropic(
 			},
 			body: JSON.stringify({
 				model,
-				max_tokens:
-					(action === 'chat'
-						? 8192
-						: action === 'generate' || action === 'import' || action === 'capture'
-							? 4096
-							: 1200) + (reasoning?.budgetTokens ?? (reasoningActive ? 4096 : 0)),
+				max_tokens: outputTokenBudget(action, reasoning, reasoningActive),
 				...(reasoning?.enabled === false
 					? { thinking: { type: 'disabled' } }
 					: reasoning?.budgetTokens
@@ -1136,7 +1168,7 @@ async function searchRecipes(prompt: string, fetcher: Fetcher, requestSignal?: A
 	const searchKey = typeof process !== 'undefined' ? process.env.BRAVE_SEARCH_API_KEY : undefined;
 	if (!searchKey) {
 		throw new AIRequestError(
-			'Recipe search is not configured. Set BRAVE_SEARCH_API_KEY on the server.',
+			'Recipe search is not configured on this installation. Ask the server operator to enable online recipe search.',
 			503
 		);
 	}
@@ -1624,32 +1656,18 @@ async function captureRecipe(
 		sourceUrl
 	});
 	assertRequestActive(requestSignal);
-	const modelResult =
-		provider === 'anthropic'
-			? await callAnthropic(
-					provider,
-					model,
-					apiKey,
-					'capture',
-					prompt,
-					image,
-					fetcher,
-					request.reasoning,
-					reasoningActive,
-					requestSignal
-				)
-			: await callOpenAICompatible(
-					provider,
-					model,
-					apiKey,
-					'capture',
-					prompt,
-					image,
-					fetcher,
-					request.reasoning,
-					reasoningActive,
-					requestSignal
-				);
+	const modelResult = await callProvider(
+		provider,
+		model,
+		apiKey,
+		'capture',
+		prompt,
+		image,
+		fetcher,
+		request.reasoning,
+		reasoningActive,
+		requestSignal
+	);
 	const parsed = CapturedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
 	const { assumptions, ...draft } = parsed.data;
@@ -2033,32 +2051,18 @@ async function importRecipe(
 		throw new AIRequestError('The selected page does not contain a structured recipe.', 422);
 	const sourceUrl = canonicalRecipeUrl(html, selectedUrl);
 	const prompt = buildImportPrompt(sourceRecipe, sourceUrl);
-	const modelResult =
-		provider === 'anthropic'
-			? await callAnthropic(
-					provider,
-					model,
-					apiKey,
-					'import',
-					prompt,
-					undefined,
-					fetcher,
-					reasoning,
-					reasoningActive,
-					requestSignal
-				)
-			: await callOpenAICompatible(
-					provider,
-					model,
-					apiKey,
-					'import',
-					prompt,
-					undefined,
-					fetcher,
-					reasoning,
-					reasoningActive,
-					requestSignal
-				);
+	const modelResult = await callProvider(
+		provider,
+		model,
+		apiKey,
+		'import',
+		prompt,
+		undefined,
+		fetcher,
+		reasoning,
+		reasoningActive,
+		requestSignal
+	);
 	const parsed = ImportedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
 	return {
