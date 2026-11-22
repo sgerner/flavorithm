@@ -290,12 +290,12 @@ main {
 	width: calc(100% - 246px);
 }
 .topbar {
-	height: 78px;
+	min-height: 78px;
 	border-bottom: 1px solid var(--line);
 	display: flex;
 	justify-content: space-between;
 	align-items: center;
-	padding: 0 43px;
+	padding: 8px 43px;
 }
 .breadcrumb {
 	font-size: 14px;
@@ -316,6 +316,7 @@ main {
 	display: flex;
 	align-items: center;
 	gap: 22px;
+	flex-shrink: 0;
 }
 .top-avatar {
 	border-radius: 50%;
@@ -552,6 +553,11 @@ main {
 	border-bottom: 1px solid var(--line);
 	padding-bottom: 15px;
 }
+.filter-tabs-scroll {
+	position: relative;
+	min-width: 0;
+	max-width: 100%;
+}
 .filter-tabs {
 	display: flex;
 	gap: 5px;
@@ -576,17 +582,43 @@ main {
 	display: flex;
 	align-items: center;
 	gap: 7px;
+	min-height: 44px;
 	color: var(--muted);
 	flex-shrink: 1;
 }
 .search-box input {
+	appearance: none;
+	-webkit-appearance: none;
 	border: 0;
 	background: none;
 	padding: 7px 0;
 	font-size: 14px;
 	width: 148px;
 	min-width: 80px;
+	min-height: 44px;
 	outline-offset: 3px;
+}
+.search-box input::-webkit-search-decoration,
+.search-box input::-webkit-search-cancel-button,
+.search-box input::-webkit-search-results-button,
+.search-box input::-webkit-search-results-decoration {
+	appearance: none;
+	-webkit-appearance: none;
+	display: none;
+}
+.search-clear {
+	display: inline-grid;
+	place-items: center;
+	flex: 0 0 44px;
+	width: 44px;
+	min-width: 44px;
+	height: 44px;
+	min-height: 44px;
+	padding: 0;
+	color: var(--muted);
+}
+.search-clear:hover {
+	color: var(--ink);
 }
 .recipe-grid {
 	display: grid;
@@ -710,6 +742,7 @@ main {
 	margin: 32px auto 0;
 	align-items: center;
 	gap: 8px;
+	min-height: 44px;
 	font-size: 14px;
 	color: var(--muted);
 	border-bottom: 1px solid var(--line);
@@ -733,12 +766,16 @@ main {
 	color: var(--muted);
 	padding: 35px;
 }
+.empty-state h2,
 .empty-state h3 {
 	font-size: 21px;
 	color: var(--ink);
 }
 .empty-state p {
 	font-size: 14px;
+}
+.empty-state button {
+	min-height: 44px;
 }
 .empty-state svg {
 	color: #87966b;
@@ -802,6 +839,9 @@ main {
 .pantry-row label {
 	display: flex;
 	align-items: center;
+	flex-wrap: wrap;
+	gap: 4px;
+	min-width: 0;
 }
 .pantry-row input {
 	padding: 7px 5px;
@@ -815,7 +855,10 @@ main {
 	border-bottom: 1px solid var(--line);
 }
 .pantry-row .unit-input {
-	width: 65px;
+	flex: 1 1 12ch;
+	width: auto;
+	max-width: 100%;
+	min-width: 0;
 }
 .pantry-footer {
 	display: flex;
@@ -1033,6 +1076,7 @@ main {
 	width: min(100%, 520px);
 	background: var(--paper);
 	padding: 40px;
+	scroll-padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
 	position: relative;
 	max-height: calc(100dvh - 56px);
 	overflow: auto;
@@ -1605,7 +1649,7 @@ main {
 		padding: 30px 28px 0;
 	}
 	.topbar {
-		padding: 0 28px;
+		padding: 8px 28px;
 	}
 	.recipe-toolbar {
 		flex-wrap: wrap;
@@ -1687,7 +1731,7 @@ main {
 		width: calc(100% - 190px);
 	}
 	.topbar {
-		height: 65px;
+		min-height: 65px;
 	}
 	.page-heading h1 {
 		font-size: 36px;
@@ -1789,8 +1833,8 @@ main {
 		width: 100%;
 	}
 	.topbar {
-		padding: 0 20px;
-		height: 62px;
+		padding: 8px 20px;
+		min-height: 62px;
 		gap: 12px;
 	}
 	.mobile-menu {
@@ -1921,10 +1965,20 @@ main {
 		background: var(--wash);
 		padding: 0 10px;
 	}
+	.search-box.has-clear {
+		padding-right: 0;
+	}
 	.search-box input {
+		flex: 1 1 auto;
 		width: 100%;
+		min-width: 0;
+		min-height: 44px;
 		font-size: 14px;
 		padding: 9px 0;
+	}
+	.search-box input::-webkit-search-cancel-button {
+		-webkit-appearance: none;
+		display: none;
 	}
 	.browse-link {
 		font-size: 14px;
@@ -1967,7 +2021,8 @@ main {
 		width: 38px;
 	}
 	.pantry-row .unit-input {
-		width: 45px;
+		flex: 1 1 12ch;
+		width: auto;
 	}
 	.pantry-footer {
 		align-items: flex-start;
@@ -2416,7 +2471,7 @@ html.dark[data-theme='nosh'] {
 		display: flex;
 		gap: 0;
 		overflow-x: auto;
-		overflow-y: hidden;
+		overflow-y: visible;
 		overscroll-behavior-x: contain;
 		scroll-snap-type: x mandatory;
 		-webkit-overflow-scrolling: touch;
@@ -2511,9 +2566,8 @@ html.dark[data-theme='nosh'] {
 
 	.breadcrumb {
 		min-width: 0;
-		overflow: hidden;
-		text-overflow: ellipsis;
-		white-space: nowrap;
+		white-space: normal;
+		overflow-wrap: break-word;
 	}
 
 	.main-content {
@@ -2534,6 +2588,7 @@ html.dark[data-theme='nosh'] {
 
 	.section-heading > .primary,
 	.recipe-toolbar .filter-tabs button,
+	.browse-link,
 	.primary,
 	.secondary,
 	.cream-button,
@@ -2553,7 +2608,8 @@ html.dark[data-theme='nosh'] {
 	.check-box,
 	.remove-meal,
 	.dialog-close,
-	.close-detail {
+	.close-detail,
+	.search-clear {
 		min-width: 44px;
 	}
 
@@ -2571,7 +2627,12 @@ html.dark[data-theme='nosh'] {
 	}
 
 	.search-box input {
+		min-height: 44px;
 		font-size: 16px;
+	}
+	.search-box input::-webkit-search-cancel-button {
+		-webkit-appearance: none;
+		display: none;
 	}
 
 	.recipe-title {
@@ -2659,7 +2720,8 @@ html.dark[data-theme='nosh'] {
 	}
 
 	.pantry-row .unit-input {
-		width: 70px;
+		flex: 1 1 12ch;
+		width: auto;
 	}
 
 	.pantry-row > input[type='date'] {
@@ -2870,6 +2932,7 @@ html.dark[data-theme='nosh'] {
 		max-width: none;
 		max-height: calc(100dvh - 16px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
 		padding: 48px 16px max(20px, env(safe-area-inset-bottom));
+		scroll-padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
 		overscroll-behavior: contain;
 	}
 
@@ -3183,13 +3246,15 @@ html.dark[data-theme='nosh'] {
 	inset: auto;
 	max-width: 690px;
 }
-.calendar-grid {
-	grid-template-rows: auto repeat(3, minmax(155px, auto));
-}
-.calendar-day {
-	display: grid;
-	grid-row: span 4;
-	grid-template-rows: subgrid;
+@media (min-width: 901px) {
+	.calendar-grid {
+		grid-template-rows: auto repeat(3, minmax(155px, auto));
+	}
+	.calendar-day {
+		display: grid;
+		grid-row: span 4;
+		grid-template-rows: subgrid;
+	}
 }
 .connection-actions {
 	display: flex;
@@ -3434,6 +3499,48 @@ html.dark[data-theme='nosh'] {
 		padding-bottom: 10px;
 	}
 
+	.filter-tabs-scroll {
+		width: 100%;
+	}
+
+	.filter-tabs-scroll::before,
+	.filter-tabs-scroll::after {
+		content: '';
+		position: absolute;
+		top: 0;
+		bottom: 0;
+		width: 28px;
+		pointer-events: none;
+		opacity: 0;
+		transition: opacity 0.2s;
+		z-index: 1;
+	}
+
+	.filter-tabs-scroll::before {
+		left: 0;
+		background: linear-gradient(
+			to right,
+			var(--paper) 18%,
+			color-mix(in srgb, var(--paper) 0%, transparent)
+		);
+		border-left: 2px solid var(--line);
+	}
+
+	.filter-tabs-scroll::after {
+		right: 0;
+		background: linear-gradient(
+			to left,
+			var(--paper) 18%,
+			color-mix(in srgb, var(--paper) 0%, transparent)
+		);
+		border-right: 2px solid var(--line);
+	}
+
+	.filter-tabs-scroll.can-scroll-left::before,
+	.filter-tabs-scroll.can-scroll-right::after {
+		opacity: 1;
+	}
+
 	.filter-tabs {
 		width: 100%;
 		flex-wrap: nowrap;
@@ -3648,6 +3755,7 @@ html.dark[data-theme='nosh'] {
 .flavor-dialog.capture-dialog {
 	width: min(100%, 690px);
 	max-width: 690px;
+	scroll-padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
 }
 
 .capture-dialog .capture-help {
@@ -3892,10 +4000,6 @@ html.dark[data-theme='nosh'] {
 }
 
 @media (max-width: 650px) {
-	.recipe-section .section-heading > div:not(.recipe-actions) {
-		display: none;
-	}
-
 	.recipe-section .section-heading > .recipe-actions {
 		display: grid;
 		grid-template-columns: repeat(2, minmax(0, 1fr));
