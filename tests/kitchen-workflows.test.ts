@@ -404,6 +404,22 @@ test('reconcileShoppingList preserves sequential tbsp offsets and 0.000001 preci
 	assert.ok(remainingFlour);
 	assert.equal(remainingFlour.unit, 'g');
 	assert.equal(remainingFlour.quantity, 4);
+
+	const recipeScopeKey = 'recipe:bread';
+	const recipeFlour = reconcileShoppingList(
+		[],
+		[shopping('req-flour', 'flour', 1, 'kg', false)],
+		recipeScopeKey
+	);
+	const restoredDownscaled = restoreShoppingItem(
+		state({ shopping: recipeFlour }),
+		{ ...recipeFlour[0], quantity: 0.996, checked: true },
+		new Date('2026-10-20T12:00:00Z')
+	);
+	const restoredRemainingFlour = restoredDownscaled.find((item) => !item.checked);
+	assert.ok(restoredRemainingFlour);
+	assert.equal(restoredRemainingFlour.unit, 'g');
+	assert.equal(restoredRemainingFlour.quantity, 4);
 });
 
 test('purchased shopping rows merge aliases and compatible units without changing an expiring lot', () => {

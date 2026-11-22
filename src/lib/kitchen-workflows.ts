@@ -282,15 +282,16 @@ export function restoreShoppingItem(
 						Number.isFinite(restoredItem.quantity) && restoredItem.quantity > 0
 							? restoredItem.quantity * restoredUnit.factor
 							: 0;
-					const remainingQuantity = Math.min(
-						MAX_SHOPPING_QUANTITY,
-						roundQuantity(Math.max(0, collidingBase - restoredBase) / collidingUnit.factor)
-					);
-					if (remainingQuantity > 0) {
+					const resolved = resolveShoppingQuantity(collidingBase - restoredBase, [
+						collidingUnit,
+						restoredUnit
+					]);
+					if (resolved) {
 						replacement.push({
 							...colliding,
 							id: nextFreeItemId(colliding, usedIds),
-							quantity: remainingQuantity
+							quantity: Math.min(MAX_SHOPPING_QUANTITY, resolved.quantity),
+							unit: resolved.unit.display
 						});
 					}
 				} else {
