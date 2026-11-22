@@ -158,7 +158,8 @@ function isCustomizedRow(item: ShoppingItem): boolean {
 
 /**
  * Replace one generated shopping-list scope while retaining manual entries, other scopes,
- * customized active rows, and checked purchases. Checked purchases credit their original bucket.
+ * customized active rows, and checked purchases. Checked purchases credit their original bucket
+ * and follow unchecked items.
  */
 export function reconcileShoppingList(
 	existing: ShoppingItem[],
@@ -269,6 +270,8 @@ export function reconcileShoppingList(
 		if (!existingUncheckedIds.has(origKey)) existingUncheckedIds.set(origKey, item.id);
 	}
 
+	const uncheckedRetained = retained.filter((item) => !item.checked);
+	const checkedRetained = retained.filter((item) => item.checked);
 	const usedIds = new Set(retained.map((item) => item.id));
 	const generated: ShoppingItem[] = [];
 	for (const [key, bucket] of additionBuckets) {
@@ -296,7 +299,7 @@ export function reconcileShoppingList(
 		});
 	}
 
-	return [...retained, ...generated];
+	return [...uncheckedRetained, ...generated, ...checkedRetained];
 }
 
 /** Check whether a shopping row is a valid checked purchase that can be transferred to pantry. */
