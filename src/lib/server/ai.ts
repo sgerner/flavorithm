@@ -2401,3 +2401,10 @@ export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<Support
 	}
 	return publicCatalog;
 }
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
+	publicCatalogFetcher = undefined;
+}
