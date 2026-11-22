@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { CloudOff, RefreshCw, Download } from '@lucide/svelte';
-	import { revealMotion } from '#lib/motion.ts';
 	import type { AppState } from '#lib/types.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	let {
@@ -25,6 +24,7 @@
 		error?: string;
 	} = $props();
 	let review = $state(false);
+	let saved = $derived(online && !pending && !syncing && !conflicts.length && !error);
 	function describe(path: string): string {
 		const match = /^kitchen\.(recipes|pantry|shopping|meals)(?:\[([^\]]+)\])?(?:\.(.*))?$/.exec(
 			path
@@ -100,22 +100,32 @@
 	}
 </script>
 
-{#if online && !pending && !syncing && !conflicts.length && !error}
-	<p class="muted" role="status">Kitchen saved</p>
-{:else}
-	<section class="sync-notice" aria-label="Kitchen synchronization" in:revealMotion|global>
-		<div role="status">
-			{#if !online}<CloudOff size={18} /><span
-					>Offline{pending && !error ? ' · Changes pending on this device' : ''}</span
-				>
-			{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
-			{:else if syncing}<RefreshCw size={18} /><span>Syncing your kitchen…</span>
-			{:else}<span
-					>{error
-						? 'Kitchen sync failed. Your changes are pending.'
-						: 'Changes pending on this device. Waiting to sync.'}</span
-				>{/if}
-		</div>
+<div
+	class:sync-notice={!saved}
+	role={saved ? undefined : 'region'}
+	aria-label={saved ? undefined : 'Kitchen synchronization'}
+>
+	<div
+		class="sync-status-line"
+		class:muted={saved}
+		role="status"
+		aria-live="polite"
+		aria-atomic="true"
+	>
+		{#if saved}
+			<span>Kitchen saved</span>
+		{:else if !online}<CloudOff size={18} aria-hidden="true" /><span
+				>Offline{pending && !error ? ' · Changes pending on this device' : ''}</span
+			>
+		{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
+		{:else if syncing}<RefreshCw size={18} aria-hidden="true" /><span>Syncing your kitchen…</span>
+		{:else}<span
+				>{error
+					? 'Kitchen sync failed. Your changes are pending.'
+					: 'Changes pending on this device. Waiting to sync.'}</span
+			>{/if}
+	</div>
+	{#if !saved}
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		{#if conflicts.length}
 			<button class="secondary" onclick={() => (review = !review)}
@@ -158,8 +168,8 @@
 				</div>
 			</div>
 		{/if}
-	</section>
-{/if}
+	{/if}
+</div>
 
 <style>
 	.sync-notice {
@@ -172,7 +182,10 @@
 		flex-wrap: wrap;
 		gap: 0.75rem;
 	}
-	.sync-notice > div:first-child {
+	.sync-status-line.muted {
+		line-height: 1.7;
+	}
+	.sync-notice > .sync-status-line {
 		display: flex;
 		gap: 0.5rem;
 		align-items: center;

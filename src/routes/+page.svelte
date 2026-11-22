@@ -61,8 +61,17 @@
 	import { applyButlerCommands } from '#lib/butler.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
+	import StatusRegion from '#lib/components/StatusRegion.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
+	import {
+		announce,
+		announceDeferred,
+		formatPantryStatus,
+		formatRecipeStatus,
+		formatWebSearchStatus,
+		notifyStatus
+	} from '#lib/status.ts';
 	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
@@ -98,9 +107,7 @@
 	let filter = $state('For you');
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
-	let toast = $state('');
-	let toastUndo = $state<(() => void) | null>(null);
-	let toastVersion = 0;
+	let hasSearchedOnline = $state(false);
 	let busy = $state(false);
 	let mobileNav = $state(false);
 	let modal = $state('');
@@ -230,11 +237,28 @@
 	let voiceModel = $state('');
 	let voiceApiKey = $state('');
 	let localVoiceAvailable = $state(false);
+	let localVoiceChecking = $state(false);
 	let voiceState = $state<VoiceState>('idle');
 	let voiceStarting = $state(false);
 	let voiceTarget = $state('');
 	let voiceCapture: VoiceCapture | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
+	async function checkVoiceAvailability(owner = user?.id ?? '') {
+		if (!owner) {
+			localVoiceChecking = false;
+			return;
+		}
+		localVoiceChecking = true;
+		try {
+			const r = await fetch('/api/voice');
+			const data = r.ok ? await r.json() : null;
+			if (user?.id === owner) localVoiceAvailable = Boolean(data?.localAvailable);
+		} catch {
+			// Keep previous availability state when offline.
+		} finally {
+			if (user?.id === owner || !user) localVoiceChecking = false;
+		}
+	}
 	$effect(() => {
 		const owner = voiceOwner;
 		if (typeof window === 'undefined') return;
@@ -244,6 +268,7 @@
 		voiceProvider = 'auto';
 		voiceModel = '';
 		localVoiceAvailable = false;
+		localVoiceChecking = false;
 		if (owner) {
 			try {
 				const saved = JSON.parse(localStorage.getItem(`flavorithm-voice:${owner}`) || '{}');
@@ -258,12 +283,7 @@
 							: '';
 				}
 			} catch {}
-			fetch('/api/voice')
-				.then((r) => (r.ok ? r.json() : null))
-				.then((data) => {
-					if (user?.id === owner) localVoiceAvailable = Boolean(data?.localAvailable);
-				})
-				.catch(() => {});
+			void checkVoiceAvailability(owner);
 		}
 		return () => voiceCapture?.cancel();
 	});
@@ -443,6 +463,20 @@
 			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
 		)
 	);
+	function currentRecipeStatus() {
+		const hasSavedRecipes = kitchen.recipes.some(
+			(r) => r.saved && (showHiddenRecipes || !r.hidden)
+		);
+		const hasFilterOrQuery = Boolean(query.trim()) || filter !== 'For you';
+		return formatRecipeStatus(recipes.length, page, hasSavedRecipes, hasFilterOrQuery);
+	}
+	function announceRecipeFilter(debounced = false) {
+		if (debounced) announceDeferred(() => currentRecipeStatus(), 300);
+		else announce(currentRecipeStatus());
+	}
+	function announcePantryFilter() {
+		announce(formatPantryStatus(visiblePantry.length, kitchen.pantry.length, pantryFilter));
+	}
 	let week = $derived.by(() => {
 		const d = new Date();
 		d.setHours(12, 0, 0, 0);
@@ -468,24 +502,14 @@
 		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 	}
 	function notify(message: string, undo?: () => void) {
-		toast = message;
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
-		toastUndo = undo
-			? () => {
-					toastUndo = null;
-					toast = '';
-					if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
-				}
-			: null;
-		const version = ++toastVersion;
-		setTimeout(
-			() => {
-				if (toastVersion === version) {
-					toast = '';
-					toastUndo = null;
-				}
-			},
-			undo ? 10000 : 4200
+		notifyStatus(
+			message,
+			undo
+				? () => {
+						if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
+					}
+				: undefined
 		);
 	}
 	function removeShoppingItem(item: AppState['shopping'][number]) {
@@ -858,6 +882,11 @@
 	function navigate(id: string) {
 		page = id;
 		mobileNav = false;
+		if ((id === 'discover' || id === 'saved') && recipes.length === 0) {
+			announceRecipeFilter(false);
+		} else if (id === 'pantry' && visiblePantry.length === 0) {
+			announcePantryFilter();
+		}
 	}
 	function addIngredients() {
 		const names = pantryInput
@@ -896,6 +925,7 @@
 		}
 		busy = true;
 		error = '';
+		announce('Opening your kitchen…');
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -1064,6 +1094,7 @@
 		}
 		try {
 			if (user) {
+				void checkVoiceAvailability(user.id);
 				await refreshConnections();
 				await loadModelCatalog();
 			}
@@ -1476,6 +1507,7 @@
 				modal = 'generate';
 				break;
 			case 'search':
+				if (!searchResults.length) hasSearchedOnline = false;
 				modal = 'search';
 				break;
 			case 'taste':
@@ -1488,6 +1520,7 @@
 		if (!needAI()) return;
 		busy = true;
 		error = '';
+		announce('Generating recipes…');
 		try {
 			const result = await ai('generate');
 			kitchen.recipes = insertRecipes(kitchen.recipes, result.recipes);
@@ -1510,6 +1543,7 @@
 			return;
 		}
 		busy = true;
+		announce('Scanning photo for ingredients…');
 		try {
 			const image = await new Promise<string>((resolve, reject) => {
 				const reader = new FileReader();
@@ -1884,6 +1918,7 @@
 		if (!canManageHousehold || !memberToRemove) return;
 		householdBusy = true;
 		error = '';
+		announce('Removing household member…');
 		try {
 			await request('/api/household', {
 				action: 'removeMember',
@@ -1926,6 +1961,7 @@
 	async function refreshNutrition() {
 		if (!selected || !needAI()) return;
 		busy = true;
+		announce('Refreshing nutrition estimate…');
 		try {
 			const result = await ai('nutrition', { recipe: selected });
 			selected.nutrition = result.nutrition;
@@ -2005,6 +2041,7 @@
 		if (managedAuth) return;
 		busy = true;
 		error = '';
+		announce('Deleting your account…');
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -2046,6 +2083,7 @@
 		if (!user || user.emailVerified || !capabilities.emailDelivery) return;
 		verificationBusy = true;
 		error = '';
+		announce('Sending verification email…');
 		try {
 			await request('/api/auth', { action: 'requestEmailVerification' });
 			await refreshAuth();
@@ -2064,6 +2102,7 @@
 		}
 		busy = true;
 		error = '';
+		announce(modal === 'reset' ? 'Resetting password…' : 'Sending password reset link…');
 		try {
 			if (modal === 'reset') {
 				await request('/api/auth', { action: 'resetPassword', token: resetToken, password });
@@ -2088,6 +2127,7 @@
 		busy = true;
 		householdBusy = true;
 		error = '';
+		announce('Leaving household…');
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -2135,9 +2175,12 @@
 		}
 		busy = true;
 		error = '';
+		announce('Searching for recipes online…');
 		try {
 			searchResults = (await ai('search', { prompt: prompt || 'seasonal weeknight recipes' }))
 				.results;
+			hasSearchedOnline = true;
+			announce(formatWebSearchStatus(searchResults.length));
 		} catch (e) {
 			error = (e as Error).message;
 		} finally {
@@ -2378,14 +2421,19 @@
 							{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
 									class:active={filter === item}
 									aria-pressed={filter === item}
-									onclick={() => (filter = item)}
+									onclick={() => {
+										filter = item;
+										announceRecipeFilter(false);
+									}}
 									>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
 								>{/each}
 							<button
 								class:active={showHiddenRecipes}
 								aria-pressed={showHiddenRecipes}
-								onclick={() => (showHiddenRecipes = !showHiddenRecipes)}
-								>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+								onclick={() => {
+									showHiddenRecipes = !showHiddenRecipes;
+									announceRecipeFilter(false);
+								}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
 							>
 						</div>
 						<div class="search-box">
@@ -2393,6 +2441,7 @@
 								aria-label="Search recipes"
 								placeholder="Search recipes"
 								bind:value={query}
+								oninput={() => announceRecipeFilter(true)}
 							/>
 						</div>
 					</div>
@@ -2469,6 +2518,7 @@
 						</div>{/if}<button
 						class="browse-link"
 						onclick={() => {
+							if (!searchResults.length) hasSearchedOnline = false;
 							modal = 'search';
 							error = '';
 						}}>Find recipes online <ArrowUpRight size={16} /></button
@@ -2490,6 +2540,7 @@
 							class="text-button"
 							onclick={() => {
 								kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
+								announcePantryFilter();
 							}}>Clear depleted items</button
 						>{/if}
 					<div>
@@ -2504,8 +2555,10 @@
 					{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
 							class:active={pantryFilter === option.id}
 							aria-pressed={pantryFilter === option.id}
-							onclick={() => (pantryFilter = option.id)}
-							>{option.label}<span>{option.count}</span></button
+							onclick={() => {
+								pantryFilter = option.id;
+								announcePantryFilter();
+							}}>{option.label}<span>{option.count}</span></button
 						>{/each}
 				</div>
 				<div class="pantry-table">
@@ -2558,8 +2611,10 @@
 							/><button
 								class="icon-button"
 								aria-label={`Remove ${item.name}`}
-								onclick={() => (kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id))}
-								><X size={16} /></button
+								onclick={() => {
+									kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id);
+									if (!visiblePantry.length) announcePantryFilter();
+								}}><X size={16} /></button
 							>
 						</div>{/each}
 				</div>
@@ -2878,13 +2933,7 @@
 		</div>
 	</main>
 </div>
-<div class="visually-hidden" role="status" aria-atomic="true">{toast}</div>
-{#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
-			onclick={() => (toast = '')}
-			aria-label="Dismiss notification"><X size={16} /></button
-		>
-	</div>{/if}
+<StatusRegion muted={Boolean(modal || selected || editingRecipe || butlerOpen)} />
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
 		initialServings={selectedMealServings ?? selected.servings}
@@ -3122,6 +3171,7 @@
 							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary full"
 							disabled={busy}
+							aria-busy={busy}
 							>{busy
 								? 'Opening your kitchen…'
 								: authMode === 'register'
@@ -3179,6 +3229,7 @@
 					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 						class="primary full"
 						disabled={busy}
+						aria-busy={busy}
 						onclick={generate}
 						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
 					>
@@ -3226,6 +3277,7 @@
 									</p>{:else}<button
 										class="secondary"
 										disabled={!capabilities.emailDelivery || verificationBusy}
+										aria-busy={verificationBusy}
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
 									>{#if !capabilities.emailDelivery}<p class="field-help">
@@ -3247,6 +3299,7 @@
 							bind:model={voiceModel}
 							bind:apiKey={voiceApiKey}
 							localAvailable={localVoiceAvailable}
+							checking={localVoiceChecking}
 							userId={user?.id}
 						/>
 					</div>
@@ -3320,7 +3373,14 @@
 				{:else if modal === 'household'}<span class="dialog-spark">✳</span>
 					<h2>Your household</h2>
 					<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
-					{#if householdBusy}<p class="field-help" role="status">Updating household…</p>{/if}
+					<p
+						class="field-help"
+						class:visually-hidden={!householdBusy}
+						role="status"
+						aria-live="polite"
+					>
+						{householdBusy ? 'Updating household…' : ''}
+					</p>
 					<div class="household-members">
 						{#each members as member (member.id)}<div class="member-row">
 								<span class="profile-avatar"
@@ -3415,6 +3475,7 @@
 						><button
 							class="primary danger-action"
 							disabled={householdBusy}
+							aria-busy={householdBusy}
 							onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button
 						>
 					</div>
@@ -3427,7 +3488,8 @@
 					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 						class="primary full"
 						onclick={leaveHousehold}
-						disabled={busy}>Leave household</button
+						disabled={busy}
+						aria-busy={busy}>Leave household</button
 					>
 				{:else if modal === 'delete' && !managedAuth}
 					<h2>Delete your account?</h2>
@@ -3446,7 +3508,8 @@
 							/></label
 						>{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary danger-button full"
-							disabled={busy}>Permanently delete my account</button
+							disabled={busy}
+							aria-busy={busy}>Permanently delete my account</button
 						>
 					</form>
 				{:else if (modal === 'recover' || modal === 'reset') && !managedAuth}<span
@@ -3478,6 +3541,7 @@
 							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary full"
 							disabled={busy}
+							aria-busy={busy}
 							>{busy
 								? 'One moment…'
 								: modal === 'reset'
@@ -3618,6 +3682,7 @@
 					><button
 						class="primary full"
 						disabled={busy || !capabilities.recipeSearch}
+						aria-busy={busy}
 						onclick={internetSearch}
 						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 					>{#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -3633,8 +3698,14 @@
 									><Plus size={16} /> Import recipe</button
 								>
 							</div>{/each}
+						{#if hasSearchedOnline && !busy && !error && !searchResults.length}
+							<p class="field-help">
+								No online recipes found. Try another search or import a link directly.
+							</p>
+						{/if}
 					</div>
 				{/if}
+				<StatusRegion modal />
 			</div>
 		{/key}
 	</div>{/if}

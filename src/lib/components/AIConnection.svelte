@@ -2,6 +2,7 @@
 	import { ArrowUpRight, RefreshCw, Check, Copy } from '@lucide/svelte';
 	import SearchPicker from './SearchPicker.svelte';
 	import { revealMotion } from '#lib/motion.ts';
+	import { announce } from '#lib/status.ts';
 	import type { Preferences } from '#lib/types.ts';
 	import {
 		searchConnections,
@@ -62,6 +63,10 @@
 		onsignin: () => void;
 	} = $props();
 	let hostError = $state('');
+	let sawCatalogLoading = $state(false);
+	$effect(() => {
+		if (loading) sawCatalogLoading = true;
+	});
 	async function setHost(enabled: boolean) {
 		hostError = '';
 		try {
@@ -74,6 +79,7 @@
 				})
 			});
 			if (!response.ok) throw new Error((await response.json()).error);
+			announce(enabled ? 'Host AI connection enabled.' : 'Host AI connection disabled.');
 			onrefresh();
 		} catch (error) {
 			hostError = (error as Error).message;
@@ -169,20 +175,57 @@
 	<button class="text-button" onclick={onrefresh}
 		><RefreshCw size={15} /> Retry model catalog</button
 	>{/if}
-{#if loading}<p class="field-help" role="status">Loading model catalog…</p>{/if}
+<p
+	class="field-help"
+	class:visually-hidden={!loading}
+	role="status"
+	aria-live="polite"
+	aria-atomic="true"
+>
+	{loading
+		? 'Loading model catalog…'
+		: sawCatalogLoading && !catalogError
+			? 'Model catalog ready.'
+			: ''}
+</p>
+
+<div
+	class="plan-status"
+	class:visually-hidden={!subscription}
+	role="status"
+	aria-live="polite"
+	aria-atomic="true"
+>
+	<span
+		class="connection-status"
+		class:connected={subscription &&
+			Boolean(activeAccount?.connected && activeAccount?.planEnabled)}
+	>
+		{#if subscription}
+			{#if device}Waiting for approval<span class="visually-hidden">
+					· Enter code {device.userCode} in ChatGPT</span
+				>
+			{:else if busy}Connecting…
+			{:else if !chatGPT.configured && signedIn}Not connected<span class="visually-hidden">
+					· {chatGPT.safeReason ||
+						'Unable to load authorization options. Retry the connection settings.'}</span
+				>
+			{:else if activeAccount?.connected && activeAccount.planEnabled}<Check
+					size={16}
+					aria-hidden="true"
+				/> Connected
+			{:else if activeAccount?.connected}Plan access needed{:else}Not connected{/if}
+		{:else if provider?.supported}
+			{provider.name} selected. Enter an API key and model.
+		{:else if provider}
+			{provider.name} integration is not yet supported.
+		{/if}
+	</span>
+</div>
 
 {#key preferences.provider}
 	<div class="connection-setup" in:revealMotion>
 		{#if subscription}
-			<div class="plan-status">
-				<span
-					class="connection-status"
-					class:connected={activeAccount?.connected && activeAccount?.planEnabled}
-				>
-					{#if activeAccount?.connected && activeAccount.planEnabled}<Check size={16} /> Connected
-					{:else if activeAccount?.connected}Plan access needed{:else}Not connected{/if}
-				</span>
-			</div>
 			{#if chatGPT.accounts.length}
 				<label class="field"
 					>ChatGPT account<select
@@ -205,6 +248,7 @@
 					<button
 						class="primary"
 						disabled={busy || !signedIn || !chatGPT.configured}
+						aria-busy={busy}
 						onclick={() => onconnect(activeAccount?.id)}
 					>
 						{busy
@@ -226,7 +270,7 @@
 				</div>
 			{/if}
 			{#if device}
-				<div class="device-login" in:revealMotion role="status">
+				<div class="device-login" in:revealMotion>
 					<p>Open ChatGPT and enter this code:</p>
 					<div class="device-code-row">
 						<code>{device.userCode}</code><button
@@ -253,7 +297,7 @@
 			{#if chatGPT.mode === 'local'}<p class="field-help">
 					Complete ChatGPT authorization in your browser. Flavorithm handles the connection.
 				</p>
-			{:else if !chatGPT.configured && signedIn}<p class="field-help" role="status">
+			{:else if !chatGPT.configured && signedIn}<p class="field-help">
 					{chatGPT.safeReason ||
 						'Unable to load authorization options. Retry the connection settings.'}
 				</p>{/if}
@@ -314,8 +358,11 @@
 		onselect={selectModel}
 		disabled={!signedIn || !models.length}
 	/>
-	{#if subscription}<button class="text-button" disabled={loading || busy} onclick={onrefresh}
-			><RefreshCw size={15} /> Refresh account models</button
+	{#if subscription}<button
+			class="text-button"
+			disabled={loading || busy}
+			aria-busy={loading}
+			onclick={onrefresh}><RefreshCw size={15} /> Refresh account models</button
 		>{/if}
 	{#if selectedModel && !selectedModel.vision}<p class="field-help">
 			This model accepts text only. Choose a model with image input to import photos.

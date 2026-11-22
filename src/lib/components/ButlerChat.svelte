@@ -14,6 +14,7 @@
 	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
+	import StatusRegion from './StatusRegion.svelte';
 	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
 	import { focusTrap } from '#lib/focus.ts';
 	import type { AppState, Recipe } from '#lib/types.ts';
@@ -434,11 +435,11 @@
 				</article>
 			{/each}
 		</div>
-		{#if busy}<div class="butler-working" role="status">
-				<span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span><span
+		<div class="butler-working" class:sr-only={!busy} role="status" aria-live="polite">
+			{#if busy}<span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span><span
 					>Basil is considering…</span
-				>
-			</div>{/if}
+				>{/if}
+		</div>
 		{#if error}<div class="butler-error" role="alert">
 				<p>{error}</p>
 				{#if failedPrompt}<button onclick={() => send(failedPrompt, true)} disabled={working}
@@ -484,6 +485,7 @@
 			{#if syncing}<LoaderCircle size={12} class="spin" />Saving changes…{:else if pendingSync}Changes
 				awaiting sync{/if}
 		</div>
+		<StatusRegion modal />
 	</div>
 {/if}
 

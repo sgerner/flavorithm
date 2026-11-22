@@ -3,6 +3,7 @@
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
+	import StatusRegion from './StatusRegion.svelte';
 	import type { Recipe } from '#lib/types.ts';
 	import {
 		X,
@@ -257,7 +258,7 @@
 							analysis.
 						</p>
 					</div>
-					<button class="text-button full" onclick={nutrition} disabled={busy}
+					<button class="text-button full" onclick={nutrition} disabled={busy} aria-busy={busy}
 						>Refresh nutrition estimate with AI</button
 					>
 				</div>{/if}
@@ -282,6 +283,7 @@
 					rel="noreferrer">View original recipe <ArrowUpRight size={15} /></a
 				>{/if}
 		</div>
+		<StatusRegion modal />
 	</div>
 </div>
 

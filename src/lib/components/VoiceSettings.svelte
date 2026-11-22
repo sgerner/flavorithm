@@ -6,12 +6,14 @@
 		model = $bindable(''),
 		apiKey = $bindable(''),
 		localAvailable,
+		checking = false,
 		userId
 	}: {
 		provider: VoiceProvider;
 		model: string;
 		apiKey: string;
 		localAvailable: boolean;
+		checking?: boolean;
 		userId?: string;
 	} = $props();
 	let selected = $derived(voiceProviders.find((item) => item.id === provider)!);
@@ -40,18 +42,31 @@
 {#if !userId}<p class="field-help">
 		Sign in to configure voice transcription. Browser dictation remains available.
 	</p>{/if}
-{#if provider === 'auto'}<p class="field-help">
+<p
+	class="field-help"
+	class:visually-hidden={provider !== 'auto' && !(provider === 'local' && !localAvailable)}
+	role="status"
+	aria-live="polite"
+	aria-atomic="true"
+>
+	{#if checking && (provider === 'auto' || provider === 'local')}
+		Checking local Whisper availability…
+	{:else if provider === 'auto'}
 		{localAvailable
 			? 'Local Whisper is available and will be used.'
 			: 'No local service configured. Select Groq or Deepgram to use voice in Firefox.'}
-	</p>{/if}
-{#if provider === 'local' && !localAvailable}<p class="field-help" role="status">
+	{:else if provider === 'local' && !localAvailable}
 		Ask the server operator to configure a Whisper endpoint. <a
 			href="https://github.com/sgerner/flavorithm/blob/main/docs/voice-input.md"
 			target="_blank"
 			rel="noopener noreferrer">Setup guide</a
 		>
-	</p>{/if}
+	{:else if provider === 'local'}
+		Local Whisper is available and selected.
+	{:else}
+		{selected.name} transcription selected.
+	{/if}
+</p>
 {#if 'models' in selected}<div in:revealMotion>
 		<label class="field"
 			>Voice model<select bind:value={model} onchange={save}

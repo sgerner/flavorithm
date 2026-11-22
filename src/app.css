@@ -1419,14 +1419,31 @@ main {
 	width: max-content;
 	max-width: calc(100vw - 40px);
 }
-.toast > span {
+.toast > span:first-child {
 	color: #dce891;
 	font-size: 23px;
+}
+.toast.modal-toast {
+	left: 50%;
 }
 .toast button {
 	display: grid;
 	place-items: center;
 	margin-left: 10px;
+}
+.toast button.toast-undo {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 6px 10px;
+	font-weight: 600;
+	text-decoration: underline;
+	text-underline-offset: 3px;
+	white-space: nowrap;
+}
+.toast button:focus-visible {
+	outline-color: currentColor;
+	outline-offset: 2px;
 }
 .recipe-dialog {
 	max-width: 980px;
@@ -3268,6 +3285,10 @@ html.dark[data-theme='nosh'] {
 		min-width: 44px;
 		min-height: 44px;
 		flex: 0 0 44px;
+	}
+	.toast button.toast-undo {
+		flex: 0 0 auto;
+		width: auto;
 	}
 
 	.onboarding-note {

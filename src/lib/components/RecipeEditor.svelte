@@ -4,6 +4,8 @@
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
+	import { announce } from '#lib/status.ts';
+	import StatusRegion from './StatusRegion.svelte';
 	import { Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
 	let {
@@ -30,6 +32,7 @@
 		if (!file) return;
 		uploading = true;
 		error = '';
+		announce('Uploading cover photo…');
 		try {
 			const body = await prepareCover(file);
 			const response = await fetch('/api/recipe-covers', {
@@ -40,6 +43,7 @@
 			const result = await response.json();
 			if (!response.ok) throw new Error(result.error || 'Could not upload the cover photo.');
 			draft.image = result.image;
+			announce('Cover photo uploaded.');
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not read that photo.';
 		} finally {
@@ -195,6 +199,7 @@
 						type="button"
 						class="secondary"
 						disabled={uploading}
+						aria-busy={uploading}
 						onclick={() => photoInput.click()}
 						>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
 					>
@@ -204,6 +209,7 @@
 							disabled={uploading}
 							onclick={() => {
 								draft.image = '';
+								announce('Cover photo removed.');
 							}}>Remove cover</button
 						>{/if}
 					<p class="muted">
@@ -327,6 +333,7 @@
 				>
 			</div>
 		</form>
+		<StatusRegion modal />
 	</div>
 </div>
 

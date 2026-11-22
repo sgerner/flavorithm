@@ -20,6 +20,7 @@
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
 	import { revealMotion } from '#lib/motion.ts';
+	import { announce } from '#lib/status.ts';
 	let {
 		session = $bindable(),
 		capture,
@@ -73,6 +74,7 @@
 		}
 		reading = true;
 		error = '';
+		announce('Reading recipe photo…');
 		try {
 			const photo = await new Promise<string>((resolve, reject) => {
 				const reader = new FileReader();
@@ -83,6 +85,7 @@
 			if (alive) {
 				session.photo = photo;
 				session.photoName = file.name;
+				announce(`Attached photo ${file.name}.`);
 			}
 		} catch (e) {
 			if (alive) error = (e as Error).message;
@@ -121,6 +124,7 @@
 		error = '';
 		retryAvailable = false;
 		busy = true;
+		announce('Creating your recipe draft…');
 		const generation = ++captureGeneration;
 		const currentController = new AbortController();
 		controller = currentController;
@@ -133,6 +137,9 @@
 				session.draft = result.recipe;
 				session.assumptions = result.assumptions;
 				reviewingDraft = true;
+				announce(
+					`Recipe draft ready: ${result.recipe.title}. Review quantities and steps before saving.`
+				);
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
 			}
@@ -243,7 +250,7 @@
 					type="button"
 					onclick={() => photoInput?.click()}
 					disabled={busy || reading}
-					><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
+					aria-busy={reading}><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
 				>
 				<button class="secondary" type="button" onclick={dictate} disabled={busy || reading}
 					><Mic size={18} />Use voice</button
@@ -256,6 +263,7 @@
 							session = emptyImportSession();
 							error = '';
 							retryAvailable = false;
+							announce('Recipe input cleared.');
 						}}>Clear</button
 					>{/if}
 			</div>
@@ -268,6 +276,7 @@
 						onclick={() => {
 							session.photo = '';
 							session.photoName = '';
+							announce('Recipe photo removed.');
 						}}><X size={18} /></button
 					>
 				</div>{/if}
@@ -448,6 +457,7 @@
 				error = '';
 				reviewingDraft = false;
 				retryAvailable = false;
+				announce('Recipe draft discarded.');
 			}}>Discard draft</button
 		>
 		{#if draft.source}<p class="field-help">
