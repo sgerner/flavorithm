@@ -2,6 +2,7 @@ import { randomBytes, scrypt as scryptCallback, createHash, timingSafeEqual } fr
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { createNewUserState } from '#lib/data.ts';
 import { COVER_PATH } from '#lib/cover-upload.ts';
@@ -324,11 +325,13 @@ export async function readJson(request: Request): Promise<unknown> {
 
 export class ApiError extends Error {
 	readonly status: number;
+	readonly code?: string;
 
-	constructor(status: number, message: string) {
+	constructor(status: number, message: string, code?: string) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
+		if (code) this.code = code;
 	}
 }
 
@@ -336,7 +339,12 @@ export function errorResponse(error: unknown): Response {
 	const status = error instanceof ApiError ? error.status : 500;
 	const message = error instanceof ApiError ? error.message : 'An unexpected server error occurred';
 	if (status === 500) console.error('API request failed:', error);
-	return Response.json({ error: message }, { status });
+	return Response.json(
+		error instanceof ApiError && error.code
+			? { error: message, code: error.code }
+			: { error: message },
+		{ status }
+	);
 }
 
 export function assertSameOrigin(request: Request): void {
@@ -1240,15 +1248,59 @@ export function revokeHouseholdInvite(user: User, inviteId: string): void {
 	if (Number(result.changes) === 0) throw new ApiError(404, 'Invitation not found');
 }
 
-function makePersonalHousehold(user: User): string {
+const starterRecipesById = new Map(
+	createNewUserState().recipes.map((recipe) => {
+		const { rating: _rating, ...rest } = recipe;
+		return [recipe.id, rest];
+	})
+);
+
+function isPopulatedHousehold(householdId: string): boolean {
+	const hasCoversTable = Boolean(
+		db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recipe_covers'").get()
+	);
+	if (
+		hasCoversTable &&
+		db.prepare('SELECT 1 FROM recipe_covers WHERE household_id = ? LIMIT 1').get(householdId)
+	) {
+		return true;
+	}
+	const row = db
+		.prepare('SELECT state_json FROM household_state WHERE household_id = ?')
+		.get(householdId) as { state_json: string } | undefined;
+	if (!row) return false;
+	try {
+		const shared = JSON.parse(row.state_json) as Omit<AppState, 'preferences'>;
+		if ((shared.pantry?.length ?? 0) > 0) return true;
+		if ((shared.meals?.length ?? 0) > 0) return true;
+		if ((shared.shopping?.length ?? 0) > 0) return true;
+		for (const recipe of shared.recipes ?? []) {
+			if (recipe.saved) return true;
+			const starter = starterRecipesById.get(recipe.id);
+			if (!starter) return true;
+			const { rating: _rating, ...comparable } = recipe;
+			if (!isDeepStrictEqual({ ...comparable, saved: false }, starter)) return true;
+		}
+		return false;
+	} catch {
+		return true;
+	}
+}
+
+function makePersonalHousehold(user: Pick<User, 'id' | 'name'>): string {
 	const householdId = id();
+	const now = Date.now();
+	const { preferences: _preferences, ...initialSharedState } = createNewUserState();
 	db.prepare('INSERT INTO households(id, name, owner_id, created_at) VALUES (?, ?, ?, ?)').run(
 		householdId,
 		`${user.name}’s household`,
 		user.id,
-		Date.now()
+		now
 	);
 	db.prepare('UPDATE users SET household_id = ? WHERE id = ?').run(householdId, user.id);
+	db.prepare(
+		'INSERT INTO household_state(household_id, state_json, version, updated_at) VALUES (?, ?, 1, ?)'
+	).run(householdId, JSON.stringify(initialSharedState), now);
 	return householdId;
 }
 
@@ -1266,7 +1318,12 @@ function removeUserFromOldHousehold(user: User, oldHouseholdId: string): void {
 	else db.prepare('DELETE FROM households WHERE id = ?').run(oldHouseholdId);
 }
 
-export function joinHousehold(user: User, rawCode: string): User {
+export function joinHousehold(
+	user: User,
+	rawCode: string,
+	options: boolean | { confirmReplace?: boolean } = false
+): User {
+	const confirmReplace = typeof options === 'boolean' ? options : Boolean(options?.confirmReplace);
 	const code = rawCode.trim();
 	if (code.length < 8 || code.length > 100)
 		throw new ApiError(400, 'Invalid or expired invite code');
@@ -1285,6 +1342,18 @@ export function joinHousehold(user: User, rawCode: string): User {
 		if (invite.household_id === user.householdId)
 			throw new ApiError(409, 'You are already in this household');
 		const oldHouseholdId = user.householdId;
+		const memberCount = (
+			db
+				.prepare('SELECT COUNT(*) AS count FROM users WHERE household_id = ?')
+				.get(oldHouseholdId) as { count: number }
+		).count;
+		if (memberCount <= 1 && !confirmReplace && isPopulatedHousehold(oldHouseholdId)) {
+			throw new ApiError(
+				409,
+				'Joining another household will replace your personal kitchen. Export a backup or confirm to continue.',
+				'confirm_replace'
+			);
+		}
 		db.prepare('UPDATE users SET household_id = ? WHERE id = ?').run(invite.household_id, user.id);
 		db.prepare(
 			'UPDATE household_invites SET uses_remaining = uses_remaining - 1 WHERE code_hash = ?'
@@ -1302,8 +1371,16 @@ export function leaveHousehold(user: User): User {
 	const oldHouseholdId = user.householdId;
 	db.exec('BEGIN IMMEDIATE');
 	try {
-		assertCurrentHousehold(user);
-		makePersonalHousehold(user);
+		const current = assertCurrentHousehold(user);
+		const memberCount = (
+			db
+				.prepare('SELECT COUNT(*) AS count FROM users WHERE household_id = ?')
+				.get(oldHouseholdId) as { count: number }
+		).count;
+		if (memberCount <= 1) {
+			throw new ApiError(400, 'You already have your own personal kitchen');
+		}
+		makePersonalHousehold({ id: current.id, name: current.name });
 		removeUserFromOldHousehold(user, oldHouseholdId);
 		db.exec('COMMIT');
 	} catch (error) {

@@ -20,7 +20,11 @@ const actionSchema = z.discriminatedUnion('action', [
 	z.object({ action: z.literal('createInvite') }),
 	z.object({ action: z.literal('revokeInvite'), inviteId: z.string().min(32).max(128) }),
 	z.object({ action: z.literal('removeMember'), memberId: z.string().min(1).max(100) }),
-	z.object({ action: z.literal('join'), code: z.string().min(8).max(100) }),
+	z.object({
+		action: z.literal('join'),
+		code: z.string().min(8).max(100),
+		confirmReplace: z.boolean().optional()
+	}),
 	z.object({ action: z.literal('leave') })
 ]);
 
@@ -48,7 +52,9 @@ export const POST: RequestHandler = async (event) => {
 		} else if (parsed.data.action === 'removeMember') {
 			removeHouseholdMember(event.locals.user, parsed.data.memberId);
 		} else if (parsed.data.action === 'join') {
-			event.locals.user = joinHousehold(event.locals.user, parsed.data.code);
+			event.locals.user = joinHousehold(event.locals.user, parsed.data.code, {
+				confirmReplace: parsed.data.confirmReplace
+			});
 		} else {
 			event.locals.user = leaveHousehold(event.locals.user);
 		}

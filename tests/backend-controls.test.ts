@@ -285,3 +285,93 @@ test('auth and household endpoints expose status, hashed invites, and one-use ve
 	assert.equal(typeof authStatusData.capabilities.recipeSearch, 'boolean');
 	assert.equal(JSON.stringify(authStatusData).includes(verification.token), false);
 });
+
+test('household endpoint blocks solo leave and requires confirmReplace before replacing populated solo kitchens', async () => {
+	const host = await backend.registerUser(
+		'Shared Host',
+		'shared-host-route@example.com',
+		'a secure shared host password'
+	);
+	const solo = await backend.registerUser(
+		'Populated Solo',
+		'populated-solo-route@example.com',
+		'a secure solo route password'
+	);
+	const soloHouseholdId = solo.user.householdId;
+	const soloState = backend.getState(solo.user)!;
+	soloState.pantry.push({
+		id: 'solo-saffron',
+		name: 'Saffron',
+		quantity: 1,
+		unit: 'jar',
+		category: 'Spices'
+	});
+	soloState.recipes[0].saved = true;
+	backend.saveState(solo.user, soloState, {
+		ifMatch: backend.getStateEtag(solo.user),
+		ifNoneMatch: null
+	});
+
+	const soloLeaveResponse = await householdRoute.POST(
+		postEvent('/api/household', { user: solo.user }, { action: 'leave' }) as never
+	);
+	assert.equal(soloLeaveResponse.status, 400);
+	assert.equal(backend.getState(solo.user)?.pantry[0]?.name, 'Saffron');
+
+	const badJoinResponse = await householdRoute.POST(
+		postEvent(
+			'/api/household',
+			{ user: solo.user },
+			{ action: 'join', code: 'not-a-valid-invite-code' }
+		) as never
+	);
+	assert.equal(badJoinResponse.status, 400);
+
+	const invite = backend.createHouseholdInvite(host.user);
+	const unconfirmedJoin = await householdRoute.POST(
+		postEvent(
+			'/api/household',
+			{ user: solo.user },
+			{ action: 'join', code: invite.inviteCode }
+		) as never
+	);
+	assert.equal(unconfirmedJoin.status, 409);
+	const unconfirmedBody = (await unconfirmedJoin.json()) as { error: string; code?: string };
+	assert.equal(unconfirmedBody.code, 'confirm_replace');
+
+	const db = backend.getDatabase();
+	const inviteRowBefore = db
+		.prepare('SELECT uses_remaining FROM household_invites WHERE invite_id = ?')
+		.get(invite.inviteId) as { uses_remaining: number };
+	assert.equal(inviteRowBefore.uses_remaining, 1);
+	assert.equal(backend.getState(solo.user)?.pantry[0]?.name, 'Saffron');
+	assert.ok(
+		db.prepare('SELECT 1 FROM household_state WHERE household_id = ?').get(soloHouseholdId)
+	);
+
+	const confirmedLocals: Record<string, unknown> = { user: solo.user };
+	const confirmedJoin = await householdRoute.POST(
+		postEvent('/api/household', confirmedLocals, {
+			action: 'join',
+			code: invite.inviteCode,
+			confirmReplace: true
+		}) as never
+	);
+	assert.equal(confirmedJoin.status, 200);
+	const confirmedData = (await confirmedJoin.json()) as {
+		members: Array<{ id: string; role: string }>;
+	};
+	assert.equal(confirmedData.members.length, 2);
+	const inviteRowAfter = db
+		.prepare('SELECT uses_remaining FROM household_invites WHERE invite_id = ?')
+		.get(invite.inviteId) as { uses_remaining: number } | undefined;
+	assert.equal(inviteRowAfter, undefined);
+	const reuseResponse = await householdRoute.POST(
+		postEvent(
+			'/api/household',
+			{ user: host.user },
+			{ action: 'join', code: invite.inviteCode }
+		) as never
+	);
+	assert.equal(reuseResponse.status, 400);
+});
