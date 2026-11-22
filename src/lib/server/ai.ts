@@ -362,7 +362,10 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher);
+			: fetcher === fetch || requestSignal || fetcher === publicCatalogFetcher
+				? await getPublicModelCatalog(fetcher)
+				: await getCustomFetcherCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2361,6 +2364,11 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
 let publicCatalog: Promise<SupportedModelResponse> | undefined;
 let publicCatalogExpiresAt = 0;
+let publicCatalogFetcher: Fetcher | undefined;
+const customFetcherCatalogs = new WeakMap<
+	Fetcher,
+	{ pending: Promise<SupportedModelResponse>; expiresAt: number }
+>();
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2384,14 +2392,31 @@ export async function getSupportedModels(
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
 	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
 		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+		publicCatalogFetcher = fetcher;
 		const pending = getSupportedModels(fetcher).catch((error) => {
 			if (publicCatalog === pending) {
 				publicCatalog = undefined;
 				publicCatalogExpiresAt = 0;
+				publicCatalogFetcher = undefined;
 			}
 			throw error;
 		});
 		publicCatalog = pending;
 	}
 	return publicCatalog;
+}
+
+function getCustomFetcherCatalog(fetcher: Fetcher): Promise<SupportedModelResponse> {
+	const now = Date.now();
+	const cached = customFetcherCatalogs.get(fetcher);
+	if (cached && now < cached.expiresAt) return cached.pending;
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const pending = getSupportedModels(fetcher).catch((error) => {
+		if (customFetcherCatalogs.get(fetcher)?.pending === pending) {
+			customFetcherCatalogs.delete(fetcher);
+		}
+		throw error;
+	});
+	customFetcherCatalogs.set(fetcher, { pending, expiresAt });
+	return pending;
 }
