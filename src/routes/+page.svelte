@@ -104,9 +104,27 @@
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
-	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
+	import {
+		VoiceCapture,
+		appendDictatedText,
+		planVoiceRetry,
+		planVoiceStart,
+		resolveClosedDialog,
+		type ResumeDialog,
+		type VoiceDialog,
+		type VoiceState
+	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import {
+		entitledChatGPTAccountId,
+		reconcileChatGPTPreferences,
+		runConcurrentModelCatalog,
+		runHouseholdTransition,
+		runOpenSettingsWorkflow,
+		runReconnectWorkflow,
+		runSignedInHydration
+	} from '#lib/client-workflows.ts';
 	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
@@ -135,6 +153,7 @@
 	let sendingSync = $state(false);
 	let syncErrors = $state('');
 	let conflicts = $state<SyncConflict[]>([]);
+	let reviewedEtag = $state<string | null>(null);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
 	let page = $state('discover');
 	let filter = $state(DEFAULT_RECIPE_FILTER);
@@ -293,6 +312,9 @@
 		modal = 'auth';
 	}
 	function clearManagedIdentity() {
+		clearVoiceSession();
+		pantryInput = '';
+		resumeDialog = '';
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
@@ -362,14 +384,17 @@
 	let localVoiceAvailable = $state(false);
 	let voiceState = $state<VoiceState>('idle');
 	let voiceStarting = $state(false);
-	let voiceTarget = $state('');
+	let voiceRetained = $state(false);
+	let voiceError = $state('');
+	let voiceBusy = $derived(voiceStarting || voiceState !== 'idle');
+	let voiceTarget = $state<'' | VoiceDialog>('');
 	let voiceCapture: VoiceCapture | undefined;
+	let activeVoiceImportSession: ImportSession | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
 		const owner = voiceOwner;
 		if (typeof window === 'undefined') return;
-		voiceCapture?.cancel();
-		voiceStarting = false;
+		clearVoiceSession();
 		voiceApiKey = '';
 		voiceProvider = 'auto';
 		voiceModel = '';
@@ -395,13 +420,11 @@
 				})
 				.catch(() => {});
 		}
-		return () => voiceCapture?.cancel();
+		return () => clearVoiceSession();
 	});
 	$effect(() => {
-		if (voiceTarget && modal !== voiceTarget) {
-			voiceCapture?.cancel();
-			voiceStarting = false;
-			voiceTarget = '';
+		if (voiceTarget && modal !== voiceTarget && (voiceStarting || voiceState !== 'idle')) {
+			clearVoiceSession();
 		}
 	});
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
@@ -448,7 +471,7 @@
 	let catalogVersion = 0;
 	let prompt = $state('');
 	let importSession = $state<ImportSession>(emptyImportSession());
-	let resumeImport = $state(false);
+	let resumeDialog = $state<ResumeDialog>('');
 	let searchResults = $state<{ title: string; url: string; description: string }[]>([]);
 	type HouseholdMember = { id: string; name: string; email: string; role: string };
 	type HouseholdInvite = { inviteId: string; expiresAt: number };
@@ -501,11 +524,13 @@
 			clearManagedIdentity();
 			renewManagedSession({ status: 401 });
 		}
+		let stateLoaded = false;
 		if (changedIdentity) {
 			if (user) {
 				const latest = await request('/api/state');
 				adoptKitchen(latest.state || createNewUserState());
 				kitchenLoaded = true;
+				stateLoaded = true;
 			} else if (managedAuth) {
 				clearManagedIdentity();
 			} else {
@@ -519,7 +544,7 @@
 			recipeSearch: Boolean(data.capabilities?.recipeSearch)
 		};
 		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
-		return data;
+		return { ...data, stateLoaded };
 	}
 	const nav = [
 		{ id: 'discover', name: 'Discover', icon: LayoutGrid },
@@ -758,6 +783,7 @@
 				pendingSync = status.pending;
 				sendingSync = status.syncing;
 				conflicts = status.conflicts;
+				reviewedEtag = status.reviewedEtag;
 				syncErrors = status.error;
 			},
 			transport: (owner) => ({
@@ -857,20 +883,33 @@
 						clearManagedIdentity();
 						renewManagedSession({ status: 401 });
 					}
+					syncing = false;
+				} else {
+					const owner = data.user.id;
+					const attempt = connectionAttempt;
+					await runSignedInHydration({
+						returnFromChatGPT,
+						fetchState: () => request('/api/state'),
+						fetchConnections: () => request('/api/connections/chatgpt'),
+						adoptState: (saved) => {
+							adoptKitchen(saved.state || createNewUserState());
+							kitchenLoaded = true;
+							user = data.user ?? null;
+							if (user) showStarter = false;
+							syncing = false;
+						},
+						openSettings: () => openSettings(),
+						onConnections: (result) => {
+							if (attempt !== connectionAttempt || user?.id !== owner) return;
+							chatGPT = result;
+							reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+						},
+						onConnectionsError: () => {
+							if (attempt !== connectionAttempt || user?.id !== owner) return;
+							notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.');
+						}
+					});
 				}
-				if (data.user) {
-					const saved = await request('/api/state');
-					adoptKitchen(saved.state || createNewUserState());
-					kitchenLoaded = true;
-				}
-				user = data.user ?? null;
-				if (user) showStarter = false;
-				syncing = false;
-				if (user && returnFromChatGPT) await openSettings();
-				if (user)
-					await refreshConnections().catch(() =>
-						notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
-					);
 				if (verificationToken && !managedAuth) {
 					try {
 						const verified = await request('/api/auth', {
@@ -954,10 +993,10 @@
 			}
 		} else kitchen = state;
 	}
-	async function retrySync(prefer?: 'local' | 'remote') {
+	async function retrySync(prefer?: 'local' | 'remote', expectedEtag?: string | null) {
 		if (!online || !user || !kitchenSync) return;
 		try {
-			await kitchenSync.sync(prefer);
+			await kitchenSync.sync(prefer, prefer ? (expectedEtag ?? reviewedEtag) : undefined);
 		} catch (e) {
 			syncErrors = (e as Error).message;
 			if (managedAuth) {
@@ -968,21 +1007,29 @@
 	}
 	async function reconnectKitchen() {
 		try {
-			const previous = user;
-			await refreshAuth();
-			if (!user) {
-				kitchenSync?.clearContext();
-				if (managedAuth) {
-					clearManagedIdentity();
-					renewManagedSession({ status: 401 });
-				} else notify('Sign in again to sync the edits saved on this device.');
-				return;
-			}
-			if (previous?.id !== user.id || previous?.householdId !== user.householdId)
-				kitchenSync?.clearContext();
-			const latest = await request('/api/state');
-			adoptKitchen(latest.state || createNewUserState());
-			await retrySync();
+			await runReconnectWorkflow({
+				hadPreviousUser: Boolean(user),
+				refreshAuth,
+				getCurrentUser: () => user,
+				onSignedOut: () => {
+					kitchenSync?.clearContext();
+					if (managedAuth) {
+						clearManagedIdentity();
+						renewManagedSession({ status: 401 });
+					} else notify('Sign in again to sync the edits saved on this device.');
+				},
+				restoreContext: (currentUser) => {
+					kitchenSync?.restore(currentUser);
+				},
+				hasPendingEdits: () => Boolean(kitchenSync?.snapshot()),
+				fetchState: () => request('/api/state'),
+				adoptState: (latest) => {
+					adoptKitchen(latest.state || createNewUserState());
+					kitchenLoaded = true;
+					showStarter = false;
+				},
+				retrySync: () => retrySync()
+			});
 		} catch (e) {
 			syncErrors = (e as Error).message;
 			if (managedAuth) {
@@ -1029,6 +1076,7 @@
 		mobileNav = false;
 	}
 	function addIngredients() {
+		if (voiceBusy || busy) return;
 		const names = pantryInput
 			.split(/[,\n;]/)
 			.map((value) => value.trim())
@@ -1091,9 +1139,10 @@
 				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 			);
 			password = '';
-			if (resumeImport) {
-				resumeImport = false;
-				modal = 'import';
+			if (resumeDialog) {
+				const target = resumeDialog;
+				resumeDialog = '';
+				modal = target;
 			} else {
 				modal = '';
 				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
@@ -1132,8 +1181,10 @@
 			members = [];
 			householdInvites = [];
 			canManageHousehold = false;
+			clearVoiceSession();
+			pantryInput = '';
 			importSession = emptyImportSession();
-			resumeImport = false;
+			resumeDialog = '';
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
@@ -1167,79 +1218,81 @@
 		chatGPTDevice = null;
 		chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 	}
-	async function loadModelCatalog() {
+	async function loadModelCatalog(connectionsTask?: Promise<void>) {
 		if (!user) return;
 		const version = ++catalogVersion;
 		const owner = user.id;
-		const accountId = kitchen.preferences.chatgptAccountId;
-		const isAccount =
-			kitchen.preferences.provider === 'chatgpt' &&
-			accountId &&
-			activeChatGPTAccount?.connected &&
-			activeChatGPTAccount.planEnabled;
 		catalogLoading = true;
 		catalogError = '';
-		const [catalog, account] = await Promise.allSettled([
-			request('/api/models'),
-			isAccount
-				? request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`)
-				: Promise.resolve(null)
-		]);
-		if (version !== catalogVersion || user?.id !== owner) return;
-		if (catalog.status === 'fulfilled') providers = catalog.value.providers;
-		else catalogError = catalog.reason.message || 'The provider catalog could not be loaded.';
-		if (account.status === 'fulfilled') accountModels = account.value?.providers[0]?.models || [];
-		else {
-			accountModels = [];
-			catalogError = account.reason.message || 'ChatGPT models could not be loaded.';
-		}
-		catalogLoading = false;
+		await runConcurrentModelCatalog({
+			connectionsTask,
+			isCurrent: () => version === catalogVersion && user?.id === owner,
+			getEntitledAccountId: () => entitledChatGPTAccountId(kitchen.preferences, chatGPT.accounts),
+			fetchPublicCatalog: () => request('/api/models'),
+			fetchAccountCatalog: (accountId) =>
+				request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`),
+			onResult: ({ catalog, account }) => {
+				if (catalog.status === 'fulfilled') providers = catalog.value.providers;
+				else
+					catalogError =
+						(catalog.reason as Error)?.message || 'The provider catalog could not be loaded.';
+				if (account.status === 'fulfilled')
+					accountModels = account.value?.providers[0]?.models || [];
+				else {
+					accountModels = [];
+					catalogError =
+						(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+				}
+				catalogLoading = false;
+			}
+		});
 	}
 	async function refreshConnections() {
 		if (!user) return;
 		const owner = user.id;
+		const attempt = connectionAttempt;
 		const result = await request('/api/connections/chatgpt');
-		if (user?.id !== owner) return;
+		if (attempt !== connectionAttempt || user?.id !== owner) return;
 		chatGPT = result;
-		if (chatGPT.host) {
-			kitchen.preferences.provider = 'chatgpt';
-			kitchen.preferences.chatgptAccountId = 'host-chatgpt';
-			kitchen.preferences.model = chatGPT.host.model;
-		}
-		if (!chatGPT.accounts.some((a) => a.id === kitchen.preferences.chatgptAccountId))
-			kitchen.preferences.chatgptAccountId =
-				chatGPT.accounts.find((a) => a.connected && a.planEnabled)?.id || chatGPT.accounts[0]?.id;
+		reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
 	}
 	async function refreshAISettings() {
 		error = '';
 		try {
-			await refreshConnections();
+			await loadModelCatalog(refreshConnections());
 		} catch (e) {
 			error = (e as Error).message;
 		}
-		await loadModelCatalog();
 	}
-	async function openSettings(focusAI = false) {
+	async function openSettings(focusTarget: boolean | 'ai' | 'voice' = false) {
 		mobileNav = false;
+		if (!focusTarget && modal !== 'pantry' && modal !== 'import' && modal !== 'settings') {
+			resumeDialog = '';
+		}
 		modal = 'settings';
 		error = '';
-		try {
-			await refreshAuth();
-		} catch {
-			// Keep the last known account state while showing Settings offline.
-		}
-		if (focusAI) {
-			await tick();
-			document.getElementById('ai-connection-heading')?.focus();
-		}
-		try {
-			if (user) {
-				await refreshConnections();
-				await loadModelCatalog();
+		const headingId =
+			focusTarget === true || focusTarget === 'ai'
+				? 'ai-connection-heading'
+				: focusTarget === 'voice'
+					? 'voice-settings-heading'
+					: '';
+		await runOpenSettingsWorkflow({
+			initialUserId: user?.id ?? null,
+			getCurrentUserId: () => user?.id ?? null,
+			refreshAuth,
+			loadConnectionsAndCatalog: () => loadModelCatalog(refreshConnections()),
+			onReadyToFocus: headingId
+				? async () => {
+						if (modal !== 'settings') return;
+						await tick();
+						document.getElementById(headingId)?.focus();
+					}
+				: undefined,
+			onError: (e) => {
+				error = (e as Error).message;
 			}
-		} catch (e) {
-			error = (e as Error).message;
-		}
+		});
 	}
 	async function changeConnection(providerId?: string) {
 		if (providerId === kitchen.preferences.provider) return;
@@ -1258,8 +1311,7 @@
 		accountModels = [];
 		error = '';
 		try {
-			await refreshConnections();
-			await loadModelCatalog();
+			await loadModelCatalog(refreshConnections());
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -1598,8 +1650,12 @@
 	function openButlerControl(target: string) {
 		switch (target) {
 			case 'settings':
-			case 'voice-settings':
+				if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
 				void openSettings();
+				break;
+			case 'voice-settings':
+				if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
+				void openSettings('voice');
 				break;
 			case 'ai-settings':
 				void openSettings(true);
@@ -1684,7 +1740,10 @@
 	}
 	async function scan(event: Event) {
 		const file = (event.target as HTMLInputElement).files?.[0];
-		if (!file || !needAI()) return;
+		if (!file || busy || voiceBusy || !needAI()) {
+			if (imageInput) imageInput.value = '';
+			return;
+		}
 		if (file.size > 5 * 1024 * 1024) {
 			notify('Choose a photo under 5 MB.');
 			return;
@@ -1711,64 +1770,133 @@
 			if (imageInput) imageInput.value = '';
 		}
 	}
+	function clearVoiceSession() {
+		voiceCapture?.cancel();
+		voiceCapture = undefined;
+		voiceStarting = false;
+		voiceState = 'idle';
+		voiceRetained = false;
+		voiceError = '';
+		voiceTarget = '';
+		activeVoiceImportSession = undefined;
+	}
+	function openVoiceSettings() {
+		if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
+		else if (voiceTarget === 'pantry' || voiceTarget === 'import') resumeDialog = voiceTarget;
+		void openSettings('voice');
+	}
+	function discardVoiceRecording() {
+		voiceCapture?.discard();
+		clearVoiceSession();
+	}
+	async function retryVoiceTranscription() {
+		if (voiceBusy || !voiceCapture?.hasRetainedAudio || !voiceTarget) return;
+		const plan = planVoiceRetry({
+			modal,
+			voiceTarget,
+			provider: voiceProvider,
+			localAvailable: localVoiceAvailable,
+			signedIn: Boolean(user),
+			apiKey: voiceApiKey
+		});
+		if (plan.action === 'auth') {
+			resumeDialog = plan.resumeDialog;
+			openAuthentication();
+			notify(plan.message);
+			return;
+		}
+		if (plan.action === 'settings') {
+			resumeDialog = plan.resumeDialog;
+			void openSettings('voice');
+			notify(plan.message);
+			return;
+		}
+		if (plan.action === 'error') {
+			voiceError = plan.message;
+			notify(plan.message);
+			return;
+		}
+		voiceError = '';
+		if (voiceTarget === 'import') activeVoiceImportSession = importSession;
+		await voiceCapture.retry({
+			provider: plan.provider,
+			model: voiceModel,
+			apiKey: voiceApiKey
+		});
+	}
 	function dictate() {
-		startDictation(false);
+		void startDictation(false);
 	}
 	function dictateRecipe() {
-		startDictation(true);
+		void startDictation(true);
 	}
 	async function startDictation(forRecipe: boolean) {
-		if (voiceStarting || voiceState !== 'idle') return;
-		const provider =
-			voiceProvider === 'auto'
-				? localVoiceAvailable && user
-					? 'local'
-					: 'browser'
-				: voiceProvider;
-		if (provider !== 'browser' && !user) {
+		if (voiceBusy) return;
+		if (forRecipe && !modal) {
+			mobileNav = false;
+			error = '';
+			modal = 'import';
+		}
+		const plan = planVoiceStart({
+			forRecipe,
+			modal,
+			provider: voiceProvider,
+			localAvailable: localVoiceAvailable,
+			signedIn: Boolean(user),
+			apiKey: voiceApiKey
+		});
+		if (plan.action === 'auth') {
+			resumeDialog = plan.resumeDialog;
 			openAuthentication();
+			notify(plan.message);
 			return;
 		}
-		if ((provider === 'groq' || provider === 'deepgram') && !voiceApiKey.trim()) {
-			modal = 'settings';
-			notify('Add a voice API key in Voice input settings.');
+		if (plan.action === 'settings') {
+			resumeDialog = plan.resumeDialog;
+			void openSettings('voice');
+			notify(plan.message);
 			return;
 		}
-		if (provider === 'local' && !localVoiceAvailable) {
-			modal = 'settings';
-			notify('Local Whisper needs an endpoint configured by the server operator.');
-			return;
-		}
-		voiceCapture?.cancel();
+		clearVoiceSession();
+		resumeDialog = '';
 		voiceStarting = true;
-		voiceTarget = forRecipe ? 'import' : 'pantry';
-		if (!forRecipe) modal = 'pantry';
-		const inputSession = importSession;
+		voiceTarget = plan.targetDialog;
+		if (modal !== plan.targetDialog) {
+			mobileNav = false;
+			error = '';
+			modal = plan.targetDialog;
+		}
+		activeVoiceImportSession = importSession;
 		const owner = user?.id;
+		const targetDialog = plan.targetDialog;
 		const capture = new VoiceCapture({
 			state: (value) => {
-				voiceState = value;
+				if (voiceCapture === capture) voiceState = value;
+			},
+			retained: (value) => {
+				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
-				if (user?.id !== owner || modal !== (forRecipe ? 'import' : 'pantry')) return;
-				if (forRecipe) {
-					if (importSession !== inputSession || importSession.draft) return;
-					importSession.text = [importSession.text, text]
-						.filter(Boolean)
-						.join('\n')
-						.slice(0, 20000);
+				if (voiceCapture !== capture || user?.id !== owner || modal !== targetDialog) return;
+				voiceError = '';
+				if (targetDialog === 'import') {
+					if (importSession !== activeVoiceImportSession || importSession.draft) return;
+					importSession.text = appendDictatedText('import', importSession.text, text);
 				} else {
-					pantryInput = [pantryInput, text].filter(Boolean).join(', ');
+					pantryInput = appendDictatedText('pantry', pantryInput, text);
 					notify('Review your ingredients, then add them.');
 				}
 			},
 			error: (message) => {
-				notify(message);
+				if (voiceCapture === capture) {
+					voiceError = message;
+					notify(message);
+				}
 			}
 		});
 		voiceCapture = capture;
 		try {
-			await capture.start({ provider, model: voiceModel, apiKey: voiceApiKey });
+			await capture.start({ provider: plan.provider, model: voiceModel, apiKey: voiceApiKey });
 		} finally {
 			if (voiceCapture === capture) voiceStarting = false;
 		}
@@ -2076,8 +2204,11 @@
 		page = 'planner';
 		notify('Meal scheduled.');
 	}
-	async function refreshHousehold() {
-		const data = await request('/api/household');
+	function applyHouseholdRoster(data: {
+		members?: HouseholdMember[];
+		invites?: HouseholdInvite[];
+		canManage?: boolean;
+	}) {
 		members = data.members ?? [];
 		householdInvites = data.invites ?? [];
 		canManageHousehold = Boolean(data.canManage);
@@ -2088,6 +2219,10 @@
 			currentInviteId = '';
 			inviteCode = '';
 		}
+	}
+	async function refreshHousehold() {
+		const data = await request('/api/household');
+		applyHouseholdRoster(data);
 		return data;
 	}
 	async function household() {
@@ -2197,18 +2332,23 @@
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
-			await request('/api/household', {
-				action: 'join',
-				code: joinCode.trim(),
-				...(confirmed ? { confirmReplace: true } : {})
+			await runHouseholdTransition({
+				mutateHousehold: () =>
+					request('/api/household', {
+						action: 'join',
+						code: joinCode.trim(),
+						...(confirmed ? { confirmReplace: true } : {})
+					}),
+				onMutated: () => {
+					joinCode = '';
+					inviteCode = '';
+					currentInviteId = '';
+				},
+				refreshAuth,
+				fetchState: () => request('/api/state'),
+				adoptState: (data) => adoptKitchen(data.state || createNewUserState()),
+				applyRoster: applyHouseholdRoster
 			});
-			joinCode = '';
-			inviteCode = '';
-			currentInviteId = '';
-			await refreshAuth();
-			const data = await request('/api/state');
-			adoptKitchen(data.state || createNewUserState());
-			await refreshHousehold();
 			modal = 'household';
 			syncing = false;
 			notify('Welcome to your shared kitchen.');
@@ -2261,20 +2401,25 @@
 			currentInviteId = '';
 		}
 		if (modal === 'onboarding') dismissOnboarding();
-		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
-			resumeImport = false;
-			modal = 'import';
-		} else modal = '';
+		else {
+			const next = resolveClosedDialog(modal, resumeDialog);
+			resumeDialog = next.resumeDialog;
+			modal = next.modal;
+		}
 		error = '';
 	}
 	function openImport(text?: string) {
-		resumeImport = false;
-		if (text !== undefined) importSession = { ...emptyImportSession(), text };
+		resumeDialog = '';
+		if (text !== undefined) {
+			if (voiceTarget === 'import') clearVoiceSession();
+			importSession = { ...emptyImportSession(), text };
+		}
 		error = '';
 		mobileNav = false;
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
+		if (voiceTarget === 'import') clearVoiceSession();
 		importSession = { ...emptyImportSession(), url };
 		openImport();
 	}
@@ -2283,7 +2428,7 @@
 		signal: AbortSignal
 	) {
 		if (!needAI()) {
-			resumeImport = true;
+			resumeDialog = 'import';
 			return null;
 		}
 		return ai('capture', input, signal);
@@ -2293,8 +2438,9 @@
 			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
 		const saved = { ...recipe, saved: true, nutritionStale };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		if (voiceTarget === 'import') clearVoiceSession();
 		importSession = emptyImportSession();
-		resumeImport = false;
+		resumeDialog = '';
 		modal = '';
 		selected = saved;
 		page = 'saved';
@@ -2347,8 +2493,10 @@
 			members = [];
 			householdInvites = [];
 			canManageHousehold = false;
+			clearVoiceSession();
+			pantryInput = '';
 			importSession = emptyImportSession();
-			resumeImport = false;
+			resumeDialog = '';
 			apiKey = '';
 			deletePassword = '';
 			stateEtag = null;
@@ -2420,15 +2568,19 @@
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
-			await request('/api/household', { action: 'leave' });
-			joinCode = '';
-			inviteCode = '';
-			currentInviteId = '';
-			memberToRemove = null;
-			await refreshAuth();
-			const data = await request('/api/state');
-			adoptKitchen(data.state || createNewUserState());
-			await refreshHousehold();
+			await runHouseholdTransition({
+				mutateHousehold: () => request('/api/household', { action: 'leave' }),
+				onMutated: () => {
+					joinCode = '';
+					inviteCode = '';
+					currentInviteId = '';
+					memberToRemove = null;
+				},
+				refreshAuth,
+				fetchState: () => request('/api/state'),
+				adoptState: (data) => adoptKitchen(data.state || createNewUserState()),
+				applyRoster: applyHouseholdRoster
+			});
 			syncing = false;
 			modal = '';
 			notify('You now have your own kitchen.');
@@ -2436,6 +2588,7 @@
 			syncing = false;
 			error = (e as Error).message;
 		} finally {
+			syncing = false;
 			busy = false;
 			householdBusy = false;
 		}
@@ -2629,7 +2782,7 @@
 						void reconnectKitchen();
 					}}
 					resolve={(choice) => {
-						void retrySync(choice);
+						void retrySync(choice, reviewedEtag);
 					}}
 					exportPending={exportPendingChanges}
 				/>{/if}
@@ -2670,10 +2823,14 @@
 						<button
 							class="secondary"
 							aria-label="Scan ingredients from a photo"
+							disabled={busy || voiceBusy}
 							onclick={() => imageInput.click()}><Camera size={19} /></button
 						>
-						<button class="secondary" aria-label="Dictate ingredients" onclick={dictate}
-							><Mic size={19} /></button
+						<button
+							class="secondary"
+							aria-label="Dictate ingredients"
+							disabled={busy || voiceBusy}
+							onclick={dictate}><Mic size={19} /></button
 						>
 					</div>{/if}
 				{#if page === 'discover'}<section
@@ -2689,9 +2846,13 @@
 								><button
 									class="banner-icon"
 									aria-label="Scan ingredients from a photo"
+									disabled={busy || voiceBusy}
 									onclick={() => imageInput.click()}><Camera size={20} /></button
-								><button class="banner-icon" aria-label="Dictate ingredients" onclick={dictate}
-									><Mic size={20} /></button
+								><button
+									class="banner-icon"
+									aria-label="Dictate ingredients"
+									disabled={busy || voiceBusy}
+									onclick={dictate}><Mic size={20} /></button
 								>
 							</div>
 						</div>
@@ -2878,9 +3039,11 @@
 							}}>Clear depleted items</button
 						>{/if}
 					<div>
-						<button class="secondary" onclick={() => imageInput.click()}
-							><Camera size={17} /> Scan a photo</button
-						><button class="secondary" onclick={dictate}
+						<button
+							class="secondary"
+							disabled={busy || voiceBusy}
+							onclick={() => imageInput.click()}><Camera size={17} /> Scan a photo</button
+						><button class="secondary" disabled={busy || voiceBusy} onclick={dictate}
 							><Mic size={17} /> Tell us what you have</button
 						>
 					</div>
@@ -3346,7 +3509,7 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if voiceState !== 'idle' || voiceStarting}<div class="voice-session" in:revealMotion>
+				{#if modal === voiceTarget && voiceBusy}<div class="voice-session" in:revealMotion>
 						<p role="status" aria-live="polite">
 							{voiceStarting
 								? 'Opening microphone…'
@@ -3357,13 +3520,33 @@
 						<div class="dialog-actions">
 							{#if voiceState === 'recording'}<button
 									class="primary"
+									type="button"
 									onclick={() => voiceCapture?.stop()}>Stop recording</button
-								>{/if}<button
-								class="secondary"
+								>{/if}<button class="secondary" type="button" onclick={clearVoiceSession}
+								>Cancel voice</button
+							>
+						</div>
+					</div>{:else if modal === voiceTarget && voiceRetained}<div
+						class="voice-session voice-recovery"
+						in:revealMotion
+					>
+						<p class="voice-error-copy" role="alert">
+							{voiceError || 'Voice transcription failed. Your recording is ready to retry.'}
+						</p>
+						<p class="voice-recovery-note">
+							Your recording is kept in this tab so you can retry without speaking again.
+						</p>
+						<div class="dialog-actions voice-recovery-actions">
+							<button
+								class="primary"
+								type="button"
 								onclick={() => {
-									voiceCapture?.cancel();
-									voiceStarting = false;
-								}}>Cancel voice</button
+									void retryVoiceTranscription();
+								}}><RefreshCw size={16} /> Retry transcription</button
+							><button class="secondary" type="button" onclick={openVoiceSettings}
+								><Settings size={16} /> Open Settings</button
+							><button class="text-button" type="button" onclick={discardVoiceRecording}
+								>Discard recording</button
 							>
 						</div>
 					</div>{/if}
@@ -3380,6 +3563,7 @@
 						capture={captureImport}
 						save={saveImportedRecipe}
 						dictate={dictateRecipe}
+						{voiceBusy}
 					/>{:else if modal === 'onboarding'}
 					<span class="dialog-spark">✷</span>
 					<h2>Recipe preferences</h2>
@@ -3468,12 +3652,18 @@
 						Separate with commas or new lines. Add quantities and units when you know them.
 					</p>
 					<div class="dialog-actions">
-						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button><button
+						<button class="secondary" type="button" disabled={voiceBusy || busy} onclick={dictate}
+							><Mic size={17} /> Use voice</button
+						><button
 							class="secondary"
+							type="button"
 							onclick={() => imageInput.click()}
-							disabled={busy}><Camera size={17} /> Use photo</button
-						><button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
-							>Add ingredients <ArrowRight size={17} /></button
+							disabled={busy || voiceBusy}><Camera size={17} /> Use photo</button
+						><button
+							class="primary"
+							type="button"
+							disabled={voiceBusy || busy || !pantryInput.trim()}
+							onclick={addIngredients}>Add ingredients <ArrowRight size={17} /></button
 						>
 					</div>
 				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
@@ -4108,11 +4298,31 @@
 		z-index: 5;
 		background: var(--surface);
 		padding: 16px;
+		margin-bottom: 16px;
 		border-bottom: 2px solid var(--accent);
 	}
+	.voice-session.voice-recovery {
+		border-bottom-color: #b55439;
+	}
 	.voice-session p {
-		font-size: 17px;
-		margin: 0 0 12px;
+		font-size: 16px;
+		margin: 0 0 10px;
+	}
+	.voice-session .voice-error-copy {
+		color: #b55439;
+		font-weight: 500;
+	}
+	.voice-session .voice-recovery-note {
+		font-size: 14px;
+		color: var(--muted);
+		margin-bottom: 12px;
+	}
+	.voice-session .dialog-actions {
+		flex-wrap: wrap;
+		margin-top: 12px;
+	}
+	.voice-session .voice-recovery-actions .primary:last-child {
+		margin-left: 0;
 	}
 
 	.expiry-filters {
