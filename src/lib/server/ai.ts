@@ -362,7 +362,7 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getSupportedModels(requestFetcher);
+			: await getPublicModelCatalog(requestFetcher);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2358,6 +2358,19 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
+type CachedPublicCatalog = {
+	pending: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+
+const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+let defaultPublicCatalog: CachedPublicCatalog | undefined;
+const customFetcherCatalogs = new WeakMap<Fetcher, CachedPublicCatalog>();
+
+function isDefaultPublicCatalogFetcher(fetcher: Fetcher): boolean {
+	return fetcher === globalThis.fetch || fetcher.name === 'server_fetch';
+}
+
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
 ): Promise<SupportedModelResponse> {
@@ -2375,4 +2388,27 @@ export async function getSupportedModels(
 	const body = await readJsonResponse(response, 'Model catalog');
 	if (!response.ok) throw upstreamError(response.status, 'Model catalog');
 	return transformModelCatalog(body);
+}
+
+export function getPublicModelCatalog(
+	fetcher: Fetcher = globalThis.fetch
+): Promise<SupportedModelResponse> {
+	const useDefaultCache = isDefaultPublicCatalogFetcher(fetcher);
+	const cached = useDefaultCache ? defaultPublicCatalog : customFetcherCatalogs.get(fetcher);
+	if (cached && Date.now() < cached.expiresAt) {
+		return cached.pending;
+	}
+	const expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const pending = getSupportedModels(fetcher).catch((error) => {
+		const current = useDefaultCache ? defaultPublicCatalog : customFetcherCatalogs.get(fetcher);
+		if (current?.pending === pending) {
+			if (useDefaultCache) defaultPublicCatalog = undefined;
+			else customFetcherCatalogs.delete(fetcher);
+		}
+		throw error;
+	});
+	const entry: CachedPublicCatalog = { pending, expiresAt };
+	if (useDefaultCache) defaultPublicCatalog = entry;
+	else customFetcherCatalogs.set(fetcher, entry);
+	return pending;
 }

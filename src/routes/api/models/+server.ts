@@ -4,7 +4,7 @@ import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-in
 import { clearChatGPTCredentials } from '#lib/server/oauth-storage.ts';
 import { ApiError } from '#lib/server/db.ts';
 import type { RequestHandler } from './$types';
-import { AIRequestError, getSupportedModels } from '#lib/server/ai.ts';
+import { AIRequestError, getPublicModelCatalog } from '#lib/server/ai.ts';
 
 const HOST_UNRECOVERABLE_CODES = new Set([
 	'chatgpt_account_reauth_required',
@@ -17,20 +17,6 @@ const HOST_UNRECOVERABLE_CODES = new Set([
 ]);
 const HOST_UNAVAILABLE_MESSAGE =
 	'Host AI is currently unavailable. Choose another connection in Settings or contact the host administrator.';
-
-let catalog: Promise<Awaited<ReturnType<typeof getSupportedModels>>> | undefined;
-let catalogExpiresAt = 0;
-function publicCatalog(fetcher: typeof fetch) {
-	if (!catalog || Date.now() >= catalogExpiresAt) {
-		catalogExpiresAt = Date.now() + 60 * 60 * 1000;
-		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (catalog === pending) catalog = undefined;
-			throw error;
-		});
-		catalog = pending;
-	}
-	return catalog;
-}
 
 export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
@@ -63,7 +49,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 				(connection) => listChatGPTModels(connection.accessToken, connection.fetcher)
 			);
 			try {
-				const catalog = await publicCatalog(fetch);
+				const catalog = await getPublicModelCatalog(fetch);
 				const openai = catalog.providers.find((provider) => provider.id === 'openai');
 				for (const model of result.providers[0].models) {
 					const metadata = openai?.models.find((candidate) => candidate.id === model.id);
@@ -77,7 +63,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return Response.json(await publicCatalog(fetch), {
+		return Response.json(await getPublicModelCatalog(fetch), {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {
