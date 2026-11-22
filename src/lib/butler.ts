@@ -223,6 +223,7 @@ export function applyButlerCommands(
 	const trackedWeeks = new Set(activeWeeklyScopes(state.shopping));
 	let shouldRefreshWeeks = false;
 	const effects: ButlerEffect[] = [];
+	const deletedCheckedWeeks = new Set<string>();
 	for (const command of commands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
@@ -249,7 +250,9 @@ export function applyButlerCommands(
 				requireId(state.recipes, command.id);
 				state.recipes = state.recipes.filter((item) => item.id !== command.id);
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
-				state.shopping = state.shopping.filter((item) => item.sourceKey !== `recipe:${command.id}`);
+				state.shopping = state.shopping.filter(
+					(item) => item.sourceKey !== `recipe:${command.id}` || item.checked
+				);
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
 				shouldRefreshWeeks = true;
 				break;
@@ -306,10 +309,16 @@ export function applyButlerCommands(
 			case 'shopping.upsert':
 				state.shopping = upsert(state.shopping, command.item);
 				break;
-			case 'shopping.delete':
+			case 'shopping.delete': {
 				requireId(state.shopping, command.id);
+				const removed = state.shopping.find((item) => item.id === command.id);
+				const week = removed?.checked
+					? removed.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1]
+					: undefined;
+				if (week) deletedCheckedWeeks.add(week);
 				state.shopping = state.shopping.filter((item) => item.id !== command.id);
 				break;
+			}
 			case 'shopping.generate': {
 				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : safeNow);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
@@ -329,11 +338,13 @@ export function applyButlerCommands(
 				break;
 		}
 	}
+	const weeksToRefresh = new Set(deletedCheckedWeeks);
 	if (shouldRefreshWeeks) {
-		for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
-		for (const week of trackedWeeks) {
-			state.shopping = refreshWeekShopping(state, week, safeNow);
-		}
+		for (const week of trackedWeeks) weeksToRefresh.add(week);
+		for (const week of activeWeeklyScopes(state.shopping)) weeksToRefresh.add(week);
+	}
+	for (const week of weeksToRefresh) {
+		state.shopping = refreshWeekShopping(state, week, safeNow);
 	}
 	if (
 		state.recipes.length > MAX_RECIPES ||
