@@ -1074,6 +1074,324 @@ test('capture keeps model nutrition when source values use per-volume or recipe-
 	}
 });
 
+test('capture and import skip multi-serving, weight, volume, and container servingSize bases while merging single servings', async () => {
+	const unsupportedCases = [
+		{ recipeYield: '4 servings', nutrition: { servingSize: '2 servings', calories: '900 kcal' } },
+		{ recipeYield: '4 servings', nutrition: { servingSize: '1/2 serving', calories: '210 kcal' } },
+		{ recipeYield: '4 servings', nutrition: { servingSize: '1-2 servings', calories: '650 kcal' } },
+		{ recipeYield: '12 cookies', nutrition: { servingSize: '2 cookies', calories: '320 kcal' } },
+		{ recipeYield: '4 servings', nutrition: { servingSize: '250 g', calories: '500 kcal' } },
+		{ recipeYield: '4 servings', nutrition: { servingSize: '4 oz', calories: '280 kcal' } },
+		{ recipeYield: '4 servings', nutrition: { servingSize: '1 cup', calories: '440 kcal' } },
+		{ recipeYield: '4 servings', nutrition: { servingSize: '240 mL', calories: '310 kcal' } },
+		{ recipeYield: '2 servings', nutrition: { servingSize: '1 can', calories: '760 kcal' } },
+		{ recipeYield: '1 jar', nutrition: { servingSize: '1 jar', calories: '1,100 kcal' } },
+		{ recipeYield: '6 servings', nutrition: { servingSize: '1 pot', calories: '2,200 kcal' } },
+		{ recipeYield: '4 servings', nutrition: { servingSize: '1 container', calories: '880 kcal' } },
+		{ recipeYield: '12 cookies', nutrition: { servingSize: '1 cookie', calories: '160 kcal' } }
+	];
+
+	for (const entry of unsupportedCases) {
+		const html = `<script type="application/ld+json">${JSON.stringify({
+			'@context': 'https://schema.org',
+			'@type': 'Recipe',
+			name: 'Source Stew',
+			recipeYield: entry.recipeYield,
+			totalTime: 'PT30M',
+			recipeIngredient: ['1 cup lentils'],
+			recipeInstructions: ['Simmer until tender.'],
+			nutrition: entry.nutrition
+		})}</script>`;
+
+		let observedCapturePrompt = '';
+		const captureResult = (await runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				url: 'https://recipes.example.test/stew'
+			},
+			async (_input, init) => {
+				observedCapturePrompt = JSON.parse(String(init?.body)).messages[1].content;
+				return jsonResponse({
+					choices: [{ message: { content: JSON.stringify(capturedRecipe) } }]
+				});
+			},
+			async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+		)) as any;
+
+		assert.match(
+			observedCapturePrompt,
+			new RegExp(
+				`"servingSize":${JSON.stringify(entry.nutrition.servingSize).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`
+			)
+		);
+		assert.deepEqual(captureResult.recipe.nutrition, nutrition, JSON.stringify(entry));
+		assert.ok(
+			captureResult.assumptions.some((note: string) => /Skipped page nutrition/i.test(note)),
+			`expected skipped nutrition assumption for ${JSON.stringify(entry)}`
+		);
+
+		const importResult = (await runAIRequest(
+			{
+				action: 'import',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				url: 'https://www.allrecipes.com/recipe/stew'
+			},
+			async () =>
+				jsonResponse({ choices: [{ message: { content: JSON.stringify(generatedRecipe) } }] }),
+			async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+		)) as any;
+
+		assert.deepEqual(importResult.recipes[0].nutrition, nutrition, JSON.stringify(entry));
+	}
+
+	const singleServingCases = [
+		{
+			recipeYield: '4 servings',
+			servings: 2,
+			nutrition: { servingSize: '1 serving (240 g)', calories: '510 kcal', proteinContent: '26 g' }
+		},
+		{
+			recipeYield: '12 cookies',
+			servings: 12,
+			nutrition: { servingSize: '1 cookie', calories: '165 kcal', proteinContent: '3 g' }
+		}
+	];
+
+	for (const entry of singleServingCases) {
+		const html = `<script type="application/ld+json">${JSON.stringify({
+			'@context': 'https://schema.org',
+			'@type': 'Recipe',
+			name: 'Single Serving Check',
+			recipeYield: entry.recipeYield,
+			totalTime: 'PT25M',
+			recipeIngredient: ['1 cup flour'],
+			recipeInstructions: ['Bake until golden.'],
+			nutrition: entry.nutrition
+		})}</script>`;
+
+		const captureResult = (await runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				url: 'https://recipes.example.test/single'
+			},
+			async () =>
+				jsonResponse({
+					choices: [
+						{
+							message: {
+								content: JSON.stringify({ ...capturedRecipe, servings: entry.servings })
+							}
+						}
+					]
+				}),
+			async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+		)) as any;
+
+		assert.equal(
+			captureResult.recipe.nutrition.calories,
+			Number.parseInt(entry.nutrition.calories, 10)
+		);
+		assert.equal(
+			captureResult.assumptions.some((note: string) => /Skipped page nutrition/i.test(note)),
+			false
+		);
+	}
+});
+
+test('capture aligns draft schemas for slow-cooker times, empty or long text, 1100-char steps, and coerced zero quantities', async () => {
+	const longTitle = 'Slow-Braised Garlic Herb Shoulder '.repeat(6).trim().slice(0, 200);
+	const longDescription = 'Rich slow-cooker broth notes. '.repeat(250);
+	const detailedStep = 'Cook covered on low heat until fork-tender, basting occasionally. '.repeat(
+		18
+	);
+	assert.equal(longTitle.length, 200);
+	assert.ok(longDescription.length > 6_000);
+	assert.ok(detailedStep.length >= 1_100);
+
+	let observedSchema: any;
+	const anthropicResult = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'anthropic',
+			model: 'claude-sonnet-4-6',
+			apiKey: 'anthropic-capture-key',
+			prompt: 'Slow cooker pork shoulder with salt to taste'
+		},
+		async (_input, init) => {
+			observedSchema = JSON.parse(String(init?.body)).output_config.format.schema;
+			return jsonResponse({
+				content: [
+					{
+						type: 'text',
+						text: JSON.stringify({
+							...capturedRecipe,
+							title: longTitle,
+							description: '',
+							time: 720,
+							ingredients: [
+								{ name: 'pork shoulder', quantity: 3, unit: 'lb' },
+								{ name: 'kosher salt', quantity: 0, unit: 'to taste' },
+								{ name: 'black pepper', quantity: 0, unit: 'pinch' },
+								{ name: 'olive oil', quantity: 0, unit: 'for frying' }
+							],
+							steps: [detailedStep, '   '],
+							assumptions: Array.from({ length: 30 }, (_, index) => `Model note ${index + 1}`)
+						})
+					}
+				]
+			});
+		}
+	)) as any;
+
+	assert.equal(observedSchema.properties.title.maxLength, 200);
+	assert.equal(observedSchema.properties.description.maxLength, 10_000);
+	assert.equal(observedSchema.properties.description.minLength, undefined);
+	assert.equal(observedSchema.properties.time.maximum, 100_000);
+	assert.equal(observedSchema.properties.steps.items.maxLength, 10_000);
+	assert.equal(observedSchema.properties.ingredients.items.properties.quantity.minimum, 0);
+	assert.equal(observedSchema.properties.nutrition.properties.calories.maximum, 1_000_000);
+
+	assert.equal(anthropicResult.recipe.title, longTitle);
+	assert.equal(anthropicResult.recipe.description, '');
+	assert.equal(anthropicResult.recipe.time, 720);
+	assert.deepEqual(anthropicResult.recipe.steps, [detailedStep.trim()]);
+	for (const ingredient of anthropicResult.recipe.ingredients) {
+		assert.ok(ingredient.quantity > 0, `expected positive quantity for ${ingredient.name}`);
+		assert.ok(ingredient.unit.length > 0);
+	}
+	assert.equal(anthropicResult.recipe.ingredients[1].unit, 'tsp');
+	assert.equal(anthropicResult.recipe.ingredients[2].unit, 'pinch');
+	assert.equal(anthropicResult.recipe.ingredients[3].unit, 'tbsp');
+	assert.equal(anthropicResult.assumptions.length, 30);
+	assert.ok(anthropicResult.assumptions.every((note: string) => note.length <= 300));
+	assert.ok(anthropicResult.assumptions.some((note: string) => /kosher salt/i.test(note)));
+	assert.ok(anthropicResult.assumptions.some((note: string) => /black pepper/i.test(note)));
+	assert.ok(anthropicResult.assumptions.some((note: string) => /olive oil/i.test(note)));
+
+	const longDescResult = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			prompt: 'Long description slow braise'
+		},
+		async () =>
+			jsonResponse({
+				choices: [
+					{
+						message: {
+							content: JSON.stringify({
+								...capturedRecipe,
+								description: longDescription,
+								time: 720,
+								steps: [detailedStep]
+							})
+						}
+					}
+				]
+			})
+	)) as any;
+
+	assert.equal(longDescResult.recipe.description, longDescription.trim());
+	assert.equal(longDescResult.recipe.time, 720);
+	assert.equal(longDescResult.recipe.steps[0], detailedStep.trim());
+
+	const combinedAssumptionsResult = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			prompt: 'https://recipes.example.test/braise\nAdd salt to taste.'
+		},
+		async () =>
+			jsonResponse({
+				choices: [
+					{
+						message: {
+							content: JSON.stringify({
+								...capturedRecipe,
+								ingredients: [
+									...capturedRecipe.ingredients,
+									{ name: 'kosher salt', quantity: 0, unit: 'to taste' }
+								],
+								assumptions: Array.from({ length: 30 }, (_, index) => `Model note ${index + 1}`)
+							})
+						}
+					}
+				]
+			}),
+		async () => {
+			throw new Error('unseparated links in prompt must not be fetched');
+		}
+	)) as any;
+
+	assert.equal(combinedAssumptionsResult.assumptions.length, 30);
+	assert.match(combinedAssumptionsResult.assumptions[0], /not fetched/i);
+	assert.match(combinedAssumptionsResult.assumptions.at(-1), /kosher salt/i);
+});
+
+test('JSON-LD normalization parses ISO-8601 day and sub-minute durations, sums prepTime plus cookTime, and keeps long fields', async () => {
+	const longTitle = 'T'.repeat(195);
+	const longDescription = 'D'.repeat(1_500);
+	const longStep = 'S'.repeat(1_100);
+	const durationCases = [
+		{ fields: { prepTime: 'PT25M', cookTime: 'PT11H35M' }, expected: 720 },
+		{ fields: { totalTime: 'P0DT0M', prepTime: 'PT15M', cookTime: 'PT30M' }, expected: 45 },
+		{ fields: { totalTime: 'P0DT0H45M' }, expected: 45 },
+		{ fields: { totalTime: 'P1DT2H' }, expected: 1_560 },
+		{ fields: { totalTime: 'PT30S' }, expected: 1 },
+		{ fields: { totalTime: 'PT1M30.5S' }, expected: 2 },
+		{ fields: { totalTime: 'P0DT0M' }, expected: 0 },
+		{ fields: { totalTime: 'P90D' }, expected: 100_000 }
+	];
+
+	for (const { fields, expected } of durationCases) {
+		let observedPrompt = '';
+		const html = `<script type="application/ld+json">${JSON.stringify({
+			'@context': 'https://schema.org',
+			'@type': 'Recipe',
+			name: longTitle,
+			description: longDescription,
+			recipeYield: '4 servings',
+			...fields,
+			recipeIngredient: ['2 lb beef chuck'],
+			recipeInstructions: [{ '@type': 'HowToStep', text: longStep }]
+		})}</script>`;
+
+		await runAIRequest(
+			{
+				action: 'capture',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'capture-key',
+				url: 'https://recipes.example.test/durations'
+			},
+			async (_input, init) => {
+				observedPrompt = JSON.parse(String(init?.body)).messages[1].content;
+				return jsonResponse({
+					choices: [{ message: { content: JSON.stringify(capturedRecipe) } }]
+				});
+			},
+			async () => new Response(html, { headers: { 'content-type': 'text/html' } })
+		);
+
+		assert.match(observedPrompt, new RegExp(`"time":${expected}\\b`), JSON.stringify(fields));
+		assert.ok(observedPrompt.includes(`"title":"${longTitle}"`));
+		assert.ok(observedPrompt.includes(`"description":"${longDescription}"`));
+		assert.ok(observedPrompt.includes(longStep));
+	}
+});
+
 test('capture and import ignore source nutrition outside finite persistence bounds', async () => {
 	const html = structuredRecipeHtml({
 		calories: `${'9'.repeat(400)} kcal`,
