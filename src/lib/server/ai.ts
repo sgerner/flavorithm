@@ -362,7 +362,8 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher);
+			: await getPublicModelCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2365,7 +2366,7 @@ type CachedPublicCatalog = {
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
 let defaultPublicCatalog: CachedPublicCatalog | undefined;
-const customFetcherCatalogs = new WeakMap<Fetcher, CachedPublicCatalog>();
+let customFetcherCatalogs = new WeakMap<Fetcher, CachedPublicCatalog>();
 
 function isDefaultPublicCatalogFetcher(fetcher: Fetcher): boolean {
 	return fetcher === globalThis.fetch || fetcher.name === 'server_fetch';
@@ -2411,4 +2412,10 @@ export function getPublicModelCatalog(
 	if (useDefaultCache) defaultPublicCatalog = entry;
 	else customFetcherCatalogs.set(fetcher, entry);
 	return pending;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	defaultPublicCatalog = undefined;
+	customFetcherCatalogs = new WeakMap<Fetcher, CachedPublicCatalog>();
 }
