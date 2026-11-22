@@ -1,5 +1,5 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
-import { normalizeName, unitInfo } from './domain.ts';
+import { buildShoppingList, normalizeName, unitInfo } from './domain.ts';
 export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
@@ -161,6 +161,163 @@ export function reconcileShoppingList(
 	return [...retained, ...generated];
 }
 
+function formatCalendarKey(date: { year: number; month: number; day: number }): string {
+	return `${date.year}-${String(date.month + 1).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`;
+}
+
+/** Compute the Monday YYYY-MM-DD start key for a calendar date string, or undefined if invalid. */
+export function weekStartForDate(value: string): string | undefined {
+	const parsed = expiryDate(value);
+	if (!parsed) return undefined;
+	const day = new Date(0);
+	day.setUTCFullYear(parsed.year, parsed.month, parsed.day);
+	day.setUTCHours(12, 0, 0, 0);
+	day.setUTCDate(day.getUTCDate() - ((day.getUTCDay() + 6) % 7));
+	return formatCalendarKey({
+		year: day.getUTCFullYear(),
+		month: day.getUTCMonth(),
+		day: day.getUTCDate()
+	});
+}
+
+function weekDatesForStart(startDate: string): Set<string> | undefined {
+	const parsed = expiryDate(startDate);
+	if (!parsed) return undefined;
+	const dates = new Set<string>();
+	for (let offset = 0; offset < 7; offset++) {
+		const day = new Date(0);
+		day.setUTCFullYear(parsed.year, parsed.month, parsed.day + offset);
+		day.setUTCHours(12, 0, 0, 0);
+		dates.add(
+			formatCalendarKey({
+				year: day.getUTCFullYear(),
+				month: day.getUTCMonth(),
+				day: day.getUTCDate()
+			})
+		);
+	}
+	return dates;
+}
+
+/** Extract valid YYYY-MM-DD start dates for all active week:<startDate> scopes in shopping. */
+export function activeWeeklyScopes(shopping: ShoppingItem[]): string[] {
+	const weeks = new Set<string>();
+	for (const item of shopping) {
+		const match = item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/);
+		if (match && expiryDate(match[1])) weeks.add(match[1]);
+	}
+	return [...weeks];
+}
+
+/** Reconcile one weekly shopping scope against incomplete meals in that 7-day window. */
+export function refreshWeekShopping(
+	state: Pick<AppState, 'recipes' | 'pantry' | 'meals' | 'shopping'>,
+	startDate: string,
+	now: Date = new Date()
+): ShoppingItem[] {
+	const dates = weekDatesForStart(startDate);
+	if (!dates) return state.shopping;
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const meals = state.meals.filter((meal) => !meal.completedAt && dates.has(meal.date));
+	const additions = buildShoppingList(state.recipes, state.pantry, meals, safeNow);
+	return reconcileShoppingList(state.shopping, additions, `week:${startDate}`);
+}
+
+/**
+ * Reconcile explicit user shopping for a recipe or week scope.
+ * Clears a recipe:<id> scope first when all of its existing rows are already checked,
+ * while preserving partial mid-trip checked rows when unchecked rows remain.
+ */
+export function shopForScope(
+	existing: ShoppingItem[],
+	additions: ShoppingItem[],
+	sourceKey: string
+): { shopping: ShoppingItem[]; uncheckedCount: number } {
+	const scopeItems = existing.filter((item) => item.sourceKey === sourceKey);
+	const clearCompletedRecipeScope =
+		sourceKey.startsWith('recipe:') &&
+		scopeItems.length > 0 &&
+		scopeItems.every((item) => item.checked);
+	const baseline = clearCompletedRecipeScope
+		? existing.filter((item) => item.sourceKey !== sourceKey)
+		: existing;
+	const shopping = reconcileShoppingList(baseline, additions, sourceKey);
+	const uncheckedCount = shopping.filter(
+		(item) => item.sourceKey === sourceKey && !item.checked
+	).length;
+	return { shopping, uncheckedCount };
+}
+
+function retireCheckedByScopeBudget(
+	shopping: ShoppingItem[],
+	budgetForScope: (scopeKey: string) => Map<string, number> | undefined
+): ShoppingItem[] {
+	const result: ShoppingItem[] = [];
+	for (const item of shopping) {
+		if (
+			!item.checked ||
+			!Number.isFinite(item.quantity) ||
+			!(item.quantity > 0) ||
+			!item.unit.trim()
+		) {
+			result.push({ ...item });
+			continue;
+		}
+		const scopeBudget = budgetForScope(item.sourceKey ?? '');
+		if (!scopeBudget) {
+			result.push({ ...item });
+			continue;
+		}
+		const key = bucketKey(item.name, item.unit);
+		const availableBase = scopeBudget.get(key) ?? 0;
+		if (!(availableBase > 0)) {
+			result.push({ ...item });
+			continue;
+		}
+		const unit = unitInfo(item.unit);
+		const itemBase = item.quantity * unit.factor;
+		const retiredBase = Math.min(itemBase, availableBase);
+		scopeBudget.set(key, Math.max(0, availableBase - retiredBase));
+		const remainingBase = Math.max(0, itemBase - retiredBase);
+		const remainingQuantity = roundQuantity(remainingBase / unit.factor);
+		if (remainingQuantity > 0) {
+			result.push({ ...item, quantity: remainingQuantity });
+		}
+	}
+	return result;
+}
+
+/**
+ * Retire matching checked shopping rows in place up to the added non-expired pantry
+ * quantities, tracked independently per shopping scope.
+ */
+export function retireCheckedShoppingItems(
+	shopping: ShoppingItem[],
+	additions: Array<Pick<Ingredient, 'name' | 'quantity' | 'unit' | 'expires'>>,
+	now: Date = new Date()
+): ShoppingItem[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const addedByBucket = new Map<string, number>();
+	for (const item of additions) {
+		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
+		if (expiryStatus(item.expires, safeNow) === 'expired') continue;
+		const key = bucketKey(item.name, item.unit);
+		const unit = unitInfo(item.unit);
+		addedByBucket.set(key, (addedByBucket.get(key) ?? 0) + item.quantity * unit.factor);
+	}
+	if (addedByBucket.size === 0) return shopping.map((item) => ({ ...item }));
+
+	const budgetsByScope = new Map<string, Map<string, number>>();
+	return retireCheckedByScopeBudget(shopping, (scopeKey) => {
+		let budget = budgetsByScope.get(scopeKey);
+		if (!budget) {
+			budget = new Map(addedByBucket);
+			budgetsByScope.set(scopeKey, budget);
+		}
+		return budget;
+	});
+}
+
 /** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
 export function transferPurchasedItemsToPantry(
 	pantry: Ingredient[],
@@ -220,6 +377,46 @@ export function transferPurchasedItemsToPantry(
 	return result;
 }
 
+/**
+ * Add pantry entries, retire matching checked shopping rows per scope up to non-expired
+ * added quantities, and refresh active weekly scopes once.
+ */
+export function addPantryItems(
+	state: AppState,
+	additions: ShoppingItem[],
+	now: Date = new Date(),
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): AppState {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const weeks = activeWeeklyScopes(state.shopping);
+	const pantry = transferPurchasedItemsToPantry(state.pantry, additions, createId);
+	let shopping = retireCheckedShoppingItems(state.shopping, additions, safeNow);
+	for (const week of weeks) {
+		shopping = refreshWeekShopping({ ...state, pantry, shopping }, week, safeNow);
+	}
+	return { ...state, pantry, shopping };
+}
+
+/**
+ * Move all checked shopping purchases into pantry, remove those checked rows,
+ * and refresh active weekly scopes once.
+ */
+export function movePurchasesToPantry(
+	state: AppState,
+	now: Date = new Date(),
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): AppState {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const checked = state.shopping.filter((item) => item.checked);
+	const weeks = activeWeeklyScopes(state.shopping);
+	const pantry = transferPurchasedItemsToPantry(state.pantry, checked, createId);
+	let shopping = state.shopping.filter((item) => !item.checked);
+	for (const week of weeks) {
+		shopping = refreshWeekShopping({ ...state, pantry, shopping }, week, safeNow);
+	}
+	return { ...state, pantry, shopping };
+}
+
 function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
 	return state.recipes.find((recipe) => recipe.id === meal.recipeId);
 }
@@ -236,9 +433,14 @@ function consumePantry(
 	recipe: Recipe,
 	servings: number,
 	now: Date
-): Ingredient[] {
+): { pantry: Ingredient[]; uncoveredByBucket: Map<string, number> } {
 	const remaining = pantry.map((item) => ({ ...item }));
-	const scale = recipe.servings > 0 && servings > 0 ? servings / recipe.servings : 1;
+	const uncoveredByBucket = new Map<string, number>();
+	if (!Number.isFinite(servings) || !(servings > 0)) {
+		return { pantry: remaining, uncoveredByBucket };
+	}
+	const scale =
+		Number.isFinite(recipe.servings) && recipe.servings > 0 ? servings / recipe.servings : 1;
 
 	for (const ingredient of recipe.ingredients) {
 		if (
@@ -276,12 +478,21 @@ function consumePantry(
 				};
 			need = Math.max(0, need - used);
 		}
+
+		if (need > 0) {
+			const key = bucketKey(ingredient.name, ingredient.unit);
+			const unit = unitInfo(ingredient.unit);
+			uncoveredByBucket.set(key, (uncoveredByBucket.get(key) ?? 0) + need * unit.factor);
+		}
 	}
 
-	return remaining;
+	return { pantry: remaining, uncoveredByBucket };
 }
 
-/** Mark a planned meal complete and optionally deduct its ingredient quantities from pantry. */
+/**
+ * Mark a planned meal complete and optionally deduct its ingredient quantities from pantry
+ * first, retiring any uncovered demand in place from the meal's weekly checked rows.
+ */
 export function completeMeal(
 	state: AppState,
 	mealId: string,
@@ -300,10 +511,30 @@ export function completeMeal(
 	const meals = state.meals.map((meal) =>
 		meal.id === mealId ? { ...meal, completedAt: safeNow.toISOString(), leftoverServings } : meal
 	);
-	const pantry =
-		options.deductPantry && recipe
-			? consumePantry(state.pantry, recipe, target.servings, safeNow)
-			: state.pantry;
 
-	return { ...state, meals, pantry };
+	const weekStart = weekStartForDate(target.date);
+	const weekSourceKey = weekStart ? `week:${weekStart}` : undefined;
+	const hadWeekScope = weekSourceKey
+		? state.shopping.some((item) => item.sourceKey === weekSourceKey)
+		: false;
+
+	let pantry = state.pantry;
+	let shopping = state.shopping;
+
+	if (options.deductPantry && recipe) {
+		const consumed = consumePantry(state.pantry, recipe, target.servings, safeNow);
+		pantry = consumed.pantry;
+		if (weekSourceKey && consumed.uncoveredByBucket.size > 0) {
+			const weekBudget = new Map(consumed.uncoveredByBucket);
+			shopping = retireCheckedByScopeBudget(shopping, (scopeKey) =>
+				scopeKey === weekSourceKey ? weekBudget : undefined
+			);
+		}
+	}
+
+	if (hadWeekScope && weekStart) {
+		shopping = refreshWeekShopping({ ...state, meals, pantry, shopping }, weekStart, safeNow);
+	}
+
+	return { ...state, meals, pantry, shopping };
 }

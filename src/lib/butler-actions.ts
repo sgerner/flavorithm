@@ -63,7 +63,7 @@ export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerA
 			case 'meal.delete':
 			case 'meal.complete':
 				share(index, `meal:${command.id}`);
-				if (command.type === 'meal.complete' && command.deductPantry) {
+				if (command.type === 'meal.complete' && (command.deductPantry ?? true)) {
 					commands.forEach((candidate, candidateIndex) => {
 						if (candidate.type === 'pantry.upsert' || candidate.type === 'pantry.delete')
 							join(index, candidateIndex);

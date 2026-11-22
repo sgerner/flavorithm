@@ -1,8 +1,15 @@
 import { z } from 'zod';
-import type { AppState } from './types.ts';
+import type { AppState, Ingredient } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
-import { buildShoppingList } from './domain.ts';
-import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
+import { normalizeName, unitInfo } from './domain.ts';
+import {
+	activeWeeklyScopes,
+	completeMeal,
+	convertCompatibleQuantity,
+	expiryStatus,
+	refreshWeekShopping,
+	retireCheckedShoppingItems
+} from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
@@ -183,18 +190,25 @@ function requireId(items: { id: string }[], target: string) {
 function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
-function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
-	const end = new Date(startKey + 'T12:00:00');
-	end.setDate(end.getDate() + 6);
-	const endKey = calendarKey(end);
-	const meals = state.meals.filter(
-		(item) => !item.completedAt && item.date >= startKey && item.date <= endKey
-	);
-	state.shopping = reconcileShoppingList(
-		state.shopping,
-		buildShoppingList(state.recipes, state.pantry, meals, now),
-		`week:${startKey}`
-	);
+function addedNonExpiredPantryItem(
+	previous: Ingredient | undefined,
+	next: Ingredient,
+	now: Date
+): Ingredient | undefined {
+	if (expiryStatus(next.expires, now) === 'expired') return undefined;
+	if (!Number.isFinite(next.quantity) || !(next.quantity > 0) || !next.unit.trim())
+		return undefined;
+	if (!previous || expiryStatus(previous.expires, now) === 'expired') return next;
+	if (
+		normalizeName(previous.name) !== normalizeName(next.name) ||
+		unitInfo(previous.unit).dimension !== unitInfo(next.unit).dimension
+	) {
+		return next;
+	}
+	const previousInNextUnit =
+		convertCompatibleQuantity(previous.quantity, previous.unit, next.unit) ?? 0;
+	const delta = next.quantity - Math.max(0, previousInNextUnit);
+	return delta > 0 ? { ...next, quantity: delta } : undefined;
 }
 
 /** Validate and apply a complete proposal without mutating the caller's kitchen. */
@@ -204,7 +218,10 @@ export function applyButlerCommands(
 	now: Date = new Date()
 ): { state: AppState; effects: ButlerEffect[] } {
 	const commands = z.array(ButlerCommandSchema).max(50).parse(input);
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	let state = structuredClone(current);
+	const trackedWeeks = new Set(activeWeeklyScopes(state.shopping));
+	let shouldRefreshWeeks = false;
 	const effects: ButlerEffect[] = [];
 	for (const command of commands) {
 		switch (command.type) {
@@ -224,21 +241,34 @@ export function applyButlerCommands(
 						...state.preferences.ratings,
 						[updated.id]: updated.rating
 					};
+				shouldRefreshWeeks = true;
 				break;
 			}
 			case 'recipe.delete':
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
 				requireId(state.recipes, command.id);
 				state.recipes = state.recipes.filter((item) => item.id !== command.id);
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
 				state.shopping = state.shopping.filter((item) => item.sourceKey !== `recipe:${command.id}`);
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
+				shouldRefreshWeeks = true;
 				break;
-			case 'pantry.upsert':
+			case 'pantry.upsert': {
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
+				const previous = state.pantry.find((item) => item.id === command.item.id);
+				const added = addedNonExpiredPantryItem(previous, command.item, safeNow);
 				state.pantry = upsert(state.pantry, command.item);
+				if (added) {
+					state.shopping = retireCheckedShoppingItems(state.shopping, [added], safeNow);
+				}
+				shouldRefreshWeeks = true;
 				break;
+			}
 			case 'pantry.delete':
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
 				requireId(state.pantry, command.id);
 				state.pantry = state.pantry.filter((item) => item.id !== command.id);
+				shouldRefreshWeeks = true;
 				break;
 			case 'meal.upsert': {
 				requireId(state.recipes, command.meal.recipeId);
@@ -251,23 +281,27 @@ export function applyButlerCommands(
 						}
 					: command.meal;
 				state.meals = upsert(state.meals, meal);
+				shouldRefreshWeeks = true;
 				break;
 			}
 			case 'meal.delete':
 				requireId(state.meals, command.id);
 				state.meals = state.meals.filter((item) => item.id !== command.id);
+				shouldRefreshWeeks = true;
 				break;
 			case 'meal.complete':
 				requireId(state.meals, command.id);
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
 				state = completeMeal(
 					state,
 					command.id,
 					{
-						deductPantry: command.deductPantry ?? false,
+						deductPantry: command.deductPantry ?? true,
 						leftoverServings: command.leftoverServings ?? 0
 					},
-					now
+					safeNow
 				);
+				shouldRefreshWeeks = true;
 				break;
 			case 'shopping.upsert':
 				state.shopping = upsert(state.shopping, command.item);
@@ -277,9 +311,9 @@ export function applyButlerCommands(
 				state.shopping = state.shopping.filter((item) => item.id !== command.id);
 				break;
 			case 'shopping.generate': {
-				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
+				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : safeNow);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
-				refreshShoppingWeek(state, calendarKey(start), now);
+				state.shopping = refreshWeekShopping(state, calendarKey(start), safeNow);
 				break;
 			}
 			case 'preferences.update':
@@ -295,19 +329,11 @@ export function applyButlerCommands(
 				break;
 		}
 	}
-	if (
-		commands.some(
-			(command) =>
-				(command.type.startsWith('recipe.') && command.type !== 'recipe.open') ||
-				command.type.startsWith('meal.')
-		)
-	) {
-		const weeks = new Set(
-			state.shopping.flatMap(
-				(item) => item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1] ?? []
-			)
-		);
-		for (const week of weeks) refreshShoppingWeek(state, week, now);
+	if (shouldRefreshWeeks) {
+		for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
+		for (const week of trackedWeeks) {
+			state.shopping = refreshWeekShopping(state, week, safeNow);
+		}
 	}
 	if (
 		state.recipes.length > MAX_RECIPES ||

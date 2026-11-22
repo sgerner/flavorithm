@@ -153,6 +153,27 @@ test('pantry changes group atomically with meal completion that deducts pantry',
 	const result = applyButlerCommands(kitchen, action.commands).state;
 	assert.equal(result.pantry.find((item) => item.id === pantryItem.id)?.quantity, 5);
 	assert.ok(result.meals[0].completedAt);
+
+	const omittedFlag = buildButlerActions(
+		[
+			{ type: 'pantry.upsert', item: pantryItem },
+			{ type: 'meal.complete', id: 'tonight' }
+		],
+		kitchen
+	);
+	assert.equal(omittedFlag.length, 1);
+	assert.equal(omittedFlag[0].commands.length, 2);
+	const omittedResult = applyButlerCommands(kitchen, omittedFlag[0].commands).state;
+	assert.equal(omittedResult.pantry.find((item) => item.id === pantryItem.id)?.quantity, 5);
+
+	const explicitOptOut = buildButlerActions(
+		[
+			{ type: 'pantry.upsert', item: pantryItem },
+			{ type: 'meal.complete', id: 'tonight', deductPantry: false }
+		],
+		kitchen
+	);
+	assert.equal(explicitOptOut.length, 2);
 });
 
 test('meal upsert preserves completion so a later completion cannot deduct pantry twice', () => {

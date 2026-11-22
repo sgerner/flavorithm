@@ -49,10 +49,12 @@
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
+		addPantryItems,
 		completeMeal,
 		expiryStatus,
-		reconcileShoppingList,
-		transferPurchasedItemsToPantry
+		movePurchasesToPantry,
+		refreshWeekShopping as refreshWeekShoppingItems,
+		shopForScope
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
@@ -336,7 +338,7 @@
 	let plannedServings = $state(2);
 	let editingMealId = $state('');
 	let cookingMealId = $state('');
-	let deductPantry = $state(false);
+	let deductPantry = $state(true);
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
 	let shoppingText = $state('');
@@ -865,7 +867,8 @@
 			.map((value) => value.trim())
 			.filter(Boolean);
 		if (!names.length) return;
-		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
 		const additions = names.map((value) => {
 			const match = value.match(
 				/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
@@ -878,13 +881,21 @@
 				checked: true
 			};
 		});
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
-		const applied = JSON.stringify(kitchen.pantry);
+		const updated = addPantryItems(kitchen, additions);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
 		modal = '';
 		notify(`${names.length} ingredients added to your pantry.`, () => {
-			if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-			else notify('Your pantry changed again. Review the current quantities before editing.');
+			if (
+				JSON.stringify(kitchen.pantry) === appliedPantry &&
+				JSON.stringify(kitchen.shopping) === appliedShopping
+			) {
+				kitchen.pantry = previousPantry;
+				kitchen.shopping = previousShopping;
+			} else notify('Your pantry changed again. Review the current quantities before editing.');
 		});
 	}
 
@@ -1656,19 +1667,7 @@
 		return dateKey(date);
 	}
 	function refreshWeekShopping(startDate: string) {
-		const start = new Date(`${startDate}T12:00:00`);
-		if (Number.isNaN(start.getTime())) return;
-		const dates = Array.from({ length: 7 }, (_, index) => {
-			const day = new Date(start);
-			day.setDate(day.getDate() + index);
-			return dateKey(day);
-		});
-		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
-		const recipes = kitchen.recipes.filter((recipe) =>
-			meals.some((meal) => meal.recipeId === recipe.id)
-		);
-		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		kitchen.shopping = refreshWeekShoppingItems(kitchen, startDate);
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -1707,11 +1706,12 @@
 			return;
 		}
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
+		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
+		kitchen.shopping = shopping;
 		selected = null;
 		page = 'shopping';
 		notify(
-			additions.length
+			uncheckedCount
 				? 'Shopping list ready. Your pantry is already accounted for.'
 				: 'You have everything you need. Happy cooking!'
 		);
@@ -1750,7 +1750,7 @@
 	function openCookDialog(meal: Meal) {
 		if (meal.completedAt) return;
 		cookingMealId = meal.id;
-		deductPantry = false;
+		deductPantry = true;
 		leftoverServings = 0;
 		modal = 'cookMeal';
 	}
@@ -2867,9 +2867,35 @@
 							class="text-button"
 							onclick={() => {
 								const checked = kitchen.shopping.filter((i) => i.checked);
-								kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
-								kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
-								notify(`${checked.length} purchased items moved to your pantry.`);
+								const previousPantry = JSON.parse(
+									JSON.stringify(kitchen.pantry)
+								) as AppState['pantry'];
+								const previousShopping = JSON.parse(
+									JSON.stringify(kitchen.shopping)
+								) as AppState['shopping'];
+								const updated = movePurchasesToPantry(kitchen);
+								kitchen.pantry = updated.pantry;
+								kitchen.shopping = updated.shopping;
+								const appliedPantry = JSON.stringify(kitchen.pantry);
+								const appliedShopping = JSON.stringify(kitchen.shopping);
+								notify(
+									`${checked.length} purchased items moved to your pantry.`,
+									checked.length
+										? () => {
+												if (
+													JSON.stringify(kitchen.pantry) === appliedPantry &&
+													JSON.stringify(kitchen.shopping) === appliedShopping
+												) {
+													kitchen.pantry = previousPantry;
+													kitchen.shopping = previousShopping;
+												} else {
+													notify(
+														'Your kitchen changed again. Review the current values before editing.'
+													);
+												}
+											}
+										: undefined
+								);
 							}}>Put purchased items in my pantry <ArrowRight size={16} /></button
 						>
 					</div>
