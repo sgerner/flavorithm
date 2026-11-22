@@ -30,7 +30,6 @@
 	"devDependencies": {
 		"@lucide/svelte": "^1.74.0",
 		"@skeletonlabs/skeleton": "^5.0.4",
-		"@skeletonlabs/skeleton-svelte": "^5.0.4",
 		"@sveltejs/adapter-node": "^6.0.3",
 		"@sveltejs/kit": "^3.2.1",
 		"@sveltejs/vite-plugin-svelte": "^7.3.1",
