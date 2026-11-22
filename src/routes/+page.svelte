@@ -8,7 +8,8 @@
 		dialogMotion,
 		revealMotion,
 		fadeMotion,
-		motionDuration
+		motionDuration,
+		prefersReducedMotion
 	} from '#lib/motion.ts';
 	import { flip } from 'svelte/animate';
 	import {
@@ -55,7 +56,14 @@
 		transferPurchasedItemsToPantry
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
-	import { insertRecipes } from '#lib/recipe-collection.ts';
+	import {
+		DEFAULT_RECIPE_FILTER,
+		filterTabScrollTarget,
+		filterTabsOverflow,
+		hasActiveRecipeFilters,
+		insertRecipes,
+		resetRecipeFilterState
+	} from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -95,9 +103,90 @@
 	let conflicts = $state<SyncConflict[]>([]);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
 	let page = $state('discover');
-	let filter = $state('For you');
+	let filter = $state(DEFAULT_RECIPE_FILTER);
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
+	let lastActivePill = $state<'filter' | 'hidden'>('filter');
+	let filterTabs = $state<HTMLDivElement | null>(null);
+	let filterOverflow = $state({ left: false, right: false });
+	let activeRecipeFilters = $derived(hasActiveRecipeFilters({ filter, query, showHiddenRecipes }));
+	function syncFilterOverflow() {
+		if (!filterTabs) {
+			filterOverflow = { left: false, right: false };
+			return;
+		}
+		filterOverflow = filterTabsOverflow({
+			scrollLeft: filterTabs.scrollLeft,
+			clientWidth: filterTabs.clientWidth,
+			scrollWidth: filterTabs.scrollWidth
+		});
+	}
+	function resetRecipeFilters() {
+		const next = resetRecipeFilterState();
+		lastActivePill = 'filter';
+		filter = next.filter;
+		query = next.query;
+		showHiddenRecipes = next.showHiddenRecipes;
+	}
+	$effect(() => {
+		const currentPage = page;
+		const currentFilter = filter;
+		const currentHidden = showHiddenRecipes;
+		const preferred = lastActivePill;
+		const container = filterTabs;
+		if ((currentPage !== 'discover' && currentPage !== 'saved') || !container) return;
+		let cancelled = false;
+		void tick().then(() => {
+			if (cancelled || filterTabs !== container) return;
+			const targetKey =
+				preferred === 'hidden' && currentHidden
+					? 'hidden'
+					: currentFilter !== DEFAULT_RECIPE_FILTER
+						? currentFilter
+						: currentHidden
+							? 'hidden'
+							: DEFAULT_RECIPE_FILTER;
+			const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'));
+			const pill = buttons.find((button) => button.dataset.filter === targetKey);
+			if (pill) {
+				const containerRect = container.getBoundingClientRect();
+				const pillRect = pill.getBoundingClientRect();
+				const pillLeft = pillRect.left - containerRect.left + container.scrollLeft;
+				const left = filterTabScrollTarget({
+					clientWidth: container.clientWidth,
+					scrollWidth: container.scrollWidth,
+					pillLeft,
+					pillWidth: pillRect.width
+				});
+				if (Math.abs(container.scrollLeft - left) > 1) {
+					container.scrollTo({
+						left,
+						behavior: prefersReducedMotion() ? 'instant' : 'smooth'
+					});
+				}
+			}
+			syncFilterOverflow();
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+	$effect(() => {
+		const container = filterTabs;
+		if (!container || typeof window === 'undefined') return;
+		syncFilterOverflow();
+		const observer =
+			typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => syncFilterOverflow()) : null;
+		observer?.observe(container);
+		window.addEventListener('resize', syncFilterOverflow);
+		void document.fonts?.ready?.then(() => {
+			if (filterTabs === container) syncFilterOverflow();
+		});
+		return () => {
+			observer?.disconnect();
+			window.removeEventListener('resize', syncFilterOverflow);
+		};
+	});
 	let toast = $state('');
 	let toastUndo = $state<(() => void) | null>(null);
 	let toastVersion = 0;
@@ -2374,26 +2463,47 @@
 						</div>
 					</div>
 					<div class="recipe-toolbar">
-						<div class="filter-tabs">
-							{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
-									class:active={filter === item}
-									aria-pressed={filter === item}
-									onclick={() => (filter = item)}
-									>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
-								>{/each}
-							<button
-								class:active={showHiddenRecipes}
-								aria-pressed={showHiddenRecipes}
-								onclick={() => (showHiddenRecipes = !showHiddenRecipes)}
-								>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
-							>
+						<div
+							class="filter-tabs-scroll"
+							class:can-scroll-left={filterOverflow.left}
+							class:can-scroll-right={filterOverflow.right}
+						>
+							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
+								{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
+										type="button"
+										data-filter={item}
+										class:active={filter === item}
+										aria-pressed={filter === item}
+										onclick={() => {
+											lastActivePill = 'filter';
+											filter = item;
+										}}
+										>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
+									>{/each}
+								<button
+									type="button"
+									data-filter="hidden"
+									class:active={showHiddenRecipes}
+									aria-pressed={showHiddenRecipes}
+									onclick={() => {
+										lastActivePill = 'hidden';
+										showHiddenRecipes = !showHiddenRecipes;
+									}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+								>
+							</div>
 						</div>
-						<div class="search-box">
-							<Search size={17} /><input
+						<div class="search-box" class:has-clear={query.length > 0}>
+							<Search size={17} aria-hidden="true" /><input
+								type="search"
 								aria-label="Search recipes"
 								placeholder="Search recipes"
 								bind:value={query}
-							/>
+							/>{#if query}<button
+									type="button"
+									class="search-clear"
+									aria-label="Clear search"
+									onclick={() => (query = '')}><X size={16} aria-hidden="true" /></button
+								>{/if}
 						</div>
 					</div>
 					<div class="recipe-grid">
@@ -2456,17 +2566,30 @@
 								</div>
 							</article>{/each}
 					</div>
-					{#if !recipes.length}<div class="empty-state">
-							<Heart size={36} />
-							<h3>
-								{page === 'saved' ? 'No saved recipes yet' : 'No recipes found'}
-							</h3>
-							<p>
-								{page === 'saved'
-									? 'Tap the bookmark on any recipe to keep it close.'
-									: 'Try another search or generate recipes.'}
-							</p>
-						</div>{/if}<button
+					{#if !recipes.length}{#if page === 'saved' && !kitchen.recipes.some((r) => r.saved && !r.hidden)}<div
+								class="empty-state"
+							>
+								<Heart size={36} />
+								<h2>No saved recipes yet</h2>
+								<p>Tap the bookmark on any recipe to keep it close.</p>
+							</div>{:else if activeRecipeFilters}<div class="empty-state filtered-recipe-empty">
+								<Heart size={36} />
+								<h2>
+									{page === 'saved' ? 'No matching saved recipes' : 'No matching recipes'}
+								</h2>
+								<p>
+									{page === 'saved'
+										? 'Your current search or filters hid your saved recipes.'
+										: 'No recipes match your current search or filters.'}
+								</p>
+								<button type="button" class="secondary" onclick={resetRecipeFilters}
+									>Reset filters</button
+								>
+							</div>{:else}<div class="empty-state">
+								<Heart size={36} />
+								<h2>No recipes found</h2>
+								<p>Import a recipe or generate ideas to get started.</p>
+							</div>{/if}{/if}<button
 						class="browse-link"
 						onclick={() => {
 							modal = 'search';
