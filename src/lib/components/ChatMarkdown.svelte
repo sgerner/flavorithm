@@ -1,5 +1,10 @@
 <script lang="ts">
-	import { parseChatMarkdown, type BlockNode, type InlineNode } from '#lib/chat-markdown.ts';
+	import {
+		imageLinkLabel,
+		parseChatMarkdown,
+		type BlockNode,
+		type InlineNode
+	} from '#lib/chat-markdown.ts';
 	let { content }: { content: string } = $props();
 	let blocks = $derived(parseChatMarkdown(content));
 </script>
@@ -12,17 +17,21 @@
 		{:else if node.type === 'strong'}<strong>{@render renderInline(node.children)}</strong>
 		{:else if node.type === 'em'}<em>{@render renderInline(node.children)}</em>
 		{:else if node.type === 'del'}<del>{@render renderInline(node.children)}</del>
-		{:else if node.type === 'link'}<a href={node.href} target="_blank" rel="noopener noreferrer"
-				><span>{@render renderInline(node.children)}</span></a
+		{:else if node.type === 'link'}<a
+				href={node.href}
+				target="_blank"
+				rel="noopener noreferrer"
+				class:stacked-link={node.stacked}><span>{@render renderInline(node.children)}</span></a
 			>
 		{:else if node.type === 'image'}
 			{#if node.href}<a
 					href={node.href}
 					target="_blank"
 					rel="noopener noreferrer"
-					class="image-link">{node.alt || 'Image'}</a
+					class="image-link"
+					class:stacked-link={node.stacked}>{node.alt || imageLinkLabel(node.href)}</a
 				>
-			{:else}<span class="image-alt">{node.alt || 'Image'}</span>{/if}
+			{:else if node.alt}<span class="image-alt">{node.alt}</span>{/if}
 		{/if}
 	{/each}
 {/snippet}
@@ -43,7 +52,7 @@
 		{:else if node.type === 'rule'}<hr />
 		{:else if node.type === 'table'}
 			<!-- svelte-ignore a11y_no_noninteractive_tabindex (Scrollable tables need keyboard focus.) -->
-			<div class="table-scroll" tabindex="0" role="region" aria-label="Markdown table">
+			<div class="table-scroll" tabindex="0" role="region" aria-label={node.label}>
 				<table>
 					<thead
 						><tr
@@ -110,7 +119,7 @@
 		font-weight: 700;
 	}
 	.chat-markdown :global(li + li) {
-		margin-top: 0.15em;
+		margin-top: 0.3em;
 	}
 	.chat-markdown :global(blockquote) {
 		margin: 0.5em 0;
@@ -140,6 +149,12 @@
 	.chat-markdown :global(a) {
 		text-decoration: underline;
 		text-underline-offset: 2px;
+	}
+	.chat-markdown :global(a.stacked-link) {
+		display: inline-flex;
+		align-items: center;
+		min-width: 24px;
+		min-height: 24px;
 	}
 	.table-scroll {
 		max-width: 100%;
