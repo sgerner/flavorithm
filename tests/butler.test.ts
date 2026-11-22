@@ -113,6 +113,65 @@ test('unsupported actions, unsafe images, invalid calendar dates and preference 
 	);
 	assert.throws(() =>
 		applyButlerCommands(current, [
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'bad-expiry',
+					name: 'milk',
+					quantity: 1,
+					unit: 'l',
+					category: 'Dairy',
+					expires: '2026-02-30'
+				}
+			}
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'text-expiry',
+					name: 'milk',
+					quantity: 1,
+					unit: 'l',
+					category: 'Dairy',
+					expires: 'tomorrow'
+				}
+			}
+		])
+	);
+	const validPantry = applyButlerCommands(current, [
+		{
+			type: 'pantry.upsert',
+			item: {
+				id: 'blank-expiry',
+				name: 'oats',
+				quantity: 1,
+				unit: 'kg',
+				category: 'Pantry',
+				expires: ''
+			}
+		},
+		{
+			type: 'pantry.upsert',
+			item: {
+				id: 'dated-expiry',
+				name: 'milk',
+				quantity: 1,
+				unit: 'l',
+				category: 'Dairy',
+				expires: '2026-11-19'
+			}
+		}
+	]);
+	assert.equal(validPantry.state.pantry.find((item) => item.id === 'blank-expiry')?.expires, '');
+	assert.equal(
+		validPantry.state.pantry.find((item) => item.id === 'dated-expiry')?.expires,
+		'2026-11-19'
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
 			{ type: 'recipe.upsert', recipe: { ...current.recipes[0], image: 'javascript:alert(1)' } }
 		])
 	);
@@ -284,6 +343,53 @@ test('weekly shopping ignores cooked meals and expired pantry and shares the UI 
 		).state.shopping,
 		result.state.shopping
 	);
+});
+
+test('weekly shopping enforces a today floor for overdue uncompleted meals in the week', () => {
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	recipe.ingredients = [{ name: 'carrot', quantity: 4, unit: 'each' }];
+	current.pantry = [
+		{
+			id: 'expired-yesterday',
+			name: 'carrot',
+			quantity: 99,
+			unit: 'each',
+			category: 'Produce',
+			expires: '2026-10-22'
+		},
+		{
+			id: 'expires-today',
+			name: 'carrot',
+			quantity: 2,
+			unit: 'each',
+			category: 'Produce',
+			expires: '2026-10-23'
+		}
+	];
+	current.shopping = [];
+	current.meals = [
+		{
+			id: 'overdue',
+			recipeId: recipe.id,
+			date: '2026-10-20',
+			slot: 'Dinner',
+			servings: recipe.servings
+		},
+		{
+			id: 'today',
+			recipeId: recipe.id,
+			date: '2026-10-23',
+			slot: 'Dinner',
+			servings: recipe.servings
+		}
+	];
+	const result = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		new Date('2026-10-23T12:00:00Z')
+	);
+	assert.equal(result.state.shopping[0].quantity, 6);
 });
 test('recipe edits preserve nutrition staleness and synchronize ratings', () => {
 	const current = createInitialState();
