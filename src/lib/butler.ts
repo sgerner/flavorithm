@@ -1,8 +1,12 @@
 import { z } from 'zod';
 import type { AppState } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
-import { buildShoppingList } from './domain.ts';
-import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
+import { buildShoppingList, normalizeName } from './domain.ts';
+import {
+	completeMeal,
+	convertCompatibleQuantity,
+	reconcileShoppingList
+} from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
@@ -73,8 +77,18 @@ const meal = z.object({
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
 	servings: z.number().finite().min(1).max(10000),
-	completedAt: z.string().datetime().optional(),
-	leftoverServings: quantity.optional()
+	completedAt: z
+		.string()
+		.datetime()
+		.optional()
+		.describe(
+			'Read-only ISO completion timestamp preserved on already-cooked meals and ignored on uncompleted meals; use meal.complete to finish a planned meal.'
+		),
+	leftoverServings: quantity
+		.optional()
+		.describe(
+			'Remaining leftover servings on an already-cooked meal (clamped between 0 and servings); ignored on uncompleted meals.'
+		)
 });
 const shopping = z.object({
 	id,
@@ -113,12 +127,20 @@ export const ButlerCommandSchema = z.discriminatedUnion('type', [
 	z.object({ type: z.literal('pantry.delete'), id }),
 	z.object({ type: z.literal('meal.upsert'), meal }),
 	z.object({ type: z.literal('meal.delete'), id }),
-	z.object({
-		type: z.literal('meal.complete'),
-		id,
-		leftoverServings: quantity.optional(),
-		deductPantry: z.boolean().optional()
-	}),
+	z
+		.object({
+			type: z.literal('meal.complete'),
+			id: id.describe('ID of the planned meal in kitchen.meals to mark cooked.'),
+			leftoverServings: quantity
+				.optional()
+				.describe('Portions saved as leftovers from 0 up to the meal servings; defaults to 0.'),
+			deductPantry: z
+				.boolean()
+				.describe(
+					'Required: true to automatically deduct recipe ingredients from pantry stock, or false to leave pantry stock unchanged.'
+				)
+		})
+		.describe('Mark an uncompleted planned meal cooked and optionally deduct pantry stock.'),
 	z.object({ type: z.literal('shopping.upsert'), item: shopping }),
 	z.object({ type: z.literal('shopping.delete'), id }),
 	z.object({ type: z.literal('shopping.generate'), weekStart: date.optional() }),
@@ -197,6 +219,37 @@ function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
 	);
 }
 
+function clampLeftoverServings(value: number, servings: number): number {
+	const clamped = Math.min(Math.max(0, servings), Math.max(0, value));
+	const rounded = Math.round(clamped * 100) / 100;
+	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+type PantryMutation =
+	| {
+			kind: 'upsert';
+			beforeCurrent?: AppState['pantry'][number];
+			beforeStep?: AppState['pantry'][number];
+			after: AppState['pantry'][number];
+			afterDeduction: boolean;
+	  }
+	| {
+			kind: 'delete';
+			beforeCurrent?: AppState['pantry'][number];
+			beforeStep?: AppState['pantry'][number];
+	  };
+
+function reducesIngredientStock(
+	before: AppState['pantry'][number] | undefined,
+	after: AppState['pantry'][number]
+): boolean {
+	if (!before || !(before.quantity > 0)) return false;
+	if (normalizeName(after.name) !== normalizeName(before.name)) return true;
+	const nextInBeforeUnit = convertCompatibleQuantity(after.quantity, after.unit, before.unit);
+	if (nextInBeforeUnit === undefined) return true;
+	return nextInBeforeUnit + 1e-9 < before.quantity;
+}
+
 /** Validate and apply a complete proposal without mutating the caller's kitchen. */
 export function applyButlerCommands(
 	current: AppState,
@@ -206,6 +259,9 @@ export function applyButlerCommands(
 	const commands = z.array(ButlerCommandSchema).max(50).parse(input);
 	let state = structuredClone(current);
 	const effects: ButlerEffect[] = [];
+	const pantryMutations: PantryMutation[] = [];
+	const deductedIngredientNames = new Set<string>();
+	const deductedPantryIds = new Set<string>();
 	for (const command of commands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
@@ -234,41 +290,85 @@ export function applyButlerCommands(
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
 				break;
 			case 'pantry.upsert':
+				pantryMutations.push({
+					kind: 'upsert',
+					beforeCurrent: current.pantry.find((item) => item.id === command.item.id),
+					beforeStep: state.pantry.find((item) => item.id === command.item.id),
+					after: command.item,
+					afterDeduction: deductedPantryIds.has(command.item.id)
+				});
 				state.pantry = upsert(state.pantry, command.item);
 				break;
 			case 'pantry.delete':
 				requireId(state.pantry, command.id);
+				pantryMutations.push({
+					kind: 'delete',
+					beforeCurrent: current.pantry.find((item) => item.id === command.id),
+					beforeStep: state.pantry.find((item) => item.id === command.id)
+				});
 				state.pantry = state.pantry.filter((item) => item.id !== command.id);
 				break;
 			case 'meal.upsert': {
 				requireId(state.recipes, command.meal.recipeId);
 				const previous = state.meals.find((item) => item.id === command.meal.id);
-				const meal = previous?.completedAt
-					? {
-							...command.meal,
-							completedAt: previous.completedAt,
-							leftoverServings: previous.leftoverServings
-						}
-					: command.meal;
-				state.meals = upsert(state.meals, meal);
+				const {
+					completedAt: _completedAt,
+					leftoverServings: requestedLeftovers,
+					...baseMeal
+				} = command.meal;
+				if (previous?.completedAt) {
+					const rawLeftovers = requestedLeftovers ?? previous.leftoverServings;
+					const leftoverServings =
+						rawLeftovers === undefined
+							? undefined
+							: clampLeftoverServings(rawLeftovers, baseMeal.servings);
+					state.meals = upsert(state.meals, {
+						...baseMeal,
+						completedAt: previous.completedAt,
+						...(leftoverServings !== undefined ? { leftoverServings } : {})
+					});
+				} else {
+					state.meals = upsert(state.meals, baseMeal);
+				}
 				break;
 			}
 			case 'meal.delete':
 				requireId(state.meals, command.id);
 				state.meals = state.meals.filter((item) => item.id !== command.id);
 				break;
-			case 'meal.complete':
+			case 'meal.complete': {
 				requireId(state.meals, command.id);
+				const targetMeal = state.meals.find((item) => item.id === command.id);
+				const beforePantry = state.pantry;
+				if (command.deductPantry && targetMeal && !targetMeal.completedAt) {
+					const recipe = state.recipes.find((item) => item.id === targetMeal.recipeId);
+					for (const ingredient of recipe?.ingredients ?? []) {
+						if (
+							Number.isFinite(ingredient.quantity) &&
+							ingredient.quantity > 0 &&
+							ingredient.unit.trim()
+						) {
+							deductedIngredientNames.add(normalizeName(ingredient.name));
+						}
+					}
+				}
 				state = completeMeal(
 					state,
 					command.id,
 					{
-						deductPantry: command.deductPantry ?? false,
+						deductPantry: command.deductPantry,
 						leftoverServings: command.leftoverServings ?? 0
 					},
 					now
 				);
+				if (state.pantry !== beforePantry) {
+					for (const item of state.pantry) {
+						const prev = beforePantry.find((entry) => entry.id === item.id);
+						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
+					}
+				}
 				break;
+			}
 			case 'shopping.upsert':
 				state.shopping = upsert(state.shopping, command.item);
 				break;
@@ -293,6 +393,39 @@ export function applyButlerCommands(
 			case 'ui':
 				effects.push(command);
 				break;
+		}
+	}
+	if (deductedIngredientNames.size > 0) {
+		for (const mutation of pantryMutations) {
+			if (mutation.kind === 'delete') {
+				const existing = mutation.beforeCurrent ?? mutation.beforeStep;
+				if (
+					existing &&
+					existing.quantity > 0 &&
+					deductedIngredientNames.has(normalizeName(existing.name))
+				) {
+					throw new Error(
+						'Meal completion already deducts recipe ingredients from the pantry. Remove duplicate pantry reductions and try again.'
+					);
+				}
+			} else {
+				const matchesRecipe =
+					(mutation.beforeCurrent &&
+						deductedIngredientNames.has(normalizeName(mutation.beforeCurrent.name))) ||
+					(mutation.beforeStep &&
+						deductedIngredientNames.has(normalizeName(mutation.beforeStep.name))) ||
+					deductedIngredientNames.has(normalizeName(mutation.after.name));
+				if (
+					matchesRecipe &&
+					(mutation.afterDeduction ||
+						reducesIngredientStock(mutation.beforeCurrent, mutation.after) ||
+						reducesIngredientStock(mutation.beforeStep, mutation.after))
+				) {
+					throw new Error(
+						'Meal completion already deducts recipe ingredients from the pantry. Remove duplicate pantry reductions and try again.'
+					);
+				}
+			}
 		}
 	}
 	if (
