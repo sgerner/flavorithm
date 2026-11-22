@@ -79,6 +79,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id);
   CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at);
   CREATE TABLE IF NOT EXISTS external_identities (
     issuer TEXT NOT NULL,
@@ -106,6 +107,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS password_reset_user_idx ON password_reset_tokens(user_id);
   CREATE INDEX IF NOT EXISTS password_reset_expiry_idx ON password_reset_tokens(expires_at);
   CREATE TABLE IF NOT EXISTS household_invites (
     code_hash TEXT PRIMARY KEY,
@@ -115,6 +117,8 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     uses_remaining INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS household_invites_household_expiry_idx ON household_invites(household_id, expires_at);
+  CREATE INDEX IF NOT EXISTS household_invites_created_by_idx ON household_invites(created_by);
   CREATE INDEX IF NOT EXISTS household_invites_expiry_idx ON household_invites(expires_at);
   CREATE TABLE IF NOT EXISTS email_verification_tokens (
     token_hash TEXT PRIMARY KEY,
@@ -122,6 +126,7 @@ db.exec(`
     expires_at INTEGER NOT NULL,
     created_at INTEGER NOT NULL
   );
+  CREATE INDEX IF NOT EXISTS email_verification_user_idx ON email_verification_tokens(user_id);
   CREATE INDEX IF NOT EXISTS email_verification_expiry_idx ON email_verification_tokens(expires_at);
 `);
 
@@ -344,6 +349,15 @@ export function assertSameOrigin(request: Request): void {
 	const origin = request.headers.get('origin');
 	if (origin && origin !== new URL(request.url).origin)
 		throw new ApiError(403, 'Cross-origin request rejected');
+}
+
+export function clientAddress(event: { getClientAddress?: () => string }): string | null {
+	try {
+		const address = event.getClientAddress?.().trim();
+		return address ? address : null;
+	} catch {
+		return null;
+	}
 }
 
 type DbUserRow = {

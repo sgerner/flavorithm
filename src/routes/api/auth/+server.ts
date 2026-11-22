@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
 	ApiError,
 	assertSameOrigin,
+	clientAddress,
 	consumeRateLimit,
 	deleteUserAccount,
 	deleteSession,
@@ -52,7 +53,7 @@ function passwordResetOrigin(request: Request): string {
 	if (!configuredOrigin && !request.headers.get('origin')) {
 		throw new ApiError(
 			503,
-			'Set ORIGIN to enable password recovery requests without a browser origin.'
+			'Email links require a public site address. Ask the server operator to configure this installation.'
 		);
 	}
 	try {
@@ -103,8 +104,6 @@ export const POST: RequestHandler = async (event) => {
 		if (authMode !== 'local') {
 			throw new ApiError(403, 'Local password authentication is disabled for this installation.');
 		}
-		const ip = event.getClientAddress();
-		consumeRateLimit(`auth-ip:${ip}`, 20, 15 * 60 * 1000);
 		const parsed = authActionSchema.safeParse(await readJson(event.request));
 		if (!parsed.success)
 			throw new ApiError(400, 'Please provide a valid auth action, email and password');
@@ -114,6 +113,9 @@ export const POST: RequestHandler = async (event) => {
 			event.cookies.delete('flavorithm_session', { path: '/' });
 			return Response.json({ user: null });
 		}
+		const ip = clientAddress(event);
+		if (!ip) throw new ApiError(403, 'The request source could not be verified');
+		consumeRateLimit(`auth-ip:${ip}`, 20, 15 * 60 * 1000);
 		if (payload.action === 'deleteAccount') {
 			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
 			consumeRateLimit(`delete-account:${event.locals.user.id}`, 5, 15 * 60 * 1000);
@@ -127,7 +129,7 @@ export const POST: RequestHandler = async (event) => {
 			if (!apiKey || !from) {
 				throw new ApiError(
 					503,
-					'Password recovery is not configured. Set RESEND_API_KEY and EMAIL_FROM to enable it.'
+					'Password recovery is not configured on this installation. Ask the server operator to configure email delivery.'
 				);
 			}
 			const email = payload.email.toLowerCase();
@@ -152,7 +154,7 @@ export const POST: RequestHandler = async (event) => {
 			if (!apiKey || !from) {
 				throw new ApiError(
 					503,
-					'Email verification is not configured. Set RESEND_API_KEY and EMAIL_FROM to enable it.'
+					'Email verification is not configured on this installation. Ask the server operator to configure email delivery.'
 				);
 			}
 			consumeRateLimit(`email-verify-ip:${ip}`, 5, 60 * 60 * 1000);
