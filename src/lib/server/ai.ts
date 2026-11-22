@@ -2381,11 +2381,6 @@ export async function getSupportedModels(
 	return transformModelCatalog(body);
 }
 
-export function resetPublicModelCatalogCache(): void {
-	publicCatalog = undefined;
-	publicCatalogExpiresAt = 0;
-}
-
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
 	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
 		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
@@ -2399,4 +2394,10 @@ export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<Support
 		publicCatalog = pending;
 	}
 	return publicCatalog;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
 }
