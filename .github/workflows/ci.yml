@@ -40,6 +40,15 @@ jobs:
         run: npm run build
       - name: Build production container
         run: docker build --tag flavorithm:ci .
+      - name: Verify container readiness check
+        run: |
+          docker run --rm \
+            --init \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            flavorithm:ci npm run readiness
       - name: Smoke-test production container
         run: |
           container="flavorithm-ci-smoke"

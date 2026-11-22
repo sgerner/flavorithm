@@ -1,12 +1,15 @@
 import type { RequestHandler } from './$types';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
-import { localWhisperUrl, transcribeVoice } from '#lib/server/voice.ts';
+import { probeLocalWhisper, transcribeVoice } from '#lib/server/voice.ts';
 import { MAX_WAV_BYTES } from '#lib/voice-config.ts';
 const headers = { 'cache-control': 'no-store' };
-export const GET: RequestHandler = ({ locals }) => {
+export const GET: RequestHandler = async ({ locals, fetch: eventFetch, request }) => {
 	if (!locals.user)
 		return Response.json({ error: 'Sign in to configure voice input.' }, { status: 401, headers });
-	return Response.json({ localAvailable: Boolean(localWhisperUrl()) }, { headers });
+	return Response.json(
+		{ localAvailable: await probeLocalWhisper(eventFetch ?? fetch, request?.signal) },
+		{ headers }
+	);
 };
 export const POST: RequestHandler = async ({ request, locals, fetch }) => {
 	try {

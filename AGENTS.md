@@ -18,7 +18,7 @@ Run checks in this order so build artifacts exist and stay current before smoke 
 4. `npm run build` — build the production SvelteKit Node adapter (`build/handler.js`).
 5. `npm run test:smoke` — start `server.mjs` against an in-memory database (or target a running container via `FLAVORITHM_SMOKE_URL`) and smoke-test production HTTP routes (requires `npm run build` first when starting locally because `server.mjs` imports `./build/handler.js`).
 6. `npm run test:sso` — start `server.mjs` (or target a running container via `FLAVORITHM_SMOKE_URL`) and smoke-test SSO and trusted-proxy authentication (requires `npm run build` first when starting locally).
-7. `docker build --tag flavorithm:ci .` — verify the production container image build (requires a running Docker daemon); CI also runs `npm run test:smoke` and `npm run test:sso` against hardened `flavorithm:ci` containers via `FLAVORITHM_SMOKE_URL`.
+7. `docker build --tag flavorithm:ci .` — verify the production container image build (requires a running Docker daemon); CI also runs `npm run readiness` and runs `npm run test:smoke` and `npm run test:sso` against hardened `flavorithm:ci` containers via `FLAVORITHM_SMOKE_URL`.
 8. `npm audit --omit=dev --audit-level=high` — audit production dependencies for high or critical vulnerabilities as run in the Security workflow (requires network access to reach the npm registry; CI runs this after `npm ci --ignore-scripts`).
 
 ### Notes and edge cases

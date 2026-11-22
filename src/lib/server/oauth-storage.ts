@@ -119,14 +119,22 @@ function keyFor(mode: OAuthMode): Buffer {
 	const dbPath =
 		process.env.FLAVORITHM_DB_PATH ?? resolve(process.cwd(), 'data', 'flavorithm.sqlite');
 	const keyPath = resolve(dirname(dbPath), 'oauth.key');
+	if (existsSync(keyPath)) {
+		const key = readFileSync(keyPath);
+		if (key.length !== 32) throw new Error('Local OAuth encryption is unavailable.');
+		chmodSync(keyPath, 0o600);
+		return key;
+	}
+
+	const fallbackKey = decodeHostedEncryptionKey();
+	if (fallbackKey) return fallbackKey;
+
 	mkdirSync(dirname(keyPath), { recursive: true });
-	if (!existsSync(keyPath)) {
-		const freshKey = randomBytes(32);
-		try {
-			writeFileSync(keyPath, freshKey, { flag: 'wx', mode: 0o600 });
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-		}
+	const freshKey = randomBytes(32);
+	try {
+		writeFileSync(keyPath, freshKey, { flag: 'wx', mode: 0o600 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
 	}
 	const key = readFileSync(keyPath);
 	if (key.length !== 32) throw new Error('Local OAuth encryption is unavailable.');
