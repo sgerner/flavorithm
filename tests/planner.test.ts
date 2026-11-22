@@ -55,6 +55,7 @@ function injectPlannerHook(svelteSource: string): string {
 		get week() { return week; },
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
+		get deductPantry() { return deductPantry; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
 		get recipesById() { return recipesById; },
@@ -65,6 +66,9 @@ function injectPlannerHook(svelteSource: string): string {
 		dateKey,
 		mealSlotKey,
 		formatCompletedDate,
+		openRecipePicker,
+		choosePickedRecipe,
+		openCookDialog,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
 		saveMealChanges,
@@ -112,6 +116,7 @@ type PlannerHarnessApi = {
 	authMetadataLoaded: boolean;
 	readonly week: Date[];
 	weekOffset: number;
+	readonly deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
 	readonly mealsByDateSlot: Map<string, Meal[]>;
@@ -125,6 +130,9 @@ type PlannerHarnessApi = {
 		formatter: Intl.DateTimeFormat,
 		fallback?: string
 	) => string;
+	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
+	choosePickedRecipe: (recipe: Recipe) => void;
+	openCookDialog: (meal: Meal) => void;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
 	saveMealChanges: () => void;
@@ -751,6 +759,50 @@ test('editing a planned meal updates mealsByDateSlot reactively', () => {
 		const moved = api.mealsByDateSlot.get(api.mealSlotKey(wednesday, 'Dinner'));
 		assert.equal(moved?.length, 1);
 		assert.equal(moved?.[0].servings, 4);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('choosing a recipe for a planner slot keeps valid servings above 24', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-large-pot', 'Large Pot Pasta');
+		recipe.servings = 250;
+		const scheduledDate = '2026-11-23';
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [] };
+
+		api.openRecipePicker({ date: scheduledDate, slot: 'Lunch' });
+		api.choosePickedRecipe(recipe);
+
+		assert.equal(api.kitchen.meals.length, 1);
+		assert.equal(api.kitchen.meals[0].date, scheduledDate);
+		assert.equal(api.kitchen.meals[0].slot, 'Lunch');
+		assert.equal(api.kitchen.meals[0].recipeId, recipe.id);
+		assert.equal(api.kitchen.meals[0].servings, 250);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('marking a meal cooked keeps pantry deduction opt-in', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-cook', 'Weeknight Pasta');
+		const meal: Meal = {
+			id: 'meal-cook',
+			date: '2026-11-23',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: recipe.servings
+		};
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
+
+		api.openCookDialog(meal);
+
+		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
 	}
