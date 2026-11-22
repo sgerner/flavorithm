@@ -60,6 +60,7 @@ function harness(args: {
 		pending: boolean;
 		syncing: boolean;
 		conflicts: unknown[];
+		reviewedEtag: string | null;
 		error: string;
 	}> = [];
 	const setStates: AppState[] = [];
@@ -600,4 +601,412 @@ test('ID-keyed recipe actions and three-way editor merge persist cleanly after s
 	assert.equal(server.recipes[0].rating, 5);
 	assert.equal(server.recipes[0].saved, true);
 	assert.equal(server.recipes[0].nutrition.calories, 640);
+});
+
+test('advancing server ETag during review blocks sync(local) from writing and refreshes reviewedEtag with an alert', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const local = structuredClone(base);
+	local.preferences.maxTime = 20;
+	let remote = structuredClone(base);
+	remote.preferences.maxTime = 60;
+	let currentEtag = 'etag-2';
+	const putCalls: Array<{ etag: string; state: AppState }> = [];
+
+	const sync = harness({
+		user,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(remote),
+				etag: currentEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state, etag) => {
+				putCalls.push({ etag, state: structuredClone(state) });
+				remote = structuredClone(state);
+				currentEtag = 'etag-4';
+				return { state: structuredClone(remote), etag: currentEtag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'etag-1');
+	sync.controller.stage(local);
+	await sync.controller.sync();
+	assert.equal(putCalls.length, 0);
+	assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-2');
+	assert.equal(sync.statuses.at(-1)?.conflicts.length, 1);
+
+	// Partner updates another item while the user is reviewing etag-2.
+	remote.pantry.push({ id: 'eggs', name: 'eggs', quantity: 12, unit: 'piece', category: 'Dairy' });
+	currentEtag = 'etag-3';
+
+	await sync.controller.sync('local');
+	assert.equal(putCalls.length, 0);
+	assert.ok(sync.controller.snapshot());
+	assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-3');
+	assert.equal(sync.statuses.at(-1)?.conflicts.length, 1);
+	assert.match(sync.statuses.at(-1)?.error || '', /updated|review/i);
+
+	// Reviewing the refreshed conflict at etag-3 and choosing local now commits with If-Match: etag-3.
+	await sync.controller.sync('local');
+	assert.equal(putCalls.length, 1);
+	assert.equal(putCalls[0].etag, 'etag-3');
+	assert.equal(putCalls[0].state.preferences.maxTime, 20);
+	assert.deepEqual(
+		putCalls[0].state.pantry.map((item) => item.id),
+		['eggs']
+	);
+	assert.equal(sync.controller.snapshot(), null);
+});
+
+test('partner editing an independent field at etag-3 halts sync(remote), keeps local edits pending, and surfaces conflicts', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	base.pantry = [
+		{ id: 'milk', name: 'milk', quantity: 1, unit: 'carton', category: 'Dairy' },
+		{ id: 'eggs', name: 'eggs', quantity: 12, unit: 'piece', category: 'Dairy' }
+	];
+	const local = structuredClone(base);
+	local.pantry[0].quantity = 2;
+	local.pantry[1].quantity = 6;
+
+	let remote = structuredClone(base);
+	remote.pantry[0].quantity = 4;
+	let currentEtag = 'etag-2';
+	let writes = 0;
+
+	const sync = harness({
+		user,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(remote),
+				etag: currentEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				writes += 1;
+				return { state, etag: 'etag-4' };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'etag-1');
+	sync.controller.stage(local);
+	await sync.controller.sync();
+	assert.equal(writes, 0);
+	assert.deepEqual(sync.statuses.at(-1)?.conflicts, [
+		{ path: 'kitchen.pantry[milk].quantity', local: 2, remote: 4 }
+	]);
+	assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-2');
+
+	// Partner updates eggs at etag-3 while user clicks "Use household values" for the milk conflict.
+	remote.pantry[1].quantity = 0;
+	currentEtag = 'etag-3';
+
+	await sync.controller.sync('remote');
+	assert.equal(writes, 0);
+	assert.equal(sync.controller.snapshot()?.local.pantry[1].quantity, 6);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-3');
+	assert.match(sync.statuses.at(-1)?.error || '', /updated|review/i);
+	assert.deepEqual(sync.statuses.at(-1)?.conflicts, [
+		{ path: 'kitchen.pantry[milk].quantity', local: 2, remote: 4 },
+		{ path: 'kitchen.pantry[eggs].quantity', local: 6, remote: 0 }
+	]);
+});
+
+test('a 412 on PUT during conflict resolution does not retry against newer ETags and refreshes conflicts', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const local = structuredClone(base);
+	local.preferences.maxTime = 20;
+	local.preferences.allergies = 'soy';
+
+	const remoteAtEtag2 = structuredClone(base);
+	remoteAtEtag2.preferences.maxTime = 60;
+	const remoteAtEtag3 = structuredClone(remoteAtEtag2);
+	remoteAtEtag3.preferences.allergies = 'tree nuts';
+
+	let getCalls = 0;
+	const attemptedPutEtags: string[] = [];
+	const sync = harness({
+		user,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => {
+				getCalls += 1;
+				return getCalls <= 2
+					? {
+							state: structuredClone(remoteAtEtag2),
+							etag: 'etag-2',
+							userId: user.id,
+							householdId: user.householdId
+						}
+					: {
+							state: structuredClone(remoteAtEtag3),
+							etag: 'etag-3',
+							userId: user.id,
+							householdId: user.householdId
+						};
+			},
+			put: async (_state, etag) => {
+				attemptedPutEtags.push(etag);
+				throw Object.assign(new Error('Precondition Failed'), { status: 412 });
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'etag-1');
+	sync.controller.stage(local);
+	await sync.controller.sync();
+	assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-2');
+
+	await sync.controller.sync('local');
+	assert.deepEqual(attemptedPutEtags, ['etag-2']);
+	assert.ok(sync.controller.snapshot());
+	assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-3');
+	assert.match(sync.statuses.at(-1)?.error || '', /updated|review/i);
+	assert.equal(sync.statuses.at(-1)?.conflicts.length, 2);
+});
+
+test('staging an edit during sync(local) or sync(remote) isolates the follow-up sync without leaking prefer', async () => {
+	for (const choice of ['local', 'remote'] as const) {
+		const user = makeUser(`user-${choice}`, `home-${choice}`);
+		const base = createNewUserState();
+		const firstLocal = structuredClone(base);
+		firstLocal.preferences.maxTime = 20;
+		const remoteConflict = structuredClone(base);
+		remoteConflict.preferences.maxTime = 60;
+
+		const firstPut = deferred<{ state: AppState; etag: string }>();
+		const followUpGet = deferred<{
+			state: AppState;
+			etag: string;
+			userId: string;
+			householdId: string;
+		}>();
+		let server = structuredClone(remoteConflict);
+		let currentEtag = 'etag-2';
+		let getCount = 0;
+		let putCount = 0;
+
+		const sync = harness({
+			user,
+			transport: () => ({
+				identity: { userId: user.id, householdId: user.householdId },
+				get: async () => {
+					getCount += 1;
+					if (getCount === 3) return followUpGet.promise;
+					return {
+						state: structuredClone(server),
+						etag: currentEtag,
+						userId: user.id,
+						householdId: user.householdId
+					};
+				},
+				put: async (state) => {
+					putCount += 1;
+					if (putCount === 1) {
+						server = structuredClone(state);
+						return firstPut.promise;
+					}
+					server = structuredClone(state);
+					return { state: structuredClone(server), etag: 'etag-5' };
+				}
+			})
+		});
+
+		sync.controller.initialize(user, base, 'etag-1');
+		sync.controller.stage(firstLocal);
+		await sync.controller.sync();
+		assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-2');
+
+		const resolving = sync.controller.sync(choice);
+		await Promise.resolve();
+		await Promise.resolve();
+
+		// Stage a new allergy edit while the conflict resolution PUT is in flight.
+		const stagedDuringSave = structuredClone(firstLocal);
+		stagedDuringSave.preferences.allergies = 'sesame';
+		sync.state = stagedDuringSave;
+		sync.controller.stage(stagedDuringSave);
+
+		const savedFirst = structuredClone(base);
+		savedFirst.preferences.maxTime = choice === 'local' ? 20 : 60;
+		server = structuredClone(savedFirst);
+		currentEtag = 'etag-3';
+		firstPut.resolve({ state: structuredClone(savedFirst), etag: 'etag-3' });
+		await resolving;
+
+		for (let attempt = 0; attempt < 20 && getCount < 3; attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		assert.equal(getCount, 3);
+
+		// Partner concurrently updates allergies on the server at etag-4; follow-up sync must pause!
+		const partnerUpdated = structuredClone(savedFirst);
+		partnerUpdated.preferences.allergies = 'peanuts';
+		server = structuredClone(partnerUpdated);
+		currentEtag = 'etag-4';
+		followUpGet.resolve({
+			state: structuredClone(partnerUpdated),
+			etag: 'etag-4',
+			userId: user.id,
+			householdId: user.householdId
+		});
+
+		for (
+			let attempt = 0;
+			attempt < 20 && sync.statuses.at(-1)?.reviewedEtag !== 'etag-4';
+			attempt += 1
+		) {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		assert.equal(putCount, 1);
+		assert.ok(sync.controller.snapshot());
+		assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'etag-4');
+		assert.deepEqual(sync.statuses.at(-1)?.conflicts, [
+			{
+				path: 'kitchen.preferences.allergies',
+				local: 'sesame',
+				remote: 'peanuts'
+			}
+		]);
+	}
+});
+
+test('two offline tabs staging 25 and 70 over server 45 report remote 45 and keep disjoint edits on both remote and local choices', async () => {
+	for (const choice of ['remote', 'local'] as const) {
+		const user = makeUser(`user-tabs-${choice}`, `home-tabs-${choice}`);
+		const base = createNewUserState();
+		base.preferences.maxTime = 45;
+		const storage = memoryStorage();
+		let server = structuredClone(base);
+		let writes = 0;
+
+		const transport = () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'etag-1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state: AppState, etag: string) => {
+				assert.equal(etag, 'etag-1');
+				writes += 1;
+				server = structuredClone(state);
+				return { state: structuredClone(server), etag: 'etag-2' };
+			}
+		});
+
+		const tabA = harness({ user, storage, transport });
+		const tabB = harness({ user, storage, transport });
+		tabA.controller.initialize(user, base, 'etag-1');
+		tabB.controller.initialize(user, base, 'etag-1');
+
+		const editA = structuredClone(base);
+		editA.preferences.maxTime = 25;
+		editA.pantry.push({ id: 'tab-a', name: 'rice', quantity: 2, unit: 'cup', category: 'Pantry' });
+
+		const editB = structuredClone(base);
+		editB.preferences.maxTime = 70;
+		editB.shopping.push({
+			id: 'tab-b',
+			name: 'lemons',
+			quantity: 3,
+			unit: 'piece',
+			checked: false
+		});
+
+		tabA.controller.stage(editA);
+		tabB.controller.stage(editB);
+		tabA.controller.clearContext();
+		tabB.controller.clearContext();
+
+		const reloaded = harness({ user, storage, transport });
+		assert.equal(reloaded.controller.restore(user), true);
+		assert.equal(reloaded.statuses.at(-1)?.reviewedEtag, 'etag-1');
+		assert.deepEqual(reloaded.statuses.at(-1)?.conflicts, [
+			{
+				path: 'kitchen.preferences.maxTime',
+				local: 70,
+				remote: 45
+			}
+		]);
+
+		await reloaded.controller.sync();
+		assert.equal(writes, 0);
+		assert.deepEqual(reloaded.statuses.at(-1)?.conflicts, [
+			{
+				path: 'kitchen.preferences.maxTime',
+				local: 70,
+				remote: 45
+			}
+		]);
+
+		await reloaded.controller.sync(choice);
+		assert.equal(writes, 1);
+		assert.equal(reloaded.controller.snapshot(), null);
+		assert.equal(server.preferences.maxTime, choice === 'remote' ? 45 : 70);
+		assert.deepEqual(
+			server.pantry.map((item) => item.id),
+			['tab-a']
+		);
+		assert.deepEqual(
+			server.shopping.map((item) => item.id),
+			['tab-b']
+		);
+	}
+});
+
+test('initialize records reviewedEtag on conflicts and blocks stale resolution if the server advances again', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const offlineEdit = structuredClone(base);
+	offlineEdit.preferences.maxTime = 20;
+
+	const offlineTab = harness({ user, storage });
+	offlineTab.controller.initialize(user, base, 'etag-1');
+	offlineTab.controller.stage(offlineEdit);
+	offlineTab.controller.clearContext();
+
+	const remoteAtEtag2 = structuredClone(base);
+	remoteAtEtag2.preferences.maxTime = 55;
+	const remoteAtEtag3 = structuredClone(remoteAtEtag2);
+	remoteAtEtag3.preferences.allergies = 'mustard';
+
+	let writes = 0;
+	const reconnected = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(remoteAtEtag3),
+				etag: 'etag-3',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				writes += 1;
+				return { state, etag: 'etag-4' };
+			}
+		})
+	});
+
+	reconnected.controller.initialize(user, remoteAtEtag2, 'etag-2');
+	assert.equal(reconnected.statuses.at(-1)?.reviewedEtag, 'etag-2');
+	assert.equal(reconnected.statuses.at(-1)?.conflicts.length, 1);
+
+	await reconnected.controller.sync('local');
+	assert.equal(writes, 0);
+	assert.equal(reconnected.statuses.at(-1)?.reviewedEtag, 'etag-3');
+	assert.match(reconnected.statuses.at(-1)?.error || '', /updated|review/i);
 });
