@@ -97,10 +97,13 @@
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
 	import {
+		createBlankRecipe,
 		DEFAULT_RECIPE_FILTER,
 		filterTabScrollTarget,
 		filterTabsOverflow,
+		finalizeManualRecipe,
 		hasActiveRecipeFilters,
+		hasZeroNutrition,
 		insertRecipes,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
@@ -342,6 +345,8 @@
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
+		editingRecipe = null;
+		editingRecipeMode = 'edit';
 		pantryDrafts = {};
 		editingShoppingId = '';
 		editingShoppingDraft = null;
@@ -397,6 +402,7 @@
 
 	let selected = $state<Recipe | null>(null);
 	let editingRecipe = $state<Recipe | null>(null);
+	let editingRecipeMode = $state<'create' | 'edit'>('edit');
 	let recipeToDelete = $state<Recipe | null>(null);
 	let pantryInput = $state('');
 	let authMode = $state('register');
@@ -1299,6 +1305,8 @@
 					kitchenSync?.clearContext();
 					localStorage.removeItem('flavorithm-last-account');
 					user = null;
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
 					inviteCode = '';
 					currentInviteId = '';
 					joinCode = '';
@@ -1722,7 +1730,8 @@
 			today: dateKey(new Date()),
 			availableThemes: themes,
 			recipeDrafts,
-			selectedRecipeId: selected?.id ?? editingRecipe?.id,
+			selectedRecipeId:
+				selected?.id ?? (editingRecipeMode === 'edit' ? editingRecipe?.id : undefined),
 			userName: user?.name?.trim().slice(0, 80),
 			page
 		});
@@ -1790,6 +1799,8 @@
 				void openSettings(true);
 				break;
 			case 'recipe-new':
+				openNewRecipe();
+				break;
 			case 'import':
 				openImport();
 				break;
@@ -2102,10 +2113,22 @@
 				: `${recipe.title} restored to your recipe list.`
 		);
 	}
+	function openNewRecipe() {
+		mobileNav = false;
+		resetMealDialogState();
+		resumeDialog = '';
+		modal = '';
+		error = '';
+		selected = null;
+		selectedMealServings = undefined;
+		editingRecipeMode = 'create';
+		editingRecipe = createBlankRecipe();
+	}
 	function editSavedRecipe(recipe: Recipe) {
 		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
 		if (!saved) return;
 		selected = null;
+		editingRecipeMode = 'edit';
 		editingRecipe = {
 			...saved,
 			tags: [...saved.tags],
@@ -2115,6 +2138,19 @@
 		};
 	}
 	function saveEditedRecipe(updated: Recipe) {
+		if (editingRecipeMode === 'create') {
+			const saved = finalizeManualRecipe(updated);
+			kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+			editingRecipe = null;
+			editingRecipeMode = 'edit';
+			selectedMealServings = undefined;
+			selected = kitchen.recipes.find((item) => item.id === saved.id) ?? saved;
+			page = 'saved';
+			query = '';
+			filter = 'For you';
+			notify('Recipe saved to your collection.');
+			return;
+		}
 		const previous = kitchen.recipes.find((item) => item.id === updated.id);
 		if (!previous || !previous.saved) {
 			editingRecipe = null;
@@ -2123,10 +2159,19 @@
 		const nutritionNeedsRefresh =
 			previous.servings !== updated.servings ||
 			JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
+		const nutritionChanged =
+			JSON.stringify(previous.nutrition) !== JSON.stringify(updated.nutrition);
+		const zeroNutrition = hasZeroNutrition(updated.nutrition);
 		const saved = {
 			...updated,
 			saved: true,
-			nutritionStale: nutritionNeedsRefresh ? true : previous.nutritionStale
+			nutritionStale: nutritionNeedsRefresh
+				? true
+				: updated.provenance === 'manual' && zeroNutrition
+					? true
+					: nutritionChanged && !zeroNutrition
+						? false
+						: previous.nutritionStale
 		};
 		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
 		editingRecipe = null;
@@ -2819,6 +2864,8 @@
 				kitchenSync?.clearContext();
 				localStorage.removeItem('flavorithm-last-account');
 				user = null;
+				editingRecipe = null;
+				editingRecipeMode = 'edit';
 				inviteCode = '';
 				currentInviteId = '';
 				joinCode = '';
@@ -3003,6 +3050,8 @@
 			mobileNav = false;
 			closeDialog();
 			selected = null;
+			editingRecipe = null;
+			editingRecipeMode = 'edit';
 		}
 	}}
 />
@@ -3212,6 +3261,8 @@
 							</h2>
 						</div>
 						<div class="recipe-actions">
+							<button class="secondary" onclick={openNewRecipe}><Plus size={17} />New recipe</button
+							>
 							<button class="secondary" onclick={() => openImport()}
 								><Plus size={17} />Import</button
 							>
@@ -3288,9 +3339,9 @@
 											alt={recipe.title}
 											loading={i > 2 ? 'lazy' : 'eager'}
 										/></button
-									><span class="recipe-badge"
-										>{recipe.hidden ? 'Hidden' : recipe.tags[0] || recipe.cuisine}</span
-									><button
+									>{#if recipe.hidden || recipe.tags[0] || recipe.cuisine}<span class="recipe-badge"
+											>{recipe.hidden ? 'Hidden' : recipe.tags[0] || recipe.cuisine}</span
+										>{/if}<button
 										class:saved={recipe.saved}
 										class="save-recipe"
 										onclick={() => saveRecipe(recipe)}
@@ -3313,9 +3364,9 @@
 									>
 									<p>{recipe.description}</p>
 									<div class="recipe-meta">
-										<span><Clock size={14} />{recipe.time} min</span><span
-											><ChefHat size={14} />{recipe.difficulty}</span
-										><span class="pantry-match"
+										<span><Clock size={14} />{recipe.time} min</span>{#if recipe.difficulty}<span
+												><ChefHat size={14} />{recipe.difficulty}</span
+											>{/if}<span class="pantry-match"
 											><Leaf size={13} />{recipe.ingredients.filter((i) =>
 												availablePantryNames.has(normalizeName(i.name))
 											).length} in your pantry</span
@@ -3329,7 +3380,10 @@
 							>
 								<Heart size={36} />
 								<h2>No saved recipes yet</h2>
-								<p>Tap the bookmark on any recipe to keep it close.</p>
+								<p>Tap the bookmark on any recipe to keep it close, or add your own.</p>
+								<button type="button" class="secondary" onclick={openNewRecipe}
+									><Plus size={17} />New recipe</button
+								>
 							</div>{:else if activeRecipeFilters}<div class="empty-state filtered-recipe-empty">
 								<Heart size={36} />
 								<h2>
@@ -3346,7 +3400,10 @@
 							</div>{:else}<div class="empty-state">
 								<Heart size={36} />
 								<h2>No recipes found</h2>
-								<p>Import a recipe or generate ideas to get started.</p>
+								<p>Add a new recipe, import a link, or generate ideas to get started.</p>
+								<button type="button" class="secondary" onclick={openNewRecipe}
+									><Plus size={17} />New recipe</button
+								>
 							</div>{/if}{/if}{#if capabilities.recipeSearch}<button
 							class="browse-link"
 							onclick={() => {
@@ -3857,11 +3914,16 @@
 			notify('Rating saved. Future recipes will use your feedback.');
 		}}
 	/>{/if}
-{#if editingRecipe}<RecipeEditor
-		recipe={editingRecipe}
-		cancel={() => (editingRecipe = null)}
-		save={saveEditedRecipe}
-	/>{/if}
+{#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
+			recipe={editingRecipe}
+			mode={editingRecipeMode}
+			canUploadCover={Boolean(user) && online}
+			cancel={() => {
+				editingRecipe = null;
+				editingRecipeMode = 'edit';
+			}}
+			save={saveEditedRecipe}
+		/>{/key}{/if}
 {#if modal}<div class="modal-backdrop" transition:backdropMotion|global>
 		{#key modal}
 			<div
