@@ -2359,8 +2359,9 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let publicCatalog: Promise<SupportedModelResponse> | undefined;
-let publicCatalogExpiresAt = 0;
+type CatalogCacheEntry = { promise: Promise<SupportedModelResponse>; expiresAt: number };
+let publicCatalog: CatalogCacheEntry | undefined;
+const customFetcherCatalogs = new WeakMap<Fetcher, CatalogCacheEntry>();
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2382,16 +2383,28 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
-		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
-		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (publicCatalog === pending) {
-				publicCatalog = undefined;
-				publicCatalogExpiresAt = 0;
-			}
-			throw error;
-		});
-		publicCatalog = pending;
+	const now = Date.now();
+	const sharedRuntimeFetch = fetcher === fetch || fetcher.name === 'server_fetch';
+	const existing = sharedRuntimeFetch ? publicCatalog : customFetcherCatalogs.get(fetcher);
+	if (existing && now < existing.expiresAt) {
+		return existing.promise;
 	}
-	return publicCatalog;
+	const entry: CatalogCacheEntry = {
+		expiresAt: now + PUBLIC_MODEL_CATALOG_TTL_MS,
+		promise: undefined as unknown as Promise<SupportedModelResponse>
+	};
+	entry.promise = getSupportedModels(fetcher).catch((error) => {
+		if (sharedRuntimeFetch) {
+			if (publicCatalog === entry) publicCatalog = undefined;
+		} else if (customFetcherCatalogs.get(fetcher) === entry) {
+			customFetcherCatalogs.delete(fetcher);
+		}
+		throw error;
+	});
+	if (sharedRuntimeFetch) {
+		publicCatalog = entry;
+	} else {
+		customFetcherCatalogs.set(fetcher, entry);
+	}
+	return entry.promise;
 }
