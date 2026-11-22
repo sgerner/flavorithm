@@ -35,11 +35,9 @@
 		ChevronLeft,
 		ChevronRight,
 		LogOut,
-		Copy,
 		Download,
 		Leaf,
 		SlidersHorizontal,
-		Flame,
 		ChefHat,
 		Star,
 		Menu,
@@ -56,23 +54,17 @@
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
-	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
-	import ButlerChat from '#lib/components/ButlerChat.svelte';
-	import { applyButlerCommands } from '#lib/butler.ts';
-	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
+	import BasilAvatar from '#lib/components/BasilAvatar.svelte';
+	import type ButlerChatType from '#lib/components/ButlerChat.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
-	import AIConnection from '#lib/components/AIConnection.svelte';
-	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
-	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
+	import type { VoiceCapture as VoiceCaptureInstance, VoiceState } from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
 	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
-	import RecipeImport, {
-		emptyImportSession,
-		type ImportSession
-	} from '#lib/components/RecipeImport.svelte';
+	import { emptyImportSession, type ImportSession } from '#lib/import-session.ts';
+	import { createModalPreloader, scheduleIdleWarmup } from '#lib/modal-preloader.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -125,22 +117,132 @@
 		taste: 'Recipe preferences',
 		search: 'Find recipes online'
 	};
+	type LazyModalKey =
+		| 'recipeDetail'
+		| 'recipeEditor'
+		| 'recipeImport'
+		| 'voiceSettings'
+		| 'aiConnection'
+		| 'household'
+		| 'onboarding'
+		| 'butlerChat';
+	let RecipeDetailComponent = $state.raw<
+		(typeof import('#lib/components/RecipeDetail.svelte'))['default'] | null
+	>(null);
+	let ButlerChatComponent = $state.raw<
+		(typeof import('#lib/components/ButlerChat.svelte'))['default'] | null
+	>(null);
+	let RecipeEditorComponent = $state.raw<
+		(typeof import('#lib/components/RecipeEditor.svelte'))['default'] | null
+	>(null);
+	let RecipeImportComponent = $state.raw<
+		(typeof import('#lib/components/RecipeImport.svelte'))['default'] | null
+	>(null);
+	let VoiceSettingsComponent = $state.raw<
+		(typeof import('#lib/components/VoiceSettings.svelte'))['default'] | null
+	>(null);
+	let AIConnectionComponent = $state.raw<
+		(typeof import('#lib/components/AIConnection.svelte'))['default'] | null
+	>(null);
+	let HouseholdDialogComponent = $state.raw<
+		(typeof import('#lib/components/HouseholdDialog.svelte'))['default'] | null
+	>(null);
+	let PreferencesQuizComponent = $state.raw<
+		(typeof import('#lib/components/PreferencesQuiz.svelte'))['default'] | null
+	>(null);
+	type VoiceCaptureConstructor = (typeof import('#lib/voice-capture.ts'))['VoiceCapture'];
+	let VoiceCaptureClass: VoiceCaptureConstructor | null = null;
+	let modalErrors = $state<Record<LazyModalKey, string>>({
+		recipeDetail: '',
+		recipeEditor: '',
+		recipeImport: '',
+		voiceSettings: '',
+		aiConnection: '',
+		household: '',
+		onboarding: '',
+		butlerChat: ''
+	});
+	const modalPreloader = createModalPreloader({
+		recipeDetail: () =>
+			import('#lib/components/RecipeDetail.svelte').then(
+				(m) => (RecipeDetailComponent = m.default)
+			),
+		recipeEditor: () =>
+			import('#lib/components/RecipeEditor.svelte').then(
+				(m) => (RecipeEditorComponent = m.default)
+			),
+		recipeImport: () =>
+			import('#lib/components/RecipeImport.svelte').then(
+				(m) => (RecipeImportComponent = m.default)
+			),
+		voiceSettings: () =>
+			import('#lib/components/VoiceSettings.svelte').then(
+				(m) => (VoiceSettingsComponent = m.default)
+			),
+		aiConnection: () =>
+			import('#lib/components/AIConnection.svelte').then((m) => {
+				const restoreHeading =
+					typeof document !== 'undefined' && document.activeElement?.id === 'ai-connection-heading';
+				AIConnectionComponent = m.default;
+				if (restoreHeading) {
+					void tick().then(() => {
+						if (modal === 'settings') document.getElementById('ai-connection-heading')?.focus();
+					});
+				}
+				return m.default;
+			}),
+		butlerChat: () =>
+			import('#lib/components/ButlerChat.svelte').then((m) => (ButlerChatComponent = m.default)),
+		household: () =>
+			import('#lib/components/HouseholdDialog.svelte').then(
+				(m) => (HouseholdDialogComponent = m.default)
+			),
+		onboarding: () =>
+			import('#lib/components/PreferencesQuiz.svelte').then(
+				(m) => (PreferencesQuizComponent = m.default)
+			),
+		butlerCommands: () => import('#lib/butler.ts'),
+		voiceCapture: (): Promise<VoiceCaptureConstructor> =>
+			import('#lib/voice-capture.ts').then((m) => {
+				VoiceCaptureClass = m.VoiceCapture;
+				return m.VoiceCapture;
+			})
+	});
+	const warmModal = (key: Parameters<typeof modalPreloader.preload>[0]) =>
+		modalPreloader.preload(key);
+	const warmSettings = () => {
+		modalPreloader.preload('voiceSettings');
+		modalPreloader.preload('aiConnection');
+	};
+	async function loadModal(key: LazyModalKey) {
+		modalErrors[key] = '';
+		try {
+			await modalPreloader.load(key);
+			return true;
+		} catch {
+			modalErrors[key] = 'Could not load this view. Check your connection and try again.';
+			return false;
+		}
+	}
+	const loadSettingsModules = () =>
+		Promise.all([loadModal('voiceSettings'), loadModal('aiConnection')]).then(
+			([voiceOk, aiOk]) => voiceOk && aiOk
+		);
+	function focusAIConnectionHeading() {
+		const active = document.activeElement;
+		const inField =
+			active instanceof HTMLInputElement ||
+			active instanceof HTMLSelectElement ||
+			active instanceof HTMLTextAreaElement;
+		if (!inField) document.getElementById('ai-connection-heading')?.focus();
+	}
 	let quizTime = $state(45);
 	let quizComplexity = $state('Easy');
 	let quizCuisines = $state<string[]>([]);
 	let quizDiet = $state('none');
 	let quizAllergies = $state('');
-	const cuisineChoices = [
-		'Mediterranean',
-		'Italian',
-		'Mexican',
-		'Indian',
-		'Japanese',
-		'Thai',
-		'Middle Eastern',
-		'American'
-	];
 	function openOnboarding() {
+		void loadModal('onboarding');
 		quizTime = kitchen.preferences.maxTime;
 		quizComplexity = kitchen.preferences.complexity;
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
@@ -233,7 +335,7 @@
 	let voiceState = $state<VoiceState>('idle');
 	let voiceStarting = $state(false);
 	let voiceTarget = $state('');
-	let voiceCapture: VoiceCapture | undefined;
+	let voiceCapture: VoiceCaptureInstance | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
 		const owner = voiceOwner;
@@ -662,6 +764,12 @@
 		const verificationToken = pageUrl.searchParams.get('verify');
 		if (returnFromChatGPT) {
 			modal = 'settings';
+			void loadSettingsModules().then(async (loaded) => {
+				if (loaded && modal === 'settings') {
+					await tick();
+					focusAIConnectionHeading();
+				}
+			});
 		}
 		if (reset && !managedAuth) {
 			resetToken = reset;
@@ -705,7 +813,7 @@
 				user = data.user ?? null;
 				if (user) showStarter = false;
 				syncing = false;
-				if (user && returnFromChatGPT) await openSettings();
+				if (user && returnFromChatGPT) await openSettings(true);
 				if (user)
 					await refreshConnections().catch(() =>
 						notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
@@ -754,19 +862,39 @@
 			navigator.serviceWorker.register('/service-worker.js').catch(() => {
 				/* Offline installation is retried on the next visit. */
 			});
+		const idleModalOrder = [
+			'recipeDetail',
+			'recipeImport',
+			'butlerChat',
+			'aiConnection',
+			'voiceSettings',
+			'recipeEditor',
+			'household',
+			'onboarding',
+			'butlerCommands',
+			'voiceCapture'
+		] as const;
+		let cancelIdleWarmup = scheduleIdleWarmup(idleModalOrder, (key) => modalPreloader.load(key));
 		const install = (e: Event) => {
 			e.preventDefault();
 			deferredInstall = e;
 		};
 		const connectionChanged = () => {
 			online = navigator.onLine;
-			if (online) void reconnectKitchen();
-			else if (managedAuth) clearManagedIdentity();
+			if (online) {
+				cancelIdleWarmup();
+				cancelIdleWarmup = scheduleIdleWarmup(idleModalOrder, (key) => modalPreloader.load(key));
+				void reconnectKitchen();
+			} else {
+				cancelIdleWarmup();
+				if (managedAuth) clearManagedIdentity();
+			}
 		};
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
 		return () => {
+			cancelIdleWarmup();
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
@@ -1053,14 +1181,16 @@
 		mobileNav = false;
 		modal = 'settings';
 		error = '';
+		const settingsReady = loadSettingsModules();
 		try {
 			await refreshAuth();
 		} catch {
 			// Keep the last known account state while showing Settings offline.
 		}
 		if (focusAI) {
+			await settingsReady;
 			await tick();
-			document.getElementById('ai-connection-heading')?.focus();
+			if (modal === 'settings') focusAIConnectionHeading();
 		}
 		try {
 			if (user) {
@@ -1337,8 +1467,18 @@
 			signal
 		);
 	}
-	let butlerChat = $state<ButlerChat>();
+	let butlerChat = $state<ButlerChatType>();
 	let butlerOpen = $state(false);
+	let butlerActivated = $state(false);
+	function openBasil() {
+		butlerActivated = true;
+		butlerOpen = true;
+		void loadModal('butlerChat');
+	}
+	function closeBasilFallback() {
+		butlerOpen = false;
+		if (!ButlerChatComponent) butlerActivated = false;
+	}
 	let cookingSteps = $state<Record<string, number[]>>({});
 	let selectedMealServings = $state<number | undefined>();
 	let cookingSessionKey = $derived(
@@ -1347,6 +1487,19 @@
 	$effect(() => {
 		if (selected && !cookingSteps[cookingSessionKey]) cookingSteps[cookingSessionKey] = [];
 	});
+	$effect(() => {
+		if (selected && !modal) {
+			void loadModal('recipeDetail');
+			if (selected.saved) warmModal('recipeEditor');
+		}
+		if (editingRecipe) void loadModal('recipeEditor');
+		if (modal === 'import') void loadModal('recipeImport');
+		else if (modal === 'settings') void loadSettingsModules();
+		else if (modal === 'household' || modal === 'removeMember' || modal === 'leave')
+			void loadModal('household');
+		else if (modal === 'onboarding') void loadModal('onboarding');
+		if (butlerOpen) void loadModal('butlerChat');
+	});
 	async function askButler(
 		message: string,
 		history: { role: 'user' | 'assistant'; content: string }[],
@@ -1354,7 +1507,8 @@
 		recipeDrafts: Recipe[] = []
 	) {
 		if (!needAI()) {
-			butlerChat?.close();
+			butlerOpen = false;
+			await butlerChat?.close();
 			throw new Error('Sign in and connect a model in Settings to speak with Basil.');
 		}
 		const owner = `${user?.id}:${user?.householdId}`;
@@ -1386,7 +1540,17 @@
 			throw new Error('The active kitchen changed. Ask Basil again.');
 		return result as { reply: string; commands: unknown[] };
 	}
-	function applyButler(commands: unknown[], expectedSnapshot: string) {
+	async function applyButler(commands: unknown[], expectedSnapshot: string) {
+		if (JSON.stringify(kitchen) !== expectedSnapshot) {
+			throw new Error(
+				'Your kitchen changed since this proposal. Ask Basil for an updated proposal.'
+			);
+		}
+		const activeOwner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+		const { applyButlerCommands } = await modalPreloader.load('butlerCommands');
+		if (`${user?.id ?? 'guest'}:${user?.householdId ?? ''}` !== activeOwner) {
+			throw new Error('The active kitchen changed. Ask Basil again.');
+		}
 		if (JSON.stringify(kitchen) !== expectedSnapshot) {
 			throw new Error(
 				'Your kitchen changed since this proposal. Ask Basil for an updated proposal.'
@@ -1398,7 +1562,7 @@
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
-				butlerChat?.close();
+				void butlerChat?.close();
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
 				if (recipe && effect.mode === 'edit') editSavedRecipe(recipe);
 				else if (recipe && effect.mode === 'cook') {
@@ -1409,7 +1573,7 @@
 					else selected = recipe;
 				} else selected = recipe ?? null;
 			} else if (effect.type === 'ui') {
-				butlerChat?.close();
+				void butlerChat?.close();
 				openButlerControl(effect.action);
 			}
 		}
@@ -1565,7 +1729,22 @@
 		if (!forRecipe) modal = 'pantry';
 		const inputSession = importSession;
 		const owner = user?.id;
-		const capture = new VoiceCapture({
+		let Capture: VoiceCaptureConstructor;
+		if (VoiceCaptureClass) {
+			Capture = VoiceCaptureClass;
+		} else {
+			try {
+				Capture = await modalPreloader.load('voiceCapture');
+			} catch {
+				voiceStarting = false;
+				notify('Voice input could not be loaded. Check your connection and try again.');
+				return;
+			}
+			if (!voiceStarting || user?.id !== owner || modal !== (forRecipe ? 'import' : 'pantry')) {
+				return;
+			}
+		}
+		const capture = new Capture({
 			state: (value) => {
 				voiceState = value;
 			},
@@ -1614,6 +1793,7 @@
 	function editSavedRecipe(recipe: Recipe) {
 		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
 		if (!saved) return;
+		void loadModal('recipeEditor');
 		selected = null;
 		editingRecipe = {
 			...saved,
@@ -1829,6 +2009,7 @@
 			openAuthentication();
 			return;
 		}
+		void loadModal('household');
 		modal = 'household';
 		error = '';
 		householdBusy = true;
@@ -1960,6 +2141,7 @@
 		if (text !== undefined) importSession = { ...emptyImportSession(), text };
 		error = '';
 		mobileNav = false;
+		void loadModal('recipeImport');
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
@@ -2146,19 +2328,90 @@
 	}
 </script>
 
+{#snippet lazyStatus(key: LazyModalKey, label: string, onclose?: () => void)}
+	{#if modalErrors[key]}
+		<p class="error" role="alert">{modalErrors[key]}</p>
+		<div class="dialog-actions">
+			{#if onclose}<button class="secondary" onclick={onclose}>Close</button>{/if}
+			<button class="primary" onclick={() => void loadModal(key)}
+				><RefreshCw size={15} /> Try again</button
+			>
+		</div>
+	{:else}
+		<p class="muted" role="status">{label}</p>
+	{/if}
+{/snippet}
+{#snippet lazyDialog(key: LazyModalKey, title: string, onclose: () => void, headingId?: string)}
+	<div class="modal-backdrop" transition:backdropMotion|global>
+		<div
+			class="flavor-dialog wide"
+			use:focusTrap
+			role="dialog"
+			aria-modal="true"
+			aria-label={headingId ? undefined : title}
+			aria-labelledby={headingId}
+			tabindex="-1"
+			transition:dialogMotion|global
+		>
+			<button class="icon-button dialog-close" onclick={onclose} aria-label="Close dialog"
+				><X size={21} /></button
+			>
+			<h2 id={headingId}>{title}</h2>
+			{@render lazyStatus(key, 'Loading…', onclose)}
+		</div>
+	</div>
+{/snippet}
+
 {#if ready}
 	<div inert={!!modal || !!selected || !!editingRecipe}>
-		<ButlerChat
-			bind:this={butlerChat}
-			bind:open={butlerOpen}
-			{kitchen}
-			owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
-			request={askButler}
-			apply={applyButler}
-			userName={user?.name ?? ''}
-			syncing={sendingSync}
-			{pendingSync}
-		/>
+		{#if butlerActivated && ButlerChatComponent}
+			<ButlerChatComponent
+				bind:this={butlerChat}
+				bind:open={butlerOpen}
+				{kitchen}
+				owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
+				request={askButler}
+				apply={applyButler}
+				userName={user?.name ?? ''}
+				syncing={sendingSync}
+				{pendingSync}
+			/>
+		{:else}
+			<button
+				class="butler-launcher"
+				class:waiting={sendingSync}
+				onpointerenter={() => warmModal('butlerChat')}
+				onfocusin={() => warmModal('butlerChat')}
+				onclick={openBasil}
+				aria-expanded={butlerOpen}
+				aria-controls="butler-panel"
+				aria-label={butlerOpen ? 'Close Basil chat' : 'Chat with Basil, your kitchen butler'}
+				title="Chat with Basil"
+			>
+				<BasilAvatar size={32} active={butlerOpen} /><span>Basil</span>
+			</button>
+			{#if butlerOpen}
+				<div
+					class="butler-fallback-panel"
+					id="butler-panel"
+					use:focusTrap
+					role="dialog"
+					aria-modal="true"
+					tabindex="-1"
+					aria-label="Chat with Basil"
+				>
+					<div class="butler-fallback-header">
+						<strong>Basil</strong>
+						<button class="icon-button" onclick={closeBasilFallback} aria-label="Close chat"
+							><X size={20} /></button
+						>
+					</div>
+					<div class="butler-fallback-body">
+						{@render lazyStatus('butlerChat', 'Summoning Basil…', closeBasilFallback)}
+					</div>
+				</div>
+			{/if}
+		{/if}
 	</div>
 {/if}
 
@@ -2172,6 +2425,8 @@
 			mobileNav = false;
 			closeDialog();
 			selected = null;
+			editingRecipe = null;
+			if (!ButlerChatComponent && butlerOpen) closeBasilFallback();
 		}
 	}}
 />
@@ -2217,8 +2472,12 @@
 				>{/each}
 		</nav>
 		<div class="bottom-nav">
-			<button onclick={household}><Users size={18} /> My household <Plus size={15} /></button
-			><button onclick={() => openSettings()}><Settings size={18} /> Settings & themes</button
+			<button
+				onpointerenter={() => warmModal('household')}
+				onfocusin={() => warmModal('household')}
+				onclick={household}><Users size={18} /> My household <Plus size={15} /></button
+			><button onpointerenter={warmSettings} onfocusin={warmSettings} onclick={() => openSettings()}
+				><Settings size={18} /> Settings & themes</button
 			><button
 				onclick={() => {
 					kitchen.preferences.dark = !kitchen.preferences.dark;
@@ -2230,7 +2489,15 @@
 				></span></button
 			>
 		</div>
-		<button class="profile-button" onclick={() => (user ? openSettings() : openAuthentication())}
+		<button
+			class="profile-button"
+			onpointerenter={() => {
+				if (user) warmSettings();
+			}}
+			onfocusin={() => {
+				if (user) warmSettings();
+			}}
+			onclick={() => (user ? openSettings() : openAuthentication())}
 			><span class="profile-avatar">{user ? user.name.slice(0, 1).toUpperCase() : 'Y'}</span><span
 				><b>{user?.name || (managedAuth ? 'Managed by provider' : 'Sign in')}</b><small
 					>{user
@@ -2261,6 +2528,12 @@
 				><button
 					class="top-avatar"
 					aria-label={user ? 'Open household and account' : 'Sign in or create an account'}
+					onpointerenter={() => {
+						if (user) warmModal('household');
+					}}
+					onfocusin={() => {
+						if (user) warmModal('household');
+					}}
 					onclick={() => (user ? household() : openAuthentication())}
 					>{user?.name.slice(0, 1) || 'Y'}</button
 				>
@@ -2306,6 +2579,8 @@
 					<button
 						class="text-button taste-note"
 						aria-label="Recipe preferences"
+						onpointerenter={() => warmModal('onboarding')}
+						onfocusin={() => warmModal('onboarding')}
 						onclick={openOnboarding}
 						><span class="preference-label">Preferences</span><SlidersHorizontal
 							size={18}
@@ -2321,8 +2596,12 @@
 							aria-label="Scan ingredients from a photo"
 							onclick={() => imageInput.click()}><Camera size={19} /></button
 						>
-						<button class="secondary" aria-label="Dictate ingredients" onclick={dictate}
-							><Mic size={19} /></button
+						<button
+							class="secondary"
+							aria-label="Dictate ingredients"
+							onpointerenter={() => warmModal('voiceCapture')}
+							onfocusin={() => warmModal('voiceCapture')}
+							onclick={dictate}><Mic size={19} /></button
 						>
 					</div>{/if}
 				{#if page === 'discover'}<section
@@ -2339,8 +2618,12 @@
 									class="banner-icon"
 									aria-label="Scan ingredients from a photo"
 									onclick={() => imageInput.click()}><Camera size={20} /></button
-								><button class="banner-icon" aria-label="Dictate ingredients" onclick={dictate}
-									><Mic size={20} /></button
+								><button
+									class="banner-icon"
+									aria-label="Dictate ingredients"
+									onpointerenter={() => warmModal('voiceCapture')}
+									onfocusin={() => warmModal('voiceCapture')}
+									onclick={dictate}><Mic size={20} /></button
 								>
 							</div>
 						</div>
@@ -2361,8 +2644,11 @@
 							</h2>
 						</div>
 						<div class="recipe-actions">
-							<button class="secondary" onclick={() => openImport()}
-								><Plus size={17} />Import</button
+							<button
+								class="secondary"
+								onpointerenter={() => warmModal('recipeImport')}
+								onfocusin={() => warmModal('recipeImport')}
+								onclick={() => openImport()}><Plus size={17} />Import</button
 							>
 							<button
 								class="primary"
@@ -2399,6 +2685,8 @@
 					<div class="recipe-grid">
 						{#each recipes as recipe, i (recipe.id)}<article
 								class="recipe-card"
+								onpointerenter={() => warmModal('recipeDetail')}
+								onfocusin={() => warmModal('recipeDetail')}
 								animate:flip={{ duration: motionDuration(250) }}
 								in:revealMotion|global={{ y: 20, duration: 400, delay: Math.min(i * 65, 350) }}
 							>
@@ -2495,8 +2783,11 @@
 					<div>
 						<button class="secondary" onclick={() => imageInput.click()}
 							><Camera size={17} /> Scan a photo</button
-						><button class="secondary" onclick={dictate}
-							><Mic size={17} /> Tell us what you have</button
+						><button
+							class="secondary"
+							onpointerenter={() => warmModal('voiceCapture')}
+							onfocusin={() => warmModal('voiceCapture')}
+							onclick={dictate}><Mic size={17} /> Tell us what you have</button
 						>
 					</div>
 				</div>
@@ -2648,6 +2939,8 @@
 												>
 													<button
 														class="meal-open"
+														onpointerenter={() => warmModal('recipeDetail')}
+														onfocusin={() => warmModal('recipeDetail')}
 														onclick={() => {
 															selectedMealServings = meal.servings;
 															selected = recipe;
@@ -2730,6 +3023,8 @@
 													}}>Use leftovers <Check size={15} /></button
 												>{/if}<button
 												class="text-button"
+												onpointerenter={() => warmModal('recipeDetail')}
+												onfocusin={() => warmModal('recipeDetail')}
 												onclick={() => {
 													selectedMealServings = undefined;
 													selected = recipe;
@@ -2885,44 +3180,52 @@
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
-{#if selected && !modal}<RecipeDetail
-		recipe={selected}
-		initialServings={selectedMealServings ?? selected.servings}
-		bind:completedSteps={
-			() => cookingSteps[cookingSessionKey] ?? [],
-			(steps) => {
-				cookingSteps[cookingSessionKey] = steps;
+{#if selected && !modal}{#if RecipeDetailComponent}<RecipeDetailComponent
+			recipe={selected}
+			initialServings={selectedMealServings ?? selected.servings}
+			bind:completedSteps={
+				() => cookingSteps[cookingSessionKey] ?? [],
+				(steps) => {
+					cookingSteps[cookingSessionKey] = steps;
+				}
 			}
-		}
-		close={() => {
+			close={() => {
+				selected = null;
+				selectedMealServings = undefined;
+			}}
+			save={() => saveRecipe(selected!)}
+			shop={(servings) =>
+				shoppingFor(
+					[selected!],
+					[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }],
+					`recipe:${selected!.id}`
+				)}
+			plan={(servings) => planRecipe(selected!, servings)}
+			nutrition={refreshNutrition}
+			edit={() => editSavedRecipe(selected!)}
+			remove={() => askDeleteRecipe(selected!)}
+			toggleHidden={() => toggleRecipeHidden(selected!)}
+			{busy}
+			rate={(n) => {
+				selected!.rating = n;
+				kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
+				kitchen.recipes = [...kitchen.recipes];
+				notify('Rating saved. Future recipes will use your feedback.');
+			}}
+		/>{:else}{@render lazyDialog('recipeDetail', selected.title, () => {
 			selected = null;
 			selectedMealServings = undefined;
-		}}
-		save={() => saveRecipe(selected!)}
-		shop={(servings) =>
-			shoppingFor(
-				[selected!],
-				[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }],
-				`recipe:${selected!.id}`
-			)}
-		plan={(servings) => planRecipe(selected!, servings)}
-		nutrition={refreshNutrition}
-		edit={() => editSavedRecipe(selected!)}
-		remove={() => askDeleteRecipe(selected!)}
-		toggleHidden={() => toggleRecipeHidden(selected!)}
-		{busy}
-		rate={(n) => {
-			selected!.rating = n;
-			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
-			kitchen.recipes = [...kitchen.recipes];
-			notify('Rating saved. Future recipes will use your feedback.');
-		}}
-	/>{/if}
-{#if editingRecipe}<RecipeEditor
-		recipe={editingRecipe}
-		cancel={() => (editingRecipe = null)}
-		save={saveEditedRecipe}
-	/>{/if}
+		})}{/if}{/if}
+{#if editingRecipe}{#if RecipeEditorComponent}<RecipeEditorComponent
+			recipe={editingRecipe}
+			cancel={() => (editingRecipe = null)}
+			save={saveEditedRecipe}
+		/>{:else}{@render lazyDialog(
+			'recipeEditor',
+			'Edit saved recipe',
+			() => (editingRecipe = null),
+			'recipe-editor-title'
+		)}{/if}{/if}
 {#if modal}<div class="modal-backdrop" transition:backdropMotion|global>
 		{#key modal}
 			<div
@@ -2971,86 +3274,33 @@
 					}}
 					aria-label="Close dialog"><X size={21} /></button
 				>
-				{#if modal === 'import'}<RecipeImport
-						bind:session={importSession}
-						capture={captureImport}
-						save={saveImportedRecipe}
-						dictate={dictateRecipe}
-					/>{:else if modal === 'onboarding'}
-					<span class="dialog-spark">✷</span>
-					<h2>Recipe preferences</h2>
-					<p class="muted onboarding-intro">
-						Optional. Change these preferences anytime in Settings.
-					</p>
-					<form onsubmit={finishOnboarding}>
-						<fieldset class="quiz-group">
-							<legend>Preferred cooking time</legend>
-							<div class="quiz-options quiz-time">
-								{#each [15, 30, 45, 60] as minutes}<label class="quiz-option"
-										><input
-											type="radio"
-											name="cooking-time"
-											value={minutes}
-											bind:group={quizTime}
-										/><span>{minutes} min</span></label
-									>{/each}
-							</div>
-						</fieldset>
-						<fieldset class="quiz-group">
-							<legend>Favorite cuisines</legend>
-							<p class="quiz-help">Choose any, or leave blank for all cuisines.</p>
-							<div class="quiz-options quiz-cuisines">
-								{#each cuisineChoices as cuisine}<label class="quiz-option"
-										><input type="checkbox" value={cuisine} bind:group={quizCuisines} /><span
-											>{cuisine}</span
-										></label
-									>{/each}
-							</div>
-						</fieldset>
-						<fieldset class="quiz-group">
-							<legend>Cooking complexity</legend>
-							<div class="quiz-options quiz-complexity">
-								{#each ['Easy', 'Moderate', 'Adventurous'] as complexity}<label class="quiz-option"
-										><input
-											type="radio"
-											name="cooking-complexity"
-											value={complexity}
-											bind:group={quizComplexity}
-										/><span>{complexity}</span></label
-									>{/each}
-							</div>
-						</fieldset>
-						<details class="quiz-dietary">
-							<summary>Any dietary preferences or allergies? <span>Optional</span></summary>
-							<label class="field"
-								>Dietary style<select bind:value={quizDiet}
-									><option value="none">No dietary restriction</option><option value="vegetarian"
-										>Vegetarian</option
-									><option value="vegan">Vegan</option><option value="pescatarian"
-										>Pescatarian</option
-									><option value="gluten-free">Gluten-free</option><option value="dairy-free"
-										>Dairy-free</option
-									></select
-								></label
-							>
-							<label class="field"
-								>Allergies or ingredients to avoid<input
-									bind:value={quizAllergies}
-									maxlength="500"
-									placeholder="e.g. peanuts, shellfish"
-								/></label
-							>
-							<p class="field-help">
-								These guide generation. Check ingredients and labels before cooking.
-							</p>
-						</details>
-						<div class="dialog-actions quiz-actions">
-							<button class="primary" type="submit">Save preferences <Check size={17} /></button
-							><button class="text-button" type="button" onclick={dismissOnboarding}
-								>Maybe later</button
-							>
-						</div>
-					</form>
+				{#if modal === 'import'}{#if RecipeImportComponent}<RecipeImportComponent
+							bind:session={importSession}
+							capture={captureImport}
+							save={saveImportedRecipe}
+							dictate={dictateRecipe}
+						/>{:else}<span class="dialog-spark">✳</span>
+						<h2 id="recipe-import-title">Import recipe</h2>
+						{@render lazyStatus(
+							'recipeImport',
+							'Opening recipe import…',
+							closeDialog
+						)}{/if}{:else if modal === 'onboarding'}
+					{#if PreferencesQuizComponent}
+						<PreferencesQuizComponent
+							bind:quizTime
+							bind:quizComplexity
+							bind:quizCuisines
+							bind:quizDiet
+							bind:quizAllergies
+							onsave={finishOnboarding}
+							ondismiss={dismissOnboarding}
+						/>
+					{:else}
+						<span class="dialog-spark">✷</span>
+						<h2>Recipe preferences</h2>
+						{@render lazyStatus('onboarding', 'Loading preferences…', dismissOnboarding)}
+					{/if}
 				{:else if modal === 'pantry'}<span class="dialog-spark">✳</span>
 					<h2>Add ingredients</h2>
 
@@ -3064,10 +3314,13 @@
 						Separate with commas or new lines. Add quantities and units when you know them.
 					</p>
 					<div class="dialog-actions">
-						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button><button
+						<button
 							class="secondary"
-							onclick={() => imageInput.click()}
-							disabled={busy}><Camera size={17} /> Use photo</button
+							onpointerenter={() => warmModal('voiceCapture')}
+							onfocusin={() => warmModal('voiceCapture')}
+							onclick={dictate}><Mic size={17} /> Use voice</button
+						><button class="secondary" onclick={() => imageInput.click()} disabled={busy}
+							><Camera size={17} /> Use photo</button
 						><button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
 							>Add ingredients <ArrowRight size={17} /></button
 						>
@@ -3209,7 +3462,11 @@
 								', '
 							) || 'Open to every cuisine'}
 						</p>
-						<button class="secondary" onclick={openOnboarding}
+						<button
+							class="secondary"
+							onpointerenter={() => warmModal('onboarding')}
+							onfocusin={() => warmModal('onboarding')}
+							onclick={openOnboarding}
 							>Edit my taste preferences <SlidersHorizontal size={16} /></button
 						>
 					</div>
@@ -3242,38 +3499,48 @@
 							</p>{/if}
 					</div>
 					<div class="settings-section">
-						<VoiceSettings
-							bind:provider={voiceProvider}
-							bind:model={voiceModel}
-							bind:apiKey={voiceApiKey}
-							localAvailable={localVoiceAvailable}
-							userId={user?.id}
-						/>
+						{#if VoiceSettingsComponent}
+							<VoiceSettingsComponent
+								bind:provider={voiceProvider}
+								bind:model={voiceModel}
+								bind:apiKey={voiceApiKey}
+								localAvailable={localVoiceAvailable}
+								userId={user?.id}
+							/>
+						{:else}
+							<h3>Voice input</h3>
+							{@render lazyStatus('voiceSettings', 'Loading voice settings…')}
+						{/if}
 					</div>
 					<div class="settings-section intelligence-settings">
-						<AIConnection
-							bind:preferences={kitchen.preferences}
-							bind:apiKey
-							{providers}
-							{accountModels}
-							{chatGPT}
-							activeAccount={activeChatGPTAccount}
-							signedIn={Boolean(user)}
-							{managedAuth}
-							busy={connectionBusy}
-							loading={catalogLoading}
-							{catalogError}
-							authorizationUrl={chatGPTAuthorizationUrl}
-							device={chatGPTDevice}
-							oncancel={cancelChatGPTDevice}
-							oncopycode={copyChatGPTDeviceCode}
-							onselect={(id) => changeConnection(id)}
-							onaccount={() => changeConnection()}
-							onconnect={connectChatGPT}
-							ondisconnect={disconnectChatGPT}
-							onrefresh={refreshAISettings}
-							onsignin={openAuthentication}
-						/>
+						{#if AIConnectionComponent}
+							<AIConnectionComponent
+								bind:preferences={kitchen.preferences}
+								bind:apiKey
+								{providers}
+								{accountModels}
+								{chatGPT}
+								activeAccount={activeChatGPTAccount}
+								signedIn={Boolean(user)}
+								{managedAuth}
+								busy={connectionBusy}
+								loading={catalogLoading}
+								{catalogError}
+								authorizationUrl={chatGPTAuthorizationUrl}
+								device={chatGPTDevice}
+								oncancel={cancelChatGPTDevice}
+								oncopycode={copyChatGPTDeviceCode}
+								onselect={(id) => changeConnection(id)}
+								onaccount={() => changeConnection()}
+								onconnect={connectChatGPT}
+								ondisconnect={disconnectChatGPT}
+								onrefresh={refreshAISettings}
+								onsignin={openAuthentication}
+							/>
+						{:else}
+							<h3 id="ai-connection-heading" tabindex="-1">AI connection</h3>
+							{@render lazyStatus('aiConnection', 'Loading AI connection…')}
+						{/if}
 					</div>
 
 					{#if user}<div class="settings-section">
@@ -3317,118 +3584,41 @@
 							}}>Done <Check size={17} /></button
 						>
 					</div>
-				{:else if modal === 'household'}<span class="dialog-spark">✳</span>
-					<h2>Your household</h2>
-					<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
-					{#if householdBusy}<p class="field-help" role="status">Updating household…</p>{/if}
-					<div class="household-members">
-						{#each members as member (member.id)}<div class="member-row">
-								<span class="profile-avatar"
-									>{member.name.trim().charAt(0).toUpperCase() || '•'}</span
-								>
-								<div class="member-copy">
-									<b>{member.name}{member.id === user?.id ? ' · You' : ''}</b><span
-										>{member.email}</span
-									>
-								</div>
-								<span class="member-role" class:owner-role={member.role === 'owner'}
-									>{member.role === 'owner' ? 'Owner' : 'Member'}</span
-								>
-								{#if canManageHousehold && member.role !== 'owner' && member.id !== user?.id}<button
-										class="text-button danger member-remove"
-										disabled={householdBusy}
-										onclick={() => askRemoveMember(member)}>Remove</button
-									>{/if}
-							</div>{/each}
-					</div>
-					{#if canManageHousehold}<section class="household-invites">
-							<h3>Invitations</h3>
-							{#if householdInvites.length}<div class="invite-list">
-									{#each householdInvites as invite (invite.inviteId)}<div class="invite-row">
-											<span
-												>Expires {new Date(invite.expiresAt).toLocaleDateString('en', {
-													month: 'short',
-													day: 'numeric'
-												})}</span
-											><button
-												class="text-button danger"
-												disabled={householdBusy}
-												onclick={() => revokeInvite(invite.inviteId)}>Revoke</button
-											>
-										</div>{/each}
-								</div>{:else}<p class="field-help">No active invitations.</p>{/if}
-							<button class="primary full" disabled={householdBusy} onclick={invite}
-								><Plus size={17} /> Create invitation</button
-							>
-							{#if inviteCode}<div class="invite-code">
-									<code>{inviteCode}</code><button
-										class="icon-button"
-										aria-label="Copy invitation"
-										onclick={() =>
-											navigator.clipboard
-												.writeText(inviteCode)
-												.then(() => notify('Invite code copied.'))
-												.catch(() => notify('Select and copy the code manually.'))}
-										><Copy size={17} /></button
-									>
-								</div>
-								<p class="field-help">Share privately. This code works once.</p>{/if}
-						</section>{:else}<p class="field-help">
-							Only the household owner can manage invitations or remove members.
-						</p>{/if}
-					<hr />
-					<h3>Have an invitation?</h3>
-					<label class="field"
-						>Invite code<input
-							bind:value={joinCode}
-							placeholder="Paste invitation code"
-							autocomplete="off"
-						/></label
-					>
-					<button class="secondary full" disabled={householdBusy || !joinCode.trim()} onclick={join}
-						>Join household <ArrowRight size={17} /></button
-					>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<button
-						class="text-button danger full"
-						disabled={householdBusy}
-						onclick={() => {
-							modal = 'leave';
-							error = '';
-						}}>Leave this household</button
-					>
-				{:else if modal === 'removeMember'}
-					<h2>Remove household member?</h2>
-					<p class="muted">
-						{memberToRemove?.name} will lose access to this shared kitchen. Their account will remain
-						active.
-					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<div class="dialog-actions">
-						<button
-							class="secondary"
-							disabled={householdBusy}
-							onclick={() => {
+				{:else if modal === 'household' || modal === 'removeMember' || modal === 'leave'}
+					{#if HouseholdDialogComponent}
+						<HouseholdDialogComponent
+							mode={modal}
+							userId={user?.id}
+							{members}
+							{householdInvites}
+							{canManageHousehold}
+							{householdBusy}
+							{busy}
+							{inviteCode}
+							bind:joinCode
+							{error}
+							{memberToRemove}
+							oninvite={invite}
+							onrevoke={revokeInvite}
+							onaskremove={askRemoveMember}
+							oncancelremove={() => {
 								memberToRemove = null;
 								modal = 'household';
-							}}>Keep member</button
-						><button
-							class="primary danger-action"
-							disabled={householdBusy}
-							onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button
-						>
-					</div>
-				{:else if modal === 'leave'}
-					<h2>Leave this household?</h2>
-					<p class="muted">
-						Leaving gives you a new personal kitchen. The shared pantry and recipes stay with your
-						household. You can rejoin with a new invitation.
-					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-						class="primary full"
-						onclick={leaveHousehold}
-						disabled={busy}>Leave household</button
-					>
+							}}
+							onconfirmremove={confirmRemoveMember}
+							onjoin={join}
+							onaskleave={() => {
+								modal = 'leave';
+								error = '';
+							}}
+							onconfirmleave={leaveHousehold}
+							onnotify={notify}
+						/>
+					{:else}
+						<span class="dialog-spark">✳</span>
+						<h2>Your household</h2>
+						{@render lazyStatus('household', 'Loading household…', closeDialog)}
+					{/if}
 				{:else if modal === 'delete' && !managedAuth}
 					<h2>Delete your account?</h2>
 					<p class="muted">
@@ -3599,8 +3789,11 @@
 						included in the prompt for your next AI recipe.
 					</p>
 					<div class="taste-summary">{String(preferenceSummary(kitchen.recipes))}</div>
-					<button class="primary full" onclick={openOnboarding}
-						>Edit preferences <ArrowRight size={17} /></button
+					<button
+						class="primary full"
+						onpointerenter={() => warmModal('onboarding')}
+						onfocusin={() => warmModal('onboarding')}
+						onclick={openOnboarding}>Edit preferences <ArrowRight size={17} /></button
 					>
 				{:else if modal === 'search'}<span class="dialog-spark">✳</span>
 					<h2>Find recipes online</h2>
@@ -3621,16 +3814,23 @@
 						onclick={internetSearch}
 						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 					>{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<button class="secondary full" onclick={() => openImport()}
-						><Plus size={17} />Import text, a link, or a photo</button
+					<button
+						class="secondary full"
+						onpointerenter={() => warmModal('recipeImport')}
+						onfocusin={() => warmModal('recipeImport')}
+						onclick={() => openImport()}><Plus size={17} />Import text, a link, or a photo</button
 					>
 					<div class="web-results">
 						{#each searchResults as result}<div class="web-result">
 								<a href={result.url} target="_blank" rel="noreferrer"
 									><b>{result.title}<ArrowUpRight size={17} /></b>
 									<p>{result.description}</p></a
-								><button class="secondary" disabled={busy} onclick={() => importRecipe(result.url)}
-									><Plus size={16} /> Import recipe</button
+								><button
+									class="secondary"
+									disabled={busy}
+									onpointerenter={() => warmModal('recipeImport')}
+									onfocusin={() => warmModal('recipeImport')}
+									onclick={() => importRecipe(result.url)}><Plus size={16} /> Import recipe</button
 								>
 							</div>{/each}
 					</div>
@@ -3911,63 +4111,54 @@
 			justify-content: flex-start;
 		}
 	}
-	.household-members {
-		margin-top: 10px;
-	}
-	.household-members .member-row {
-		gap: 9px;
-		flex-wrap: wrap;
-		padding: 12px 0;
-	}
-	.member-copy {
-		min-width: 0;
-		flex: 1 1 125px;
+	.butler-launcher {
+		position: fixed;
+		right: 16px;
+		bottom: max(10px, env(safe-area-inset-bottom));
+		z-index: 45;
 		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-	.member-copy span {
-		font-size: 13px;
-		color: var(--muted);
-		overflow-wrap: anywhere;
-	}
-	.member-role {
-		padding: 4px 7px;
-		background: var(--wash);
-		color: var(--muted);
+		align-items: center;
+		gap: 5px;
+		padding: 4px 10px 4px 4px;
+		border: 1px solid var(--line);
+		border-radius: 40px;
+		color: var(--surface);
+		background: var(--ink);
+		box-shadow: 0 4px 20px #0002;
 		font-size: 12px;
+		font-weight: 650;
 	}
-	.member-role.owner-role {
-		background: var(--accent);
+	.butler-fallback-panel {
+		position: fixed;
+		right: 16px;
+		bottom: calc(60px + env(safe-area-inset-bottom));
+		z-index: 46;
+		width: min(440px, calc(100vw - 24px));
+		background: var(--surface);
 		color: var(--ink);
+		border: 1px solid var(--line);
+		border-radius: 18px;
+		box-shadow: 0 18px 70px #0003;
 	}
-	.member-remove {
-		min-height: 40px;
-		padding-inline: 6px;
-		font-size: 13px;
-	}
-	.household-invites {
-		margin-top: 22px;
-		padding: 18px 0 4px;
-		border-top: 1px solid var(--line);
-	}
-	.household-invites h3 {
-		margin-bottom: 6px;
-	}
-	.invite-list {
-		margin: 8px 0 14px;
-	}
-	.invite-row {
+	.butler-fallback-header {
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
-		gap: 12px;
-		min-height: 44px;
+		padding: 10px 12px;
 		border-bottom: 1px solid var(--line);
-		font-size: 14px;
 	}
-	.invite-row button {
-		min-height: 40px;
-		padding-inline: 6px;
+	.butler-fallback-body {
+		padding: 16px;
+	}
+	@media (max-width: 640px) {
+		.butler-launcher {
+			right: 10px;
+			bottom: max(8px, env(safe-area-inset-bottom));
+		}
+		.butler-fallback-panel {
+			right: 8px;
+			bottom: calc(8px + env(safe-area-inset-bottom));
+			width: calc(100vw - 16px);
+		}
 	}
 </style>

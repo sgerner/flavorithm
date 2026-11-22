@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, tick } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import {
 		X,
 		Send,
@@ -75,7 +75,7 @@
 	let launcher = $state<HTMLButtonElement>();
 	let sequence = 0;
 	let generation = 0;
-	let currentOwner = '';
+	let currentOwner = untrack(() => owner);
 	let alive = true;
 	let controller: AbortController | undefined;
 	let requestTimer: ReturnType<typeof setTimeout> | undefined;
@@ -137,11 +137,19 @@
 			behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth'
 		});
 	}
+	$effect(() => {
+		if (!open) return;
+		untrack(() => {
+			void tick().then(() => {
+				if (alive && open && !input?.disabled) input?.focus();
+			});
+		});
+	});
 	export async function close() {
 		resetReaction();
 		open = false;
 		await tick();
-		launcher?.focus();
+		if (!launcher?.closest('[inert]')) launcher?.focus();
 	}
 	async function toggle() {
 		open = !open;

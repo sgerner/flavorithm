@@ -1,25 +1,9 @@
-<script module lang="ts">
-	import type { Recipe } from '#lib/types.ts';
-	export type ImportSession = {
-		text: string;
-		photo: string;
-		photoName: string;
-		draft: Recipe | null;
-		assumptions: string[];
-	};
-	export const emptyImportSession = (): ImportSession => ({
-		text: '',
-		photo: '',
-		photoName: '',
-		draft: null,
-		assumptions: []
-	});
-</script>
-
 <script lang="ts">
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
+	import { emptyImportSession, type ImportSession } from '#lib/import-session.ts';
 	import { revealMotion } from '#lib/motion.ts';
+	import type { Recipe } from '#lib/types.ts';
 	let {
 		session = $bindable(),
 		capture,
