@@ -277,7 +277,9 @@ test('/api/models preserves private max-age caching, enforces no-store on errors
 	assert.equal(catalogFetchCount, 2);
 
 	configureMode('local');
-	// runAIRequest with reasoning reuses the same cached public catalog without fetching models.dev again.
+	// runAIRequest with reasoning reuses the same cached public catalog without fetching models.dev again,
+	// even when a request abort signal wraps the provider fetcher, while isolating distinct custom fetchers.
+	const activeController = new AbortController();
 	await ai.runAIRequest(
 		{
 			action: 'vision',
@@ -287,8 +289,53 @@ test('/api/models preserves private max-age caching, enforces no-store on errors
 			image: 'data:image/png;base64,aGVsbG8=',
 			reasoning: { effort: 'high' }
 		},
-		mockFetcher
+		mockFetcher,
+		undefined,
+		undefined,
+		activeController.signal
 	);
+	assert.equal(catalogFetchCount, 2);
+
+	let alternateCatalogFetchCount = 0;
+	const alternateFetcher: typeof fetch = async (input) => {
+		if (String(input) === 'https://models.dev/api.json') {
+			alternateCatalogFetchCount += 1;
+			return Response.json({
+				anthropic: {
+					name: 'Anthropic',
+					models: {
+						'claude-alt': {
+							reasoning: true,
+							reasoning_options: [{ type: 'effort', values: ['low', 'high'] }],
+							modalities: { input: ['text', 'image'], output: ['text'] }
+						}
+					}
+				}
+			});
+		}
+		return Response.json({
+			content: [
+				{
+					type: 'text',
+					text: JSON.stringify({
+						ingredients: [{ name: 'Eggs', quantity: 2, unit: 'item', category: 'Dairy & eggs' }]
+					})
+				}
+			]
+		});
+	};
+	await ai.runAIRequest(
+		{
+			action: 'vision',
+			provider: 'anthropic',
+			model: 'claude-alt',
+			apiKey: 'sk-alt-key',
+			image: 'data:image/png;base64,aGVsbG8=',
+			reasoning: { effort: 'high' }
+		},
+		alternateFetcher
+	);
+	assert.equal(alternateCatalogFetchCount, 1);
 	assert.equal(catalogFetchCount, 2);
 
 	// Missing accountId on ?connection=chatgpt returns 400 with no-store headers.

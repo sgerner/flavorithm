@@ -463,23 +463,23 @@ test('chained pantry deductions honor prefer = remote while preserving disjoint 
 	];
 
 	const savedStates: Array<ReturnType<typeof createNewUserState>> = [];
-	const resolved = await syncPendingKitchenJournal(
-		records,
-		{
-			identity: { userId: 'a', householdId: 'home' },
-			get: async () => ({
-				state: structuredClone(server),
-				etag: 'v2',
-				userId: 'a',
-				householdId: 'home'
-			}),
-			put: async (state) => {
-				savedStates.push(structuredClone(state));
-				return { state, etag: 'v3' };
-			}
-		},
-		'remote'
-	);
+	const transport = {
+		identity: { userId: 'a', householdId: 'home' },
+		get: async () => ({
+			state: structuredClone(server),
+			etag: 'v2',
+			userId: 'a',
+			householdId: 'home'
+		}),
+		put: async (state: ReturnType<typeof createNewUserState>) => {
+			savedStates.push(structuredClone(state));
+			return { state, etag: 'v3' };
+		}
+	};
+	const preview = await syncPendingKitchenJournal(records, transport);
+	assert.equal(preview.saved, false);
+	assert.equal(preview.etag, 'v2');
+	const resolved = await syncPendingKitchenJournal(records, transport, 'remote', preview.etag);
 	assert.equal(resolved.saved, true);
 	assert.equal(savedStates.length, 1);
 	assert.equal(savedStates[0].pantry.find((item) => item.id === 'flour')?.quantity, 3);
@@ -550,4 +550,233 @@ test('same-timestamp dependent pantry deductions with peer shopping items replay
 
 	const resolvedLocal = mergePendingKitchenJournal(records, competingRemote, 'local');
 	assert.equal(resolvedLocal.state.pantry[0].quantity, 1);
+});
+
+test('prefer syncs pin If-Match to reviewedEtag and halt without PUT when GET returns a newer ETag', async () => {
+	const base = createNewUserState();
+	base.pantry = [
+		{ id: 'milk', name: 'milk', quantity: 1, unit: 'carton', category: 'Dairy' },
+		{ id: 'eggs', name: 'eggs', quantity: 12, unit: 'piece', category: 'Dairy' }
+	];
+	const local = structuredClone(base);
+	local.pantry[0].quantity = 2;
+	local.pantry[1].quantity = 6;
+	const remoteAtEtag3 = structuredClone(base);
+	remoteAtEtag3.pantry[0].quantity = 4;
+	remoteAtEtag3.pantry[1].quantity = 0;
+
+	const record: PendingJournalRecord = {
+		writerId: 'tab-1',
+		pending: {
+			userId: 'a',
+			householdId: 'home',
+			base,
+			local,
+			etag: 'etag-1',
+			updatedAt: 1,
+			writerId: 'tab-1'
+		},
+		keys: []
+	};
+	let puts = 0;
+	const localChoiceResult = await syncPendingKitchenJournal(
+		[record],
+		{
+			identity: { userId: 'a', householdId: 'home' },
+			get: async () => ({
+				state: structuredClone(remoteAtEtag3),
+				etag: 'etag-3',
+				userId: 'a',
+				householdId: 'home'
+			}),
+			put: async (state) => {
+				puts += 1;
+				return { state, etag: 'etag-4' };
+			}
+		},
+		'local',
+		'etag-2'
+	);
+	assert.equal(puts, 0);
+	assert.equal(localChoiceResult.saved, false);
+	assert.equal(localChoiceResult.staleEtag, true);
+	assert.equal(localChoiceResult.etag, 'etag-3');
+	assert.deepEqual(localChoiceResult.conflicts.map((item) => item.path).sort(), [
+		'kitchen.pantry[eggs].quantity',
+		'kitchen.pantry[milk].quantity'
+	]);
+
+	const journalResult = await syncPendingKitchenJournal(
+		[record],
+		{
+			identity: { userId: 'a', householdId: 'home' },
+			get: async () => ({
+				state: structuredClone(remoteAtEtag3),
+				etag: 'etag-3',
+				userId: 'a',
+				householdId: 'home'
+			}),
+			put: async (state) => {
+				puts += 1;
+				return { state, etag: 'etag-4' };
+			}
+		},
+		'remote',
+		'etag-2'
+	);
+	assert.equal(puts, 0);
+	assert.equal(journalResult.saved, false);
+	assert.equal(journalResult.staleEtag, true);
+	assert.equal(journalResult.etag, 'etag-3');
+	assert.equal(journalResult.conflicts.length, 2);
+});
+
+test('prefer syncs skip 412 retries and recompute conflicts against the latest server state', async () => {
+	const base = createNewUserState();
+	const local = structuredClone(base);
+	local.preferences.maxTime = 20;
+	local.preferences.allergies = 'sesame';
+	const reviewedRemote = structuredClone(base);
+	reviewedRemote.preferences.maxTime = 60;
+	const newerRemote = structuredClone(reviewedRemote);
+	newerRemote.preferences.allergies = 'peanuts';
+
+	const record: PendingJournalRecord = {
+		writerId: 'tab-1',
+		pending: {
+			userId: 'a',
+			householdId: 'home',
+			base,
+			local,
+			etag: 'etag-1',
+			updatedAt: 1,
+			writerId: 'tab-1'
+		},
+		keys: []
+	};
+	let gets = 0;
+	const putEtags: string[] = [];
+	const result = await syncPendingKitchenJournal(
+		[record],
+		{
+			identity: { userId: 'a', householdId: 'home' },
+			get: async () => {
+				gets += 1;
+				return gets === 1
+					? {
+							state: structuredClone(reviewedRemote),
+							etag: 'etag-2',
+							userId: 'a',
+							householdId: 'home'
+						}
+					: {
+							state: structuredClone(newerRemote),
+							etag: 'etag-3',
+							userId: 'a',
+							householdId: 'home'
+						};
+			},
+			put: async (_state, etag) => {
+				putEtags.push(etag);
+				throw Object.assign(new Error('Precondition Failed'), { status: 412 });
+			}
+		},
+		'remote',
+		'etag-2'
+	);
+	assert.deepEqual(putEtags, ['etag-2']);
+	assert.equal(result.saved, false);
+	assert.equal(result.staleEtag, true);
+	assert.equal(result.etag, 'etag-3');
+	assert.deepEqual(result.conflicts.map((item) => item.path).sort(), [
+		'kitchen.preferences.allergies',
+		'kitchen.preferences.maxTime'
+	]);
+});
+
+test('mergePendingKitchenJournal anchors cross-tab conflict remote values to server state and preserves disjoint edits', () => {
+	const base = createNewUserState();
+	base.preferences.maxTime = 45;
+	const tabA = structuredClone(base);
+	tabA.preferences.maxTime = 25;
+	tabA.pantry.push({ id: 'rice', name: 'rice', quantity: 2, unit: 'cup', category: 'Pantry' });
+	const tabB = structuredClone(base);
+	tabB.preferences.maxTime = 70;
+	tabB.shopping.push({
+		id: 'lemons',
+		name: 'lemons',
+		quantity: 3,
+		unit: 'piece',
+		checked: false
+	});
+	const remote = structuredClone(base);
+	remote.pantry.push({ id: 'beans', name: 'beans', quantity: 1, unit: 'can', category: 'Pantry' });
+
+	const records: PendingJournalRecord[] = [
+		{
+			writerId: 'tab-a',
+			pending: {
+				userId: 'a',
+				householdId: 'home',
+				base,
+				local: tabA,
+				etag: 'etag-1',
+				createdAt: 1,
+				updatedAt: 1,
+				writerId: 'tab-a'
+			},
+			keys: []
+		},
+		{
+			writerId: 'tab-b',
+			pending: {
+				userId: 'a',
+				householdId: 'home',
+				base,
+				local: tabB,
+				etag: 'etag-1',
+				createdAt: 2,
+				updatedAt: 2,
+				writerId: 'tab-b'
+			},
+			keys: []
+		}
+	];
+
+	const preview = mergePendingKitchenJournal(records, remote);
+	assert.deepEqual(preview.conflicts, [
+		{
+			path: 'kitchen.preferences.maxTime',
+			local: 70,
+			remote: 45
+		}
+	]);
+	assert.equal(preview.state.preferences.maxTime, 45);
+
+	const chooseHousehold = mergePendingKitchenJournal(records, remote, 'remote');
+	assert.equal(chooseHousehold.state.preferences.maxTime, 45);
+	assert.deepEqual(chooseHousehold.state.pantry.map((item) => item.id).sort(), ['beans', 'rice']);
+	assert.deepEqual(
+		chooseHousehold.state.shopping.map((item) => item.id),
+		['lemons']
+	);
+
+	const chooseMine = mergePendingKitchenJournal(records, remote, 'local');
+	assert.equal(chooseMine.state.preferences.maxTime, 70);
+	assert.deepEqual(chooseMine.state.pantry.map((item) => item.id).sort(), ['beans', 'rice']);
+	assert.deepEqual(
+		chooseMine.state.shopping.map((item) => item.id),
+		['lemons']
+	);
+
+	const serverChanged = structuredClone(remote);
+	serverChanged.preferences.maxTime = 60;
+	const tripleConflict = mergePendingKitchenJournal(records, serverChanged);
+	assert.deepEqual(tripleConflict.conflicts, [
+		{
+			path: 'kitchen.preferences.maxTime',
+			local: 70,
+			remote: 60
+		}
+	]);
 });

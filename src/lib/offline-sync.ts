@@ -330,19 +330,115 @@ function describeMealRecipe(snapshot: AppState, mealId: string, recipeId: string
 	return `${mealExists ? 'Meal planned' : 'Meal not planned'}; ${recipe ? `recipe available: ${recipe.title}` : 'recipe removed'}`;
 }
 
-/** Merge disjoint field edits and additions; surface competing edits/deletions explicitly. */
-export function mergeKitchenStates(
+type PathSegment = { kind: 'prop'; key: string } | { kind: 'id'; id: string };
+type DetailedConflict = SyncConflict & {
+	segments: PathSegment[];
+	orphanedMeal?: { mealId: string; recipeId: string };
+};
+export type KitchenSyncResult = {
+	state: AppState;
+	etag: string;
+	conflicts: SyncConflict[];
+	saved: boolean;
+	staleEtag?: boolean;
+	remoteState?: AppState;
+};
+
+function readChild(source: unknown, segment: PathSegment): unknown {
+	if (segment.kind === 'prop') return object(source) ? source[segment.key] : undefined;
+	if (!Array.isArray(source)) return undefined;
+	return source.find((item) => object(item) && item.id === segment.id);
+}
+
+function assignChild(target: unknown, segment: PathSegment, value: unknown): void {
+	if (segment.kind === 'prop') {
+		if (!object(target)) return;
+		if (value === undefined) delete target[segment.key];
+		else target[segment.key] = structuredClone(value);
+		return;
+	}
+	if (!Array.isArray(target)) return;
+	const index = target.findIndex((item) => object(item) && item.id === segment.id);
+	if (value === undefined) {
+		if (index !== -1) target.splice(index, 1);
+	} else if (index !== -1) {
+		target[index] = structuredClone(value);
+	} else {
+		target.push(structuredClone(value));
+	}
+}
+
+function matchesNextContainer(value: unknown, next: PathSegment): boolean {
+	return next.kind === 'prop' ? object(value) : Array.isArray(value);
+}
+
+function getAtSegments(root: AppState, segments: PathSegment[]): unknown {
+	let current: unknown = root;
+	for (const segment of segments) {
+		current = readChild(current, segment);
+		if (current === undefined) return undefined;
+	}
+	return structuredClone(current);
+}
+
+function restoreFromRemote(state: AppState, remote: AppState, segments: PathSegment[]): void {
+	if (!segments.length) return;
+	let stateCurrent: unknown = state;
+	let remoteCurrent: unknown = remote;
+	for (let index = 0; index < segments.length; index += 1) {
+		const segment = segments[index];
+		const remoteChild = readChild(remoteCurrent, segment);
+		if (index === segments.length - 1) {
+			assignChild(stateCurrent, segment, remoteChild);
+			return;
+		}
+		const nextSegment = segments[index + 1];
+		const stateChild = readChild(stateCurrent, segment);
+		if (
+			!matchesNextContainer(remoteChild, nextSegment) ||
+			!matchesNextContainer(stateChild, nextSegment)
+		) {
+			assignChild(stateCurrent, segment, remoteChild);
+			return;
+		}
+		stateCurrent = stateChild;
+		remoteCurrent = remoteChild;
+	}
+}
+
+function segmentsStartWith(prefix: PathSegment[], full: PathSegment[]): boolean {
+	if (prefix.length > full.length) return false;
+	return prefix.every((segment, index) => {
+		const other = full[index];
+		return segment.kind === 'prop'
+			? other.kind === 'prop' && segment.key === other.key
+			: other.kind === 'id' && segment.id === other.id;
+	});
+}
+
+function mergeKitchenStatesDetailed(
 	base: AppState,
 	local: AppState,
 	remote: AppState,
 	prefer?: 'local' | 'remote'
-): { state: AppState; conflicts: SyncConflict[] } {
-	const conflicts: SyncConflict[] = [];
-	const conflict = (path: string, mine: unknown, theirs: unknown) => {
-		conflicts.push({ path, local: mine, remote: theirs });
+): { state: AppState; conflicts: DetailedConflict[] } {
+	const conflicts: DetailedConflict[] = [];
+	const conflict = (path: string, segments: PathSegment[], mine: unknown, theirs: unknown) => {
+		conflicts.push({
+			path,
+			local: mine === undefined ? undefined : structuredClone(mine),
+			remote: theirs === undefined ? undefined : structuredClone(theirs),
+			segments
+		});
 		return prefer === 'local' ? mine : theirs;
 	};
-	const merge = (old: unknown, mine: unknown, theirs: unknown, path: string): unknown => {
+	const merge = (
+		old: unknown,
+		mine: unknown,
+		theirs: unknown,
+		path: string,
+		segments: PathSegment[]
+	): unknown => {
 		const descendIntoEqualPantry =
 			path === 'kitchen.pantry' &&
 			equal(mine, theirs) &&
@@ -364,11 +460,11 @@ export function mergeKitchenStates(
 			!equal(theirs, old) &&
 			equal(mine, theirs) &&
 			!equal(local, remote);
-		if (sameChangedPantryQuantity) return conflict(path, mine, theirs);
+		if (sameChangedPantryQuantity) return conflict(path, segments, mine, theirs);
 		if (equal(mine, theirs) && !descendIntoEqualPantry && !descendIntoEqualPantryItem) return mine;
 		if (equal(mine, old)) return theirs;
 		if (equal(theirs, old)) return mine;
-		if (mine === undefined || theirs === undefined) return conflict(path, mine, theirs);
+		if (mine === undefined || theirs === undefined) return conflict(path, segments, mine, theirs);
 		if (object(mine) && object(theirs) && (old === undefined || object(old))) {
 			const result: Record<string, unknown> = {};
 			for (const name of new Set([
@@ -380,7 +476,8 @@ export function mergeKitchenStates(
 					(old as Record<string, unknown> | undefined)?.[name],
 					mine[name],
 					theirs[name],
-					`${path}.${name}`
+					`${path}.${name}`,
+					[...segments, { kind: 'prop', key: name }]
 				);
 				if (value !== undefined) result[name] = value;
 			}
@@ -399,22 +496,31 @@ export function mergeKitchenStates(
 				);
 				const result = [];
 				for (const id of new Set([...right.keys(), ...left.keys(), ...before.keys()])) {
-					const value = merge(before.get(id), left.get(id), right.get(id), `${path}[${id}]`);
+					const value = merge(before.get(id), left.get(id), right.get(id), `${path}[${id}]`, [
+						...segments,
+						{ kind: 'id', id }
+					]);
 					if (value !== undefined) result.push(value);
 				}
 				return result;
 			}
 		}
-		return conflict(path, mine, theirs);
+		return conflict(path, segments, mine, theirs);
 	};
-	const state = structuredClone(merge(base, local, remote, 'kitchen')) as AppState;
+	const state = structuredClone(merge(base, local, remote, 'kitchen', [])) as AppState;
 	// Deleting a recipe while someone plans it must never create an orphaned meal.
 	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
 	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
 		conflicts.push({
 			path: `kitchen.meals[${meal.id}].recipeId`,
 			local: describeMealRecipe(local, meal.id, meal.recipeId),
-			remote: describeMealRecipe(remote, meal.id, meal.recipeId)
+			remote: describeMealRecipe(remote, meal.id, meal.recipeId),
+			segments: [
+				{ kind: 'prop', key: 'meals' },
+				{ kind: 'id', id: meal.id },
+				{ kind: 'prop', key: 'recipeId' }
+			],
+			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
 		});
 		{
 			// Keep the complete proposed meal available for review and backup until a choice is made.
@@ -430,6 +536,24 @@ export function mergeKitchenStates(
 	}
 	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
 	return { state, conflicts };
+}
+
+/** Merge disjoint field edits and additions; surface competing edits/deletions explicitly. */
+export function mergeKitchenStates(
+	base: AppState,
+	local: AppState,
+	remote: AppState,
+	prefer?: 'local' | 'remote'
+): { state: AppState; conflicts: SyncConflict[] } {
+	const merged = mergeKitchenStatesDetailed(base, local, remote, prefer);
+	return {
+		state: merged.state,
+		conflicts: merged.conflicts.map(({ path, local: mine, remote: theirs }) => ({
+			path,
+			local: mine,
+			remote: theirs
+		}))
+	};
 }
 
 export type KitchenTransport = {
@@ -513,24 +637,33 @@ function composeDeltaPair(
 	secondBase: AppState,
 	secondLocal: AppState,
 	prefer?: 'local' | 'remote'
-): { base: AppState; local: AppState; conflicts: SyncConflict[] } {
-	const conflicts: SyncConflict[] = [];
+): { base: AppState; local: AppState; conflicts: DetailedConflict[] } {
+	const conflicts: DetailedConflict[] = [];
 	const chooseConflict = (
 		path: string,
+		segments: PathSegment[],
 		b1: unknown,
 		l1: unknown,
 		b2: unknown,
 		l2: unknown
 	): { base: unknown; local: unknown } => {
-		conflicts.push({ path, local: l2, remote: l1 });
-		return prefer === 'local' ? { base: b2, local: l2 } : { base: b1, local: l1 };
+		conflicts.push({
+			path,
+			local: l2 === undefined ? undefined : structuredClone(l2),
+			remote: l1 === undefined ? undefined : structuredClone(l1),
+			segments
+		});
+		return prefer === 'local'
+			? { base: b1 !== undefined ? b1 : b2, local: l2 }
+			: { base: b1, local: l1 };
 	};
 	const compose = (
 		b1: unknown,
 		l1: unknown,
 		b2: unknown,
 		l2: unknown,
-		path: string
+		path: string,
+		segments: PathSegment[]
 	): { base: unknown; local: unknown } => {
 		if (equal(l2, b2)) return { base: b1, local: l1 };
 		if (equal(l1, b1)) return { base: b2, local: l2 };
@@ -546,7 +679,10 @@ function composeDeltaPair(
 					...Object.keys(b2),
 					...Object.keys(l2)
 				])) {
-					const entry = compose(b1[name], l1[name], b2[name], l2[name], `${path}.${name}`);
+					const entry = compose(b1[name], l1[name], b2[name], l2[name], `${path}.${name}`, [
+						...segments,
+						{ kind: 'prop', key: name }
+					]);
 					if (entry.base !== undefined) nextBase[name] = entry.base;
 					if (entry.local !== undefined) nextLocal[name] = entry.local;
 				}
@@ -555,7 +691,10 @@ function composeDeltaPair(
 			if (b1 === undefined && b2 === undefined) {
 				const nextLocal: Record<string, unknown> = {};
 				for (const name of new Set([...Object.keys(l1), ...Object.keys(l2)])) {
-					const entry = compose(undefined, l1[name], undefined, l2[name], `${path}.${name}`);
+					const entry = compose(undefined, l1[name], undefined, l2[name], `${path}.${name}`, [
+						...segments,
+						{ kind: 'prop', key: name }
+					]);
 					if (entry.local !== undefined) nextLocal[name] = entry.local;
 				}
 				return { base: undefined, local: nextLocal };
@@ -577,7 +716,10 @@ function composeDeltaPair(
 				])) {
 					entries.set(
 						id,
-						compose(b1Map.get(id), l1Map.get(id), b2Map.get(id), l2Map.get(id), `${path}[${id}]`)
+						compose(b1Map.get(id), l1Map.get(id), b2Map.get(id), l2Map.get(id), `${path}[${id}]`, [
+							...segments,
+							{ kind: 'id', id }
+						])
 					);
 				}
 				const nextBase = [];
@@ -615,10 +757,10 @@ function composeDeltaPair(
 		if (equal(l1, l2) && !concurrentPantryQuantity) {
 			return { base: b1, local: l1 };
 		}
-		return chooseConflict(path, b1, l1, b2, l2);
+		return chooseConflict(path, segments, b1, l1, b2, l2);
 	};
 
-	const composed = compose(firstBase, firstLocal, secondBase, secondLocal, 'kitchen');
+	const composed = compose(firstBase, firstLocal, secondBase, secondLocal, 'kitchen', []);
 	const base = structuredClone(composed.base) as AppState;
 	const local = structuredClone(composed.local) as AppState;
 	const recipeIds = new Set(local.recipes.map((recipe) => recipe.id));
@@ -626,7 +768,13 @@ function composeDeltaPair(
 		conflicts.push({
 			path: `kitchen.meals[${meal.id}].recipeId`,
 			local: describeMealRecipe(secondLocal, meal.id, meal.recipeId),
-			remote: describeMealRecipe(firstLocal, meal.id, meal.recipeId)
+			remote: describeMealRecipe(firstLocal, meal.id, meal.recipeId),
+			segments: [
+				{ kind: 'prop', key: 'meals' },
+				{ kind: 'id', id: meal.id },
+				{ kind: 'prop', key: 'recipeId' }
+			],
+			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
 		});
 		const candidates = prefer
 			? (prefer === 'local' ? secondLocal : firstLocal).recipes
@@ -641,21 +789,20 @@ function composeDeltaPair(
 	return { base, local, conflicts };
 }
 
-/** Compose ordered journal records into a single (effectiveBase, effectiveLocal) delta. */
-export function composePendingKitchenJournal(
+function composePendingKitchenJournalDetailed(
 	records: PendingJournalRecord[],
 	prefer?: 'local' | 'remote'
 ): {
 	ordered: PendingJournalRecord[];
 	base: AppState;
 	local: AppState;
-	conflicts: SyncConflict[];
+	conflicts: DetailedConflict[];
 } | null {
 	if (!records.length) return null;
 	const ordered = orderPendingJournalRecords(records);
 	let effectiveBase = structuredClone(ordered[0].pending.base);
 	let effectiveLocal = structuredClone(ordered[0].pending.local);
-	const conflicts: SyncConflict[] = [];
+	const rawConflicts: DetailedConflict[] = [];
 	for (let index = 1; index < ordered.length; index += 1) {
 		const record = ordered[index];
 		const step = composeDeltaPair(
@@ -667,13 +814,40 @@ export function composePendingKitchenJournal(
 		);
 		effectiveBase = step.base;
 		effectiveLocal = step.local;
-		for (const conflict of step.conflicts) {
-			const existingIndex = conflicts.findIndex((item) => item.path === conflict.path);
-			if (existingIndex >= 0) conflicts[existingIndex] = conflict;
-			else conflicts.push(conflict);
-		}
+		rawConflicts.push(...step.conflicts);
 	}
-	return { ordered, base: effectiveBase, local: effectiveLocal, conflicts };
+	return { ordered, base: effectiveBase, local: effectiveLocal, conflicts: rawConflicts };
+}
+
+/** Compose ordered journal records into a single (effectiveBase, effectiveLocal) delta. */
+export function composePendingKitchenJournal(
+	records: PendingJournalRecord[],
+	prefer?: 'local' | 'remote'
+): {
+	ordered: PendingJournalRecord[];
+	base: AppState;
+	local: AppState;
+	conflicts: SyncConflict[];
+} | null {
+	const composed = composePendingKitchenJournalDetailed(records, prefer);
+	if (!composed) return null;
+	const conflicts: SyncConflict[] = [];
+	for (const conflict of composed.conflicts) {
+		const entry: SyncConflict = {
+			path: conflict.path,
+			local: conflict.local,
+			remote: conflict.remote
+		};
+		const existingIndex = conflicts.findIndex((item) => item.path === conflict.path);
+		if (existingIndex >= 0) conflicts[existingIndex] = entry;
+		else conflicts.push(entry);
+	}
+	return {
+		ordered: composed.ordered,
+		base: composed.base,
+		local: composed.local,
+		conflicts
+	};
 }
 
 /** Compose writer snapshots into a net baseline/local delta and reconcile once against remote. */
@@ -682,23 +856,122 @@ export function mergePendingKitchenJournal(
 	remote: AppState,
 	prefer?: 'local' | 'remote'
 ): { state: AppState; conflicts: SyncConflict[] } {
-	const composed = composePendingKitchenJournal(records, prefer);
+	const composed = composePendingKitchenJournalDetailed(records, 'local');
 	if (!composed) return { state: structuredClone(remote), conflicts: [] };
-	const merged = mergeKitchenStates(composed.base, composed.local, remote, prefer);
-	const mergedPaths = new Set(merged.conflicts.map((conflict) => conflict.path));
-	const conflicts = [
-		...composed.conflicts.filter((conflict) => !mergedPaths.has(conflict.path)),
-		...merged.conflicts
-	];
-	return { state: merged.state, conflicts };
+	const {
+		ordered,
+		base: composedBase,
+		local: composedLocal,
+		conflicts: rawLocalConflicts
+	} = composed;
+	const remoteMerged = mergeKitchenStatesDetailed(composedBase, composedLocal, remote, prefer);
+	if (!rawLocalConflicts.length) {
+		return {
+			state: remoteMerged.state,
+			conflicts: remoteMerged.conflicts.map(({ path, local: mine, remote: theirs }) => ({
+				path,
+				local: mine,
+				remote: theirs
+			}))
+		};
+	}
+	const localConflicts: DetailedConflict[] = [];
+	for (const candidate of rawLocalConflicts) {
+		if (
+			localConflicts.some((existing) => segmentsStartWith(existing.segments, candidate.segments))
+		) {
+			continue;
+		}
+		for (let index = localConflicts.length - 1; index >= 0; index -= 1) {
+			if (segmentsStartWith(candidate.segments, localConflicts[index].segments)) {
+				localConflicts.splice(index, 1);
+			}
+		}
+		localConflicts.push(candidate);
+	}
+	const state = structuredClone(remoteMerged.state);
+	const combined: DetailedConflict[] = [];
+	for (const localConflict of localConflicts) {
+		if (
+			remoteMerged.conflicts.some((remoteConflict) =>
+				segmentsStartWith(remoteConflict.segments, localConflict.segments)
+			)
+		) {
+			continue;
+		}
+		if (localConflict.orphanedMeal) {
+			const { mealId, recipeId } = localConflict.orphanedMeal;
+			const localPreview = structuredClone(composedLocal);
+			const localMeals = ordered.flatMap((record) => record.pending.local.meals);
+			const plannedMeal = localMeals.find((item) => item.id === mealId);
+			if (plannedMeal && !localPreview.meals.some((item) => item.id === mealId)) {
+				localPreview.meals.push(structuredClone(plannedMeal));
+			}
+			combined.push({
+				...localConflict,
+				local: describeMealRecipe(localPreview, mealId, recipeId),
+				remote: describeMealRecipe(remote, mealId, recipeId)
+			});
+			if (prefer === 'remote') {
+				restoreFromRemote(state, remote, [
+					{ kind: 'prop', key: 'meals' },
+					{ kind: 'id', id: mealId }
+				]);
+				restoreFromRemote(state, remote, [
+					{ kind: 'prop', key: 'recipes' },
+					{ kind: 'id', id: recipeId }
+				]);
+			} else if (!prefer) {
+				if (plannedMeal && !state.meals.some((item) => item.id === mealId)) {
+					state.meals.push(structuredClone(plannedMeal));
+				}
+				const candidates = [
+					...ordered.flatMap((record) => record.pending.local.recipes),
+					...remote.recipes
+				];
+				const recipe = candidates.find((item) => item.id === recipeId);
+				if (recipe && !state.recipes.some((item) => item.id === recipeId)) {
+					state.recipes.push(structuredClone(recipe));
+				}
+			}
+		} else {
+			combined.push({
+				...localConflict,
+				local: getAtSegments(composedLocal, localConflict.segments),
+				remote: getAtSegments(remote, localConflict.segments)
+			});
+			if (prefer !== 'local') {
+				restoreFromRemote(state, remote, localConflict.segments);
+			}
+		}
+	}
+	for (const remoteConflict of remoteMerged.conflicts) {
+		if (
+			combined.some((existing) => segmentsStartWith(existing.segments, remoteConflict.segments))
+		) {
+			continue;
+		}
+		combined.push(remoteConflict);
+	}
+	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
+	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+	return {
+		state,
+		conflicts: combined.map(({ path, local: mine, remote: theirs }) => ({
+			path,
+			local: mine,
+			remote: theirs
+		}))
+	};
 }
 
 /** Reconcile every account-scoped writer delta against current server state before the write. */
 export async function syncPendingKitchenJournal(
 	records: PendingJournalRecord[],
 	transport: KitchenTransport,
-	prefer?: 'local' | 'remote'
-): Promise<{ state: AppState; etag: string; conflicts: SyncConflict[]; saved: boolean }> {
+	prefer?: 'local' | 'remote',
+	reviewedEtag?: string | null
+): Promise<KitchenSyncResult> {
 	const identity = { ...transport.identity };
 	if (!records.length) throw new Error('There are no offline changes to sync.');
 	for (const record of records) {
@@ -707,16 +980,60 @@ export async function syncPendingKitchenJournal(
 			householdId: record.pending.householdId
 		});
 	}
+	if (prefer) {
+		const expectedEtag =
+			reviewedEtag !== undefined ? reviewedEtag : (records[0]?.pending.etag ?? null);
+		const remote = await transport.get();
+		assertSameSyncIdentity(identity, remote);
+		assertSameSyncIdentity(identity, transport.identity);
+		if (typeof expectedEtag !== 'string' || remote.etag !== expectedEtag) {
+			const recomputed = mergePendingKitchenJournal(records, remote.state);
+			return {
+				state: recomputed.state,
+				etag: remote.etag,
+				conflicts: recomputed.conflicts,
+				saved: false,
+				staleEtag: true,
+				remoteState: structuredClone(remote.state)
+			};
+		}
+		const resolved = mergePendingKitchenJournal(records, remote.state, prefer);
+		try {
+			const result = await transport.put(resolved.state, expectedEtag);
+			return { ...result, conflicts: [], saved: true };
+		} catch (error) {
+			if ((error as { status?: number }).status !== 412) throw error;
+			const latest = await transport.get();
+			assertSameSyncIdentity(identity, latest);
+			assertSameSyncIdentity(identity, transport.identity);
+			const recomputed = mergePendingKitchenJournal(records, latest.state);
+			return {
+				state: recomputed.state,
+				etag: latest.etag,
+				conflicts: recomputed.conflicts,
+				saved: false,
+				staleEtag: true,
+				remoteState: structuredClone(latest.state)
+			};
+		}
+	}
 	for (let attempt = 0; attempt < 3; attempt += 1) {
 		const remote = await transport.get();
 		assertSameSyncIdentity(identity, remote);
 		assertSameSyncIdentity(identity, transport.identity);
-		const merged = mergePendingKitchenJournal(records, remote.state, prefer);
-		if (merged.conflicts.length && !prefer)
-			return { state: merged.state, etag: remote.etag, conflicts: merged.conflicts, saved: false };
+		const merged = mergePendingKitchenJournal(records, remote.state);
+		if (merged.conflicts.length) {
+			return {
+				state: merged.state,
+				etag: remote.etag,
+				conflicts: merged.conflicts,
+				saved: false,
+				remoteState: structuredClone(remote.state)
+			};
+		}
 		try {
 			const result = await transport.put(merged.state, remote.etag);
-			return { ...result, conflicts: merged.conflicts, saved: true };
+			return { ...result, conflicts: [], saved: true };
 		} catch (error) {
 			if ((error as { status?: number }).status !== 412 || attempt === 2) throw error;
 		}

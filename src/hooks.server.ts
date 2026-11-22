@@ -143,6 +143,8 @@ export const handle: Handle = async ({ event, resolve }) => {
 			// The cookie name is shared for compatibility with the existing app, but
 			// only a session created for this configured issuer and client is accepted.
 			event.locals.user = getSsoUserFromSession(event.cookies.get(SESSION_COOKIE));
+		} else if (isFrameworkAsset(path)) {
+			event.locals.user = null;
 		} else {
 			const identity = authenticateProxyRequest(event.request);
 			event.locals.user = identity?.user ?? null;
@@ -153,12 +155,14 @@ export const handle: Handle = async ({ event, resolve }) => {
 					issuer: identity.issuer,
 					subject: identity.subject
 				});
-				setOidcSessionCookie(
-					event.cookies,
-					binding.token,
-					binding.expiresAt,
-					requestOriginIsSecure(event.url, event.request)
-				);
+				if (binding.setCookie) {
+					setOidcSessionCookie(
+						event.cookies,
+						binding.token,
+						binding.expiresAt,
+						requestOriginIsSecure(event.url, event.request)
+					);
+				}
 			} else {
 				// A binding cookie is never an identity credential. Removing it when
 				// the proxy assertion is absent makes that boundary explicit.
