@@ -21,11 +21,10 @@ function typecheckServiceWorker(overrideWorkerSource?: string): readonly ts.Diag
 	const configPath = resolve('tsconfig.service-worker.json');
 	const workerPath = resolve('src/service-worker.ts');
 	const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
-	assert.equal(
-		configFile.error,
-		undefined,
-		configFile.error ? ts.formatDiagnostics([configFile.error], formatHost) : undefined
-	);
+	const configErrorMessage = configFile.error
+		? ts.formatDiagnostics([configFile.error], formatHost)
+		: 'Could not read tsconfig.service-worker.json';
+	assert.equal(configFile.error, undefined, configErrorMessage);
 	const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, dirname(configPath));
 	assert.equal(parsed.errors.length, 0, ts.formatDiagnostics(parsed.errors, formatHost));
 	const baseHost = ts.createCompilerHost(parsed.options);
