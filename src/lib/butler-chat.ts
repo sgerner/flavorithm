@@ -167,7 +167,7 @@ export function createButlerChat(options: {
 				}
 			}
 			options.setRecipeDrafts([...drafts.values()].slice(-10));
-			options.onSpeak?.(Math.min(12000, Math.max(2400, result.reply.length * 28)));
+			options.onSpeak?.(Math.min(4500, Math.max(2400, result.reply.length * 28)));
 			const warning = droppedCommandsWarning(result.droppedCommands);
 			options.setMessages([
 				...messages,
