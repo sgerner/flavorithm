@@ -138,6 +138,7 @@ export function rankRecipes(
 	preferences: Preferences,
 	now: Date = new Date()
 ): Recipe[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const rated: RatedRecipe[] = recipes.flatMap((recipe) => {
 		const rating = recipeRating(recipe, preferences);
 		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
@@ -149,8 +150,8 @@ export function rankRecipes(
 	>();
 	for (const item of pantry) {
 		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-		const expiry = expiryStatus(item.expires, now);
-		if (expiry === 'expired') continue;
+		const expiry = expiryStatus(item.expires, safeNow);
+		if (expiry === 'expired' || (Boolean(item.expires?.trim()) && expiry === 'unknown')) continue;
 		const key = normalizeIngredientName(item.name);
 		const entries = pantryIndex.get(key) ?? [];
 		entries.push({ item, expiry });
@@ -160,7 +161,7 @@ export function rankRecipes(
 		.map((recipe, index) => ({
 			recipe,
 			index,
-			score: scoreRecipe(recipe, pantryIndex, preferences, rated, now)
+			score: scoreRecipe(recipe, pantryIndex, preferences, rated, safeNow)
 		}))
 		.sort((a, b) => b.score - a.score || a.index - b.index)
 		.map(({ recipe }) => recipe);
