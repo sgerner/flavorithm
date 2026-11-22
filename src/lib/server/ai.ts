@@ -362,7 +362,8 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher);
+			: await getPublicModelCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2359,10 +2360,15 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-const publicCatalogByFetcher = new WeakMap<
-	Fetcher,
-	{ pending: Promise<SupportedModelResponse>; expiresAt: number }
->();
+type PublicCatalogCacheEntry = {
+	pending: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
+
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
+}
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2384,18 +2390,24 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	const cacheKey = fetcher === fetch || fetcher.name === 'server_fetch' ? fetch : fetcher;
-	const cached = publicCatalogByFetcher.get(cacheKey);
-	if (!cached || Date.now() >= cached.expiresAt) {
-		const expiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
-		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (publicCatalogByFetcher.get(cacheKey)?.pending === pending) {
-				publicCatalogByFetcher.delete(cacheKey);
-			}
-			throw error;
-		});
-		publicCatalogByFetcher.set(cacheKey, { pending, expiresAt });
-		return pending;
-	}
-	return cached.pending;
+	const cache = publicCatalogCache;
+	const key = publicCatalogKey(fetcher);
+	const cached = cache.get(key);
+	const now = Date.now();
+	if (cached && now < cached.expiresAt) return cached.pending;
+
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
+	const pending = getSupportedModels(fetcher).catch((error) => {
+		if (cache.get(key)?.pending === pending) {
+			cache.delete(key);
+		}
+		throw error;
+	});
+	cache.set(key, { pending, expiresAt });
+	return pending;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalogCache = new WeakMap();
 }
