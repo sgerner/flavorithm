@@ -362,7 +362,8 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getReasoningModelCatalog(fetcher);
+			: await getPublicModelCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2359,10 +2360,15 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 }
 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
-let publicCatalog: Promise<SupportedModelResponse> | undefined;
-let publicCatalogExpiresAt = 0;
-let publicCatalogShared = false;
-let publicCatalogFetcher: Fetcher | undefined;
+type PublicCatalogCacheEntry = {
+	pending: Promise<SupportedModelResponse>;
+	expiresAt: number;
+};
+let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
+
+function publicCatalogKey(fetcher: Fetcher): Fetcher {
+	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
+}
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2383,42 +2389,24 @@ export async function getSupportedModels(
 	return transformModelCatalog(body);
 }
 
-function loadPublicModelCatalog(
-	fetcher: Fetcher,
-	shared: boolean
-): Promise<SupportedModelResponse> {
-	publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
-	publicCatalogShared = shared;
-	publicCatalogFetcher = fetcher;
+export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	const key = publicCatalogKey(fetcher);
+	const cached = publicCatalogCache.get(key);
+	const now = Date.now();
+	if (cached && now < cached.expiresAt) return cached.pending;
+
+	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		if (publicCatalog === pending) {
-			publicCatalog = undefined;
-			publicCatalogExpiresAt = 0;
-			publicCatalogShared = false;
-			publicCatalogFetcher = undefined;
+		if (publicCatalogCache.get(key)?.pending === pending) {
+			publicCatalogCache.delete(key);
 		}
 		throw error;
 	});
-	publicCatalog = pending;
-	return publicCatalog;
+	publicCatalogCache.set(key, { pending, expiresAt });
+	return pending;
 }
 
-export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
-		return loadPublicModelCatalog(fetcher, true);
-	}
-	publicCatalogShared = true;
-	return publicCatalog;
-}
-
-function getReasoningModelCatalog(fetcher: Fetcher): Promise<SupportedModelResponse> {
-	const isRuntimeFetch = fetcher === fetch || fetcher.name === 'server_fetch';
-	if (
-		publicCatalog &&
-		Date.now() < publicCatalogExpiresAt &&
-		(publicCatalogShared || isRuntimeFetch || fetcher === publicCatalogFetcher)
-	) {
-		return publicCatalog;
-	}
-	return loadPublicModelCatalog(fetcher, isRuntimeFetch);
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalogCache = new WeakMap();
 }
