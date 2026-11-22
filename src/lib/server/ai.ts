@@ -903,7 +903,7 @@ async function searchRecipes(prompt: string, fetcher: Fetcher) {
 	const searchKey = typeof process !== 'undefined' ? process.env.BRAVE_SEARCH_API_KEY : undefined;
 	if (!searchKey) {
 		throw new AIRequestError(
-			'Recipe search is not configured. Set BRAVE_SEARCH_API_KEY on the server.',
+			'Recipe search is not configured on this installation. Ask the server operator to enable online recipe search.',
 			503
 		);
 	}

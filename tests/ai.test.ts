@@ -1107,7 +1107,9 @@ test('search fails with a clear configuration error when Brave is not configured
 			(error: unknown) =>
 				error instanceof AIRequestError &&
 				error.status === 503 &&
-				error.message.includes('BRAVE_SEARCH_API_KEY')
+				error.message ===
+					'Recipe search is not configured on this installation. Ask the server operator to enable online recipe search.' &&
+				!error.message.includes('BRAVE_SEARCH_API_KEY')
 		);
 	} finally {
 		if (previous === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
