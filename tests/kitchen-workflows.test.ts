@@ -370,6 +370,53 @@ test('purchased shopping rows merge aliases and compatible units without changin
 	assert.equal(result.find((item) => item.unit === 'package')?.quantity, 1);
 });
 
+test('pantry transfers clamp negative or null baseline stock, cap quantities at 1,000,000, and bound array size', () => {
+	const corruptedPantry: Ingredient[] = [
+		pantry('flour', -3, 'cup'),
+		pantry('sugar', null as unknown as number, 'cup'),
+		pantry('rice', 999_999.5, 'cup')
+	];
+	const transferred = transferPurchasedItemsToPantry(
+		corruptedPantry,
+		[
+			shopping('buy-flour', 'flour', 2, 'cups', true),
+			shopping('buy-sugar', 'sugar', 1.5, 'cups', true),
+			shopping('buy-rice', 'rice', 10, 'cups', true),
+			shopping('buy-salt', 'salt', 2_500_000, 'g', true),
+			shopping('buy-zero', 'pepper', 0, 'tsp', true),
+			shopping('buy-blank', '   ', 2, 'tsp', true)
+		],
+		() => 'new-salt'
+	);
+
+	assert.equal(transferred.find((item) => item.name === 'flour')?.quantity, 2);
+	assert.equal(transferred.find((item) => item.name === 'sugar')?.quantity, 1.5);
+	assert.equal(transferred.find((item) => item.name === 'rice')?.quantity, 1_000_000);
+	assert.equal(transferred.find((item) => item.name === 'salt')?.quantity, 1_000_000);
+	assert.equal(
+		transferred.find((item) => item.name === 'pepper'),
+		undefined
+	);
+
+	const fullPantry = Array.from({ length: 1_000 }, (_, index) =>
+		pantry(`item-${index}`, 1, 'piece')
+	);
+	const capped = transferPurchasedItemsToPantry(
+		fullPantry,
+		[
+			shopping('merge-existing', 'item-0', 3, 'piece', true),
+			shopping('overflow', 'brand-new-ingredient', 2, 'piece', true)
+		],
+		() => 'unused-overflow'
+	);
+	assert.equal(capped.length, 1_000);
+	assert.equal(capped[0].quantity, 4);
+	assert.equal(
+		capped.some((item) => item.name === 'brand-new-ingredient'),
+		false
+	);
+});
+
 test('completing a meal deducts compatible pantry quantities once and never goes below zero', () => {
 	const plannedRecipe = recipe({
 		id: 'soup',
@@ -579,6 +626,48 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 });
 
+test('transferPurchasedItemsToPantry preserves categories on new lots and merges item/bunch aliases into unexpired stock', () => {
+	const existing = [
+		{ ...pantry('avocado', 1, 'whole', '2026-10-24'), category: 'Produce' },
+		{ ...pantry('cilantro', 1, 'bunch'), category: 'Herbs' }
+	];
+	const transferred = transferPurchasedItemsToPantry(
+		existing,
+		[
+			{ ...shopping('scan-avocado', 'avocados', 2, 'items', true), category: 'Produce' },
+			{ ...shopping('scan-cilantro', 'cilantro', 1, 'bunches', true), category: 'Produce' },
+			shopping('manual-flour', 'flour', 1.5, 'cups', true)
+		],
+		(() => {
+			let n = 0;
+			return () => `new-lot-${++n}`;
+		})()
+	);
+
+	assert.equal(transferred.length, 4);
+	// Expiring avocado lot stays untouched; new unexpired avocado lot keeps Produce category.
+	assert.equal(transferred[0].quantity, 1);
+	assert.equal(transferred[0].expires, '2026-10-24');
+	const newAvocado = transferred.find((item) => item.id === 'new-lot-1');
+	assert.ok(newAvocado);
+	assert.equal(newAvocado.unit, 'each');
+	assert.equal(newAvocado.quantity, 2);
+	assert.equal(newAvocado.category, 'Produce');
+
+	// Unexpired cilantro bunch merges compatible bunches without duplicating lots.
+	const cilantro = transferred.find((item) => item.name === 'cilantro');
+	assert.ok(cilantro);
+	assert.equal(cilantro.quantity, 2);
+	assert.equal(cilantro.unit, 'bunch');
+	assert.equal(cilantro.category, 'Herbs');
+
+	// Manual lines without category default to Pantry.
+	const flour = transferred.find((item) => item.name === 'flour');
+	assert.ok(flour);
+	assert.equal(flour.category, 'Pantry');
+	assert.equal(flour.unit, 'cup');
+});
+
 test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and guards invalid now', () => {
 	const invalidMatch = recipe({
 		id: 'invalid-lot',
@@ -629,13 +718,13 @@ test('normalizeShoppingItem trims, bounds lengths, and clamps or defaults quanti
 
 	const oversized = shopping(
 		'long',
-		`  ${'a'.repeat(120)}  `,
+		`  ${'a'.repeat(240)}  `,
 		5_000_000,
 		` ${'u'.repeat(50)} `,
 		true
 	);
 	normalizeShoppingItem(oversized);
-	assert.equal(oversized.name, 'a'.repeat(100));
+	assert.equal(oversized.name, 'a'.repeat(200));
 	assert.equal(oversized.unit, 'u'.repeat(40));
 	assert.equal(oversized.quantity, 1_000_000);
 
@@ -648,6 +737,21 @@ test('normalizeShoppingItem trims, bounds lengths, and clamps or defaults quanti
 	const nonFinite = shopping('nan', 'salt', Number.NaN, 'tsp', false);
 	normalizeShoppingItem(nonFinite);
 	assert.equal(nonFinite.quantity, 1);
+
+	const withDraft = shopping('draft-item', 'San Marzano tomatoes', 2.5, 'cans', false);
+	const validDraft = { name: '  Roma tomatoes  ', quantity: 4, unit: ' lb ' };
+	normalizeShoppingItem(withDraft, validDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'lb');
+	assert.deepEqual(validDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'lb' });
+
+	const clearedDraft = { name: '   ', quantity: null, unit: '   ' };
+	normalizeShoppingItem(withDraft, clearedDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'piece');
+	assert.deepEqual(clearedDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'piece' });
 });
 
 test('snapshotShoppingItem and revertShoppingItem restore pre-edit fields while keeping row metadata', () => {
