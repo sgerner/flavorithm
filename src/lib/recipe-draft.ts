@@ -167,10 +167,20 @@ export function validateRecipeDraft(
 		recipe: {
 			...draft,
 			title,
+			description: draft.description.trim().slice(0, 10_000),
+			cuisine: draft.cuisine.trim().slice(0, 100),
+			difficulty: draft.difficulty.trim().slice(0, 80),
 			ingredients,
 			steps,
 			nutrition: { ...draft.nutrition },
-			...(options?.assumptions !== undefined ? { importNotes: [...options.assumptions] } : {}),
+			...(options?.assumptions !== undefined
+				? {
+						importNotes: options.assumptions
+							.map((note) => note.trim().slice(0, 300))
+							.filter(Boolean)
+							.slice(0, 30)
+					}
+				: {}),
 			nutritionStale,
 			saved: true
 		}
