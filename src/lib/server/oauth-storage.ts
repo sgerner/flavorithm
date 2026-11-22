@@ -62,6 +62,7 @@ db.exec(`
 		expires_at INTEGER NOT NULL,
 		envelope TEXT NOT NULL
 	);
+	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pending_user_idx ON chatgpt_oauth_pending(user_id);
 	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pending_expiry_idx ON chatgpt_oauth_pending(expires_at);
 	CREATE TABLE IF NOT EXISTS chatgpt_oauth_pairings (
 		id TEXT PRIMARY KEY,
@@ -69,6 +70,8 @@ db.exec(`
 		expires_at INTEGER NOT NULL,
 		envelope TEXT NOT NULL
 	);
+	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pairings_user_idx ON chatgpt_oauth_pairings(user_id);
+	CREATE INDEX IF NOT EXISTS chatgpt_oauth_pairings_expiry_idx ON chatgpt_oauth_pairings(expires_at);
 `);
 
 type AccountRow = {
@@ -116,14 +119,22 @@ function keyFor(mode: OAuthMode): Buffer {
 	const dbPath =
 		process.env.FLAVORITHM_DB_PATH ?? resolve(process.cwd(), 'data', 'flavorithm.sqlite');
 	const keyPath = resolve(dirname(dbPath), 'oauth.key');
+	if (existsSync(keyPath)) {
+		const key = readFileSync(keyPath);
+		if (key.length !== 32) throw new Error('Local OAuth encryption is unavailable.');
+		chmodSync(keyPath, 0o600);
+		return key;
+	}
+
+	const fallbackKey = decodeHostedEncryptionKey();
+	if (fallbackKey) return fallbackKey;
+
 	mkdirSync(dirname(keyPath), { recursive: true });
-	if (!existsSync(keyPath)) {
-		const freshKey = randomBytes(32);
-		try {
-			writeFileSync(keyPath, freshKey, { flag: 'wx', mode: 0o600 });
-		} catch (error) {
-			if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-		}
+	const freshKey = randomBytes(32);
+	try {
+		writeFileSync(keyPath, freshKey, { flag: 'wx', mode: 0o600 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
 	}
 	const key = readFileSync(keyPath);
 	if (key.length !== 32) throw new Error('Local OAuth encryption is unavailable.');
@@ -563,7 +574,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS codex_device_attempts (
  expires_at INTEGER NOT NULL, next_poll INTEGER NOT NULL, envelope TEXT NOT NULL,
  lease_token TEXT, lease_until INTEGER NOT NULL DEFAULT 0,
  exchanging INTEGER NOT NULL DEFAULT 0
-)`);
+);
+CREATE INDEX IF NOT EXISTS codex_device_attempts_user_idx ON codex_device_attempts(user_id);
+CREATE INDEX IF NOT EXISTS codex_device_attempts_expiry_idx ON codex_device_attempts(expires_at);`);
 export function storeCodexDeviceAttempt(input: {
 	id: string;
 	userId: string;
