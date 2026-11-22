@@ -232,6 +232,8 @@ function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
 function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
+	const start = new Date(startKey + 'T12:00:00');
+	if (!Number.isFinite(start.getTime()) || calendarKey(start) !== startKey) return;
 	const end = new Date(startKey + 'T12:00:00');
 	end.setDate(end.getDate() + 6);
 	const endKey = calendarKey(end);
@@ -257,6 +259,7 @@ export function applyButlerCommands(
 	const knownGeneratedIds = new Set<string>();
 	recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
 	const effects: ButlerEffect[] = [];
+	const deletedCheckedWeeks = new Set<string>();
 	for (const command of commands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
@@ -285,7 +288,9 @@ export function applyButlerCommands(
 				requireId(state.recipes, command.id);
 				state.recipes = state.recipes.filter((item) => item.id !== command.id);
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
-				state.shopping = state.shopping.filter((item) => item.sourceKey !== `recipe:${command.id}`);
+				state.shopping = state.shopping.filter(
+					(item) => item.sourceKey !== `recipe:${command.id}` || item.checked
+				);
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
 				break;
 			case 'pantry.upsert':
@@ -328,13 +333,19 @@ export function applyButlerCommands(
 				state.shopping = upsert(state.shopping, command.item);
 				recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
 				break;
-			case 'shopping.delete':
-				if (state.shopping.some((item) => item.id === command.id)) {
+			case 'shopping.delete': {
+				const removed = state.shopping.find((item) => item.id === command.id);
+				if (removed) {
+					const week = removed.checked
+						? removed.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1]
+						: undefined;
+					if (week) deletedCheckedWeeks.add(week);
 					state.shopping = state.shopping.filter((item) => item.id !== command.id);
 				} else if (!knownGeneratedIds.has(command.id)) {
 					requireId(state.shopping, command.id);
 				}
 				break;
+			}
 			case 'shopping.generate': {
 				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
@@ -361,6 +372,7 @@ export function applyButlerCommands(
 				break;
 		}
 	}
+	const weeks = new Set(deletedCheckedWeeks);
 	if (
 		commands.some(
 			(command) =>
@@ -370,8 +382,9 @@ export function applyButlerCommands(
 		)
 	) {
 		recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
-		for (const week of activeWeeks) refreshShoppingWeek(state, week, now);
+		for (const week of activeWeeks) weeks.add(week);
 	}
+	for (const week of weeks) refreshShoppingWeek(state, week, now);
 	if (
 		state.recipes.length > MAX_RECIPES ||
 		state.pantry.length > 1000 ||

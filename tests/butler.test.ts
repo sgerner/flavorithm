@@ -370,6 +370,94 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 	]);
 });
 
+test('recipe.delete retains checked recipe purchases and shopping.delete refreshes checked week scopes only', () => {
+	const now = new Date('2026-10-23T12:00:00Z');
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	recipe.ingredients = [
+		{ name: 'carrot', quantity: 4, unit: 'each' },
+		{ name: 'onion', quantity: 2, unit: 'each' }
+	];
+	current.pantry = [];
+	current.meals = [
+		{
+			id: 'meal',
+			recipeId: recipe.id,
+			date: '2026-10-23',
+			slot: 'Dinner',
+			servings: recipe.servings
+		}
+	];
+	current.shopping = [
+		{
+			id: 'recipe-bought',
+			name: 'olive oil',
+			quantity: 1,
+			unit: 'cup',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		},
+		{
+			id: 'recipe-needed',
+			name: 'carrot',
+			quantity: 4,
+			unit: 'each',
+			checked: false,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	];
+
+	const afterRecipeDelete = applyButlerCommands(
+		current,
+		[{ type: 'recipe.delete', id: recipe.id }],
+		now
+	).state;
+	assert.deepEqual(afterRecipeDelete.shopping, [
+		{
+			id: 'recipe-bought',
+			name: 'olive oil',
+			quantity: 1,
+			unit: 'cup',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	]);
+
+	// Weekly shopping: generate week, dismiss unchecked onion, check carrot, then delete checked carrot
+	const generated = applyButlerCommands(
+		{ ...current, shopping: [] },
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	const onion = generated.shopping.find((item) => item.name === 'onion')!;
+	const afterDismissOnion = applyButlerCommands(
+		generated,
+		[{ type: 'shopping.delete', id: onion.id }],
+		now
+	).state;
+	assert.equal(
+		afterDismissOnion.shopping.some((item) => item.name === 'onion'),
+		false
+	);
+
+	const carrot = afterDismissOnion.shopping.find((item) => item.name === 'carrot')!;
+	const withCheckedCarrot = applyButlerCommands(
+		afterDismissOnion,
+		[{ type: 'shopping.upsert', item: { ...carrot, checked: true } }],
+		now
+	).state;
+	const afterDeleteCheckedCarrot = applyButlerCommands(
+		withCheckedCarrot,
+		[{ type: 'shopping.delete', id: carrot.id }],
+		now
+	).state;
+	const refreshedCarrot = afterDeleteCheckedCarrot.shopping.find((item) => item.name === 'carrot');
+	assert.ok(refreshedCarrot);
+	assert.equal(refreshedCarrot.checked, false);
+	assert.equal(refreshedCarrot.quantity, 4);
+	assert.equal(refreshedCarrot.sourceKey, 'week:2026-10-19');
+});
+
 test('new Basil recipes default to saved while updates preserve existing saved state', async () => {
 	const { createNewUserState } = await import('../src/lib/data.ts');
 	const signedIn = createNewUserState();
