@@ -2309,7 +2309,7 @@
 							<span class="desktop-title"
 								>{page === 'saved' ? 'Your recipe collection' : 'Discover recipes'}</span
 							><span class="mobile-title">{page === 'saved' ? 'Saved recipes' : 'Recipes'}</span
-							><span class="heading-spark">✴</span>
+							><span class="heading-spark" aria-hidden="true">✴</span>
 						</h1>
 					</div>
 					<button
@@ -2489,7 +2489,7 @@
 			{:else if page === 'pantry'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Your pantry<span class="heading-spark">✳</span></h1>
+						<h1>Your pantry<span class="heading-spark" aria-hidden="true">✳</span></h1>
 						<p>Track ingredients and quantities you have on hand.</p>
 					</div>
 					<button class="primary" onclick={() => (modal = 'pantry')}
@@ -2617,7 +2617,7 @@
 			{:else if page === 'planner'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Meal planner<span class="heading-spark">✷</span></h1>
+						<h1>Meal planner<span class="heading-spark" aria-hidden="true">✷</span></h1>
 						<p>Schedule meals and build your weekly shopping list.</p>
 					</div>
 					<button
@@ -2783,7 +2783,7 @@
 			{:else if page === 'shopping'}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
-						<h1>Shopping list<span class="heading-spark">✴</span></h1>
+						<h1>Shopping list<span class="heading-spark" aria-hidden="true">✴</span></h1>
 						<p>
 							Generated rows show their recipe or meal-plan source. Editing a row keeps your changes
 							visible until that source is refreshed.

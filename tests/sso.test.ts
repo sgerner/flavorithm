@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { generateKeyPair } from 'jose';
 import { exportJWK, SignJWT } from 'jose';
 import { test } from 'node:test';
@@ -10,9 +11,11 @@ process.env.ORIGIN = 'https://kitchen.example.test';
 const dbPath = '../src/lib/server/db.ts';
 const ssoPath = '../src/lib/server/sso.ts';
 const hooksPath = '../src/hooks.server.ts';
+const authRoutePath = '../src/routes/api/auth/+server.ts';
 const backend = await import(dbPath);
 const sso = await import(ssoPath);
 const { handle } = await import(hooksPath);
+const authRoute = await import(authRoutePath);
 
 const proxySecret = 'sso-test-shared-secret-long-enough-for-timing-safe-checks';
 const oidcIssuer = 'https://idp.example.test/application/o/flavorithm/';
@@ -515,11 +518,21 @@ test('OIDC ignores local cookies, redirects HTML to login, and returns JSON 401 
 	assert.equal(api.response.status, 401);
 	assert.match(api.response.headers.get('content-type') ?? '', /application\/json/);
 
+	const oidcProbe = await runHook({ url: 'https://kitchen.example.test/api/auth' });
+	assert.equal(oidcProbe.response.status, 200);
+	assert.deepEqual(await oidcProbe.response.json(), {
+		user: null,
+		authMode: 'oidc'
+	});
+
 	process.env.FLAVORITHM_AUTH_MODE = '';
 	assert.equal(sso.getAuthMode(), null, 'an explicitly empty auth mode is invalid');
 	const invalid = await runHook({ url: 'https://kitchen.example.test/api/state' });
 	assert.equal(invalid.response.status, 503);
 	assert.equal(invalid.event.locals.authMode, 'invalid');
+	const invalidProbe = await runHook({ url: 'https://kitchen.example.test/api/auth' });
+	assert.equal(invalidProbe.response.status, 503);
+	assert.equal(invalidProbe.event.locals.authMode, 'invalid');
 });
 
 test('SSO configuration fails closed for missing secrets, insecure origins, and invalid bounds', () => {
@@ -551,4 +564,67 @@ test('SSO configuration fails closed for missing secrets, insecure origins, and 
 		false,
 		'session bounds must stay between 5 minutes and 24 hours'
 	);
+});
+
+test('container healthcheck targets GET /api/auth, returns 200 in valid modes, and returns 503 when auth is broken', async () => {
+	const composeYaml = readFileSync(new URL('../compose.yml', import.meta.url), 'utf8');
+	const probeMatch = composeYaml.match(/fetch\('([^']+)'\)/);
+	assert.ok(probeMatch, 'compose.yml must define a fetch-based healthcheck probe');
+	const probeUrl = new URL(probeMatch[1]);
+	assert.equal(probeUrl.href, 'http://127.0.0.1:3000/api/auth');
+	assert.ok(!composeYaml.includes('/manifest.webmanifest'));
+
+	async function runHealthcheckProbe(): Promise<Response> {
+		const jar = cookieJar();
+		const request = new Request(`https://kitchen.example.test${probeUrl.pathname}`, {
+			method: 'GET'
+		});
+		const event = {
+			request,
+			url: new URL(request.url),
+			cookies: jar.cookies,
+			locals: { user: null as unknown, authMode: 'invalid' }
+		};
+		return handle({
+			event,
+			resolve: (resolvedEvent: typeof event) => authRoute.GET(resolvedEvent as never)
+		} as never);
+	}
+
+	process.env.ORIGIN = 'https://kitchen.example.test';
+	process.env.FLAVORITHM_AUTH_MODE = 'local';
+	const localProbe = await runHealthcheckProbe();
+	assert.equal(localProbe.status, 200);
+	assert.equal((await localProbe.json()).authMode, 'local');
+
+	process.env.FLAVORITHM_AUTH_MODE = 'oidc';
+	process.env.FLAVORITHM_OIDC_ISSUER = oidcIssuer;
+	process.env.FLAVORITHM_OIDC_CLIENT_ID = oidcClientId;
+	process.env.FLAVORITHM_OIDC_CLIENT_SECRET = '';
+	process.env.FLAVORITHM_OIDC_CLIENT_AUTH_METHOD = 'none';
+	process.env.FLAVORITHM_OIDC_SESSION_TTL_SECONDS = '3600';
+	process.env.FLAVORITHM_OIDC_REDIRECT_URI = 'https://kitchen.example.test/auth/callback';
+	const oidcProbe = await runHealthcheckProbe();
+	assert.equal(oidcProbe.status, 200);
+	assert.equal((await oidcProbe.json()).authMode, 'oidc');
+
+	process.env.FLAVORITHM_AUTH_MODE = 'proxy';
+	process.env.FLAVORITHM_PROXY_SHARED_SECRET = proxySecret;
+	delete process.env.FLAVORITHM_PROXY_SECRET_HEADER;
+	const proxyProbe = await runHealthcheckProbe();
+	assert.equal(proxyProbe.status, 200);
+	const proxyData = await proxyProbe.json();
+	assert.equal(proxyData.authMode, 'proxy');
+	assert.equal(proxyData.user, null);
+
+	process.env.FLAVORITHM_AUTH_MODE = 'invalid-mode';
+	assert.equal((await runHealthcheckProbe()).status, 503);
+
+	process.env.FLAVORITHM_AUTH_MODE = 'proxy';
+	process.env.FLAVORITHM_PROXY_SHARED_SECRET = 'short';
+	assert.equal((await runHealthcheckProbe()).status, 503);
+
+	process.env.FLAVORITHM_AUTH_MODE = 'oidc';
+	process.env.FLAVORITHM_OIDC_CLIENT_ID = '';
+	assert.equal((await runHealthcheckProbe()).status, 503);
 });
