@@ -9,7 +9,10 @@ import {
 	completeMeal,
 	convertCompatibleQuantity,
 	expiryStatus,
+	filterPantryItems,
+	listPantryCategories,
 	normalizeIngredientName,
+	normalizePantryDraft,
 	reconcileShoppingList,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
@@ -359,5 +362,126 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
+	);
+});
+
+test('normalizePantryDraft clamps quantities, trims unit to 40 chars, and normalizes optional expiry', () => {
+	assert.deepEqual(
+		normalizePantryDraft({
+			quantity: null,
+			unit: '  cups  ',
+			category: '  Grains  ',
+			expires: '   '
+		}),
+		{
+			quantity: 0,
+			unit: 'cups',
+			category: 'Grains'
+		}
+	);
+	assert.deepEqual(
+		normalizePantryDraft({
+			quantity: '',
+			unit: '',
+			category: '',
+			expires: ' 2026-12-01 '
+		}),
+		{
+			quantity: 0,
+			unit: 'piece',
+			category: 'Pantry',
+			expires: '2026-12-01'
+		}
+	);
+	assert.equal(
+		normalizePantryDraft({
+			quantity: -12.5,
+			unit: 'g',
+			category: 'Spices',
+			expires: ''
+		}).quantity,
+		0
+	);
+	assert.equal(
+		normalizePantryDraft({
+			quantity: 2_500_000,
+			unit: 'g',
+			category: 'Spices',
+			expires: ''
+		}).quantity,
+		1_000_000
+	);
+	const longUnit = normalizePantryDraft({
+		quantity: 1.5,
+		unit: `  ${'u'.repeat(55)}  `,
+		category: `  ${'c'.repeat(120)}  `,
+		expires: ''
+	});
+	assert.equal(longUnit.quantity, 1.5);
+	assert.equal(longUnit.unit.length, 40);
+	assert.equal(longUnit.category.length, 100);
+});
+
+test('filterPantryItems and listPantryCategories combine search text, category, and expiry filters', () => {
+	const now = new Date(2026, 10, 21, 12, 0);
+	const items: Ingredient[] = [
+		{
+			id: 'oil',
+			name: 'olive oil',
+			quantity: 0.5,
+			unit: 'cup',
+			category: 'Oils & condiments'
+		},
+		{
+			id: 'spinach',
+			name: 'baby spinach',
+			quantity: 2,
+			unit: 'cups',
+			category: 'Produce',
+			expires: '2026-11-23'
+		},
+		{
+			id: 'milk',
+			name: 'whole milk',
+			quantity: 1,
+			unit: 'qt',
+			category: 'Dairy & eggs',
+			expires: '2026-11-18'
+		},
+		{
+			id: 'rice',
+			name: 'jasmine rice',
+			quantity: 2,
+			unit: 'cups',
+			category: 'Grains',
+			expires: '2027-06-01'
+		}
+	];
+
+	const categories = listPantryCategories(items);
+	assert.deepEqual(
+		categories.map((entry) => entry.label),
+		['Dairy & eggs', 'Grains', 'Oils & condiments', 'Produce']
+	);
+	assert.equal(
+		listPantryCategories(items, 'Spices').find((entry) => entry.key === 'spices')?.count,
+		0
+	);
+
+	assert.deepEqual(
+		filterPantryItems(items, { query: 'condiment', category: 'all', expiry: 'all' }, now).map(
+			(item) => item.id
+		),
+		['oil']
+	);
+	assert.deepEqual(
+		filterPantryItems(items, { query: '', category: 'Produce', expiry: 'soon' }, now).map(
+			(item) => item.id
+		),
+		['spinach']
+	);
+	assert.deepEqual(
+		filterPantryItems(items, { query: 'rice', category: 'Grains', expiry: 'expired' }, now),
+		[]
 	);
 });

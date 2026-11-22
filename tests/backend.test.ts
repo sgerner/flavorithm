@@ -344,3 +344,30 @@ test('reasoning preferences survive persistence and reject invalid budgets', asy
 	state.preferences.reasoning.budgetTokens = -1;
 	assert.equal(backend.validateAppState(state), null);
 });
+
+test('normalized pantry drafts always satisfy validateAppState while raw null quantities are rejected', async () => {
+	const { normalizePantryDraft } = await import('../src/lib/kitchen-workflows.ts');
+	const state = data.createInitialState();
+
+	const withNullQuantity = structuredClone(state) as Record<string, unknown>;
+	(withNullQuantity.pantry as Array<Record<string, unknown>>)[0].quantity = null;
+	assert.equal(backend.validateAppState(withNullQuantity), null);
+
+	const normalizedCleared = normalizePantryDraft({
+		quantity: null,
+		unit: `  ${'x'.repeat(60)}  `,
+		category: `  ${'y'.repeat(130)}  `,
+		expires: ''
+	});
+	state.pantry[0] = {
+		id: state.pantry[0].id,
+		name: state.pantry[0].name,
+		...normalizedCleared
+	};
+	const validated = backend.validateAppState(state);
+	assert.ok(validated);
+	assert.equal(validated.pantry[0].quantity, 0);
+	assert.equal(validated.pantry[0].unit.length, 40);
+	assert.equal(validated.pantry[0].category.length, 100);
+	assert.equal(validated.pantry[0].expires, undefined);
+});
