@@ -6,7 +6,7 @@ import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
-const quantity = z.number().finite().nonnegative().max(1000000);
+const quantity = z.number().nonnegative().max(1000000);
 const nutrition = z.object({
 	calories: quantity,
 	fat: quantity,
@@ -33,7 +33,7 @@ const recipe = z.object({
 			'Use an HTTP image URL or a recipe cover.'
 		),
 	time: quantity,
-	servings: z.number().finite().min(1).max(10000),
+	servings: z.number().min(1).max(10000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -72,8 +72,8 @@ const meal = z.object({
 	date,
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
-	servings: z.number().finite().min(1).max(10000),
-	completedAt: z.string().datetime().optional(),
+	servings: z.number().min(1).max(10000),
+	completedAt: z.iso.datetime().optional(),
 	leftoverServings: quantity.optional()
 });
 const shopping = z.object({
@@ -88,7 +88,7 @@ const preferences = z
 	.object({
 		diet: z.string().max(200),
 		allergies: z.string().max(500),
-		maxTime: z.number().finite().nonnegative().max(100000),
+		maxTime: z.number().nonnegative().max(100000),
 		complexity: z.string().max(80),
 		cuisines: z.array(z.string().max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
