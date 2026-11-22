@@ -2,8 +2,7 @@
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
-	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
+	import ModalDialog from './ModalDialog.svelte';
 	import { Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
 	let {
@@ -133,202 +132,195 @@
 	}
 </script>
 
-<div class="modal-backdrop" transition:backdropMotion|global>
-	<div
-		class="flavor-dialog wide capture-dialog recipe-editor-dialog"
-		use:focusTrap
-		role="dialog"
-		aria-modal="true"
-		aria-labelledby="recipe-editor-title"
-		tabindex="-1"
-		transition:dialogMotion|global
-	>
-		<h2 id="recipe-editor-title">Edit saved recipe</h2>
-		<p class="muted">Changes are saved to your recipe collection.</p>
-		<form onsubmit={saveDraft}>
-			<div class="draft-summary">
-				<label class="field draft-title"
-					>Title<input bind:value={draft.title} required maxlength="200" /></label
+<ModalDialog
+	dialogClass="flavor-dialog wide capture-dialog recipe-editor-dialog"
+	labelledBy="recipe-editor-title"
+	closeLabel="Close recipe editor"
+	onclose={cancel}
+>
+	<h2 id="recipe-editor-title">Edit saved recipe</h2>
+	<p class="muted">Changes are saved to your recipe collection.</p>
+	<form onsubmit={saveDraft}>
+		<div class="draft-summary">
+			<label class="field draft-title"
+				>Title<input bind:value={draft.title} required maxlength="200" /></label
+			>
+			<label class="field"
+				>Time (minutes)<input
+					type="number"
+					bind:value={draft.time}
+					min="1"
+					max="100000"
+					step="1"
+					required
+				/></label
+			>
+			<label class="field"
+				>Servings<input
+					type="number"
+					bind:value={draft.servings}
+					min="1"
+					max="10000"
+					step="1"
+					required
+				/></label
+			>
+			<label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label>
+			<label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label>
+			<label class="field full-field"
+				>Description<textarea bind:value={draft.description} maxlength="10000" rows="2"
+				></textarea></label
+			>
+			<div class="full-field cover-picker">
+				<img
+					src={draft.image || recipePlaceholder(draft)}
+					alt="Recipe cover preview"
+					onerror={(event) => recipeImageError(event, draft)}
+				/>
+				<input
+					hidden
+					type="file"
+					accept="image/jpeg,image/png,image/webp"
+					bind:this={photoInput}
+					onchange={uploadCover}
+					disabled={uploading}
+				/>
+				<button
+					type="button"
+					class="secondary"
+					disabled={uploading}
+					onclick={() => photoInput.click()}
+					>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
 				>
-				<label class="field"
-					>Time (minutes)<input
-						type="number"
-						bind:value={draft.time}
-						min="1"
-						max="100000"
-						step="1"
-						required
+				{#if draft.image}<button
+						type="button"
+						class="text-button"
+						disabled={uploading}
+						onclick={() => {
+							draft.image = '';
+						}}>Remove cover</button
+					>{/if}
+				<p class="muted">
+					JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household. Sign-in
+					and an internet connection are required.
+				</p>
+			</div>
+			{#if !COVER_PATH.test(draft.image)}<label class="field full-field"
+					>Image URL<input
+						bind:value={draft.image}
+						maxlength="4000"
+						type="text"
+						placeholder="https://… (optional)"
+						disabled={uploading}
 					/></label
-				>
-				<label class="field"
-					>Servings<input
-						type="number"
-						bind:value={draft.servings}
-						min="1"
-						max="10000"
-						step="1"
+				>{/if}
+			<label class="field full-field"
+				>Tags<input
+					bind:value={tagsText}
+					maxlength="3029"
+					placeholder="weeknight, vegetarian"
+				/></label
+			>
+		</div>
+		<div class="draft-section-heading">
+			<h3>Ingredients</h3>
+			<button
+				class="text-button"
+				type="button"
+				disabled={draft.ingredients.length >= 60}
+				onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
+				><Plus size={17} />Add</button
+			>
+		</div>
+		<div class="draft-ingredients">
+			{#each draft.ingredients as item, i}<div class="draft-ingredient">
+					<input
+						class="ingredient-name"
+						aria-label={`Ingredient ${i + 1}`}
+						bind:value={item.name}
 						required
-					/></label
-				>
-				<label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label>
-				<label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label
-				>
-				<label class="field full-field"
-					>Description<textarea bind:value={draft.description} maxlength="10000" rows="2"
-					></textarea></label
-				>
-				<div class="full-field cover-picker">
-					<img
-						src={draft.image || recipePlaceholder(draft)}
-						alt="Recipe cover preview"
-						onerror={(event) => recipeImageError(event, draft)}
+						maxlength="100"
+						placeholder="Ingredient"
 					/>
 					<input
-						hidden
-						type="file"
-						accept="image/jpeg,image/png,image/webp"
-						bind:this={photoInput}
-						onchange={uploadCover}
-						disabled={uploading}
-					/>
-					<button
-						type="button"
-						class="secondary"
-						disabled={uploading}
-						onclick={() => photoInput.click()}
-						>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
-					>
-					{#if draft.image}<button
-							type="button"
-							class="text-button"
-							disabled={uploading}
-							onclick={() => {
-								draft.image = '';
-							}}>Remove cover</button
-						>{/if}
-					<p class="muted">
-						JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.
-						Sign-in and an internet connection are required.
-					</p>
-				</div>
-				{#if !COVER_PATH.test(draft.image)}<label class="field full-field"
-						>Image URL<input
-							bind:value={draft.image}
-							maxlength="4000"
-							type="text"
-							placeholder="https://… (optional)"
-							disabled={uploading}
-						/></label
-					>{/if}
-				<label class="field full-field"
-					>Tags<input
-						bind:value={tagsText}
-						maxlength="3029"
-						placeholder="weeknight, vegetarian"
-					/></label
-				>
-			</div>
-			<div class="draft-section-heading">
-				<h3>Ingredients</h3>
-				<button
-					class="text-button"
-					type="button"
-					disabled={draft.ingredients.length >= 60}
-					onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
-					><Plus size={17} />Add</button
-				>
-			</div>
-			<div class="draft-ingredients">
-				{#each draft.ingredients as item, i}<div class="draft-ingredient">
-						<input
-							class="ingredient-name"
-							aria-label={`Ingredient ${i + 1}`}
-							bind:value={item.name}
-							required
-							maxlength="100"
-							placeholder="Ingredient"
-						/>
-						<input
-							class="ingredient-quantity"
-							aria-label={`Quantity for ingredient ${i + 1}`}
-							type="number"
-							bind:value={item.quantity}
-							required
-							min="0.000001"
-							max="1000000"
-							step="any"
-						/>
-						<input
-							class="ingredient-unit"
-							aria-label={`Unit for ingredient ${i + 1}`}
-							bind:value={item.unit}
-							required
-							maxlength="40"
-							placeholder="Unit"
-						/>
-						<button
-							class="icon-button"
-							type="button"
-							aria-label={`Remove ingredient ${i + 1}`}
-							onclick={() =>
-								(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
-							><X size={18} /></button
-						>
-					</div>{/each}
-			</div>
-			<div class="draft-section-heading">
-				<h3>Steps</h3>
-				<button
-					class="text-button"
-					type="button"
-					disabled={draft.steps.length >= 40}
-					onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
-				>
-			</div>
-			{#each draft.steps as step, i}<div class="draft-step">
-					<span>{i + 1}</span><textarea
-						aria-label={`Step ${i + 1}`}
-						bind:value={draft.steps[i]}
+						class="ingredient-quantity"
+						aria-label={`Quantity for ingredient ${i + 1}`}
+						type="number"
+						bind:value={item.quantity}
 						required
-						maxlength="10000"
-						rows="2"></textarea>
+						min="0.000001"
+						max="1000000"
+						step="any"
+					/>
+					<input
+						class="ingredient-unit"
+						aria-label={`Unit for ingredient ${i + 1}`}
+						bind:value={item.unit}
+						required
+						maxlength="40"
+						placeholder="Unit"
+					/>
 					<button
 						class="icon-button"
 						type="button"
-						aria-label={`Remove step ${i + 1}`}
-						onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
+						aria-label={`Remove ingredient ${i + 1}`}
+						onclick={() =>
+							(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
 						><X size={18} /></button
 					>
 				</div>{/each}
-			<details class="import-notes">
-				<summary>Nutrition estimates</summary>
-				<p>
-					Estimated values per serving. Ingredient or serving changes will mark these values as
-					stale.
-				</p>
-				<div class="draft-summary">
-					{#each nutritionFields as [key, label]}<label class="field"
-							>{label}<input
-								type="number"
-								min="0"
-								max="1000000"
-								step="any"
-								required
-								bind:value={draft.nutrition[key]}
-							/></label
-						>{/each}
-				</div>
-			</details>
-			{#if error}<p class="error" role="alert">{error}</p>{/if}
-			<div class="draft-footer">
-				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
-				<button class="primary" type="submit" disabled={uploading}
-					><Check size={18} />Save changes</button
+		</div>
+		<div class="draft-section-heading">
+			<h3>Steps</h3>
+			<button
+				class="text-button"
+				type="button"
+				disabled={draft.steps.length >= 40}
+				onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
+			>
+		</div>
+		{#each draft.steps as step, i}<div class="draft-step">
+				<span>{i + 1}</span><textarea
+					aria-label={`Step ${i + 1}`}
+					bind:value={draft.steps[i]}
+					required
+					maxlength="10000"
+					rows="2"></textarea>
+				<button
+					class="icon-button"
+					type="button"
+					aria-label={`Remove step ${i + 1}`}
+					onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
+					><X size={18} /></button
 				>
+			</div>{/each}
+		<details class="import-notes">
+			<summary>Nutrition estimates</summary>
+			<p>
+				Estimated values per serving. Ingredient or serving changes will mark these values as stale.
+			</p>
+			<div class="draft-summary">
+				{#each nutritionFields as [key, label]}<label class="field"
+						>{label}<input
+							type="number"
+							min="0"
+							max="1000000"
+							step="any"
+							required
+							bind:value={draft.nutrition[key]}
+						/></label
+					>{/each}
 			</div>
-		</form>
-	</div>
-</div>
+		</details>
+		{#if error}<p class="error" role="alert">{error}</p>{/if}
+		<div class="draft-footer">
+			<button class="secondary" type="button" onclick={cancel}>Cancel</button>
+			<button class="primary" type="submit" disabled={uploading}
+				><Check size={18} />Save changes</button
+			>
+		</div>
+	</form>
+</ModalDialog>
 
 <style>
 	.cover-picker img {
@@ -342,12 +334,7 @@
 		font-size: 13px;
 		margin-top: 10px;
 	}
-	.recipe-editor-dialog .full-field {
+	.full-field {
 		grid-column: 1 / -1;
-	}
-	@media (max-width: 650px) {
-		.recipe-editor-dialog {
-			padding: 28px 16px 20px;
-		}
 	}
 </style>

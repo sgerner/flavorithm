@@ -1,56 +1,227 @@
-/** Keep keyboard focus in a modal and return it to its trigger on close. */
-let activeTraps = 0;
+/** Keep keyboard focus inside an active modal or drawer and return it cleanly on close. */
+export type FocusTrapOptions = {
+	enabled?: boolean;
+	key?: unknown;
+	returnFocus?: HTMLElement | (() => HTMLElement | null | undefined) | null;
+};
+
+type ResolvedOptions = {
+	enabled: boolean;
+	key: unknown;
+	returnFocus?: HTMLElement | (() => HTMLElement | null | undefined) | null;
+};
+
+type TrapEntry = {
+	node: HTMLElement;
+	deactivate: (exiting?: boolean) => void;
+};
+
+const FOCUSABLE_SELECTOR =
+	'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),details > summary:first-of-type,[tabindex="0"]';
+
+const activeTraps: TrapEntry[] = [];
 let originalOverflow = '';
 let originalFocus: HTMLElement | null = null;
+let handoffFocus: HTMLElement | null = null;
+let handoffOverflow: string | null = null;
 
-export function focusTrap(node: HTMLElement) {
-	const previous = document.activeElement as HTMLElement | null;
-	const controls = () =>
-		Array.from(
-			node.querySelectorAll<HTMLElement>(
-				'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex="0"]'
-			)
-		).filter((el) => el.offsetParent !== null);
-	queueMicrotask(() => {
-		(controls()[0] || node).focus();
-	});
+function resolveOptions(param?: FocusTrapOptions | boolean): ResolvedOptions {
+	if (typeof param === 'boolean') return { enabled: param, key: undefined };
+	return {
+		enabled: param?.enabled ?? true,
+		key: param?.key,
+		returnFocus: param?.returnFocus
+	};
+}
+
+function resolveReturnElement(
+	target: ResolvedOptions['returnFocus'],
+	fallback: HTMLElement | null
+): HTMLElement | null {
+	const explicit = typeof target === 'function' ? target() : target;
+	return explicit ?? fallback;
+}
+
+function isHiddenInClosedDetails(el: HTMLElement, container: HTMLElement): boolean {
+	let current: HTMLElement | null = el;
+	while (current && current !== container) {
+		const parent: HTMLElement | null = current.parentElement;
+		if (parent && parent.tagName === 'DETAILS' && !(parent as HTMLDetailsElement).open) {
+			let summary: Element | null = null;
+			for (const child of Array.from(parent.children)) {
+				if (child.tagName === 'SUMMARY') {
+					summary = child;
+					break;
+				}
+			}
+			if (current !== summary) return true;
+		}
+		current = parent;
+	}
+	return false;
+}
+
+function isElementVisible(el: HTMLElement): boolean {
+	if (el.hidden || el.closest('[hidden], [inert]')) return false;
+	if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+		const style = window.getComputedStyle(el);
+		if (style.display === 'none' || style.visibility === 'hidden') return false;
+		if (el.offsetParent === null && style.position !== 'fixed') return false;
+		return true;
+	}
+	return el.offsetParent !== null;
+}
+
+export function focusableControls(node: HTMLElement): HTMLElement[] {
+	return Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+		(el) => !isHiddenInClosedDetails(el, node) && isElementVisible(el)
+	);
+}
+
+function canRestoreFocus(
+	target: HTMLElement | null,
+	closingNode: HTMLElement
+): target is HTMLElement {
+	if (!target || !target.isConnected || !isElementVisible(target)) return false;
+	const active = document.activeElement as HTMLElement | null;
+	if (
+		active &&
+		active !== document.body &&
+		active !== document.documentElement &&
+		active !== target &&
+		!closingNode.contains(active) &&
+		!active.closest('[inert], [hidden]')
+	) {
+		return false;
+	}
+	return true;
+}
+
+export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean) {
+	let options = resolveOptions(param);
+	let active = false;
+	let focusGeneration = 0;
+	let inertObserver: MutationObserver | null = null;
+
+	function focusInitial() {
+		const token = ++focusGeneration;
+		queueMicrotask(() => {
+			if (!active || token !== focusGeneration || node.inert || !node.isConnected) return;
+			(focusableControls(node)[0] || node).focus();
+		});
+	}
+
 	function keydown(event: KeyboardEvent) {
-		if (event.key !== 'Tab') return;
-		const elements = controls();
+		if (event.key !== 'Tab' || !active) return;
+		const elements = focusableControls(node);
 		if (!elements.length) {
 			event.preventDefault();
 			node.focus();
 			return;
 		}
-		const first = elements[0],
-			last = elements[elements.length - 1];
-		if (event.shiftKey && (document.activeElement === first || document.activeElement === node)) {
+		const first = elements[0];
+		const last = elements[elements.length - 1];
+		const current = document.activeElement as HTMLElement | null;
+		if (!current || !node.contains(current)) {
+			event.preventDefault();
+			(event.shiftKey ? last : first).focus();
+		} else if (event.shiftKey && (current === first || current === node)) {
 			event.preventDefault();
 			last.focus();
-		} else if (!event.shiftKey && document.activeElement === last) {
+		} else if (!event.shiftKey && (current === last || current === node)) {
 			event.preventDefault();
 			first.focus();
 		}
 	}
-	node.addEventListener('keydown', keydown);
-	if (activeTraps === 0) {
-		originalOverflow = document.body.style.overflow;
-		originalFocus = previous;
+
+	function outrostart(event: Event) {
+		if (event.target === node) deactivate(true);
 	}
-	activeTraps += 1;
-	document.body.style.overflow = 'hidden';
+
+	const entry: TrapEntry = {
+		node,
+		deactivate
+	};
+
+	function deactivate(exiting = false) {
+		if (!active) {
+			if (exiting) node.removeAttribute('aria-modal');
+			return;
+		}
+		active = false;
+		focusGeneration += 1;
+		node.removeEventListener('keydown', keydown);
+		node.removeEventListener('outrostart', outrostart);
+		inertObserver?.disconnect();
+		inertObserver = null;
+		if (exiting) node.removeAttribute('aria-modal');
+
+		const index = activeTraps.indexOf(entry);
+		if (index !== -1) activeTraps.splice(index, 1);
+
+		if (activeTraps.length === 0) {
+			document.body.style.overflow = originalOverflow;
+			const returnTarget = originalFocus;
+			handoffFocus = returnTarget;
+			handoffOverflow = originalOverflow;
+			originalFocus = null;
+			queueMicrotask(() => {
+				if (activeTraps.length !== 0) return;
+				handoffFocus = null;
+				handoffOverflow = null;
+				if (canRestoreFocus(returnTarget, node)) returnTarget.focus();
+			});
+		}
+	}
+
+	function activate() {
+		if (active) return;
+		const previous = document.activeElement as HTMLElement | null;
+		const exitingTraps = activeTraps.filter((item) => item.node.inert);
+
+		if (activeTraps.length === 0) {
+			originalOverflow = handoffOverflow ?? document.body.style.overflow;
+			originalFocus = handoffFocus ?? resolveReturnElement(options.returnFocus, previous);
+			handoffFocus = null;
+			handoffOverflow = null;
+		}
+
+		active = true;
+		activeTraps.push(entry);
+		for (const stale of exitingTraps) stale.deactivate(true);
+
+		document.body.style.overflow = 'hidden';
+		node.addEventListener('keydown', keydown);
+		node.addEventListener('outrostart', outrostart);
+
+		if (typeof MutationObserver !== 'undefined') {
+			inertObserver = new MutationObserver(() => {
+				if (node.inert) deactivate(true);
+			});
+			inertObserver.observe(node, { attributes: true, attributeFilter: ['inert'] });
+		}
+
+		focusInitial();
+	}
+
+	if (options.enabled) activate();
+
 	return {
-		destroy() {
-			node.removeEventListener('keydown', keydown);
-			activeTraps -= 1;
-			if (activeTraps === 0) {
-				document.body.style.overflow = originalOverflow;
-				const returnTarget = originalFocus;
-				queueMicrotask(() => {
-					if (activeTraps === 0 && returnTarget?.isConnected && !returnTarget.closest('[inert]'))
-						returnTarget.focus();
-				});
+		update(nextParam?: FocusTrapOptions | boolean) {
+			const next = resolveOptions(nextParam);
+			const keyChanged = next.key !== options.key;
+			options = next;
+			if (options.enabled && !active) {
+				activate();
+			} else if (!options.enabled && active) {
+				deactivate(false);
+			} else if (options.enabled && active && keyChanged) {
+				node.scrollTop = 0;
+				focusInitial();
 			}
+		},
+		destroy() {
+			deactivate(true);
 		}
 	};
 }

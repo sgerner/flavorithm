@@ -1435,6 +1435,7 @@ main {
 	overflow: auto;
 	background: var(--paper);
 	box-shadow: 0 25px 100px #0003;
+	position: relative;
 }
 .detail-photo {
 	height: 275px;
@@ -1446,6 +1447,7 @@ main {
 	position: absolute;
 	right: 18px;
 	top: 18px;
+	z-index: 2;
 	background: var(--paper);
 }
 .photo-label {

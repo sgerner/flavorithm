@@ -61,8 +61,13 @@
 	}
 	async function keyboard(event: KeyboardEvent) {
 		if (event.key === 'Escape') {
-			open = false;
-			active = -1;
+			if (open) {
+				event.stopPropagation();
+				event.preventDefault();
+				open = false;
+				query = '';
+				active = -1;
+			}
 			return;
 		}
 		if (event.key === 'Enter') {
