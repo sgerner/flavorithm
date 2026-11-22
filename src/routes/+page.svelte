@@ -1400,14 +1400,20 @@
 			else if (effect.type === 'recipe.open') {
 				butlerChat?.close();
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
-				if (recipe && effect.mode === 'edit') editSavedRecipe(recipe);
+				if (recipe && effect.mode === 'edit') openRecipeEditor(recipe);
 				else if (recipe && effect.mode === 'cook') {
 					const meal = kitchen.meals.find(
 						(item) => item.recipeId === recipe.id && !item.completedAt
 					);
 					if (meal) openCookDialog(meal);
-					else selected = recipe;
-				} else selected = recipe ?? null;
+					else {
+						modal = '';
+						selected = recipe;
+					}
+				} else {
+					modal = '';
+					selected = recipe ?? null;
+				}
 			} else if (effect.type === 'ui') {
 				butlerChat?.close();
 				openButlerControl(effect.action);
@@ -1611,21 +1617,26 @@
 				: `${recipe.title} restored to your recipe list.`
 		);
 	}
+	function openRecipeEditor(recipe: Recipe) {
+		selected = null;
+		modal = '';
+		editingRecipe = {
+			...recipe,
+			tags: [...recipe.tags],
+			ingredients: recipe.ingredients.map((item) => ({ ...item })),
+			steps: [...recipe.steps],
+			...(recipe.importNotes ? { importNotes: [...recipe.importNotes] } : {}),
+			nutrition: { ...recipe.nutrition }
+		};
+	}
 	function editSavedRecipe(recipe: Recipe) {
 		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
 		if (!saved) return;
-		selected = null;
-		editingRecipe = {
-			...saved,
-			tags: [...saved.tags],
-			ingredients: saved.ingredients.map((item) => ({ ...item })),
-			steps: [...saved.steps],
-			nutrition: { ...saved.nutrition }
-		};
+		openRecipeEditor(saved);
 	}
 	function saveEditedRecipe(updated: Recipe) {
 		const previous = kitchen.recipes.find((item) => item.id === updated.id);
-		if (!previous || !previous.saved) {
+		if (!previous) {
 			editingRecipe = null;
 			return;
 		}

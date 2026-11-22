@@ -149,3 +149,37 @@ test('Basil can revise an unsaved recipe card in the same conversation', async (
 	assert.equal(updated.recipes.filter((recipe) => recipe.id === draft.id).length, 1);
 	assert.equal(updated.recipes.find((recipe) => recipe.id === draft.id)?.servings, 6);
 });
+
+test('butler prompt contract enforces saved recipes, importNotes attribution, and Settings-only AI connections', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const kitchen = createInitialState();
+	await runAIRequest(
+		request,
+		provider({ reply: 'All in order.', commands: [] }, (body) => {
+			const systemPrompt = String(body.messages[0].content);
+			assert.match(systemPrompt, /saved: true/);
+			assert.match(systemPrompt, /whole-number servings between 1 and 24/);
+			assert.match(systemPrompt, /importNotes/);
+			assert.match(systemPrompt, /rather than in source/);
+			assert.match(systemPrompt, /ai-settings/);
+			assert.match(systemPrompt, /grouped in one action card/);
+		})
+	);
+
+	for (const badCommand of [
+		{ type: 'preferences.update', preferences: { provider: 'anthropic', model: 'claude' } },
+		{
+			type: 'recipe.upsert',
+			recipe: { ...kitchen.recipes[0], source: 'Inspired by a local bistro' }
+		},
+		{
+			type: 'recipe.upsert',
+			recipe: { ...kitchen.recipes[0], servings: 30 }
+		}
+	]) {
+		await assert.rejects(
+			runAIRequest(request, provider({ reply: 'Ready.', commands: [badCommand] })),
+			(error: unknown) => error instanceof AIRequestError && error.status === 502
+		);
+	}
+});

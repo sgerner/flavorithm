@@ -1,12 +1,32 @@
 import { z } from 'zod';
-import type { AppState } from './types.ts';
+import type { AppState, Ingredient, ShoppingItem } from './types.ts';
+import { COVER_PATH } from './cover-upload.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
-import { buildShoppingList } from './domain.ts';
-import { completeMeal, reconcileShoppingList } from './kitchen-workflows.ts';
+import { buildShoppingList, normalizeName, unitInfo } from './domain.ts';
+import {
+	completeMeal,
+	reconcileShoppingList,
+	transferPurchasedItemsToPantry
+} from './kitchen-workflows.ts';
 
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
 const quantity = z.number().finite().nonnegative().max(1000000);
+const cookingTime = z.number().finite().nonnegative().max(100000);
+const servings = z.number().int().min(1).max(24);
+const leftoverServings = z.number().finite().nonnegative().max(10000);
+const publicUrl = z
+	.string()
+	.max(4000)
+	.refine((value) => {
+		if (!value) return true;
+		try {
+			const url = new URL(value);
+			return url.protocol === 'https:' && !url.username && !url.password;
+		} catch {
+			return false;
+		}
+	}, 'Use a public HTTPS URL.');
 const nutrition = z.object({
 	calories: quantity,
 	fat: quantity,
@@ -21,19 +41,9 @@ const recipe = z.object({
 	id,
 	title: z.string().trim().min(1).max(200),
 	description: text,
-	image: z
-		.string()
-		.max(4000)
-		.refine(
-			(value) =>
-				!value ||
-				value.startsWith('/recipe-covers/') ||
-				value.startsWith('/api/recipe-covers/') ||
-				/^https?:\/\//.test(value),
-			'Use an HTTP image URL or a recipe cover.'
-		),
-	time: quantity,
-	servings: z.number().finite().min(1).max(10000),
+	image: z.union([publicUrl, z.string().regex(COVER_PATH)]),
+	time: cookingTime,
+	servings,
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -44,11 +54,11 @@ const recipe = z.object({
 		.max(250),
 	steps: z.array(text).max(200),
 	nutrition,
-	source: z.string().max(4000).optional(),
+	source: publicUrl.optional(),
 	provenance: z.enum(['web-import', 'ai-generated']).optional(),
-	importNotes: z.array(z.string().max(1000)).max(50).optional(),
+	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
-	rating: z.number().min(0).max(5).optional(),
+	rating: z.number().finite().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
@@ -72,9 +82,9 @@ const meal = z.object({
 	date,
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
-	servings: z.number().finite().min(1).max(10000),
-	completedAt: z.string().datetime().optional(),
-	leftoverServings: quantity.optional()
+	servings,
+	completedAt: z.string().datetime().max(50).optional(),
+	leftoverServings: leftoverServings.optional()
 });
 const shopping = z.object({
 	id,
@@ -88,21 +98,13 @@ const preferences = z
 	.object({
 		diet: z.string().max(200),
 		allergies: z.string().max(500),
-		maxTime: z.number().finite().nonnegative().max(100000),
+		maxTime: cookingTime,
 		complexity: z.string().max(80),
-		cuisines: z.array(z.string().max(80)).max(8),
+		cuisines: z.array(z.string().trim().min(1).max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
 		theme: z.string().max(80),
 		dark: z.boolean(),
-		provider: z.string().max(100),
-		model: z.string().max(200),
-		reasoning: z.object({
-			effort: z.string().max(24).optional(),
-			enabled: z.boolean().optional(),
-			budgetTokens: z.number().int().min(0).max(32768).optional()
-		}),
-		ratings: z.record(id, z.number().min(0).max(5)),
-		chatgptAccountId: z.string().max(100)
+		ratings: z.record(id, z.number().finite().min(0).max(5))
 	})
 	.partial()
 	.strict();
@@ -116,7 +118,7 @@ export const ButlerCommandSchema = z.discriminatedUnion('type', [
 	z.object({
 		type: z.literal('meal.complete'),
 		id,
-		leftoverServings: quantity.optional(),
+		leftoverServings: leftoverServings.optional(),
 		deductPantry: z.boolean().optional()
 	}),
 	z.object({ type: z.literal('shopping.upsert'), item: shopping }),
@@ -180,6 +182,52 @@ function requireId(items: { id: string }[], target: string) {
 		);
 }
 
+function upsertPantryItem(pantryItems: Ingredient[], item: Ingredient): Ingredient[] {
+	if (pantryItems.some((value) => value.id === item.id)) return upsert(pantryItems, item);
+	if (item.expires?.trim() || !item.unit.trim()) return [...pantryItems, item];
+	if (item.quantity === 0) {
+		const normalized = normalizeName(item.name);
+		const dimension = unitInfo(item.unit).dimension;
+		const hasUnexpiredMatch = pantryItems.some(
+			(existing) =>
+				normalizeName(existing.name) === normalized &&
+				unitInfo(existing.unit).dimension === dimension &&
+				!existing.expires?.trim()
+		);
+		if (hasUnexpiredMatch) return pantryItems;
+		const { expires: _unused, ...withoutExpires } = item;
+		return [...pantryItems, withoutExpires];
+	}
+	return transferPurchasedItemsToPantry(
+		pantryItems,
+		[
+			{
+				id: item.id,
+				name: item.name,
+				quantity: item.quantity,
+				unit: item.unit,
+				checked: true,
+				category: item.category
+			}
+		],
+		() => item.id
+	);
+}
+
+function recordShoppingMetadata(
+	items: ShoppingItem[],
+	activeWeeks: Set<string>,
+	knownGeneratedIds: Set<string>
+) {
+	for (const item of items) {
+		const sourceKey = item.sourceKey?.trim();
+		if (!sourceKey) continue;
+		knownGeneratedIds.add(item.id);
+		const week = sourceKey.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1];
+		if (week) activeWeeks.add(week);
+	}
+}
+
 function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
@@ -205,12 +253,19 @@ export function applyButlerCommands(
 ): { state: AppState; effects: ButlerEffect[] } {
 	const commands = z.array(ButlerCommandSchema).max(50).parse(input);
 	let state = structuredClone(current);
+	const activeWeeks = new Set<string>();
+	const knownGeneratedIds = new Set<string>();
+	recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
 	const effects: ButlerEffect[] = [];
 	for (const command of commands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
 				const previous = state.recipes.find((item) => item.id === command.recipe.id);
-				const updated = { ...command.recipe };
+				const saved = command.recipe.saved ?? (previous ? previous.saved : true);
+				const updated = {
+					...command.recipe,
+					...(saved !== undefined ? { saved } : {})
+				};
 				if (
 					previous &&
 					(previous.servings !== updated.servings ||
@@ -234,7 +289,7 @@ export function applyButlerCommands(
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
 				break;
 			case 'pantry.upsert':
-				state.pantry = upsert(state.pantry, command.item);
+				state.pantry = upsertPantryItem(state.pantry, command.item);
 				break;
 			case 'pantry.delete':
 				requireId(state.pantry, command.id);
@@ -271,19 +326,30 @@ export function applyButlerCommands(
 				break;
 			case 'shopping.upsert':
 				state.shopping = upsert(state.shopping, command.item);
+				recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
 				break;
 			case 'shopping.delete':
-				requireId(state.shopping, command.id);
-				state.shopping = state.shopping.filter((item) => item.id !== command.id);
+				if (state.shopping.some((item) => item.id === command.id)) {
+					state.shopping = state.shopping.filter((item) => item.id !== command.id);
+				} else if (!knownGeneratedIds.has(command.id)) {
+					requireId(state.shopping, command.id);
+				}
 				break;
 			case 'shopping.generate': {
 				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
 				refreshShoppingWeek(state, calendarKey(start), now);
+				recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
 				break;
 			}
 			case 'preferences.update':
-				state.preferences = { ...state.preferences, ...command.preferences };
+				state.preferences = {
+					...state.preferences,
+					...command.preferences,
+					...(command.preferences.ratings !== undefined
+						? { ratings: { ...state.preferences.ratings, ...command.preferences.ratings } }
+						: {})
+				};
 				break;
 			case 'recipe.open':
 				requireId(state.recipes, command.id);
@@ -299,21 +365,20 @@ export function applyButlerCommands(
 		commands.some(
 			(command) =>
 				(command.type.startsWith('recipe.') && command.type !== 'recipe.open') ||
-				command.type.startsWith('meal.')
+				command.type.startsWith('meal.') ||
+				command.type.startsWith('pantry.')
 		)
 	) {
-		const weeks = new Set(
-			state.shopping.flatMap(
-				(item) => item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1] ?? []
-			)
-		);
-		for (const week of weeks) refreshShoppingWeek(state, week, now);
+		recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
+		for (const week of activeWeeks) refreshShoppingWeek(state, week, now);
 	}
 	if (
 		state.recipes.length > MAX_RECIPES ||
 		state.pantry.length > 1000 ||
 		state.meals.length > 1000 ||
-		state.shopping.length > 1000
+		state.shopping.length > 1000 ||
+		state.pantry.some((item) => item.quantity > 1000000) ||
+		state.shopping.some((item) => item.quantity > 1000000)
 	)
 		throw new Error('This proposal exceeds the kitchen storage limit. Please make room first.');
 	return { state, effects };

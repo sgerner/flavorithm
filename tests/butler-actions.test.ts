@@ -259,3 +259,117 @@ test('invalid command payloads fail validation', () => {
 	);
 	assert.throws(() => buildButlerActions([{ type: 'ui', action: 'execute' }], kitchen));
 });
+
+test('cancelling a planned meal groups with its generated weekly shopping removals into one card', () => {
+	const kitchen = createInitialState();
+	const recipe = kitchen.recipes[0];
+	kitchen.pantry = [];
+	kitchen.meals = [
+		{ id: 'wed-dinner', date: '2026-10-21', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+	const now = new Date('2026-10-20T12:00:00Z');
+	const populated = applyButlerCommands(
+		kitchen,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.ok(populated.shopping.length >= 2);
+
+	const commands = [
+		{ type: 'meal.delete', id: 'wed-dinner' },
+		...populated.shopping.slice(0, 2).map((item) => ({ type: 'shopping.delete', id: item.id }))
+	];
+	const actions = buildButlerActions(commands, populated);
+	assert.equal(actions.length, 1);
+	assert.equal(actions[0].destructive, true);
+
+	const applied = applyButlerCommands(populated, actions[0].commands, now).state;
+	assert.equal(applied.meals.length, 0);
+	assert.equal(applied.shopping.length, 0);
+});
+
+test('deleting a recipe groups with recipe-scoped and weekly generated shopping removals without missing-item errors', () => {
+	const kitchen = createInitialState();
+	const recipe = kitchen.recipes[0];
+	recipe.ingredients = [{ name: 'green beans', quantity: 8, unit: 'oz' }];
+	kitchen.pantry = [];
+	kitchen.meals = [
+		{ id: 'thu-dinner', date: '2026-10-22', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+	const now = new Date('2026-10-20T12:00:00Z');
+	const populated = applyButlerCommands(
+		kitchen,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	const weeklyId = populated.shopping[0].id;
+	populated.shopping.push({
+		id: 'generated-recipe-beans',
+		name: 'green beans',
+		quantity: 8,
+		unit: 'oz',
+		checked: false,
+		sourceKey: `recipe:${recipe.id}`
+	});
+
+	const actions = buildButlerActions(
+		[
+			{ type: 'recipe.delete', id: recipe.id },
+			{ type: 'shopping.delete', id: 'generated-recipe-beans' },
+			{ type: 'shopping.delete', id: weeklyId }
+		],
+		populated
+	);
+	assert.equal(actions.length, 1);
+	assert.equal(actions[0].destructive, true);
+
+	const applied = applyButlerCommands(populated, actions[0].commands, now).state;
+	assert.equal(
+		applied.recipes.some((item) => item.id === recipe.id),
+		false
+	);
+	assert.equal(applied.shopping.length, 0);
+});
+
+test('pantry changes group with matching generated shopping removals while manual shopping removals stay separate', () => {
+	const kitchen = createInitialState();
+	kitchen.shopping = [
+		{
+			id: 'generated-oil',
+			name: 'olive oil',
+			quantity: 2,
+			unit: 'tbsp',
+			checked: false,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'manual-napkins',
+			name: 'paper napkins',
+			quantity: 1,
+			unit: 'pack',
+			checked: false
+		}
+	];
+
+	const actions = buildButlerActions(
+		[
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'bought-ev-oil',
+					name: 'extra virgin olive oil',
+					quantity: 1,
+					unit: 'cup',
+					category: 'Oils & condiments'
+				}
+			},
+			{ type: 'shopping.delete', id: 'generated-oil' },
+			{ type: 'shopping.delete', id: 'manual-napkins' }
+		],
+		kitchen
+	);
+	assert.equal(actions.length, 2);
+	assert.equal(actions[0].commands.length, 2);
+	assert.equal(actions[1].commands.length, 1);
+	assert.equal(actions[1].title, 'paper napkins');
+});

@@ -164,13 +164,18 @@ export function reconcileShoppingList(
 /** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
 export function transferPurchasedItemsToPantry(
 	pantry: Ingredient[],
-	purchases: ShoppingItem[],
+	purchases: Array<ShoppingItem & { category?: string }>,
 	createId: () => string = () => globalThis.crypto.randomUUID()
 ): Ingredient[] {
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		{
+			name: string;
+			unit: ReturnType<typeof unitInfo>;
+			quantityBase: number;
+			category?: string;
+		}
 	>();
 	for (const item of purchases) {
 		if (
@@ -183,8 +188,15 @@ export function transferPurchasedItemsToPantry(
 		const normalizedName = normalizeName(item.name);
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		const bucket = buckets.get(key) ?? { name: item.name.trim(), unit, quantityBase: 0 };
+		const bucket = buckets.get(key) ?? {
+			name: item.name.trim(),
+			unit,
+			quantityBase: 0,
+			category: item.category
+		};
 		bucket.quantityBase += item.quantity * unit.factor;
+		if (bucket.category === undefined && item.category !== undefined)
+			bucket.category = item.category;
 		buckets.set(key, bucket);
 	}
 
@@ -214,7 +226,7 @@ export function transferPurchasedItemsToPantry(
 			name: bucket.name,
 			quantity: roundPantryQuantity(bucket.quantityBase / bucket.unit.factor),
 			unit: bucket.unit.display,
-			category: 'Pantry'
+			category: bucket.category ?? 'Pantry'
 		});
 	}
 	return result;
