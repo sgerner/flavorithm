@@ -32,7 +32,7 @@
 	}
 </script>
 
-<h3>Voice input</h3>
+<h3 id="voice-settings-heading" tabindex="-1">Voice input</h3>
 <label class="field"
 	>Transcription<select bind:value={provider} onchange={change} disabled={!userId}>
 		{#each voiceProviders as option}<option value={option.id}>{option.name}</option>{/each}
