@@ -114,7 +114,15 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
-	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
+	import {
+		appendImportTranscript,
+		applyImportedRecipeSave,
+		canAppendImportTranscript,
+		cloneImportSession,
+		isReviewingImportDraft,
+		replaceImportSessionWithUrl
+	} from '#lib/import-session.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -398,7 +406,10 @@
 		return () => voiceCapture?.cancel();
 	});
 	$effect(() => {
-		if (voiceTarget && modal !== voiceTarget) {
+		if (
+			voiceTarget &&
+			(modal !== voiceTarget || (voiceTarget === 'import' && isReviewingImportDraft(importSession)))
+		) {
 			voiceCapture?.cancel();
 			voiceStarting = false;
 			voiceTarget = '';
@@ -1726,15 +1737,18 @@
 					: 'browser'
 				: voiceProvider;
 		if (provider !== 'browser' && !user) {
+			if (forRecipe && modal === 'import') resumeImport = true;
 			openAuthentication();
 			return;
 		}
 		if ((provider === 'groq' || provider === 'deepgram') && !voiceApiKey.trim()) {
+			if (forRecipe && modal === 'import') resumeImport = true;
 			modal = 'settings';
 			notify('Add a voice API key in Voice input settings.');
 			return;
 		}
 		if (provider === 'local' && !localVoiceAvailable) {
+			if (forRecipe && modal === 'import') resumeImport = true;
 			modal = 'settings';
 			notify('Local Whisper needs an endpoint configured by the server operator.');
 			return;
@@ -1742,7 +1756,12 @@
 		voiceCapture?.cancel();
 		voiceStarting = true;
 		voiceTarget = forRecipe ? 'import' : 'pantry';
-		if (!forRecipe) modal = 'pantry';
+		if (forRecipe) {
+			importSession.reviewingDraft = false;
+			modal = 'import';
+		} else {
+			modal = 'pantry';
+		}
 		const inputSession = importSession;
 		const owner = user?.id;
 		const capture = new VoiceCapture({
@@ -1750,14 +1769,20 @@
 				voiceState = value;
 			},
 			text: (text) => {
-				if (user?.id !== owner || modal !== (forRecipe ? 'import' : 'pantry')) return;
 				if (forRecipe) {
-					if (importSession !== inputSession || importSession.draft) return;
-					importSession.text = [importSession.text, text]
-						.filter(Boolean)
-						.join('\n')
-						.slice(0, 20000);
+					if (
+						!canAppendImportTranscript({
+							modal,
+							currentSession: importSession,
+							startedSession: inputSession,
+							currentUserId: user?.id,
+							startedUserId: owner
+						})
+					)
+						return;
+					importSession.text = appendImportTranscript(importSession.text, text);
 				} else {
+					if (user?.id !== owner || modal !== 'pantry') return;
 					pantryInput = [pantryInput, text].filter(Boolean).join(', ');
 					notify('Review your ingredients, then add them.');
 				}
@@ -2267,16 +2292,34 @@
 		} else modal = '';
 		error = '';
 	}
-	function openImport(text?: string) {
+	function openImport() {
 		resumeImport = false;
-		if (text !== undefined) importSession = { ...emptyImportSession(), text };
 		error = '';
 		mobileNav = false;
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
-		importSession = { ...emptyImportSession(), url };
+		if (voiceTarget === 'import') {
+			voiceCapture?.cancel();
+			voiceStarting = false;
+			voiceTarget = '';
+		}
+		const { session, previous } = replaceImportSessionWithUrl($state.snapshot(importSession), url);
+		importSession = session;
 		openImport();
+		if (previous) {
+			notify('Recipe link loaded. Undo to restore your previous import.', () => {
+				if (voiceTarget === 'import') {
+					voiceCapture?.cancel();
+					voiceStarting = false;
+					voiceTarget = '';
+				}
+				importSession = cloneImportSession(previous);
+				resumeImport = false;
+				error = '';
+				modal = 'import';
+			});
+		}
 	}
 	async function captureImport(
 		input: { url?: string; prompt: string; image?: string },
@@ -2289,21 +2332,45 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const nutritionStale =
-			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
-		const saved = { ...recipe, saved: true, nutritionStale };
-		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
-		importSession = emptyImportSession();
+		const previousPage = page;
+		const previousQuery = query;
+		const previousFilter = filter;
+		const applied = applyImportedRecipeSave(
+			$state.snapshot(kitchen),
+			$state.snapshot(importSession),
+			recipe
+		);
+		kitchen.recipes = applied.nextRecipes;
+		importSession = applied.nextSession;
 		resumeImport = false;
 		modal = '';
-		selected = saved;
+		selected = applied.saved;
 		page = 'saved';
 		query = '';
 		filter = 'For you';
 		notify(
-			nutritionStale
+			applied.saved.nutritionStale
 				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
-				: 'Recipe saved to your collection.'
+				: 'Recipe saved to your collection.',
+			() => {
+				const rolledBack = applied.rollback($state.snapshot(kitchen));
+				if (!rolledBack.ok) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				kitchen = rolledBack.kitchen;
+				if (selected?.id === applied.saved.id) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				importSession = rolledBack.session;
+				resumeImport = false;
+				error = '';
+				page = previousPage;
+				query = previousQuery;
+				filter = previousFilter;
+				modal = 'import';
+			}
 		);
 	}
 	async function exportKitchen() {
@@ -3284,8 +3351,12 @@
 </div>
 <div class="visually-hidden" role="status" aria-atomic="true">{toast}</div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
-			onclick={() => (toast = '')}
+		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}>Undo</button
+			>{/if}<button
+			onclick={() => {
+				toast = '';
+				toastUndo = null;
+			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}

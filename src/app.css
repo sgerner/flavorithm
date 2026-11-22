@@ -1354,6 +1354,11 @@ main {
 	place-items: center;
 	margin-left: 10px;
 }
+.toast .toast-undo {
+	font-weight: 600;
+	text-decoration: underline;
+	text-underline-offset: 3px;
+}
 .recipe-dialog {
 	max-width: 980px;
 	width: 100%;
@@ -3045,7 +3050,7 @@ html.dark[data-theme='nosh'] {
 	.toast button {
 		min-width: 44px;
 		min-height: 44px;
-		flex: 0 0 44px;
+		flex: 0 0 auto;
 	}
 
 	.onboarding-intro {
