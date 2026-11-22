@@ -73,6 +73,7 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
+	import { isStandaloneRecipeUrl } from '#lib/recipe-scraper.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -1287,6 +1288,14 @@
 			chatGPTDevice = null;
 		}
 	}
+	function hasAIConnection() {
+		if (!user) return false;
+		const isPlan = kitchen.preferences.provider === 'chatgpt';
+		return Boolean(
+			(isPlan ? activeChatGPTAccount?.connected && activeChatGPTAccount.planEnabled : apiKey) &&
+			kitchen.preferences.model
+		);
+	}
 	function needAI() {
 		if (!user) {
 			openAuthentication();
@@ -1298,10 +1307,7 @@
 			return false;
 		}
 		const isPlan = kitchen.preferences.provider === 'chatgpt';
-		if (
-			(isPlan ? !activeChatGPTAccount?.connected || !activeChatGPTAccount.planEnabled : !apiKey) ||
-			!kitchen.preferences.model
-		) {
+		if (!hasAIConnection()) {
 			openSettings(true);
 			notify(
 				isPlan
@@ -1966,6 +1972,27 @@
 		openImport(url);
 	}
 	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
+		if (!input.image && isStandaloneRecipeUrl(input.prompt)) {
+			const connected = hasAIConnection();
+			return request(
+				'/api/recipe-import',
+				{
+					url: input.prompt.trim(),
+					...(connected
+						? {
+								...(kitchen.preferences.provider === 'chatgpt'
+									? { connectionId: kitchen.preferences.chatgptAccountId }
+									: { apiKey }),
+								provider: kitchen.preferences.provider,
+								model: kitchen.preferences.model,
+								reasoning: kitchen.preferences.reasoning
+							}
+						: {})
+				},
+				'POST',
+				signal
+			);
+		}
 		if (!needAI()) {
 			resumeImport = true;
 			return null;
