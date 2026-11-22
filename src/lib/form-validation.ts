@@ -1,3 +1,4 @@
+import { parseIngredientLines } from './domain.ts';
 import {
 	MAX_COOKING_TIME,
 	MAX_DRAFT_INGREDIENTS,
@@ -165,11 +166,18 @@ export function validatePassword(
 }
 
 export function validatePantryInput(value: string): string {
-	const items = value
-		.split(/[,\n;]/)
+	const bounded = value.slice(0, 20_000);
+	const segments = bounded
+		.split(/[,;\r\n]+(?![^\[\]]*\])/)
 		.map((entry) => entry.trim())
 		.filter(Boolean);
-	return items.length ? '' : 'Enter at least one ingredient to add to your pantry.';
+	if (!segments.length) {
+		return 'Enter at least one ingredient to add to your pantry.';
+	}
+	if (!parseIngredientLines(bounded).length) {
+		return 'Enter at least one valid ingredient with a quantity above zero.';
+	}
+	return '';
 }
 
 export function validateInviteCode(value: string): string {

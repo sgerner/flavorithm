@@ -99,7 +99,9 @@ test('meal, leftover, pantry, invite, and auth validators enforce exact bounds',
 	assert.match(validatePassword('', 'delete'), /confirm account deletion/);
 
 	assert.equal(validatePantryInput('2 eggs, spinach'), '');
+	assert.equal(validatePantryInput('1 1/2 cups milk [Dairy, Eggs]'), '');
 	assert.match(validatePantryInput(' , \n ; '), /at least one ingredient/);
+	assert.match(validatePantryInput('0 g flour'), /quantity above zero/);
 
 	assert.equal(validateInviteCode('INV-123'), '');
 	assert.match(validateInviteCode('   '), /invitation code/);

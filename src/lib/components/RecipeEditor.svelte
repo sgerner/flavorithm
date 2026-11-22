@@ -9,6 +9,7 @@
 		fieldAria,
 		validateRecipeDraftFields
 	} from '#lib/form-validation.ts';
+	import { isValidNutrition } from '#lib/recipe-draft.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
 	import { Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
@@ -31,7 +32,7 @@
 	let submitted = $state(false);
 	let uploadError = $state('');
 	let uploading = $state(false);
-	let nutritionOpen = $state(false);
+	let nutritionOpen = $state(untrack(() => !isValidNutrition(draft.nutrition)));
 	let photoInput: HTMLInputElement;
 	let formEl = $state<HTMLFormElement>();
 	let addIngredientButton = $state<HTMLButtonElement>();
@@ -88,6 +89,7 @@
 			return;
 		}
 		submitted = false;
+		const title = draft.title.trim();
 		const tags = [
 			...new Set(
 				tagsText
@@ -105,11 +107,11 @@
 		const image = draft.image.trim();
 		save({
 			...draft,
-			title: draft.title.trim(),
-			description: draft.description.trim(),
+			title,
+			description: draft.description.trim().slice(0, 10000),
 			image,
-			cuisine: draft.cuisine.trim(),
-			difficulty: draft.difficulty.trim(),
+			cuisine: draft.cuisine.trim().slice(0, 100),
+			difficulty: draft.difficulty.trim().slice(0, 80),
 			tags,
 			ingredients,
 			steps

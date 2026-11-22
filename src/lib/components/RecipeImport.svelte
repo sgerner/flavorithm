@@ -1,6 +1,7 @@
 <script module lang="ts">
 	import {
 		createDraftBaseline,
+		isValidNutrition,
 		MAX_SERVINGS,
 		NUTRITION_FIELDS,
 		validateRecipeDraft,
@@ -63,7 +64,9 @@
 	let captureSubmitted = $state(false);
 	let draftSubmitted = $state(false);
 	let moreDetailsOpen = $state(false);
-	let nutritionOpen = $state(false);
+	let nutritionOpen = $state(
+		untrack(() => (session.draft ? !isValidNutrition(session.draft.nutrition) : false))
+	);
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let heading = $state<HTMLHeadingElement>();
@@ -203,7 +206,7 @@
 				session.assumptions = result.assumptions;
 				draftSubmitted = false;
 				moreDetailsOpen = false;
-				nutritionOpen = false;
+				nutritionOpen = !isValidNutrition(result.recipe.nutrition);
 				reviewingDraft = true;
 				await tick();
 				if (alive && generation === captureGeneration) heading?.focus();
@@ -268,12 +271,7 @@
 		}
 		draftSubmitted = false;
 		try {
-			save({
-				...validation.recipe,
-				description: draft.description.trim(),
-				cuisine: draft.cuisine.trim(),
-				difficulty: draft.difficulty.trim()
-			});
+			save(validation.recipe);
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -371,6 +369,8 @@
 							error = '';
 							captureSubmitted = false;
 							draftSubmitted = false;
+							moreDetailsOpen = false;
+							nutritionOpen = false;
 							retryAvailable = false;
 						}}>Clear</button
 					>{/if}
