@@ -813,3 +813,83 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 		else process.env.FLAVORITHM_PROXY_SHARED_SECRET = prevProxySecret;
 	}
 });
+
+test('importRecipeFromUrl skips unsupported per-100g nutrition and coerces zero-quantity AI fallback ingredients', async () => {
+	const per100gHtml = structuredPageHtml({
+		'@context': 'https://schema.org',
+		'@type': 'Recipe',
+		name: 'Rye Sourdough Loaf',
+		recipeYield: '8 slices',
+		totalTime: 'P0DT1H30M',
+		recipeIngredient: ['500 g bread flour', '350 ml water'],
+		recipeInstructions: ['Mix and ferment.', 'Bake until crust is deep brown.'],
+		nutrition: {
+			'@type': 'NutritionInformation',
+			servingSize: '100 g',
+			calories: '250 kcal',
+			proteinContent: '9 g'
+		}
+	});
+
+	const scraped = await importRecipeFromUrl(
+		{ url: 'https://recipes.example.com/rye-loaf' },
+		async () => new Response(per100gHtml, { status: 200, headers: { 'content-type': 'text/html' } })
+	);
+	assert.equal(scraped.recipe.time, 90);
+	assert.equal(scraped.recipe.nutrition.calories, 0);
+	assert.equal(scraped.recipe.nutritionStale, true);
+	assert.ok(scraped.assumptions.some((note) => /Skipped page nutrition.*100 g/i.test(note)));
+
+	const unstructuredHtml =
+		'<!doctype html><html><body><article><h1>Pan Steak</h1><p>Sear steak with salt to taste.</p></article></body></html>';
+	const fallback = await importRecipeFromUrl(
+		{
+			url: 'https://recipes.example.com/pan-steak',
+			authenticated: true,
+			resolveFallback: async () => ({
+				provider: 'openai',
+				model: 'gpt-4o-mini',
+				apiKey: 'sk-test',
+				fetcher: async () =>
+					Response.json({
+						choices: [
+							{
+								message: {
+									content: JSON.stringify({
+										title: 'Pan Steak',
+										description: '',
+										image: '',
+										time: 15,
+										servings: 2,
+										difficulty: 'Easy',
+										cuisine: 'American',
+										tags: ['Dinner'],
+										ingredients: [
+											{ name: 'ribeye steak', quantity: 1, unit: 'lb' },
+											{ name: 'kosher salt', quantity: 0, unit: 'to taste' }
+										],
+										steps: ['Season and sear steak.'],
+										nutrition: {
+											calories: 520,
+											fat: 38,
+											saturatedFat: 16,
+											sodium: 480,
+											carbs: 0,
+											fiber: 0,
+											sugar: 0,
+											protein: 44
+										},
+										assumptions: []
+									})
+								}
+							}
+						]
+					})
+			})
+		},
+		async () =>
+			new Response(unstructuredHtml, { status: 200, headers: { 'content-type': 'text/html' } })
+	);
+	assert.ok(fallback.recipe.ingredients.every((item) => item.quantity > 0));
+	assert.ok(fallback.assumptions.some((note) => /kosher salt/i.test(note)));
+});

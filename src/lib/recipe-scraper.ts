@@ -12,6 +12,7 @@ export type ScrapedRecipeMetadata = {
 	ingredients: string[];
 	steps: string[];
 	nutrition?: Partial<Recipe['nutrition']>;
+	nutritionNote?: string;
 };
 
 export type ParsedIngredientLine = {
@@ -587,7 +588,7 @@ function normalizeSteps(rawSteps: string[]): string[] {
 				.trim()
 				.replace(/^(?:step\s*\d+\s*[:.)-]|\d+\s*[.)])\s+/i, '')
 				.trim()
-				.slice(0, 1_000)
+				.slice(0, 10_000)
 		)
 		.filter(Boolean)
 		.slice(0, 40);
@@ -601,7 +602,7 @@ function inferDifficulty(timeMinutes: number, stepCount: number, ingredientCount
 }
 
 function safeHttpsImage(value: string): string {
-	if (!value || value.length > 2_000) return '';
+	if (!value || value.length > 4_000) return '';
 	try {
 		const url = new URL(value);
 		return url.protocol === 'https:' && !url.username && !url.password ? url.toString() : '';
@@ -625,11 +626,11 @@ export function buildStructuredRecipeDraft(
 	source: ScrapedRecipeMetadata,
 	sourceUrl: string
 ): { recipe: Recipe; assumptions: string[] } {
-	const title = decodeRecipeText(source.title).replace(/\s+/g, ' ').trim().slice(0, 160);
+	const title = decodeRecipeText(source.title).replace(/\s+/g, ' ').trim().slice(0, 200);
 	const description = decodeRecipeText(source.description)
 		.replace(/\s+/g, ' ')
 		.trim()
-		.slice(0, 600);
+		.slice(0, 10_000);
 	const steps = normalizeSteps(source.steps);
 
 	const nonHeaderLines = source.ingredients.filter((line) => !isSectionHeaderLine(line));
@@ -682,7 +683,8 @@ export function buildStructuredRecipeDraft(
 	}
 	if (providedNutritionCount === 0) {
 		notes.push(
-			'Per-serving nutrition was not listed on the page; values defaulted to 0 for review.'
+			source.nutritionNote ??
+				'Per-serving nutrition was not listed on the page; values defaulted to 0 for review.'
 		);
 	} else if (providedNutritionCount < NUTRITION_KEYS.length) {
 		notes.push('Some nutrition fields were not listed on the page and defaulted to 0.');
@@ -692,14 +694,14 @@ export function buildStructuredRecipeDraft(
 		decodeRecipeText(source.cuisine ?? '')
 			.replace(/\s+/g, ' ')
 			.trim()
-			.slice(0, 80) || 'International';
+			.slice(0, 100) || 'International';
 	const tags = [
 		...new Set(
 			(source.tags ?? [])
-				.map((tag) => decodeRecipeText(tag).replace(/\s+/g, ' ').trim().slice(0, 40))
+				.map((tag) => decodeRecipeText(tag).replace(/\s+/g, ' ').trim().slice(0, 100))
 				.filter(Boolean)
 		)
-	].slice(0, 20);
+	].slice(0, 30);
 	const difficulty = inferDifficulty(time, steps.length, ingredients.length);
 
 	const uniqueIngredientNotes = [...new Set(ingredientNotes)];
