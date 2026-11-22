@@ -362,7 +362,7 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getSupportedModels(requestFetcher);
+			: await getPublicModelCatalog(requestFetcher);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2358,6 +2358,10 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 	return { providers };
 }
 
+const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
+let publicCatalog: Promise<SupportedModelResponse> | undefined;
+let publicCatalogExpiresAt = 0;
+
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
 ): Promise<SupportedModelResponse> {
@@ -2375,4 +2379,25 @@ export async function getSupportedModels(
 	const body = await readJsonResponse(response, 'Model catalog');
 	if (!response.ok) throw upstreamError(response.status, 'Model catalog');
 	return transformModelCatalog(body);
+}
+
+export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
+		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
+		const pending = getSupportedModels(fetcher).catch((error) => {
+			if (publicCatalog === pending) {
+				publicCatalog = undefined;
+				publicCatalogExpiresAt = 0;
+			}
+			throw error;
+		});
+		publicCatalog = pending;
+	}
+	return publicCatalog;
+}
+
+/** Clear the shared catalog cache so injected-fetch tests remain isolated. */
+export function resetPublicModelCatalogCache(): void {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
 }

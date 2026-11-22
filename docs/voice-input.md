@@ -6,7 +6,7 @@ Choose **Settings → Voice input → Transcription**. The same **Use voice** bu
 
 | Connection        | Setup                                                                                | Cost / availability                                                                                                                                        |
 | ----------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Automatic         | No user setup                                                                        | Uses the installation's local Whisper endpoint if configured, otherwise browser dictation. It does not silently use a paid cloud provider.                 |
+| Automatic         | No user setup                                                                        | Uses the installation's local Whisper endpoint when configured and reachable, otherwise browser dictation. It does not silently use a paid cloud provider. |
 | Browser dictation | Allow microphone access                                                              | No Flavorithm API key. Requires browser SpeechRecognition support; Firefox stable may not expose it. The browser may send audio to its own speech service. |
 | Local Whisper     | Operator configures the service below                                                | No external transcription bill; operator supplies compute and a Whisper model.                                                                             |
 | Groq              | [Create an API key](https://console.groq.com/keys), choose Whisper Turbo or Large v3 | Free plan with account-specific limits. Published paid audio rates: Turbo $0.04/hour; Large v3 $0.111/hour, with a 10-second minimum per request.          |
@@ -39,7 +39,7 @@ WHISPER_MODEL=whisper-1
 
 For an OpenAI-compatible local server, set the **full** URL ending in `/v1/audio/transcriptions` instead. The server must accept multipart `file`, `model`, `language`, and `response_format=json`, and return `{ "text": "..." }`. whisper.cpp uses the model loaded by its server; changing `WHISPER_MODEL` does not load a new whisper.cpp model. Requests are converted to mono 16kHz PCM WAV in the browser, so whisper.cpp does not require ffmpeg conversion for these recordings.
 
-Settings will report the local service as available when a valid endpoint is configured; this is configuration detection, not a live health check. Connection failures are reported when recording. For Skynet, preserve both Compose files when restarting:
+`GET /api/voice` probes `/health` (falling back to `WHISPER_TRANSCRIPTION_URL` when `/health` is absent) with a short timeout and reports the local service as available only when reachable, returning `localAvailable: false` on network errors, `401`/`403`/`404`, or `5xx` responses so `Automatic` stays on browser dictation. Connection failures during an upload are still reported when stopping a recording. On Skynet, run `./deploy/skynet/setup-whisper.sh` once to download `ggml-base.bin` and start `flavorithm-whisper`, and preserve both Compose files when restarting:
 
 ```sh
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml up -d --no-deps flavorithm
