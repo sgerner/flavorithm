@@ -247,7 +247,8 @@ export function applyButlerCommands(
 					? {
 							...command.meal,
 							completedAt: previous.completedAt,
-							leftoverServings: previous.leftoverServings
+							leftoverServings: previous.leftoverServings,
+							...(previous.pantryDeductions ? { pantryDeductions: previous.pantryDeductions } : {})
 						}
 					: command.meal;
 				state.meals = upsert(state.meals, meal);

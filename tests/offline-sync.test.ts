@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createNewUserState } from '../src/lib/data.ts';
-import { completeMeal } from '../src/lib/kitchen-workflows.ts';
+import { buildShoppingList } from '../src/lib/domain.ts';
+import {
+	completeMeal,
+	reconcileShoppingList,
+	transferPurchasedItemsToPantry
+} from '../src/lib/kitchen-workflows.ts';
 import {
 	mergeKitchenStates,
 	readPending,
@@ -124,7 +129,7 @@ test('concurrent recipe deletion and meal addition never creates orphaned plans'
 	);
 });
 
-test('concurrent equal pantry deductions conflict, while identical snapshots remain idempotent', async () => {
+test('distinct completed meals sum pantry deductions, while manual equal edits conflict and retries stay idempotent', async () => {
 	const base = createNewUserState();
 	const recipe = base.recipes[0];
 	recipe.servings = 2;
@@ -147,7 +152,8 @@ test('concurrent equal pantry deductions conflict, while identical snapshots rem
 		new Date('2026-10-23T18:00:00.000Z')
 	);
 	const result = mergeKitchenStates(base, local, remote);
-	assert.equal(result.state.pantry[0].quantity, 1);
+	assert.equal(result.conflicts.length, 0);
+	assert.equal(result.state.pantry[0].quantity, 0);
 	assert.deepEqual(
 		result.state.meals
 			.filter((meal) => meal.completedAt)
@@ -155,13 +161,39 @@ test('concurrent equal pantry deductions conflict, while identical snapshots rem
 			.sort(),
 		['meal-one', 'meal-two']
 	);
-	assert.ok(result.conflicts.some((item) => item.path === 'kitchen.pantry[flour].quantity'));
-	let writes = 0;
-	const blocked = await syncPendingKitchen(
+	let savedMealsSync = 0;
+	const syncedMeals = await syncPendingKitchen(
 		{ userId: 'a', householdId: 'home', base, local, etag: 'old', updatedAt: 0 },
 		{
 			identity: { userId: 'a', householdId: 'home' },
 			get: async () => ({ state: remote, etag: 'current', userId: 'a', householdId: 'home' }),
+			put: async (state) => {
+				savedMealsSync += 1;
+				return { state, etag: 'saved' };
+			}
+		}
+	);
+	assert.equal(syncedMeals.saved, true);
+	assert.equal(savedMealsSync, 1);
+	assert.equal(syncedMeals.state.pantry[0].quantity, 0);
+
+	const manualLocal = structuredClone(base);
+	manualLocal.pantry[0].quantity = 1;
+	manualLocal.preferences.maxTime = 25;
+	const manualRemote = structuredClone(base);
+	manualRemote.pantry[0].quantity = 1;
+	manualRemote.preferences.allergies = 'sesame';
+	let writes = 0;
+	const blocked = await syncPendingKitchen(
+		{ userId: 'a', householdId: 'home', base, local: manualLocal, etag: 'old', updatedAt: 0 },
+		{
+			identity: { userId: 'a', householdId: 'home' },
+			get: async () => ({
+				state: manualRemote,
+				etag: 'current',
+				userId: 'a',
+				householdId: 'home'
+			}),
 			put: async (state) => {
 				writes += 1;
 				return { state, etag: 'saved' };
@@ -175,6 +207,256 @@ test('concurrent equal pantry deductions conflict, while identical snapshots rem
 	const identicalRetry = mergeKitchenStates(base, local, structuredClone(local));
 	assert.equal(identicalRetry.conflicts.length, 0);
 	assert.equal(identicalRetry.state.pantry[0].quantity, 1);
+});
+
+test('merging a checked weekly purchase with a refreshed meal plan keeps the purchase and adds an unchecked shortage row', () => {
+	const base = createNewUserState();
+	const recipe = base.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'olive oil', quantity: 1, unit: 'cup' }];
+	base.meals = [
+		{ id: 'tue-dinner', date: '2026-10-20', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+	base.shopping = reconcileShoppingList(
+		[],
+		buildShoppingList([recipe], base.pantry, base.meals),
+		'week:2026-10-19'
+	);
+
+	const local = structuredClone(base);
+	local.shopping[0].checked = true;
+
+	const remote = structuredClone(base);
+	remote.meals[0].servings = 6;
+	remote.shopping = reconcileShoppingList(
+		remote.shopping,
+		buildShoppingList([recipe], remote.pantry, remote.meals),
+		'week:2026-10-19'
+	);
+	assert.equal(remote.shopping[0].id, local.shopping[0].id);
+	assert.equal(remote.shopping[0].quantity, 3);
+
+	const merged = mergeKitchenStates(base, local, remote);
+	assert.equal(merged.conflicts.length, 0);
+	const checkedRows = merged.state.shopping.filter((item) => item.checked);
+	const uncheckedRows = merged.state.shopping.filter((item) => !item.checked);
+	assert.equal(checkedRows.length, 1);
+	assert.equal(checkedRows[0].quantity, 1);
+	assert.equal(checkedRows[0].sourceKey, 'week:2026-10-19');
+	assert.equal(uncheckedRows.length, 1);
+	assert.equal(uncheckedRows[0].quantity, 2);
+	assert.equal(uncheckedRows[0].sourceKey, 'week:2026-10-19');
+	assert.notEqual(checkedRows[0].id, uncheckedRows[0].id);
+
+	const transferredPantry = transferPurchasedItemsToPantry(
+		merged.state.pantry,
+		merged.state.shopping,
+		() => 'oil-lot'
+	);
+	assert.equal(transferredPantry.length, 1);
+	assert.equal(transferredPantry[0].quantity, 1);
+
+	const cancelledRemote = structuredClone(base);
+	cancelledRemote.meals = [];
+	cancelledRemote.shopping = reconcileShoppingList(cancelledRemote.shopping, [], 'week:2026-10-19');
+	const mergedWithRemovedPlan = mergeKitchenStates(base, local, cancelledRemote);
+	assert.equal(mergedWithRemovedPlan.conflicts.length, 0);
+	assert.equal(mergedWithRemovedPlan.state.shopping.length, 1);
+	assert.equal(mergedWithRemovedPlan.state.shopping[0].checked, true);
+	assert.equal(mergedWithRemovedPlan.state.shopping[0].quantity, 1);
+});
+
+test('incompatible edits to manual or recipe shopping items surface one item conflict', () => {
+	const base = createNewUserState();
+	const recipe = base.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'rice', quantity: 1, unit: 'cup' }];
+	const recipeRows = reconcileShoppingList(
+		[],
+		buildShoppingList([recipe], [], undefined),
+		`recipe:${recipe.id}`
+	);
+	base.shopping = [
+		{ id: 'manual-milk', name: 'milk', quantity: 1, unit: 'l', checked: false },
+		...recipeRows
+	];
+
+	const local = structuredClone(base);
+	local.shopping[0].checked = true;
+	local.shopping[1].checked = true;
+
+	const remote = structuredClone(base);
+	remote.shopping[0].quantity = 500;
+	remote.shopping[0].unit = 'ml';
+	remote.shopping = reconcileShoppingList(
+		remote.shopping,
+		[{ id: 'next-rice', name: 'rice', quantity: 2, unit: 'cup', checked: false }],
+		`recipe:${recipe.id}`
+	);
+
+	const merged = mergeKitchenStates(base, local, remote);
+	assert.deepEqual(
+		merged.conflicts.map((item) => item.path),
+		['kitchen.shopping[manual-milk]', `kitchen.shopping[${recipeRows[0].id}]`]
+	);
+});
+
+test('concurrent meal completion and rescheduling raises one meal conflict, clamps leftovers, and aligns pantry stock', () => {
+	const base = createNewUserState();
+	const recipe = base.recipes[0];
+	recipe.servings = 4;
+	recipe.ingredients = [{ name: 'flour', quantity: 2, unit: 'cup' }];
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 2, unit: 'cup', category: 'Pantry' }];
+	base.meals = [
+		{ id: 'meal-target', date: '2026-10-22', slot: 'Dinner', recipeId: recipe.id, servings: 4 }
+	];
+
+	const local = completeMeal(
+		structuredClone(base),
+		'meal-target',
+		{ deductPantry: true, leftoverServings: 3 },
+		new Date('2026-10-22T18:30:00.000Z')
+	);
+	const remote = structuredClone(base);
+	remote.meals[0].date = '2026-10-29';
+	remote.meals[0].servings = 2;
+
+	const preview = mergeKitchenStates(base, local, remote);
+	assert.equal(preview.conflicts.length, 1);
+	assert.equal(preview.conflicts[0].path, 'kitchen.meals[meal-target]');
+	assert.equal(preview.state.meals[0].completedAt, undefined);
+	assert.equal(preview.state.meals[0].date, '2026-10-29');
+	assert.equal(preview.state.meals[0].leftoverServings, undefined);
+	assert.equal(preview.state.pantry[0].quantity, 2);
+
+	const resolvedLocal = mergeKitchenStates(base, local, remote, 'local');
+	assert.equal(resolvedLocal.state.meals[0].date, '2026-10-22');
+	assert.ok(resolvedLocal.state.meals[0].completedAt);
+	assert.equal(resolvedLocal.state.meals[0].leftoverServings, 3);
+	assert.equal(resolvedLocal.state.pantry[0].quantity, 0);
+
+	const resolvedRemote = mergeKitchenStates(base, local, remote, 'remote');
+	assert.equal(resolvedRemote.state.meals[0].date, '2026-10-29');
+	assert.equal(resolvedRemote.state.meals[0].completedAt, undefined);
+	assert.equal(resolvedRemote.state.pantry[0].quantity, 2);
+
+	const rejectedRemoteCompletion = mergeKitchenStates(base, remote, local, 'local');
+	assert.equal(rejectedRemoteCompletion.state.meals[0].date, '2026-10-29');
+	assert.equal(rejectedRemoteCompletion.state.meals[0].completedAt, undefined);
+	assert.equal(rejectedRemoteCompletion.state.pantry[0].quantity, 2);
+
+	const oversizedLeftovers = structuredClone(local);
+	oversizedLeftovers.meals[0].servings = 2;
+	oversizedLeftovers.meals[0].leftoverServings = 9;
+	const clamped = mergeKitchenStates(base, oversizedLeftovers, base);
+	assert.equal(clamped.state.meals[0].leftoverServings, 2);
+});
+
+test('post-merge weekly reconciliation updates shortages after distinct meal deductions while subtracting checked purchases', () => {
+	const base = createNewUserState();
+	const recipe = base.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'flour', quantity: 1, unit: 'cup' }];
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 2, unit: 'cup', category: 'Pantry' }];
+	base.meals = [
+		{ id: 'prev-a', date: '2026-10-15', slot: 'Dinner', recipeId: recipe.id, servings: 2 },
+		{ id: 'prev-b', date: '2026-10-16', slot: 'Dinner', recipeId: recipe.id, servings: 2 },
+		{ id: 'next-week', date: '2026-10-22', slot: 'Dinner', recipeId: recipe.id, servings: 5 }
+	];
+	const nextWeekMeals = base.meals.filter((meal) => meal.id === 'next-week');
+	base.shopping = [
+		{
+			id: 'bought-flour',
+			name: 'flour',
+			quantity: 0.25,
+			unit: 'cup',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		},
+		...reconcileShoppingList(
+			[
+				{
+					id: 'bought-flour',
+					name: 'flour',
+					quantity: 0.25,
+					unit: 'cup',
+					checked: true,
+					sourceKey: 'week:2026-10-19'
+				}
+			],
+			buildShoppingList([recipe], base.pantry, nextWeekMeals),
+			'week:2026-10-19'
+		).filter((item) => !item.checked)
+	];
+	assert.equal(base.shopping.find((item) => !item.checked)?.quantity, 0.25);
+
+	const local = completeMeal(
+		structuredClone(base),
+		'prev-a',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-15T18:00:00.000Z')
+	);
+	const remote = completeMeal(
+		structuredClone(base),
+		'prev-b',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-16T18:00:00.000Z')
+	);
+
+	const merged = mergeKitchenStates(base, local, remote);
+	assert.equal(merged.conflicts.length, 0);
+	assert.equal(merged.state.pantry[0].quantity, 0);
+	const checked = merged.state.shopping.find((item) => item.checked);
+	const shortage = merged.state.shopping.find((item) => !item.checked);
+	assert.equal(checked?.quantity, 0.25);
+	assert.equal(shortage?.quantity, 2.25);
+	assert.equal(shortage?.sourceKey, 'week:2026-10-19');
+
+	const sharedBase = createNewUserState();
+	sharedBase.recipes[0].servings = 2;
+	sharedBase.recipes[0].ingredients = [{ name: 'flour', quantity: 1, unit: 'cup' }];
+	sharedBase.pantry = [
+		{ id: 'flour', name: 'flour', quantity: 1, unit: 'cup', category: 'Pantry' }
+	];
+	sharedBase.meals = [
+		{
+			id: 'tonight',
+			date: '2026-10-15',
+			slot: 'Dinner',
+			recipeId: sharedBase.recipes[0].id,
+			servings: 2
+		}
+	];
+	const plannedBranch = structuredClone(sharedBase);
+	plannedBranch.meals.push({
+		id: 'planned-thu',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		recipeId: sharedBase.recipes[0].id,
+		servings: 2
+	});
+	plannedBranch.shopping = reconcileShoppingList(
+		[],
+		buildShoppingList(
+			[sharedBase.recipes[0]],
+			plannedBranch.pantry,
+			plannedBranch.meals.filter((meal) => meal.id === 'planned-thu')
+		),
+		'week:2026-10-19'
+	);
+	assert.equal(plannedBranch.shopping.length, 0);
+	const cookedBranch = completeMeal(
+		structuredClone(sharedBase),
+		'tonight',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-15T18:00:00.000Z')
+	);
+	const combined = mergeKitchenStates(sharedBase, plannedBranch, cookedBranch);
+	assert.equal(combined.conflicts.length, 0);
+	assert.equal(combined.state.pantry[0].quantity, 0);
+	assert.equal(combined.state.shopping.length, 1);
+	assert.equal(combined.state.shopping[0].quantity, 1);
+	assert.equal(combined.state.shopping[0].sourceKey, 'week:2026-10-19');
 });
 
 test('sync retries a changing ETag without losing independent remote edits', async () => {

@@ -245,16 +245,23 @@ export function createKitchenSync(options: {
 		prefer?: 'local' | 'remote',
 		setUI = false
 	): { state: AppState; conflicts: SyncConflict[] } {
-		const merged = mergePendingKitchenJournal(loaded.records, seed, prefer);
-		context.pending = aggregatePending(context, loaded.records, merged.state);
+		const detected = prefer ? null : mergePendingKitchenJournal(loaded.records, seed);
+		const conflicts = prefer ? [] : detected!.conflicts;
+		const view = prefer
+			? mergePendingKitchenJournal(loaded.records, seed, prefer)
+			: conflicts.length
+				? mergePendingKitchenJournal(loaded.records, seed, 'local')
+				: detected!;
+		const resolvedConflicts = prefer ? view.conflicts : conflicts;
+		context.pending = aggregatePending(context, loaded.records, view.state);
 		context.pendingDurable = loaded.durable;
 		context.blockedByStorage = loaded.blocked;
-		context.conflicts = clone(merged.conflicts);
-		if (setUI) context.viewState = clone(merged.state);
+		context.conflicts = clone(resolvedConflicts);
+		if (setUI) context.viewState = clone(view.state);
 		if (!loaded.error) context.error = '';
 		else context.error = loaded.error;
-		if (setUI) setContextState(context, merged.state);
-		return merged;
+		if (setUI) setContextState(context, view.state);
+		return { state: view.state, conflicts: resolvedConflicts };
 	}
 
 	function saveBaseline(context: ActiveContext, state: AppState, etag: string): void {
@@ -417,13 +424,16 @@ export function createKitchenSync(options: {
 	function stage(state: AppState): void {
 		const context = active;
 		if (!context || !isActive(context)) return;
-		context.error = '';
 		const next = clone(state);
 		if (!isState(next)) {
 			context.error = 'The kitchen state is invalid and was not saved.';
 			emitStatus(context);
 			return;
 		}
+		if (context.viewState && equal(next, context.viewState)) {
+			return;
+		}
+		context.error = '';
 		const loaded = loadJournal(context);
 		const own = loaded.records.find((record) => record.writerId === writerId);
 		const base = own?.pending.base || context.viewState || context.baseline?.state;
@@ -532,7 +542,8 @@ export function createKitchenSync(options: {
 			loaded.records,
 			mergePendingKitchenJournal(
 				loaded.records,
-				context.baseline?.state || loaded.records[0].pending.base
+				context.baseline?.state || loaded.records[0].pending.base,
+				'local'
 			).state
 		);
 		context.pendingDurable = loaded.durable;
@@ -559,6 +570,9 @@ export function createKitchenSync(options: {
 				);
 			}
 			const identity = { ...raw.identity };
+			const remoteSnapshot: { current: { state: AppState; etag: string } | null } = {
+				current: null
+			};
 			const guarded: KitchenTransport = {
 				identity,
 				get: async () => {
@@ -567,6 +581,9 @@ export function createKitchenSync(options: {
 					const result = await raw.get();
 					if (!isActive(context))
 						throw Object.assign(new Error('Kitchen account changed.'), { status: 409 });
+					if (result.userId === identity.userId && result.householdId === identity.householdId) {
+						remoteSnapshot.current = { state: clone(result.state), etag: result.etag };
+					}
 					return result;
 				},
 				put: async (state, etag) => {
@@ -578,8 +595,19 @@ export function createKitchenSync(options: {
 			const result = await syncPendingKitchenJournal(captured, guarded, prefer);
 			if (!isActive(context)) return;
 			if (!result.saved) {
+				if (remoteSnapshot.current) {
+					try {
+						saveBaseline(context, remoteSnapshot.current.state, remoteSnapshot.current.etag);
+					} catch {
+						// Retain active conflict review even when confirmed baseline storage is full.
+					}
+				}
+				const seed =
+					remoteSnapshot.current?.state || context.baseline?.state || captured[0].pending.base;
+				const localPreview = mergePendingKitchenJournal(captured, seed, 'local');
 				context.conflicts = clone(result.conflicts);
-				context.pending = aggregatePending(context, captured, result.state);
+				context.pending = aggregatePending(context, captured, localPreview.state);
+				setContextState(context, localPreview.state);
 				context.error = 'Resolve the kitchen conflicts before syncing these changes.';
 				return;
 			}
@@ -650,7 +678,7 @@ export function createKitchenSync(options: {
 		const loaded = loadJournal(active);
 		if (!loaded.records.length) return null;
 		const seed = active.baseline?.state || loaded.records[0].pending.base;
-		const merged = mergePendingKitchenJournal(loaded.records, seed);
+		const merged = mergePendingKitchenJournal(loaded.records, seed, 'local');
 		return aggregatePending(active, loaded.records, merged.state);
 	}
 

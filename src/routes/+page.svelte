@@ -579,7 +579,7 @@
 		}
 		if (user) kitchenSync?.stage(JSON.parse(snapshot));
 		clearTimeout(saveTimer);
-		if (user && !syncing && online)
+		if (user && !syncing && online && !conflicts.length)
 			saveTimer = setTimeout(() => {
 				void retrySync();
 			}, 500);
@@ -798,6 +798,7 @@
 		}
 	}
 	async function reconnectKitchen() {
+		clearTimeout(saveTimer);
 		try {
 			const previous = user;
 			await refreshAuth();
@@ -813,6 +814,7 @@
 				kitchenSync?.clearContext();
 			const latest = await request('/api/state');
 			adoptKitchen(latest.state || createNewUserState());
+			clearTimeout(saveTimer);
 			await retrySync();
 		} catch (e) {
 			syncErrors = (e as Error).message;

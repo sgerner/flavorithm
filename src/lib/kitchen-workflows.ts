@@ -1,4 +1,4 @@
-import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
+import type { AppState, Ingredient, Meal, PantryDeduction, Recipe, ShoppingItem } from './types';
 import { normalizeName, unitInfo } from './domain.ts';
 export { normalizeName, normalizeName as normalizeIngredientName, unitInfo } from './domain.ts';
 
@@ -175,6 +175,7 @@ export function transferPurchasedItemsToPantry(
 	for (const item of purchases) {
 		if (
 			!item.checked ||
+			!item.name.trim() ||
 			!Number.isFinite(item.quantity) ||
 			!(item.quantity > 0) ||
 			!item.unit.trim()
@@ -236,7 +237,7 @@ function consumePantry(
 	recipe: Recipe,
 	servings: number,
 	now: Date
-): Ingredient[] {
+): { pantry: Ingredient[]; deductions: PantryDeduction[] } {
 	const remaining = pantry.map((item) => ({ ...item }));
 	const scale = recipe.servings > 0 && servings > 0 ? servings / recipe.servings : 1;
 
@@ -278,7 +279,33 @@ function consumePantry(
 		}
 	}
 
-	return remaining;
+	const deductions: PantryDeduction[] = [];
+	for (let index = 0; index < pantry.length; index += 1) {
+		const before = pantry[index];
+		const after = remaining[index];
+		const deducted = roundPantryQuantity(before.quantity - after.quantity);
+		if (Number.isFinite(deducted) && deducted > 0) {
+			deductions.push({
+				pantryId: before.id,
+				name: before.name,
+				quantity: deducted,
+				unit: before.unit
+			});
+		}
+	}
+
+	return { pantry: remaining, deductions };
+}
+
+/** Clamp leftover servings between 0 and the meal's valid serving count. */
+export function clampLeftoverServings(
+	leftoverServings: number | undefined,
+	servings: number
+): number {
+	const servingsLimit = Number.isFinite(servings) ? Math.max(0, servings) : 0;
+	return Number.isFinite(leftoverServings)
+		? roundQuantity(Math.min(servingsLimit, Math.max(0, leftoverServings as number)))
+		: 0;
 }
 
 /** Mark a planned meal complete and optionally deduct its ingredient quantities from pantry. */
@@ -293,17 +320,21 @@ export function completeMeal(
 
 	const recipe = recipeForMeal(state, target);
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
-	const servingsLimit = Number.isFinite(target.servings) ? Math.max(0, target.servings) : 0;
-	const leftoverServings = Number.isFinite(options.leftoverServings)
-		? roundQuantity(Math.min(servingsLimit, Math.max(0, options.leftoverServings)))
-		: 0;
-	const meals = state.meals.map((meal) =>
-		meal.id === mealId ? { ...meal, completedAt: safeNow.toISOString(), leftoverServings } : meal
-	);
-	const pantry =
+	const leftoverServings = clampLeftoverServings(options.leftoverServings, target.servings);
+	const consumed =
 		options.deductPantry && recipe
 			? consumePantry(state.pantry, recipe, target.servings, safeNow)
-			: state.pantry;
+			: { pantry: state.pantry, deductions: [] };
+	const meals = state.meals.map((meal) =>
+		meal.id === mealId
+			? {
+					...meal,
+					completedAt: safeNow.toISOString(),
+					leftoverServings,
+					...(consumed.deductions.length ? { pantryDeductions: consumed.deductions } : {})
+				}
+			: meal
+	);
 
-	return { ...state, meals, pantry };
+	return { ...state, meals, pantry: consumed.pantry };
 }

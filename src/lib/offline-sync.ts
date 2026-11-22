@@ -1,4 +1,10 @@
-import type { AppState, User } from '#lib/types.ts';
+import { buildShoppingList } from '#lib/domain.ts';
+import {
+	clampLeftoverServings,
+	convertCompatibleQuantity,
+	reconcileShoppingList
+} from '#lib/kitchen-workflows.ts';
+import type { AppState, Ingredient, Meal, ShoppingItem, User } from '#lib/types.ts';
 
 export type SyncConflict = { path: string; local: unknown; remote: unknown };
 export type PendingKitchen = {
@@ -254,6 +260,101 @@ function describeMealRecipe(snapshot: AppState, mealId: string, recipeId: string
 	return `${mealExists ? 'Meal planned' : 'Meal not planned'}; ${recipe ? `recipe available: ${recipe.title}` : 'recipe removed'}`;
 }
 
+function roundPantryQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
+	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function newlyCompletedMeals(base: AppState, snapshot: AppState): Meal[] {
+	const baseById = new Map(base.meals.map((meal) => [meal.id, meal]));
+	return snapshot.meals.filter(
+		(meal) =>
+			Boolean(meal.completedAt) &&
+			!baseById.get(meal.id)?.completedAt &&
+			Boolean(meal.pantryDeductions?.length)
+	);
+}
+
+function restoreMealPantryDeductions(base: AppState, snapshot: AppState): AppState {
+	const completed = newlyCompletedMeals(base, snapshot);
+	if (!completed.length) return snapshot;
+	const restored = structuredClone(snapshot);
+	const pantryById = new Map(restored.pantry.map((item) => [item.id, item]));
+	for (const meal of completed) {
+		for (const deduction of meal.pantryDeductions ?? []) {
+			if (!Number.isFinite(deduction.quantity) || !(deduction.quantity > 0)) continue;
+			const target = pantryById.get(deduction.pantryId);
+			if (!target) continue;
+			const delta = convertCompatibleQuantity(deduction.quantity, deduction.unit, target.unit);
+			if (delta === undefined) continue;
+			target.quantity = roundPantryQuantity(target.quantity + delta);
+		}
+	}
+	return restored;
+}
+
+function applyMealPantryDeductions(pantry: Ingredient[], meals: Meal[]): Ingredient[] {
+	if (!meals.length) return pantry;
+	const result = pantry.map((item) => ({ ...item }));
+	const pantryById = new Map(result.map((item) => [item.id, item]));
+	for (const meal of meals) {
+		for (const deduction of meal.pantryDeductions ?? []) {
+			if (!Number.isFinite(deduction.quantity) || !(deduction.quantity > 0)) continue;
+			const target = pantryById.get(deduction.pantryId);
+			if (!target) continue;
+			const delta = convertCompatibleQuantity(deduction.quantity, deduction.unit, target.unit);
+			if (delta === undefined) continue;
+			target.quantity = roundPantryQuantity(Math.max(0, target.quantity - delta));
+		}
+	}
+	return result;
+}
+
+const isWeekScope = (sourceKey: unknown): sourceKey is string =>
+	typeof sourceKey === 'string' && sourceKey.startsWith('week:');
+
+function formatDateKey(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function parseWeekScopeDate(sourceKey: unknown): string | null {
+	if (typeof sourceKey !== 'string') return null;
+	const match = /^week:(\d{4}-\d{2}-\d{2})$/.exec(sourceKey);
+	if (!match) return null;
+	const parsed = new Date(`${match[1]}T12:00:00`);
+	return Number.isFinite(parsed.getTime()) && formatDateKey(parsed) === match[1] ? match[1] : null;
+}
+
+function weekStartForDate(value: string): string | null {
+	const cleaned = value.trim();
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) return null;
+	const date = new Date(`${cleaned}T12:00:00`);
+	if (!Number.isFinite(date.getTime()) || formatDateKey(date) !== cleaned) return null;
+	date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+	return formatDateKey(date);
+}
+
+function refreshWeeklyScope(state: AppState, startDate: string): void {
+	const start = new Date(`${startDate}T12:00:00`);
+	if (!Number.isFinite(start.getTime()) || formatDateKey(start) !== startDate) return;
+	const dates = new Set(
+		Array.from({ length: 7 }, (_, index) => {
+			const day = new Date(start);
+			day.setDate(day.getDate() + index);
+			return formatDateKey(day);
+		})
+	);
+	const meals = state.meals.filter((meal) => !meal.completedAt && dates.has(meal.date));
+	const recipes = state.recipes.filter((recipe) =>
+		meals.some((meal) => meal.recipeId === recipe.id)
+	);
+	const additions = buildShoppingList(recipes, state.pantry, meals);
+	state.shopping = reconcileShoppingList(state.shopping, additions, `week:${startDate}`);
+}
+
+const isShoppingEntityPath = /^kitchen\.shopping\[[^\]]+\]$/;
+const isMealEntityPath = /^kitchen\.meals\[[^\]]+\]$/;
+
 /** Merge disjoint field edits and additions; surface competing edits/deletions explicitly. */
 export function mergeKitchenStates(
 	base: AppState,
@@ -266,7 +367,64 @@ export function mergeKitchenStates(
 		conflicts.push({ path, local: mine, remote: theirs });
 		return prefer === 'local' ? mine : theirs;
 	};
+	const localNormalized = restoreMealPantryDeductions(base, local);
+	const remoteNormalized = restoreMealPantryDeductions(base, remote);
+	const planningInputsChanged =
+		!equal(local.meals, base.meals) ||
+		!equal(remote.meals, base.meals) ||
+		!equal(local.pantry, base.pantry) ||
+		!equal(remote.pantry, base.pantry) ||
+		!equal(local.recipes, base.recipes) ||
+		!equal(remote.recipes, base.recipes);
+	const refreshedWeekScopes = new Map<string, 'local' | 'remote'>();
+
 	const merge = (old: unknown, mine: unknown, theirs: unknown, path: string): unknown => {
+		if (isShoppingEntityPath.test(path)) {
+			const oldItem = old as ShoppingItem | undefined;
+			const localItem = mine as ShoppingItem | undefined;
+			const remoteItem = theirs as ShoppingItem | undefined;
+			if (equal(localItem, remoteItem)) return localItem;
+			if (!oldItem?.checked) {
+				if (localItem?.checked && isWeekScope(localItem.sourceKey)) {
+					if (equal(remoteItem, oldItem)) return localItem;
+					if (
+						!remoteItem ||
+						(!remoteItem.checked && remoteItem.sourceKey === localItem.sourceKey)
+					) {
+						refreshedWeekScopes.set(localItem.sourceKey, 'remote');
+						return localItem;
+					}
+				}
+				if (remoteItem?.checked && isWeekScope(remoteItem.sourceKey)) {
+					if (equal(localItem, oldItem)) return remoteItem;
+					if (!localItem || (!localItem.checked && localItem.sourceKey === remoteItem.sourceKey)) {
+						refreshedWeekScopes.set(remoteItem.sourceKey, 'local');
+						return remoteItem;
+					}
+				}
+			}
+			if (equal(localItem, oldItem)) return remoteItem;
+			if (equal(remoteItem, oldItem)) return localItem;
+			if (
+				planningInputsChanged &&
+				!oldItem?.checked &&
+				(!localItem || (!localItem.checked && Boolean(parseWeekScopeDate(localItem.sourceKey)))) &&
+				(!remoteItem ||
+					(!remoteItem.checked && Boolean(parseWeekScopeDate(remoteItem.sourceKey)))) &&
+				Boolean(
+					parseWeekScopeDate(localItem?.sourceKey ?? remoteItem?.sourceKey ?? oldItem?.sourceKey)
+				)
+			) {
+				return prefer === 'local' ? localItem : (remoteItem ?? localItem);
+			}
+			return conflict(path, localItem, remoteItem);
+		}
+		if (isMealEntityPath.test(path)) {
+			if (equal(mine, theirs)) return mine;
+			if (equal(mine, old)) return theirs;
+			if (equal(theirs, old)) return mine;
+			return conflict(path, mine, theirs);
+		}
 		const descendIntoEqualPantry =
 			path === 'kitchen.pantry' &&
 			equal(mine, theirs) &&
@@ -331,7 +489,9 @@ export function mergeKitchenStates(
 		}
 		return conflict(path, mine, theirs);
 	};
-	const state = structuredClone(merge(base, local, remote, 'kitchen')) as AppState;
+	const state = structuredClone(
+		merge(base, localNormalized, remoteNormalized, 'kitchen')
+	) as AppState;
 	// Deleting a recipe while someone plans it must never create an orphaned meal.
 	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
 	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
@@ -352,7 +512,75 @@ export function mergeKitchenStates(
 			}
 		}
 	}
-	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+	state.meals = state.meals
+		.filter((meal) => recipeIds.has(meal.recipeId))
+		.map((meal) => {
+			if (!meal.completedAt) {
+				const next = { ...meal };
+				delete next.leftoverServings;
+				delete next.pantryDeductions;
+				return next;
+			}
+			return {
+				...meal,
+				leftoverServings: clampLeftoverServings(meal.leftoverServings, meal.servings)
+			};
+		});
+
+	const baseMealsById = new Map(base.meals.map((meal) => [meal.id, meal]));
+	const acceptedNewCompletions = state.meals.filter(
+		(meal) =>
+			Boolean(meal.completedAt) &&
+			!baseMealsById.get(meal.id)?.completedAt &&
+			Boolean(meal.pantryDeductions?.length)
+	);
+	state.pantry = applyMealPantryDeductions(state.pantry, acceptedNewCompletions);
+
+	if (!equal(local, remote)) {
+		const reconciledScopes = new Set<string>();
+		const stateInputsChanged =
+			!equal(state.meals, base.meals) ||
+			!equal(state.pantry, base.pantry) ||
+			!equal(state.recipes, base.recipes);
+		const bothBranchesDiverged = !equal(local, base) && !equal(remote, base);
+		if ((stateInputsChanged || planningInputsChanged) && bothBranchesDiverged) {
+			const affectedWeeks = new Set<string>();
+			for (const item of [...base.shopping, ...local.shopping, ...remote.shopping]) {
+				const startDate = parseWeekScopeDate(item.sourceKey);
+				if (startDate) affectedWeeks.add(startDate);
+			}
+			const localPlanningChanged =
+				!equal(local.meals, base.meals) ||
+				!equal(local.pantry, base.pantry) ||
+				!equal(local.recipes, base.recipes);
+			const remotePlanningChanged =
+				!equal(remote.meals, base.meals) ||
+				!equal(remote.pantry, base.pantry) ||
+				!equal(remote.recipes, base.recipes);
+			if (localPlanningChanged && remotePlanningChanged) {
+				for (const meal of state.meals) {
+					if (meal.completedAt) continue;
+					const previous = baseMealsById.get(meal.id);
+					if (!previous || !equal(previous, meal)) {
+						const startDate = weekStartForDate(meal.date);
+						if (startDate) affectedWeeks.add(startDate);
+					}
+				}
+			}
+			for (const startDate of [...affectedWeeks].sort()) {
+				refreshWeeklyScope(state, startDate);
+				reconciledScopes.add(`week:${startDate}`);
+			}
+		}
+		for (const [sourceKey, branch] of refreshedWeekScopes) {
+			if (reconciledScopes.has(sourceKey)) continue;
+			const sourceItems = (branch === 'local' ? local : remote).shopping.filter(
+				(item) => item.sourceKey === sourceKey
+			);
+			state.shopping = reconcileShoppingList(state.shopping, sourceItems, sourceKey);
+		}
+	}
+
 	return { state, conflicts };
 }
 

@@ -39,6 +39,12 @@ export type Recipe = {
 	saved?: boolean;
 	hidden?: boolean;
 };
+export type PantryDeduction = {
+	pantryId: string;
+	name: string;
+	quantity: number;
+	unit: string;
+};
 export type Meal = {
 	id: string;
 	date: string;
@@ -47,6 +53,7 @@ export type Meal = {
 	servings: number;
 	completedAt?: string;
 	leftoverServings?: number;
+	pantryDeductions?: PantryDeduction[];
 };
 export type ShoppingItem = {
 	id: string;

@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { rankRecipes } from '../src/lib/discovery.ts';
 import {
+	buildShoppingList,
 	normalizeName as normalizeDomainName,
 	unitInfo as domainUnitInfo
 } from '../src/lib/domain.ts';
 import {
+	clampLeftoverServings,
 	completeMeal,
 	convertCompatibleQuantity,
 	expiryStatus,
@@ -13,6 +15,7 @@ import {
 	reconcileShoppingList,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
+import { mergeKitchenStates } from '../src/lib/offline-sync.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -360,4 +363,66 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
+});
+
+test('transferring merged weekly purchases moves only the checked quantity and links meal deductions safely', () => {
+	const pastaRecipe = recipe({
+		id: 'pasta',
+		servings: 2,
+		ingredients: [{ name: 'olive oil', quantity: 2, unit: 'tbsp' }]
+	});
+	const base = state({
+		pantry: [pantry('olive oil', 0.5, 'cup')],
+		recipes: [pastaRecipe],
+		meals: [{ id: 'wed', date: '2026-10-21', slot: 'Dinner', recipeId: 'pasta', servings: 10 }]
+	});
+	base.shopping = reconcileShoppingList(
+		[],
+		buildShoppingList(base.recipes, base.pantry, base.meals),
+		'week:2026-10-19'
+	);
+	assert.equal(base.shopping.length, 1);
+	assert.equal(base.shopping[0].quantity, 2);
+
+	const shopper = structuredClone(base);
+	shopper.shopping[0].checked = true;
+
+	const planner = structuredClone(base);
+	planner.meals[0].servings = 16;
+	planner.shopping = reconcileShoppingList(
+		planner.shopping,
+		buildShoppingList(planner.recipes, planner.pantry, planner.meals),
+		'week:2026-10-19'
+	);
+
+	const merged = mergeKitchenStates(base, shopper, planner);
+	const transferred = transferPurchasedItemsToPantry(
+		merged.state.pantry,
+		merged.state.shopping,
+		() => 'unused'
+	);
+	assert.equal(transferred.length, 1);
+	assert.ok(Math.abs(transferred[0].quantity - 0.625) < 0.001);
+
+	assert.equal(clampLeftoverServings(5, 3), 3);
+	assert.equal(clampLeftoverServings(-2, 3), 0);
+	assert.equal(clampLeftoverServings(Number.NaN, 3), 0);
+
+	const cookedWithDeduction = completeMeal(
+		base,
+		'wed',
+		{ deductPantry: true, leftoverServings: 2 },
+		new Date('2026-10-21T18:00:00.000Z')
+	);
+	assert.deepEqual(cookedWithDeduction.meals[0].pantryDeductions, [
+		{ pantryId: 'olive oil-cup', name: 'olive oil', quantity: 0.5, unit: 'cup' }
+	]);
+
+	const cookedWithoutDeduction = completeMeal(
+		base,
+		'wed',
+		{ deductPantry: false, leftoverServings: 2 },
+		new Date('2026-10-21T18:00:00.000Z')
+	);
+	assert.equal(cookedWithoutDeduction.meals[0].pantryDeductions, undefined);
 });

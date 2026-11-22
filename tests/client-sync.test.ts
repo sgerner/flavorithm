@@ -503,3 +503,92 @@ test('an acknowledgement retires only captured journal versions, preserving a pe
 	);
 	assert.equal(storage.getItem(peerKey), null);
 });
+
+test('reactive staging after reconnect preserves pending local values, active conflicts, and local backups', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 2, unit: 'cup', category: 'Pantry' }];
+	const storage = memoryStorage();
+
+	const localEdit = structuredClone(base);
+	localEdit.pantry[0].quantity = 5;
+	localEdit.preferences.maxTime = 20;
+
+	const remoteState = structuredClone(base);
+	remoteState.pantry[0].quantity = 1;
+	remoteState.preferences.maxTime = 60;
+	remoteState.shopping.push({
+		id: 'remote-milk',
+		name: 'milk',
+		quantity: 1,
+		unit: 'l',
+		checked: false
+	});
+
+	let server = structuredClone(remoteState);
+	let currentState = structuredClone(base);
+	let latestStatus = {
+		pending: false,
+		syncing: false,
+		conflicts: [] as unknown[],
+		error: ''
+	};
+	let writes = 0;
+
+	const controller = createKitchenSync({
+		storage,
+		getUser: () => user,
+		getState: () => structuredClone(currentState),
+		setState: (state) => {
+			currentState = structuredClone(state);
+			// Mirrors src/routes/+page.svelte's reactive $effect calling kitchenSync.stage(kitchen).
+			controller.stage(structuredClone(currentState));
+		},
+		onStatus: (status) => {
+			latestStatus = status;
+		},
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'v2',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (next) => {
+				writes += 1;
+				server = structuredClone(next);
+				return { state: structuredClone(server), etag: 'v3' };
+			}
+		})
+	});
+
+	controller.initialize(user, base, 'v1');
+	currentState = structuredClone(localEdit);
+	controller.stage(structuredClone(currentState));
+
+	// Simulate reconnectKitchen(): adoptKitchen(latest.state) -> reactive stage() -> retrySync().
+	controller.initialize(user, remoteState, 'v2');
+	await controller.sync();
+
+	assert.equal(writes, 0);
+	assert.equal(currentState.pantry[0].quantity, 5);
+	assert.equal(currentState.preferences.maxTime, 20);
+	assert.equal(currentState.shopping[0]?.id, 'remote-milk');
+	assert.equal(latestStatus.pending, true);
+	assert.equal(latestStatus.conflicts.length, 2);
+
+	const backup = controller.snapshot();
+	assert.ok(backup);
+	assert.equal(backup.local.pantry[0].quantity, 5);
+	assert.equal(backup.local.preferences.maxTime, 20);
+	assert.equal(backup.local.shopping[0]?.id, 'remote-milk');
+
+	await controller.sync('local');
+	assert.equal(writes, 1);
+	assert.equal(server.pantry[0].quantity, 5);
+	assert.equal(server.preferences.maxTime, 20);
+	assert.equal(server.shopping[0]?.id, 'remote-milk');
+	assert.equal(controller.snapshot(), null);
+	assert.equal(latestStatus.conflicts.length, 0);
+});
