@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { test } from 'node:test';
+import { createInitialState } from '../src/lib/data.ts';
+import { buildAIRequestPayload } from '../src/lib/discovery.ts';
 import { ChatGPTInferenceError } from '../src/lib/server/chatgpt-inference.ts';
 import {
 	AIRequestError,
@@ -1525,4 +1527,92 @@ test('model endpoint fetch uses the public models.dev catalog URL', async () => 
 			models: [{ id: 'openai/gpt-4.1-mini', name: 'GPT-4.1 mini', vision: true }]
 		}
 	]);
+});
+
+test('client AI payloads pass validation across generate, vision, nutrition, search, and import for legacy and new profiles', async () => {
+	const previousBrave = process.env.BRAVE_SEARCH_API_KEY;
+	process.env.BRAVE_SEARCH_API_KEY = 'brave-test-key';
+	try {
+		const kitchen = createInitialState();
+		kitchen.preferences.diet = 'Low-Carb';
+		kitchen.preferences.allergies = 'soy, sesame, '.repeat(60);
+		kitchen.preferences.complexity = 'Moderate'.padEnd(95, ' ');
+		kitchen.preferences.theme = 'nosh';
+		kitchen.recipes[0].rating = 5;
+
+		let activeAction: 'generate' | 'vision' | 'nutrition' | 'search' | 'import' = 'generate';
+		const providerFetcher: typeof fetch = async (input) => {
+			const url = String(input);
+			if (url.startsWith('https://api.search.brave.com')) {
+				return jsonResponse({
+					web: {
+						results: [
+							{
+								title: 'Tofu Bowl',
+								url: 'https://recipes.example/tofu',
+								description: 'Quick bowl.'
+							}
+						]
+					}
+				});
+			}
+			const mockContent =
+				activeAction === 'vision'
+					? { ingredients: [{ name: 'broccoli', quantity: 1, unit: 'head', category: 'Produce' }] }
+					: activeAction === 'nutrition'
+						? nutrition
+						: activeAction === 'import'
+							? generatedRecipe
+							: { recipes: [generatedRecipe] };
+			return jsonResponse({
+				choices: [
+					{
+						message: {
+							content: JSON.stringify(mockContent)
+						}
+					}
+				]
+			});
+		};
+		const pageFetcher = async () =>
+			new Response(
+				structuredRecipeHtml({ '@type': 'NutritionInformation', calories: '400 kcal' }),
+				{
+					headers: { 'content-type': 'text/html; charset=utf-8' }
+				}
+			);
+
+		for (const [action, extra] of [
+			['generate', {}],
+			['vision', { image: 'data:image/png;base64,aGVsbG8=' }],
+			['nutrition', { recipe: kitchen.recipes[0] }],
+			['search', { prompt: 'weeknight bowls' }],
+			['import', { url: 'https://www.allrecipes.com/recipe/selected/' }]
+		] as const) {
+			activeAction = action;
+			const payload = buildAIRequestPayload(kitchen, action, {
+				apiKey: 'temporary-test-key',
+				prompt: 'quick dinner',
+				extra
+			});
+			await assert.doesNotReject(() => runAIRequest(payload, providerFetcher, pageFetcher));
+		}
+
+		await assert.rejects(
+			runAIRequest(
+				{
+					action: 'generate',
+					provider: 'openai',
+					model: 'gpt-4o-mini',
+					apiKey: 'temporary-test-key',
+					preferences: { ...preferences, allergies: 'x'.repeat(501) }
+				},
+				providerFetcher
+			),
+			(error: unknown) => error instanceof AIRequestError && error.status === 400
+		);
+	} finally {
+		if (previousBrave === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
+		else process.env.BRAVE_SEARCH_API_KEY = previousBrave;
+	}
 });

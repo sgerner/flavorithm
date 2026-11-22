@@ -54,7 +54,16 @@
 		reconcileShoppingList,
 		transferPurchasedItemsToPantry
 	} from '#lib/kitchen-workflows.ts';
-	import { rankRecipes } from '#lib/discovery.ts';
+	import {
+		DIET_OPTIONS,
+		MAX_ALLERGIES_LENGTH,
+		buildAIRequestPayload,
+		clampAllergies,
+		dietLabel,
+		evaluateRecipeConflicts,
+		normalizeDiet,
+		rankRecipes
+	} from '#lib/discovery.ts';
 	import { insertRecipes } from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
@@ -130,6 +139,10 @@
 	let quizCuisines = $state<string[]>([]);
 	let quizDiet = $state('none');
 	let quizAllergies = $state('');
+	let generateMaxTime = $state(45);
+	let generateDiet = $state('none');
+	let generateAllergies = $state('');
+	let saveGenerateDefaults = $state(false);
 	const cuisineChoices = [
 		'Mediterranean',
 		'Italian',
@@ -144,9 +157,24 @@
 		quizTime = kitchen.preferences.maxTime;
 		quizComplexity = kitchen.preferences.complexity;
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
-		quizDiet = kitchen.preferences.diet;
-		quizAllergies = kitchen.preferences.allergies;
+		quizDiet = normalizeDiet(kitchen.preferences.diet);
+		quizAllergies = clampAllergies(kitchen.preferences.allergies);
 		modal = 'onboarding';
+	}
+	function openGenerate() {
+		generateMaxTime = kitchen.preferences.maxTime;
+		generateDiet = normalizeDiet(kitchen.preferences.diet);
+		generateAllergies = clampAllergies(kitchen.preferences.allergies);
+		saveGenerateDefaults = false;
+		error = '';
+		modal = 'generate';
+	}
+	function applyGeneratePreferences() {
+		Object.assign(kitchen.preferences, {
+			maxTime: generateMaxTime,
+			diet: normalizeDiet(generateDiet),
+			allergies: clampAllergies(generateAllergies).trim()
+		});
 	}
 	function openAuthentication() {
 		if (installationAuthMode === 'oidc') {
@@ -208,8 +236,8 @@
 			maxTime: quizTime,
 			complexity: quizComplexity,
 			cuisines: [...quizCuisines],
-			diet: quizDiet,
-			allergies: quizAllergies.trim(),
+			diet: normalizeDiet(quizDiet),
+			allergies: clampAllergies(quizAllergies).trim(),
 			onboardingStatus: 'completed'
 		});
 		modal = '';
@@ -434,9 +462,13 @@
 				(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
 				(filter !== 'High protein' || r.nutrition.protein >= 25)
 		);
-		return filter === 'For you'
-			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
-			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+		if (filter === 'For you') {
+			const includeConflicts = page === 'saved' || Boolean(query.trim());
+			return rankRecipes(matches, kitchen.pantry, kitchen.preferences, new Date(), {
+				includeConflicts
+			});
+		}
+		return matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
 	});
 	let visiblePantry = $derived(
 		kitchen.pantry.filter(
@@ -650,6 +682,8 @@
 				if (local) {
 					kitchen = JSON.parse(local);
 					if (!themes.includes(kitchen.preferences.theme)) kitchen.preferences.theme = 'nosh';
+					kitchen.preferences.diet = normalizeDiet(kitchen.preferences.diet);
+					kitchen.preferences.allergies = clampAllergies(kitchen.preferences.allergies);
 				}
 			} catch {}
 			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
@@ -776,14 +810,22 @@
 		};
 	});
 	function adoptKitchen(state: AppState) {
+		const normalizedState: AppState = {
+			...state,
+			preferences: {
+				...state.preferences,
+				diet: normalizeDiet(state.preferences.diet),
+				allergies: clampAllergies(state.preferences.allergies)
+			}
+		};
 		if (user && kitchenSync) {
-			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), state, stateEtag || '');
+			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), normalizedState, stateEtag || '');
 			if (!managedAuth) {
 				try {
 					localStorage.setItem('flavorithm-last-account', JSON.stringify(user));
 				} catch {}
 			}
-		} else kitchen = state;
+		} else kitchen = normalizedState;
 	}
 	async function retrySync(prefer?: 'local' | 'remote') {
 		if (!online || !user || !kitchenSync) return;
@@ -1315,24 +1357,7 @@
 	async function ai(action: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) {
 		return request(
 			'/api/ai',
-			{
-				action,
-				...(kitchen.preferences.provider === 'chatgpt'
-					? { connectionId: kitchen.preferences.chatgptAccountId }
-					: { apiKey }),
-				provider: kitchen.preferences.provider,
-				model: kitchen.preferences.model,
-				reasoning: kitchen.preferences.reasoning,
-				...(action === 'capture' || action === 'chat'
-					? {}
-					: {
-							pantry: kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired'),
-							preferences: kitchen.preferences,
-							recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
-							prompt
-						}),
-				...extra
-			},
+			buildAIRequestPayload(kitchen, action, { apiKey, prompt, extra }),
 			'POST',
 			signal
 		);
@@ -1362,7 +1387,15 @@
 		const { diet, allergies, maxTime, complexity, cuisines, theme, dark } = kitchen.preferences;
 		const context = JSON.stringify({
 			...JSON.parse(snapshot),
-			preferences: { diet, allergies, maxTime, complexity, cuisines, theme, dark },
+			preferences: {
+				diet: normalizeDiet(diet),
+				allergies: clampAllergies(allergies),
+				maxTime,
+				complexity,
+				cuisines,
+				theme,
+				dark
+			},
 			today: dateKey(new Date()),
 			availableThemes: themes,
 			recipeDrafts,
@@ -1473,7 +1506,7 @@
 				dictateRecipe();
 				break;
 			case 'generate':
-				modal = 'generate';
+				openGenerate();
 				break;
 			case 'search':
 				modal = 'search';
@@ -1485,16 +1518,27 @@
 	}
 
 	async function generate() {
+		const bufferedPreferences = {
+			...kitchen.preferences,
+			maxTime: generateMaxTime,
+			diet: normalizeDiet(generateDiet),
+			allergies: clampAllergies(generateAllergies).trim()
+		};
+		const savedDefaults = saveGenerateDefaults;
+		if (savedDefaults) {
+			applyGeneratePreferences();
+			saveGenerateDefaults = false;
+		}
 		if (!needAI()) return;
 		busy = true;
 		error = '';
 		try {
-			const result = await ai('generate');
+			const result = await ai('generate', { preferences: bufferedPreferences });
 			kitchen.recipes = insertRecipes(kitchen.recipes, result.recipes);
 			modal = '';
 			page = 'discover';
 			filter = 'For you';
-			notify('Recipes generated.');
+			notify(savedDefaults ? 'Preferences saved and recipes generated.' : 'Recipes generated.');
 		} catch (e) {
 			error = (e as Error).message;
 			notify(error);
@@ -1786,7 +1830,7 @@
 			.filter(Boolean);
 		if (!names.length) return;
 		prompt = `Use these ingredients first, prioritizing them because they are expiring: ${names.join(', ')}. Build a practical recipe that uses as much of them as possible while following my preferences.`;
-		modal = 'generate';
+		openGenerate();
 		await generate();
 	}
 	function addMeal() {
@@ -2364,12 +2408,7 @@
 							<button class="secondary" onclick={() => openImport()}
 								><Plus size={17} />Import</button
 							>
-							<button
-								class="primary"
-								onclick={() => {
-									modal = 'generate';
-									error = '';
-								}}><Sparkles size={17} /> Generate</button
+							<button class="primary" onclick={openGenerate}><Sparkles size={17} /> Generate</button
 							>
 						</div>
 					</div>
@@ -2397,7 +2436,11 @@
 						</div>
 					</div>
 					<div class="recipe-grid">
-						{#each recipes as recipe, i (recipe.id)}<article
+						{#each recipes as recipe, i (recipe.id)}{@const conflict = evaluateRecipeConflicts(
+								recipe,
+								kitchen.preferences
+							)}
+							<article
 								class="recipe-card"
 								animate:flip={{ duration: motionDuration(250) }}
 								in:revealMotion|global={{ y: 20, duration: 400, delay: Math.min(i * 65, 350) }}
@@ -2439,6 +2482,10 @@
 											selected = recipe;
 										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
+									{#if conflict.hasConflict}<div class="card-conflict-warning">
+											<span class="conflict-pill">{conflict.badge}</span>
+											<span>{conflict.summary} · Check labels before cooking.</span>
+										</div>{/if}
 									<p>{recipe.description}</p>
 									<div class="recipe-meta">
 										<span><Clock size={14} />{recipe.time} min</span><span
@@ -2573,7 +2620,7 @@
 						<p>Try another expiry filter or update a best-before date.</p>
 					</div>{/if}
 				<div class="pantry-footer">
-					<button class="primary" onclick={() => (modal = 'generate')}
+					<button class="primary" onclick={openGenerate}
 						><Sparkles size={17} /> Cook from my pantry</button
 					>
 				</div>
@@ -2887,6 +2934,7 @@
 	</div>{/if}
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
+		preferences={kitchen.preferences}
 		initialServings={selectedMealServings ?? selected.servings}
 		bind:completedSteps={
 			() => cookingSteps[cookingSessionKey] ?? [],
@@ -3020,28 +3068,27 @@
 									>{/each}
 							</div>
 						</fieldset>
-						<details class="quiz-dietary">
+						<details
+							class="quiz-dietary"
+							open={quizDiet !== 'none' || Boolean(quizAllergies.trim())}
+						>
 							<summary>Any dietary preferences or allergies? <span>Optional</span></summary>
 							<label class="field"
 								>Dietary style<select bind:value={quizDiet}
-									><option value="none">No dietary restriction</option><option value="vegetarian"
-										>Vegetarian</option
-									><option value="vegan">Vegan</option><option value="pescatarian"
-										>Pescatarian</option
-									><option value="gluten-free">Gluten-free</option><option value="dairy-free"
-										>Dairy-free</option
-									></select
+									>{#each DIET_OPTIONS as option}<option value={option.value}>{option.label}</option
+										>{/each}</select
 								></label
 							>
 							<label class="field"
 								>Allergies or ingredients to avoid<input
 									bind:value={quizAllergies}
-									maxlength="500"
+									maxlength={MAX_ALLERGIES_LENGTH}
 									placeholder="e.g. peanuts, shellfish"
 								/></label
 							>
 							<p class="field-help">
-								These guide generation. Check ingredients and labels before cooking.
+								Culinary guidance for discovery and generation. Check ingredients and package labels
+								before cooking.
 							</p>
 						</details>
 						<div class="dialog-actions quiz-actions">
@@ -3152,36 +3199,53 @@
 					>
 					<div class="two-fields">
 						<label class="field"
-							>Time to cook<select bind:value={kitchen.preferences.maxTime}
-								><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option
-									value={45}>45 minutes</option
-								><option value={60}>An hour</option><option value={120}>A slow afternoon</option
+							>Time to cook<select bind:value={generateMaxTime}
+								>{#if ![15, 30, 45, 60, 120].includes(generateMaxTime)}<option
+										value={generateMaxTime}>{generateMaxTime} minutes</option
+									>{/if}<option value={15}>15 minutes</option><option value={30}>30 minutes</option
+								><option value={45}>45 minutes</option><option value={60}>An hour</option><option
+									value={120}>A slow afternoon</option
 								></select
 							></label
 						><label class="field"
-							>Dietary style<select bind:value={kitchen.preferences.diet}
-								><option value="none">A bit of everything</option><option>Vegetarian</option><option
-									>Vegan</option
-								><option>Pescatarian</option><option>Gluten-free</option><option>Low-carb</option
-								></select
+							>Dietary style<select bind:value={generateDiet}
+								>{#each DIET_OPTIONS as option}<option value={option.value}>{option.label}</option
+									>{/each}</select
 							></label
 						>
 					</div>
 					<label class="field"
 						>Allergies & ingredients to avoid<input
-							bind:value={kitchen.preferences.allergies}
+							bind:value={generateAllergies}
+							maxlength={MAX_ALLERGIES_LENGTH}
 							placeholder="e.g. peanuts, shellfish"
 						/></label
 					>
-					<p class="field-help">
-						Check all ingredients and substitutions against your allergies before cooking.
-					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-						class="primary full"
-						disabled={busy}
-						onclick={generate}
-						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
+					<label class="cook-option generate-defaults-option"
+						><input type="checkbox" bind:checked={saveGenerateDefaults} /><span
+							><b>Save as my default preferences</b><small
+								>Updates your saved cooking time, dietary style, and allergy notes.</small
+							></span
+						></label
 					>
+					<p class="field-help">
+						Culinary guidance only — check all ingredients, substitutions, and package labels before
+						cooking.
+					</p>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="dialog-actions">
+						<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
+							class="text-button"
+							type="button"
+							onclick={() => {
+								applyGeneratePreferences();
+								saveGenerateDefaults = false;
+								notify('Preferences saved.');
+							}}>Save defaults</button
+						><button class="primary" type="button" disabled={busy} onclick={generate}
+							><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
+						>
+					</div>
 				{:else if modal === 'settings'}
 					<h2>Settings</h2>
 					<div class="settings-section">
@@ -3205,9 +3269,13 @@
 					<div class="settings-section">
 						<h3>Recipe preferences</h3>
 						<p class="muted">
-							{kitchen.preferences.maxTime} minutes · {kitchen.preferences.complexity} · {kitchen.preferences.cuisines?.join(
-								', '
-							) || 'Open to every cuisine'}
+							{kitchen.preferences.maxTime} minutes · {kitchen.preferences.complexity} · {dietLabel(
+								kitchen.preferences.diet
+							)} · {kitchen.preferences.cuisines?.join(', ') || 'Open to every cuisine'}
+						</p>
+						<p class="muted settings-allergy-line">
+							Allergies & avoidances: {clampAllergies(kitchen.preferences.allergies).trim() ||
+								'None'}
 						</p>
 						<button class="secondary" onclick={openOnboarding}
 							>Edit my taste preferences <SlidersHorizontal size={16} /></button
@@ -3576,7 +3644,10 @@
 				{:else if modal === 'pickRecipe'}
 					<h2>Choose a recipe</h2>
 					<div class="pick-list">
-						{#each kitchen.recipes as recipe}<button
+						{#each kitchen.recipes as recipe}{@const conflict = evaluateRecipeConflicts(
+								recipe,
+								kitchen.preferences
+							)}<button
 								onclick={() => {
 									selected = recipe;
 									plannedServings = recipe.servings;
@@ -3588,7 +3659,11 @@
 									onerror={(event) => recipeImageError(event, recipe)}
 									alt=""
 								/><span
-									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
+									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small
+									>{#if conflict.hasConflict}<small class="picker-conflict-warning"
+											><span class="conflict-pill">{conflict.badge}</span>
+											{conflict.summary} · Check labels</small
+										>{/if}</span
 								><Plus size={17} /></button
 							>{/each}
 					</div>
@@ -3969,5 +4044,57 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	.card-conflict-warning {
+		margin-top: 8px;
+		padding: 7px 9px;
+		background: #b94e311a;
+		border-left: 2px solid #8f3b26;
+		color: #8f3b26;
+		font-size: 13px;
+		line-height: 1.5;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+	}
+	:global(.dark) .card-conflict-warning {
+		background: #b94e312b;
+		border-left-color: #ffb4a2;
+		color: #ffb4a2;
+	}
+	.conflict-pill {
+		padding: 1px 6px;
+		background: #8f3b26;
+		color: #fffefa;
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.5px;
+		text-transform: uppercase;
+	}
+	:global(.dark) .conflict-pill {
+		background: #ffb4a2;
+		color: #2b1410;
+	}
+	.picker-conflict-warning {
+		display: inline-flex !important;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 5px;
+		margin-top: 6px !important;
+		color: #8f3b26 !important;
+		font-size: 12px !important;
+		line-height: 1.45;
+	}
+	:global(.dark) .picker-conflict-warning {
+		color: #ffb4a2 !important;
+	}
+	.generate-defaults-option {
+		margin: 14px 0 8px;
+	}
+	.settings-allergy-line {
+		margin-top: 4px;
+		margin-bottom: 14px;
+		overflow-wrap: anywhere;
 	}
 </style>

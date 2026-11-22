@@ -94,7 +94,7 @@ test('household management is owner-only and removed members get a private initi
 	assert.ok(privateKitchen, 'the departing member receives initialized kitchen state');
 	assert.deepEqual(privateKitchen.pantry, []);
 	assert.ok(privateKitchen.recipes.length > 0);
-	assert.equal(privateKitchen.preferences.diet, 'Vegetarian');
+	assert.equal(privateKitchen.preferences.diet, 'vegetarian');
 	assert.deepEqual(privateKitchen.preferences.cuisines, ['Korean']);
 	assert.throws(
 		() => backend.saveState(memberAfterJoin, personal, { ifMatch: 'stale', ifNoneMatch: null }),

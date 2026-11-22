@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { z } from 'zod';
 import { createNewUserState } from '#lib/data.ts';
+import { clampAllergies, normalizeDiet } from '#lib/discovery.ts';
 import { COVER_PATH } from '#lib/cover-upload.ts';
 import { MAX_RECIPES } from '#lib/recipe-collection.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
@@ -237,7 +238,7 @@ const recipeSchema = z.object({
 
 const preferencesSchema = z.object({
 	diet: z.string().max(200),
-	allergies: z.string().max(2_000),
+	allergies: z.string().max(500),
 	maxTime: z.number().finite().min(0).max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
@@ -1089,9 +1090,20 @@ export function getState(user: User): AppState | null {
 		const preferenceRow = db
 			.prepare('SELECT preferences_json FROM user_preferences WHERE user_id = ?')
 			.get(user.id) as { preferences_json: string } | undefined;
-		const preferences = preferenceRow
+		const rawPreferences = preferenceRow
 			? (JSON.parse(preferenceRow.preferences_json) as Preferences)
 			: DEFAULT_PREFERENCES;
+		const preferences: Preferences = {
+			...rawPreferences,
+			diet:
+				typeof rawPreferences.diet === 'string'
+					? normalizeDiet(rawPreferences.diet)
+					: DEFAULT_PREFERENCES.diet,
+			allergies:
+				typeof rawPreferences.allergies === 'string'
+					? clampAllergies(rawPreferences.allergies)
+					: DEFAULT_PREFERENCES.allergies
+		};
 		const ratings = preferences.ratings ?? {};
 		const recipes = shared.recipes.map((recipe) => {
 			const { rating: _householdRating, ...householdRecipe } = recipe;

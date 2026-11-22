@@ -3,7 +3,13 @@
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
-	import type { Recipe } from '#lib/types.ts';
+	import {
+		clampAllergies,
+		evaluateRecipeConflicts,
+		normalizeDiet,
+		parseAllergies
+	} from '#lib/discovery.ts';
+	import type { Preferences, Recipe } from '#lib/types.ts';
 	import {
 		X,
 		Clock,
@@ -29,6 +35,7 @@
 		toggleHidden,
 		busy,
 		initialServings,
+		preferences,
 		completedSteps = $bindable<number[]>([])
 	}: {
 		recipe: Recipe;
@@ -43,6 +50,7 @@
 		toggleHidden: () => void;
 		busy: boolean;
 		initialServings?: number;
+		preferences?: Pick<Preferences, 'diet' | 'allergies'>;
 		completedSteps?: number[];
 	} = $props();
 	let nutritionMode = $state('serving');
@@ -74,6 +82,14 @@
 			Number.isInteger(servingCount) &&
 			servingCount >= 1 &&
 			servingCount <= 24
+	);
+	let conflict = $derived(preferences ? evaluateRecipeConflicts(recipe, preferences) : null);
+	let hasActiveGuidance = $derived(
+		Boolean(
+			preferences &&
+			(normalizeDiet(preferences.diet) !== 'none' ||
+				parseAllergies(clampAllergies(preferences.allergies)).length > 0)
+		)
 	);
 </script>
 
@@ -141,6 +157,21 @@
 			{#if !validServings}<p class="field-help" id="servings-help">
 					Enter 1–24 servings to plan or shop.
 				</p>{/if}
+			{#if conflict?.hasConflict}<div
+					class="conflict-banner"
+					role="region"
+					aria-label="Dietary and allergen guidance"
+				>
+					<div class="conflict-banner-header">
+						<span class="conflict-banner-badge">{conflict.badge}</span>
+						<strong>{conflict.summary}</strong>
+					</div>
+					<p>
+						Culinary guidance only — not medical certification{recipe.provenance
+							? ' (especially for imported or AI-generated recipes)'
+							: ''}. Always verify every ingredient, substitution, and package label before cooking.
+					</p>
+				</div>{/if}
 			<div class="tabs">
 				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
 				><button class:active={tab === 'nutrition'} onclick={() => (tab = 'nutrition')}
@@ -164,15 +195,25 @@
 							>
 						</div>
 						<ul class="ingredients-list">
-							{#each recipe.ingredients as item}<li>
+							{#each recipe.ingredients as item, idx}{@const reasons =
+									conflict?.ingredientReasons[idx]}
+								<li class:conflict-ingredient={Boolean(reasons)}>
 									<span
 										>{validServings && servingCount !== undefined
 											? +((item.quantity * servingCount) / recipe.servings).toFixed(2)
 											: '—'}
 										{item.unit}</span
-									>{item.name}
+									><span class="ingredient-line-name"
+										>{item.name}{#if reasons?.length}<small class="ingredient-conflict-tag"
+												>{reasons.join(', ')}</small
+											>{/if}</span
+									>
 								</li>{/each}
 						</ul>
+						{#if hasActiveGuidance}<p class="label-check-note">
+								Check package labels and sub-ingredients before cooking; dietary and allergy flags
+								are culinary guidance, not medical certification.
+							</p>{/if}
 					</div>
 					<div>
 						<h3>Let's make it</h3>
@@ -297,5 +338,76 @@
 		background: var(--wash);
 		color: var(--muted);
 		font-size: 14px;
+	}
+	.conflict-banner {
+		padding: 14px 16px;
+		margin: 0 0 22px;
+		background: #b94e311c;
+		border-left: 3px solid #8f3b26;
+		color: #8f3b26;
+		font-size: 14px;
+	}
+	:global(.dark) .conflict-banner {
+		background: #b94e312b;
+		border-left-color: #ffb4a2;
+		color: #ffb4a2;
+	}
+	.conflict-banner-header {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 6px;
+	}
+	.conflict-banner-badge {
+		padding: 2px 7px;
+		background: #8f3b26;
+		color: #fffefa;
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.6px;
+		text-transform: uppercase;
+	}
+	:global(.dark) .conflict-banner-badge {
+		background: #ffb4a2;
+		color: #2b1410;
+	}
+	.conflict-banner p {
+		font-size: 13px;
+		line-height: 1.6;
+	}
+	.ingredients-list li.conflict-ingredient {
+		padding-inline: 8px;
+		background: #b94e3114;
+		border-left: 2px solid #8f3b26;
+	}
+	:global(.dark) .ingredients-list li.conflict-ingredient {
+		background: #b94e3126;
+		border-left-color: #ffb4a2;
+	}
+	.ingredient-line-name {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		color: var(--ink) !important;
+		min-width: 0 !important;
+	}
+	.ingredient-conflict-tag {
+		padding: 1px 6px;
+		background: #b94e3120;
+		color: #8f3b26;
+		font-size: 12px;
+		font-weight: 600;
+	}
+	:global(.dark) .ingredient-conflict-tag {
+		background: #b94e3138;
+		color: #ffb4a2;
+	}
+	.label-check-note {
+		margin-top: 10px;
+		font-size: 13px;
+		line-height: 1.6;
+		color: var(--muted);
 	}
 </style>

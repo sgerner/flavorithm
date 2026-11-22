@@ -1,6 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rankRecipes } from '../src/lib/discovery.ts';
+import { seedRecipes } from '../src/lib/data.ts';
+import {
+	DIET_OPTIONS,
+	evaluateRecipeConflicts,
+	normalizeDiet,
+	parseAllergies,
+	rankRecipes
+} from '../src/lib/discovery.ts';
 import {
 	normalizeName as normalizeDomainName,
 	unitInfo as domainUnitInfo
@@ -360,4 +367,158 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
+});
+
+test('normalizes diet values case-insensitively across all canonical lowercase options', () => {
+	assert.deepEqual(
+		DIET_OPTIONS.map((option) => option.value),
+		['none', 'vegetarian', 'vegan', 'pescatarian', 'gluten-free', 'dairy-free', 'low-carb']
+	);
+	assert.equal(normalizeDiet(''), 'none');
+	assert.equal(normalizeDiet('A bit of everything'), 'none');
+	assert.equal(normalizeDiet('No dietary restriction'), 'none');
+	assert.equal(normalizeDiet('Vegetarian'), 'vegetarian');
+	assert.equal(normalizeDiet('VEGAN'), 'vegan');
+	assert.equal(normalizeDiet('Pescetarian'), 'pescatarian');
+	assert.equal(normalizeDiet('Gluten Free'), 'gluten-free');
+	assert.equal(normalizeDiet('Dairy-Free'), 'dairy-free');
+	assert.equal(normalizeDiet('Low_Carb'), 'low-carb');
+});
+
+test('parses free-text allergies across commas, newlines, and conjunctions with whole-word matching', () => {
+	assert.deepEqual(parseAllergies('Avoid soy and sesame\npeanuts, tree nuts, or shellfish'), [
+		'soy',
+		'sesame',
+		'peanut',
+		'tree nut',
+		'shellfish'
+	]);
+	assert.deepEqual(parseAllergies('none'), []);
+
+	const peaSafe = recipe({
+		id: 'pea-safe',
+		ingredients: [
+			{ name: 'chickpeas', quantity: 1, unit: 'can' },
+			{ name: 'peanut butter', quantity: 1, unit: 'tbsp' }
+		]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(peaSafe, { diet: 'none', allergies: 'peas' }).hasConflict,
+		false
+	);
+
+	const squashAndCoconut = recipe({
+		id: 'squash-coconut',
+		tags: ['vegan', 'dairy-free'],
+		ingredients: [
+			{ name: 'butternut squash', quantity: 10, unit: 'oz' },
+			{ name: 'light coconut milk', quantity: 1, unit: 'cup' },
+			{ name: 'eggplant', quantity: 1, unit: 'whole' },
+			{ name: 'oyster mushroom', quantity: 4, unit: 'oz' },
+			{ name: 'nutmeg', quantity: 0.25, unit: 'tsp' }
+		]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(squashAndCoconut, {
+			diet: 'vegan',
+			allergies: 'tree nuts, dairy, eggs, and shellfish'
+		}).hasConflict,
+		false
+	);
+});
+
+test('evaluates deterministic meat, poultry, seafood, dairy, egg, honey, gluten, and carb rules', () => {
+	const steakBowl = recipe({
+		id: 'steak',
+		ingredients: [
+			{ name: 'ribeye steak', quantity: 8, unit: 'oz' },
+			{ name: 'green beans', quantity: 6, unit: 'oz' },
+			{ name: 'rice vinegar', quantity: 1, unit: 'tbsp' }
+		]
+	});
+	assert.deepEqual(
+		evaluateRecipeConflicts(steakBowl, { diet: 'vegetarian', allergies: '' }).dietCategories,
+		['meat']
+	);
+	assert.deepEqual(
+		evaluateRecipeConflicts(steakBowl, { diet: 'pescatarian', allergies: '' }).dietCategories,
+		['meat']
+	);
+	assert.equal(
+		evaluateRecipeConflicts(steakBowl, { diet: 'low-carb', allergies: '' }).hasConflict,
+		false
+	);
+
+	const goatCheeseEgg = recipe({
+		id: 'frittata',
+		ingredients: [
+			{ name: 'eggs', quantity: 3, unit: 'whole' },
+			{ name: 'goat cheese', quantity: 2, unit: 'oz' },
+			{ name: 'raw honey', quantity: 1, unit: 'tsp' }
+		]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(goatCheeseEgg, { diet: 'vegetarian', allergies: '' }).hasConflict,
+		false
+	);
+	assert.deepEqual(
+		evaluateRecipeConflicts(goatCheeseEgg, { diet: 'vegan', allergies: '' }).dietCategories,
+		['dairy', 'egg', 'honey']
+	);
+	assert.deepEqual(
+		evaluateRecipeConflicts(goatCheeseEgg, { diet: 'dairy-free', allergies: '' }).dietCategories,
+		['dairy']
+	);
+
+	const orzo = seedRecipes.find((item) => item.id === 'lemon-chickpea-orzo')!;
+	const orzoGluten = evaluateRecipeConflicts(orzo, { diet: 'Gluten-Free', allergies: '' });
+	assert.equal(orzoGluten.hasConflict, true);
+	assert.deepEqual(orzoGluten.dietCategories, ['gluten']);
+	assert.deepEqual(orzoGluten.matchingIngredientIndices, [0]);
+
+	const orzoLowCarb = evaluateRecipeConflicts(orzo, { diet: 'low-carb', allergies: '' });
+	assert.equal(orzoLowCarb.hasConflict, true);
+	assert.deepEqual(orzoLowCarb.dietCategories, ['carb']);
+});
+
+test('Mediterranean vegan For you ranking excludes chicken, salmon, feta, yogurt, and parmesan recipes', () => {
+	const ranked = rankRecipes(
+		seedRecipes,
+		[],
+		preferences({ cuisines: ['Mediterranean'], diet: 'Vegan', allergies: '' }),
+		new Date(2026, 9, 22)
+	);
+	const ids = ranked.map((item) => item.id);
+	assert.deepEqual(ids.sort(), ['coconut-red-lentil-dal', 'maple-chili-tofu']);
+	for (const excluded of [
+		'lemon-herb-chicken',
+		'sesame-salmon-bowls',
+		'tomato-butter-beans',
+		'lemon-chickpea-orzo',
+		'roasted-veg-farro',
+		'chicken-shawarma-wraps'
+	]) {
+		assert.equal(ids.includes(excluded), false, `expected ${excluded} to be excluded`);
+	}
+});
+
+test('avoiding soy and sesame excludes maple-chili-tofu and sesame-salmon-bowls from For you while search/saved can inspect conflicts', () => {
+	const userPrefs = preferences({ diet: 'none', allergies: 'soy and sesame' });
+	const ranked = rankRecipes(seedRecipes, [], userPrefs, new Date(2026, 9, 22));
+	const ids = ranked.map((item) => item.id);
+	assert.equal(ids.includes('maple-chili-tofu'), false);
+	assert.equal(ids.includes('sesame-salmon-bowls'), false);
+	assert.equal(ids.length, seedRecipes.length - 2);
+
+	const withConflicts = rankRecipes(seedRecipes, [], userPrefs, new Date(2026, 9, 22), {
+		includeConflicts: true
+	});
+	assert.equal(withConflicts.length, seedRecipes.length);
+	const tofuReport = evaluateRecipeConflicts(
+		seedRecipes.find((item) => item.id === 'maple-chili-tofu')!,
+		userPrefs
+	);
+	assert.equal(tofuReport.hasConflict, true);
+	assert.deepEqual(tofuReport.allergenMatches, ['soy', 'sesame']);
+	assert.deepEqual(tofuReport.matchingIngredientIndices, [0, 4, 8]);
 });

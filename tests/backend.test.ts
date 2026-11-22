@@ -84,7 +84,7 @@ test('accounts, shared household state, invites and owner-safe leave', async () 
 		ifNoneMatch: null
 	});
 	assert.equal(backend.getState(alice.user)?.pantry[0]?.quantity, 4);
-	assert.equal(backend.getState(alice.user)?.preferences.diet, 'Vegetarian');
+	assert.equal(backend.getState(alice.user)?.preferences.diet, 'vegetarian');
 	assert.throws(
 		() => backend.saveState(alice.user, state, { ifMatch: staleAliceTag, ifNoneMatch: null }),
 		{ status: 412 }
@@ -124,6 +124,46 @@ test('state validation rejects malformed values and registration enforces the UI
 		() => backend.registerUser('Short Password', 'short@example.com', 'too-short'),
 		{ status: 400 }
 	);
+
+	const valid500 = backend.validateAppState({
+		pantry: [],
+		recipes: [],
+		meals: [],
+		shopping: [],
+		preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(500) }
+	});
+	assert.equal(valid500?.preferences.allergies.length, 500);
+	assert.equal(
+		backend.validateAppState({
+			pantry: [],
+			recipes: [],
+			meals: [],
+			shopping: [],
+			preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(501) }
+		}),
+		null
+	);
+
+	const legacyUser = await backend.registerUser(
+		'Legacy Example',
+		'legacy-prefs@example.com',
+		'a secure legacy password'
+	);
+	backend
+		.getDatabase()
+		.prepare('UPDATE user_preferences SET preferences_json = ? WHERE user_id = ?')
+		.run(
+			JSON.stringify({
+				...data.defaultPreferences,
+				diet: 'Gluten-Free',
+				allergies: 'peanuts, '.repeat(180)
+			}),
+			legacyUser.user.id
+		);
+	const loadedLegacy = backend.getState(legacyUser.user);
+	assert.ok(loadedLegacy);
+	assert.equal(loadedLegacy.preferences.diet, 'gluten-free');
+	assert.equal(loadedLegacy.preferences.allergies.length, 500);
 });
 
 test('account deletion confirms the password and preserves a shared household for remaining members', async () => {
