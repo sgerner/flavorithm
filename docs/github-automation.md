@@ -1,8 +1,11 @@
 # GitHub automation
 
-CI checks types, tests, the production build, the container build, and both
-server and SSO smoke tests on pushes and pull requests. Runs use Ubuntu 24.04
-and Node 24, have a 20-minute timeout, and cancel superseded runs.
+CI checks Svelte/TypeScript types (including the service worker, `server.mjs`,
+and `scripts/*.mjs`), unit tests, the production build, the container build, and
+both HTTP and SSO smoke tests against the hardened `flavorithm:ci` container on
+pushes and pull requests. Runs use Ubuntu 24.04 and Node 24, have a 20-minute
+timeout, and cancel superseded pull-request runs while letting `main`, manual,
+and scheduled runs finish.
 
 Dependabot checks npm packages, GitHub Actions, and the Dockerfile weekly.
 Minor and patch npm updates are grouped; major npm updates remain separate

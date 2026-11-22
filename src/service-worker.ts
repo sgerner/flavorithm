@@ -6,14 +6,16 @@ const worker = self as unknown as ServiceWorkerGlobalScope;
 const cachePrefix = 'flavorithm-';
 const cacheName = `${cachePrefix}${version}`;
 const origin = worker.location.origin;
-const offlineUrl = new URL(resolve('/'), origin).href;
-const apiPath = new URL(resolve('/api'), origin).pathname.replace(/\/$/, '');
+const basePath = resolve('/');
+const offlineUrl = new URL(basePath, origin).href;
+const baseUrl = new URL(basePath.endsWith('/') ? basePath : `${basePath}/`, origin);
+const apiPath = new URL('api', baseUrl).pathname.replace(/\/$/, '');
 
 // Navigation HTML can contain an authenticated identity, including when identity is supplied by a
 // reverse proxy rather than a browser cookie. Keep only static assets in Cache Storage.
 const staticUrls = new Set(
 	[
-		...immutable.map(({ path }) => toUrl(resolve(path.replace(/^\/+/, '')))),
+		...immutable.map(({ path }) => new URL(path.replace(/^\/+/, ''), baseUrl).href),
 		...staticAssets.map(({ path }) => toUrl(asset(path))),
 		...prerendered.map(({ path }) => toUrl(resolve(path)))
 	].filter((url) => !isApiUrl(new URL(url)))

@@ -1,49 +1,60 @@
 // Deployment checks print configuration status, never secret values.
+/** @param {string} name */
 const configured = (name) => Boolean(process.env[name]?.trim());
 const origin = process.env.ORIGIN;
 let secureOrigin = false;
-try {
-	const parsed = new URL(origin);
-	secureOrigin =
-		parsed.protocol === 'https:' &&
-		parsed.pathname === '/' &&
-		!parsed.search &&
-		!parsed.hash &&
-		!parsed.username &&
-		!parsed.password;
-} catch {}
+if (origin) {
+	try {
+		const parsed = new URL(origin);
+		secureOrigin =
+			parsed.protocol === 'https:' &&
+			parsed.pathname === '/' &&
+			!parsed.search &&
+			!parsed.hash &&
+			!parsed.username &&
+			!parsed.password;
+	} catch {}
+}
+const emailFrom = process.env.EMAIL_FROM?.trim() ?? '';
 const mail =
 	configured('RESEND_API_KEY') &&
-	configured('EMAIL_FROM') &&
-	!/@example\.(?:com|test|org)>?$/i.test(process.env.EMAIL_FROM);
+	Boolean(emailFrom) &&
+	!/@example\.(?:com|test|org)>?$/i.test(emailFrom);
 const authMode = process.env.FLAVORITHM_AUTH_MODE?.trim().toLowerCase() || 'local';
 const validAuthMode = ['local', 'oidc', 'proxy'].includes(authMode);
+/** @param {string} hostname */
 function isLoopbackHost(hostname) {
 	return ['localhost', '127.0.0.1', '[::1]'].includes(hostname.toLowerCase());
 }
 let validAuthOrigin = false;
+/** @type {URL | undefined} */
 let authOrigin;
-try {
-	authOrigin = new URL(origin);
-	validAuthOrigin =
-		(authOrigin.protocol === 'https:' ||
-			(authOrigin.protocol === 'http:' && isLoopbackHost(authOrigin.hostname))) &&
-		authOrigin.pathname === '/' &&
-		!authOrigin.search &&
-		!authOrigin.hash &&
-		!authOrigin.username &&
-		!authOrigin.password;
-} catch {}
+if (origin) {
+	try {
+		authOrigin = new URL(origin);
+		validAuthOrigin =
+			(authOrigin.protocol === 'https:' ||
+				(authOrigin.protocol === 'http:' && isLoopbackHost(authOrigin.hostname))) &&
+			authOrigin.pathname === '/' &&
+			!authOrigin.search &&
+			!authOrigin.hash &&
+			!authOrigin.username &&
+			!authOrigin.password;
+	} catch {}
+}
 let validOidcIssuer = false;
-try {
-	const issuer = new URL(process.env.FLAVORITHM_OIDC_ISSUER);
-	validOidcIssuer =
-		issuer.protocol === 'https:' &&
-		!issuer.username &&
-		!issuer.password &&
-		!issuer.search &&
-		!issuer.hash;
-} catch {}
+const oidcIssuer = process.env.FLAVORITHM_OIDC_ISSUER;
+if (oidcIssuer) {
+	try {
+		const issuer = new URL(oidcIssuer);
+		validOidcIssuer =
+			issuer.protocol === 'https:' &&
+			!issuer.username &&
+			!issuer.password &&
+			!issuer.search &&
+			!issuer.hash;
+	} catch {}
+}
 const expectedOidcRedirect = authOrigin ? `${authOrigin.origin}/auth/callback` : '';
 const configuredOidcRedirect = process.env.FLAVORITHM_OIDC_REDIRECT_URI?.trim();
 let validOidcRedirect = !configuredOidcRedirect;
@@ -72,6 +83,10 @@ const oidcReady =
 	validOidcRedirect &&
 	validOidcClientAuth &&
 	validOidcSessionTtl;
+/**
+ * @param {string} value
+ * @param {string} fallback
+ */
 const validHeaderName = (value, fallback) =>
 	/^[!#$%&'*+.^_`|~0-9a-z-]+$/i.test(process.env[value]?.trim() || fallback);
 const proxySecret = process.env.FLAVORITHM_PROXY_SHARED_SECRET ?? '';
@@ -97,17 +112,20 @@ const proxyReady =
 	validHeaderName('FLAVORITHM_PROXY_NAME_HEADER', 'x-authentik-name') &&
 	validProxyLogout;
 let hostedOAuth = false;
-try {
-	const redirect = new URL(process.env.OPENAI_OAUTH_REDIRECT_URI);
-	hostedOAuth =
-		configured('OPENAI_OAUTH_CLIENT_ID') &&
-		secureOrigin &&
-		redirect.origin === new URL(origin).origin &&
-		redirect.pathname === '/api/connections/chatgpt/callback' &&
-		!redirect.search &&
-		!redirect.hash &&
-		Buffer.from(process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY || '', 'base64').length === 32;
-} catch {}
+const oauthRedirectUri = process.env.OPENAI_OAUTH_REDIRECT_URI;
+if (oauthRedirectUri && origin) {
+	try {
+		const redirect = new URL(oauthRedirectUri);
+		hostedOAuth =
+			configured('OPENAI_OAUTH_CLIENT_ID') &&
+			secureOrigin &&
+			redirect.origin === new URL(origin).origin &&
+			redirect.pathname === '/api/connections/chatgpt/callback' &&
+			!redirect.search &&
+			!redirect.hash &&
+			Buffer.from(process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY || '', 'base64').length === 32;
+	} catch {}
+}
 const checks = [
 	['Authentication mode', validAuthMode, 'Set FLAVORITHM_AUTH_MODE to local, oidc, or proxy.'],
 	...(authMode === 'oidc'
