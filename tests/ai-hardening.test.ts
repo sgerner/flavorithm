@@ -117,9 +117,27 @@ test('valid max-bound appStateSchema records trigger zero 400 errors across AI a
 		importNotes: Array.from({ length: 30 }, () => 'N'.repeat(300)),
 		provenance: 'ai-generated' as const
 	};
+	const manualRecipe = {
+		id: 'recipe-manual-1',
+		title: 'Handwritten Herb Pasta',
+		description: 'Typed directly in the recipe editor.',
+		image: '',
+		time: 20,
+		servings: 2,
+		difficulty: 'Easy',
+		cuisine: 'Italian',
+		tags: ['pasta'],
+		ingredients: [{ name: 'spaghetti', quantity: 200, unit: 'g' }],
+		steps: ['Boil pasta and toss with herbs and olive oil.'],
+		nutrition,
+		rating: 5,
+		saved: true,
+		hidden: false,
+		provenance: 'manual' as const
+	};
 	const state = {
 		pantry: maxPantry,
-		recipes: [maxRecipe],
+		recipes: [maxRecipe, manualRecipe],
 		meals: [],
 		shopping: [],
 		preferences: {
@@ -133,7 +151,7 @@ test('valid max-bound appStateSchema records trigger zero 400 errors across AI a
 			onboardingStatus: 'completed' as const,
 			provider: 'openai',
 			model: 'gpt-4.1-mini',
-			ratings: { 'recipe-max-1': 5 }
+			ratings: { 'recipe-max-1': 5, 'recipe-manual-1': 5 }
 		}
 	};
 	const validated = backend.validateAppState(state);

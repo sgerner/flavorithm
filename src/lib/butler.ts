@@ -45,7 +45,7 @@ const recipe = z.object({
 	steps: z.array(text).max(200),
 	nutrition,
 	source: z.string().max(4000).optional(),
-	provenance: z.enum(['web-import', 'ai-generated']).optional(),
+	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
 	importNotes: z.array(z.string().max(1000)).max(50).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
@@ -214,6 +214,9 @@ export function applyButlerCommands(
 			case 'recipe.upsert': {
 				const previous = state.recipes.find((item) => item.id === command.recipe.id);
 				const updated = { ...command.recipe };
+				if (previous?.provenance === 'manual') updated.provenance = 'manual';
+				else if (updated.provenance === undefined && previous?.provenance)
+					updated.provenance = previous.provenance;
 				if (
 					previous &&
 					(previous.servings !== updated.servings ||
