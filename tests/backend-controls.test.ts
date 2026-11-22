@@ -289,6 +289,181 @@ test('auth and household endpoints expose status, hashed invites, and one-use ve
 	assert.equal(typeof authStatusData.capabilities.emailDelivery, 'boolean');
 	assert.equal(typeof authStatusData.capabilities.recipeSearch, 'boolean');
 	assert.equal(JSON.stringify(authStatusData).includes(verification.token), false);
+
+	const previousResend = process.env.RESEND_API_KEY;
+	const previousFrom = process.env.EMAIL_FROM;
+	const previousOrigin = process.env.ORIGIN;
+	try {
+		delete process.env.RESEND_API_KEY;
+		delete process.env.EMAIL_FROM;
+		delete process.env.ORIGIN;
+
+		const resetUnavailable = await authRoute.POST(
+			postEvent(
+				'/api/auth',
+				{},
+				{ action: 'requestPasswordReset', email: owner.user.email }
+			) as never
+		);
+		assert.equal(resetUnavailable.status, 503);
+		const resetUnavailableBody = (await resetUnavailable.json()) as { error: string };
+		assert.match(resetUnavailableBody.error, /server operator/i);
+		for (const envName of ['RESEND_API_KEY', 'EMAIL_FROM', 'ORIGIN']) {
+			assert.equal(resetUnavailableBody.error.includes(envName), false);
+		}
+
+		const verifyUnavailable = await authRoute.POST(
+			postEvent('/api/auth', { user: member.user }, { action: 'requestEmailVerification' }) as never
+		);
+		assert.equal(verifyUnavailable.status, 503);
+		const verifyUnavailableBody = (await verifyUnavailable.json()) as { error: string };
+		assert.match(verifyUnavailableBody.error, /server operator/i);
+		for (const envName of ['RESEND_API_KEY', 'EMAIL_FROM', 'ORIGIN']) {
+			assert.equal(verifyUnavailableBody.error.includes(envName), false);
+		}
+
+		process.env.RESEND_API_KEY = 'test-resend-key';
+		process.env.EMAIL_FROM = 'Flavorithm <kitchen@example.com>';
+
+		const originlessReset = await authRoute.POST({
+			request: new Request('https://flavorithm.example/api/auth', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ action: 'requestPasswordReset', email: owner.user.email })
+			}),
+			locals: {},
+			getClientAddress: () => '192.0.2.11',
+			cookies: {
+				get: () => undefined,
+				set: () => undefined,
+				delete: () => undefined
+			}
+		} as never);
+		assert.equal(originlessReset.status, 503);
+		const originlessResetBody = (await originlessReset.json()) as { error: string };
+		assert.match(originlessResetBody.error, /server operator/i);
+		for (const envName of ['RESEND_API_KEY', 'EMAIL_FROM', 'ORIGIN']) {
+			assert.equal(originlessResetBody.error.includes(envName), false);
+		}
+
+		const originlessVerify = await authRoute.POST({
+			request: new Request('https://flavorithm.example/api/auth', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ action: 'requestEmailVerification' })
+			}),
+			locals: { user: member.user },
+			getClientAddress: () => '192.0.2.11',
+			cookies: {
+				get: () => undefined,
+				set: () => undefined,
+				delete: () => undefined
+			}
+		} as never);
+		assert.equal(originlessVerify.status, 503);
+		const originlessVerifyBody = (await originlessVerify.json()) as { error: string };
+		assert.match(originlessVerifyBody.error, /server operator/i);
+		for (const envName of ['RESEND_API_KEY', 'EMAIL_FROM', 'ORIGIN']) {
+			assert.equal(originlessVerifyBody.error.includes(envName), false);
+		}
+	} finally {
+		if (previousResend === undefined) delete process.env.RESEND_API_KEY;
+		else process.env.RESEND_API_KEY = previousResend;
+		if (previousFrom === undefined) delete process.env.EMAIL_FROM;
+		else process.env.EMAIL_FROM = previousFrom;
+		if (previousOrigin === undefined) delete process.env.ORIGIN;
+		else process.env.ORIGIN = previousOrigin;
+	}
+});
+
+test('household endpoint blocks solo leave and requires confirmReplace before replacing populated solo kitchens', async () => {
+	const host = await backend.registerUser(
+		'Shared Host',
+		'shared-host-route@example.com',
+		'a secure shared host password'
+	);
+	const solo = await backend.registerUser(
+		'Populated Solo',
+		'populated-solo-route@example.com',
+		'a secure solo route password'
+	);
+	const soloHouseholdId = solo.user.householdId;
+	const soloState = backend.getState(solo.user)!;
+	soloState.pantry.push({
+		id: 'solo-saffron',
+		name: 'Saffron',
+		quantity: 1,
+		unit: 'jar',
+		category: 'Spices'
+	});
+	soloState.recipes[0].saved = true;
+	backend.saveState(solo.user, soloState, {
+		ifMatch: backend.getStateEtag(solo.user),
+		ifNoneMatch: null
+	});
+
+	const soloLeaveResponse = await householdRoute.POST(
+		postEvent('/api/household', { user: solo.user }, { action: 'leave' }) as never
+	);
+	assert.equal(soloLeaveResponse.status, 400);
+	assert.equal(backend.getState(solo.user)?.pantry[0]?.name, 'Saffron');
+
+	const badJoinResponse = await householdRoute.POST(
+		postEvent(
+			'/api/household',
+			{ user: solo.user },
+			{ action: 'join', code: 'not-a-valid-invite-code' }
+		) as never
+	);
+	assert.equal(badJoinResponse.status, 400);
+
+	const invite = backend.createHouseholdInvite(host.user);
+	const unconfirmedJoin = await householdRoute.POST(
+		postEvent(
+			'/api/household',
+			{ user: solo.user },
+			{ action: 'join', code: invite.inviteCode }
+		) as never
+	);
+	assert.equal(unconfirmedJoin.status, 409);
+	const unconfirmedBody = (await unconfirmedJoin.json()) as { error: string; code?: string };
+	assert.equal(unconfirmedBody.code, 'confirm_replace');
+
+	const db = backend.getDatabase();
+	const inviteRowBefore = db
+		.prepare('SELECT uses_remaining FROM household_invites WHERE invite_id = ?')
+		.get(invite.inviteId) as { uses_remaining: number };
+	assert.equal(inviteRowBefore.uses_remaining, 1);
+	assert.equal(backend.getState(solo.user)?.pantry[0]?.name, 'Saffron');
+	assert.ok(
+		db.prepare('SELECT 1 FROM household_state WHERE household_id = ?').get(soloHouseholdId)
+	);
+
+	const confirmedLocals: Record<string, unknown> = { user: solo.user };
+	const confirmedJoin = await householdRoute.POST(
+		postEvent('/api/household', confirmedLocals, {
+			action: 'join',
+			code: invite.inviteCode,
+			confirmReplace: true
+		}) as never
+	);
+	assert.equal(confirmedJoin.status, 200);
+	const confirmedData = (await confirmedJoin.json()) as {
+		members: Array<{ id: string; role: string }>;
+	};
+	assert.equal(confirmedData.members.length, 2);
+	const inviteRowAfter = db
+		.prepare('SELECT uses_remaining FROM household_invites WHERE invite_id = ?')
+		.get(invite.inviteId) as { uses_remaining: number } | undefined;
+	assert.equal(inviteRowAfter, undefined);
+	const reuseResponse = await householdRoute.POST(
+		postEvent(
+			'/api/household',
+			{ user: host.user },
+			{ action: 'join', code: invite.inviteCode }
+		) as never
+	);
+	assert.equal(reuseResponse.status, 400);
 });
 
 test('auth endpoint trims valid padded emails and rejects malformed or oversized emails', async () => {
