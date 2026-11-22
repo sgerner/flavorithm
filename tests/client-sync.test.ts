@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createNewUserState } from '../src/lib/data.ts';
 import { createKitchenSync } from '../src/lib/client-sync.ts';
+import { sanitizeKitchenState } from '../src/lib/guest-storage.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import type { KitchenTransport } from '../src/lib/offline-sync.ts';
 
@@ -1263,4 +1264,53 @@ test('failed logout, join, and leaveHousehold transitions release pause lock and
 	}
 	assert.equal(putCount, 3);
 	sync.controller.dispose();
+});
+
+test('sanitizing setState with reactive observe preserves offline conflict journal without synthetic staging echoes', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+
+	// Simulate an older offline journal entry with unsanitized unit/maxTime + competing preference edit.
+	const legacyOffline = structuredClone(base);
+	legacyOffline.preferences.maxTime = 20;
+	legacyOffline.pantry.push({
+		id: 'legacy-item',
+		name: '  olive oil  ',
+		quantity: 2,
+		unit: '',
+		category: 'Pantry'
+	});
+	const writer = harness({ user, storage });
+	writer.controller.initialize(user, base, 'etag-1');
+	writer.controller.stage(legacyOffline);
+	writer.controller.clearContext();
+
+	const remote = structuredClone(base);
+	remote.preferences.maxTime = 55;
+	let currentState = createNewUserState();
+	const statuses: Array<{ pending: boolean; conflicts: unknown[] }> = [];
+	const controller = createKitchenSync({
+		storage,
+		getUser: () => user,
+		getState: () => sanitizeKitchenState(structuredClone(currentState)),
+		setState: (state) => {
+			currentState = sanitizeKitchenState(state);
+			queueMicrotask(() => {
+				controller.observe(sanitizeKitchenState(structuredClone(currentState)));
+			});
+		},
+		onStatus: (status) => statuses.push(status),
+		transport: () => transportFor(user, remote, 'etag-2')
+	});
+
+	controller.initialize(user, sanitizeKitchenState(remote), 'etag-2');
+	await new Promise((resolve) => setTimeout(resolve, 10));
+
+	assert.equal(statuses.at(-1)?.pending, true);
+	assert.deepEqual(statuses.at(-1)?.conflicts, [
+		{ path: 'kitchen.preferences.maxTime', local: 20, remote: 55 }
+	]);
+	assert.equal(currentState.pantry[0]?.unit, 'piece');
+	controller.dispose();
 });

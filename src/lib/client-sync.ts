@@ -189,6 +189,8 @@ export function createKitchenSync(options: {
 			applyingStateDepth += 1;
 			try {
 				options.setState(clone(next));
+				const applied = options.getState();
+				if (isState(applied)) context.viewState = clone(applied);
 			} finally {
 				applyingStateDepth -= 1;
 			}
