@@ -418,6 +418,13 @@ function describe(
 			return { label: `Open ${title.toLowerCase()}`, title, summary: 'Navigate to this section.' };
 		}
 		case 'ui': {
+			if (command.action === 'recipe-new') {
+				return {
+					label: 'Open new recipe',
+					title: 'New recipe',
+					summary: 'Open a blank recipe form.'
+				};
+			}
 			const title = command.action
 				.split('-')
 				.map((part) => (part === 'ai' ? 'AI' : part.charAt(0).toUpperCase() + part.slice(1)))
