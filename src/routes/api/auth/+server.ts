@@ -3,7 +3,6 @@ import { z } from 'zod';
 import {
 	ApiError,
 	assertSameOrigin,
-	changePassword,
 	consumeRateLimit,
 	deleteUserAccount,
 	deleteSession,
@@ -14,6 +13,7 @@ import {
 	readJson,
 	registerUser,
 	resetUserPassword,
+	rotateUserCredentials,
 	sendEmailVerificationEmail,
 	sendPasswordResetEmail,
 	updateAccountProfile,
@@ -25,13 +25,13 @@ const authActionSchema = z.discriminatedUnion('action', [
 	z.object({
 		action: z.literal('register'),
 		name: z.string().trim().min(2).max(80),
-		email: z.string().trim().email().max(254),
+		email: z.string().trim().max(254).pipe(z.email()),
 		password: z.string().min(10).max(128)
 	}),
 	z.object({
 		action: z.literal('login'),
 		name: z.string().optional(),
-		email: z.string().trim().email().max(254),
+		email: z.string().trim().max(254).pipe(z.email()),
 		password: z.string().min(1).max(128)
 	}),
 	z.object({ action: z.literal('logout') }),
@@ -44,12 +44,12 @@ const authActionSchema = z.discriminatedUnion('action', [
 	z.object({
 		action: z.literal('updateAccountProfile'),
 		name: z.string().trim().min(2).max(80).optional(),
-		email: z.string().trim().email().max(254).optional(),
+		email: z.string().trim().max(254).pipe(z.email()).optional(),
 		currentPassword: z.string().max(128).optional()
 	}),
 	z.object({
 		action: z.literal('requestPasswordReset'),
-		email: z.string().trim().email().max(254)
+		email: z.string().trim().max(254).pipe(z.email())
 	}),
 	z.object({
 		action: z.literal('resetPassword'),
@@ -137,7 +137,7 @@ export const POST: RequestHandler = async (event) => {
 		if (payload.action === 'changePassword') {
 			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
 			consumeRateLimit(`change-password:${event.locals.user.id}`, 5, 15 * 60 * 1000);
-			const result = await changePassword(
+			const result = await rotateUserCredentials(
 				event.locals.user.id,
 				payload.currentPassword,
 				payload.newPassword

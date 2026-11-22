@@ -349,29 +349,34 @@ test('local password rotation keeps a rotated session while revoking other sessi
 	const firstDevice = await backend.registerUser(
 		'Nadia Cook',
 		'nadia@example.com',
-		'initial-local-password'
+		'initial local password'
 	);
-	const secondDevice = await backend.loginUser('nadia@example.com', 'initial-local-password');
+	const secondDevice = await backend.loginUser('nadia@example.com', 'initial local password');
 	const pendingReset = backend.issuePasswordReset('nadia@example.com')!;
 
 	await assert.rejects(
 		() =>
-			backend.changePassword(firstDevice.user.id, 'wrong-password', 'rotated-local-password-123'),
+			backend.rotateUserCredentials(
+				firstDevice.user.id,
+				'wrong local password',
+				'rotated local password 123'
+			),
 		{ status: 401 }
 	);
 	await assert.rejects(
-		() => backend.changePassword(firstDevice.user.id, 'initial-local-password', 'short'),
+		() => backend.rotateUserCredentials(firstDevice.user.id, 'initial local password', 'short'),
 		{ status: 400 }
 	);
 	await assert.rejects(
-		() => backend.changePassword(firstDevice.user.id, 'initial-local-password', 'x'.repeat(129)),
+		() =>
+			backend.rotateUserCredentials(firstDevice.user.id, 'initial local password', 'x'.repeat(129)),
 		{ status: 400 }
 	);
 
-	const rotated = await backend.changePassword(
+	const rotated = await backend.rotateUserCredentials(
 		firstDevice.user.id,
-		'initial-local-password',
-		'rotated-local-password-123'
+		'initial local password',
+		'rotated local password 123'
 	);
 	assert.notEqual(rotated.token, firstDevice.token);
 	assert.notEqual(rotated.token, secondDevice.token);
@@ -379,14 +384,14 @@ test('local password rotation keeps a rotated session while revoking other sessi
 	assert.equal(backend.getUserFromSession(secondDevice.token), null);
 	assert.equal(backend.getUserFromSession(rotated.token)?.id, firstDevice.user.id);
 	await assert.rejects(
-		() => backend.resetUserPassword(pendingReset.token, 'another-valid-password-123'),
+		() => backend.resetUserPassword(pendingReset.token, 'another valid password 123'),
 		{ status: 400 }
 	);
-	await assert.rejects(() => backend.loginUser('nadia@example.com', 'initial-local-password'), {
+	await assert.rejects(() => backend.loginUser('nadia@example.com', 'initial local password'), {
 		status: 401
 	});
 	assert.equal(
-		(await backend.loginUser('nadia@example.com', 'rotated-local-password-123')).user.id,
+		(await backend.loginUser('nadia@example.com', 'rotated local password 123')).user.id,
 		firstDevice.user.id
 	);
 
@@ -398,7 +403,7 @@ test('local password rotation keeps a rotated session while revoking other sessi
 		emailVerified: true
 	});
 	await assert.rejects(
-		() => backend.changePassword(ssoUser.id, 'anything', 'rotated-local-password-123'),
+		() => backend.rotateUserCredentials(ssoUser.id, 'anything', 'rotated local password 123'),
 		{ status: 403 }
 	);
 });
@@ -407,9 +412,9 @@ test('local profile updates validate passwords on email changes, clear verificat
 	const account = await backend.registerUser(
 		'Original Name',
 		'profile-user@example.com',
-		'profile-secure-password'
+		'profile secure password'
 	);
-	await backend.registerUser('Existing Neighbor', 'taken@example.com', 'neighbor-secure-password');
+	await backend.registerUser('Existing Neighbor', 'taken@example.com', 'neighbor secure password');
 
 	const initialVerify = backend.issueEmailVerification(account.user.id)!;
 	const verifiedUser = backend.verifyEmailToken(initialVerify.token);
@@ -432,7 +437,7 @@ test('local profile updates validate passwords on email changes, clear verificat
 		() =>
 			backend.updateAccountProfile(account.user.id, {
 				email: 'new-address@example.com',
-				currentPassword: 'wrong-password'
+				currentPassword: 'wrong local password'
 			}),
 		{ status: 401 }
 	);
@@ -440,7 +445,7 @@ test('local profile updates validate passwords on email changes, clear verificat
 		() =>
 			backend.updateAccountProfile(account.user.id, {
 				email: 'TAKEN@EXAMPLE.COM',
-				currentPassword: 'profile-secure-password'
+				currentPassword: 'profile secure password'
 			}),
 		{ status: 409 }
 	);
@@ -448,7 +453,7 @@ test('local profile updates validate passwords on email changes, clear verificat
 	const reEmail = await backend.updateAccountProfile(account.user.id, {
 		name: 'Chef Deux',
 		email: 'New-Address@Example.com',
-		currentPassword: 'profile-secure-password'
+		currentPassword: 'profile secure password'
 	});
 	assert.equal(reEmail.name, 'Chef Deux');
 	assert.equal(reEmail.email, 'new-address@example.com');
@@ -458,13 +463,13 @@ test('local profile updates validate passwords on email changes, clear verificat
 	const pendingReset = backend.issuePasswordReset('new-address@example.com')!;
 	const thirdEmail = await backend.updateAccountProfile(account.user.id, {
 		email: 'third-address@example.com',
-		currentPassword: 'profile-secure-password'
+		currentPassword: 'profile secure password'
 	});
 	assert.equal(thirdEmail.email, 'third-address@example.com');
 	assert.equal(thirdEmail.emailVerified, false);
 	assert.throws(() => backend.verifyEmailToken(pendingNewVerify.token), { status: 400 });
 	await assert.rejects(
-		() => backend.resetUserPassword(pendingReset.token, 'replacement-password-123'),
+		() => backend.resetUserPassword(pendingReset.token, 'replacement secure password 123'),
 		{ status: 400 }
 	);
 
@@ -480,11 +485,11 @@ test('local profile updates validate passwords on email changes, clear verificat
 		{ status: 403 }
 	);
 	await assert.rejects(
-		() => backend.resetLocalUserPassword('sso-profile@example.com', 'operator-password-123'),
+		() => backend.resetLocalUserPassword('sso-profile@example.com', 'operator secure password'),
 		{ status: 403 }
 	);
 	await assert.rejects(
-		() => backend.resetLocalUserPassword('unknown@example.com', 'operator-password-123'),
+		() => backend.resetLocalUserPassword('unknown@example.com', 'operator secure password'),
 		{ status: 404 }
 	);
 });
