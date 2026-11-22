@@ -78,6 +78,7 @@
 	let currentOwner = '';
 	let alive = true;
 	let controller: AbortController | undefined;
+	let activePrompt = '';
 	let requestTimer: ReturnType<typeof setTimeout> | undefined;
 	let reaction = $state<'idle' | 'speaking' | 'pleased'>('idle');
 	let reactionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -183,13 +184,14 @@
 		draft = '';
 		error = '';
 		failedPrompt = '';
+		activePrompt = prompt;
 		busy = true;
 		const snapshot = JSON.stringify(kitchen);
 		const currentController = new AbortController();
 		controller = currentController;
 		requestTimer = setTimeout(
 			() => currentController.abort(new Error('Basil took too long to respond. Please try again.')),
-			90000
+			100000
 		);
 		void scroll();
 		try {
@@ -214,8 +216,11 @@
 			});
 		} catch (e) {
 			if (!alive || token !== generation) return;
+			const abortReason = currentController.signal.reason;
 			error = currentController.signal.aborted
-				? 'The request was interrupted. Please try again.'
+				? abortReason instanceof Error
+					? abortReason.message
+					: 'Request cancelled. Try again when you’re ready.'
 				: e instanceof Error
 					? e.message
 					: 'Basil could not connect. Please try again.';
@@ -224,15 +229,18 @@
 			if (alive && token === generation) {
 				clearTimeout(requestTimer);
 				controller = undefined;
+				activePrompt = '';
 				busy = false;
 				void scroll();
 			}
 		}
 	}
 	function stop() {
+		const cancelledPrompt = activePrompt;
 		cancelRequest();
-		error = '';
-		failedPrompt = '';
+		activePrompt = '';
+		error = 'Request cancelled. Try again when you’re ready.';
+		failedPrompt = cancelledPrompt;
 	}
 	async function applyAction(message: Message, action: Action) {
 		if (working || action.status !== 'pending' || !message.snapshot) return;

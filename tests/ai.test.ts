@@ -1526,3 +1526,233 @@ test('model endpoint fetch uses the public models.dev catalog URL', async () => 
 		}
 	]);
 });
+
+test('upstream 400, 401, 403, 404, and 429 responses return distinct statuses and Retry-After wait times instead of 502', async () => {
+	for (const provider of ['openai', 'anthropic', 'google'] as const) {
+		for (const status of [400, 401, 403, 404, 429] as const) {
+			await assert.rejects(
+				runAIRequest(
+					{
+						action: 'nutrition',
+						provider,
+						model: 'test-model',
+						apiKey: 'secret-provider-key',
+						recipe: generatedRecipe
+					},
+					async () =>
+						new Response(JSON.stringify({ error: { message: `Provider returned ${status}` } }), {
+							status,
+							headers: {
+								'content-type': 'application/json',
+								...(status === 429 ? { 'retry-after': '90' } : {})
+							}
+						})
+				),
+				(error: unknown) => {
+					assert.ok(error instanceof AIRequestError);
+					assert.equal(error.status, status, `${provider} ${status} should preserve status`);
+					assert.notEqual(error.status, 502);
+					assert.equal(error.message.includes('secret-provider-key'), false);
+					if (status === 429) {
+						assert.equal(error.retryAfter, 90);
+						assert.match(error.message, /2 minutes/);
+					} else {
+						assert.match(error.message, /Settings|API key|model|limit|input/i);
+					}
+					return true;
+				}
+			);
+		}
+	}
+});
+
+test('length and max_tokens cutoffs return 422 output_truncated with clear recovery steps instead of 502', async () => {
+	const cutoffCases: Array<{
+		provider: 'openai' | 'anthropic' | 'google';
+		payload: unknown;
+	}> = [
+		{
+			provider: 'openai',
+			payload: {
+				choices: [{ finish_reason: 'length', message: { content: '{"recipes":[{"title":"Cut' } }]
+			}
+		},
+		{
+			provider: 'openai',
+			payload: {
+				choices: [
+					{ finish_reason: 'max_tokens', message: { content: '{"recipes":[{"title":"Cut' } }
+				]
+			}
+		},
+		{
+			provider: 'anthropic',
+			payload: {
+				stop_reason: 'max_tokens',
+				content: [{ type: 'text', text: '{"recipes":[{"title":"Cut' }]
+			}
+		},
+		{
+			provider: 'google',
+			payload: {
+				candidates: [
+					{
+						finishReason: 'MAX_TOKENS',
+						content: { parts: [{ text: '{"recipes":[{"title":"Cut' }] }
+					}
+				]
+			}
+		}
+	];
+
+	for (const { provider, payload } of cutoffCases) {
+		await assert.rejects(
+			runAIRequest(
+				{
+					action: 'generate',
+					provider,
+					model: 'test-model',
+					apiKey: 'secret-key',
+					preferences
+				},
+				async () => jsonResponse(payload)
+			),
+			(error: unknown) =>
+				error instanceof AIRequestError &&
+				error.status === 422 &&
+				error.code === 'output_truncated' &&
+				/token limit|shorter|Reasoning/i.test(error.message)
+		);
+	}
+});
+
+test('reasoning models under Model default receive token headroom without sending explicit reasoning overrides', async () => {
+	let openAIBody: any;
+	await runAIRequest(
+		{
+			action: 'generate',
+			provider: 'openai',
+			model: 'o3-mini',
+			apiKey: 'secret-key',
+			preferences
+		},
+		async (_input, init) => {
+			openAIBody = JSON.parse(String(init?.body));
+			return jsonResponse({
+				choices: [
+					{
+						finish_reason: 'stop',
+						message: { content: JSON.stringify({ recipes: [generatedRecipe] }) }
+					}
+				]
+			});
+		}
+	);
+	assert.equal(openAIBody.max_completion_tokens, 8_192);
+	assert.equal('reasoning_effort' in openAIBody, false);
+
+	let googleBody: any;
+	await runAIRequest(
+		{
+			action: 'nutrition',
+			provider: 'google',
+			model: 'gemini-2.5-pro',
+			apiKey: 'secret-key',
+			reasoning: {},
+			recipe: generatedRecipe
+		},
+		async (_input, init) => {
+			googleBody = JSON.parse(String(init?.body));
+			return jsonResponse({
+				candidates: [
+					{ finishReason: 'STOP', content: { parts: [{ text: JSON.stringify(nutrition) }] } }
+				]
+			});
+		}
+	);
+	assert.equal(googleBody.generationConfig.maxOutputTokens, 12_288);
+	assert.equal('thinkingConfig' in googleBody.generationConfig, false);
+
+	transformModelCatalog({
+		anthropic: {
+			name: 'Anthropic',
+			models: {
+				'claude-custom-thinking': {
+					name: 'Claude Custom Thinking',
+					reasoning: true,
+					reasoning_options: [{ type: 'toggle' }],
+					modalities: { input: ['text'], output: ['text'] }
+				}
+			}
+		}
+	});
+	let anthropicBody: any;
+	await runAIRequest(
+		{
+			action: 'nutrition',
+			provider: 'anthropic',
+			model: 'claude-custom-thinking',
+			apiKey: 'secret-key',
+			recipe: generatedRecipe
+		},
+		async (_input, init) => {
+			anthropicBody = JSON.parse(String(init?.body));
+			return jsonResponse({
+				stop_reason: 'end_turn',
+				content: [{ type: 'text', text: JSON.stringify(nutrition) }]
+			});
+		}
+	);
+	assert.equal(anthropicBody.max_tokens, 5_296);
+	assert.equal('thinking' in anthropicBody, false);
+});
+
+test('aborted AbortSignal requests return 499 instead of 504 across providers and recipe fetches', async () => {
+	for (const provider of ['openai', 'anthropic', 'google'] as const) {
+		const controller = new AbortController();
+		let started!: () => void;
+		const inFlight = new Promise<void>((resolve) => (started = resolve));
+		const pending = runAIRequest(
+			{
+				action: 'nutrition',
+				provider,
+				model: 'test-model',
+				apiKey: 'secret-key',
+				recipe: generatedRecipe
+			},
+			async (_input, init) =>
+				new Promise((_resolve, reject) => {
+					started();
+					init?.signal?.addEventListener(
+						'abort',
+						() => reject(new DOMException('Aborted', 'AbortError')),
+						{ once: true }
+					);
+				}),
+			undefined,
+			undefined,
+			controller.signal
+		);
+		await inFlight;
+		controller.abort();
+		await assert.rejects(
+			pending,
+			(error: unknown) =>
+				error instanceof AIRequestError &&
+				error.status === 499 &&
+				error.code === 'request_cancelled'
+		);
+	}
+
+	const pageAbort = new AbortController();
+	pageAbort.abort();
+	await assert.rejects(
+		fetchCaptureRecipePage('https://recipes.example.test/recipe', {
+			signal: pageAbort.signal,
+			resolveAddresses: async () => ['93.184.216.34'],
+			requestPinned: async () => new Response('<html></html>')
+		}),
+		(error: unknown) =>
+			error instanceof AIRequestError && error.status === 499 && error.code === 'request_cancelled'
+	);
+});

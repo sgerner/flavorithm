@@ -324,19 +324,34 @@ export async function readJson(request: Request): Promise<unknown> {
 
 export class ApiError extends Error {
 	readonly status: number;
+	readonly retryAfter?: number;
 
-	constructor(status: number, message: string) {
+	constructor(status: number, message: string, retryAfter?: number) {
 		super(message);
 		this.name = 'ApiError';
 		this.status = status;
+		this.retryAfter = retryAfter;
 	}
+}
+
+export function formatRetryWait(seconds: number): string {
+	const safeSeconds = Math.max(1, Math.ceil(seconds));
+	if (safeSeconds >= 60) {
+		const minutes = Math.ceil(safeSeconds / 60);
+		return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+	}
+	return `${safeSeconds} second${safeSeconds === 1 ? '' : 's'}`;
 }
 
 export function errorResponse(error: unknown): Response {
 	const status = error instanceof ApiError ? error.status : 500;
 	const message = error instanceof ApiError ? error.message : 'An unexpected server error occurred';
+	const headers =
+		error instanceof ApiError && error.retryAfter
+			? { 'Retry-After': String(Math.max(1, Math.ceil(error.retryAfter))) }
+			: undefined;
 	if (status === 500) console.error('API request failed:', error);
-	return Response.json({ error: message }, { status });
+	return Response.json({ error: message }, { status, ...(headers ? { headers } : {}) });
 }
 
 export function assertSameOrigin(request: Request): void {
@@ -1074,7 +1089,14 @@ export function consumeRateLimit(key: string, limit: number, windowMs: number): 
 		rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
 		return;
 	}
-	if (current.count >= limit) throw new ApiError(429, 'Too many attempts. Please try again later.');
+	if (current.count >= limit) {
+		const retryAfter = Math.max(1, Math.ceil((current.resetAt - now) / 1000));
+		const wait = formatRetryWait(retryAfter);
+		const message = key.startsWith('ai-user:')
+			? `Hourly AI limit reached (${limit} requests per hour). Try again in ${wait}.`
+			: `Too many attempts. Try again in ${wait}.`;
+		throw new ApiError(429, message, retryAfter);
+	}
 	current.count += 1;
 }
 

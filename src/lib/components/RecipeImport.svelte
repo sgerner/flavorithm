@@ -22,11 +22,15 @@
 	import { revealMotion } from '#lib/motion.ts';
 	let {
 		session = $bindable(),
+		visionSupported = true,
+		opensettings,
 		capture,
 		save,
 		dictate
 	}: {
 		session: ImportSession;
+		visionSupported?: boolean;
+		opensettings?: () => void;
 		capture: (
 			input: { prompt: string; image?: string },
 			signal: AbortSignal
@@ -39,6 +43,15 @@
 	let reviewingDraft = $state(untrack(() => session.draft !== null));
 	let retryAvailable = $state(false);
 	let error = $state('');
+	let visionBlocked = $state(false);
+	const visionBlockedMessage =
+		'Your selected model accepts text only and cannot read photos. Choose a model with image input in Settings, or paste recipe text instead.';
+	$effect(() => {
+		if (visionSupported && visionBlocked) {
+			visionBlocked = false;
+			if (error === visionBlockedMessage) error = '';
+		}
+	});
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let heading = $state<HTMLHeadingElement>();
@@ -61,8 +74,24 @@
 		controller?.abort();
 	});
 
+	function openPhotoPicker() {
+		if (busy || reading) return;
+		if (!visionSupported) {
+			visionBlocked = true;
+			error = visionBlockedMessage;
+			return;
+		}
+		photoInput?.click();
+	}
+
 	async function attachPhoto(file?: File) {
 		if (!file || busy || reading) return;
+		if (!visionSupported) {
+			visionBlocked = true;
+			error = visionBlockedMessage;
+			if (photoInput) photoInput.value = '';
+			return;
+		}
 		if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
 			error = 'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.';
 			return;
@@ -118,6 +147,11 @@
 	async function prepare(event: SubmitEvent) {
 		event.preventDefault();
 		if (busy || reading || !alive || (!session.text.trim() && !session.photo)) return;
+		if (session.photo && !visionSupported) {
+			visionBlocked = true;
+			error = visionBlockedMessage;
+			return;
+		}
 		error = '';
 		retryAvailable = false;
 		busy = true;
@@ -238,11 +272,7 @@
 					aria-label="Recipe photo"
 					disabled={busy || reading}
 				/>
-				<button
-					class="secondary"
-					type="button"
-					onclick={() => photoInput?.click()}
-					disabled={busy || reading}
+				<button class="secondary" type="button" onclick={openPhotoPicker} disabled={busy || reading}
 					><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
 				>
 				<button class="secondary" type="button" onclick={dictate} disabled={busy || reading}
@@ -273,9 +303,19 @@
 				</div>{/if}
 		</div>
 		{#if error}<p class="error" role="alert">{error}</p>
-			{#if /^https?:\/\/\S+$/.test(session.text.trim())}<p class="field-help">
+			{#if (visionBlocked || (session.photo && !visionSupported)) && opensettings}<button
+					class="secondary"
+					type="button"
+					onclick={opensettings}>Open AI settings</button
+				>{/if}
+			{#if /^https?:\/\/\S+$/.test(session.text.trim()) && visionSupported}<p class="field-help">
 					If a website can’t be read, copy its recipe text or attach a screenshot instead.
 				</p>{/if}{/if}
+		{#if !visionSupported && !error}<p class="field-help" role="status">
+				Your selected model accepts text only. Choose an image-capable model in{#if opensettings}
+					<button class="text-button" type="button" onclick={opensettings}>Settings</button>{:else}
+					Settings{/if} to import photos.
+			</p>{/if}
 		<div class="capture-actions">
 			{#if busy}<button class="secondary" type="button" onclick={cancelPrepare}>Cancel</button>{/if}
 			<button

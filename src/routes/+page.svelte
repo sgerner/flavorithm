@@ -65,7 +65,14 @@
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
 	import { VoiceCapture, type VoiceState } from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
-	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import {
+		buildAIPayload,
+		formatRetryWait,
+		parseRetryAfter,
+		resolveConnectionModel,
+		type ConnectionProvider,
+		type ConnectionModel
+	} from '#lib/ai-connections.ts';
 	import { quarantineLegacyKitchen } from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
@@ -316,9 +323,15 @@
 	let catalogLoading = $state(false);
 	let catalogError = $state('');
 	let catalogVersion = 0;
+	let catalogPromise: Promise<void> | null = null;
+	let connectionModel = $derived(
+		resolveConnectionModel(kitchen.preferences, providers, accountModels)
+	);
+	let aiController: AbortController | undefined;
 	let prompt = $state('');
 	let importSession = $state<ImportSession>(emptyImportSession());
 	let resumeImport = $state(false);
+	let resumePantry = $state(false);
 	let searchResults = $state<{ title: string; url: string; description: string }[]>([]);
 	type HouseholdMember = { id: string; name: string; email: string; role: string };
 	type HouseholdInvite = { inviteId: string; expiresAt: number };
@@ -539,7 +552,7 @@
 			throw error;
 		}
 		if (!response.ok) {
-			if (response.status === 401 && managedAuth) {
+			if (response.status === 401 && managedAuth && !(url === '/api/ai' && data?.code)) {
 				clearManagedIdentity();
 				renewManagedSession({ status: 401 });
 			}
@@ -548,8 +561,19 @@
 				void reconnectKitchen();
 				notify('Your household changed in another tab. Checking for updates.');
 			}
-			throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), {
-				status: response.status
+			const retryAfter = parseRetryAfter(response.headers.get('retry-after'));
+			let message = data.error || 'Something went wrong. Please try again.';
+			if (
+				response.status === 429 &&
+				retryAfter &&
+				!/\b\d+\s+(?:second|minute|hour)/i.test(message)
+			) {
+				message = `${message.replace(/\s*$/, '')} Try again in ${formatRetryWait(retryAfter)}.`;
+			}
+			throw Object.assign(new Error(message), {
+				status: response.status,
+				code: data.code,
+				retryAfter
 			});
 		}
 		if (url === '/api/state') stateEtag = data.state ? response.headers.get('etag') : null;
@@ -706,10 +730,12 @@
 				if (user) showStarter = false;
 				syncing = false;
 				if (user && returnFromChatGPT) await openSettings();
-				if (user)
+				if (user) {
 					await refreshConnections().catch(() =>
 						notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 					);
+					void loadModelCatalog();
+				}
 				if (verificationToken && !managedAuth) {
 					try {
 						const verified = await request('/api/auth', {
@@ -772,6 +798,7 @@
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
 			clearInterval(connectionPoll);
+			aiController?.abort();
 			voiceCapture?.cancel();
 		};
 	});
@@ -921,10 +948,14 @@
 			await refreshConnections().catch(() =>
 				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 			);
+			void loadModelCatalog();
 			password = '';
 			if (resumeImport) {
 				resumeImport = false;
 				modal = 'import';
+			} else if (resumePantry) {
+				resumePantry = false;
+				modal = 'pantry';
 			} else {
 				modal = '';
 				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
@@ -984,10 +1015,13 @@
 
 	function clearAIConnectionState() {
 		connectionAttempt++;
+		aiController?.abort();
+		aiController = undefined;
 		apiKey = '';
 		providers = [];
 		accountModels = [];
 		catalogVersion++;
+		catalogPromise = null;
 		catalogLoading = false;
 		catalogError = '';
 		clearInterval(connectionPoll);
@@ -1009,21 +1043,42 @@
 			activeChatGPTAccount.planEnabled;
 		catalogLoading = true;
 		catalogError = '';
-		const [catalog, account] = await Promise.allSettled([
-			request('/api/models'),
-			isAccount
-				? request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`)
-				: Promise.resolve(null)
-		]);
-		if (version !== catalogVersion || user?.id !== owner) return;
-		if (catalog.status === 'fulfilled') providers = catalog.value.providers;
-		else catalogError = catalog.reason.message || 'The provider catalog could not be loaded.';
-		if (account.status === 'fulfilled') accountModels = account.value?.providers[0]?.models || [];
-		else {
-			accountModels = [];
-			catalogError = account.reason.message || 'ChatGPT models could not be loaded.';
+		const run = (async () => {
+			const [catalog, account] = await Promise.allSettled([
+				request('/api/models'),
+				isAccount
+					? request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`)
+					: Promise.resolve(null)
+			]);
+			if (version !== catalogVersion || user?.id !== owner) return;
+			if (catalog.status === 'fulfilled') providers = catalog.value.providers;
+			else {
+				providers = [];
+				catalogError = catalog.reason.message || 'The provider catalog could not be loaded.';
+			}
+			if (account.status === 'fulfilled') accountModels = account.value?.providers[0]?.models || [];
+			else {
+				accountModels = [];
+				catalogError = account.reason.message || 'ChatGPT models could not be loaded.';
+			}
+			catalogLoading = false;
+		})();
+		catalogPromise = run;
+		try {
+			await run;
+		} finally {
+			if (catalogPromise === run) catalogPromise = null;
 		}
-		catalogLoading = false;
+	}
+	async function ensureModelCatalog() {
+		if (!user) return;
+		if (catalogPromise) {
+			await catalogPromise;
+			return;
+		}
+		if (!connectionModel.catalogLoaded && !catalogError) {
+			await loadModelCatalog();
+		}
 	}
 	async function refreshConnections() {
 		if (!user) return;
@@ -1310,29 +1365,41 @@
 			);
 			return false;
 		}
+		if (connectionModel.modelOmitted) {
+			notify(
+				`Model “${kitchen.preferences.model}” is not in the loaded catalog. Choose an available model in Settings if requests fail.`
+			);
+		} else if (!connectionModel.catalogLoaded && !catalogLoading) {
+			void loadModelCatalog();
+		}
 		return true;
+	}
+	function startAIRequest() {
+		aiController?.abort();
+		const current = new AbortController();
+		aiController = current;
+		return current;
+	}
+	function cancelAIRequest(message = 'Request cancelled.') {
+		if (!aiController) return;
+		aiController.abort();
+		aiController = undefined;
+		busy = false;
+		if (modal === 'generate' || modal === 'search') error = message;
+		notify(message);
 	}
 	async function ai(action: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) {
 		return request(
 			'/api/ai',
-			{
-				action,
-				...(kitchen.preferences.provider === 'chatgpt'
-					? { connectionId: kitchen.preferences.chatgptAccountId }
-					: { apiKey }),
-				provider: kitchen.preferences.provider,
-				model: kitchen.preferences.model,
-				reasoning: kitchen.preferences.reasoning,
-				...(action === 'capture' || action === 'chat'
-					? {}
-					: {
-							pantry: kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired'),
-							preferences: kitchen.preferences,
-							recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
-							prompt
-						}),
-				...extra
-			},
+			buildAIPayload(action, {
+				preferences: kitchen.preferences,
+				apiKey,
+				selectedModel: connectionModel.selectedModel,
+				pantry: kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired'),
+				recipes: kitchen.recipes,
+				prompt,
+				extra
+			}),
 			'POST',
 			signal
 		);
@@ -1373,7 +1440,6 @@
 		const result = await ai(
 			'chat',
 			{
-				prompt: message,
 				messages: [
 					...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
 					{ role: 'user', content: message }
@@ -1467,7 +1533,7 @@
 				modal = 'leave';
 				break;
 			case 'scan':
-				imageInput?.click();
+				void openPantryPhotoScan();
 				break;
 			case 'dictate':
 				dictateRecipe();
@@ -1486,38 +1552,84 @@
 
 	async function generate() {
 		if (!needAI()) return;
+		const current = startAIRequest();
 		busy = true;
 		error = '';
 		try {
-			const result = await ai('generate');
+			const result = await ai('generate', {}, current.signal);
+			if (current.signal.aborted) return;
 			kitchen.recipes = insertRecipes(kitchen.recipes, result.recipes);
+			prompt = '';
 			modal = '';
 			page = 'discover';
 			filter = 'For you';
 			notify('Recipes generated.');
 		} catch (e) {
+			if (current.signal.aborted) {
+				if (!error) error = 'Request cancelled.';
+				return;
+			}
 			error = (e as Error).message;
 			notify(error);
 		} finally {
-			busy = false;
+			if (aiController === current) {
+				aiController = undefined;
+				busy = false;
+			}
 		}
 	}
+	async function openPantryPhotoScan() {
+		if (!needAI()) return;
+		await ensureModelCatalog();
+		if (connectionModel.selectedModel?.vision === false) {
+			if (modal === 'pantry') resumePantry = true;
+			void openSettings(true);
+			notify(
+				'Your selected model accepts text only and cannot scan photos. Choose a model with image input in Settings.'
+			);
+			return;
+		}
+		imageInput?.click();
+	}
 	async function scan(event: Event) {
-		const file = (event.target as HTMLInputElement).files?.[0];
-		if (!file || !needAI()) return;
+		const input = event.target as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file) return;
+		if (!needAI()) {
+			input.value = '';
+			return;
+		}
+		await ensureModelCatalog();
+		if (connectionModel.selectedModel?.vision === false) {
+			input.value = '';
+			if (modal === 'pantry') resumePantry = true;
+			void openSettings(true);
+			notify(
+				'Your selected model accepts text only and cannot scan photos. Choose a model with image input in Settings.'
+			);
+			return;
+		}
+		if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+			input.value = '';
+			notify('Choose a JPG, PNG, or WebP photo.');
+			return;
+		}
 		if (file.size > 5 * 1024 * 1024) {
+			input.value = '';
 			notify('Choose a photo under 5 MB.');
 			return;
 		}
+		const current = startAIRequest();
 		busy = true;
 		try {
 			const image = await new Promise<string>((resolve, reject) => {
 				const reader = new FileReader();
 				reader.onload = () => resolve(String(reader.result));
-				reader.onerror = reject;
+				reader.onerror = () => reject(new Error('Could not read that photo. Try another file.'));
 				reader.readAsDataURL(file);
 			});
-			const result = await ai('vision', { image });
+			const result = await ai('vision', { image }, current.signal);
+			if (current.signal.aborted) return;
 			const recognized = result.ingredients
 				.map((i: any) => `${i.quantity} ${i.unit} ${i.name}`)
 				.join('\n');
@@ -1525,9 +1637,13 @@
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
+			if (current.signal.aborted) return;
 			notify((e as Error).message);
 		} finally {
-			busy = false;
+			if (aiController === current) {
+				aiController = undefined;
+				busy = false;
+			}
 			if (imageInput) imageInput.value = '';
 		}
 	}
@@ -1785,7 +1901,10 @@
 			.map((item) => item.name.trim())
 			.filter(Boolean);
 		if (!names.length) return;
-		prompt = `Use these ingredients first, prioritizing them because they are expiring: ${names.join(', ')}. Build a practical recipe that uses as much of them as possible while following my preferences.`;
+		const prefix = 'Use these ingredients first, prioritizing them because they are expiring: ';
+		const suffix =
+			'. Build a practical recipe that uses as much of them as possible while following my preferences.';
+		prompt = `${prefix}${names.join(', ').slice(0, 2000 - prefix.length - suffix.length)}${suffix}`;
 		modal = 'generate';
 		await generate();
 	}
@@ -1925,20 +2044,30 @@
 	}
 	async function refreshNutrition() {
 		if (!selected || !needAI()) return;
+		const current = startAIRequest();
 		busy = true;
 		try {
-			const result = await ai('nutrition', { recipe: selected });
+			const result = await ai('nutrition', { recipe: selected }, current.signal);
+			if (current.signal.aborted || !selected) return;
 			selected.nutrition = result.nutrition;
 			selected.nutritionStale = false;
 			kitchen.recipes = [...kitchen.recipes];
 			notify('Nutrition estimate refreshed, per serving.');
 		} catch (e) {
+			if (current.signal.aborted) return;
 			notify((e as Error).message);
 		} finally {
-			busy = false;
+			if (aiController === current) {
+				aiController = undefined;
+				busy = false;
+			}
 		}
 	}
 	function closeDialog() {
+		if (modal === 'generate' || modal === 'search') {
+			if (aiController) cancelAIRequest();
+			prompt = '';
+		}
 		if (modal === 'plan') selected = null;
 		if (modal === 'editMeal') editingMealId = '';
 		if (modal === 'cookMeal') cookingMealId = '';
@@ -1952,12 +2081,16 @@
 		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
 			resumeImport = false;
 			modal = 'import';
+		} else if (resumePantry && (modal === 'settings' || modal === 'auth')) {
+			resumePantry = false;
+			modal = 'pantry';
 		} else modal = '';
 		error = '';
 	}
 	function openImport(text?: string) {
 		resumeImport = false;
 		if (text !== undefined) importSession = { ...emptyImportSession(), text };
+		if (user && !connectionModel.catalogLoaded && !catalogLoading) void loadModelCatalog();
 		error = '';
 		mobileNav = false;
 		modal = 'import';
@@ -1969,6 +2102,17 @@
 		if (!needAI()) {
 			resumeImport = true;
 			return null;
+		}
+		if (input.image) {
+			await ensureModelCatalog();
+			if (connectionModel.selectedModel?.vision === false) {
+				resumeImport = true;
+				void openSettings(true);
+				notify(
+					'Your selected model accepts text only and cannot read photos. Choose a model with image input in Settings.'
+				);
+				return null;
+			}
 		}
 		return ai('capture', input, signal);
 	}
@@ -2133,15 +2277,28 @@
 			openAuthentication();
 			return;
 		}
+		const current = startAIRequest();
 		busy = true;
 		error = '';
 		try {
-			searchResults = (await ai('search', { prompt: prompt || 'seasonal weeknight recipes' }))
-				.results;
+			const result = await ai(
+				'search',
+				{ prompt: (prompt.trim() || 'seasonal weeknight recipes').slice(0, 2000) },
+				current.signal
+			);
+			if (current.signal.aborted) return;
+			searchResults = result.results;
 		} catch (e) {
+			if (current.signal.aborted) {
+				if (!error) error = 'Request cancelled.';
+				return;
+			}
 			error = (e as Error).message;
 		} finally {
-			busy = false;
+			if (aiController === current) {
+				aiController = undefined;
+				busy = false;
+			}
 		}
 	}
 </script>
@@ -2319,7 +2476,7 @@
 						<button
 							class="secondary"
 							aria-label="Scan ingredients from a photo"
-							onclick={() => imageInput.click()}><Camera size={19} /></button
+							onclick={openPantryPhotoScan}><Camera size={19} /></button
 						>
 						<button class="secondary" aria-label="Dictate ingredients" onclick={dictate}
 							><Mic size={19} /></button
@@ -2338,7 +2495,7 @@
 								><button
 									class="banner-icon"
 									aria-label="Scan ingredients from a photo"
-									onclick={() => imageInput.click()}><Camera size={20} /></button
+									onclick={openPantryPhotoScan}><Camera size={20} /></button
 								><button class="banner-icon" aria-label="Dictate ingredients" onclick={dictate}
 									><Mic size={20} /></button
 								>
@@ -2493,7 +2650,7 @@
 							}}>Clear depleted items</button
 						>{/if}
 					<div>
-						<button class="secondary" onclick={() => imageInput.click()}
+						<button class="secondary" onclick={openPantryPhotoScan}
 							><Camera size={17} /> Scan a photo</button
 						><button class="secondary" onclick={dictate}
 							><Mic size={17} /> Tell us what you have</button
@@ -2895,6 +3052,7 @@
 			}
 		}
 		close={() => {
+			if (busy) cancelAIRequest();
 			selected = null;
 			selectedMealServings = undefined;
 		}}
@@ -2907,6 +3065,7 @@
 			)}
 		plan={(servings) => planRecipe(selected!, servings)}
 		nutrition={refreshNutrition}
+		oncancel={() => cancelAIRequest()}
 		edit={() => editSavedRecipe(selected!)}
 		remove={() => askDeleteRecipe(selected!)}
 		toggleHidden={() => toggleRecipeHidden(selected!)}
@@ -2973,6 +3132,11 @@
 				>
 				{#if modal === 'import'}<RecipeImport
 						bind:session={importSession}
+						visionSupported={connectionModel.selectedModel?.vision !== false}
+						opensettings={() => {
+							resumeImport = true;
+							void openSettings(true);
+						}}
 						capture={captureImport}
 						save={saveImportedRecipe}
 						dictate={dictateRecipe}
@@ -3036,7 +3200,7 @@
 							<label class="field"
 								>Allergies or ingredients to avoid<input
 									bind:value={quizAllergies}
-									maxlength="500"
+									maxlength="2000"
 									placeholder="e.g. peanuts, shellfish"
 								/></label
 							>
@@ -3064,11 +3228,12 @@
 						Separate with commas or new lines. Add quantities and units when you know them.
 					</p>
 					<div class="dialog-actions">
-						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button><button
-							class="secondary"
-							onclick={() => imageInput.click()}
-							disabled={busy}><Camera size={17} /> Use photo</button
-						><button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
+						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button
+						>{#if busy}<button class="secondary" onclick={() => cancelAIRequest()}
+								>Cancel scan</button
+							>{:else}<button class="secondary" onclick={openPantryPhotoScan}
+								><Camera size={17} /> Use photo</button
+							>{/if}<button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
 							>Add ingredients <ArrowRight size={17} /></button
 						>
 					</div>
@@ -3147,6 +3312,7 @@
 					<label class="field"
 						>What are you in the mood for?<textarea
 							rows="3"
+							maxlength="2000"
 							bind:value={prompt}
 							placeholder="e.g. a spicy vegetarian dinner in 30 minutes"></textarea></label
 					>
@@ -3170,18 +3336,29 @@
 					<label class="field"
 						>Allergies & ingredients to avoid<input
 							bind:value={kitchen.preferences.allergies}
+							maxlength="2000"
 							placeholder="e.g. peanuts, shellfish"
 						/></label
 					>
 					<p class="field-help">
 						Check all ingredients and substitutions against your allergies before cooking.
 					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-						class="primary full"
-						disabled={busy}
-						onclick={generate}
-						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
-					>
+					{#if connectionModel.modelOmitted}<p class="field-help" role="status">
+							Model “{kitchen.preferences.model}” is not in the loaded catalog. Choose an available
+							model in Settings if generation fails.
+						</p>{/if}
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="dialog-actions">
+						{#if busy}<button
+								class="secondary"
+								type="button"
+								onclick={() => cancelAIRequest('Request cancelled. Your prompt is still here.')}
+								>Cancel</button
+							>{/if}
+						<button class="primary full" disabled={busy} onclick={generate}
+							><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
+						>
+					</div>
 				{:else if modal === 'settings'}
 					<h2>Settings</h2>
 					<div class="settings-section">
@@ -3613,14 +3790,25 @@
 					<label class="field"
 						>What are you craving?<input
 							bind:value={prompt}
+							maxlength="2000"
 							placeholder="Lemony weeknight pasta…"
 						/></label
-					><button
-						class="primary full"
-						disabled={busy || !capabilities.recipeSearch}
-						onclick={internetSearch}
-						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
-					>{#if error}<p class="error" role="alert">{error}</p>{/if}
+					>
+					<div class="dialog-actions">
+						{#if busy}<button
+								class="secondary"
+								type="button"
+								onclick={() => cancelAIRequest('Search cancelled. Your query is still here.')}
+								>Cancel</button
+							>{/if}
+						<button
+							class="primary full"
+							disabled={busy || !capabilities.recipeSearch}
+							onclick={internetSearch}
+							><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
+						>
+					</div>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<button class="secondary full" onclick={() => openImport()}
 						><Plus size={17} />Import text, a link, or a photo</button
 					>

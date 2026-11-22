@@ -4,21 +4,7 @@ import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-in
 import { ApiError } from '#lib/server/db.ts';
 import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
-import { AIRequestError, getSupportedModels } from '#lib/server/ai.ts';
-
-let catalog: Promise<Awaited<ReturnType<typeof getSupportedModels>>> | undefined;
-let catalogExpiresAt = 0;
-function publicCatalog(fetcher: typeof fetch) {
-	if (!catalog || Date.now() >= catalogExpiresAt) {
-		catalogExpiresAt = Date.now() + 60 * 60 * 1000;
-		const pending = getSupportedModels(fetcher).catch((error) => {
-			if (catalog === pending) catalog = undefined;
-			throw error;
-		});
-		catalog = pending;
-	}
-	return catalog;
-}
+import { AIRequestError, getCachedSupportedModels } from '#lib/server/ai.ts';
 
 export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 	if (!locals.user) return json({ error: 'Unauthorized.' }, { status: 401 });
@@ -35,7 +21,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 			);
 			const result = await listChatGPTModels(connection.accessToken, connection.fetcher);
 			try {
-				const catalog = await publicCatalog(fetch);
+				const catalog = await getCachedSupportedModels(fetch);
 				const openai = catalog.providers.find((provider) => provider.id === 'openai');
 				for (const model of result.providers[0].models) {
 					const metadata = openai?.models.find((candidate) => candidate.id === model.id);
@@ -49,7 +35,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return json(await publicCatalog(fetch), {
+		return json(await getCachedSupportedModels(fetch), {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {

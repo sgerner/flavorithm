@@ -1,12 +1,14 @@
-import type { ReasoningSettings } from '#lib/ai-connections.ts';
+import { formatRetryWait, parseRetryAfter, type ReasoningSettings } from '#lib/ai-connections.ts';
 /** Official Sign in with ChatGPT plan inference, over the public Responses API. */
 export class ChatGPTInferenceError extends Error {
 	status: number;
 	code?: string;
-	constructor(message: string, status = 502, code?: string) {
+	retryAfter?: number;
+	constructor(message: string, status = 502, code?: string, retryAfter?: number) {
 		super(message);
 		this.status = status;
 		this.code = code;
+		this.retryAfter = retryAfter;
 		this.name = 'ChatGPTInferenceError';
 	}
 }
@@ -24,35 +26,63 @@ const knownErrors: Record<string, string> = {
 	chatpass_v2_invalid_authorization_context:
 		'The ChatGPT connection is not authorized for this request. Reconnect or check the app registration.'
 };
-function upstreamFailure(value: unknown, status = 502): ChatGPTInferenceError {
+function upstreamFailure(value: unknown, status = 502, retryAfter?: number): ChatGPTInferenceError {
 	const body = value as { error?: { code?: string }; response?: { error?: { code?: string } } };
 	const code =
 		body?.error?.code || body?.response?.error?.code || (value as { code?: string })?.code;
-	if (code && knownErrors[code])
-		return new ChatGPTInferenceError(knownErrors[code], /limit/.test(code) ? 429 : status, code);
+	if (code && knownErrors[code]) {
+		const mappedStatus = /limit/.test(code) ? 429 : status;
+		return new ChatGPTInferenceError(
+			knownErrors[code],
+			mappedStatus,
+			code,
+			mappedStatus === 429 ? (retryAfter ?? 60) : undefined
+		);
+	}
+	if (status === 400)
+		return new ChatGPTInferenceError(
+			'ChatGPT rejected this request (for example, the selected model may not accept photos). Check your input or choose another model in Settings.',
+			400,
+			code || 'invalid_input'
+		);
 	if (status === 401)
 		return new ChatGPTInferenceError(
 			'Your ChatGPT connection needs to be renewed. Reconnect the selected account.',
 			401,
-			code
+			code || 'chatgpt_auth_error'
 		);
 	if (status === 403)
 		return new ChatGPTInferenceError(
 			'ChatGPT plan access was not authorized. Check the granted permissions, account eligibility, and app registration.',
 			403,
-			code
+			code || 'chatgpt_permission_error'
 		);
-	if (status === 429)
+	if (status === 404)
 		return new ChatGPTInferenceError(
-			'ChatGPT usage is currently limited. Review ChatGPT Settings → Usage or try again later.',
-			429,
-			code
+			'The selected ChatGPT model was not found for this account. Choose an available model in Settings.',
+			404,
+			code || 'model_not_found'
 		);
+	if (status === 429) {
+		const waitNote = retryAfter
+			? `Try again in ${formatRetryWait(retryAfter)}, or review ChatGPT Settings → Usage.`
+			: 'Review ChatGPT Settings → Usage or try again later.';
+		return new ChatGPTInferenceError(
+			`ChatGPT usage is currently limited. ${waitNote}`,
+			429,
+			code || 'rate_limited',
+			retryAfter ?? 60
+		);
+	}
 	return new ChatGPTInferenceError(
 		'ChatGPT could not complete this request. No API-key billing was used as a fallback.',
 		status >= 500 ? 502 : status,
 		code
 	);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+	return error instanceof Error && (error.name === 'AbortError' || error.name === 'TimeoutError');
 }
 async function limitedJson(response: Response) {
 	if (Number(response.headers.get('content-length') || 0) > MAX_RESPONSE_BYTES)
@@ -151,9 +181,13 @@ export async function chatGPTResponse(
 		prompt: string;
 		image?: string;
 		reasoning?: ReasoningSettings;
+		signal?: AbortSignal;
 	},
 	fetcher: typeof fetch = fetch
 ): Promise<string> {
+	if (options.signal?.aborted) {
+		throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+	}
 	const controller = AbortSignal.timeout(TIMEOUT_MS);
 	const content = options.image
 		? [
@@ -182,7 +216,17 @@ export async function chatGPTResponse(
 				stream: true
 			})
 		});
-	} catch {
+	} catch (error) {
+		if (options.signal?.aborted || (!controller.aborted && isAbortLikeError(error))) {
+			throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+		}
+		if (controller.aborted) {
+			throw new ChatGPTInferenceError(
+				'ChatGPT took too long to respond. Please try again.',
+				504,
+				'timeout'
+			);
+		}
 		throw new ChatGPTInferenceError(
 			'Could not reach ChatGPT. Check your connection and try again.'
 		);
@@ -192,7 +236,11 @@ export async function chatGPTResponse(
 		try {
 			body = await limitedJson(response);
 		} catch {}
-		throw upstreamFailure(body, response.status);
+		throw upstreamFailure(
+			body,
+			response.status,
+			parseRetryAfter(response.headers.get('retry-after'))
+		);
 	}
 	if (!response.body) throw new ChatGPTInferenceError('ChatGPT returned an empty stream.');
 	const reader = response.body.getReader();
@@ -221,9 +269,17 @@ export async function chatGPTResponse(
 			throw upstreamFailure(event, 502);
 		if (event.type === 'response.incomplete')
 			throw new ChatGPTInferenceError(
-				'ChatGPT stopped before finishing the recipe. Please try again.'
+				'ChatGPT stopped before finishing because it reached the output limit. Shorten your prompt or try another model.',
+				422,
+				'output_truncated'
 			);
 		if (event.type === 'response.completed') {
+			if (event.response?.status === 'incomplete')
+				throw new ChatGPTInferenceError(
+					'ChatGPT stopped before finishing because it reached the output limit. Shorten your prompt or try another model.',
+					422,
+					'output_truncated'
+				);
 			if (event.response?.status && event.response.status !== 'completed')
 				throw new ChatGPTInferenceError('ChatGPT did not complete the request.');
 			const finalText = Array.isArray(event.response?.output)
@@ -260,6 +316,16 @@ export async function chatGPTResponse(
 		if (buffer.trim() && !completed) consumeEvent(buffer);
 	} catch (error) {
 		await reader.cancel().catch(() => {});
+		if (options.signal?.aborted || (!controller.aborted && isAbortLikeError(error))) {
+			throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+		}
+		if (controller.aborted) {
+			throw new ChatGPTInferenceError(
+				'ChatGPT took too long to respond. Please try again.',
+				504,
+				'timeout'
+			);
+		}
 		if (error instanceof ChatGPTInferenceError) throw error;
 		throw new ChatGPTInferenceError(
 			'The ChatGPT connection was interrupted before completion. Please try again.'

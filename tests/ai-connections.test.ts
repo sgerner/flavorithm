@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { searchConnections, searchModels } from '../src/lib/ai-connections.ts';
+import {
+	buildAIPayload,
+	formatRetryWait,
+	parseRetryAfter,
+	resolveConnectionModel,
+	searchConnections,
+	searchModels
+} from '../src/lib/ai-connections.ts';
+import { defaultPreferences, seedRecipes } from '../src/lib/data.ts';
 import { transformModelCatalog, runAIRequest, AIRequestError } from '../src/lib/server/ai.ts';
 
 const model = {
@@ -160,4 +168,130 @@ test('unsupported providers and invalid model reasoning are rejected before any 
 			(error: unknown) => error instanceof AIRequestError && error.status === 400
 		);
 	}
+});
+
+test('resolveConnectionModel distinguishes listed vision/text models, omitted models, and catalog outages', () => {
+	const { providers } = transformModelCatalog({
+		openai: {
+			name: 'OpenAI',
+			models: {
+				'gpt-4.1-mini': { name: 'GPT-4.1 mini', modalities: { input: ['text', 'image'] } },
+				'o3-mini': {
+					name: 'o3-mini',
+					reasoning: true,
+					reasoning_options: [{ type: 'effort', values: ['low', 'high'] }],
+					modalities: { input: ['text'] }
+				}
+			}
+		}
+	});
+	const accountModels = [
+		{ id: 'gpt-4.1', name: 'GPT-4.1', vision: true },
+		{ id: 'o4-mini-text', name: 'o4-mini text', vision: false }
+	];
+
+	const listedVision = resolveConnectionModel(
+		{ provider: 'openai', model: 'gpt-4.1-mini' },
+		providers,
+		[]
+	);
+	assert.equal(listedVision.catalogLoaded, true);
+	assert.equal(listedVision.modelOmitted, false);
+	assert.equal(listedVision.selectedModel?.vision, true);
+
+	const listedTextOnly = resolveConnectionModel(
+		{ provider: 'openai', model: 'o3-mini' },
+		providers,
+		[]
+	);
+	assert.equal(listedTextOnly.catalogLoaded, true);
+	assert.equal(listedTextOnly.modelOmitted, false);
+	assert.equal(listedTextOnly.selectedModel?.vision, false);
+
+	const omittedApiModel = resolveConnectionModel(
+		{ provider: 'openai', model: 'retired-model-2024' },
+		providers,
+		[]
+	);
+	assert.equal(omittedApiModel.catalogLoaded, true);
+	assert.equal(omittedApiModel.modelOmitted, true);
+	assert.equal(omittedApiModel.selectedModel, undefined);
+
+	const omittedAccountModel = resolveConnectionModel(
+		{ provider: 'chatgpt', model: 'removed-plan-model' },
+		providers,
+		accountModels
+	);
+	assert.equal(omittedAccountModel.catalogLoaded, true);
+	assert.equal(omittedAccountModel.modelOmitted, true);
+
+	const outage = resolveConnectionModel({ provider: 'openai', model: 'gpt-4.1-mini' }, [], []);
+	assert.equal(outage.catalogLoaded, false);
+	assert.equal(outage.modelOmitted, false);
+});
+
+test('buildAIPayload scopes task-required fields per action and signals default reasoning headroom', () => {
+	const rated = { ...seedRecipes[0], rating: 5 };
+	const unrated = { ...seedRecipes[1], rating: undefined };
+	const pantry = [{ id: 'p1', name: 'Tomato', quantity: 2, unit: 'whole', category: 'Produce' }];
+	const reasoningModel = {
+		id: 'custom-reasoner',
+		name: 'Custom Reasoner',
+		vision: false,
+		reasoning: { efforts: ['low', 'high'], toggle: false }
+	};
+	const prefs = { ...defaultPreferences, provider: 'openai', model: 'custom-reasoner' };
+
+	const searchPayload = buildAIPayload('search', {
+		preferences: prefs,
+		apiKey: 'secret',
+		selectedModel: reasoningModel,
+		pantry,
+		recipes: [rated, unrated],
+		prompt: 'unused dialog prompt',
+		extra: { prompt: 'lentil soup' }
+	});
+	assert.deepEqual(searchPayload, { action: 'search', prompt: 'lentil soup' });
+
+	for (const [action, extra] of [
+		['vision', { image: 'data:image/png;base64,aGVsbG8=' }],
+		['nutrition', { recipe: rated }],
+		['import', { url: 'https://www.allrecipes.com/recipe/test' }],
+		['capture', { prompt: '2 cups flour, 1 egg' }],
+		['chat', { messages: [{ role: 'user', content: 'Hi' }], context: '{}' }]
+	] as const) {
+		const payload = buildAIPayload(action, {
+			preferences: prefs,
+			apiKey: 'secret',
+			selectedModel: reasoningModel,
+			pantry,
+			recipes: [rated, unrated],
+			prompt: 'stale prompt that must not leak',
+			extra
+		});
+		assert.equal('pantry' in payload, false, `${action} must omit pantry`);
+		assert.equal('preferences' in payload, false, `${action} must omit preferences`);
+		assert.equal('recipes' in payload, false, `${action} must omit recipes`);
+		if (action !== 'capture')
+			assert.equal('prompt' in payload, false, `${action} must omit prompt`);
+		assert.deepEqual(payload.reasoning, {});
+	}
+
+	const generatePayload = buildAIPayload('generate', {
+		preferences: prefs,
+		apiKey: 'secret',
+		selectedModel: reasoningModel,
+		pantry,
+		recipes: [rated, unrated],
+		prompt: '  quick dinner  '
+	});
+	assert.deepEqual(generatePayload.pantry, pantry);
+	assert.equal((generatePayload.recipes as unknown[]).length, 1);
+	assert.equal(generatePayload.prompt, 'quick dinner');
+	assert.deepEqual(generatePayload.reasoning, {});
+
+	assert.equal(parseRetryAfter('45'), 45);
+	assert.equal(parseRetryAfter('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120);
+	assert.equal(formatRetryWait(45), '45 seconds');
+	assert.equal(formatRetryWait(61), '2 minutes');
 });
