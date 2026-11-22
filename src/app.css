@@ -1078,6 +1078,7 @@ main {
 	width: min(100%, 520px);
 	background: var(--paper);
 	padding: 40px;
+	scroll-padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
 	position: relative;
 	max-height: calc(100dvh - 56px);
 	overflow: auto;
@@ -2866,6 +2867,7 @@ html.dark[data-theme='nosh'] {
 		max-width: none;
 		max-height: calc(100dvh - 16px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
 		padding: 48px 16px max(20px, env(safe-area-inset-bottom));
+		scroll-padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
 		overscroll-behavior: contain;
 	}
 
@@ -3673,6 +3675,7 @@ html.dark[data-theme='nosh'] {
 .flavor-dialog.capture-dialog {
 	width: min(100%, 690px);
 	max-width: 690px;
+	scroll-padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
 }
 
 .capture-dialog .capture-help {
