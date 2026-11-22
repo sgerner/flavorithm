@@ -11,9 +11,14 @@ const apiPath = new URL(resolve('/api'), origin).pathname.replace(/\/$/, '');
 
 // Navigation HTML can contain an authenticated identity, including when identity is supplied by a
 // reverse proxy rather than a browser cookie. Keep only static assets in Cache Storage.
+const immutableUrls = new Set(
+	immutable
+		.map(({ path }) => toUrl(resolve(path.replace(/^\/+/, ''))))
+		.filter((url) => !isApiUrl(new URL(url)))
+);
 const staticUrls = new Set(
 	[
-		...immutable.map(({ path }) => toUrl(resolve(path.replace(/^\/+/, '')))),
+		...immutableUrls,
 		...staticAssets.map(({ path }) => toUrl(asset(path))),
 		...prerendered.map(({ path }) => toUrl(resolve(path)))
 	].filter((url) => !isApiUrl(new URL(url)))
@@ -117,14 +122,29 @@ function isCacheableLocalShell(response: Response, expectedUrl: string): boolean
 	return !/\b(private|no-store)\b/.test(cacheControl) && hasSameOrigin(expectedUrl);
 }
 
-async function fetchAndCacheStatic(url: string, required = false): Promise<Response> {
-	const response = await fetch(new Request(url, { credentials: 'same-origin', cache: 'no-store' }));
+async function fetchAndCacheStatic(
+	url: string,
+	options: { event?: ExtendableEvent; required?: boolean } = {}
+): Promise<Response> {
+	const response = await fetch(
+		new Request(
+			url,
+			immutableUrls.has(url)
+				? { credentials: 'same-origin' }
+				: { credentials: 'same-origin', cache: 'no-cache' }
+		)
+	);
 	if (isCacheableStaticResponse(response, url)) {
-		const cache = await caches.open(cacheName);
-		await cache.put(cacheKey(url), response.clone());
+		const copy = response.clone();
+		const write = caches.open(cacheName).then((cache) => cache.put(cacheKey(url), copy));
+		if (options.event) {
+			options.event.waitUntil(write);
+		} else {
+			await write;
+		}
 		return response;
 	}
-	if (required) {
+	if (options.required) {
 		throw new Error(`Required static asset could not be cached: ${url}`);
 	}
 	return response;
@@ -192,7 +212,7 @@ worker.addEventListener('install', (event: ExtendableEvent) => {
 				}
 				if (mode === 'local') {
 					const results = await Promise.allSettled([
-						...[...staticUrls].map((url) => fetchAndCacheStatic(url, true)),
+						...[...staticUrls].map((url) => fetchAndCacheStatic(url, { required: true })),
 						fetchAndCacheLocalShell(true)
 					]);
 					const failure = results.find(
@@ -272,11 +292,22 @@ worker.addEventListener('fetch', (event: FetchEvent) => {
 	if (!staticUrls.has(url.href)) return;
 	event.respondWith(
 		(async () => {
+			const cache = await caches.open(cacheName);
+			const cached = await cache.match(cacheKey(url.href));
+			if (cached) {
+				if (!immutableUrls.has(url.href)) {
+					event.waitUntil(
+						fetchAndCacheStatic(url.href).catch(() => {
+							// Keep serving the cached asset when offline revalidation fails.
+						})
+					);
+				}
+				return cached;
+			}
 			try {
-				return await fetchAndCacheStatic(url.href);
+				return await fetchAndCacheStatic(url.href, { event });
 			} catch {
-				const cache = await caches.open(cacheName);
-				return (await cache.match(cacheKey(url.href))) ?? new Response(null, { status: 504 });
+				return new Response(null, { status: 504 });
 			}
 		})()
 	);

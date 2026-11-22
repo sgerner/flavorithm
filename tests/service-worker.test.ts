@@ -33,18 +33,29 @@ function workerHarness(initialMode: string, options: HarnessOptions = {}) {
 	const origin = 'https://kitchen.example.test';
 	const version = options.version ?? 'test';
 	const cacheName = `flavorithm-${version}`;
-	const buckets = options.buckets ?? new Map<string, Map<string, Response>>();
+	const stored = options.buckets?.get(cacheName) ?? new Map<string, Response>();
+	const buckets =
+		options.buckets ??
+		new Map<string, Map<string, Response>>([
+			['flavorithm-old', new Map()],
+			[cacheName, stored],
+			['unrelated-cache', new Map()]
+		]);
 	let mode = initialMode;
 	let offline = false;
 	let loginHtml = false;
 	let skipWaitingCount = 0;
-	const stored = buckets.get(cacheName) ?? new Map<string, Response>();
-	const credentials: Array<{ path: string; credentials: string }> = [];
+	let immutableBody = '/* static */';
+	let iconBody = '<svg id="v1"></svg>';
+	let putGate: Promise<void> | null = null;
+	const credentials: Array<{ path: string; credentials: string; cache: RequestCache }> = [];
+	const waitUntilTasks: Array<Promise<unknown>> = [];
 	const handlers = new Map<string, (event: any) => void>();
 	function makeCache(bucket: Map<string, Response>) {
 		return {
 			put: async (request: Request, response: Response) => {
 				assert.equal(request.credentials, 'omit');
+				if (putGate) await putGate;
 				bucket.set(request.url, response.clone());
 			},
 			match: async (request: Request) => bucket.get(request.url)?.clone(),
@@ -60,9 +71,13 @@ function workerHarness(initialMode: string, options: HarnessOptions = {}) {
 			if (name === '$app/env') return { version };
 			if (name === '$app/manifest')
 				return {
-					assets: [{ path: 'manifest.webmanifest' }],
-					immutable: [{ path: '_app/test.js' }],
-					prerendered: []
+					assets: [
+						{ path: 'favicon.svg' },
+						{ path: 'manifest.webmanifest' },
+						{ path: 'api/asset-bypass.js' }
+					],
+					immutable: [{ path: '_app/test.js' }, { path: 'api/immutable-bypass.js' }],
+					prerendered: [{ path: '/api/prerendered-bypass' }]
 				};
 			if (name === '$app/paths')
 				return {
@@ -99,11 +114,13 @@ function workerHarness(initialMode: string, options: HarnessOptions = {}) {
 		fetch: async (request: Request) => {
 			if (offline) throw new TypeError('Offline test fixture');
 			const path = new URL(request.url).pathname;
-			credentials.push({ path, credentials: request.credentials });
+			credentials.push({ path, credentials: request.credentials, cache: request.cache });
 			const defaultFetch = async () => {
 				if (path === '/api/auth') return Response.json({ user: null, authMode: mode });
 				if (path === '/_app/test.js' && !loginHtml)
-					return new Response('/* static */', { headers: { 'content-type': 'text/javascript' } });
+					return new Response(immutableBody, { headers: { 'content-type': 'text/javascript' } });
+				if (path === '/favicon.svg' && !loginHtml)
+					return new Response(iconBody, { headers: { 'content-type': 'image/svg+xml' } });
 				if (path === '/manifest.webmanifest' && !loginHtml)
 					return new Response('{"name":"Flavorithm"}', {
 						headers: { 'content-type': 'application/manifest+json; charset=utf-8' }
@@ -118,12 +135,9 @@ function workerHarness(initialMode: string, options: HarnessOptions = {}) {
 			return defaultFetch();
 		}
 	});
-	function dispatchRequest(
-		path: string,
-		navigate = false
-	): { response: Promise<Response>; settled: Promise<void> } {
+	function dispatch(path: string, navigate = false) {
 		let pending: Promise<Response> | undefined;
-		const background: Array<Promise<unknown>> = [];
+		const eventWaitUntil: Array<Promise<unknown>> = [];
 		const request = new Request(origin + path);
 		handlers.get('fetch')!({
 			request: navigate
@@ -139,21 +153,31 @@ function workerHarness(initialMode: string, options: HarnessOptions = {}) {
 				pending = value;
 			},
 			waitUntil: (value: Promise<unknown>) => {
-				background.push(value);
+				eventWaitUntil.push(value);
+				waitUntilTasks.push(value);
 			}
 		});
+		return { pending, waitUntil: eventWaitUntil };
+	}
+	function dispatchRequest(
+		path: string,
+		navigate = false
+	): { response: Promise<Response>; settled: Promise<void> } {
+		const { pending, waitUntil } = dispatch(path, navigate);
 		assert.ok(pending, 'worker handles the tested request');
 		const response = pending;
 		const settled = (async () => {
 			await response;
-			await Promise.all(background);
+			await Promise.all(waitUntil);
 		})();
 		return { response, settled };
 	}
 	return {
 		buckets,
 		stored,
+		cacheBuckets: buckets,
 		credentials,
+		waitUntilTasks,
 		get skipWaitingCalls() {
 			return skipWaitingCount;
 		},
@@ -163,11 +187,33 @@ function workerHarness(initialMode: string, options: HarnessOptions = {}) {
 		setOffline: (value: boolean) => {
 			offline = value;
 		},
-		goOffline: () => {
-			offline = true;
+		goOffline: (value = true) => {
+			offline = value;
 		},
-		serveLoginHtml: () => {
-			loginHtml = true;
+		serveLoginHtml: (value = true) => {
+			loginHtml = value;
+		},
+		setImmutableBody: (value: string) => {
+			immutableBody = value;
+		},
+		setIconBody: (value: string) => {
+			iconBody = value;
+		},
+		gateCachePut: () => {
+			let release!: () => void;
+			putGate = new Promise<void>((resolve) => {
+				release = () => {
+					putGate = null;
+					resolve();
+				};
+			});
+			return release;
+		},
+		flushWaitUntil: async () => {
+			while (waitUntilTasks.length > 0) {
+				const batch = waitUntilTasks.splice(0);
+				await Promise.all(batch);
+			}
 		},
 		install: async () => {
 			let pending: Promise<unknown> | undefined;
@@ -187,11 +233,12 @@ function workerHarness(initialMode: string, options: HarnessOptions = {}) {
 			});
 			await pending;
 		},
+		dispatch,
 		dispatchRequest,
 		request: async (path: string, navigate = false): Promise<Response> => {
-			const { response, settled } = dispatchRequest(path, navigate);
-			await settled;
-			return response;
+			const { pending } = dispatch(path, navigate);
+			assert.ok(pending, 'worker handles the tested request');
+			return pending;
 		}
 	};
 }
@@ -252,10 +299,17 @@ test('manifest.webmanifest validates with application/manifest+json and serves o
 	const manifest = await worker.request('/manifest.webmanifest');
 	assert.equal(manifest.status, 200);
 	assert.deepEqual(await manifest.json(), { name: 'Flavorithm' });
+	await assert.doesNotReject(() => worker.flushWaitUntil());
 });
 
 test('upgrading from v1 to v2 during HTTP 503 rejects v2 install, deletes partial v2 cache, and retains flavorithm-v1', async () => {
-	for (const failingPath of ['/api/auth', '/_app/test.js', '/manifest.webmanifest', '/']) {
+	for (const failingPath of [
+		'/api/auth',
+		'/_app/test.js',
+		'/favicon.svg',
+		'/manifest.webmanifest',
+		'/'
+	]) {
 		const buckets = new Map<string, Map<string, Response>>();
 		const v1 = workerHarness('local', { version: 'v1', buckets });
 		await v1.install();
@@ -377,7 +431,7 @@ test('online local navigations with credentials include restore offlineUrl via a
 test('same-origin local redirects preserve offlineUrl while cross-origin, non-local, and gateway navigations evict it', async () => {
 	let nextNavigationResponse: (() => Response) | null = null;
 	const worker = workerHarness('local', {
-		customFetch: async (request, path, defaultFetch) => {
+		customFetch: async (request, _path, defaultFetch) => {
 			if (nextNavigationResponse && request.credentials === 'include') {
 				const reply = nextNavigationResponse;
 				nextNavigationResponse = null;
@@ -427,6 +481,7 @@ test('same-origin local redirects preserve offlineUrl while cross-origin, non-lo
 
 	// Restore shell via online local navigation, then verify non-local and gateway evictions.
 	await worker.request('/', true);
+	await worker.flushWaitUntil();
 	assert.ok(worker.stored.has('https://kitchen.example.test/'));
 
 	for (const nonLocalMode of ['oidc', 'proxy', 'invalid']) {
@@ -443,6 +498,7 @@ test('same-origin local redirects preserve offlineUrl while cross-origin, non-lo
 			`${nonLocalMode} navigation must evict offlineUrl`
 		);
 		await worker.request('/', true);
+		await worker.flushWaitUntil();
 		assert.ok(worker.stored.has('https://kitchen.example.test/'));
 	}
 
@@ -488,4 +544,151 @@ test('in-flight local shell refresh does not repopulate offlineUrl after concurr
 	releaseRefresh!();
 	await nav.settled;
 	assert.equal(worker.stored.has('https://kitchen.example.test/'), false);
+});
+
+test('precached immutable bundles serve from CacheStorage with zero online origin fetches', async () => {
+	const worker = workerHarness('local');
+	await worker.install();
+	const installImmutableFetch = worker.credentials.find(
+		(request) => request.path === '/_app/test.js'
+	);
+	assert.ok(installImmutableFetch);
+	assert.equal(installImmutableFetch.credentials, 'same-origin');
+	assert.notEqual(installImmutableFetch.cache, 'no-store');
+
+	worker.credentials.length = 0;
+	worker.waitUntilTasks.length = 0;
+	worker.setImmutableBody('/* unexpected refetch */');
+
+	const response = await worker.request('/_app/test.js');
+	assert.equal(response.status, 200);
+	assert.equal(await response.text(), '/* static */');
+	assert.equal(worker.credentials.length, 0);
+	assert.equal(worker.waitUntilTasks.length, 0);
+
+	await worker.activate();
+	assert.equal(worker.cacheBuckets.has('flavorithm-old'), false);
+	assert.equal(worker.cacheBuckets.has('flavorithm-test'), true);
+	assert.equal(worker.cacheBuckets.has('unrelated-cache'), true);
+});
+
+test('immutable cache misses populate CacheStorage asynchronously via waitUntil without blocking respondWith', async () => {
+	const worker = workerHarness('proxy');
+	worker.serveLoginHtml(true);
+	await worker.install();
+	assert.equal(worker.stored.size, 0);
+
+	worker.serveLoginHtml(false);
+	worker.credentials.length = 0;
+	const releasePut = worker.gateCachePut();
+
+	const firstResponse = await worker.request('/_app/test.js');
+	assert.equal(firstResponse.status, 200);
+	assert.equal(await firstResponse.text(), '/* static */');
+	assert.equal(worker.stored.has('https://kitchen.example.test/_app/test.js'), false);
+	assert.equal(worker.waitUntilTasks.length, 1);
+
+	releasePut();
+	await worker.flushWaitUntil();
+	assert.equal(worker.stored.has('https://kitchen.example.test/_app/test.js'), true);
+
+	worker.credentials.length = 0;
+	const secondResponse = await worker.request('/_app/test.js');
+	assert.equal(await secondResponse.text(), '/* static */');
+	assert.equal(worker.credentials.length, 0);
+});
+
+test('mutable static assets return cached responses immediately and revalidate in waitUntil', async () => {
+	const worker = workerHarness('local');
+	await worker.install();
+	worker.credentials.length = 0;
+	worker.setIconBody('<svg id="v2"></svg>');
+
+	const staleResponse = await worker.request('/favicon.svg');
+	assert.equal(staleResponse.status, 200);
+	assert.equal(await staleResponse.text(), '<svg id="v1"></svg>');
+	assert.equal(worker.waitUntilTasks.length, 1);
+	await worker.flushWaitUntil();
+
+	assert.equal(worker.credentials.length, 1);
+	assert.equal(worker.credentials[0].path, '/favicon.svg');
+	assert.equal(worker.credentials[0].credentials, 'same-origin');
+	assert.equal(worker.credentials[0].cache, 'no-cache');
+
+	const freshResponse = await worker.request('/favicon.svg');
+	assert.equal(await freshResponse.text(), '<svg id="v2"></svg>');
+	await worker.flushWaitUntil();
+
+	worker.goOffline(true);
+	const offlineHit = await worker.request('/favicon.svg');
+	assert.equal(offlineHit.status, 200);
+	assert.equal(await offlineHit.text(), '<svg id="v2"></svg>');
+	await assert.doesNotReject(() => worker.flushWaitUntil());
+});
+
+test('uncacheable and uncached static asset misses return 504 when offline', async () => {
+	const worker = workerHarness('oidc', {
+		customFetch: async (_request, path, defaultFetch) => {
+			if (path === '/favicon.svg') {
+				return new Response('<svg id="private"></svg>', {
+					headers: {
+						'content-type': 'image/svg+xml',
+						'cache-control': 'private, no-store'
+					}
+				});
+			}
+			return defaultFetch();
+		}
+	});
+	await worker.install();
+	assert.equal(worker.stored.has('https://kitchen.example.test/favicon.svg'), false);
+
+	const onlineIcon = await worker.request('/favicon.svg');
+	assert.equal(onlineIcon.status, 200);
+	assert.equal(await onlineIcon.text(), '<svg id="private"></svg>');
+	await worker.flushWaitUntil();
+	assert.equal(worker.stored.has('https://kitchen.example.test/favicon.svg'), false);
+
+	worker.goOffline(true);
+	const offlineIcon = await worker.request('/favicon.svg');
+	assert.equal(offlineIcon.status, 504);
+
+	const blockedWorker = workerHarness('proxy');
+	blockedWorker.serveLoginHtml(true);
+	await blockedWorker.install();
+	blockedWorker.goOffline(true);
+	const offlineImmutableMiss = await blockedWorker.request('/_app/test.js');
+	assert.equal(offlineImmutableMiss.status, 504);
+});
+
+test('API URLs stay excluded from static precaching and fetch interception while SSO clearOfflineShell preserves static assets', async () => {
+	const worker = workerHarness('local');
+	await worker.install();
+	assert.equal(
+		worker.credentials.some(
+			(request) => request.path.startsWith('/api/') && request.path !== '/api/auth'
+		),
+		false
+	);
+	for (const apiPath of [
+		'/api',
+		'/api/state',
+		'/api/recipe-covers/cover-1',
+		'/api/asset-bypass.js',
+		'/api/immutable-bypass.js',
+		'/api/prerendered-bypass'
+	]) {
+		assert.equal(worker.dispatch(apiPath).pending, undefined, `${apiPath} must bypass worker`);
+		assert.equal(worker.stored.has(`https://kitchen.example.test${apiPath}`), false);
+	}
+
+	assert.equal(worker.stored.has('https://kitchen.example.test/'), true);
+	assert.equal(worker.stored.has('https://kitchen.example.test/_app/test.js'), true);
+	assert.equal(worker.stored.has('https://kitchen.example.test/favicon.svg'), true);
+
+	worker.setMode('oidc');
+	await worker.request('/api/auth');
+	assert.equal(worker.stored.has('https://kitchen.example.test/'), false);
+	assert.equal(worker.stored.has('https://kitchen.example.test/_app/test.js'), true);
+	assert.equal(worker.stored.has('https://kitchen.example.test/favicon.svg'), true);
 });
