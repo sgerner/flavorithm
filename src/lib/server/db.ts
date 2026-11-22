@@ -350,6 +350,15 @@ export function assertSameOrigin(request: Request): void {
 		throw new ApiError(403, 'Cross-origin request rejected');
 }
 
+export function clientAddress(event: { getClientAddress?: () => string }): string | null {
+	try {
+		const address = event.getClientAddress?.().trim();
+		return address ? address : null;
+	} catch {
+		return null;
+	}
+}
+
 type DbUserRow = {
 	id: string;
 	name: string;
