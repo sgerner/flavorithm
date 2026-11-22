@@ -45,10 +45,14 @@ function harness(args: {
 	storage?: ReturnType<typeof memoryStorage>;
 	transport?: (user: User) => KitchenTransport;
 	initial?: AppState;
+	reactive?: boolean;
+	online?: boolean;
+	debounceMs?: number;
 }) {
 	const storage = args.storage || memoryStorage();
 	let currentUser = args.user;
 	let currentState = structuredClone(args.initial || createNewUserState());
+	let online = args.online ?? true;
 	const statuses: Array<{
 		pending: boolean;
 		syncing: boolean;
@@ -59,11 +63,19 @@ function harness(args: {
 	const controller = createKitchenSync({
 		storage,
 		getUser: () => currentUser,
-		getState: () => currentState,
+		getState: () => structuredClone(currentState),
 		setState: (state) => {
 			currentState = structuredClone(state);
 			setStates.push(structuredClone(state));
+			if (args.reactive) {
+				controller.observe(structuredClone(currentState));
+				queueMicrotask(() => {
+					controller.observe(structuredClone(currentState));
+				});
+			}
 		},
+		isOnline: () => online,
+		debounceMs: args.debounceMs,
 		onStatus: (status) => statuses.push(status),
 		transport: (user) => {
 			if (!args.transport) throw new Error('No transport configured');
@@ -75,6 +87,13 @@ function harness(args: {
 		storage,
 		statuses,
 		setStates,
+		get online() {
+			return online;
+		},
+		set online(next: boolean) {
+			online = next;
+			if (!next) controller.cancelScheduledSync();
+		},
 		get user() {
 			return currentUser;
 		},
@@ -86,6 +105,9 @@ function harness(args: {
 		},
 		set state(state: AppState) {
 			currentState = structuredClone(state);
+			if (args.reactive) {
+				controller.observe(structuredClone(currentState));
+			}
 		}
 	};
 }
@@ -272,6 +294,95 @@ test('unresolved conflicts retain the queue until an explicit resolution is chos
 	assert.equal(writes, 1);
 	assert.equal(sync.controller.snapshot(), null);
 	assert.equal(sync.statuses.at(-1)?.conflicts.length, 0);
+});
+
+test('reactive setState echoes during initialize and reconnect preserve conflicts without PUT writes', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const local = structuredClone(base);
+	local.preferences.maxTime = 20;
+	local.preferences.allergies = 'peanuts';
+	local.pantry.push({
+		id: 'local-item',
+		name: 'garlic',
+		quantity: 3,
+		unit: 'clove',
+		category: 'Produce'
+	});
+	const remote = structuredClone(base);
+	remote.preferences.maxTime = 60;
+	remote.preferences.allergies = 'shellfish';
+	remote.shopping.push({
+		id: 'remote-item',
+		name: 'milk',
+		quantity: 1,
+		unit: 'l',
+		checked: false
+	});
+	let writes = 0;
+	let server = structuredClone(remote);
+	const sync = harness({
+		user,
+		reactive: true,
+		online: false,
+		debounceMs: 15,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'v2',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				writes += 1;
+				server = structuredClone(state);
+				return { state: structuredClone(server), etag: 'v3' };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	sync.state = local;
+	assert.equal(sync.controller.snapshot()?.local.preferences.maxTime, 20);
+	assert.equal(sync.controller.snapshot()?.local.preferences.allergies, 'peanuts');
+
+	// Reconnect: initialize applies a conflict-preview state while reactive tracking is active.
+	sync.online = true;
+	sync.controller.initialize(user, remote, 'v2');
+	await new Promise((resolve) => setTimeout(resolve, 40));
+
+	assert.equal(writes, 0);
+	assert.equal(sync.statuses.at(-1)?.conflicts.length, 2);
+	assert.deepEqual(
+		sync.state.pantry.map((item) => item.id),
+		['local-item']
+	);
+	assert.deepEqual(
+		sync.state.shopping.map((item) => item.id),
+		['remote-item']
+	);
+	assert.equal(sync.controller.snapshot()?.local.preferences.maxTime, 20);
+	assert.equal(sync.controller.snapshot()?.local.preferences.allergies, 'peanuts');
+
+	// Retry sync on reconnect keeps conflicts pending for explicit review with zero PUTs.
+	await sync.controller.sync();
+	assert.equal(writes, 0);
+	assert.equal(sync.statuses.at(-1)?.conflicts.length, 2);
+	assert.ok(sync.controller.snapshot());
+
+	// Explicit resolution writes the merged result once and clears the queue.
+	await sync.controller.sync('local');
+	assert.equal(writes, 1);
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(sync.statuses.at(-1)?.conflicts.length, 0);
+	assert.equal(server.preferences.maxTime, 20);
+	assert.equal(server.preferences.allergies, 'peanuts');
+	assert.deepEqual(
+		server.shopping.map((item) => item.id),
+		['remote-item']
+	);
+	sync.controller.dispose();
 });
 
 test('storage failure blocks network sync and reports that the edit was not saved', async () => {
@@ -502,4 +613,245 @@ test('an acknowledgement retires only captured journal versions, preserving a pe
 		['peer']
 	);
 	assert.equal(storage.getItem(peerKey), null);
+});
+
+test('flush during an in-flight save waits for both active and rebased follow-up writes', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const firstEdit = structuredClone(base);
+	firstEdit.preferences.maxTime = 22;
+	const secondEdit = structuredClone(firstEdit);
+	secondEdit.preferences.allergies = 'hazelnuts';
+
+	const firstPut = deferred<{ state: AppState; etag: string }>();
+	const secondPut = deferred<{ state: AppState; etag: string }>();
+	const firstPutStarted = deferred<void>();
+	const secondPutStarted = deferred<void>();
+	let server = structuredClone(base);
+	let putCount = 0;
+
+	const sync = harness({
+		user,
+		reactive: true,
+		debounceMs: 10,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: `v${putCount + 1}`,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				putCount += 1;
+				if (putCount === 1) {
+					firstPutStarted.resolve();
+					return firstPut.promise;
+				}
+				secondPutStarted.resolve();
+				return secondPut.promise.then((result) => {
+					server = structuredClone(state);
+					return result;
+				});
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	sync.state = firstEdit;
+	await firstPutStarted.promise;
+
+	// Stage another edit while the first PUT is in flight, then flush concurrently.
+	sync.state = secondEdit;
+	let flushDone = false;
+	const flushing = sync.controller.flush().then(() => {
+		flushDone = true;
+	});
+	const coalescedFlush = sync.controller.flush();
+
+	await Promise.resolve();
+	assert.equal(flushDone, false);
+
+	server = structuredClone(firstEdit);
+	firstPut.resolve({ state: structuredClone(firstEdit), etag: 'v2' });
+	await secondPutStarted.promise;
+	assert.equal(flushDone, false);
+
+	secondPut.resolve({ state: structuredClone(secondEdit), etag: 'v3' });
+	await Promise.all([flushing, coalescedFlush]);
+
+	assert.equal(flushDone, true);
+	assert.equal(putCount, 2);
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(server.preferences.maxTime, 22);
+	assert.equal(server.preferences.allergies, 'hazelnuts');
+	sync.controller.dispose();
+});
+
+test('concurrent sync calls coalesce and non-flushing transitions await active writes without starting new saves', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const firstEdit = structuredClone(base);
+	firstEdit.preferences.maxTime = 28;
+	const putGate = deferred<{ state: AppState; etag: string }>();
+	const putStarted = deferred<void>();
+	let getCount = 0;
+	let putCount = 0;
+
+	let putCompleted = false;
+	const sync = harness({
+		user,
+		reactive: true,
+		debounceMs: 25,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => {
+				getCount += 1;
+				return {
+					state: structuredClone(base),
+					etag: 'v1',
+					userId: user.id,
+					householdId: user.householdId
+				};
+			},
+			put: async (state) => {
+				putCount += 1;
+				putStarted.resolve();
+				return putGate.promise.then(() => {
+					putCompleted = true;
+					return { state: structuredClone(state), etag: 'v2' };
+				});
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	sync.controller.stage(firstEdit);
+
+	const syncA = sync.controller.sync();
+	const syncB = sync.controller.sync();
+	await putStarted.promise;
+
+	let secondSyncResolved = false;
+	void syncB.then(() => {
+		secondSyncResolved = true;
+	});
+	let accountDeleted = false;
+	const deleting = sync.controller.transition(async () => {
+		assert.equal(putCompleted, true);
+		assert.equal(sync.statuses.at(-1)?.syncing, false);
+		assert.equal(sync.controller.snapshot(), null);
+		accountDeleted = true;
+	});
+
+	await Promise.resolve();
+	assert.equal(secondSyncResolved, false);
+	assert.equal(accountDeleted, false);
+
+	putGate.resolve({ state: structuredClone(firstEdit), etag: 'v2' });
+	await Promise.all([syncA, syncB, deleting]);
+	assert.equal(secondSyncResolved, true);
+	assert.equal(getCount, 1);
+	assert.equal(putCount, 1);
+	assert.equal(accountDeleted, true);
+	assert.equal(sync.controller.isPaused(), false);
+
+	// A pending debounce timer is cancelled by deleteAccount transition without starting a new save.
+	const unsavedEdit = structuredClone(firstEdit);
+	unsavedEdit.preferences.allergies = 'soy';
+	sync.state = unsavedEdit;
+	await sync.controller.transition(async () => {
+		sync.controller.clearContext();
+		sync.user = null;
+	});
+	await new Promise((resolve) => setTimeout(resolve, 40));
+	assert.equal(putCount, 1);
+	sync.controller.dispose();
+});
+
+test('failed logout, join, and leaveHousehold transitions release pause lock and schedule later debounced saves', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	let server = structuredClone(base);
+	let failNetwork = true;
+	let putCount = 0;
+
+	const sync = harness({
+		user,
+		reactive: true,
+		debounceMs: 15,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => {
+				if (failNetwork) throw new Error('Offline during sign-out');
+				return {
+					state: structuredClone(server),
+					etag: `v${putCount + 1}`,
+					userId: user.id,
+					householdId: user.householdId
+				};
+			},
+			put: async (state) => {
+				if (failNetwork) throw new Error('Offline during sign-out');
+				putCount += 1;
+				server = structuredClone(state);
+				return { state: structuredClone(server), etag: `v${putCount + 1}` };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	const editBeforeLogout = structuredClone(base);
+	editBeforeLogout.preferences.maxTime = 30;
+	sync.state = editBeforeLogout;
+
+	// 1. Failed logout when flush cannot sync pending edits.
+	await assert.rejects(
+		sync.controller.transition(
+			async () => {
+				throw new Error('should not reach logout endpoint');
+			},
+			{ flush: true }
+		),
+		/Sync or back up your pending kitchen changes/
+	);
+	assert.equal(sync.controller.isPaused(), false);
+
+	// Network returns and user continues editing; debounced background save resumes automatically.
+	failNetwork = false;
+	const editAfterFailedLogout = structuredClone(editBeforeLogout);
+	editAfterFailedLogout.preferences.allergies = 'almonds';
+	sync.state = editAfterFailedLogout;
+	for (let attempt = 0; attempt < 20 && sync.controller.snapshot(); attempt += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 10));
+	}
+	assert.equal(putCount, 1);
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(server.preferences.maxTime, 30);
+	assert.equal(server.preferences.allergies, 'almonds');
+
+	// 2. Failed join and leaveHousehold endpoints after flush also unlock and schedule later saves.
+	for (const label of ['join', 'leaveHousehold']) {
+		await assert.rejects(
+			sync.controller.transition(
+				async () => {
+					throw new Error(`${label} rejected`);
+				},
+				{ flush: true }
+			),
+			new RegExp(`${label} rejected`)
+		);
+		assert.equal(sync.controller.isPaused(), false);
+
+		const nextEdit = structuredClone(sync.state);
+		nextEdit.preferences.maxTime = label === 'join' ? 35 : 40;
+		sync.state = nextEdit;
+		for (let attempt = 0; attempt < 20 && sync.controller.snapshot(); attempt += 1) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		assert.equal(sync.controller.snapshot(), null);
+		assert.equal(server.preferences.maxTime, nextEdit.preferences.maxTime);
+	}
+	assert.equal(putCount, 3);
+	sync.controller.dispose();
 });

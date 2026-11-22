@@ -16,7 +16,15 @@ import {
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> &
 	Partial<Pick<Storage, 'key' | 'length'>>;
-type SyncStatus = { pending: boolean; syncing: boolean; conflicts: SyncConflict[]; error: string };
+export type SyncStatus = {
+	pending: boolean;
+	syncing: boolean;
+	conflicts: SyncConflict[];
+	error: string;
+};
+export type TransitionOptions = {
+	flush?: boolean;
+};
 type ConfirmedKitchen = {
 	userId: string;
 	householdId: string;
@@ -128,12 +136,33 @@ export function createKitchenSync(options: {
 	setState: (state: AppState) => void;
 	onStatus: (status: SyncStatus) => void;
 	transport: (user: User) => KitchenTransport;
+	isOnline?: () => boolean;
+	debounceMs?: number;
 }) {
 	let active: ActiveContext | null = null;
 	let generation = 0;
+	let applyingStateDepth = 0;
+	let pauseDepth = 0;
+	let saveTimer: ReturnType<typeof setTimeout> | undefined;
+	let currentSync: {
+		context: ActiveContext;
+		promise: Promise<void>;
+		prefer?: 'local' | 'remote';
+	} | null = null;
+	let idleWait: Promise<void> | null = null;
+	let currentFlush: Promise<void> | null = null;
 	const writerId = randomId();
 	const memoryRecords = new Map<string, Map<string, MemoryRecord>>();
 	const baselines = new Map<string, ConfirmedKitchen>();
+	const isOnline = () => options.isOnline?.() ?? true;
+	const debounceMs = options.debounceMs ?? 500;
+
+	function cancelScheduledSync(): void {
+		if (saveTimer !== undefined) {
+			clearTimeout(saveTimer);
+			saveTimer = undefined;
+		}
+	}
 
 	const statusOf = (context: ActiveContext): SyncStatus => ({
 		pending: !!context.pending,
@@ -150,8 +179,14 @@ export function createKitchenSync(options: {
 	};
 	const setContextState = (context: ActiveContext, state: AppState) => {
 		if (isActive(context)) {
-			context.viewState = clone(state);
-			options.setState(clone(state));
+			const next = clone(state);
+			context.viewState = next;
+			applyingStateDepth += 1;
+			try {
+				options.setState(clone(next));
+			} finally {
+				applyingStateDepth -= 1;
+			}
 		}
 	};
 
@@ -273,6 +308,7 @@ export function createKitchenSync(options: {
 	function activate(user: User): ActiveContext | null {
 		const identity = { userId: user.id, householdId: user.householdId };
 		if (!isSameIdentity(options.getUser(), identity)) return null;
+		cancelScheduledSync();
 		generation += 1;
 		const key = identityKey(identity);
 		const context: ActiveContext = {
@@ -415,15 +451,19 @@ export function createKitchenSync(options: {
 	}
 
 	function stage(state: AppState): void {
+		if (applyingStateDepth > 0) return;
 		const context = active;
 		if (!context || !isActive(context)) return;
-		context.error = '';
 		const next = clone(state);
 		if (!isState(next)) {
 			context.error = 'The kitchen state is invalid and was not saved.';
 			emitStatus(context);
 			return;
 		}
+		if (context.viewState && equal(next, context.viewState)) {
+			return;
+		}
+		context.error = '';
 		const loaded = loadJournal(context);
 		const own = loaded.records.find((record) => record.writerId === writerId);
 		const base = own?.pending.base || context.viewState || context.baseline?.state;
@@ -432,18 +472,21 @@ export function createKitchenSync(options: {
 			emitStatus(context);
 			return;
 		}
-		if (own && equal(next, own.pending.local)) {
+		const localNext =
+			own && context.viewState && !equal(context.viewState, own.pending.local)
+				? mergeKitchenStates(context.viewState, next, own.pending.local, 'local').state
+				: next;
+		if (own && equal(localNext, own.pending.local)) {
 			context.viewState = next;
 			updateAggregate(context, loaded, context.baseline?.state || base);
 			emitStatus(context);
 			return;
 		}
-		if (!own && equal(next, context.viewState)) {
-			updateAggregate(context, loaded, context.baseline?.state || base);
-			emitStatus(context);
-			return;
-		}
-		if (own && equal(next, own.pending.base)) {
+		if (
+			own &&
+			equal(localNext, own.pending.base) &&
+			(!context.baseline || equal(localNext, context.baseline.state))
+		) {
 			try {
 				acknowledge(context, [own]);
 				const after = loadJournal(context);
@@ -467,7 +510,7 @@ export function createKitchenSync(options: {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
 			base: clone(own?.pending.base || context.viewState || context.baseline!.state),
-			local: next,
+			local: localNext,
 			etag: own?.pending.etag ?? (context.baseline?.etag || null),
 			createdAt: own?.pending.createdAt ?? now,
 			updatedAt: now,
@@ -515,9 +558,60 @@ export function createKitchenSync(options: {
 		emitStatus(context);
 	}
 
-	async function sync(prefer?: 'local' | 'remote'): Promise<void> {
+	function scheduleDebouncedSync(): void {
+		cancelScheduledSync();
 		const context = active;
-		if (!context || !isActive(context) || context.syncing) return;
+		if (
+			!context ||
+			!isActive(context) ||
+			pauseDepth > 0 ||
+			!isOnline() ||
+			!context.pending ||
+			!context.pendingDurable ||
+			context.blockedByStorage ||
+			context.conflicts.length > 0 ||
+			!!context.error
+		) {
+			return;
+		}
+		saveTimer = setTimeout(() => {
+			saveTimer = undefined;
+			if (!active || !isActive(active) || pauseDepth > 0 || !isOnline()) return;
+			void sync();
+		}, debounceMs);
+	}
+
+	function observe(state: AppState): void {
+		if (applyingStateDepth > 0) return;
+		const context = active;
+		if (!context || !isActive(context)) {
+			cancelScheduledSync();
+			return;
+		}
+		if (!context.viewState || !equal(state, context.viewState)) {
+			stage(state);
+		}
+		scheduleDebouncedSync();
+	}
+
+	function waitForIdle(): Promise<void> {
+		if (idleWait) return idleWait;
+		if (!currentSync) return Promise.resolve();
+		idleWait = (async () => {
+			try {
+				while (currentSync) {
+					await currentSync.promise;
+				}
+			} finally {
+				idleWait = null;
+			}
+		})();
+		return idleWait;
+	}
+
+	function startSyncPass(prefer?: 'local' | 'remote'): Promise<void> {
+		const context = active;
+		if (!context || !isActive(context)) return Promise.resolve();
 		const loaded = loadJournal(context);
 		if (!loaded.records.length) {
 			context.pending = null;
@@ -525,7 +619,7 @@ export function createKitchenSync(options: {
 			context.blockedByStorage = !!loaded.error;
 			context.error = loaded.error;
 			emitStatus(context);
-			return;
+			return Promise.resolve();
 		}
 		context.pending = aggregatePending(
 			context,
@@ -540,109 +634,217 @@ export function createKitchenSync(options: {
 		if (!loaded.durable || loaded.blocked) {
 			context.error ||= 'Offline changes are not safely saved on this device, so sync is paused.';
 			emitStatus(context);
-			return;
+			return Promise.resolve();
 		}
 		const captured = clone(loaded.records);
 		context.syncing = true;
 		context.error = '';
 		emitStatus(context);
-		let shouldContinue = false;
-		try {
-			const raw = options.transport(clone(context.user));
-			if (
-				raw.identity.userId !== context.identity.userId ||
-				raw.identity.householdId !== context.identity.householdId
-			) {
-				throw Object.assign(
-					new Error('The sync connection belongs to a different account or household.'),
-					{ status: 409 }
-				);
-			}
-			const identity = { ...raw.identity };
-			const guarded: KitchenTransport = {
-				identity,
-				get: async () => {
-					if (!isActive(context))
-						throw Object.assign(new Error('Kitchen account changed.'), { status: 409 });
-					const result = await raw.get();
-					if (!isActive(context))
-						throw Object.assign(new Error('Kitchen account changed.'), { status: 409 });
-					return result;
-				},
-				put: async (state, etag) => {
-					if (!isActive(context))
-						throw Object.assign(new Error('Kitchen account changed.'), { status: 409 });
-					return raw.put(state, etag);
+		let finishedSynchronously = false;
+		const entry: {
+			context: ActiveContext;
+			promise: Promise<void>;
+			prefer?: 'local' | 'remote';
+		} = {
+			context,
+			promise: Promise.resolve(),
+			prefer
+		};
+		entry.promise = (async () => {
+			let shouldContinue = false;
+			try {
+				const raw = options.transport(clone(context.user));
+				if (
+					raw.identity.userId !== context.identity.userId ||
+					raw.identity.householdId !== context.identity.householdId
+				) {
+					throw Object.assign(
+						new Error('The sync connection belongs to a different account or household.'),
+						{ status: 409 }
+					);
 				}
-			};
-			const result = await syncPendingKitchenJournal(captured, guarded, prefer);
-			if (!isActive(context)) return;
-			if (!result.saved) {
-				context.conflicts = clone(result.conflicts);
-				context.pending = aggregatePending(context, captured, result.state);
-				context.error = 'Resolve the kitchen conflicts before syncing these changes.';
-				return;
-			}
-			try {
-				saveBaseline(context, result.state, result.etag);
-			} catch {
-				context.error =
-					'The server saved these changes, but the confirmed state could not be saved on this device.';
-				return;
-			}
-			let afterSaveError = '';
-			try {
-				acknowledge(context, captured);
-			} catch {
-				afterSaveError =
-					'The server saved these changes, but acknowledged journal entries could not be retired.';
-			}
-			let remaining = loadJournal(context);
-			afterSaveError ||= rebaseNewerWriterRecords(
-				context,
-				captured,
-				remaining.records,
-				result.state,
-				result.etag
-			);
-			remaining = loadJournal(context);
-			const merged = updateAggregate(context, remaining, result.state);
-			if (remaining.records.length) {
-				setContextState(context, merged.state);
-				shouldContinue = remaining.durable && !remaining.blocked && merged.conflicts.length === 0;
-				if (merged.conflicts.length) {
+				const identity = { ...raw.identity };
+				const guarded: KitchenTransport = {
+					identity,
+					get: async () => {
+						if (!isActive(context))
+							throw Object.assign(new Error('Kitchen account changed.'), { status: 409 });
+						const result = await raw.get();
+						if (!isActive(context))
+							throw Object.assign(new Error('Kitchen account changed.'), { status: 409 });
+						return result;
+					},
+					put: async (state, etag) => {
+						if (!isActive(context))
+							throw Object.assign(new Error('Kitchen account changed.'), { status: 409 });
+						return raw.put(state, etag);
+					}
+				};
+				const result = await syncPendingKitchenJournal(captured, guarded, prefer);
+				if (!isActive(context)) return;
+				if (!result.saved) {
+					context.conflicts = clone(result.conflicts);
+					context.pending = aggregatePending(context, captured, result.state);
+					context.error = 'Resolve the kitchen conflicts before syncing these changes.';
+					return;
+				}
+				try {
+					saveBaseline(context, result.state, result.etag);
+				} catch {
 					context.error =
-						'Newer offline edits overlap saved changes. Review the conflicts before syncing.';
+						'The server saved these changes, but the confirmed state could not be saved on this device.';
+					return;
 				}
+				let afterSaveError = '';
+				try {
+					acknowledge(context, captured);
+				} catch {
+					afterSaveError =
+						'The server saved these changes, but acknowledged journal entries could not be retired.';
+				}
+				let remaining = loadJournal(context);
+				afterSaveError ||= rebaseNewerWriterRecords(
+					context,
+					captured,
+					remaining.records,
+					result.state,
+					result.etag
+				);
+				remaining = loadJournal(context);
+				const merged = updateAggregate(context, remaining, result.state);
+				if (remaining.records.length) {
+					setContextState(context, merged.state);
+					shouldContinue = remaining.durable && !remaining.blocked && merged.conflicts.length === 0;
+					if (merged.conflicts.length) {
+						context.error =
+							'Newer offline edits overlap saved changes. Review the conflicts before syncing.';
+					}
+				} else {
+					context.pending = null;
+					context.pendingDurable = false;
+					context.blockedByStorage = !!remaining.error;
+					context.conflicts = [];
+					context.viewState = clone(result.state);
+					setContextState(context, result.state);
+				}
+				if (remaining.error) context.error = remaining.error;
+				if (afterSaveError) context.error = afterSaveError;
+			} catch (error) {
+				if (isActive(context)) {
+					context.error =
+						error instanceof Error ? error.message : 'Could not sync offline changes.';
+				}
+			} finally {
+				finishedSynchronously = true;
+				if (currentSync === entry) currentSync = null;
+				if (isActive(context)) {
+					context.syncing = false;
+					emitStatus(context);
+					if (shouldContinue && context.pending && context.pendingDurable && !context.error) {
+						void startSyncPass(prefer);
+					}
+				}
+			}
+		})();
+		if (!finishedSynchronously && !currentSync) {
+			currentSync = entry;
+		}
+		return entry.promise;
+	}
+
+	async function sync(prefer?: 'local' | 'remote'): Promise<void> {
+		cancelScheduledSync();
+		if (currentSync) {
+			const runningContext = currentSync.context;
+			const runningPrefer = currentSync.prefer;
+			await waitForIdle();
+			if (
+				active &&
+				isActive(active) &&
+				snapshot() &&
+				(runningContext !== active || (prefer !== undefined && prefer !== runningPrefer))
+			) {
+				await startSyncPass(prefer);
+				await waitForIdle();
+			}
+			return;
+		}
+		await startSyncPass(prefer);
+	}
+
+	function flush(): Promise<void> {
+		if (currentFlush) return currentFlush;
+		currentFlush = (async () => {
+			try {
+				cancelScheduledSync();
+				const context = active;
+				if (!context || !isActive(context)) {
+					await waitForIdle();
+					return;
+				}
+				stage(options.getState());
+				if (currentSync) {
+					const runningContext = currentSync.context;
+					await waitForIdle();
+					if (
+						isActive(context) &&
+						snapshot() &&
+						(runningContext !== context ||
+							(!context.conflicts.length && !context.blockedByStorage && !context.error))
+					) {
+						await startSyncPass();
+						await waitForIdle();
+					}
+				} else {
+					await startSyncPass();
+					await waitForIdle();
+				}
+				if (snapshot()) {
+					throw new Error(
+						'Sync or back up your pending kitchen changes before switching accounts or households.'
+					);
+				}
+			} finally {
+				currentFlush = null;
+			}
+		})();
+		return currentFlush;
+	}
+
+	async function transition<T>(
+		fn: () => Promise<T>,
+		transitionOptions?: TransitionOptions
+	): Promise<T> {
+		cancelScheduledSync();
+		pauseDepth += 1;
+		try {
+			if (transitionOptions?.flush) {
+				await flush();
 			} else {
-				context.pending = null;
-				context.pendingDurable = false;
-				context.blockedByStorage = !!remaining.error;
-				context.conflicts = [];
-				context.viewState = clone(result.state);
-				setContextState(context, result.state);
+				await waitForIdle();
 			}
-			if (remaining.error) context.error = remaining.error;
-			if (afterSaveError) context.error = afterSaveError;
-		} catch (error) {
-			if (isActive(context)) {
-				context.error = error instanceof Error ? error.message : 'Could not sync offline changes.';
-			}
+			return await fn();
 		} finally {
-			if (isActive(context)) {
-				context.syncing = false;
-				emitStatus(context);
-				if (shouldContinue && context.pending && context.pendingDurable && !context.error) {
-					void sync(prefer);
-				}
+			pauseDepth = Math.max(0, pauseDepth - 1);
+			if (pauseDepth === 0) {
+				scheduleDebouncedSync();
 			}
 		}
 	}
 
+	function isPaused(): boolean {
+		return pauseDepth > 0;
+	}
+
 	function clearContext(): void {
+		cancelScheduledSync();
 		generation += 1;
 		active = null;
 		options.onStatus({ pending: false, syncing: false, conflicts: [], error: '' });
+	}
+
+	function dispose(): void {
+		cancelScheduledSync();
 	}
 
 	function snapshot(): PendingKitchen | null {
@@ -650,9 +852,23 @@ export function createKitchenSync(options: {
 		const loaded = loadJournal(active);
 		if (!loaded.records.length) return null;
 		const seed = active.baseline?.state || loaded.records[0].pending.base;
-		const merged = mergePendingKitchenJournal(loaded.records, seed);
+		const merged = mergePendingKitchenJournal(loaded.records, seed, 'local');
 		return aggregatePending(active, loaded.records, merged.state);
 	}
 
-	return { initialize, restore, stage, sync, snapshot, clearContext };
+	return {
+		initialize,
+		restore,
+		stage,
+		observe,
+		sync,
+		flush,
+		waitForIdle,
+		transition,
+		cancelScheduledSync,
+		isPaused,
+		snapshot,
+		clearContext,
+		dispose
+	};
 }

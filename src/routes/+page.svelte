@@ -544,7 +544,7 @@
 				renewManagedSession({ status: 401 });
 			}
 			if (response.status === 412 || response.status === 428) {
-				clearTimeout(saveTimer);
+				kitchenSync?.cancelScheduledSync();
 				void reconnectKitchen();
 				notify('Your household changed in another tab. Checking for updates.');
 			}
@@ -556,14 +556,14 @@
 		return data;
 	}
 
-	let syncing = $state(false);
 	$effect(() => {
 		page;
 		if (ready) window.scrollTo({ top: 0, behavior: 'instant' });
 	});
 	let stateEtag: string | null = null;
-	let writeChain = Promise.resolve();
-	let saveTimer: ReturnType<typeof setTimeout>;
+	function runSyncTransition<T>(fn: () => Promise<T>, options?: { flush?: boolean }): Promise<T> {
+		return kitchenSync ? kitchenSync.transition(fn, options) : fn();
+	}
 	$effect(() => {
 		const snapshot = JSON.stringify(kitchen);
 		if (!ready) return;
@@ -577,12 +577,8 @@
 				notify('Device storage is full. Export your kitchen before leaving.');
 			}
 		}
-		if (user) kitchenSync?.stage(JSON.parse(snapshot));
-		clearTimeout(saveTimer);
-		if (user && !syncing && online)
-			saveTimer = setTimeout(() => {
-				void retrySync();
-			}, 500);
+		if (user) kitchenSync?.observe(JSON.parse(snapshot));
+		else kitchenSync?.cancelScheduledSync();
 	});
 	onMount(() => {
 		online = navigator.onLine;
@@ -593,6 +589,7 @@
 			setState: (state) => {
 				kitchen = state;
 			},
+			isOnline: () => online,
 			onStatus: (status) => {
 				pendingSync = status.pending;
 				sendingSync = status.syncing;
@@ -687,24 +684,24 @@
 					emailDelivery: Boolean(data.capabilities?.emailDelivery),
 					recipeSearch: Boolean(data.capabilities?.recipeSearch)
 				};
-				syncing = true;
-				user = data.user ?? null;
-				if (!user) {
-					kitchenSync?.clearContext();
-					localStorage.removeItem('flavorithm-last-account');
-					if (managedAuth) {
-						clearManagedIdentity();
-						renewManagedSession({ status: 401 });
+				await runSyncTransition(async () => {
+					user = data.user ?? null;
+					if (!user) {
+						kitchenSync?.clearContext();
+						localStorage.removeItem('flavorithm-last-account');
+						if (managedAuth) {
+							clearManagedIdentity();
+							renewManagedSession({ status: 401 });
+						}
 					}
-				}
-				if (data.user) {
-					const saved = await request('/api/state');
-					adoptKitchen(saved.state || createNewUserState());
-					kitchenLoaded = true;
-				}
-				user = data.user ?? null;
-				if (user) showStarter = false;
-				syncing = false;
+					if (data.user) {
+						const saved = await request('/api/state');
+						adoptKitchen(saved.state || createNewUserState());
+						kitchenLoaded = true;
+					}
+					user = data.user ?? null;
+					if (user) showStarter = false;
+				});
 				if (user && returnFromChatGPT) await openSettings();
 				if (user)
 					await refreshConnections().catch(() =>
@@ -740,7 +737,6 @@
 						}
 					} catch {}
 				}
-				syncing = false;
 				notify(
 					managedAuth
 						? 'Your organization session could not be confirmed. Reconnect to continue.'
@@ -761,7 +757,10 @@
 		const connectionChanged = () => {
 			online = navigator.onLine;
 			if (online) void reconnectKitchen();
-			else if (managedAuth) clearManagedIdentity();
+			else {
+				kitchenSync?.cancelScheduledSync();
+				if (managedAuth) clearManagedIdentity();
+			}
 		};
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
@@ -770,7 +769,7 @@
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
-			clearTimeout(saveTimer);
+			kitchenSync?.dispose();
 			clearInterval(connectionPoll);
 			voiceCapture?.cancel();
 		};
@@ -832,16 +831,7 @@
 			);
 	}
 	async function flushKitchen() {
-		clearTimeout(saveTimer);
-		await writeChain;
-		if (user && kitchenSync) {
-			kitchenSync.stage(JSON.parse(JSON.stringify(kitchen)));
-			await kitchenSync.sync();
-			if (kitchenSync.snapshot())
-				throw new Error(
-					'Sync or back up your pending kitchen changes before switching accounts or households.'
-				);
-		}
+		await kitchenSync?.flush();
 	}
 
 	function freshKitchen() {
@@ -897,27 +887,26 @@
 		busy = true;
 		error = '';
 		try {
-			syncing = true;
-			clearTimeout(saveTimer);
-			const guestKitchen =
-				authMode === 'register' ? (JSON.parse(JSON.stringify(kitchen)) as AppState) : null;
-			const result = await request('/api/auth', { action: authMode, name, email, password });
-			user = result.user;
-			const saved = await request('/api/state');
-			if (guestKitchen) {
-				adoptKitchen(saved.state || createNewUserState());
-				kitchen = guestKitchen;
-				kitchenSync?.stage(guestKitchen);
-				await kitchenSync?.sync();
-			} else if (saved.state) adoptKitchen(saved.state);
-			else {
-				kitchen = guestKitchen ?? createNewUserState();
-				await request('/api/state', { state: kitchen }, 'PUT');
-				adoptKitchen(kitchen);
-			}
-			user = result.user;
-			showStarter = false;
-			syncing = false;
+			await runSyncTransition(async () => {
+				const guestKitchen =
+					authMode === 'register' ? (JSON.parse(JSON.stringify(kitchen)) as AppState) : null;
+				const result = await request('/api/auth', { action: authMode, name, email, password });
+				user = result.user;
+				const saved = await request('/api/state');
+				if (guestKitchen) {
+					adoptKitchen(saved.state || createNewUserState());
+					kitchen = guestKitchen;
+					kitchenSync?.stage(guestKitchen);
+					await kitchenSync?.sync();
+				} else if (saved.state) adoptKitchen(saved.state);
+				else {
+					kitchen = guestKitchen ?? createNewUserState();
+					await request('/api/state', { state: kitchen }, 'PUT');
+					adoptKitchen(kitchen);
+				}
+				user = result.user;
+				showStarter = false;
+			});
 			await refreshConnections().catch(() =>
 				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 			);
@@ -934,14 +923,13 @@
 			error = (e as Error).message;
 		} finally {
 			busy = false;
-			syncing = false;
 		}
 	}
 	async function logout() {
 		if (managedAuth) {
 			if (!providerLogoutUrl) return;
 			try {
-				await flushKitchen();
+				await runSyncTransition(async () => {}, { flush: true });
 			} catch {
 				notify('Signing out. The latest edits may still be syncing.');
 			}
@@ -950,33 +938,34 @@
 			return;
 		}
 		try {
-			syncing = true;
-			clearTimeout(saveTimer);
-			await flushKitchen();
-			await request('/api/auth', { action: 'logout' });
-			kitchenSync?.clearContext();
-			localStorage.removeItem('flavorithm-last-account');
-			user = null;
-			inviteCode = '';
-			currentInviteId = '';
-			joinCode = '';
-			members = [];
-			householdInvites = [];
-			canManageHousehold = false;
-			importSession = emptyImportSession();
-			resumeImport = false;
-			kitchen = createInitialState();
-			quarantineLegacyKitchen(localStorage);
-			clearAIConnectionState();
-			clearInterval(connectionPoll);
-			connectionBusy = false;
-			chatGPTAuthorizationUrl = '';
-			chatGPTDevice = null;
-			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
-			stateEtag = null;
-			syncing = false;
-			modal = '';
-			notify('Signed out. Your household is safely saved.');
+			await runSyncTransition(
+				async () => {
+					await request('/api/auth', { action: 'logout' });
+					kitchenSync?.clearContext();
+					localStorage.removeItem('flavorithm-last-account');
+					user = null;
+					inviteCode = '';
+					currentInviteId = '';
+					joinCode = '';
+					members = [];
+					householdInvites = [];
+					canManageHousehold = false;
+					importSession = emptyImportSession();
+					resumeImport = false;
+					kitchen = createInitialState();
+					quarantineLegacyKitchen(localStorage);
+					clearAIConnectionState();
+					clearInterval(connectionPoll);
+					connectionBusy = false;
+					chatGPTAuthorizationUrl = '';
+					chatGPTDevice = null;
+					chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
+					stateEtag = null;
+					modal = '';
+					notify('Signed out. Your household is safely saved.');
+				},
+				{ flush: true }
+			);
 		} catch (e) {
 			notify((e as Error).message);
 		}
@@ -1902,24 +1891,23 @@
 	async function join() {
 		householdBusy = true;
 		try {
-			syncing = true;
-			clearTimeout(saveTimer);
-			await flushKitchen();
-			await request('/api/household', { action: 'join', code: joinCode.trim() });
-			joinCode = '';
-			inviteCode = '';
-			currentInviteId = '';
-			await refreshAuth();
-			const data = await request('/api/state');
-			adoptKitchen(data.state || createNewUserState());
-			await refreshHousehold();
-			syncing = false;
-			notify('Welcome to your shared kitchen.');
+			await runSyncTransition(
+				async () => {
+					await request('/api/household', { action: 'join', code: joinCode.trim() });
+					joinCode = '';
+					inviteCode = '';
+					currentInviteId = '';
+					await refreshAuth();
+					const data = await request('/api/state');
+					adoptKitchen(data.state || createNewUserState());
+					await refreshHousehold();
+					notify('Welcome to your shared kitchen.');
+				},
+				{ flush: true }
+			);
 		} catch (e) {
-			syncing = false;
 			error = (e as Error).message;
 		} finally {
-			syncing = false;
 			householdBusy = false;
 		}
 	}
@@ -2006,38 +1994,35 @@
 		busy = true;
 		error = '';
 		try {
-			syncing = true;
-			clearTimeout(saveTimer);
-			await writeChain;
-			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
-			if (user) {
-				for (const key of Object.keys(localStorage)) {
-					if (key.startsWith('flavorithm-') && key.includes(`:${user.id}:`))
-						localStorage.removeItem(key);
+			await runSyncTransition(async () => {
+				await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
+				if (user) {
+					for (const key of Object.keys(localStorage)) {
+						if (key.startsWith('flavorithm-') && key.includes(`:${user.id}:`))
+							localStorage.removeItem(key);
+					}
 				}
-			}
-			kitchenSync?.clearContext();
-			localStorage.removeItem('flavorithm-last-account');
-			user = null;
-			inviteCode = '';
-			currentInviteId = '';
-			joinCode = '';
-			members = [];
-			householdInvites = [];
-			canManageHousehold = false;
-			importSession = emptyImportSession();
-			resumeImport = false;
-			apiKey = '';
-			deletePassword = '';
-			stateEtag = null;
-			kitchen = createInitialState();
-			quarantineLegacyKitchen(localStorage);
-			syncing = false;
-			modal = '';
-			notify('Your account and personal data have been deleted.');
+				kitchenSync?.clearContext();
+				localStorage.removeItem('flavorithm-last-account');
+				user = null;
+				inviteCode = '';
+				currentInviteId = '';
+				joinCode = '';
+				members = [];
+				householdInvites = [];
+				canManageHousehold = false;
+				importSession = emptyImportSession();
+				resumeImport = false;
+				apiKey = '';
+				deletePassword = '';
+				stateEtag = null;
+				kitchen = createInitialState();
+				quarantineLegacyKitchen(localStorage);
+				modal = '';
+				notify('Your account and personal data have been deleted.');
+			});
 		} catch (e) {
 			error = (e as Error).message;
-			syncing = false;
 		} finally {
 			busy = false;
 		}
@@ -2089,23 +2074,23 @@
 		householdBusy = true;
 		error = '';
 		try {
-			syncing = true;
-			clearTimeout(saveTimer);
-			await flushKitchen();
-			await request('/api/household', { action: 'leave' });
-			joinCode = '';
-			inviteCode = '';
-			currentInviteId = '';
-			memberToRemove = null;
-			await refreshAuth();
-			const data = await request('/api/state');
-			adoptKitchen(data.state || createNewUserState());
-			await refreshHousehold();
-			syncing = false;
-			modal = '';
-			notify('You now have your own kitchen.');
+			await runSyncTransition(
+				async () => {
+					await request('/api/household', { action: 'leave' });
+					joinCode = '';
+					inviteCode = '';
+					currentInviteId = '';
+					memberToRemove = null;
+					await refreshAuth();
+					const data = await request('/api/state');
+					adoptKitchen(data.state || createNewUserState());
+					await refreshHousehold();
+					modal = '';
+					notify('You now have your own kitchen.');
+				},
+				{ flush: true }
+			);
 		} catch (e) {
-			syncing = false;
 			error = (e as Error).message;
 		} finally {
 			busy = false;
