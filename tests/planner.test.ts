@@ -16,12 +16,14 @@ import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
-import * as collectionMod from '../src/lib/recipe-collection.ts';
+import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as draftMod from '../src/lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
+
+const { MAX_RECIPES } = recipeCollectionMod;
 
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
@@ -144,7 +146,6 @@ type PlannerHarnessApi = {
 
 const noopComponent = () => {};
 const iconProxy = new Proxy({}, { get: () => noopComponent });
-const { MAX_RECIPES } = collectionMod;
 
 function createModuleMap() {
 	return {
@@ -173,7 +174,7 @@ function createModuleMap() {
 		'#lib/domain.ts': domainMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
-		'#lib/recipe-collection.ts': collectionMod,
+		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
