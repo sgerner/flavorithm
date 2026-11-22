@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { MAX_SERVINGS } from '../src/lib/recipe-draft.ts';
 import {
 	applyEditedRecipe,
 	beginDeleteSavedRecipe,
@@ -268,13 +269,24 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 	assert.equal(canceledFromDetail.selectedMealServings, 5);
 
 	// Confirming addMeal intentionally closes RecipeDetail and schedules plannedRecipe.
-	assert.deepEqual(
-		completePlanMeal(openRecipe, '2026-11-21', 'Dinner', 0, () => 'meal-1'),
-		{
-			ok: false,
-			reason: 'invalidServings'
-		}
+	for (const badServings of [0, 2.5, MAX_SERVINGS + 1]) {
+		assert.deepEqual(
+			completePlanMeal(openRecipe, '2026-11-21', 'Dinner', badServings, () => 'meal-1'),
+			{
+				ok: false,
+				reason: 'invalidServings'
+			}
+		);
+	}
+	const highYield = completePlanMeal(
+		openRecipe,
+		'2026-11-21',
+		'Dinner',
+		MAX_SERVINGS,
+		() => 'meal-max'
 	);
+	assert.equal(highYield.ok, true);
+	if (highYield.ok) assert.equal(highYield.meal.servings, MAX_SERVINGS);
 	const scheduledFromDetail = completePlanMeal(
 		fromDetail.plannedRecipe,
 		fromDetail.mealDate,

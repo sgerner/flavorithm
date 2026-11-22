@@ -1,3 +1,4 @@
+import { isValidServings } from '#lib/recipe-draft.ts';
 import type { AppState, Meal, Recipe } from '#lib/types.ts';
 
 export type RecipeSubflowReset = {
@@ -238,7 +239,7 @@ export function completePlanMeal(
 	if (!plannedRecipe || !mealDate) {
 		return { ok: false, reason: 'missing' };
 	}
-	if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
+	if (!isValidServings(plannedServings)) {
 		return { ok: false, reason: 'invalidServings' };
 	}
 	return {

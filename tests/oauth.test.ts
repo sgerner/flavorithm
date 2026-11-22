@@ -927,3 +927,76 @@ test('connection API offers device auth, supports configured hosted OAuth, and f
 	const anonymous = { ...event(), locals: { user: null } };
 	assert.equal((await route.GET(anonymous as never)).status, 401);
 });
+
+test('OAuth tables index foreign-key and expiry columns and avoid table scans on cleanups and cascades', async () => {
+	await import('../src/lib/server/oauth-storage.ts');
+	const database = backend.getDatabase();
+
+	for (const [table, expectedIndexedColumns] of [
+		['chatgpt_oauth_accounts', ['user_id']],
+		['chatgpt_oauth_pending', ['user_id', 'expires_at']],
+		['chatgpt_oauth_pairings', ['user_id', 'expires_at']],
+		['codex_device_attempts', ['user_id', 'expires_at']]
+	] as const) {
+		const indexes = database.prepare(`PRAGMA index_list("${table}")`).all() as Array<{
+			name: string;
+			partial: number;
+		}>;
+		for (const columnName of expectedIndexedColumns) {
+			const hasUnconditionalLeadingIndex = indexes.some((index) => {
+				if (index.partial !== 0) return false;
+				const columns = database.prepare(`PRAGMA index_info("${index.name}")`).all() as Array<{
+					seqno: number;
+					name: string | null;
+				}>;
+				return columns.some((column) => column.seqno === 0 && column.name === columnName);
+			});
+			assert.equal(
+				hasUnconditionalLeadingIndex,
+				true,
+				`Expected unconditional leading index on ${table}.${columnName}`
+			);
+		}
+	}
+
+	const queries = [
+		'DELETE FROM users WHERE id = ?',
+		'DELETE FROM chatgpt_oauth_pending WHERE expires_at <= ?',
+		'DELETE FROM chatgpt_oauth_pairings WHERE expires_at <= ?',
+		'DELETE FROM codex_device_attempts WHERE user_id = ? OR expires_at <= ?'
+	];
+
+	for (const sql of queries) {
+		const plan = database.prepare(`EXPLAIN QUERY PLAN ${sql}`).all() as Array<{
+			parent: number;
+			detail: string;
+		}>;
+		assert.ok(plan.length > 0, `Expected query plan for: ${sql}`);
+		assert.equal(
+			plan.some((step) => step.detail.startsWith('SEARCH ')),
+			true,
+			`Expected SEARCH step in plan for ${sql}: ${JSON.stringify(plan)}`
+		);
+		for (const step of plan) {
+			assert.doesNotMatch(step.detail, /\bSCAN\b/, `Unexpected SCAN in plan for: ${sql}`);
+			if (step.parent === 0) {
+				assert.match(
+					step.detail,
+					/^(SEARCH |MULTI-INDEX OR$)/,
+					`Expected SEARCH or MULTI-INDEX OR root step for: ${sql}`
+				);
+			}
+		}
+	}
+
+	const deviceCleanupPlan = database
+		.prepare(
+			'EXPLAIN QUERY PLAN DELETE FROM codex_device_attempts WHERE user_id = ? OR expires_at <= ?'
+		)
+		.all() as Array<{ detail: string }>;
+	assert.equal(
+		deviceCleanupPlan.some((step) => step.detail === 'MULTI-INDEX OR'),
+		true,
+		'Expected MULTI-INDEX OR plan for codex_device_attempts cleanup'
+	);
+});
