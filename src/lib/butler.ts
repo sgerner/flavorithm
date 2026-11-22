@@ -55,20 +55,12 @@ const recipe = z.object({
 	steps: z.array(text).max(200),
 	nutrition,
 	source: publicUrl.optional(),
-	provenance: z.enum(['web-import', 'ai-generated']).optional(),
+	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
 	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
 	hidden: z.boolean().optional()
-});
-const pantry = z.object({
-	id,
-	name: z.string().trim().min(1).max(200),
-	quantity,
-	unit: z.string().max(40),
-	category: z.string().max(80),
-	expires: z.string().max(40).optional()
 });
 const date = z
 	.string()
@@ -77,6 +69,14 @@ const date = z
 		const d = new Date(value + 'T12:00:00Z');
 		return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === value;
 	}, 'Use a real calendar date.');
+const pantry = z.object({
+	id,
+	name: z.string().trim().min(1).max(200),
+	quantity,
+	unit: z.string().max(40),
+	category: z.string().max(80),
+	expires: z.union([date, z.literal('')]).optional()
+});
 const meal = z.object({
 	id,
 	date,
@@ -185,32 +185,49 @@ function requireId(items: { id: string }[], target: string) {
 function upsertPantryItem(pantryItems: Ingredient[], item: Ingredient): Ingredient[] {
 	if (pantryItems.some((value) => value.id === item.id)) return upsert(pantryItems, item);
 	if (item.expires?.trim() || !item.unit.trim()) return [...pantryItems, item];
+	const normalized = normalizeName(item.name);
+	const unit = unitInfo(item.unit);
+	const destination = pantryItems.find(
+		(existing) =>
+			normalizeName(existing.name) === normalized &&
+			unitInfo(existing.unit).dimension === unit.dimension &&
+			!existing.expires?.trim()
+	);
 	if (item.quantity === 0) {
-		const normalized = normalizeName(item.name);
-		const dimension = unitInfo(item.unit).dimension;
-		const hasUnexpiredMatch = pantryItems.some(
-			(existing) =>
-				normalizeName(existing.name) === normalized &&
-				unitInfo(existing.unit).dimension === dimension &&
-				!existing.expires?.trim()
-		);
-		if (hasUnexpiredMatch) return pantryItems;
-		const { expires: _unused, ...withoutExpires } = item;
-		return [...pantryItems, withoutExpires];
+		if (destination) return pantryItems;
+		return [...pantryItems, item];
 	}
-	return transferPurchasedItemsToPantry(
-		pantryItems,
-		[
-			{
-				id: item.id,
-				name: item.name,
-				quantity: item.quantity,
-				unit: item.unit,
-				checked: true,
-				category: item.category
-			}
-		],
-		() => item.id
+	const createdItem = {
+		id: item.id,
+		name: item.name,
+		quantity: item.quantity,
+		unit: item.unit,
+		checked: true,
+		category: item.category
+	};
+	const withExplicitExpires = (items: Ingredient[]) =>
+		item.expires !== undefined
+			? items.map((entry) => (entry.id === item.id ? { ...entry, expires: item.expires } : entry))
+			: items;
+	if (destination) {
+		const baseline = Number.isFinite(destination.quantity) ? Math.max(0, destination.quantity) : 0;
+		const merged =
+			Math.round(
+				(baseline + (item.quantity * unit.factor) / unitInfo(destination.unit).factor) * 1_000_000
+			) / 1_000_000;
+		if (merged > 1_000_000) {
+			throw new Error('This proposal exceeds the kitchen storage limit. Please make room first.');
+		}
+		return transferPurchasedItemsToPantry(pantryItems, [createdItem], () => item.id);
+	}
+	if (pantryItems.length >= 1_000) {
+		return [
+			...pantryItems,
+			...withExplicitExpires(transferPurchasedItemsToPantry([], [createdItem], () => item.id))
+		];
+	}
+	return withExplicitExpires(
+		transferPurchasedItemsToPantry(pantryItems, [createdItem], () => item.id)
 	);
 }
 
@@ -269,6 +286,9 @@ export function applyButlerCommands(
 					...command.recipe,
 					...(saved !== undefined ? { saved } : {})
 				};
+				if (previous?.provenance === 'manual') updated.provenance = 'manual';
+				else if (updated.provenance === undefined && previous?.provenance)
+					updated.provenance = previous.provenance;
 				if (
 					previous &&
 					(previous.servings !== updated.servings ||
