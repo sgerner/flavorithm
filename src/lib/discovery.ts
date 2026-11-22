@@ -134,11 +134,12 @@ function scoreRecipe(
 type PantryIndex = Map<string, { item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]>;
 
 function buildPantryIndex(pantry: Ingredient[], now: Date): PantryIndex {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const pantryIndex: PantryIndex = new Map();
 	for (const item of pantry) {
 		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-		const expiry = expiryStatus(item.expires, now);
-		if (expiry === 'expired') continue;
+		const expiry = expiryStatus(item.expires, safeNow);
+		if (expiry === 'expired' || (Boolean(item.expires?.trim()) && expiry === 'unknown')) continue;
 		const key = normalizeIngredientName(item.name);
 		const entries = pantryIndex.get(key) ?? [];
 		entries.push({ item, expiry });
@@ -162,9 +163,10 @@ export function rankPantryRecipes(
 	targetIngredients?: Ingredient[],
 	now: Date = new Date()
 ): Recipe[] {
-	const pantryIndex = buildPantryIndex(pantry, now);
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const pantryIndex = buildPantryIndex(pantry, safeNow);
 	const matchIndex =
-		targetIngredients !== undefined ? buildPantryIndex(targetIngredients, now) : pantryIndex;
+		targetIngredients !== undefined ? buildPantryIndex(targetIngredients, safeNow) : pantryIndex;
 	if (!matchIndex.size) return [];
 	const rated = ratedSignals(recipes, preferences);
 
@@ -175,7 +177,7 @@ export function rankPantryRecipes(
 			const score =
 				targetMatch.available * 18 +
 				targetMatch.expiring * 8 +
-				scoreRecipe(recipe, pantryIndex, preferences, rated, now);
+				scoreRecipe(recipe, pantryIndex, preferences, rated, safeNow);
 			return [{ recipe, index, score }];
 		})
 		.sort((a, b) => b.score - a.score || a.index - b.index)
@@ -189,13 +191,14 @@ export function rankRecipes(
 	preferences: Preferences,
 	now: Date = new Date()
 ): Recipe[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const rated = ratedSignals(recipes, preferences);
-	const pantryIndex = buildPantryIndex(pantry, now);
+	const pantryIndex = buildPantryIndex(pantry, safeNow);
 	return recipes
 		.map((recipe, index) => ({
 			recipe,
 			index,
-			score: scoreRecipe(recipe, pantryIndex, preferences, rated, now)
+			score: scoreRecipe(recipe, pantryIndex, preferences, rated, safeNow)
 		}))
 		.sort((a, b) => b.score - a.score || a.index - b.index)
 		.map(({ recipe }) => recipe);
