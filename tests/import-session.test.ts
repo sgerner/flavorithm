@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createNewUserState, seedRecipes } from '#lib/data.ts';
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
 import {
 	appendImportTranscript,
 	applyImportedRecipeSave,
@@ -248,6 +249,7 @@ test('saving an imported recipe offers undo restoring prior recipes, replaced en
 	);
 	const replacementDraft = makeRecipe(originalTarget.id, {
 		title: 'Accidentally Replaced Soup',
+		image: '/legacy/placeholder.svg',
 		servings: 6,
 		importNotes: ['Estimated 1 tbsp olive oil'],
 		saved: true
@@ -270,8 +272,10 @@ test('saving an imported recipe offers undo restoring prior recipes, replaced en
 	assert.equal(applied.nextRecipes[0].title, 'Accidentally Replaced Soup');
 	assert.deepEqual(applied.nextSession, emptyImportSession());
 
-	// Simulate server /api/state validation round-trip (which normalizes key ordering via Zod).
-	const syncedKitchen = validateAppState({ ...kitchen, recipes: applied.nextRecipes });
+	// Simulate client sanitizeKitchenState + server /api/state validation round-trip (which normalizes bounds and key ordering).
+	const syncedKitchen = sanitizeKitchenState(
+		validateAppState(sanitizeKitchenState({ ...kitchen, recipes: applied.nextRecipes }))
+	);
 	assert.ok(syncedKitchen);
 
 	const rolledBack = applied.rollback(syncedKitchen);

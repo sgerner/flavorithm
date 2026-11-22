@@ -1,3 +1,4 @@
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
 import { insertRecipes } from '#lib/recipe-collection.ts';
 import {
 	createDraftBaseline,
@@ -148,14 +149,17 @@ export function applyImportedRecipeSave(
 		reviewingDraft: true
 	};
 	const nextRecipes = insertRecipes(kitchen.recipes, [saved]);
-	const appliedSnapshot = stableKitchenSnapshot({ ...previousKitchen, recipes: nextRecipes });
+	const nextState: AppState = { ...previousKitchen, recipes: nextRecipes };
+	const appliedSnapshot = stableKitchenSnapshot(nextState);
+	const sanitizedAppliedSnapshot = stableKitchenSnapshot(sanitizeKitchenState(nextState));
 	return {
 		saved,
 		nextRecipes,
 		nextSession: emptyImportSession(),
 		appliedSnapshot,
 		rollback(currentKitchen: AppState) {
-			if (stableKitchenSnapshot(currentKitchen) !== appliedSnapshot) {
+			const currentSnapshot = stableKitchenSnapshot(currentKitchen);
+			if (currentSnapshot !== appliedSnapshot && currentSnapshot !== sanitizedAppliedSnapshot) {
 				return { ok: false };
 			}
 			return {

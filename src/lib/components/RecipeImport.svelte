@@ -14,6 +14,7 @@
 	import { revealMotion } from '#lib/motion.ts';
 	import {
 		createDraftBaseline,
+		isValidNutrition,
 		MAX_SERVINGS,
 		NUTRITION_FIELDS,
 		validateRecipeDraft
@@ -37,7 +38,9 @@
 	} = $props();
 	let busy = $state(false);
 	let reading = $state(false);
-	let nutritionOpen = $state(false);
+	let nutritionOpen = $state(
+		untrack(() => (session.draft ? !isValidNutrition(session.draft.nutrition) : false))
+	);
 	let retryAvailable = $state(false);
 	let error = $state('');
 	let dragging = $state(false);
@@ -57,7 +60,7 @@
 			controller?.abort();
 			controller = undefined;
 			busy = false;
-			nutritionOpen = false;
+			nutritionOpen = session.draft ? !isValidNutrition(session.draft.nutrition) : false;
 			error = '';
 			retryAvailable = false;
 		}
@@ -169,7 +172,7 @@
 				targetSession.baseline = createDraftBaseline(result.recipe);
 				targetSession.assumptions = result.assumptions;
 				targetSession.reviewingDraft = true;
-				nutritionOpen = false;
+				nutritionOpen = !isValidNutrition(result.recipe.nutrition);
 				await tick();
 				if (alive && generation === captureGeneration && session === targetSession)
 					heading?.focus();
@@ -289,6 +292,7 @@
 						onclick={() => {
 							clearImportSourceInPlace(session);
 							error = '';
+							nutritionOpen = session.draft ? !isValidNutrition(session.draft.nutrition) : false;
 							retryAvailable = false;
 							if (photoInput) photoInput.value = '';
 						}}>Clear</button
