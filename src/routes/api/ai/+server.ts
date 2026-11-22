@@ -2,7 +2,7 @@ import { getHostAI } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import type { RequestHandler } from './$types';
-import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
+import { AIRequestError, resolvePublicFetcher, runAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
 
 const MAX_REQUEST_BYTES = 9_000_000;
@@ -39,7 +39,7 @@ export const POST: RequestHandler = async (event) => {
 		}
 
 		let connection: { accessToken: string; codex?: boolean } | undefined;
-		let providerFetch = event.fetch;
+		let providerFetch = resolvePublicFetcher(event);
 		if (
 			body &&
 			typeof body === 'object' &&
@@ -50,7 +50,11 @@ export const POST: RequestHandler = async (event) => {
 			const accountId =
 				'connectionId' in body && typeof body.connectionId === 'string' ? body.connectionId : '';
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			const resolved = await getChatGPTConnection(host?.userId ?? user.id, accountId, event.fetch);
+			const resolved = await getChatGPTConnection(
+				host?.userId ?? user.id,
+				accountId,
+				providerFetch
+			);
 			connection = { accessToken: resolved.accessToken, codex: resolved.codex };
 			providerFetch = resolved.fetcher;
 		}

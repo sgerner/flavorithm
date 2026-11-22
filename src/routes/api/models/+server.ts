@@ -3,9 +3,11 @@ import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
 import type { RequestHandler } from './$types';
-import { AIRequestError, getPublicModelCatalog } from '#lib/server/ai.ts';
+import { AIRequestError, getPublicModelCatalog, resolvePublicFetcher } from '#lib/server/ai.ts';
 
-export const GET: RequestHandler = async ({ locals, fetch, url }) => {
+export const GET: RequestHandler = async (event) => {
+	const { locals, url } = event;
+	const catalogFetcher = resolvePublicFetcher(event);
 	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
 
 	try {
@@ -16,11 +18,11 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 			const connection = await getChatGPTConnection(
 				host?.userId ?? locals.user.id,
 				host?.accountId ?? accountId,
-				fetch
+				catalogFetcher
 			);
 			const result = await listChatGPTModels(connection.accessToken, connection.fetcher);
 			try {
-				const catalog = await getPublicModelCatalog(fetch);
+				const catalog = await getPublicModelCatalog(catalogFetcher);
 				const openai = catalog.providers.find((provider) => provider.id === 'openai');
 				for (const model of result.providers[0].models) {
 					const metadata = openai?.models.find((candidate) => candidate.id === model.id);
@@ -34,7 +36,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return Response.json(await getPublicModelCatalog(fetch), {
+		return Response.json(await getPublicModelCatalog(catalogFetcher), {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {
