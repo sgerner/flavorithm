@@ -1,16 +1,24 @@
 import type { RequestHandler } from './$types';
-import { ApiError, consumeRateLimit } from '#lib/server/db.ts';
+import { ApiError, clientAddress, consumeRateLimit } from '#lib/server/db.ts';
 import { createOidcAuthorizationRedirect, getAuthMode } from '#lib/server/sso.ts';
 
-export const GET: RequestHandler = async ({ url, cookies, locals, getClientAddress }) => {
+export const GET: RequestHandler = async (event) => {
+	const { url, cookies, locals } = event;
 	if (locals.authMode !== 'oidc' || getAuthMode() !== 'oidc') {
 		return new Response('Organization sign-in is not enabled.', {
 			status: 404,
 			headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
 		});
 	}
+	const address = clientAddress(event);
+	if (!address) {
+		return new Response('The request source could not be verified.', {
+			status: 403,
+			headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' }
+		});
+	}
 	try {
-		consumeRateLimit(`oidc-login:${getClientAddress()}`, 100, 10 * 60 * 1000);
+		consumeRateLimit(`oidc-login:${address}`, 100, 10 * 60 * 1000);
 		const authorizationUrl = await createOidcAuthorizationRedirect({
 			requestUrl: url,
 			cookies,
