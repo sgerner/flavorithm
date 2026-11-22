@@ -46,7 +46,14 @@
 		RefreshCw
 	} from '@lucide/svelte';
 	import type { AppState, Meal, Recipe, User } from '#lib/types.ts';
-	import { createInitialState, createNewUserState } from '#lib/data.ts';
+	import { createInitialState, createNewUserState, defaultPreferences } from '#lib/data.ts';
+	import {
+		applyGenerateGuestFilters,
+		captureGenerateGuestFilters,
+		hasAIConnection,
+		resolvePostSetupAction,
+		type PendingAIContinuation
+	} from '#lib/ai-continuation.ts';
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
 		completeMeal,
@@ -164,9 +171,14 @@
 		modal = 'auth';
 	}
 	function clearManagedIdentity() {
+		clearPendingAIState();
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
+		selected = null;
+		editingRecipe = null;
+		selectedMealServings = undefined;
+		selectedDetailTab = 'recipe';
 		kitchen = createInitialState();
 		kitchenLoaded = false;
 		showStarter = false;
@@ -200,7 +212,7 @@
 	}
 	function dismissOnboarding() {
 		if (!kitchen.preferences.onboardingStatus) kitchen.preferences.onboardingStatus = 'skipped';
-		modal = '';
+		completePostSetupSurface();
 	}
 	function finishOnboarding(event: SubmitEvent) {
 		event.preventDefault();
@@ -212,11 +224,12 @@
 			allergies: quizAllergies.trim(),
 			onboardingStatus: 'completed'
 		});
-		modal = '';
+		completePostSetupSurface();
 		notify('Preferences saved.');
 	}
 
 	let selected = $state<Recipe | null>(null);
+	let selectedDetailTab = $state<'recipe' | 'nutrition'>('recipe');
 	let editingRecipe = $state<Recipe | null>(null);
 	let recipeToDelete = $state<Recipe | null>(null);
 	let pantryInput = $state('');
@@ -318,7 +331,8 @@
 	let catalogVersion = 0;
 	let prompt = $state('');
 	let importSession = $state<ImportSession>(emptyImportSession());
-	let resumeImport = $state(false);
+	let pendingAIContinuation = $state<PendingAIContinuation | null>(null);
+	let stagedScanFile = $state<File | null>(null);
 	let searchResults = $state<{ title: string; url: string; description: string }[]>([]);
 	type HouseholdMember = { id: string; name: string; email: string; role: string };
 	type HouseholdInvite = { inviteId: string; expiresAt: number };
@@ -361,7 +375,12 @@
 		if (modeChanged && managedAuth) clearManagedIdentity();
 		if (changedIdentity) {
 			kitchenSync?.clearContext();
+			clearPendingAIState();
 			clearAIConnectionState();
+			selected = null;
+			editingRecipe = null;
+			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 		}
 		user = data.user ?? null;
 		if (managedAuth && !user) {
@@ -881,6 +900,7 @@
 		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
 		const applied = JSON.stringify(kitchen.pantry);
 		pantryInput = '';
+		stagedScanFile = null;
 		modal = '';
 		notify(`${names.length} ingredients added to your pantry.`, () => {
 			if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
@@ -915,6 +935,9 @@
 				await request('/api/state', { state: kitchen }, 'PUT');
 				adoptKitchen(kitchen);
 			}
+			if (authMode !== 'register' && pendingAIContinuation?.kind === 'generate') {
+				applyGenerateGuestFilters(kitchen.preferences, pendingAIContinuation.guestFilters);
+			}
 			user = result.user;
 			showStarter = false;
 			syncing = false;
@@ -922,9 +945,11 @@
 				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 			);
 			password = '';
-			if (resumeImport) {
-				resumeImport = false;
-				modal = 'import';
+			const nextStep = resolvePostSetupAction(pendingAIContinuation, isAIReady());
+			if (nextStep === 'settings') {
+				await openSettings(true);
+			} else if (nextStep === 'resume') {
+				restoreAIContinuation();
 			} else {
 				modal = '';
 				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
@@ -964,7 +989,11 @@
 			householdInvites = [];
 			canManageHousehold = false;
 			importSession = emptyImportSession();
-			resumeImport = false;
+			clearPendingAIState();
+			selected = null;
+			editingRecipe = null;
+			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 			kitchen = createInitialState();
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
@@ -982,6 +1011,11 @@
 		}
 	}
 
+	function clearPendingAIState() {
+		pendingAIContinuation = null;
+		stagedScanFile = null;
+		if (imageInput) imageInput.value = '';
+	}
 	function clearAIConnectionState() {
 		connectionAttempt++;
 		apiKey = '';
@@ -1167,7 +1201,13 @@
 
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else if (importSession.text || importSession.photo || importSession.draft) {
+			else if (
+				pendingAIContinuation ||
+				stagedScanFile ||
+				importSession.text ||
+				importSession.photo ||
+				importSession.draft
+			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
 				window.location.assign(result.authorizationUrl);
@@ -1287,6 +1327,62 @@
 			chatGPTDevice = null;
 		}
 	}
+	function isAIReady() {
+		return hasAIConnection({
+			user,
+			preferences: kitchen.preferences,
+			apiKey,
+			activeChatGPTAccount
+		});
+	}
+	function recordAIContinuation(continuation: PendingAIContinuation) {
+		if (modal === 'auth' || modal === 'settings') {
+			pendingAIContinuation = continuation;
+			return true;
+		}
+		return false;
+	}
+	function restoreAIContinuation() {
+		const continuation = pendingAIContinuation;
+		pendingAIContinuation = null;
+		if (!continuation) {
+			modal = '';
+			return;
+		}
+		switch (continuation.kind) {
+			case 'import':
+				modal = 'import';
+				break;
+			case 'generate':
+				prompt = continuation.prompt;
+				modal = 'generate';
+				break;
+			case 'butler':
+				modal = '';
+				void butlerChat?.reopen(continuation.prompt);
+				break;
+			case 'scan':
+				modal = 'pantry';
+				if (stagedScanFile && isAIReady()) {
+					void scanPantryPhoto(stagedScanFile);
+				}
+				break;
+			case 'nutrition': {
+				const recipe = kitchen.recipes.find((item) => item.id === continuation.recipeId) ?? null;
+				selectedMealServings = recipe ? continuation.servings : undefined;
+				selectedDetailTab = recipe ? 'nutrition' : 'recipe';
+				selected = recipe;
+				modal = '';
+				break;
+			}
+		}
+	}
+	function completePostSetupSurface() {
+		const next = resolvePostSetupAction(pendingAIContinuation, isAIReady());
+		if (next === 'settings') void openSettings(true);
+		else if (next === 'resume') restoreAIContinuation();
+		else modal = '';
+	}
 	function needAI() {
 		if (!user) {
 			openAuthentication();
@@ -1298,11 +1394,8 @@
 			return false;
 		}
 		const isPlan = kitchen.preferences.provider === 'chatgpt';
-		if (
-			(isPlan ? !activeChatGPTAccount?.connected || !activeChatGPTAccount.planEnabled : !apiKey) ||
-			!kitchen.preferences.model
-		) {
-			openSettings(true);
+		if (!isAIReady()) {
+			void openSettings(true);
 			notify(
 				isPlan
 					? 'Connect your ChatGPT plan and choose an available model.'
@@ -1354,7 +1447,10 @@
 		recipeDrafts: Recipe[] = []
 	) {
 		if (!needAI()) {
-			butlerChat?.close();
+			if (recordAIContinuation({ kind: 'butler', prompt: message })) {
+				void butlerChat?.close();
+				return null;
+			}
 			throw new Error('Sign in and connect a model in Settings to speak with Basil.');
 		}
 		const owner = `${user?.id}:${user?.householdId}`;
@@ -1406,8 +1502,16 @@
 						(item) => item.recipeId === recipe.id && !item.completedAt
 					);
 					if (meal) openCookDialog(meal);
-					else selected = recipe;
-				} else selected = recipe ?? null;
+					else {
+						selectedMealServings = undefined;
+						selectedDetailTab = 'recipe';
+						selected = recipe;
+					}
+				} else {
+					selectedMealServings = undefined;
+					selectedDetailTab = 'recipe';
+					selected = recipe ?? null;
+				}
 			} else if (effect.type === 'ui') {
 				butlerChat?.close();
 				openButlerControl(effect.action);
@@ -1485,7 +1589,14 @@
 	}
 
 	async function generate() {
-		if (!needAI()) return;
+		const currentPrompt = prompt;
+		const guestFilters = !user
+			? captureGenerateGuestFilters(kitchen.preferences, defaultPreferences)
+			: undefined;
+		if (!needAI()) {
+			recordAIContinuation({ kind: 'generate', prompt: currentPrompt, guestFilters });
+			return;
+		}
 		busy = true;
 		error = '';
 		try {
@@ -1503,10 +1614,25 @@
 		}
 	}
 	async function scan(event: Event) {
-		const file = (event.target as HTMLInputElement).files?.[0];
-		if (!file || !needAI()) return;
+		const input = event.target as HTMLInputElement | null;
+		const file = input?.files?.[0];
+		if (input) input.value = '';
+		if (imageInput) imageInput.value = '';
+		if (!file) return;
+		if (file.type && !['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(file.type)) {
+			notify('Choose a JPG, PNG, or WebP photo.');
+			return;
+		}
 		if (file.size > 5 * 1024 * 1024) {
 			notify('Choose a photo under 5 MB.');
+			return;
+		}
+		await scanPantryPhoto(file);
+	}
+	async function scanPantryPhoto(file: File) {
+		stagedScanFile = file;
+		if (!needAI()) {
+			if (!recordAIContinuation({ kind: 'scan' })) modal = 'pantry';
 			return;
 		}
 		busy = true;
@@ -1522,9 +1648,11 @@
 				.map((i: any) => `${i.quantity} ${i.unit} ${i.name}`)
 				.join('\n');
 			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n');
+			if (stagedScanFile === file) stagedScanFile = null;
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
+			modal = 'pantry';
 			notify((e as Error).message);
 		} finally {
 			busy = false;
@@ -1776,6 +1904,7 @@
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
 		selectedMealServings = meal.servings;
+		selectedDetailTab = 'recipe';
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
@@ -1924,7 +2053,18 @@
 		}
 	}
 	async function refreshNutrition() {
-		if (!selected || !needAI()) return;
+		if (!selected) return;
+		const targetId = selected.id;
+		const targetServings = selectedMealServings;
+		selectedDetailTab = 'nutrition';
+		if (!needAI()) {
+			recordAIContinuation({
+				kind: 'nutrition',
+				recipeId: targetId,
+				servings: targetServings
+			});
+			return;
+		}
 		busy = true;
 		try {
 			const result = await ai('nutrition', { recipe: selected });
@@ -1939,7 +2079,11 @@
 		}
 	}
 	function closeDialog() {
-		if (modal === 'plan') selected = null;
+		if (modal === 'plan') {
+			selected = null;
+			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
+		}
 		if (modal === 'editMeal') editingMealId = '';
 		if (modal === 'cookMeal') cookingMealId = '';
 		if (modal === 'deleteRecipe') recipeToDelete = null;
@@ -1949,14 +2093,18 @@
 			currentInviteId = '';
 		}
 		if (modal === 'onboarding') dismissOnboarding();
-		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
-			resumeImport = false;
-			modal = 'import';
+		else if (pendingAIContinuation && modal === 'delete') {
+			completePostSetupSurface();
+		} else if (
+			pendingAIContinuation &&
+			(modal === 'settings' || modal === 'auth' || modal === 'recover')
+		) {
+			restoreAIContinuation();
 		} else modal = '';
 		error = '';
 	}
 	function openImport(text?: string) {
-		resumeImport = false;
+		if (pendingAIContinuation?.kind === 'import') pendingAIContinuation = null;
 		if (text !== undefined) importSession = { ...emptyImportSession(), text };
 		error = '';
 		mobileNav = false;
@@ -1967,7 +2115,7 @@
 	}
 	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
 		if (!needAI()) {
-			resumeImport = true;
+			recordAIContinuation({ kind: 'import' });
 			return null;
 		}
 		return ai('capture', input, signal);
@@ -1976,8 +2124,9 @@
 		const saved = { ...recipe, saved: true };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
 		importSession = emptyImportSession();
-		resumeImport = false;
+		if (pendingAIContinuation?.kind === 'import') pendingAIContinuation = null;
 		modal = '';
+		selectedDetailTab = 'recipe';
 		selected = saved;
 		page = 'saved';
 		query = '';
@@ -2026,8 +2175,12 @@
 			householdInvites = [];
 			canManageHousehold = false;
 			importSession = emptyImportSession();
-			resumeImport = false;
-			apiKey = '';
+			clearPendingAIState();
+			clearAIConnectionState();
+			selected = null;
+			editingRecipe = null;
+			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
@@ -2170,8 +2323,12 @@
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
 			mobileNav = false;
-			closeDialog();
-			selected = null;
+			if (modal) closeDialog();
+			else if (selected) {
+				selected = null;
+				selectedMealServings = undefined;
+				selectedDetailTab = 'recipe';
+			}
 		}
 	}}
 />
@@ -2407,6 +2564,7 @@
 										class="image-open"
 										onclick={() => {
 											selectedMealServings = undefined;
+											selectedDetailTab = 'recipe';
 											selected = recipe;
 										}}
 										aria-label={`Open ${recipe.title}`}
@@ -2436,6 +2594,7 @@
 										class="recipe-title"
 										onclick={() => {
 											selectedMealServings = undefined;
+											selectedDetailTab = 'recipe';
 											selected = recipe;
 										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
@@ -2650,6 +2809,7 @@
 														class="meal-open"
 														onclick={() => {
 															selectedMealServings = meal.servings;
+															selectedDetailTab = 'recipe';
 															selected = recipe;
 														}}
 														><img
@@ -2732,6 +2892,7 @@
 												class="text-button"
 												onclick={() => {
 													selectedMealServings = undefined;
+													selectedDetailTab = 'recipe';
 													selected = recipe;
 												}}
 												>{recipe.rating ? 'View rating' : 'Rate recipe'} <Star size={15} /></button
@@ -2888,6 +3049,7 @@
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
 		initialServings={selectedMealServings ?? selected.servings}
+		bind:tab={selectedDetailTab}
 		bind:completedSteps={
 			() => cookingSteps[cookingSessionKey] ?? [],
 			(steps) => {
@@ -2897,6 +3059,7 @@
 		close={() => {
 			selected = null;
 			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 		}}
 		save={() => saveRecipe(selected!)}
 		shop={(servings) =>
@@ -3063,6 +3226,23 @@
 					<p class="field-help">
 						Separate with commas or new lines. Add quantities and units when you know them.
 					</p>
+					{#if stagedScanFile}<div class="staged-scan" role="status">
+							<span>Photo staged: <b>{stagedScanFile.name}</b></span>
+							<div class="staged-scan-actions">
+								<button
+									class="secondary"
+									type="button"
+									disabled={busy}
+									onclick={() => stagedScanFile && scanPantryPhoto(stagedScanFile)}
+									>{busy ? 'Scanning…' : 'Scan photo'}</button
+								><button
+									class="text-button"
+									type="button"
+									disabled={busy}
+									onclick={() => (stagedScanFile = null)}>Remove</button
+								>
+							</div>
+						</div>{/if}
 					<div class="dialog-actions">
 						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button><button
 							class="secondary"
@@ -3969,5 +4149,22 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	.staged-scan {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		flex-wrap: wrap;
+		gap: 10px;
+		margin: 12px 0;
+		padding: 10px 12px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		font-size: 14px;
+	}
+	.staged-scan-actions {
+		display: flex;
+		align-items: center;
+		gap: 8px;
 	}
 </style>

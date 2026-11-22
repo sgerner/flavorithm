@@ -15,6 +15,7 @@
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
 	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
+	import { transitionButlerOwner } from '#lib/ai-continuation.ts';
 	import { focusTrap } from '#lib/focus.ts';
 	import type { AppState, Recipe } from '#lib/types.ts';
 
@@ -42,7 +43,7 @@
 			history: Turn[],
 			signal?: AbortSignal,
 			recipeDrafts?: Recipe[]
-		) => Promise<{ reply: string; commands: unknown[] }>;
+		) => Promise<{ reply: string; commands: unknown[] } | null>;
 		apply: (commands: unknown[], expectedSnapshot: string) => string | Promise<string>;
 	} = $props();
 	let recipeDrafts = $state<Recipe[]>([]);
@@ -115,14 +116,23 @@
 	}
 	$effect(() => {
 		if (owner !== currentOwner) {
+			const previousOwner = currentOwner;
 			currentOwner = owner;
 			cancelRequest();
-			messages = [];
-			recipeDrafts = [];
-			draft = '';
-			error = '';
-			failedPrompt = '';
-			applying = '';
+			const next = transitionButlerOwner(previousOwner, owner, {
+				messages,
+				recipeDrafts,
+				draft,
+				error,
+				failedPrompt,
+				applying
+			});
+			messages = next.messages;
+			recipeDrafts = next.recipeDrafts;
+			draft = next.draft;
+			error = next.error;
+			failedPrompt = next.failedPrompt;
+			applying = next.applying;
 			open = false;
 		}
 	});
@@ -141,7 +151,14 @@
 		resetReaction();
 		open = false;
 		await tick();
-		launcher?.focus();
+		if (!launcher?.closest('[inert]')) launcher?.focus();
+	}
+	export async function reopen(fallbackPrompt = '') {
+		await tick();
+		if (fallbackPrompt && !draft.trim()) draft = fallbackPrompt;
+		open = true;
+		await tick();
+		input?.focus();
 	}
 	async function toggle() {
 		open = !open;
@@ -176,10 +193,15 @@
 					content: applied?.length ? `${content}\n\n[User applied: ${applied.join('; ')}]` : content
 				};
 			});
+		const previouslyPending: Action[] = [];
 		for (const message of messages)
 			for (const action of message.actions ?? [])
-				if (action.status === 'pending') action.status = 'dismissed';
-		if (!retry) messages.push({ id: ++sequence, role: 'user', content: prompt });
+				if (action.status === 'pending') {
+					action.status = 'dismissed';
+					previouslyPending.push(action);
+				}
+		const addedId = !retry ? ++sequence : 0;
+		if (addedId) messages.push({ id: addedId, role: 'user', content: prompt });
 		draft = '';
 		error = '';
 		failedPrompt = '';
@@ -196,6 +218,15 @@
 			const result = await request(prompt, history, currentController.signal, recipeDrafts);
 			currentController.signal.throwIfAborted();
 			if (!alive || token !== generation) return;
+			if (!result) {
+				for (const action of previouslyPending) action.status = 'pending';
+				if (addedId) messages = messages.filter((item) => item.id !== addedId);
+				else if (messages.at(-1)?.role === 'user' && messages.at(-1)?.content === prompt) {
+					messages = messages.slice(0, -1);
+				}
+				draft = prompt;
+				return;
+			}
 			const actions = buildButlerActions(result.commands, JSON.parse(snapshot)).map(
 				(action): Action => ({ ...action, status: 'pending' })
 			);
