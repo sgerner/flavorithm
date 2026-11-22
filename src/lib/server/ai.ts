@@ -362,7 +362,8 @@ export async function runAIRequest(
 	if (request.reasoning && Object.keys(request.reasoning).length) {
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(requestFetcher);
+			: await getPublicModelCatalog(fetcher);
+		assertRequestActive(requestSignal);
 		const metadata: ConnectionModel['reasoning'] = catalog.providers
 			.find(
 				(p) =>
@@ -2361,6 +2362,7 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 const PUBLIC_MODEL_CATALOG_TTL_MS = 60 * 60 * 1000;
 let publicCatalog: Promise<SupportedModelResponse> | undefined;
 let publicCatalogExpiresAt = 0;
+let publicCatalogFetcher: Fetcher | undefined;
 
 export async function getSupportedModels(
 	fetcher: Fetcher = fetch
@@ -2382,12 +2384,14 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
-	if (!publicCatalog || Date.now() >= publicCatalogExpiresAt) {
+	if (!publicCatalog || publicCatalogFetcher !== fetcher || Date.now() >= publicCatalogExpiresAt) {
+		publicCatalogFetcher = fetcher;
 		publicCatalogExpiresAt = Date.now() + PUBLIC_MODEL_CATALOG_TTL_MS;
 		const pending = getSupportedModels(fetcher).catch((error) => {
 			if (publicCatalog === pending) {
 				publicCatalog = undefined;
 				publicCatalogExpiresAt = 0;
+				publicCatalogFetcher = undefined;
 			}
 			throw error;
 		});
