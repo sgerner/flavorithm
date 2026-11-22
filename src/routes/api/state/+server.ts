@@ -1,4 +1,3 @@
-import { json } from '@sveltejs/kit';
 import type { RequestHandler } from './$types';
 import {
 	ApiError,
@@ -13,9 +12,9 @@ import {
 
 export const GET: RequestHandler = async ({ locals }) => {
 	try {
-		if (!locals.user) return json({ error: 'Authentication required' }, { status: 401 });
+		if (!locals.user) return Response.json({ error: 'Authentication required' }, { status: 401 });
 		const state = getState(locals.user);
-		return json(
+		return Response.json(
 			{ state, userId: locals.user.id, householdId: locals.user.householdId },
 			{ headers: state ? { ETag: getStateEtag(locals.user) } : {} }
 		);
@@ -42,7 +41,7 @@ export const PUT: RequestHandler = async ({ request, locals }) => {
 			ifMatch: request.headers.get('if-match'),
 			ifNoneMatch: request.headers.get('if-none-match')
 		});
-		return json({ state: saved }, { headers: { ETag: getStateEtag(locals.user) } });
+		return Response.json({ state: saved }, { headers: { ETag: getStateEtag(locals.user) } });
 	} catch (error) {
 		return errorResponse(error);
 	}

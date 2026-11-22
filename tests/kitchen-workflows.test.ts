@@ -389,13 +389,24 @@ test('schedulePlannedMeal rejects missing recipes without creating orphaned meal
 		recipeId: 'tacos',
 		date: '2026-10-22',
 		slot: 'Dinner',
-		servings: 4
+		servings: 100
 	});
 	assert.equal(scheduled.status, 'scheduled');
 	assert.equal(scheduled.state.meals.length, 1);
 	assert.equal(scheduled.state.meals[0].recipeId, 'tacos');
+	assert.equal(scheduled.state.meals[0].servings, 100);
 	assert.equal(scheduled.state.shopping.length, 1);
-	assert.equal(scheduled.state.shopping[0].quantity, 4);
+	assert.equal(scheduled.state.shopping[0].quantity, 100);
+
+	const outOfRange = schedulePlannedMeal(initial, {
+		id: 'meal-3',
+		recipeId: 'tacos',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		servings: 10_001
+	});
+	assert.equal(outOfRange.status, 'invalid-servings');
+	assert.equal(outOfRange.state, initial);
 });
 
 test('savePlannedMealChanges and cookPlannedMeal guard concurrently completed or removed meals', () => {
