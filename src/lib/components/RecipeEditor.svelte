@@ -95,10 +95,10 @@
 		}
 		if (
 			!draft.title.trim() ||
-			!Number.isFinite(draft.time) ||
+			!Number.isInteger(draft.time) ||
 			draft.time < 1 ||
 			draft.time > 100000 ||
-			!Number.isFinite(draft.servings) ||
+			!Number.isInteger(draft.servings) ||
 			draft.servings < 1 ||
 			draft.servings > 10000 ||
 			!ingredients.length ||
