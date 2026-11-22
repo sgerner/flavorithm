@@ -107,6 +107,7 @@ a:focus-visible {
 	outline: 2px solid var(--green);
 	outline-offset: 4px;
 }
+[tabindex='0']:focus-visible,
 input:focus,
 textarea:focus,
 select:focus {
@@ -452,7 +453,12 @@ main {
 	bottom: 0;
 	color: #8b9a61;
 	font-weight: 400;
-	animation: gentle-turn 18s linear infinite;
+	animation: gentle-turn 3.6s ease-out 1;
+}
+@media (prefers-reduced-motion: reduce) {
+	.heading-spark {
+		animation: none;
+	}
 }
 .page-heading p {
 	font-size: 16px;
