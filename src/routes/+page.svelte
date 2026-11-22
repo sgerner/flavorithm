@@ -117,6 +117,15 @@
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
 	import {
+		entitledChatGPTAccountId,
+		reconcileChatGPTPreferences,
+		runConcurrentModelCatalog,
+		runHouseholdTransition,
+		runOpenSettingsWorkflow,
+		runReconnectWorkflow,
+		runSignedInHydration
+	} from '#lib/client-workflows.ts';
+	import {
 		clearGuestData,
 		clearGuestKitchen,
 		quarantineLegacyKitchen
@@ -549,6 +558,7 @@
 			clearManagedIdentity();
 			renewManagedSession({ status: 401 });
 		}
+		let stateLoaded = false;
 		if (changedIdentity) {
 			if (user) {
 				const snapshotUser = $state.snapshot(user);
@@ -560,6 +570,7 @@
 					const latest = await request('/api/state');
 					adoptKitchen(latest.state || createNewUserState());
 					kitchenLoaded = true;
+					stateLoaded = true;
 					if (online && kitchenSync?.snapshot()) await retrySync();
 				} catch (e) {
 					kitchenSync?.failLoad((e as Error).message);
@@ -582,13 +593,14 @@
 				const latest = await request('/api/state');
 				adoptKitchen(latest.state || createNewUserState());
 				kitchenLoaded = true;
+				stateLoaded = true;
 				if (online && kitchenSync?.snapshot()) await retrySync();
 			} catch (e) {
 				kitchenSync?.failLoad((e as Error).message);
 				throw e;
 			}
 		}
-		return data;
+		return { ...data, stateLoaded };
 	}
 	const nav = [
 		{ id: 'discover', name: 'Discover', icon: LayoutGrid },
@@ -931,6 +943,7 @@
 						clearManagedIdentity();
 						renewManagedSession({ status: 401 });
 					}
+					syncing = false;
 				} else {
 					clearHouseholdViewState();
 					kitchen = createNewUserState();
@@ -939,11 +952,38 @@
 					kitchenSync?.prepare(nextUser);
 					kitchenLoaded = true;
 					saveLastAccount(nextUser);
+					const owner = nextUser.id;
+					const attempt = connectionAttempt;
 					try {
-						const saved = await request('/api/state');
-						adoptKitchen(saved.state || createNewUserState());
-						if (online && kitchenSync?.snapshot()) await retrySync();
+						await runSignedInHydration({
+							returnFromChatGPT,
+							fetchState: () => request('/api/state'),
+							fetchConnections: () => request('/api/connections/chatgpt'),
+							adoptState: (saved) => {
+								adoptKitchen(saved.state || createNewUserState());
+								kitchenLoaded = true;
+								showStarter = false;
+								syncing = false;
+							},
+							openSettings: async () => {
+								if (online && kitchenSync?.snapshot()) await retrySync();
+								await openSettings();
+							},
+							onConnections: (result) => {
+								if (attempt !== connectionAttempt || user?.id !== owner) return;
+								chatGPT = result;
+								reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+							},
+							onConnectionsError: () => {
+								if (attempt !== connectionAttempt || user?.id !== owner) return;
+								notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.');
+							}
+						});
+						if (!returnFromChatGPT && online && kitchenSync?.snapshot()) {
+							await retrySync();
+						}
 					} catch (stateError) {
+						syncing = false;
 						kitchenSync?.failLoad((stateError as Error).message);
 						if (managedAuth) renewManagedSession(stateError);
 						notify(
@@ -951,12 +991,6 @@
 						);
 					}
 				}
-				syncing = false;
-				if (user && returnFromChatGPT) await openSettings();
-				if (user && syncReady)
-					await refreshConnections().catch(() =>
-						notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
-					);
 				if (verificationToken && !managedAuth) {
 					try {
 						const verified = await request('/api/auth', {
@@ -1056,22 +1090,29 @@
 	}
 	async function reconnectKitchen() {
 		try {
-			const previous = user;
-			const wasReady = syncReady;
-			await refreshAuth();
-			if (!user) {
-				kitchenSync?.clearContext();
-				if (managedAuth) {
-					clearManagedIdentity();
-					renewManagedSession({ status: 401 });
-				} else notify('Sign in again to sync the edits saved on this device.');
-				return;
-			}
-			if (wasReady && previous?.id === user.id && previous?.householdId === user.householdId) {
-				const latest = await request('/api/state');
-				adoptKitchen(latest.state || createNewUserState());
-				await retrySync();
-			}
+			await runReconnectWorkflow({
+				hadPreviousUser: Boolean(user),
+				refreshAuth,
+				getCurrentUser: () => user,
+				onSignedOut: () => {
+					kitchenSync?.clearContext();
+					if (managedAuth) {
+						clearManagedIdentity();
+						renewManagedSession({ status: 401 });
+					} else notify('Sign in again to sync the edits saved on this device.');
+				},
+				restoreContext: (currentUser) => {
+					kitchenSync?.restore(currentUser);
+				},
+				hasPendingEdits: () => Boolean(kitchenSync?.snapshot()),
+				fetchState: () => request('/api/state'),
+				adoptState: (latest) => {
+					adoptKitchen(latest.state || createNewUserState());
+					kitchenLoaded = true;
+					showStarter = false;
+				},
+				retrySync: () => retrySync()
+			});
 		} catch (e) {
 			kitchenSync?.failLoad((e as Error).message);
 			syncErrors = (e as Error).message;
@@ -1290,57 +1331,51 @@
 		chatGPTDevice = null;
 		chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 	}
-	async function loadModelCatalog() {
+	async function loadModelCatalog(connectionsTask?: Promise<void>) {
 		if (!user) return;
 		const version = ++catalogVersion;
 		const owner = user.id;
-		const accountId = kitchen.preferences.chatgptAccountId;
-		const isAccount =
-			kitchen.preferences.provider === 'chatgpt' &&
-			accountId &&
-			activeChatGPTAccount?.connected &&
-			activeChatGPTAccount.planEnabled;
 		catalogLoading = true;
 		catalogError = '';
-		const [catalog, account] = await Promise.allSettled([
-			request('/api/models'),
-			isAccount
-				? request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`)
-				: Promise.resolve(null)
-		]);
-		if (version !== catalogVersion || user?.id !== owner) return;
-		if (catalog.status === 'fulfilled') providers = catalog.value.providers;
-		else catalogError = catalog.reason.message || 'The provider catalog could not be loaded.';
-		if (account.status === 'fulfilled') accountModels = account.value?.providers[0]?.models || [];
-		else {
-			accountModels = [];
-			catalogError = account.reason.message || 'ChatGPT models could not be loaded.';
-		}
-		catalogLoading = false;
+		await runConcurrentModelCatalog({
+			connectionsTask,
+			isCurrent: () => version === catalogVersion && user?.id === owner,
+			getEntitledAccountId: () => entitledChatGPTAccountId(kitchen.preferences, chatGPT.accounts),
+			fetchPublicCatalog: () => request('/api/models'),
+			fetchAccountCatalog: (accountId) =>
+				request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`),
+			onResult: ({ catalog, account }) => {
+				if (catalog.status === 'fulfilled') providers = catalog.value.providers;
+				else
+					catalogError =
+						(catalog.reason as Error)?.message || 'The provider catalog could not be loaded.';
+				if (account.status === 'fulfilled')
+					accountModels = account.value?.providers[0]?.models || [];
+				else {
+					accountModels = [];
+					catalogError =
+						(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+				}
+				catalogLoading = false;
+			}
+		});
 	}
 	async function refreshConnections() {
 		if (!user) return;
 		const owner = user.id;
+		const attempt = connectionAttempt;
 		const result = await request('/api/connections/chatgpt');
-		if (user?.id !== owner) return;
+		if (attempt !== connectionAttempt || user?.id !== owner) return;
 		chatGPT = result;
-		if (chatGPT.host) {
-			kitchen.preferences.provider = 'chatgpt';
-			kitchen.preferences.chatgptAccountId = 'host-chatgpt';
-			kitchen.preferences.model = chatGPT.host.model;
-		}
-		if (!chatGPT.accounts.some((a) => a.id === kitchen.preferences.chatgptAccountId))
-			kitchen.preferences.chatgptAccountId =
-				chatGPT.accounts.find((a) => a.connected && a.planEnabled)?.id || chatGPT.accounts[0]?.id;
+		reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
 	}
 	async function refreshAISettings() {
 		error = '';
 		try {
-			await refreshConnections();
+			await loadModelCatalog(refreshConnections());
 		} catch (e) {
 			error = (e as Error).message;
 		}
-		await loadModelCatalog();
 	}
 	async function openSettings(focusTarget: boolean | 'ai' | 'voice' = false) {
 		mobileNav = false;
@@ -1355,27 +1390,25 @@
 				: focusTarget === 'voice'
 					? 'voice-settings-heading'
 					: '';
-		if (headingId) {
-			await tick();
-			document.getElementById(headingId)?.focus();
-		}
-		try {
-			await refreshAuth();
-		} catch (e) {
-			if (online || syncErrors) error = (e as Error).message;
-		}
-		if (headingId) {
-			await tick();
-			document.getElementById(headingId)?.focus();
-		}
-		try {
-			if (user) {
-				await refreshConnections();
-				await loadModelCatalog();
+		await runOpenSettingsWorkflow({
+			initialUserId: user?.id ?? null,
+			getCurrentUserId: () => user?.id ?? null,
+			refreshAuth,
+			loadConnectionsAndCatalog: () => loadModelCatalog(refreshConnections()),
+			onReadyToFocus: headingId
+				? async () => {
+						if (modal !== 'settings') return;
+						await tick();
+						document.getElementById(headingId)?.focus();
+					}
+				: undefined,
+			onAuthError: (e) => {
+				if (online || syncErrors) error = (e as Error).message;
+			},
+			onError: (e) => {
+				error ||= (e as Error).message;
 			}
-		} catch (e) {
-			error ||= (e as Error).message;
-		}
+		});
 	}
 	async function changeConnection(providerId?: string) {
 		if (providerId === kitchen.preferences.provider) return;
@@ -1394,8 +1427,7 @@
 		accountModels = [];
 		error = '';
 		try {
-			await refreshConnections();
-			await loadModelCatalog();
+			await loadModelCatalog(refreshConnections());
 		} catch (e) {
 			error = (e as Error).message;
 		}
@@ -2288,8 +2320,11 @@
 		page = 'planner';
 		notify('Meal scheduled.');
 	}
-	async function refreshHousehold() {
-		const data = await request('/api/household');
+	function applyHouseholdRoster(data: {
+		members?: HouseholdMember[];
+		invites?: HouseholdInvite[];
+		canManage?: boolean;
+	}) {
 		members = data.members ?? [];
 		householdInvites = data.invites ?? [];
 		canManageHousehold = Boolean(data.canManage);
@@ -2300,6 +2335,10 @@
 			currentInviteId = '';
 			inviteCode = '';
 		}
+	}
+	async function refreshHousehold() {
+		const data = await request('/api/household');
+		applyHouseholdRoster(data);
 		return data;
 	}
 	async function household() {
@@ -2410,25 +2449,29 @@
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
-			const updated = await request('/api/household', {
-				action: 'join',
-				code: joinCode.trim(),
-				...(confirmed ? { confirmReplace: true } : {})
+			await runHouseholdTransition({
+				mutateHousehold: () =>
+					request('/api/household', {
+						action: 'join',
+						code: joinCode.trim(),
+						...(confirmed ? { confirmReplace: true } : {})
+					}),
+				onMutated: () => {
+					joinedHousehold = true;
+					kitchenSync?.clearContext();
+					clearAIConnectionState();
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = createNewUserState();
+					joinCode = '';
+					inviteCode = '';
+					currentInviteId = '';
+				},
+				refreshAuth,
+				fetchState: () => request('/api/state'),
+				adoptState: (data) => adoptKitchen(data.state || createNewUserState()),
+				applyRoster: applyHouseholdRoster
 			});
-			joinedHousehold = true;
-			kitchenSync?.clearContext();
-			clearAIConnectionState();
-			clearHouseholdViewState();
-			stateEtag = null;
-			kitchen = createNewUserState();
-			members = updated.members ?? [];
-			householdInvites = updated.invites ?? [];
-			canManageHousehold = Boolean(updated.canManage);
-			joinCode = '';
-			inviteCode = '';
-			currentInviteId = '';
-			await refreshAuth();
-			await refreshHousehold();
 			modal = 'household';
 			syncing = false;
 			notify('Welcome to your shared kitchen.');
@@ -2652,22 +2695,25 @@
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
-			const updated = await request('/api/household', { action: 'leave' });
-			leftHousehold = true;
-			kitchenSync?.clearContext();
-			clearAIConnectionState();
-			clearHouseholdViewState();
-			stateEtag = null;
-			kitchen = createNewUserState();
-			members = updated.members ?? [];
-			householdInvites = updated.invites ?? [];
-			canManageHousehold = Boolean(updated.canManage);
-			joinCode = '';
-			inviteCode = '';
-			currentInviteId = '';
-			memberToRemove = null;
-			await refreshAuth();
-			await refreshHousehold();
+			await runHouseholdTransition({
+				mutateHousehold: () => request('/api/household', { action: 'leave' }),
+				onMutated: () => {
+					leftHousehold = true;
+					kitchenSync?.clearContext();
+					clearAIConnectionState();
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = createNewUserState();
+					joinCode = '';
+					inviteCode = '';
+					currentInviteId = '';
+					memberToRemove = null;
+				},
+				refreshAuth,
+				fetchState: () => request('/api/state'),
+				adoptState: (data) => adoptKitchen(data.state || createNewUserState()),
+				applyRoster: applyHouseholdRoster
+			});
 			syncing = false;
 			modal = '';
 			notify('You now have your own kitchen.');
