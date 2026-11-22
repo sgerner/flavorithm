@@ -108,7 +108,11 @@
 		appendVoiceTranscript,
 		isVoiceTargetActive,
 		parseQuickShoppingItems,
+		planVoiceRetry,
+		planVoiceStart,
+		resolveClosedDialog,
 		VoiceCapture,
+		type ResumeDialog,
 		type VoiceState,
 		type VoiceTarget
 	} from '#lib/voice-capture.ts';
@@ -300,6 +304,9 @@
 		modal = 'auth';
 	}
 	function clearManagedIdentity() {
+		clearVoiceSession();
+		pantryInput = '';
+		resumeDialog = '';
 		clearAIConnectionState();
 		kitchenSync?.clearContext();
 		user = null;
@@ -369,16 +376,17 @@
 	let localVoiceAvailable = $state(false);
 	let voiceState = $state<VoiceState>('idle');
 	let voiceStarting = $state(false);
+	let voiceRetained = $state(false);
+	let voiceError = $state('');
+	let voiceBusy = $derived(voiceStarting || voiceState !== 'idle');
 	let voiceTarget = $state<VoiceTarget | ''>('');
 	let voiceCapture: VoiceCapture | undefined;
+	let activeVoiceImportSession: ImportSession | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
 		const owner = voiceOwner;
 		if (typeof window === 'undefined') return;
-		voiceCapture?.cancel();
-		voiceStarting = false;
-		voiceState = 'idle';
-		voiceTarget = '';
+		clearVoiceSession();
 		voiceApiKey = '';
 		voiceProvider = 'auto';
 		voiceModel = '';
@@ -404,7 +412,7 @@
 				})
 				.catch(() => {});
 		}
-		return () => voiceCapture?.cancel();
+		return () => clearVoiceSession();
 	});
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
@@ -450,7 +458,7 @@
 	let catalogVersion = 0;
 	let prompt = $state('');
 	let importSession = $state<ImportSession>(emptyImportSession());
-	let resumeImport = $state(false);
+	let resumeDialog = $state<ResumeDialog>('');
 	let searchResults = $state<{ title: string; url: string; description: string }[]>([]);
 	type HouseholdMember = { id: string; name: string; email: string; role: string };
 	type HouseholdInvite = { inviteId: string; expiresAt: number };
@@ -1031,6 +1039,7 @@
 		mobileNav = false;
 	}
 	function addIngredients() {
+		if (voiceBusy || busy) return;
 		const names = pantryInput
 			.split(/[,\n;]/)
 			.map((value) => value.trim())
@@ -1093,9 +1102,10 @@
 				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 			);
 			password = '';
-			if (resumeImport) {
-				resumeImport = false;
-				modal = 'import';
+			if (resumeDialog) {
+				const target = resumeDialog;
+				resumeDialog = '';
+				modal = target;
 			} else {
 				modal = '';
 				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
@@ -1134,8 +1144,10 @@
 			members = [];
 			householdInvites = [];
 			canManageHousehold = false;
+			clearVoiceSession();
+			pantryInput = '';
 			importSession = emptyImportSession();
-			resumeImport = false;
+			resumeDialog = '';
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
@@ -1221,18 +1233,31 @@
 		}
 		await loadModelCatalog();
 	}
-	async function openSettings(focusAI = false) {
+	async function openSettings(focusTarget: boolean | 'ai' | 'voice' = false) {
 		mobileNav = false;
+		if (!focusTarget && modal !== 'pantry' && modal !== 'import' && modal !== 'settings') {
+			resumeDialog = '';
+		}
 		modal = 'settings';
 		error = '';
+		const headingId =
+			focusTarget === true || focusTarget === 'ai'
+				? 'ai-connection-heading'
+				: focusTarget === 'voice'
+					? 'voice-settings-heading'
+					: '';
+		if (headingId) {
+			await tick();
+			document.getElementById(headingId)?.focus();
+		}
 		try {
 			await refreshAuth();
 		} catch {
 			// Keep the last known account state while showing Settings offline.
 		}
-		if (focusAI) {
+		if (headingId) {
 			await tick();
-			document.getElementById('ai-connection-heading')?.focus();
+			document.getElementById(headingId)?.focus();
 		}
 		try {
 			if (user) {
@@ -1520,10 +1545,11 @@
 		Boolean(butlerOpen || editingRecipe || (!modal && (selected || mobileNav)))
 	);
 	$effect(() => {
-		if (voiceTarget && !isVoiceTargetActive(voiceTarget, { modal, page, overlay: voiceOverlay })) {
-			voiceCapture?.cancel();
-			voiceStarting = false;
-			voiceTarget = '';
+		if (!voiceTarget) return;
+		if (voiceBusy && !isVoiceTargetActive(voiceTarget, { modal, page, overlay: voiceOverlay })) {
+			clearVoiceSession();
+		} else if (voiceTarget === 'shopping' && page !== 'shopping') {
+			clearVoiceSession();
 		}
 	});
 	let cookingSteps = $state<Record<string, number[]>>({});
@@ -1610,8 +1636,12 @@
 	function openButlerControl(target: string) {
 		switch (target) {
 			case 'settings':
-			case 'voice-settings':
+				if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
 				void openSettings();
+				break;
+			case 'voice-settings':
+				if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
+				void openSettings('voice');
 				break;
 			case 'ai-settings':
 				void openSettings(true);
@@ -1696,7 +1726,10 @@
 	}
 	async function scan(event: Event) {
 		const file = (event.target as HTMLInputElement).files?.[0];
-		if (!file || !needAI()) return;
+		if (!file || busy || voiceBusy || !needAI()) {
+			if (imageInput) imageInput.value = '';
+			return;
+		}
 		if (file.size > 5 * 1024 * 1024) {
 			notify('Choose a photo under 5 MB.');
 			return;
@@ -1723,6 +1756,61 @@
 			if (imageInput) imageInput.value = '';
 		}
 	}
+	function clearVoiceSession() {
+		voiceCapture?.cancel();
+		voiceCapture = undefined;
+		voiceStarting = false;
+		voiceState = 'idle';
+		voiceRetained = false;
+		voiceError = '';
+		voiceTarget = '';
+		activeVoiceImportSession = undefined;
+	}
+	function openVoiceSettings() {
+		if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
+		else if (voiceTarget === 'pantry' || voiceTarget === 'import') resumeDialog = voiceTarget;
+		else resumeDialog = '';
+		void openSettings('voice');
+	}
+	function discardVoiceRecording() {
+		voiceCapture?.discard();
+		clearVoiceSession();
+	}
+	async function retryVoiceTranscription() {
+		if (voiceBusy || !voiceCapture?.hasRetainedAudio || !voiceTarget) return;
+		const plan = planVoiceRetry({
+			modal,
+			voiceTarget,
+			provider: voiceProvider,
+			localAvailable: localVoiceAvailable,
+			signedIn: Boolean(user),
+			apiKey: voiceApiKey
+		});
+		if (plan.action === 'auth') {
+			resumeDialog = plan.resumeDialog;
+			openAuthentication();
+			notify(plan.message);
+			return;
+		}
+		if (plan.action === 'settings') {
+			resumeDialog = plan.resumeDialog;
+			void openSettings('voice');
+			notify(plan.message);
+			return;
+		}
+		if (plan.action === 'error') {
+			voiceError = plan.message;
+			notify(plan.message);
+			return;
+		}
+		voiceError = '';
+		if (voiceTarget === 'import') activeVoiceImportSession = importSession;
+		await voiceCapture.retry({
+			provider: plan.provider,
+			model: voiceModel,
+			apiKey: voiceApiKey
+		});
+	}
 	function dictate() {
 		void startDictation('pantry');
 	}
@@ -1733,41 +1821,47 @@
 		void startDictation('shopping');
 	}
 	async function startDictation(target: VoiceTarget) {
-		if (voiceStarting || voiceState !== 'idle') return;
-		const provider =
-			voiceProvider === 'auto'
-				? localVoiceAvailable && user
-					? 'local'
-					: 'browser'
-				: voiceProvider;
-		if (provider !== 'browser' && !user) {
+		if (voiceBusy) return;
+		if (target === 'import' && modal !== 'import') {
+			openImport(importSession.draft ? '' : undefined);
+		}
+		const plan = planVoiceStart({
+			target,
+			modal,
+			provider: voiceProvider,
+			localAvailable: localVoiceAvailable,
+			signedIn: Boolean(user),
+			apiKey: voiceApiKey
+		});
+		if (plan.action === 'auth') {
+			resumeDialog = plan.resumeDialog;
 			openAuthentication();
+			notify(plan.message);
 			return;
 		}
-		if ((provider === 'groq' || provider === 'deepgram') && !voiceApiKey.trim()) {
-			modal = 'settings';
-			notify('Add a voice API key in Voice input settings.');
+		if (plan.action === 'settings') {
+			resumeDialog = plan.resumeDialog;
+			void openSettings('voice');
+			notify(plan.message);
 			return;
 		}
-		if (provider === 'local' && !localVoiceAvailable) {
-			modal = 'settings';
-			notify('Local Whisper needs an endpoint configured by the server operator.');
-			return;
-		}
-		voiceCapture?.cancel();
+		clearVoiceSession();
+		resumeDialog = '';
 		if (target === 'import') {
 			if (modal !== 'import') openImport(importSession.draft ? '' : undefined);
 		} else if (target === 'pantry') {
 			mobileNav = false;
+			error = '';
 			modal = 'pantry';
 		} else {
 			mobileNav = false;
+			error = '';
 			modal = '';
 			if (page !== 'shopping') navigate('shopping');
 		}
 		voiceStarting = true;
 		voiceTarget = target;
-		const inputSession = importSession;
+		activeVoiceImportSession = importSession;
 		const owner = user?.id;
 		const capture = new VoiceCapture({
 			state: (value) => {
@@ -1775,8 +1869,11 @@
 				voiceState = value;
 				if (value === 'idle') {
 					voiceStarting = false;
-					voiceTarget = '';
+					if (!capture.hasRetainedAudio) voiceTarget = '';
 				}
+			},
+			retained: (value) => {
+				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
 				if (
@@ -1786,8 +1883,9 @@
 					!isVoiceTargetActive(target, { modal, page, overlay: voiceOverlay })
 				)
 					return;
+				voiceError = '';
 				if (target === 'import') {
-					if (importSession !== inputSession || importSession.draft) return;
+					if (importSession !== activeVoiceImportSession || importSession.draft) return;
 					importSession.text = appendVoiceTranscript(importSession.text, text, '\n', 20000);
 				} else if (target === 'pantry') {
 					pantryInput = appendVoiceTranscript(pantryInput, text);
@@ -1798,17 +1896,19 @@
 				}
 			},
 			error: (message) => {
-				if (voiceCapture !== capture) return;
-				notify(message);
+				if (voiceCapture === capture) {
+					voiceError = message;
+					notify(message);
+				}
 			}
 		});
 		voiceCapture = capture;
 		try {
-			await capture.start({ provider, model: voiceModel, apiKey: voiceApiKey });
+			await capture.start({ provider: plan.provider, model: voiceModel, apiKey: voiceApiKey });
 		} finally {
 			if (voiceCapture === capture) {
 				voiceStarting = false;
-				if (voiceState === 'idle') voiceTarget = '';
+				if (voiceState === 'idle' && !capture.hasRetainedAudio) voiceTarget = '';
 			}
 		}
 	}
@@ -2299,21 +2399,29 @@
 			inviteCode = '';
 			currentInviteId = '';
 		}
+		if ((modal === 'pantry' || modal === 'import') && voiceTarget === modal) {
+			clearVoiceSession();
+		}
 		if (modal === 'onboarding') dismissOnboarding();
-		else if (resumeImport && (modal === 'settings' || modal === 'auth')) {
-			resumeImport = false;
-			modal = 'import';
-		} else modal = '';
+		else {
+			const next = resolveClosedDialog(modal, resumeDialog);
+			resumeDialog = next.resumeDialog;
+			modal = next.modal;
+		}
 		error = '';
 	}
 	function openImport(text?: string) {
-		resumeImport = false;
-		if (text !== undefined) importSession = { ...emptyImportSession(), text };
+		resumeDialog = '';
+		if (text !== undefined) {
+			if (voiceTarget === 'import') clearVoiceSession();
+			importSession = { ...emptyImportSession(), text };
+		}
 		error = '';
 		mobileNav = false;
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
+		if (voiceTarget === 'import') clearVoiceSession();
 		importSession = { ...emptyImportSession(), url };
 		openImport();
 	}
@@ -2322,7 +2430,7 @@
 		signal: AbortSignal
 	) {
 		if (!needAI()) {
-			resumeImport = true;
+			resumeDialog = 'import';
 			return null;
 		}
 		return ai('capture', input, signal);
@@ -2332,8 +2440,9 @@
 			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
 		const saved = { ...recipe, saved: true, nutritionStale };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		if (voiceTarget === 'import') clearVoiceSession();
 		importSession = emptyImportSession();
-		resumeImport = false;
+		resumeDialog = '';
 		modal = '';
 		selected = saved;
 		page = 'saved';
@@ -2386,8 +2495,10 @@
 			members = [];
 			householdInvites = [];
 			canManageHousehold = false;
+			clearVoiceSession();
+			pantryInput = '';
 			importSession = emptyImportSession();
-			resumeImport = false;
+			resumeDialog = '';
 			apiKey = '';
 			deletePassword = '';
 			stateEtag = null;
@@ -2537,30 +2648,44 @@
 </script>
 
 {#snippet voiceSession()}
-	<div class="voice-session" in:revealMotion>
-		<p role="status" aria-live="polite">
-			{voiceStarting
-				? 'Opening microphone…'
-				: voiceState === 'recording'
-					? 'Listening… up to 2 minutes'
-					: 'Transcribing…'}
-		</p>
-		<div class="dialog-actions">
-			{#if voiceState === 'recording'}<button
-					type="button"
+	{#if voiceBusy}<div class="voice-session" in:revealMotion>
+			<p role="status" aria-live="polite">
+				{voiceStarting
+					? 'Opening microphone…'
+					: voiceState === 'recording'
+						? 'Listening… up to 2 minutes'
+						: 'Transcribing…'}
+			</p>
+			<div class="dialog-actions">
+				{#if voiceState === 'recording'}<button
+						type="button"
+						class="primary"
+						onclick={() => voiceCapture?.stop()}>Stop recording</button
+					>{/if}<button type="button" class="secondary" onclick={clearVoiceSession}
+					>Cancel voice</button
+				>
+			</div>
+		</div>{:else if voiceRetained}<div class="voice-session voice-recovery" in:revealMotion>
+			<p class="voice-error-copy" role="alert">
+				{voiceError || 'Voice transcription failed. Your recording is ready to retry.'}
+			</p>
+			<p class="voice-recovery-note">
+				Your recording is kept in this tab so you can retry without speaking again.
+			</p>
+			<div class="dialog-actions voice-recovery-actions">
+				<button
 					class="primary"
-					onclick={() => voiceCapture?.stop()}>Stop recording</button
-				>{/if}<button
-				type="button"
-				class="secondary"
-				onclick={() => {
-					voiceCapture?.cancel();
-					voiceStarting = false;
-					voiceTarget = '';
-				}}>Cancel voice</button
-			>
-		</div>
-	</div>
+					type="button"
+					onclick={() => {
+						void retryVoiceTranscription();
+					}}><RefreshCw size={16} /> Retry transcription</button
+				><button class="secondary" type="button" onclick={openVoiceSettings}
+					><Settings size={16} /> Open Settings</button
+				><button class="text-button" type="button" onclick={discardVoiceRecording}
+					>Discard recording</button
+				>
+			</div>
+		</div>{/if}
 {/snippet}
 
 {#if ready}
@@ -2736,10 +2861,14 @@
 						<button
 							class="secondary"
 							aria-label="Scan ingredients from a photo"
+							disabled={busy || voiceBusy}
 							onclick={() => imageInput.click()}><Camera size={19} /></button
 						>
-						<button class="secondary" aria-label="Dictate ingredients" onclick={dictate}
-							><Mic size={19} /></button
+						<button
+							class="secondary"
+							aria-label="Dictate ingredients"
+							disabled={busy || voiceBusy}
+							onclick={dictate}><Mic size={19} /></button
 						>
 					</div>{/if}
 				{#if page === 'discover'}<section
@@ -2755,9 +2884,13 @@
 								><button
 									class="banner-icon"
 									aria-label="Scan ingredients from a photo"
+									disabled={busy || voiceBusy}
 									onclick={() => imageInput.click()}><Camera size={20} /></button
-								><button class="banner-icon" aria-label="Dictate ingredients" onclick={dictate}
-									><Mic size={20} /></button
+								><button
+									class="banner-icon"
+									aria-label="Dictate ingredients"
+									disabled={busy || voiceBusy}
+									onclick={dictate}><Mic size={20} /></button
 								>
 							</div>
 						</div>
@@ -2944,9 +3077,11 @@
 							}}>Clear depleted items</button
 						>{/if}
 					<div>
-						<button class="secondary" onclick={() => imageInput.click()}
-							><Camera size={17} /> Scan a photo</button
-						><button class="secondary" onclick={dictate}
+						<button
+							class="secondary"
+							disabled={busy || voiceBusy}
+							onclick={() => imageInput.click()}><Camera size={17} /> Scan a photo</button
+						><button class="secondary" disabled={busy || voiceBusy} onclick={dictate}
 							><Mic size={17} /> Tell us what you have</button
 						>
 					</div>
@@ -3227,7 +3362,7 @@
 									>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
-						{#if voiceTarget === 'shopping' && (voiceState !== 'idle' || voiceStarting)}{@render voiceSession()}{/if}
+						{#if voiceTarget === 'shopping' && !modal && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
 						<form
 							class="inline-add"
 							onsubmit={(e) => {
@@ -3252,7 +3387,7 @@
 								type="button"
 								class="icon-button"
 								aria-label="Dictate shopping items"
-								disabled={voiceStarting || voiceState !== 'idle'}
+								disabled={voiceBusy}
 								onclick={dictateShopping}><Mic size={18} /></button
 							><button type="submit" class="text-button">Add</button>
 						</form>
@@ -3413,7 +3548,7 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if voiceTarget === modal && (voiceState !== 'idle' || voiceStarting)}{@render voiceSession()}{/if}
+				{#if modal === voiceTarget && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
 
 				<button
 					class="icon-button dialog-close"
@@ -3427,6 +3562,7 @@
 						capture={captureImport}
 						save={saveImportedRecipe}
 						dictate={dictateRecipe}
+						{voiceBusy}
 					/>{:else if modal === 'onboarding'}
 					<span class="dialog-spark">✷</span>
 					<h2>Recipe preferences</h2>
@@ -3515,12 +3651,18 @@
 						Separate with commas or new lines. Add quantities and units when you know them.
 					</p>
 					<div class="dialog-actions">
-						<button class="secondary" onclick={dictate}><Mic size={17} /> Use voice</button><button
+						<button class="secondary" type="button" disabled={voiceBusy || busy} onclick={dictate}
+							><Mic size={17} /> Use voice</button
+						><button
 							class="secondary"
+							type="button"
 							onclick={() => imageInput.click()}
-							disabled={busy}><Camera size={17} /> Use photo</button
-						><button class="primary" disabled={!pantryInput.trim()} onclick={addIngredients}
-							>Add ingredients <ArrowRight size={17} /></button
+							disabled={busy || voiceBusy}><Camera size={17} /> Use photo</button
+						><button
+							class="primary"
+							type="button"
+							disabled={voiceBusy || busy || !pantryInput.trim()}
+							onclick={addIngredients}>Add ingredients <ArrowRight size={17} /></button
 						>
 					</div>
 				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
@@ -4155,11 +4297,31 @@
 		z-index: 5;
 		background: var(--surface);
 		padding: 16px;
+		margin-bottom: 16px;
 		border-bottom: 2px solid var(--accent);
 	}
+	.voice-session.voice-recovery {
+		border-bottom-color: #b55439;
+	}
 	.voice-session p {
-		font-size: 17px;
-		margin: 0 0 12px;
+		font-size: 16px;
+		margin: 0 0 10px;
+	}
+	.voice-session .voice-error-copy {
+		color: #b55439;
+		font-weight: 500;
+	}
+	.voice-session .voice-recovery-note {
+		font-size: 14px;
+		color: var(--muted);
+		margin-bottom: 12px;
+	}
+	.voice-session .dialog-actions {
+		flex-wrap: wrap;
+		margin-top: 12px;
+	}
+	.voice-session .voice-recovery-actions .primary:last-child {
+		margin-left: 0;
 	}
 
 	.expiry-filters {
