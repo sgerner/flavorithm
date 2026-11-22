@@ -482,7 +482,9 @@ main {
 }
 .banner-icon {
 	border: 1px solid color-mix(in srgb, #f6f5e8 65%, #294b37);
-	padding: 9px;
+	min-width: 44px;
+	min-height: 44px;
+	padding: 11px;
 	display: grid;
 	place-items: center;
 }
