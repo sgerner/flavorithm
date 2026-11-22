@@ -7,6 +7,7 @@ import {
 	fetchCaptureRecipePage,
 	fetchRecipePage,
 	getSupportedModels,
+	resetPublicModelCatalog,
 	runAIRequest,
 	transformModelCatalog,
 	validateCaptureRecipeUrl,
@@ -1339,7 +1340,9 @@ test('import normalizes a real allowlisted JSON-LD recipe and preserves server-v
 	assert.equal(JSON.stringify(result).includes('temporary-import-key'), false);
 });
 
-test('import routes Anthropic requests with text-only content, import schema, and reasoning budget', async () => {
+test('import routes Anthropic requests with text-only content, import schema, and reasoning budget', async (t) => {
+	resetPublicModelCatalog();
+	t.after(() => resetPublicModelCatalog());
 	const sourceImage = 'https://images.allrecipes.com/anthropic-recipe.jpg';
 	const html = `
 		<link rel="canonical" href="https://www.allrecipes.com/recipe/anthropic-original/">
@@ -1415,7 +1418,9 @@ test('import routes Anthropic requests with text-only content, import schema, an
 	assert.equal(result.recipes[0].provenance, 'web-import');
 });
 
-test('token budgets apply action tiers, reasoning reserves, provider keys, and keep Google distinct', async () => {
+test('token budgets apply action tiers, reasoning reserves, provider keys, and keep Google distinct', async (t) => {
+	resetPublicModelCatalog();
+	t.after(() => resetPublicModelCatalog());
 	const catalog = {
 		openai: {
 			name: 'OpenAI',

@@ -2395,3 +2395,8 @@ export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<Support
 	}
 	return publicCatalog;
 }
+
+export function resetPublicModelCatalog() {
+	publicCatalog = undefined;
+	publicCatalogExpiresAt = 0;
+}
