@@ -1,17 +1,20 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
 import { ChatGPTInferenceError } from '../src/lib/server/chatgpt-inference.ts';
 import {
 	AIRequestError,
 	fetchCaptureRecipePage,
 	fetchRecipePage,
 	getSupportedModels,
+	resetPublicModelCatalogCache,
 	runAIRequest,
 	transformModelCatalog,
 	validateCaptureRecipeUrl,
 	validateRecipeUrl
 } from '../src/lib/server/ai.ts';
+
+beforeEach(() => resetPublicModelCatalogCache());
 
 const nutrition = {
 	calories: 420,
@@ -280,8 +283,97 @@ test('capture turns recipe text into an unsaved validated draft and never fetche
 	assert.equal(result.recipe.saved, false);
 	assert.equal(result.recipe.image, '');
 	assert.equal(result.recipe.source, undefined);
-	assert.deepEqual(result.assumptions, capturedRecipe.assumptions);
+	assert.equal(result.recipe.provenance, 'ai-generated');
+	assert.equal(result.assumptions.length, capturedRecipe.assumptions.length + 1);
+	assert.match(result.assumptions[0], /not fetched/i);
+	assert.deepEqual(result.assumptions.slice(1), capturedRecipe.assumptions);
 	assert.equal(JSON.stringify(result).includes('temporary-capture-key'), false);
+});
+
+test('capture fetches url while applying prompt as user notes and preserves web-import provenance', async () => {
+	let pageFetches = 0;
+	let observedUrl = '';
+	let observedPrompt = '';
+	const pageHtml = structuredRecipeHtml({ calories: '380 kcal' });
+	const fetcher: typeof fetch = async (_input, init) => {
+		observedPrompt = JSON.parse(String(init?.body)).messages[1].content;
+		return jsonResponse({
+			choices: [{ message: { content: JSON.stringify(capturedRecipe) } }]
+		});
+	};
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: 'https://recipes.example.test/chickpea-skillet',
+			prompt: 'Double the garlic and use smoked paprika.'
+		},
+		fetcher,
+		async (url) => {
+			pageFetches += 1;
+			observedUrl = url;
+			return new Response(pageHtml, { headers: { 'content-type': 'text/html' } });
+		}
+	)) as any;
+
+	assert.equal(pageFetches, 1);
+	assert.equal(observedUrl, 'https://recipes.example.test/chickpea-skillet');
+	assert.match(observedPrompt, /User notes for the fetched recipe:/);
+	assert.match(observedPrompt, /Double the garlic and use smoked paprika\./);
+	assert.match(observedPrompt, /Structured recipe data from the fetched page:/);
+	assert.doesNotMatch(observedPrompt, /Recipe text supplied by the user:/);
+	assert.equal(result.recipe.source, 'https://recipes.example.test/chickpea-skillet');
+	assert.equal(result.recipe.provenance, 'web-import');
+	assert.deepEqual(result.assumptions, capturedRecipe.assumptions);
+});
+
+test('capture skips fetching links accompanied by notes in prompt and bounds assumptions warnings', async () => {
+	let pageFetches = 0;
+	const maxAssumptions = Array.from({ length: 30 }, (_, index) =>
+		`Assumption ${index + 1}: ${'x'.repeat(300)}`.slice(0, 300)
+	);
+	const fetcher: typeof fetch = async () =>
+		jsonResponse({
+			choices: [
+				{
+					message: {
+						content: JSON.stringify({
+							...capturedRecipe,
+							assumptions: maxAssumptions
+						})
+					}
+				}
+			]
+		});
+
+	const result = (await runAIRequest(
+		{
+			action: 'capture',
+			provider: 'openai',
+			model: 'gpt-4.1-mini',
+			apiKey: 'capture-key',
+			url: '',
+			prompt: 'https://recipes.example.test/chili\nMake it vegetarian and halve the salt.'
+		},
+		fetcher,
+		async () => {
+			pageFetches += 1;
+			throw new Error('unseparated links in prompt must not be fetched');
+		}
+	)) as any;
+
+	assert.equal(pageFetches, 0);
+	assert.equal(result.recipe.source, undefined);
+	assert.equal(result.recipe.provenance, 'ai-generated');
+	assert.equal(result.assumptions.length, 30);
+	assert.match(result.assumptions[0], /not fetched/i);
+	assert.deepEqual(result.assumptions.slice(1), maxAssumptions.slice(0, 29));
+	for (const note of result.assumptions) {
+		assert.ok(note.length >= 1 && note.length <= 300);
+	}
 });
 
 test('capture sends photo bytes to Anthropic and includes assumptions in its response schema', async () => {

@@ -1,3 +1,33 @@
+<script module lang="ts">
+	const COOKED_HISTORY_PAGE_SIZE = 20;
+	const MEAL_SLOTS = ['Breakfast', 'Lunch', 'Dinner'] as const;
+	const weekdayFormatter = new Intl.DateTimeFormat('en', { weekday: 'short' });
+	const cookedBadgeFormatter = new Intl.DateTimeFormat('en', {
+		month: 'short',
+		day: 'numeric'
+	});
+	const historyDateFormatter = new Intl.DateTimeFormat('en', {
+		weekday: 'short',
+		month: 'short',
+		day: 'numeric'
+	});
+
+	function mealSlotKey(date: string, slot: string) {
+		return `${date}:${slot}`;
+	}
+
+	function formatCompletedDate(
+		value: string | undefined,
+		formatter: Intl.DateTimeFormat,
+		fallback = 'Unknown date'
+	) {
+		if (!value) return fallback;
+		const timestamp = Date.parse(value);
+		if (!Number.isFinite(timestamp)) return fallback;
+		return formatter.format(timestamp);
+	}
+</script>
+
 <script lang="ts">
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick } from 'svelte';
@@ -8,7 +38,8 @@
 		dialogMotion,
 		revealMotion,
 		fadeMotion,
-		motionDuration
+		motionDuration,
+		prefersReducedMotion
 	} from '#lib/motion.ts';
 	import { flip } from 'svelte/animate';
 	import {
@@ -37,6 +68,7 @@
 		LogOut,
 		Copy,
 		Download,
+		Share2,
 		Leaf,
 		SlidersHorizontal,
 		Flame,
@@ -50,12 +82,21 @@
 	import { buildShoppingList, preferenceSummary } from '#lib/domain.ts';
 	import {
 		completeMeal,
+		deleteShoppingItem,
 		expiryStatus,
 		reconcileShoppingList,
+		restoreShoppingItem,
 		transferPurchasedItemsToPantry
 	} from '#lib/kitchen-workflows.ts';
 	import { rankRecipes } from '#lib/discovery.ts';
-	import { insertRecipes } from '#lib/recipe-collection.ts';
+	import {
+		DEFAULT_RECIPE_FILTER,
+		filterTabScrollTarget,
+		filterTabsOverflow,
+		hasActiveRecipeFilters,
+		insertRecipes,
+		resetRecipeFilterState
+	} from '#lib/recipe-collection.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -73,6 +114,7 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
+	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -95,14 +137,100 @@
 	let conflicts = $state<SyncConflict[]>([]);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
 	let page = $state('discover');
-	let filter = $state('For you');
+	let filter = $state(DEFAULT_RECIPE_FILTER);
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
+	let lastActivePill = $state<'filter' | 'hidden'>('filter');
+	let filterTabs = $state<HTMLDivElement | null>(null);
+	let filterOverflow = $state({ left: false, right: false });
+	let activeRecipeFilters = $derived(hasActiveRecipeFilters({ filter, query, showHiddenRecipes }));
+	function syncFilterOverflow() {
+		if (!filterTabs) {
+			filterOverflow = { left: false, right: false };
+			return;
+		}
+		filterOverflow = filterTabsOverflow({
+			scrollLeft: filterTabs.scrollLeft,
+			clientWidth: filterTabs.clientWidth,
+			scrollWidth: filterTabs.scrollWidth
+		});
+	}
+	function resetRecipeFilters() {
+		const next = resetRecipeFilterState();
+		lastActivePill = 'filter';
+		filter = next.filter;
+		query = next.query;
+		showHiddenRecipes = next.showHiddenRecipes;
+	}
+	$effect(() => {
+		const currentPage = page;
+		const currentFilter = filter;
+		const currentHidden = showHiddenRecipes;
+		const preferred = lastActivePill;
+		const container = filterTabs;
+		if ((currentPage !== 'discover' && currentPage !== 'saved') || !container) return;
+		let cancelled = false;
+		void tick().then(() => {
+			if (cancelled || filterTabs !== container) return;
+			const targetKey =
+				preferred === 'hidden' && currentHidden
+					? 'hidden'
+					: currentFilter !== DEFAULT_RECIPE_FILTER
+						? currentFilter
+						: currentHidden
+							? 'hidden'
+							: DEFAULT_RECIPE_FILTER;
+			const buttons = Array.from(container.querySelectorAll<HTMLButtonElement>('button'));
+			const pill = buttons.find((button) => button.dataset.filter === targetKey);
+			if (pill) {
+				const containerRect = container.getBoundingClientRect();
+				const pillRect = pill.getBoundingClientRect();
+				const pillLeft = pillRect.left - containerRect.left + container.scrollLeft;
+				const left = filterTabScrollTarget({
+					clientWidth: container.clientWidth,
+					scrollWidth: container.scrollWidth,
+					pillLeft,
+					pillWidth: pillRect.width
+				});
+				if (Math.abs(container.scrollLeft - left) > 1) {
+					container.scrollTo({
+						left,
+						behavior: prefersReducedMotion() ? 'instant' : 'smooth'
+					});
+				}
+			}
+			syncFilterOverflow();
+		});
+		return () => {
+			cancelled = true;
+		};
+	});
+	$effect(() => {
+		const container = filterTabs;
+		if (!container || typeof window === 'undefined') return;
+		syncFilterOverflow();
+		const observer =
+			typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => syncFilterOverflow()) : null;
+		observer?.observe(container);
+		window.addEventListener('resize', syncFilterOverflow);
+		void document.fonts?.ready?.then(() => {
+			if (filterTabs === container) syncFilterOverflow();
+		});
+		return () => {
+			observer?.disconnect();
+			window.removeEventListener('resize', syncFilterOverflow);
+		};
+	});
 	let toast = $state('');
 	let toastUndo = $state<(() => void) | null>(null);
 	let toastVersion = 0;
 	let busy = $state(false);
 	let mobileNav = $state(false);
+	let mobileCalendar = $state(
+		typeof window !== 'undefined' &&
+			typeof window.matchMedia === 'function' &&
+			window.matchMedia('(max-width: 650px)').matches
+	);
 	let modal = $state('');
 	const dialogNames: Record<string, string> = {
 		onboarding: 'Recipe preferences',
@@ -112,6 +240,7 @@
 		generate: 'Generate recipes',
 		settings: 'Settings',
 		household: 'Your household',
+		confirmJoin: 'Replace personal kitchen',
 		removeMember: 'Remove household member',
 		leave: 'Leave household',
 		delete: 'Delete account',
@@ -168,6 +297,7 @@
 		kitchenSync?.clearContext();
 		user = null;
 		kitchen = createInitialState();
+		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
 		showStarter = false;
 		stateEtag = null;
@@ -331,14 +461,17 @@
 	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
+	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
 	let plannedServings = $state(2);
+	let pickingForSlot = $state(false);
 	let editingMealId = $state('');
 	let cookingMealId = $state('');
 	let deductPantry = $state(false);
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
+	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
 	let deletePassword = $state('');
@@ -433,7 +566,7 @@
 				(filter !== 'Quick & easy' || r.time <= 30) &&
 				(filter !== 'Plant-powered' || r.tags.some((t) => /vegetarian|vegan|plant/i.test(t))) &&
 				(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
-				(filter !== 'High protein' || r.nutrition.protein >= 25)
+				(filter !== 'High protein' || (!r.nutritionStale && r.nutrition.protein >= 25))
 		);
 		return filter === 'For you'
 			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
@@ -443,6 +576,12 @@
 		kitchen.pantry.filter(
 			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
 		)
+	);
+	let checkedCount = $derived(kitchen.shopping.filter((item) => item.checked).length);
+	let visibleShopping = $derived(
+		shoppingFilter === 'unpurchased'
+			? kitchen.shopping.filter((item) => !item.checked)
+			: kitchen.shopping
 	);
 	let week = $derived.by(() => {
 		const d = new Date();
@@ -454,6 +593,26 @@
 			return date;
 		});
 	});
+	let recipesById = $derived(new Map(kitchen.recipes.map((recipe) => [recipe.id, recipe])));
+	let plannerMeals = $derived.by(() => {
+		const byDateSlot = new Map<string, Meal[]>();
+		const completed: Meal[] = [];
+		for (const meal of kitchen.meals) {
+			const slotKey = mealSlotKey(meal.date, meal.slot);
+			const bucket = byDateSlot.get(slotKey);
+			if (bucket) bucket.push(meal);
+			else byDateSlot.set(slotKey, [meal]);
+			if (meal.completedAt) completed.push(meal);
+		}
+		completed.sort((a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? ''));
+		return { mealsByDateSlot: byDateSlot, completedMeals: completed };
+	});
+	let mealsByDateSlot = $derived(plannerMeals.mealsByDateSlot);
+	let completedMeals = $derived(plannerMeals.completedMeals);
+	let renderableCompletedMeals = $derived(
+		completedMeals.filter((meal) => recipesById.has(meal.recipeId))
+	);
+	let visibleCompletedMeals = $derived(renderableCompletedMeals.slice(0, cookedHistoryLimit));
 	function ingredientEmoji(name: string) {
 		return /tomato/i.test(name)
 			? '🍅'
@@ -491,10 +650,10 @@
 	}
 	function removeShoppingItem(item: AppState['shopping'][number]) {
 		const removed = structuredClone($state.snapshot(item));
-		kitchen.shopping = kitchen.shopping.filter((entry) => entry.id !== item.id);
+		if (editingShoppingId === removed.id) editingShoppingId = '';
+		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
 		notify(`${item.name} removed.`, () => {
-			if (!kitchen.shopping.some((entry) => entry.id === removed.id))
-				kitchen.shopping.push(removed);
+			kitchen.shopping = restoreShoppingItem(kitchen, removed);
 		});
 	}
 	function removePlannedMeal(meal: Meal) {
@@ -550,7 +709,8 @@
 				notify('Your household changed in another tab. Checking for updates.');
 			}
 			throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), {
-				status: response.status
+				status: response.status,
+				code: data.code
 			});
 		}
 		if (url === '/api/state') stateEtag = data.state ? response.headers.get('etag') : null;
@@ -764,10 +924,18 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
+		const calendarMedia =
+			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
+		const calendarMediaChanged = () => {
+			mobileCalendar = Boolean(calendarMedia?.matches);
+		};
+		calendarMediaChanged();
+		calendarMedia?.addEventListener('change', calendarMediaChanged);
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
 		return () => {
+			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
@@ -967,6 +1135,7 @@
 			importSession = emptyImportSession();
 			resumeImport = false;
 			kitchen = createInitialState();
+			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
 			clearInterval(connectionPoll);
@@ -1168,7 +1337,12 @@
 
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else if (importSession.text || importSession.photo || importSession.draft) {
+			else if (
+				importSession.url ||
+				importSession.text ||
+				importSession.photo ||
+				importSession.draft
+			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
 				window.location.assign(result.authorizationUrl);
@@ -1449,7 +1623,7 @@
 				void exportKitchen();
 				break;
 			case 'export-shopping':
-				exportList();
+				void exportList();
 				break;
 			case 'export-pending':
 				exportPendingChanges();
@@ -1465,7 +1639,7 @@
 				else void openSettings();
 				break;
 			case 'leave-household':
-				modal = 'leave';
+				void openLeaveHousehold();
 				break;
 			case 'scan':
 				imageInput?.click();
@@ -1661,6 +1835,31 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
+	function weekOffsetForDate(value: string) {
+		const target = new Date(`${value}T12:00:00`);
+		if (Number.isNaN(target.getTime())) return weekOffset;
+		target.setDate(target.getDate() - ((target.getDay() + 6) % 7));
+		const currentMonday = new Date();
+		currentMonday.setHours(12, 0, 0, 0);
+		currentMonday.setDate(currentMonday.getDate() - ((currentMonday.getDay() + 6) % 7));
+		const utcTarget = Date.UTC(target.getFullYear(), target.getMonth(), target.getDate());
+		const utcCurrent = Date.UTC(
+			currentMonday.getFullYear(),
+			currentMonday.getMonth(),
+			currentMonday.getDate()
+		);
+		return Math.round((utcTarget - utcCurrent) / (7 * 86_400_000));
+	}
+	function resetMealDialogState() {
+		pickingForSlot = false;
+		mealDate = '';
+		mealSlot = 'Dinner';
+		plannedServings = 2;
+		editingMealId = '';
+		cookingMealId = '';
+		deductPantry = false;
+		leftoverServings = 0;
+	}
 	function refreshWeekShopping(startDate: string) {
 		const start = new Date(`${startDate}T12:00:00`);
 		if (Number.isNaN(start.getTime())) return;
@@ -1683,7 +1882,9 @@
 		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
 		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
 		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
-		kitchen.shopping = kitchen.shopping.filter((item) => item.sourceKey !== `recipe:${recipe.id}`);
+		kitchen.shopping = kitchen.shopping.filter(
+			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
+		);
 		if (kitchen.preferences.ratings) {
 			const ratings = { ...kitchen.preferences.ratings };
 			delete ratings[recipe.id];
@@ -1722,45 +1923,100 @@
 				: 'You have everything you need. Happy cooking!'
 		);
 	}
+	function openRecipePicker(slotTarget?: { date: string; slot: string }) {
+		resetMealDialogState();
+		selected = null;
+		selectedMealServings = undefined;
+		if (slotTarget) {
+			pickingForSlot = true;
+			mealDate = slotTarget.date;
+			mealSlot = slotTarget.slot;
+		} else {
+			mealDate = dateKey(new Date());
+			mealSlot = 'Dinner';
+		}
+		modal = 'pickRecipe';
+	}
+	function choosePickedRecipe(recipe: Recipe) {
+		if (pickingForSlot && mealDate && ['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) {
+			const scheduledDate = mealDate;
+			const scheduledSlot = mealSlot;
+			const scheduledWeek = weekStartForDate(scheduledDate);
+			const servings = isValidServings(recipe.servings) ? recipe.servings : 2;
+			const created: Meal = {
+				id: crypto.randomUUID(),
+				date: scheduledDate,
+				slot: scheduledSlot,
+				recipeId: recipe.id,
+				servings
+			};
+			kitchen.meals.push(created);
+			refreshWeekShopping(scheduledWeek);
+			weekOffset = weekOffsetForDate(scheduledDate);
+			selectedMealServings = undefined;
+			selected = null;
+			resetMealDialogState();
+			modal = '';
+			page = 'planner';
+			notify(`${recipe.title} scheduled.`, () => {
+				const existing = kitchen.meals.find((entry) => entry.id === created.id);
+				if (!existing) return;
+				const affectedWeek = weekStartForDate(existing.date);
+				kitchen.meals = kitchen.meals.filter((entry) => entry.id !== created.id);
+				refreshWeekShopping(affectedWeek);
+				if (affectedWeek !== scheduledWeek) refreshWeekShopping(scheduledWeek);
+			});
+			return;
+		}
+		planRecipe(recipe, recipe.servings);
+	}
 	function planRecipe(r: Recipe, servings = r.servings) {
+		resetMealDialogState();
 		plannedServings = servings;
 		selected = r;
 		mealDate = dateKey(new Date());
+		mealSlot = 'Dinner';
 		modal = 'plan';
 	}
 	function editPlannedMeal(meal: Meal) {
 		if (meal.completedAt) return;
+		resetMealDialogState();
 		editingMealId = meal.id;
 		mealDate = meal.date;
 		mealSlot = meal.slot;
 		plannedServings = meal.servings;
 		modal = 'editMeal';
 	}
-	function saveMealChanges() {
+	function saveMealChanges(event?: SubmitEvent) {
+		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === editingMealId);
 		if (!meal || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
-		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
-			notify('Choose between 1 and 24 whole servings.');
+		if (!isValidServings(plannedServings)) {
+			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			return;
 		}
 		const previousWeek = weekStartForDate(meal.date);
-		meal.date = mealDate;
+		const updatedDate = mealDate;
+		meal.date = updatedDate;
 		meal.slot = mealSlot;
 		meal.servings = Math.round(plannedServings);
 		refreshWeekShopping(previousWeek);
 		refreshWeekShopping(weekStartForDate(meal.date));
-		editingMealId = '';
+		weekOffset = weekOffsetForDate(updatedDate);
+		resetMealDialogState();
 		modal = '';
 		notify('Meal plan updated.');
 	}
 	function openCookDialog(meal: Meal) {
 		if (meal.completedAt) return;
+		resetMealDialogState();
 		cookingMealId = meal.id;
 		deductPantry = false;
 		leftoverServings = 0;
 		modal = 'cookMeal';
 	}
-	function markMealCooked() {
+	function markMealCooked(event?: SubmitEvent) {
+		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === cookingMealId);
 		if (!meal) return;
 		if (
@@ -1772,16 +2028,17 @@
 			return;
 		}
 		const recipeId = meal.recipeId;
+		const servingsCooked = meal.servings;
 		const startDate = weekStartForDate(meal.date);
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
 		refreshWeekShopping(startDate);
-		cookingMealId = '';
+		resetMealDialogState();
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
-		selectedMealServings = meal.servings;
+		selectedMealServings = servingsCooked;
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
@@ -1795,22 +2052,26 @@
 		modal = 'generate';
 		await generate();
 	}
-	function addMeal() {
-		if (!selected || !mealDate) return;
-		if (!Number.isInteger(plannedServings) || plannedServings < 1 || plannedServings > 24) {
-			notify('Choose between 1 and 24 whole servings.');
+	function addMeal(event?: SubmitEvent) {
+		event?.preventDefault();
+		if (!selected || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
+		if (!isValidServings(plannedServings)) {
+			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			return;
 		}
+		const scheduledDate = mealDate;
 		kitchen.meals.push({
 			id: crypto.randomUUID(),
-			date: mealDate,
+			date: scheduledDate,
 			slot: mealSlot,
 			recipeId: selected.id,
 			servings: plannedServings
 		});
-		refreshWeekShopping(weekStartForDate(mealDate));
+		refreshWeekShopping(weekStartForDate(scheduledDate));
+		weekOffset = weekOffsetForDate(scheduledDate);
 		selectedMealServings = undefined;
 		selected = null;
+		resetMealDialogState();
 		modal = '';
 		page = 'planner';
 		notify('Meal scheduled.');
@@ -1905,13 +2166,42 @@
 			householdBusy = false;
 		}
 	}
-	async function join() {
+	async function openLeaveHousehold() {
+		mobileNav = false;
+		if (!user) {
+			openAuthentication();
+			return;
+		}
+		error = '';
 		householdBusy = true;
+		try {
+			const data = await refreshHousehold();
+			if ((data.members ?? []).length <= 1) {
+				modal = 'household';
+				notify('You already have your own personal kitchen.');
+			} else {
+				modal = 'leave';
+			}
+		} catch (e) {
+			modal = 'household';
+			error = (e as Error).message;
+		} finally {
+			householdBusy = false;
+		}
+	}
+	async function join(confirmReplace = false) {
+		const confirmed = confirmReplace === true;
+		householdBusy = true;
+		error = '';
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
 			await flushKitchen();
-			await request('/api/household', { action: 'join', code: joinCode.trim() });
+			await request('/api/household', {
+				action: 'join',
+				code: joinCode.trim(),
+				...(confirmed ? { confirmReplace: true } : {})
+			});
 			joinCode = '';
 			inviteCode = '';
 			currentInviteId = '';
@@ -1919,11 +2209,18 @@
 			const data = await request('/api/state');
 			adoptKitchen(data.state || createNewUserState());
 			await refreshHousehold();
+			modal = 'household';
 			syncing = false;
 			notify('Welcome to your shared kitchen.');
 		} catch (e) {
 			syncing = false;
-			error = (e as Error).message;
+			const err = e as Error & { status?: number; code?: string };
+			if (!confirmed && err.status === 409 && err.code === 'confirm_replace') {
+				error = '';
+				modal = 'confirmJoin';
+				return;
+			}
+			error = err.message;
 		} finally {
 			syncing = false;
 			householdBusy = false;
@@ -1945,9 +2242,18 @@
 		}
 	}
 	function closeDialog() {
-		if (modal === 'plan') selected = null;
-		if (modal === 'editMeal') editingMealId = '';
-		if (modal === 'cookMeal') cookingMealId = '';
+		if (modal === 'plan') {
+			selected = null;
+			selectedMealServings = undefined;
+		}
+		if (
+			modal === 'plan' ||
+			modal === 'pickRecipe' ||
+			modal === 'editMeal' ||
+			modal === 'cookMeal'
+		) {
+			resetMealDialogState();
+		}
 		if (modal === 'deleteRecipe') recipeToDelete = null;
 		if (modal === 'removeMember') memberToRemove = null;
 		if (modal === 'household') {
@@ -1969,9 +2275,13 @@
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
-		openImport(url);
+		importSession = { ...emptyImportSession(), url };
+		openImport();
 	}
-	async function captureImport(input: { prompt: string; image?: string }, signal: AbortSignal) {
+	async function captureImport(
+		input: { url?: string; prompt: string; image?: string },
+		signal: AbortSignal
+	) {
 		if (!needAI()) {
 			resumeImport = true;
 			return null;
@@ -1979,7 +2289,9 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const saved = { ...recipe, saved: true };
+		const nutritionStale =
+			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
+		const saved = { ...recipe, saved: true, nutritionStale };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
 		importSession = emptyImportSession();
 		resumeImport = false;
@@ -1988,7 +2300,11 @@
 		page = 'saved';
 		query = '';
 		filter = 'For you';
-		notify('Recipe saved to your collection.');
+		notify(
+			nutritionStale
+				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
+				: 'Recipe saved to your collection.'
+		);
 	}
 	async function exportKitchen() {
 		try {
@@ -2037,6 +2353,7 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
+			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
 			modal = '';
@@ -2124,16 +2441,39 @@
 		}
 	}
 
-	function exportList() {
+	async function exportList() {
+		if (!kitchen.shopping.length) return;
 		const text = kitchen.shopping
 			.map((i) => `${i.checked ? '✓' : '☐'} ${i.quantity} ${i.unit} ${i.name}`)
 			.join('\n');
-		const url = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
-		const a = document.createElement('a');
-		a.href = url;
-		a.download = 'flavorithm-shopping.txt';
-		a.click();
-		URL.revokeObjectURL(url);
+		const shareData = { title: 'Shopping list', text };
+		if (
+			typeof navigator.share === 'function' &&
+			(typeof navigator.canShare !== 'function' || navigator.canShare(shareData))
+		) {
+			try {
+				await navigator.share(shareData);
+				return;
+			} catch (e) {
+				if ((e as { name?: string })?.name === 'AbortError') return;
+			}
+		}
+		if (typeof navigator.clipboard?.writeText === 'function') {
+			try {
+				await navigator.clipboard.writeText(text);
+				notify('Shopping list copied.');
+				return;
+			} catch {
+				/* Fall back to file download when clipboard access is unavailable. */
+			}
+		}
+		download(text, 'flavorithm-shopping.txt', 'text/plain');
+	}
+	function movePurchasedToPantry() {
+		const checked = kitchen.shopping.filter((i) => i.checked);
+		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
+		kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
+		notify(`${checked.length} purchased items moved to your pantry.`);
 	}
 	async function internetSearch() {
 		if (!capabilities.recipeSearch) {
@@ -2385,26 +2725,47 @@
 						</div>
 					</div>
 					<div class="recipe-toolbar">
-						<div class="filter-tabs">
-							{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
-									class:active={filter === item}
-									aria-pressed={filter === item}
-									onclick={() => (filter = item)}
-									>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
-								>{/each}
-							<button
-								class:active={showHiddenRecipes}
-								aria-pressed={showHiddenRecipes}
-								onclick={() => (showHiddenRecipes = !showHiddenRecipes)}
-								>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
-							>
+						<div
+							class="filter-tabs-scroll"
+							class:can-scroll-left={filterOverflow.left}
+							class:can-scroll-right={filterOverflow.right}
+						>
+							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
+								{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
+										type="button"
+										data-filter={item}
+										class:active={filter === item}
+										aria-pressed={filter === item}
+										onclick={() => {
+											lastActivePill = 'filter';
+											filter = item;
+										}}
+										>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
+									>{/each}
+								<button
+									type="button"
+									data-filter="hidden"
+									class:active={showHiddenRecipes}
+									aria-pressed={showHiddenRecipes}
+									onclick={() => {
+										lastActivePill = 'hidden';
+										showHiddenRecipes = !showHiddenRecipes;
+									}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+								>
+							</div>
 						</div>
-						<div class="search-box">
-							<Search size={17} /><input
+						<div class="search-box" class:has-clear={query.length > 0}>
+							<Search size={17} aria-hidden="true" /><input
+								type="search"
 								aria-label="Search recipes"
 								placeholder="Search recipes"
 								bind:value={query}
-							/>
+							/>{#if query}<button
+									type="button"
+									class="search-clear"
+									aria-label="Clear search"
+									onclick={() => (query = '')}><X size={16} aria-hidden="true" /></button
+								>{/if}
 						</div>
 					</div>
 					<div class="recipe-grid">
@@ -2467,17 +2828,30 @@
 								</div>
 							</article>{/each}
 					</div>
-					{#if !recipes.length}<div class="empty-state">
-							<Heart size={36} />
-							<h3>
-								{page === 'saved' ? 'No saved recipes yet' : 'No recipes found'}
-							</h3>
-							<p>
-								{page === 'saved'
-									? 'Tap the bookmark on any recipe to keep it close.'
-									: 'Try another search or generate recipes.'}
-							</p>
-						</div>{/if}{#if capabilities.recipeSearch}<button
+					{#if !recipes.length}{#if page === 'saved' && !kitchen.recipes.some((r) => r.saved && !r.hidden)}<div
+								class="empty-state"
+							>
+								<Heart size={36} />
+								<h2>No saved recipes yet</h2>
+								<p>Tap the bookmark on any recipe to keep it close.</p>
+							</div>{:else if activeRecipeFilters}<div class="empty-state filtered-recipe-empty">
+								<Heart size={36} />
+								<h2>
+									{page === 'saved' ? 'No matching saved recipes' : 'No matching recipes'}
+								</h2>
+								<p>
+									{page === 'saved'
+										? 'Your current search or filters hid your saved recipes.'
+										: 'No recipes match your current search or filters.'}
+								</p>
+								<button type="button" class="secondary" onclick={resetRecipeFilters}
+									>Reset filters</button
+								>
+							</div>{:else}<div class="empty-state">
+								<Heart size={36} />
+								<h2>No recipes found</h2>
+								<p>Import a recipe or generate ideas to get started.</p>
+							</div>{/if}{/if}{#if capabilities.recipeSearch}<button
 							class="browse-link"
 							onclick={() => {
 								modal = 'search';
@@ -2589,17 +2963,14 @@
 					>
 				</div>
 			{:else if page === 'planner'}
+				{@const todayKey = dateKey(new Date())}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
 						<h1>Meal planner<span class="heading-spark" aria-hidden="true">✷</span></h1>
 						<p>Schedule meals and build your weekly shopping list.</p>
 					</div>
-					<button
-						class="primary"
-						onclick={() => {
-							selected = null;
-							modal = 'pickRecipe';
-						}}><Plus size={17} /> Plan a meal</button
+					<button class="primary" onclick={() => openRecipePicker()}
+						><Plus size={17} /> Plan a meal</button
 					>
 				</section>
 				<div class="calendar-toolbar">
@@ -2642,41 +3013,40 @@
 						class="calendar-grid"
 						in:revealMotion|global={{ y: 8, duration: 220 }}
 					>
-						{#each week as day}<div
-								class:today={dateKey(day) === dateKey(new Date())}
-								class="calendar-day"
-							>
+						{#each week as day}{@const dayKey = dateKey(day)}
+							<div class:today={dayKey === todayKey} class="calendar-day">
 								<div class="day-heading">
-									<span>{day.toLocaleDateString('en', { weekday: 'short' })}</span><b
-										>{day.getDate()}</b
-									>
+									<span>{weekdayFormatter.format(day)}</span><b>{day.getDate()}</b>
 								</div>
-								{#each ['Breakfast', 'Lunch', 'Dinner'] as slot}<div class="meal-slot">
+								{#each MEAL_SLOTS as slot}<div class="meal-slot">
 										<span class="meal-label">{slot}</span
-										>{#each kitchen.meals.filter((m) => m.date === dateKey(day) && m.slot === slot) as meal}{@const recipe =
-												kitchen.recipes.find((r) => r.id === meal.recipeId)}{#if recipe}<div
-													class="calendar-meal"
-												>
+										>{#each mealsByDateSlot.get(mealSlotKey(dayKey, slot)) ?? [] as meal}{@const recipe =
+												recipesById.get(meal.recipeId)}{#if recipe}<div class="calendar-meal">
 													<button
 														class="meal-open"
 														onclick={() => {
 															selectedMealServings = meal.servings;
 															selected = recipe;
 														}}
-														><img
-															src={recipe.image || recipePlaceholder(recipe)}
-															onerror={(event) => recipeImageError(event, recipe)}
-															alt=""
-														/><b>{recipe.title}</b><small
+														>{#if !mobileCalendar}<img
+																src={recipe.image || recipePlaceholder(recipe)}
+																onerror={(event) => recipeImageError(event, recipe)}
+																alt=""
+																width="180"
+																height="65"
+																loading="lazy"
+																decoding="async"
+															/>{/if}<b>{recipe.title}</b><small
 															>{recipe.time} min · {meal.servings} servings</small
 														></button
 													>
 													<div class="calendar-meal-actions">
-														{#if meal.completedAt}<small class="cooked-badge"
-																>Cooked {new Date(meal.completedAt).toLocaleDateString('en', {
-																	month: 'short',
-																	day: 'numeric'
-																})}</small
+														{#if meal.completedAt}{@const cookedDate = formatCompletedDate(
+																meal.completedAt,
+																cookedBadgeFormatter,
+																''
+															)}<small class="cooked-badge"
+																>{cookedDate ? `Cooked ${cookedDate}` : 'Cooked'}</small
 															>{:else}<button
 																class="text-button"
 																onclick={() => editPlannedMeal(meal)}>Edit</button
@@ -2691,11 +3061,7 @@
 													</div>
 												</div>{/if}{/each}<button
 											class="add-meal"
-											onclick={() => {
-												mealDate = dateKey(day);
-												mealSlot = slot;
-												modal = 'pickRecipe';
-											}}
+											onclick={() => openRecipePicker({ date: dayKey, slot })}
 											aria-label={`Plan ${slot} for ${day.toDateString()}`}
 											><Plus size={17} /></button
 										>
@@ -2705,29 +3071,25 @@
 				<section class="cooked-history">
 					<div class="section-line">
 						<h2>Cooked history</h2>
-						<span class="muted"
-							>{kitchen.meals.filter((meal) => meal.completedAt).length} meals</span
-						>
+						<span class="muted">{completedMeals.length} meals</span>
 					</div>
-					{#if kitchen.meals.some((meal) => meal.completedAt)}<div class="cooked-history-list">
-							{#each kitchen.meals
-								.filter((meal) => meal.completedAt)
-								.sort( (a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? '') ) as meal (meal.id)}{@const recipe =
-									kitchen.recipes.find((item) => item.id === meal.recipeId)}{#if recipe}<article
-										class="cooked-history-row"
-									>
+					{#if renderableCompletedMeals.length}<div class="cooked-history-list">
+							{#each visibleCompletedMeals as meal (meal.id)}{@const recipe = recipesById.get(
+									meal.recipeId
+								)}{#if recipe}<article class="cooked-history-row">
 										<img
 											src={recipe.image || recipePlaceholder(recipe)}
 											onerror={(event) => recipeImageError(event, recipe)}
 											alt=""
+											width="54"
+											height="48"
+											loading="lazy"
+											decoding="async"
 										/>
 										<div>
 											<b>{recipe.title}</b><span
-												>{new Date(meal.completedAt!).toLocaleDateString('en', {
-													weekday: 'short',
-													month: 'short',
-													day: 'numeric'
-												})} · {meal.servings} servings{meal.leftoverServings
+												>{formatCompletedDate(meal.completedAt, historyDateFormatter)} · {meal.servings}
+												servings{meal.leftoverServings
 													? ` · ${meal.leftoverServings} leftover`
 													: ''}</span
 											>
@@ -2749,7 +3111,12 @@
 											>
 										</div>
 									</article>{/if}{/each}
-						</div>{:else}<p class="muted history-empty">
+						</div>
+						{#if renderableCompletedMeals.length > cookedHistoryLimit}<button
+								type="button"
+								class="secondary history-more"
+								onclick={() => (cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE)}>Show more</button
+							>{/if}{:else}<p class="muted history-empty">
 							Meals marked cooked will appear here. You can add leftovers and update pantry stock
 							when you finish a meal.
 						</p>{/if}
@@ -2763,22 +3130,66 @@
 							visible until that source is refreshed.
 						</p>
 					</div>
-					<button class="secondary" onclick={exportList}><Download size={17} /> Export list</button>
+					<button class="secondary" disabled={!kitchen.shopping.length} onclick={exportList}
+						><Share2 size={17} /> Share list</button
+					>
 				</section>
 				<div class="shopping-layout">
 					<div>
 						<div class="section-line">
 							<h2>Items to buy</h2>
-							<span class="muted"
-								>{kitchen.shopping.filter((i) => i.checked).length} of {kitchen.shopping.length} purchased</span
-							>
+							<span class="muted">{checkedCount} of {kitchen.shopping.length} purchased</span>
 						</div>
-						<div class="shopping-progress">
+						<div
+							class="shopping-progress"
+							role="progressbar"
+							aria-label="Shopping progress"
+							aria-valuemin={0}
+							aria-valuemax={kitchen.shopping.length}
+							aria-valuenow={checkedCount}
+						>
 							<span
-								style={`width:${kitchen.shopping.length ? (kitchen.shopping.filter((i) => i.checked).length / kitchen.shopping.length) * 100 : 0}%`}
+								style={`width:${kitchen.shopping.length ? (checkedCount / kitchen.shopping.length) * 100 : 0}%`}
 							></span>
 						</div>
-						{#each kitchen.shopping as item (item.id)}<div
+						<div class="shopping-filters" role="group" aria-label="Filter shopping list">
+							{#each [{ id: 'all' as const, label: 'Show all', count: kitchen.shopping.length }, { id: 'unpurchased' as const, label: 'Hide purchased', count: checkedCount }] as option}<button
+									type="button"
+									class:active={shoppingFilter === option.id}
+									aria-pressed={shoppingFilter === option.id}
+									onclick={() => (shoppingFilter = option.id)}
+									>{option.label}<span>{option.count}</span></button
+								>{/each}
+						</div>
+						<form
+							class="inline-add"
+							onsubmit={(e) => {
+								e.preventDefault();
+								if (shoppingText.trim()) {
+									const newItem = {
+										id: crypto.randomUUID(),
+										name: shoppingText.trim(),
+										quantity: 1,
+										unit: 'piece',
+										checked: false
+									};
+									const firstCheckedIndex = kitchen.shopping.findIndex((item) => item.checked);
+									if (firstCheckedIndex === -1) {
+										kitchen.shopping.push(newItem);
+									} else {
+										kitchen.shopping.splice(firstCheckedIndex, 0, newItem);
+									}
+									shoppingText = '';
+								}
+							}}
+						>
+							<Plus size={18} /><input
+								aria-label="Add shopping item"
+								placeholder="Anything else for the basket?"
+								bind:value={shoppingText}
+							/><button class="text-button">Add</button>
+						</form>
+						{#each visibleShopping as item (item.id)}<div
 								class:checked={item.checked}
 								class="shopping-row"
 								animate:flip={{ duration: motionDuration(200) }}
@@ -2851,38 +3262,20 @@
 								<button class="secondary" onclick={() => navigate('discover')}
 									>Browse recipes <ArrowRight size={16} /></button
 								>
+							</div>{:else if !visibleShopping.length}<div class="shopping-complete">
+								<p>
+									<Check size={16} />All {checkedCount}
+									{checkedCount === 1 ? 'item' : 'items'} purchased.
+								</p>
+								<button class="text-button" onclick={movePurchasedToPantry}
+									>Put purchased items in my pantry <ArrowRight size={16} /></button
+								>
 							</div>{/if}
-						<form
-							class="inline-add"
-							onsubmit={(e) => {
-								e.preventDefault();
-								if (shoppingText.trim()) {
-									kitchen.shopping.push({
-										id: crypto.randomUUID(),
-										name: shoppingText.trim(),
-										quantity: 1,
-										unit: 'piece',
-										checked: false
-									});
-									shoppingText = '';
-								}
-							}}
-						>
-							<Plus size={18} /><input
-								aria-label="Add shopping item"
-								placeholder="Anything else for the basket?"
-								bind:value={shoppingText}
-							/><button class="text-button">Add</button>
-						</form>
-						<button
-							class="text-button"
-							onclick={() => {
-								const checked = kitchen.shopping.filter((i) => i.checked);
-								kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, checked);
-								kitchen.shopping = kitchen.shopping.filter((i) => !i.checked);
-								notify(`${checked.length} purchased items moved to your pantry.`);
-							}}>Put purchased items in my pantry <ArrowRight size={16} /></button
-						>
+						{#if !kitchen.shopping.length || visibleShopping.length}<button
+								class="text-button shopping-transfer"
+								onclick={movePurchasedToPantry}
+								>Put purchased items in my pantry <ArrowRight size={16} /></button
+							>{/if}
 					</div>
 				</div>
 			{/if}
@@ -3389,18 +3782,52 @@
 							autocomplete="off"
 						/></label
 					>
-					<button class="secondary full" disabled={householdBusy || !joinCode.trim()} onclick={join}
-						>Join household <ArrowRight size={17} /></button
+					<button
+						class="secondary full"
+						disabled={householdBusy || !joinCode.trim()}
+						onclick={() => join()}>Join household <ArrowRight size={17} /></button
 					>
 					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<button
-						class="text-button danger full"
-						disabled={householdBusy}
-						onclick={() => {
-							modal = 'leave';
-							error = '';
-						}}>Leave this household</button
+					{#if members.length > 1}
+						<button
+							class="text-button danger full"
+							disabled={householdBusy}
+							onclick={() => {
+								modal = 'leave';
+								error = '';
+							}}>Leave this household</button
+						>
+					{:else if members.length === 1 || !householdBusy}
+						<p class="field-help">
+							You already have your own personal kitchen. Invite someone above to share it, or enter
+							an invite code to join another household.
+						</p>
+					{/if}
+				{:else if modal === 'confirmJoin'}
+					<h2>Replace your personal kitchen?</h2>
+					<p class="muted">
+						Joining this household will replace your current personal kitchen, including any saved
+						recipes, cover photos, pantry items, planned meals, and shopping list. Download a backup
+						first if you want to keep a copy.
+					</p>
+					<button class="secondary full" disabled={householdBusy} onclick={exportKitchen}
+						><Download size={17} /> Export backup</button
 					>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="dialog-actions">
+						<button
+							class="secondary"
+							disabled={householdBusy}
+							onclick={() => {
+								error = '';
+								modal = 'household';
+							}}>Cancel</button
+						><button
+							class="primary danger-action"
+							disabled={householdBusy}
+							onclick={() => join(true)}>{householdBusy ? 'Joining…' : 'Replace kitchen'}</button
+						>
+					</div>
 				{:else if modal === 'removeMember'}
 					<h2>Remove household member?</h2>
 					<p class="muted">
@@ -3414,6 +3841,7 @@
 							disabled={householdBusy}
 							onclick={() => {
 								memberToRemove = null;
+								error = '';
 								modal = 'household';
 							}}>Keep member</button
 						><button
@@ -3423,16 +3851,35 @@
 						>
 					</div>
 				{:else if modal === 'leave'}
+					{@const nextHouseholdOwner = canManageHousehold
+						? members.find((member) => member.id !== user?.id)
+						: undefined}
 					<h2>Leave this household?</h2>
 					<p class="muted">
 						Leaving gives you a new personal kitchen. The shared pantry and recipes stay with your
 						household. You can rejoin with a new invitation.
 					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-						class="primary full"
-						onclick={leaveHousehold}
-						disabled={busy}>Leave household</button
-					>
+					{#if nextHouseholdOwner}
+						<p class="field-help">
+							Ownership of this household will transfer to <b>{nextHouseholdOwner.name}</b>.
+						</p>
+					{/if}
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<div class="dialog-actions">
+						<button
+							class="secondary"
+							disabled={busy || householdBusy}
+							onclick={() => {
+								error = '';
+								modal = 'household';
+							}}>Stay in household</button
+						><button
+							class="primary danger-action"
+							disabled={busy || householdBusy}
+							onclick={leaveHousehold}
+							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
+						>
+					</div>
 				{:else if modal === 'delete' && !managedAuth}
 					<h2>Delete your account?</h2>
 					<p class="muted">
@@ -3503,94 +3950,105 @@
 						>
 					</div>
 				{:else if modal === 'editMeal'}
+					{@const editingMeal = kitchen.meals.find((meal) => meal.id === editingMealId)}
+					{@const editingMealRecipe = kitchen.recipes.find(
+						(recipe) => recipe.id === editingMeal?.recipeId
+					)}
 					<h2>Edit planned meal</h2>
-					<p class="muted">
-						Update this meal in place. Its calendar entry keeps the same identity.
-					</p>
-					<label class="field"
-						>When are we cooking?<input type="date" required bind:value={mealDate} /></label
-					>
-					<label class="field"
-						>Meal<select bind:value={mealSlot}
-							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-						></label
-					>
-					<label class="field"
-						>Servings<input
-							type="number"
-							min="1"
-							max="24"
-							step="1"
-							required
-							bind:value={plannedServings}
-						/></label
-					>
-					<div class="dialog-actions">
-						<button class="secondary" onclick={closeDialog}>Cancel</button><button
-							class="primary"
-							disabled={!mealDate || !plannedServings || plannedServings < 1}
-							onclick={saveMealChanges}>Save meal</button
+					<p class="muted">{editingMealRecipe?.title}</p>
+					<form onsubmit={saveMealChanges}>
+						<label class="field"
+							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
 						>
-					</div>
+						<label class="field"
+							>Meal<select required bind:value={mealSlot}
+								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+							></label
+						>
+						<label class="field"
+							>Servings<input
+								type="number"
+								min="1"
+								max={MAX_SERVINGS}
+								step="1"
+								required
+								bind:value={plannedServings}
+							/></label
+						>
+						<div class="dialog-actions">
+							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
+								class="primary"
+								type="submit">Save meal</button
+							>
+						</div>
+					</form>
 				{:else if modal === 'cookMeal'}
 					{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
-					{@const cookingRecipe = kitchen.recipes.find(
-						(recipe) => recipe.id === cookingMeal?.recipeId
-					)}
+					{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
 					<h2>Mark meal cooked</h2>
 					<p class="muted">{cookingRecipe?.title}</p>
-					<label class="cook-option"
-						><input type="checkbox" bind:checked={deductPantry} /><span
-							><b>Deduct ingredients from pantry</b><small
-								>Uses the planned serving amount and available matching stock.</small
-							></span
-						></label
-					>
-					<label class="field"
-						>Leftover servings<input
-							type="number"
-							min="0"
-							max={cookingMeal?.servings ?? 24}
-							step="1"
-							bind:value={leftoverServings}
-						/><small class="field-help">Enter 0 if there are no leftovers.</small></label
-					>
-					<div class="dialog-actions">
-						<button class="secondary" onclick={closeDialog}>Cancel</button><button
-							class="primary"
-							onclick={markMealCooked}><Check size={17} /> Mark cooked</button
+					<form onsubmit={markMealCooked}>
+						<label class="cook-option"
+							><input type="checkbox" bind:checked={deductPantry} /><span
+								><b>Deduct ingredients from pantry</b><small
+									>Uses the planned serving amount and available matching stock.</small
+								></span
+							></label
 						>
-					</div>
+						<label class="field"
+							>Leftover servings<input
+								type="number"
+								min="0"
+								max={cookingMeal?.servings ?? MAX_SERVINGS}
+								step="1"
+								required
+								bind:value={leftoverServings}
+							/><small class="field-help">Enter 0 if there are no leftovers.</small></label
+						>
+						<div class="dialog-actions">
+							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
+								class="primary"
+								type="submit"><Check size={17} /> Mark cooked</button
+							>
+						</div>
+					</form>
 				{:else if modal === 'plan'}
 					<h2>Schedule a recipe</h2>
 					<p class="muted">{selected?.title}</p>
-					<label class="field"
-						>When are we cooking?<input type="date" required bind:value={mealDate} /></label
-					><label class="field"
-						>Meal<select bind:value={mealSlot}
-							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-						></label
-					><label class="field"
-						>Servings<input type="number" min="1" max="24" bind:value={plannedServings} /></label
-					><button
-						class="primary full"
-						disabled={!mealDate || !plannedServings || plannedServings < 1}
-						onclick={addMeal}><CalendarDays size={17} /> Put it on the calendar</button
-					>
+					<form onsubmit={addMeal}>
+						<label class="field"
+							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
+						><label class="field"
+							>Meal<select required bind:value={mealSlot}
+								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+							></label
+						><label class="field"
+							>Servings<input
+								type="number"
+								min="1"
+								max={MAX_SERVINGS}
+								step="1"
+								required
+								bind:value={plannedServings}
+							/></label
+						><button class="primary full" type="submit"
+							><CalendarDays size={17} /> Put it on the calendar</button
+						>
+					</form>
 				{:else if modal === 'pickRecipe'}
 					<h2>Choose a recipe</h2>
 					<div class="pick-list">
 						{#each kitchen.recipes as recipe}<button
-								onclick={() => {
-									selected = recipe;
-									plannedServings = recipe.servings;
-									if (!mealDate) mealDate = dateKey(new Date());
-									modal = 'plan';
-								}}
+								type="button"
+								onclick={() => choosePickedRecipe(recipe)}
 								><img
 									src={recipe.image || recipePlaceholder(recipe)}
 									onerror={(event) => recipeImageError(event, recipe)}
 									alt=""
+									width="75"
+									height="60"
+									loading="lazy"
+									decoding="async"
 								/><span
 									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
 								><Plus size={17} /></button
@@ -3833,18 +4291,27 @@
 	.history-empty {
 		margin-top: 12px;
 	}
+	.history-more {
+		margin-top: 16px;
+		min-height: 44px;
+	}
 	.cook-option {
 		display: flex;
 		align-items: flex-start;
 		gap: 12px;
+		min-height: 44px;
+		padding: 12px 14px;
 		margin: 22px 0;
+		border: 1px solid var(--line);
+		background: var(--surface);
+		cursor: pointer;
 		font-size: 14px;
 	}
 	.cook-option input {
-		width: 20px;
-		height: 20px;
-		flex: 0 0 20px;
-		margin-top: 2px;
+		width: 24px;
+		height: 24px;
+		flex: 0 0 24px;
+		margin-top: 1px;
 		accent-color: var(--green);
 	}
 	.cook-option span {
