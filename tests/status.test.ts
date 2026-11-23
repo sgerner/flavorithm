@@ -171,6 +171,11 @@ test('formats recipe, pantry, online search, and Undo status messages clearly', 
 	);
 	assert.equal(formatPantryStatus(2, 5, 'soon'), '2 ingredients expiring soon.');
 	assert.equal(formatPantryStatus(1, 5, 'expired'), '1 expired ingredient.');
+	assert.equal(formatPantryStatus(3, 5, 'all', true), '3 matching ingredients shown.');
+	assert.equal(
+		formatPantryStatus(0, 5, 'all', true),
+		'No matching ingredients. Try another search, category, or expiry filter.'
+	);
 
 	assert.equal(formatShoppingStatus(0, 0, 0, 'all'), 'Your shopping list is empty.');
 	assert.equal(formatShoppingStatus(0, 3, 3, 'unpurchased'), 'All 3 items purchased.');

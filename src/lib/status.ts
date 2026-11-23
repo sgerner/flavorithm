@@ -51,19 +51,25 @@ export function formatRecipeStatus(
 export function formatPantryStatus(
 	visibleCount: number,
 	totalCount: number,
-	filter: string
+	filter: string,
+	hasSearchOrCategory = false
 ): string {
 	if (totalCount === 0) {
 		return 'No ingredients yet. Add a few things from your fridge to get started.';
 	}
 	if (visibleCount === 0) {
-		return 'No matching ingredients. Try another expiry filter or update a best-before date.';
+		return hasSearchOrCategory
+			? 'No matching ingredients. Try another search, category, or expiry filter.'
+			: 'No matching ingredients. Try another expiry filter or update a best-before date.';
 	}
 	if (filter === 'soon') {
 		return `${visibleCount} ingredient${visibleCount === 1 ? '' : 's'} expiring soon.`;
 	}
 	if (filter === 'expired') {
 		return `${visibleCount} expired ingredient${visibleCount === 1 ? '' : 's'}.`;
+	}
+	if (hasSearchOrCategory) {
+		return `${visibleCount} matching ingredient${visibleCount === 1 ? '' : 's'} shown.`;
 	}
 	return `${visibleCount} ingredient${visibleCount === 1 ? '' : 's'} in your pantry.`;
 }
