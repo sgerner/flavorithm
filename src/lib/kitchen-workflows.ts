@@ -69,6 +69,82 @@ function nextFreeGeneratedId(sourceKey: string, key: string, usedIds: Set<string
 
 export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
 
+export type PantryDraft = {
+	id: string;
+	quantity: number | string | null;
+	unit: string;
+	category: string;
+	expires: string;
+};
+
+export type PantryCategoryOption = {
+	key: string;
+	label: string;
+	count: number;
+};
+
+export function normalizePantryDraft(
+	draft: Pick<PantryDraft, 'quantity' | 'unit' | 'category' | 'expires'>
+): Pick<Ingredient, 'quantity' | 'unit' | 'category' | 'expires'> {
+	const rawQuantity =
+		draft.quantity === null ||
+		draft.quantity === undefined ||
+		(typeof draft.quantity === 'string' && draft.quantity.trim() === '')
+			? 0
+			: Number(draft.quantity);
+	const clampedQuantity = Number.isFinite(rawQuantity)
+		? Math.max(0, Math.min(rawQuantity, 1_000_000))
+		: 0;
+	const quantity = Object.is(clampedQuantity, -0) ? 0 : clampedQuantity;
+	const unit = (draft.unit ?? '').trim().slice(0, 40) || 'piece';
+	const category = (draft.category ?? '').trim().slice(0, 100) || 'Pantry';
+	const expires = (draft.expires ?? '').trim().slice(0, 50) || undefined;
+	return expires ? { quantity, unit, category, expires } : { quantity, unit, category };
+}
+
+export function listPantryCategories(
+	pantry: Ingredient[],
+	activeCategory = 'all'
+): PantryCategoryOption[] {
+	const byKey = new Map<string, PantryCategoryOption>();
+	for (const item of pantry) {
+		const label = item.category?.trim() || 'Pantry';
+		const key = label.toLowerCase();
+		const existing = byKey.get(key);
+		if (existing) existing.count += 1;
+		else byKey.set(key, { key, label, count: 1 });
+	}
+	const activeTrimmed = activeCategory.trim();
+	const activeKey = activeTrimmed.toLowerCase();
+	if (activeTrimmed && activeKey !== 'all' && !byKey.has(activeKey)) {
+		byKey.set(activeKey, { key: activeKey, label: activeTrimmed, count: 0 });
+	}
+	return Array.from(byKey.values()).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+export function filterPantryItems(
+	pantry: Ingredient[],
+	filters: { query?: string; category?: string; expiry?: string },
+	now: Date = new Date()
+): Ingredient[] {
+	const search = (filters.query ?? '').trim().toLowerCase();
+	const selectedCategory = (filters.category ?? 'all').trim().toLowerCase() || 'all';
+	const selectedExpiry = (filters.expiry ?? 'all').trim().toLowerCase() || 'all';
+	return pantry.filter((item) => {
+		const itemCategory = item.category?.trim() || 'Pantry';
+		if (selectedExpiry !== 'all' && expiryStatus(item.expires, now) !== selectedExpiry) {
+			return false;
+		}
+		if (selectedCategory !== 'all' && itemCategory.toLowerCase() !== selectedCategory) {
+			return false;
+		}
+		if (search && !`${item.name} ${itemCategory} ${item.unit}`.toLowerCase().includes(search)) {
+			return false;
+		}
+		return true;
+	});
+}
+
 function calendarDate(value: Date): { year: number; month: number; day: number } | undefined {
 	if (!Number.isFinite(value.getTime())) return undefined;
 	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
