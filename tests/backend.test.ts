@@ -432,6 +432,7 @@ test('import estimates survive household storage, with bounded notes', async () 
 	];
 	state.recipes[0].provenance = 'web-import';
 	state.recipes[1].provenance = 'ai-generated';
+	state.recipes[2].provenance = 'manual';
 	backend.saveState(account.user, state, {
 		ifMatch: backend.getStateEtag(account.user),
 		ifNoneMatch: null
@@ -440,11 +441,13 @@ test('import estimates survive household storage, with bounded notes', async () 
 	assert.deepEqual(saved.recipes[0].importNotes, state.recipes[0].importNotes);
 	assert.equal(saved.recipes[0].provenance, 'web-import');
 	assert.equal(saved.recipes[1].provenance, 'ai-generated');
+	assert.equal(saved.recipes[2].provenance, 'manual');
 
 	const exportedResponse = await exportRoute.GET({ locals: { user: account.user } } as never);
 	const exported = (await exportedResponse.json()) as { state: typeof state };
 	assert.equal(exported.state.recipes[0].provenance, 'web-import');
 	assert.equal(exported.state.recipes[1].provenance, 'ai-generated');
+	assert.equal(exported.state.recipes[2].provenance, 'manual');
 	assert.deepEqual(exported.state.recipes[0].importNotes, state.recipes[0].importNotes);
 
 	const invalid = structuredClone(state);
@@ -566,4 +569,31 @@ test('all foreign keys have unconditional leading indexes and auth/household que
 			}
 		}
 	}
+});
+
+test('normalized pantry drafts always satisfy validateAppState while raw null quantities are rejected', async () => {
+	const { normalizePantryDraft } = await import('../src/lib/kitchen-workflows.ts');
+	const state = data.createInitialState();
+
+	const withNullQuantity = structuredClone(state) as Record<string, unknown>;
+	(withNullQuantity.pantry as Array<Record<string, unknown>>)[0].quantity = null;
+	assert.equal(backend.validateAppState(withNullQuantity), null);
+
+	const normalizedCleared = normalizePantryDraft({
+		quantity: null,
+		unit: `  ${'x'.repeat(60)}  `,
+		category: `  ${'y'.repeat(130)}  `,
+		expires: ''
+	});
+	state.pantry[0] = {
+		id: state.pantry[0].id,
+		name: state.pantry[0].name,
+		...normalizedCleared
+	};
+	const validated = backend.validateAppState(state);
+	assert.ok(validated);
+	assert.equal(validated.pantry[0].quantity, 0);
+	assert.equal(validated.pantry[0].unit.length, 40);
+	assert.equal(validated.pantry[0].category.length, 100);
+	assert.equal(validated.pantry[0].expires, undefined);
 });

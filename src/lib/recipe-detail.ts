@@ -1,3 +1,4 @@
+import { formatRecipeQuantity } from './domain.ts';
 import { isValidServings, MAX_SERVINGS } from './recipe-draft.ts';
 import type { Recipe } from './types.ts';
 
@@ -63,7 +64,18 @@ export function scaleIngredientQuantity(
 	targetServings: number
 ): number {
 	const baseline = Number.isFinite(recipeServings) && recipeServings > 0 ? recipeServings : 1;
-	return +((quantity * targetServings) / baseline).toFixed(2);
+	const scaled = (quantity * targetServings) / baseline;
+	if (!Number.isFinite(scaled) || scaled <= 0) return 0;
+	return scaled >= 0.1 ? +scaled.toFixed(2) : Number(scaled.toPrecision(2));
+}
+
+export function formatScaledIngredientQuantity(
+	quantity: number,
+	recipeServings: number,
+	targetServings: number
+): string {
+	const baseline = Number.isFinite(recipeServings) && recipeServings > 0 ? recipeServings : 1;
+	return formatRecipeQuantity((quantity * targetServings) / baseline);
 }
 
 export function nutritionMultiplierFor(

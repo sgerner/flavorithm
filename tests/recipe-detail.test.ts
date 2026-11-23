@@ -9,6 +9,7 @@ import {
 	applyRecipeRating,
 	bookmarkLabel,
 	clampServings,
+	formatScaledIngredientQuantity,
 	isValidServings,
 	nextRatingStarForKey,
 	nextRecipeTabForKey,
@@ -115,6 +116,11 @@ test('transient blank servings keep scaled ingredients and nutrition stable via 
 	assert.equal(activeDuringBlank, 5);
 	assert.equal(scaleIngredientQuantity(200, 2, activeDuringBlank), 500);
 	assert.equal(scaleIngredientQuantity(0.75, 2, 3), 1.13);
+	assert.equal(scaleIngredientQuantity(0.01, 4, 1), 0.0025);
+	assert.equal(formatScaledIngredientQuantity(200, 2, activeDuringBlank), '500');
+	assert.equal(formatScaledIngredientQuantity(0.75, 2, 3), '1.13');
+	assert.equal(formatScaledIngredientQuantity(0.01, 4, 1), '0.0025');
+	assert.equal(formatScaledIngredientQuantity(5e-7, 1, 1), '0.0000005');
 });
 
 test('nutrition multiplier and labels scale for serving, scaled, and whole-recipe modes', () => {
