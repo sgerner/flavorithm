@@ -5,7 +5,10 @@ import {
 	normalizeName,
 	parseCalendarDate,
 	parseIngredientInput,
-	unitInfo
+	resolveShoppingQuantity,
+	roundShoppingQuantity,
+	unitInfo,
+	type UnitInfo
 } from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 export {
@@ -108,6 +111,82 @@ export function weekStartForDate(value: string): string {
 
 export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
 
+export type PantryDraft = {
+	id: string;
+	quantity: number | string | null;
+	unit: string;
+	category: string;
+	expires: string;
+};
+
+export type PantryCategoryOption = {
+	key: string;
+	label: string;
+	count: number;
+};
+
+export function normalizePantryDraft(
+	draft: Pick<PantryDraft, 'quantity' | 'unit' | 'category' | 'expires'>
+): Pick<Ingredient, 'quantity' | 'unit' | 'category' | 'expires'> {
+	const rawQuantity =
+		draft.quantity === null ||
+		draft.quantity === undefined ||
+		(typeof draft.quantity === 'string' && draft.quantity.trim() === '')
+			? 0
+			: Number(draft.quantity);
+	const clampedQuantity = Number.isFinite(rawQuantity)
+		? Math.max(0, Math.min(rawQuantity, 1_000_000))
+		: 0;
+	const quantity = Object.is(clampedQuantity, -0) ? 0 : clampedQuantity;
+	const unit = (draft.unit ?? '').trim().slice(0, 40) || 'piece';
+	const category = (draft.category ?? '').trim().slice(0, 100) || 'Pantry';
+	const expires = (draft.expires ?? '').trim().slice(0, 50) || undefined;
+	return expires ? { quantity, unit, category, expires } : { quantity, unit, category };
+}
+
+export function listPantryCategories(
+	pantry: Ingredient[],
+	activeCategory = 'all'
+): PantryCategoryOption[] {
+	const byKey = new Map<string, PantryCategoryOption>();
+	for (const item of pantry) {
+		const label = item.category?.trim() || 'Pantry';
+		const key = label.toLowerCase();
+		const existing = byKey.get(key);
+		if (existing) existing.count += 1;
+		else byKey.set(key, { key, label, count: 1 });
+	}
+	const activeTrimmed = activeCategory.trim();
+	const activeKey = activeTrimmed.toLowerCase();
+	if (activeTrimmed && activeKey !== 'all' && !byKey.has(activeKey)) {
+		byKey.set(activeKey, { key: activeKey, label: activeTrimmed, count: 0 });
+	}
+	return Array.from(byKey.values()).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+export function filterPantryItems(
+	pantry: Ingredient[],
+	filters: { query?: string; category?: string; expiry?: string },
+	now: Date = new Date()
+): Ingredient[] {
+	const search = (filters.query ?? '').trim().toLowerCase();
+	const selectedCategory = (filters.category ?? 'all').trim().toLowerCase() || 'all';
+	const selectedExpiry = (filters.expiry ?? 'all').trim().toLowerCase() || 'all';
+	return pantry.filter((item) => {
+		const itemCategory = item.category?.trim() || 'Pantry';
+		if (selectedExpiry !== 'all' && expiryStatus(item.expires, now) !== selectedExpiry) {
+			return false;
+		}
+		if (selectedCategory !== 'all' && itemCategory.toLowerCase() !== selectedCategory) {
+			return false;
+		}
+		if (search && !`${item.name} ${itemCategory} ${item.unit}`.toLowerCase().includes(search)) {
+			return false;
+		}
+		return true;
+	});
+}
+
 function calendarDate(value: Date): { year: number; month: number; day: number } | undefined {
 	if (!Number.isFinite(value.getTime())) return undefined;
 	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
@@ -135,8 +214,11 @@ function isCustomizedRow(item: ShoppingItem): boolean {
 		Number.isFinite(item.requirementQuantity) &&
 		Number.isFinite(item.quantity)
 	) {
-		const currentBase = item.quantity * unitInfo(item.unit).factor;
-		if (Math.abs(currentBase - item.requirementQuantity) > 1e-6) return true;
+		const expectedQuantity = Math.min(
+			MAX_SHOPPING_QUANTITY,
+			roundShoppingQuantity(item.requirementQuantity / unitInfo(item.unit).factor)
+		);
+		if (Math.abs(item.quantity - expectedQuantity) > 1e-6) return true;
 	}
 	return false;
 }
@@ -156,7 +238,7 @@ export function reconcileShoppingList(
 		{
 			item: ShoppingItem;
 			normalizedName: string;
-			unit: ReturnType<typeof unitInfo>;
+			units: UnitInfo[];
 			quantityBase: number;
 		}
 	>();
@@ -168,15 +250,16 @@ export function reconcileShoppingList(
 		const bucket = additionBuckets.get(key) ?? {
 			item: addition,
 			normalizedName,
-			unit,
+			units: [],
 			quantityBase: 0
 		};
 		bucket.quantityBase += addition.quantity * unit.factor;
+		bucket.units.push(unit);
 		additionBuckets.set(key, bucket);
 	}
 
 	const checked = existing.filter((item) => item.sourceKey === sourceKey && item.checked);
-	const checkedByBucket = new Map<string, number>();
+	const checkedByBucket = new Map<string, { quantityBase: number; units: UnitInfo[] }>();
 	for (const item of checked) {
 		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
 		const currentKey = bucketKey(item.name, item.unit);
@@ -185,9 +268,11 @@ export function reconcileShoppingList(
 			? normalizeLegacyBucketKey(item.requirementKey)
 			: currentKey;
 		const targetDimension = splitBucketKey(targetKey)?.dimension;
+		const checkedBucket = checkedByBucket.get(targetKey) ?? { quantityBase: 0, units: [] };
 		let creditBase: number;
 		if (targetDimension === undefined || currentUnit.dimension === targetDimension) {
 			creditBase = item.quantity * currentUnit.factor;
+			checkedBucket.units.push(currentUnit);
 		} else if (
 			item.requirementQuantity !== undefined &&
 			Number.isFinite(item.requirementQuantity) &&
@@ -197,16 +282,21 @@ export function reconcileShoppingList(
 		} else {
 			creditBase = additionBuckets.get(targetKey)?.quantityBase ?? 0;
 		}
-		checkedByBucket.set(targetKey, (checkedByBucket.get(targetKey) ?? 0) + creditBase);
+		checkedBucket.quantityBase += creditBase;
+		checkedByBucket.set(targetKey, checkedBucket);
 	}
 
-	const remainingBucketQuantity = (
+	const resolveBucketRemainder = (
 		key: string,
-		bucket: { unit: ReturnType<typeof unitInfo>; quantityBase: number }
+		bucket: { units: UnitInfo[]; quantityBase: number }
 	) => {
-		const alreadyPurchased = checkedByBucket.get(key) ?? 0;
-		const remainingBase = Math.max(0, bucket.quantityBase - alreadyPurchased);
-		return Math.min(MAX_SHOPPING_QUANTITY, roundQuantity(remainingBase / bucket.unit.factor));
+		const checkedBucket = checkedByBucket.get(key);
+		const rawRemainingBase = bucket.quantityBase - (checkedBucket?.quantityBase ?? 0);
+		const resolved = resolveShoppingQuantity(rawRemainingBase, [
+			...bucket.units,
+			...(checkedBucket?.units ?? [])
+		]);
+		return resolved ? { rawRemainingBase, resolved } : undefined;
 	};
 
 	const existingUncheckedIds = new Map<string, string>();
@@ -224,30 +314,28 @@ export function reconcileShoppingList(
 		if (isCustomizedRow(item)) {
 			const origIngredient = splitBucketKey(origKey)?.ingredient ?? normalizeName(item.name);
 			let matchedKey: string | undefined;
-			let matchedBucket = additionBuckets.get(origKey);
-			if (matchedBucket && remainingBucketQuantity(origKey, matchedBucket) > 0) {
+			const origBucket = additionBuckets.get(origKey);
+			let matchedRemainder = origBucket ? resolveBucketRemainder(origKey, origBucket) : undefined;
+			if (matchedRemainder) {
 				matchedKey = origKey;
 			} else {
-				matchedBucket = undefined;
 				for (const [candidateKey, candidateBucket] of additionBuckets) {
-					if (
-						candidateBucket.normalizedName === origIngredient &&
-						remainingBucketQuantity(candidateKey, candidateBucket) > 0
-					) {
+					if (candidateBucket.normalizedName !== origIngredient) continue;
+					const candidateRemainder = resolveBucketRemainder(candidateKey, candidateBucket);
+					if (candidateRemainder) {
 						matchedKey = candidateKey;
-						matchedBucket = candidateBucket;
+						matchedRemainder = candidateRemainder;
 						break;
 					}
 				}
 			}
-			if (matchedKey && matchedBucket) {
-				const remQty = remainingBucketQuantity(matchedKey, matchedBucket);
+			if (matchedKey && matchedRemainder) {
 				coveredByCustomized.add(matchedKey);
 				retained.push({
 					...item,
 					customized: true,
 					requirementKey: matchedKey,
-					requirementQuantity: remQty * matchedBucket.unit.factor
+					requirementQuantity: matchedRemainder.rawRemainingBase
 				});
 			}
 			continue;
@@ -261,8 +349,9 @@ export function reconcileShoppingList(
 	const generated: ShoppingItem[] = [];
 	for (const [key, bucket] of additionBuckets) {
 		if (coveredByCustomized.has(key)) continue;
-		const remainingQuantity = remainingBucketQuantity(key, bucket);
-		if (remainingQuantity <= 0) continue;
+		const remainder = resolveBucketRemainder(key, bucket);
+		if (!remainder) continue;
+		const { rawRemainingBase, resolved } = remainder;
 		const reusableId = existingUncheckedIds.get(key);
 		let id: string;
 		if (reusableId && !usedIds.has(reusableId)) {
@@ -275,12 +364,12 @@ export function reconcileShoppingList(
 		generated.push({
 			...baseItem,
 			id,
-			quantity: remainingQuantity,
-			unit: bucket.unit.display,
+			quantity: Math.min(MAX_SHOPPING_QUANTITY, resolved.quantity),
+			unit: resolved.unit.display,
 			checked: false,
 			sourceKey,
 			requirementKey: key,
-			requirementQuantity: remainingQuantity * bucket.unit.factor
+			requirementQuantity: Math.min(rawRemainingBase, MAX_SHOPPING_QUANTITY * resolved.unit.factor)
 		});
 	}
 
@@ -405,17 +494,23 @@ export function restoreShoppingItem(
 						Number.isFinite(restoredItem.quantity) && restoredItem.quantity > 0
 							? restoredItem.quantity * restoredUnit.factor
 							: 0;
-					const remainingQuantity = Math.min(
-						MAX_SHOPPING_QUANTITY,
-						roundQuantity(Math.max(0, collidingBase - restoredBase) / collidingUnit.factor)
-					);
-					if (remainingQuantity > 0) {
+					const resolved = resolveShoppingQuantity(collidingBase - restoredBase, [
+						collidingUnit,
+						restoredUnit
+					]);
+					if (resolved) {
 						replacement.push({
 							...colliding,
 							id: nextFreeItemId(colliding, usedIds),
-							quantity: remainingQuantity,
+							quantity: Math.min(MAX_SHOPPING_QUANTITY, resolved.quantity),
+							unit: resolved.unit.display,
 							...(colliding.requirementQuantity !== undefined && !colliding.customized
-								? { requirementQuantity: remainingQuantity * collidingUnit.factor }
+								? {
+										requirementQuantity: Math.min(
+											collidingBase - restoredBase,
+											MAX_SHOPPING_QUANTITY * resolved.unit.factor
+										)
+									}
 								: {})
 						});
 					}
