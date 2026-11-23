@@ -72,17 +72,21 @@ test('pantry, hidden-recipe filter, and color mode controls expose explicit labe
 	// No mobile CSS pseudo-element label override
 	assert.doesNotMatch(cssSource, /\.pantry-row\s*>\s*label::before/);
 
-	// Expiry filter group with separated item counts
+	// Expiry and category filter groups with ToggleButton and separated item counts
 	assert.match(
 		pageSource,
 		/class="expiry-filters"\s+role="group"\s+aria-label="Filter pantry by expiry"/
 	);
 	assert.match(pageSource, /<span class="visually-hidden">\{', '\}<\/span>/);
-
-	// Pantry row group and explicit H44 labels starting with Amount, Unit, Best before
 	assert.match(
 		pageSource,
-		/class="pantry-row"[\s\S]*?role="group"[\s\S]*?aria-labelledby=\{`pantry-item-\$\{itemDomId\}`\}/
+		/class="filter-tabs pantry-categories"[\s\S]*?role="group"[\s\S]*?aria-label="Filter pantry by category"[\s\S]*?<ToggleButton/
+	);
+
+	// Pantry row group and explicit H44 labels starting with Amount, Unit, Category, Best before
+	assert.match(
+		pageSource,
+		/class="pantry-edit-fields"[\s\S]*?role="group"[\s\S]*?aria-labelledby=\{`pantry-item-\$\{itemDomId\}`\}/
 	);
 	assert.match(
 		pageSource,
@@ -91,6 +95,10 @@ test('pantry, hidden-recipe filter, and color mode controls expose explicit labe
 	assert.match(
 		pageSource,
 		/<label class="pantry-field-label" for=\{`pantry-unit-\$\{itemDomId\}`\}[\s\S]*?><span>Unit<\/span><span class="visually-hidden"\s*>\{` for \$\{item\.name\}`\}<\/span\s*>/
+	);
+	assert.match(
+		pageSource,
+		/<label class="pantry-field-label" for=\{`pantry-category-\$\{itemDomId\}`\}[\s\S]*?><span>Category<\/span><span class="visually-hidden"\s*>\{` for \$\{item\.name\}`\}<\/span\s*>/
 	);
 	assert.match(
 		pageSource,
