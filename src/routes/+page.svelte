@@ -89,7 +89,10 @@
 		completeMeal,
 		deleteShoppingItem,
 		expiryStatus,
+		filterPantryItems,
+		listPantryCategories,
 		normalizeIngredientName,
+		normalizePantryDraft,
 		normalizeShoppingItem,
 		reconcileShoppingList,
 		restoreShoppingItem,
@@ -97,6 +100,7 @@
 		snapshotShoppingItem,
 		transferPurchasedItemsToPantry,
 		unitInfo,
+		type PantryDraft,
 		type ShoppingItemDraft,
 		type ShoppingItemSnapshot
 	} from '#lib/kitchen-workflows.ts';
@@ -365,6 +369,8 @@
 		inviteCode = '';
 		currentInviteId = '';
 		joinCode = '';
+		pantryDraft = null;
+		resetPantryFilters();
 	}
 	function renewManagedSession(error: unknown) {
 		if (!navigator.onLine || (error as { status?: number })?.status !== 401) return;
@@ -529,7 +535,9 @@
 	let deductPantry = $state(false);
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
-	let pantryDrafts = $state<Record<string, { quantity: number | null; unit: string }>>({});
+	let pantryQuery = $state('');
+	let pantryCategory = $state('all');
+	let pantryDraft = $state<PantryDraft | null>(null);
 	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
@@ -637,10 +645,105 @@
 			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
 	});
 	let visiblePantry = $derived(
-		kitchen.pantry.filter(
-			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
+		filterPantryItems(kitchen.pantry, {
+			query: pantryQuery,
+			category: pantryCategory,
+			expiry: pantryFilter
+		})
+	);
+	let pantryCategories = $derived(listPantryCategories(kitchen.pantry, pantryCategory));
+	let pantryCategorySuggestions = $derived(
+		[
+			'Produce',
+			'Grains',
+			'Oils & condiments',
+			'Canned goods',
+			'Dairy & eggs',
+			'Spices',
+			'Pantry',
+			...pantryCategories.map((entry) => entry.label)
+		].filter(
+			(label, index, all) =>
+				all.findIndex((candidate) => candidate.toLowerCase() === label.toLowerCase()) === index
 		)
 	);
+	$effect(() => {
+		if (pantryDraft && !kitchen.pantry.some((item) => item.id === pantryDraft?.id)) {
+			pantryDraft = null;
+		}
+	});
+	async function startPantryEdit(item: AppState['pantry'][number]) {
+		pantryDraft = {
+			id: item.id,
+			quantity: item.quantity,
+			unit: item.unit,
+			category: item.category.trim() || 'Pantry',
+			expires: item.expires ?? ''
+		};
+		await tick();
+		document.querySelector<HTMLInputElement>('.pantry-row.editing input[type="number"]')?.focus();
+	}
+	async function savePantryEdit() {
+		const draft = pantryDraft;
+		if (!draft) return;
+		const normalized = normalizePantryDraft(draft);
+		kitchen.pantry = kitchen.pantry.map((item) => {
+			if (item.id !== draft.id) return item;
+			const updated: AppState['pantry'][number] = {
+				id: item.id,
+				name: item.name,
+				quantity: normalized.quantity,
+				unit: normalized.unit,
+				category: normalized.category
+			};
+			if (normalized.expires) updated.expires = normalized.expires;
+			return updated;
+		});
+		const editedId = draft.id;
+		pantryDraft = null;
+		await tick();
+		document
+			.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
+			?.focus();
+	}
+	async function cancelPantryEdit() {
+		const editedId = pantryDraft?.id;
+		pantryDraft = null;
+		if (editedId) {
+			await tick();
+			document
+				.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
+				?.focus();
+		}
+	}
+	function handlePantryInputKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			event.stopPropagation();
+			void cancelPantryEdit();
+		} else if (event.key === 'Enter') {
+			event.preventDefault();
+			void savePantryEdit();
+		}
+	}
+	function removePantryItem(item: AppState['pantry'][number]) {
+		if (pantryDraft?.id === item.id) pantryDraft = null;
+		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
+	}
+	function resetPantryFilters() {
+		pantryQuery = '';
+		pantryCategory = 'all';
+		pantryFilter = 'all';
+	}
+	function expiryBadgeLabel(status: ReturnType<typeof expiryStatus>) {
+		return status === 'expired'
+			? 'Expired'
+			: status === 'soon'
+				? 'Use soon'
+				: status === 'fresh'
+					? 'In date'
+					: 'No date';
+	}
 	let availablePantryNames = $derived(
 		new Set(
 			kitchen.pantry
@@ -1165,12 +1268,13 @@
 	}
 
 	function freshKitchen() {
-		pantryDrafts = {};
 		clearEditingShoppingState();
 		kitchen.pantry = [];
 		kitchen.meals = [];
 		kitchen.shopping = [];
 		kitchen.recipes = kitchen.recipes.map((r) => ({ ...r, rating: undefined, saved: false }));
+		pantryDraft = null;
+		resetPantryFilters();
 		showStarter = false;
 		localStorage.setItem('flavorithm-started', 'yes');
 		page = 'pantry';
@@ -1365,6 +1469,8 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
+			pantryDraft = null;
+			resetPantryFilters();
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			quarantineLegacyKitchen(localStorage);
@@ -2305,30 +2411,8 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
-	function normalizePantryItem(item: AppState['pantry'][number]) {
-		const draft = pantryDrafts[item.id];
-		delete pantryDrafts[item.id];
-		if (!kitchen.pantry.some((entry) => entry.id === item.id)) return;
-		const rawQuantity = draft ? draft.quantity : item.quantity;
-		const parsed =
-			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
-				? 0
-				: Number(rawQuantity);
-		const clamped = Number.isFinite(parsed) ? Math.min(1_000_000, Math.max(0, parsed)) : 0;
-		item.quantity = Object.is(clamped, -0) ? 0 : clamped;
-		const rawUnit = draft ? draft.unit : item.unit;
-		item.unit =
-			String(rawUnit ?? '')
-				.trim()
-				.slice(0, 40) || 'piece';
-		item.expires = item.expires?.trim().slice(0, 50) || undefined;
-	}
 	function commitInlineEdits() {
-		for (const id of Object.keys(pantryDrafts)) {
-			const item = kitchen.pantry.find((entry) => entry.id === id);
-			if (item) normalizePantryItem(item);
-			else delete pantryDrafts[id];
-		}
+		if (pantryDraft) void savePantryEdit();
 		if (editingShoppingId) {
 			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
 			if (item) applyShoppingEdit(item);
@@ -3053,6 +3137,9 @@
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
 			const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
+			if (!overlayOpen && pantryDraft) {
+				void cancelPantryEdit();
+			}
 			mobileNav = false;
 			closeDialog();
 			selected = null;
@@ -3457,103 +3544,165 @@
 						<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
 						<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 					</div>{/if}
-				<div class="expiry-filters" aria-label="Filter pantry by expiry">
-					{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
-							class:active={pantryFilter === option.id}
-							aria-pressed={pantryFilter === option.id}
-							onclick={() => (pantryFilter = option.id)}
-							>{option.label}<span>{option.count}</span></button
-						>{/each}
+				<div class="pantry-controls">
+					<div class="pantry-filter-bar">
+						<label class="search-box pantry-search">
+							<Search size={17} /><span class="visually-hidden">Search pantry</span><input
+								type="search"
+								placeholder="Search pantry"
+								bind:value={pantryQuery}
+							/>
+						</label>
+						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
+									type="button"
+									class:active={pantryFilter === option.id}
+									aria-pressed={pantryFilter === option.id}
+									onclick={() => (pantryFilter = option.id)}
+									>{option.label}<span>{option.count}</span></button
+								>{/each}
+						</div>
+					</div>
+					{#if pantryCategories.length}<div
+							class="filter-tabs pantry-categories"
+							role="group"
+							aria-label="Filter pantry by category"
+						>
+							<button
+								type="button"
+								class:active={pantryCategory === 'all'}
+								aria-pressed={pantryCategory === 'all'}
+								onclick={() => (pantryCategory = 'all')}>All categories</button
+							>{#each pantryCategories as category (category.key)}<button
+									type="button"
+									class:active={pantryCategory.toLowerCase() === category.key}
+									aria-pressed={pantryCategory.toLowerCase() === category.key}
+									onclick={() =>
+										(pantryCategory =
+											pantryCategory.toLowerCase() === category.key ? 'all' : category.label)}
+									>{category.label}</button
+								>{/each}
+						</div>{/if}
 				</div>
 				<div class="pantry-table">
-					<div class="table-head">
-						<span>INGREDIENT</span><span>AMOUNT</span><span>BEST BEFORE</span><span></span>
-					</div>
-					{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(item.expires)}
-						<div
-							class="pantry-row"
-							animate:flip={{ duration: motionDuration(200) }}
-							in:revealMotion|global={{ y: 8, duration: 200 }}
-							out:fadeMotion={{ duration: 120 }}
-						>
-							<span class="pantry-ingredient">
-								<span class="ingredient-symbol">{ingredientEmoji(item.name)}</span><span
-									class="ingredient-meta"
-									><b>{item.name}</b><small
-										class="expiry-badge"
-										class:expired={expiry === 'expired'}
-										class:soon={expiry === 'soon'}
-										>{expiry === 'expired'
-											? 'Expired'
-											: expiry === 'soon'
-												? 'Use soon'
-												: expiry === 'fresh'
-													? 'In date'
-													: 'No date'}</small
-									>{#if expiry === 'soon'}<button
-											class="text-button use-first"
-											onclick={() => useFirstIngredients([item])}
-											><Sparkles size={14} />Use first</button
-										>{/if}</span
+					{#if pantryDraft}<datalist id="pantry-category-suggestions">
+							{#each pantryCategorySuggestions as suggestion}<option value={suggestion}
+								></option>{/each}
+						</datalist>{/if}
+					{#if visiblePantry.length}<div class="table-head" aria-hidden="true">
+							<span>INGREDIENT</span><span>AMOUNT</span><span>BEST BEFORE</span><span></span>
+						</div>
+						<div class="pantry-list" role="list" aria-label="Pantry ingredients">
+							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(item.expires)}
+								<div
+									class="pantry-row"
+									class:editing={pantryDraft?.id === item.id}
+									role="listitem"
+									animate:flip={{ duration: motionDuration(200) }}
+									in:revealMotion|global={{ y: 8, duration: 200 }}
+									out:fadeMotion={{ duration: 120 }}
 								>
-							</span><label
-								><input
-									aria-label={`Quantity of ${item.name}`}
-									type="number"
-									min="0"
-									max="1000000"
-									step="0.25"
-									bind:value={
-										() =>
-											item.id in pantryDrafts ? pantryDrafts[item.id].quantity : item.quantity,
-										(value) => {
-											pantryDrafts[item.id] = {
-												quantity: value,
-												unit: pantryDrafts[item.id]?.unit ?? item.unit
-											};
-										}
-									}
-									onblur={() => normalizePantryItem(item)}
-									onkeydown={(e) => {
-										if (e.key === 'Enter') e.currentTarget.blur();
-									}}
-								/><input
-									class="unit-input"
-									aria-label={`Unit for ${item.name}`}
-									maxlength="40"
-									bind:value={
-										() => (item.id in pantryDrafts ? pantryDrafts[item.id].unit : item.unit),
-										(value) => {
-											pantryDrafts[item.id] = {
-												quantity:
-													item.id in pantryDrafts ? pantryDrafts[item.id].quantity : item.quantity,
-												unit: value
-											};
-										}
-									}
-									onblur={() => normalizePantryItem(item)}
-									onkeydown={(e) => {
-										if (e.key === 'Enter') e.currentTarget.blur();
-									}}
-								/></label
-							><input
-								aria-label={`Expiry for ${item.name}`}
-								type="date"
-								bind:value={
-									() => item.expires ?? '',
-									(value) => {
-										item.expires = value ? value.trim().slice(0, 50) : undefined;
-									}
-								}
-							/><button
-								class="icon-button"
-								aria-label={`Remove ${item.name}`}
-								onclick={() => {
-									delete pantryDrafts[item.id];
-									kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id);
-								}}><X size={16} /></button
-							>
-						</div>{/each}
+									{#if pantryDraft?.id === item.id}<form
+											class="pantry-edit-form"
+											novalidate
+											onsubmit={(event) => {
+												event.preventDefault();
+												void savePantryEdit();
+											}}
+										>
+											<div class="pantry-edit-header">
+												<span class="pantry-ingredient">
+													<span class="ingredient-symbol" aria-hidden="true"
+														>{ingredientEmoji(item.name)}</span
+													><b class="pantry-name">{item.name}</b>
+												</span>
+												<div class="pantry-edit-actions">
+													<button type="submit" class="primary pantry-done-button">Done</button
+													><button
+														type="button"
+														class="secondary pantry-cancel-button"
+														onclick={() => cancelPantryEdit()}>Cancel</button
+													><button
+														type="button"
+														class="icon-button pantry-remove-button"
+														aria-label={`Remove ${item.name}`}
+														onclick={() => removePantryItem(item)}><X size={16} /></button
+													>
+												</div>
+											</div>
+											<div class="pantry-edit-fields">
+												<label class="pantry-field"
+													><span>Quantity</span><input
+														type="number"
+														min="0"
+														max="1000000"
+														step="any"
+														bind:value={pantryDraft.quantity}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												><label class="pantry-field"
+													><span>Unit</span><input
+														type="text"
+														maxlength="40"
+														bind:value={pantryDraft.unit}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												><label class="pantry-field"
+													><span>Category</span><input
+														type="text"
+														maxlength="100"
+														list="pantry-category-suggestions"
+														bind:value={pantryDraft.category}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												><label class="pantry-field"
+													><span>Best before</span><input
+														type="date"
+														bind:value={pantryDraft.expires}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												>
+											</div>
+										</form>{:else}<span class="pantry-ingredient">
+											<span class="ingredient-symbol" aria-hidden="true"
+												>{ingredientEmoji(item.name)}</span
+											><span class="ingredient-meta"
+												><b class="pantry-name">{item.name}</b><span class="ingredient-tags"
+													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
+													>{#if expiry === 'soon'}<button
+															type="button"
+															class="text-button use-first"
+															onclick={() => useFirstIngredients([item])}
+															><Sparkles size={14} />Use first</button
+														>{/if}</span
+												></span
+											>
+										</span><span class="pantry-amount"
+											>{item.quantity}{item.unit ? ` ${item.unit}` : ''}</span
+										><span class="pantry-expiry"
+											><small
+												class="expiry-badge"
+												class:expired={expiry === 'expired'}
+												class:soon={expiry === 'soon'}>{expiryBadgeLabel(expiry)}</small
+											>{#if item.expires}<small class="pantry-date">{item.expires}</small
+												>{/if}</span
+										>
+										<div class="pantry-row-actions">
+											<button
+												type="button"
+												class="text-button pantry-edit-button"
+												data-pantry-edit={item.id}
+												aria-label={`Edit ${item.name}`}
+												onclick={() => startPantryEdit(item)}>Edit</button
+											><button
+												type="button"
+												class="icon-button pantry-remove-button"
+												aria-label={`Remove ${item.name}`}
+												onclick={() => removePantryItem(item)}><X size={16} /></button
+											>
+										</div>{/if}
+								</div>{/each}
+						</div>{/if}
 				</div>
 				{#if !kitchen.pantry.length}<div class="empty-state">
 						<Carrot size={40} />
@@ -3562,7 +3711,10 @@
 					</div>{:else if !visiblePantry.length}<div class="empty-state filtered-pantry-empty">
 						<Carrot size={34} />
 						<h2>No matching ingredients</h2>
-						<p>Try another expiry filter or update a best-before date.</p>
+						<p>Try another search, category, or expiry filter.</p>
+						<button type="button" class="secondary" onclick={resetPantryFilters}
+							>Reset filters</button
+						>
 					</div>{/if}
 				<div class="pantry-footer">
 					<button class="primary" onclick={() => (modal = 'generate')}
@@ -3821,6 +3973,7 @@
 								>
 								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<form
 										class="shopping-edit-form"
+										novalidate
 										onsubmit={(e) => {
 											e.preventDefault();
 											void finishEditingShoppingItem(item);
@@ -4842,11 +4995,41 @@
 		}
 	}
 
+	.pantry-controls {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		margin: 18px 0 10px;
+	}
+	.pantry-filter-bar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		flex-wrap: wrap;
+	}
+	.pantry-search {
+		flex: 1 1 220px;
+		max-width: 320px;
+		min-height: 44px;
+		padding: 0 12px;
+		border: 1px solid var(--line);
+		background: var(--surface);
+	}
+	.pantry-search input {
+		width: 100%;
+		min-width: 0;
+		font-size: 14px;
+		padding: 9px 0;
+	}
+	.pantry-categories {
+		padding-bottom: 2px;
+	}
 	.expiry-filters {
 		display: flex;
 		gap: 8px;
 		flex-wrap: wrap;
-		margin: 20px 0 10px;
+		margin: 0;
 	}
 	.expiry-filters button {
 		min-height: 44px;
@@ -4879,6 +5062,39 @@
 		align-items: flex-start;
 		gap: 4px;
 	}
+	.pantry-name {
+		overflow-wrap: anywhere;
+	}
+	.ingredient-tags {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px 8px;
+	}
+	.category-badge {
+		display: inline-flex;
+		align-items: center;
+		padding: 2px 7px;
+		background: var(--wash);
+		color: var(--muted);
+		font-size: 12px;
+		line-height: 1.35;
+	}
+	.pantry-amount {
+		font-weight: 500;
+		overflow-wrap: anywhere;
+	}
+	.pantry-expiry {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 2px;
+		min-width: 0;
+	}
+	.pantry-date {
+		font-size: 12px;
+		color: var(--muted);
+	}
 	.expiry-badge {
 		font-size: 12px;
 		color: var(--muted);
@@ -4899,8 +5115,83 @@
 		padding: 3px 0;
 		font-size: 13px;
 	}
+	.pantry-row-actions {
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 4px;
+	}
+	.pantry-edit-button {
+		padding: 6px 8px;
+		font-size: 14px;
+	}
+	.pantry-remove-button {
+		display: grid;
+		place-items: center;
+		width: 36px;
+		height: 36px;
+	}
+	.pantry-edit-form {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		width: 100%;
+	}
+	.pantry-edit-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+		flex-wrap: wrap;
+	}
+	.pantry-edit-actions {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-left: auto;
+	}
+	.pantry-done-button,
+	.pantry-cancel-button {
+		min-height: 38px;
+		padding: 7px 12px;
+		font-size: 14px;
+	}
+	.pantry-edit-fields {
+		display: grid;
+		grid-template-columns: minmax(90px, 0.8fr) minmax(100px, 1fr) minmax(130px, 1.2fr) minmax(
+				140px,
+				1.2fr
+			);
+		gap: 10px;
+	}
+	.pantry-field {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		gap: 4px;
+		min-width: 0;
+		font-size: 12px;
+		font-weight: 500;
+		color: var(--muted);
+	}
+	.pantry-field input {
+		width: 100%;
+		max-width: none;
+		min-width: 0;
+		min-height: 40px;
+		padding: 7px 9px;
+		font-size: 14px;
+		font-weight: 400;
+		color: var(--ink);
+		background: var(--surface);
+		border: 1px solid var(--line);
+	}
 	.filtered-pantry-empty {
 		padding: 32px 12px;
+	}
+	.filtered-pantry-empty button {
+		min-height: 44px;
+		padding: 8px 14px;
 	}
 	.shopping-edit-form {
 		display: contents;
@@ -5084,15 +5375,84 @@
 		background: #87332c;
 	}
 	@media (max-width: 650px) {
+		.pantry-controls {
+			gap: 8px;
+			margin: 12px 0 6px;
+		}
+		.pantry-filter-bar {
+			flex-direction: column;
+			align-items: stretch;
+			gap: 8px;
+		}
+		.pantry-search {
+			flex: 0 0 auto;
+			max-width: none;
+			width: 100%;
+		}
+		.pantry-search input {
+			font-size: 16px;
+		}
 		.expiry-filters {
 			display: grid;
 			grid-template-columns: repeat(3, minmax(0, 1fr));
+			width: 100%;
 		}
 		.expiry-filters button {
 			justify-content: center;
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
+		}
+		.ingredient-meta {
+			flex-direction: row;
+			flex-wrap: wrap;
+			align-items: center;
+			gap: 3px 7px;
+		}
+		.pantry-amount {
+			font-size: 13px;
+			color: var(--ink);
+			white-space: nowrap;
+		}
+		.pantry-expiry {
+			flex-direction: row;
+			align-items: center;
+			flex-wrap: wrap;
+			gap: 5px;
+		}
+		.pantry-expiry::before {
+			content: '·';
+			color: var(--muted);
+			font-size: 12px;
+		}
+		.use-first {
+			min-height: 44px;
+			padding: 6px 4px;
+		}
+		.pantry-row-actions {
+			gap: 2px;
+		}
+		.pantry-edit-button,
+		.pantry-done-button,
+		.pantry-cancel-button {
+			min-width: 44px;
+			min-height: 44px;
+			padding: 8px 10px;
+		}
+		.pantry-remove-button {
+			width: 44px;
+			min-width: 44px;
+			height: 44px;
+			min-height: 44px;
+		}
+		.pantry-edit-fields {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+			gap: 8px 10px;
+		}
+		.pantry-field input {
+			min-height: 44px;
+			padding: 8px;
+			font-size: 16px;
 		}
 		.shopping-row {
 			flex-wrap: wrap;
