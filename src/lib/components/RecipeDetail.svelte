@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { formatRecipeQuantity } from '#lib/domain.ts';
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
@@ -165,7 +166,7 @@
 							{#each recipe.ingredients as item}<li>
 									<span
 										>{validServings && servingCount !== undefined
-											? +((item.quantity * servingCount) / recipe.servings).toFixed(2)
+											? formatRecipeQuantity((item.quantity * servingCount) / recipe.servings)
 											: '—'}
 										{item.unit}</span
 									>{item.name}
