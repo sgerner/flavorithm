@@ -2887,6 +2887,10 @@
 					selected = null;
 					selectedMealServings = undefined;
 				}
+				if (editingRecipeMode === 'edit' && editingRecipe?.id === applied.saved.id) {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}
 				importSession = rolledBack.session;
 				resumeDialog = '';
 				error = '';
