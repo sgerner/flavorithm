@@ -27,10 +27,14 @@ export type ModalDialogState<TMember = unknown> = {
 	onboardingStatus?: 'completed' | 'skipped';
 };
 
-export type EscapeLayerState<TMember = unknown> = ModalDialogState<TMember> & {
+export type EscapeLayerState<
+	TMember = unknown,
+	TPantryDraft = unknown
+> = ModalDialogState<TMember> & {
 	editingRecipe: Recipe | null;
 	editingRecipeMode?: 'create' | 'edit';
 	mobileNav: boolean;
+	pantryDraft?: TPantryDraft | null;
 };
 
 export function isRecipeDetailInert(modal: string, editingRecipe: Recipe | null): boolean {
@@ -304,12 +308,12 @@ export function closeModalDialog<TMember = unknown>(
 	return next;
 }
 
-export function dismissEscapeLayer<TMember = unknown>(
+export function dismissEscapeLayer<TMember = unknown, TPantryDraft = unknown>(
 	event: { key: string; defaultPrevented?: boolean },
-	state: EscapeLayerState<TMember>
+	state: EscapeLayerState<TMember, TPantryDraft>
 ): {
-	dismissed: 'none' | 'modal' | 'editingRecipe' | 'selected' | 'mobileNav';
-	state: EscapeLayerState<TMember>;
+	dismissed: 'none' | 'modal' | 'editingRecipe' | 'selected' | 'mobileNav' | 'pantryDraft';
+	state: EscapeLayerState<TMember, TPantryDraft>;
 } {
 	if (event.key !== 'Escape' || event.defaultPrevented) {
 		return { dismissed: 'none', state };
@@ -349,6 +353,15 @@ export function dismissEscapeLayer<TMember = unknown>(
 			state: {
 				...state,
 				mobileNav: false
+			}
+		};
+	}
+	if (state.pantryDraft) {
+		return {
+			dismissed: 'pantryDraft',
+			state: {
+				...state,
+				pantryDraft: null
 			}
 		};
 	}

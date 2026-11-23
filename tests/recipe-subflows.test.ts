@@ -450,9 +450,10 @@ test('settings, onboarding, resumeDialog, and identity reset helpers preserve or
 	});
 });
 
-test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe, selected, then mobileNav', () => {
+test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe, selected, mobileNav, then pantryDraft', () => {
 	const activeRecipe = makeRecipe();
 	const draft = makeRecipe({ title: 'Draft Edit' });
+	const pantryEdit = { id: 'p1', quantity: 2, unit: 'g', category: 'Pantry', expires: '' };
 
 	let state = makeEscapeState({
 		modal: 'deleteRecipe',
@@ -461,10 +462,11 @@ test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe
 		editingRecipeMode: 'create',
 		selected: activeRecipe,
 		selectedMealServings: 6,
-		mobileNav: true
+		mobileNav: true,
+		pantryDraft: pantryEdit
 	});
 
-	// Non-Escape keys and defaultPrevented Escape (e.g. ButlerChat) are ignored.
+	// Non-Escape keys and defaultPrevented Escape (e.g. ButlerChat or pantry input) are ignored.
 	assert.equal(dismissEscapeLayer({ key: 'Enter' }, state).dismissed, 'none');
 	assert.equal(
 		dismissEscapeLayer({ key: 'Escape', defaultPrevented: true }, state).dismissed,
@@ -481,6 +483,7 @@ test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe
 	assert.equal(state.selected, activeRecipe);
 	assert.equal(state.selectedMealServings, 6);
 	assert.equal(state.mobileNav, true);
+	assert.equal(state.pantryDraft, pantryEdit);
 
 	// 2nd Escape dismisses editingRecipe only and resets editingRecipeMode.
 	step = dismissEscapeLayer({ key: 'Escape' }, state);
@@ -491,22 +494,31 @@ test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe
 	assert.equal(state.selected, activeRecipe);
 	assert.equal(state.selectedMealServings, 6);
 	assert.equal(state.mobileNav, true);
+	assert.equal(state.pantryDraft, pantryEdit);
 
-	// 3rd Escape dismisses selected and clears selectedMealServings, keeping mobileNav.
+	// 3rd Escape dismisses selected and clears selectedMealServings, keeping mobileNav and pantryDraft.
 	step = dismissEscapeLayer({ key: 'Escape' }, state);
 	assert.equal(step.dismissed, 'selected');
 	state = step.state;
 	assert.equal(state.selected, null);
 	assert.equal(state.selectedMealServings, undefined);
 	assert.equal(state.mobileNav, true);
+	assert.equal(state.pantryDraft, pantryEdit);
 
-	// 4th Escape dismisses mobileNav.
+	// 4th Escape dismisses mobileNav, keeping pantryDraft.
 	step = dismissEscapeLayer({ key: 'Escape' }, state);
 	assert.equal(step.dismissed, 'mobileNav');
 	state = step.state;
 	assert.equal(state.mobileNav, false);
+	assert.equal(state.pantryDraft, pantryEdit);
 
-	// 5th Escape with nothing open is a no-op.
+	// 5th Escape dismisses pantryDraft.
+	step = dismissEscapeLayer({ key: 'Escape' }, state);
+	assert.equal(step.dismissed, 'pantryDraft');
+	state = step.state;
+	assert.equal(state.pantryDraft, null);
+
+	// 6th Escape with nothing open is a no-op.
 	step = dismissEscapeLayer({ key: 'Escape' }, state);
 	assert.equal(step.dismissed, 'none');
 });
