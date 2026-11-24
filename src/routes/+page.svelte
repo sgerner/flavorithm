@@ -29,6 +29,7 @@
 </script>
 
 <script lang="ts">
+	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
@@ -867,6 +868,34 @@
 		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
 		notify(`${item.name} removed.`, () => {
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
+		});
+	}
+	function consumeLeftoverServing(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		const next = Math.max(0, Math.round((previous - 1) * 100) / 100);
+		meal.leftoverServings = next;
+		notify(
+			next > 0
+				? `1 leftover serving used · ${next} remaining.`
+				: 'Last leftover serving marked used.',
+			() => {
+				const target = kitchen.meals.find((entry) => entry.id === mealId);
+				if (target && target.leftoverServings === next) target.leftoverServings = previous;
+				else notify('Leftovers changed again. Review the current count before editing.');
+			}
+		);
+	}
+	function clearMealLeftovers(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		meal.leftoverServings = 0;
+		notify('Leftovers marked used.', () => {
+			const target = kitchen.meals.find((entry) => entry.id === mealId);
+			if (target && target.leftoverServings === 0) target.leftoverServings = previous;
+			else notify('Leftovers changed again. Review the current count before editing.');
 		});
 	}
 	function removePlannedMeal(meal: Meal) {
@@ -1989,7 +2018,7 @@
 				void openLeaveHousehold();
 				break;
 			case 'scan':
-				if (!scanBusy) imageInput?.click();
+				if (!scanBusy && !busy && !voiceBusy) imageInput?.click();
 				break;
 			case 'dictate':
 				dictateRecipe();
@@ -2035,37 +2064,13 @@
 		if (input) input.value = '';
 		if (imageInput) imageInput.value = '';
 		if (!file || scanBusy || busy || voiceBusy || !needAI()) return;
-		if (file.size > 5 * 1024 * 1024) {
-			notify('Choose a photo under 5 MB.');
-			return;
-		}
 		const generation = ++scanGeneration;
 		const currentController = new AbortController();
 		scanController = currentController;
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
 		scanBusy = true;
 		try {
-			const image = await new Promise<string>((resolve, reject) => {
-				const reader = new FileReader();
-				const onAbort = () => {
-					reader.abort();
-					reject(new DOMException('Scan aborted.', 'AbortError'));
-				};
-				if (currentController.signal.aborted) {
-					onAbort();
-					return;
-				}
-				currentController.signal.addEventListener('abort', onAbort, { once: true });
-				reader.onload = () => {
-					currentController.signal.removeEventListener('abort', onAbort);
-					resolve(String(reader.result));
-				};
-				reader.onerror = () => {
-					currentController.signal.removeEventListener('abort', onAbort);
-					reject(new Error('Could not read that photo. Try another file.'));
-				};
-				reader.readAsDataURL(file);
-			});
+			const image = await prepareAIPhoto(file, { signal: currentController.signal });
 			const result = await ai('vision', { image }, currentController.signal);
 			if (
 				generation !== scanGeneration ||
@@ -2102,7 +2107,7 @@
 				notify(
 					currentController.signal.aborted
 						? 'Photo scan cancelled.'
-						: e instanceof Error
+						: e instanceof Error && e.message
 							? e.message
 							: 'Could not recognize ingredients from that photo.'
 				);
@@ -2112,6 +2117,7 @@
 				scanBusy = false;
 				scanController = undefined;
 			}
+			if (input) input.value = '';
 			if (imageInput) imageInput.value = '';
 		}
 	}
@@ -4050,10 +4056,13 @@
 										<div class="cooked-history-actions">
 											{#if meal.leftoverServings}<button
 													class="text-button"
-													onclick={() => {
-														meal.leftoverServings = 0;
-														notify('Leftovers marked used.');
-													}}>Use leftovers <Check size={15} /></button
+													aria-label={`Use 1 leftover of ${recipe.title}`}
+													onclick={() => consumeLeftoverServing(meal)}>Use 1 leftover</button
+												><button
+													class="text-button"
+													aria-label={`Clear leftovers for ${recipe.title}`}
+													onclick={() => clearMealLeftovers(meal)}
+													>Clear leftovers <Check size={15} /></button
 												>{/if}<button
 												class="text-button"
 												onclick={() => {
