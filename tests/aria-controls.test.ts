@@ -62,69 +62,167 @@ const VOID_TAGS = new Set([
 	'wbr'
 ]);
 
+const HTML_ENTITIES: Record<string, string> = {
+	'&quot;': '"',
+	'&#39;': "'",
+	'&#x27;': "'",
+	'&lt;': '<',
+	'&gt;': '>',
+	'&amp;': '&'
+};
+
 function decodeEntities(text: string): string {
-	return text
-		.replace(/&quot;/g, '"')
-		.replace(/&#39;|&#x27;/gi, "'")
-		.replace(/&lt;/g, '<')
-		.replace(/&gt;/g, '>')
-		.replace(/&amp;/g, '&');
+	return text.replace(/&(?:quot|#39|#x27|lt|gt|amp);/gi, (entity) => {
+		return HTML_ENTITIES[entity.toLowerCase()] ?? entity;
+	});
 }
 
-function parseAttributes(rawAttrs: string): Map<string, string> {
-	const attrs = new Map<string, string>();
-	const attrPattern = /([^\s=/>"']+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
-	let match: RegExpExecArray | null;
-	while ((match = attrPattern.exec(rawAttrs)) !== null) {
-		const name = match[1]!.toLowerCase();
-		const value = match[2] ?? match[3] ?? match[4] ?? '';
-		attrs.set(name, decodeEntities(value));
-	}
-	return attrs;
+function isAsciiWhitespace(ch: string): boolean {
+	return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f';
+}
+
+function isAsciiAlpha(ch: string): boolean {
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+}
+
+function isTagNameChar(ch: string): boolean {
+	return isAsciiAlpha(ch) || (ch >= '0' && ch <= '9') || ch === '-' || ch === '_' || ch === ':';
 }
 
 function parseHtml(html: string): HtmlElement {
-	const withoutComments = html.replace(/<!--[\s\S]*?-->/g, '');
 	const root: HtmlElement = { tag: '#document', attrs: new Map(), children: [], parent: null };
 	const stack: HtmlElement[] = [root];
-	const tagPattern = /<\/?([a-zA-Z][\w:-]*)(\s[^>]*?)?\s*(\/?)>/g;
-	let lastIndex = 0;
-	let match: RegExpExecArray | null;
+	let pos = 0;
 
-	while ((match = tagPattern.exec(withoutComments)) !== null) {
-		if (match.index > lastIndex) {
-			const text = decodeEntities(withoutComments.slice(lastIndex, match.index));
+	while (pos < html.length) {
+		const lt = html.indexOf('<', pos);
+		if (lt === -1) {
+			const tail = decodeEntities(html.slice(pos));
+			if (tail) stack[stack.length - 1]!.children.push(tail);
+			break;
+		}
+
+		if (lt > pos) {
+			const text = decodeEntities(html.slice(pos, lt));
 			if (text) stack[stack.length - 1]!.children.push(text);
 		}
-		const fullMatch = match[0];
-		const tag = match[1]!.toLowerCase();
-		const rawAttrs = match[2] ?? '';
-		const selfClosing = match[3] === '/' || VOID_TAGS.has(tag);
 
-		if (fullMatch.startsWith('</')) {
+		if (html.startsWith('<!--', lt)) {
+			const commentEnd = html.indexOf('-->', lt + 4);
+			pos = commentEnd === -1 ? html.length : commentEnd + 3;
+			continue;
+		}
+
+		if (html[lt + 1] === '/') {
+			const gt = html.indexOf('>', lt + 2);
+			if (gt === -1) break;
+			const closeTag = html
+				.slice(lt + 2, gt)
+				.trim()
+				.toLowerCase();
 			for (let idx = stack.length - 1; idx > 0; idx -= 1) {
-				if (stack[idx]!.tag === tag) {
+				if (stack[idx]!.tag === closeTag) {
 					stack.length = idx;
 					break;
 				}
 			}
-		} else {
-			const parent = stack[stack.length - 1]!;
-			const element: HtmlElement = {
-				tag,
-				attrs: parseAttributes(rawAttrs),
-				children: [],
-				parent
-			};
-			parent.children.push(element);
-			if (!selfClosing) stack.push(element);
+			pos = gt + 1;
+			continue;
 		}
-		lastIndex = tagPattern.lastIndex;
-	}
 
-	if (lastIndex < withoutComments.length) {
-		const tail = decodeEntities(withoutComments.slice(lastIndex));
-		if (tail) stack[stack.length - 1]!.children.push(tail);
+		const firstTagChar = html[lt + 1] ?? '';
+		if (!isAsciiAlpha(firstTagChar)) {
+			stack[stack.length - 1]!.children.push('<');
+			pos = lt + 1;
+			continue;
+		}
+
+		let cursor = lt + 2;
+		while (cursor < html.length && isTagNameChar(html[cursor]!)) {
+			cursor += 1;
+		}
+		const tag = html.slice(lt + 1, cursor).toLowerCase();
+		const attrs = new Map<string, string>();
+		let selfClosing = VOID_TAGS.has(tag);
+
+		while (cursor < html.length) {
+			while (cursor < html.length && isAsciiWhitespace(html[cursor]!)) {
+				cursor += 1;
+			}
+			if (cursor >= html.length) break;
+
+			const ch = html[cursor]!;
+			if (ch === '>') {
+				cursor += 1;
+				break;
+			}
+			if (ch === '/' && html[cursor + 1] === '>') {
+				selfClosing = true;
+				cursor += 2;
+				break;
+			}
+			if (ch === '/') {
+				cursor += 1;
+				continue;
+			}
+
+			const nameStart = cursor;
+			while (cursor < html.length) {
+				const c = html[cursor]!;
+				if (isAsciiWhitespace(c) || c === '=' || c === '>' || c === '/') break;
+				cursor += 1;
+			}
+			const attrName = html.slice(nameStart, cursor).toLowerCase();
+			while (cursor < html.length && isAsciiWhitespace(html[cursor]!)) {
+				cursor += 1;
+			}
+
+			let attrValue = '';
+			if (html[cursor] === '=') {
+				cursor += 1;
+				while (cursor < html.length && isAsciiWhitespace(html[cursor]!)) {
+					cursor += 1;
+				}
+				const quote = html[cursor];
+				if (quote === '"' || quote === "'") {
+					cursor += 1;
+					const valStart = cursor;
+					const closeQuote = html.indexOf(quote, cursor);
+					if (closeQuote === -1) {
+						attrValue = html.slice(valStart);
+						cursor = html.length;
+					} else {
+						attrValue = html.slice(valStart, closeQuote);
+						cursor = closeQuote + 1;
+					}
+				} else {
+					const valStart = cursor;
+					while (cursor < html.length) {
+						const c = html[cursor]!;
+						if (isAsciiWhitespace(c) || c === '>' || (c === '/' && html[cursor + 1] === '>')) {
+							break;
+						}
+						cursor += 1;
+					}
+					attrValue = html.slice(valStart, cursor);
+				}
+			}
+
+			if (attrName) {
+				attrs.set(attrName, decodeEntities(attrValue));
+			}
+		}
+
+		const parent = stack[stack.length - 1]!;
+		const element: HtmlElement = {
+			tag,
+			attrs,
+			children: [],
+			parent
+		};
+		parent.children.push(element);
+		if (!selfClosing) stack.push(element);
+		pos = cursor;
 	}
 
 	return root;
