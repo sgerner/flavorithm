@@ -139,6 +139,7 @@ export async function runOpenSettingsWorkflow(options: {
 	refreshAuth: () => Promise<{ stateLoaded?: boolean }>;
 	loadConnectionsAndCatalog: () => Promise<void>;
 	onReadyToFocus?: () => Promise<void>;
+	onAuthError?: (error: unknown) => void;
 	onError: (error: unknown) => void;
 }): Promise<void> {
 	const authTask = settle(options.refreshAuth());
@@ -151,6 +152,9 @@ export async function runOpenSettingsWorkflow(options: {
 	}
 
 	const authResult = await authTask;
+	if (authResult.status === 'rejected') {
+		options.onAuthError?.(authResult.reason);
+	}
 	const currentUserId = options.getCurrentUserId();
 	if (!currentUserId) return;
 
@@ -195,12 +199,12 @@ export async function runHouseholdTransition<
 }): Promise<void> {
 	const roster = await options.mutateHousehold();
 	options.onMutated();
+	options.applyRoster(roster);
 	const auth = await options.refreshAuth();
 	if (!auth.stateLoaded) {
 		const state = await options.fetchState();
 		options.adoptState(state);
 	}
-	options.applyRoster(roster);
 }
 
 /**
@@ -224,7 +228,7 @@ export async function runReconnectWorkflow<TState = { state?: AppState | null }>
 		options.onSignedOut();
 		return;
 	}
-	if (!options.hadPreviousUser) {
+	if (!options.hadPreviousUser && !auth.stateLoaded) {
 		options.restoreContext(currentUser);
 	}
 	if (!auth.stateLoaded && !options.hasPendingEdits()) {
