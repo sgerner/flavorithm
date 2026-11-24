@@ -1,3 +1,4 @@
+export const HOST_CONNECTION_ID = 'host-chatgpt';
 export type ReasoningSettings = { effort?: string; enabled?: boolean; budgetTokens?: number };
 export type ConnectionModel = {
 	id: string;
