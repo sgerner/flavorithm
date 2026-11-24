@@ -374,55 +374,168 @@ type ParsedTag = {
 	attrs: Record<string, string>;
 };
 
-function parseOpeningTags(html: string): ParsedTag[] {
-	const clean = html.replace(/<!--[\s\S]*?-->/g, '');
-	const tags: ParsedTag[] = [];
-	const tagRegex = /<([a-zA-Z][a-zA-Z0-9-]*)\b((?:[^>"']|"[^"]*"|'[^']*')*)>/g;
-	for (const match of clean.matchAll(tagRegex)) {
-		const tag = match[1].toLowerCase();
-		const attrSource = match[2];
-		const attrs: Record<string, string> = {};
-		const attrRegex =
-			/([a-zA-Z_:][a-zA-Z0-9_.:-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
-		for (const attrMatch of attrSource.matchAll(attrRegex)) {
-			const name = attrMatch[1].toLowerCase();
-			const val = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? '';
-			attrs[name] = val;
+type HtmlToken =
+	| { kind: 'open'; tag: string; attrs: Record<string, string>; selfClosing: boolean }
+	| { kind: 'close'; tag: string }
+	| { kind: 'text'; text: string };
+
+const VOID_HTML_TAGS = new Set(['input', 'img', 'br', 'hr', 'meta', 'link', 'source']);
+
+function isAsciiAlpha(ch: string | undefined): boolean {
+	if (!ch) return false;
+	const code = ch.charCodeAt(0);
+	return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function isTagNameChar(ch: string | undefined): boolean {
+	if (!ch) return false;
+	if (isAsciiAlpha(ch)) return true;
+	const code = ch.charCodeAt(0);
+	return (code >= 48 && code <= 57) || ch === '-';
+}
+
+function isWhitespaceChar(ch: string | undefined): boolean {
+	return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f';
+}
+
+function tokenizeHtml(html: string): HtmlToken[] {
+	const tokens: HtmlToken[] = [];
+	let i = 0;
+	while (i < html.length) {
+		if (html.startsWith('<!--', i)) {
+			const endComment = html.indexOf('-->', i + 4);
+			i = endComment === -1 ? html.length : endComment + 3;
+			continue;
 		}
-		tags.push({ tag, attrs });
+		if (html[i] === '<') {
+			if (html[i + 1] === '/' && isAsciiAlpha(html[i + 2])) {
+				const closeGt = html.indexOf('>', i + 2);
+				if (closeGt === -1) break;
+				const closeName = html
+					.slice(i + 2, closeGt)
+					.trim()
+					.toLowerCase();
+				tokens.push({ kind: 'close', tag: closeName });
+				i = closeGt + 1;
+				continue;
+			}
+			if (isAsciiAlpha(html[i + 1])) {
+				let cursor = i + 1;
+				while (cursor < html.length && isTagNameChar(html[cursor])) cursor += 1;
+				const tag = html.slice(i + 1, cursor).toLowerCase();
+				const attrs: Record<string, string> = {};
+				let selfClosing = false;
+				while (cursor < html.length) {
+					while (cursor < html.length && isWhitespaceChar(html[cursor])) cursor += 1;
+					if (cursor >= html.length) break;
+					if (html[cursor] === '>') {
+						cursor += 1;
+						break;
+					}
+					if (html[cursor] === '/' && html[cursor + 1] === '>') {
+						selfClosing = true;
+						cursor += 2;
+						break;
+					}
+					const nameStart = cursor;
+					while (
+						cursor < html.length &&
+						!isWhitespaceChar(html[cursor]) &&
+						html[cursor] !== '=' &&
+						html[cursor] !== '>' &&
+						html[cursor] !== '/'
+					) {
+						cursor += 1;
+					}
+					if (cursor === nameStart) {
+						cursor += 1;
+						continue;
+					}
+					const attrName = html.slice(nameStart, cursor).toLowerCase();
+					while (cursor < html.length && isWhitespaceChar(html[cursor])) cursor += 1;
+					let attrValue = '';
+					if (html[cursor] === '=') {
+						cursor += 1;
+						while (cursor < html.length && isWhitespaceChar(html[cursor])) cursor += 1;
+						const quote = html[cursor];
+						if (quote === '"' || quote === "'") {
+							cursor += 1;
+							const valStart = cursor;
+							const closeQuote = html.indexOf(quote, cursor);
+							if (closeQuote === -1) {
+								attrValue = html.slice(valStart);
+								cursor = html.length;
+							} else {
+								attrValue = html.slice(valStart, closeQuote);
+								cursor = closeQuote + 1;
+							}
+						} else {
+							const valStart = cursor;
+							while (
+								cursor < html.length &&
+								!isWhitespaceChar(html[cursor]) &&
+								html[cursor] !== '>'
+							) {
+								cursor += 1;
+							}
+							attrValue = html.slice(valStart, cursor);
+						}
+					}
+					attrs[attrName] = attrValue;
+				}
+				tokens.push({ kind: 'open', tag, attrs, selfClosing });
+				i = cursor;
+				continue;
+			}
+			tokens.push({ kind: 'text', text: '<' });
+			i += 1;
+			continue;
+		}
+		const nextLt = html.indexOf('<', i);
+		const end = nextLt === -1 ? html.length : nextLt;
+		tokens.push({ kind: 'text', text: html.slice(i, end) });
+		i = end;
+	}
+	return tokens;
+}
+
+function parseOpeningTags(html: string): ParsedTag[] {
+	const tags: ParsedTag[] = [];
+	for (const token of tokenizeHtml(html)) {
+		if (token.kind === 'open') {
+			tags.push({ tag: token.tag, attrs: token.attrs });
+		}
 	}
 	return tags;
 }
 
 function findElementTextById(html: string, targetId: string): string | null {
-	const clean = html.replace(/<!--[\s\S]*?-->/g, '');
-	const escaped = targetId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	const openRegex = new RegExp(
-		`<([a-zA-Z][a-zA-Z0-9-]*)\\b(?:[^>"']|"[^"]*"|'[^']*')*\\bid="${escaped}"(?:[^>"']|"[^"]*"|'[^']*')*>`,
-		'i'
+	const tokens = tokenizeHtml(html);
+	const startIdx = tokens.findIndex(
+		(token) => token.kind === 'open' && token.attrs.id === targetId
 	);
-	const openMatch = openRegex.exec(clean);
-	if (!openMatch || openMatch.index === undefined) return null;
-	const tagName = openMatch[1].toLowerCase();
-	const voidTags = new Set(['input', 'img', 'br', 'hr', 'meta', 'link', 'source']);
-	if (voidTags.has(tagName)) return '';
+	if (startIdx === -1) return null;
+	const openToken = tokens[startIdx];
+	if (openToken.kind !== 'open') return null;
+	if (openToken.selfClosing || VOID_HTML_TAGS.has(openToken.tag)) return '';
 
-	const tokenRegex = new RegExp(`<\\/?${tagName}\\b(?:[^>"']|"[^"]*"|'[^']*')*>`, 'gi');
-	tokenRegex.lastIndex = openMatch.index + openMatch[0].length;
 	let depth = 1;
-	let tokenMatch: RegExpExecArray | null;
-	while ((tokenMatch = tokenRegex.exec(clean)) !== null) {
-		if (tokenMatch[0].startsWith('</')) {
-			depth -= 1;
-			if (depth === 0) {
-				const inner = clean.slice(openMatch.index + openMatch[0].length, tokenMatch.index);
-				return inner
-					.replace(/<[^>]+>/g, ' ')
-					.replace(/\s+/g, ' ')
-					.trim();
+	const chunks: string[] = [];
+	for (let idx = startIdx + 1; idx < tokens.length; idx += 1) {
+		const token = tokens[idx];
+		if (token.kind === 'open') {
+			if (!token.selfClosing && !VOID_HTML_TAGS.has(token.tag) && token.tag === openToken.tag) {
+				depth += 1;
 			}
-		} else if (!tokenMatch[0].endsWith('/>')) {
-			depth += 1;
+		} else if (token.kind === 'close') {
+			if (token.tag === openToken.tag) {
+				depth -= 1;
+				if (depth === 0) {
+					return chunks.join(' ').replace(/\s+/g, ' ').trim();
+				}
+			}
+		} else {
+			chunks.push(token.text);
 		}
 	}
 	return null;
