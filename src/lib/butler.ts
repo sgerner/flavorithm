@@ -81,7 +81,7 @@ const meal = z.object({
 	date,
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
-	servings: z.number().min(1).max(10000),
+	servings: z.number().finite().min(1).max(10000),
 	completedAt: z.iso
 		.datetime()
 		.optional()
@@ -89,6 +89,7 @@ const meal = z.object({
 			'Read-only ISO completion timestamp preserved on already-cooked meals and ignored on uncompleted meals; use meal.complete to finish a planned meal.'
 		),
 	leftoverServings: quantity
+		.finite()
 		.optional()
 		.describe(
 			'Remaining leftover servings on an already-cooked meal (clamped between 0 and servings); ignored on uncompleted meals.'
