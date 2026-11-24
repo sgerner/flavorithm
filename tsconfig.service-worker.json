@@ -1,0 +1,7 @@
+{
+	"extends": "$app/tsconfig/service-worker.json",
+	"include": ["src/service-worker.ts"],
+	"compilerOptions": {
+		"strict": true
+	}
+}
