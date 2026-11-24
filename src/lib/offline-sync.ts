@@ -1,7 +1,8 @@
-import { z } from 'zod';
-import { COVER_PATH } from '#lib/cover-upload.ts';
-import { MAX_RECIPES } from '#lib/recipe-collection.ts';
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
+import { isKitchenState, isKitchenStateShape } from '#lib/state-schema.ts';
 import type { AppState, User } from '#lib/types.ts';
+
+export { isKitchenState, isKitchenStateShape };
 
 export type SyncConflict = { path: string; local: unknown; remote: unknown };
 export type PendingKitchen = {
@@ -27,6 +28,8 @@ const journalPrefix = (user: Pick<User, 'id' | 'householdId'>) =>
 const quarantinePrefix = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-quarantined-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
 export const MAX_PENDING_JOURNAL_ENTRIES = 64;
+export const MAX_QUARANTINED_JOURNAL_ENTRIES = 8;
+export const MAX_QUARANTINED_ENTRY_CHARS = 262_144;
 
 export type PendingJournalRecord = {
 	writerId: string;
@@ -35,132 +38,44 @@ export type PendingJournalRecord = {
 	keys: Array<{ key: string; pending: PendingKitchen }>;
 };
 export type PendingJournalRead = { records: PendingJournalRecord[]; error: string };
+export type QuarantinedJournalEntry = {
+	key: string;
+	slot: string;
+	raw: string;
+	parsed?: unknown;
+};
 
-function isPublicHttpsUrl(value: string): boolean {
-	if (!value) return true;
-	try {
-		const url = new URL(value);
-		return url.protocol === 'https:' && !url.username && !url.password;
-	} catch {
-		return false;
+/**
+ * Validate a candidate kitchen snapshot while allowing untouched legacy fields already present in
+ * `referenceBase` to heal via `sanitizeKitchenState`. Newly introduced invalid edits still return
+ * `null` and are rejected.
+ */
+export function repairLegacyKitchenState(
+	value: unknown,
+	referenceBase?: AppState | null
+): AppState | null {
+	if (isKitchenState(value)) return value;
+	if (!isKitchenStateShape(value)) return null;
+	if (!referenceBase || !isKitchenStateShape(referenceBase) || isKitchenState(referenceBase)) {
+		return null;
 	}
+	const sanitizedBase = sanitizeKitchenState(referenceBase);
+	const candidate = mergeKitchenStates(referenceBase, value, sanitizedBase, 'local').state;
+	return isKitchenState(candidate) ? candidate : null;
 }
 
-const publicHttpsUrlSchema = z
-	.string()
-	.max(4_000)
-	.refine(isPublicHttpsUrl, 'Only public HTTPS URLs are allowed');
-
-const nutritionSchema = z.object({
-	calories: z.number().min(0).max(1_000_000),
-	fat: z.number().min(0).max(1_000_000),
-	saturatedFat: z.number().min(0).max(1_000_000),
-	sodium: z.number().min(0).max(1_000_000),
-	carbs: z.number().min(0).max(1_000_000),
-	fiber: z.number().min(0).max(1_000_000),
-	sugar: z.number().min(0).max(1_000_000),
-	protein: z.number().min(0).max(1_000_000)
-});
-
-const recipeSchema = z.object({
-	id: z.string().min(1).max(100),
-	title: z.string().trim().min(1).max(200),
-	description: z.string().max(10_000),
-	image: z.union([publicHttpsUrlSchema, z.string().regex(COVER_PATH)]),
-	time: z.number().min(0).max(100_000),
-	servings: z.number().min(1).max(10_000),
-	difficulty: z.string().max(80),
-	cuisine: z.string().max(100),
-	tags: z.array(z.string().max(100)).max(100),
-	ingredients: z
-		.array(
-			z.object({
-				name: z.string().trim().min(1).max(200),
-				quantity: z.number().min(0).max(1_000_000),
-				unit: z.string().max(40)
-			})
-		)
-		.max(250),
-	steps: z.array(z.string().max(10_000)).max(200),
-	nutrition: nutritionSchema,
-	source: publicHttpsUrlSchema.optional(),
-	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
-	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
-	nutritionStale: z.boolean().optional(),
-	rating: z.number().min(0).max(5).optional(),
-	saved: z.boolean().optional(),
-	hidden: z.boolean().optional()
-});
-
-const preferencesSchema = z.object({
-	diet: z.string().max(200),
-	allergies: z.string().max(2_000),
-	maxTime: z.number().min(0).max(100_000),
-	complexity: z.string().max(100),
-	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
-	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
-	theme: z.string().max(100),
-	dark: z.boolean(),
-	provider: z.string().max(100),
-	model: z.string().max(200),
-	reasoning: z
-		.object({
-			effort: z
-				.string()
-				.regex(/^[a-z_]{1,24}$/)
-				.optional(),
-			enabled: z.boolean().optional(),
-			budgetTokens: z.number().int().min(0).max(32_768).optional()
-		})
-		.optional(),
-	chatgptAccountId: z.string().max(100).optional(),
-	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
-});
-
-const kitchenStateSchema = z.object({
-	pantry: z
-		.array(
-			z.object({
-				id: z.string().min(1).max(100),
-				name: z.string().trim().min(1).max(200),
-				quantity: z.number().min(0).max(1_000_000),
-				unit: z.string().max(40),
-				category: z.string().max(100),
-				expires: z.string().max(50).optional()
-			})
-		)
-		.max(1_000),
-	recipes: z.array(recipeSchema).max(MAX_RECIPES),
-	meals: z
-		.array(
-			z.object({
-				id: z.string().min(1).max(100),
-				date: z.string().max(50),
-				slot: z.string().max(100),
-				recipeId: z.string().max(100),
-				servings: z.number().min(1).max(10_000),
-				completedAt: z.string().max(50).optional(),
-				leftoverServings: z.number().min(0).max(10_000).optional()
-			})
-		)
-		.max(1_000),
-	shopping: z
-		.array(
-			z.object({
-				id: z.string().min(1).max(100),
-				name: z.string().trim().min(1).max(200),
-				quantity: z.number().min(0).max(1_000_000),
-				unit: z.string().max(40),
-				checked: z.boolean(),
-				sourceKey: z.string().max(200).optional()
-			})
-		)
-		.max(1_000),
-	preferences: preferencesSchema
-});
-
-export function isKitchenState(value: unknown): value is AppState {
-	return kitchenStateSchema.safeParse(value).success;
+function listQuarantinedKeys(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>
+): string[] {
+	if (typeof storage.length !== 'number' || typeof storage.key !== 'function') return [];
+	const prefix = quarantinePrefix(user);
+	const keys: string[] = [];
+	for (let index = 0; index < storage.length; index += 1) {
+		const storageKey = storage.key(index);
+		if (storageKey?.startsWith(prefix)) keys.push(storageKey);
+	}
+	return keys;
 }
 
 function quarantineSlot(
@@ -170,31 +85,91 @@ function quarantineSlot(
 	slotId: string,
 	raw: string
 ): void {
-	const safeSlot = slotId ? encodeURIComponent(slotId) : 'corrupt';
+	const safeSlot = (slotId ? encodeURIComponent(slotId) : 'corrupt').slice(0, 120) || 'corrupt';
 	const baseKey = `${quarantinePrefix(user)}${safeSlot}`;
+	const boundedRaw =
+		raw.length > MAX_QUARANTINED_ENTRY_CHARS ? raw.slice(0, MAX_QUARANTINED_ENTRY_CHARS) : raw;
 	try {
-		let targetKey = baseKey;
-		const existing = storage.getItem(targetKey);
-		if (existing !== null && existing !== raw) {
-			let suffix = 2;
-			while (suffix <= MAX_PENDING_JOURNAL_ENTRIES) {
-				const candidate = `${baseKey}:${suffix}`;
-				const current = storage.getItem(candidate);
-				if (current === null || current === raw) {
-					targetKey = candidate;
-					break;
-				}
-				suffix += 1;
+		const existingKeys = listQuarantinedKeys(storage, user);
+		for (const existingKey of existingKeys) {
+			if (storage.getItem(existingKey) === boundedRaw) {
+				storage.removeItem(activeKey);
+				return;
 			}
-			if (targetKey === baseKey) targetKey = `${baseKey}:${Date.now()}`;
 		}
-		if (storage.getItem(targetKey) !== raw) {
-			storage.setItem(targetKey, raw);
+		let targetKey = `${baseKey}:${MAX_QUARANTINED_JOURNAL_ENTRIES}`;
+		for (let suffix = 1; suffix <= MAX_QUARANTINED_JOURNAL_ENTRIES; suffix += 1) {
+			const candidate = suffix === 1 ? baseKey : `${baseKey}:${suffix}`;
+			const current = storage.getItem(candidate);
+			if (current === null || current === boundedRaw) {
+				targetKey = candidate;
+				break;
+			}
+		}
+		const evictable = existingKeys.filter((entry) => entry !== targetKey);
+		const overflowCount =
+			existingKeys.includes(targetKey) || existingKeys.length < MAX_QUARANTINED_JOURNAL_ENTRIES
+				? 0
+				: existingKeys.length - MAX_QUARANTINED_JOURNAL_ENTRIES + 1;
+		try {
+			if (storage.getItem(targetKey) !== boundedRaw) {
+				storage.setItem(targetKey, boundedRaw);
+			}
+		} catch (writeError) {
+			if (!evictable.length) throw writeError;
+			storage.removeItem(evictable.shift()!);
+			storage.setItem(targetKey, boundedRaw);
+		}
+		for (let i = 0; i < overflowCount && evictable.length > 0; i += 1) {
+			storage.removeItem(evictable.shift()!);
 		}
 		storage.removeItem(activeKey);
 	} catch {
 		// Leave the original untouched for manual recovery if storage refuses writes or removals.
 	}
+}
+
+/** Read quarantined journal entries for this account/household so backups can export them. */
+export function readQuarantinedJournal(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>
+): QuarantinedJournalEntry[] {
+	const prefix = quarantinePrefix(user);
+	const entries: QuarantinedJournalEntry[] = [];
+	try {
+		const keys =
+			typeof storage.length === 'number' && typeof storage.key === 'function'
+				? listQuarantinedKeys(storage, user).sort()
+				: [`${prefix}legacy-main`];
+		for (const storageKey of keys) {
+			const raw = storage.getItem(storageKey);
+			if (raw === null) continue;
+			const rawSlot = storageKey.slice(prefix.length);
+			let slot = rawSlot || 'corrupt';
+			try {
+				slot = decodeURIComponent(rawSlot) || 'corrupt';
+			} catch {
+				slot = rawSlot || 'corrupt';
+			}
+			let hasParsed = false;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(raw);
+				hasParsed = true;
+			} catch {
+				hasParsed = false;
+			}
+			entries.push({
+				key: storageKey,
+				slot,
+				raw,
+				...(hasParsed ? { parsed } : {})
+			});
+		}
+	} catch {
+		return entries;
+	}
+	return entries;
 }
 
 function parsePending(value: unknown, user: User): PendingKitchen | null {
@@ -203,8 +178,8 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 		typeof value !== 'object' ||
 		(value as PendingKitchen).userId !== user.id ||
 		(value as PendingKitchen).householdId !== user.householdId ||
-		!isState((value as PendingKitchen).base) ||
-		!isState((value as PendingKitchen).local) ||
+		!isKitchenStateShape((value as PendingKitchen).base) ||
+		!isKitchenStateShape((value as PendingKitchen).local) ||
 		!(
 			(value as PendingKitchen).etag === null || typeof (value as PendingKitchen).etag === 'string'
 		) ||
@@ -218,7 +193,17 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 	) {
 		return null;
 	}
-	return value as PendingKitchen;
+	const candidate = value as PendingKitchen;
+	if (isKitchenState(candidate.base) && isKitchenState(candidate.local)) {
+		return candidate;
+	}
+	const repairedLocal = repairLegacyKitchenState(candidate.local, candidate.base);
+	if (!repairedLocal) return null;
+	return {
+		...candidate,
+		base: isKitchenState(candidate.base) ? candidate.base : sanitizeKitchenState(candidate.base),
+		local: repairedLocal
+	};
 }
 
 /** Read every per-writer durable delta, plus the old single-slot format for migration. */
@@ -857,6 +842,11 @@ export function mergePendingKitchenJournal(
 	};
 }
 
+function prepareMergedStateForPut(mergedState: AppState, remoteState: AppState): AppState {
+	if (isKitchenState(mergedState)) return mergedState;
+	return repairLegacyKitchenState(mergedState, remoteState) ?? sanitizeKitchenState(mergedState);
+}
+
 /** Reconcile every account-scoped writer delta against current server state before the write. */
 export async function syncPendingKitchenJournal(
 	records: PendingJournalRecord[],
@@ -891,7 +881,10 @@ export async function syncPendingKitchenJournal(
 		}
 		const resolved = mergePendingKitchenJournal(records, remote.state, prefer);
 		try {
-			const result = await transport.put(resolved.state, expectedEtag);
+			const result = await transport.put(
+				prepareMergedStateForPut(resolved.state, remote.state),
+				expectedEtag
+			);
 			return { ...result, conflicts: [], saved: true };
 		} catch (error) {
 			if ((error as { status?: number }).status !== 412) throw error;
@@ -924,7 +917,10 @@ export async function syncPendingKitchenJournal(
 			};
 		}
 		try {
-			const result = await transport.put(merged.state, remote.etag);
+			const result = await transport.put(
+				prepareMergedStateForPut(merged.state, remote.state),
+				remote.etag
+			);
 			return { ...result, conflicts: [], saved: true };
 		} catch (error) {
 			if ((error as { status?: number }).status !== 412 || attempt === 2) throw error;

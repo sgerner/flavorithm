@@ -136,7 +136,7 @@
 			{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
 		</div>
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
-		{#if pending && !(review && conflicts.length)}
+		{#if (pending || error.includes('quarantined')) && !(review && conflicts.length)}
 			<button class="secondary" type="button" onclick={exportPending}
 				><Download size={16} /> Back up my changes</button
 			>
@@ -189,8 +189,10 @@
 					</ul>
 				</div>
 				<div class="sync-actions">
-					{#if pending}<button class="secondary" type="button" onclick={exportPending}
-							><Download size={16} /> Back up my changes</button
+					{#if pending || error.includes('quarantined')}<button
+							class="secondary"
+							type="button"
+							onclick={exportPending}><Download size={16} /> Back up my changes</button
 						>{/if}
 					<button
 						class="secondary"

@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import type { AppState } from './types.ts';
-import { COVER_PATH } from './cover-upload.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList, normalizeName } from './domain.ts';
 import {
@@ -12,20 +11,9 @@ import {
 	reconcileShoppingList
 } from './kitchen-workflows.ts';
 
-function isPublicHttpsUrl(value: string): boolean {
-	try {
-		const url = new URL(value);
-		return url.protocol === 'https:' && !url.username && !url.password;
-	} catch {
-		return false;
-	}
-}
-
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
 const quantity = z.number().nonnegative().max(1000000);
-const cookingTime = z.number().nonnegative().max(100000);
-const leftoverQuantity = z.number().nonnegative().max(10000);
 const nutrition = z.object({
 	calories: quantity,
 	fat: quantity,
@@ -44,10 +32,14 @@ const recipe = z.object({
 		.string()
 		.max(4000)
 		.refine(
-			(value) => !value || COVER_PATH.test(value) || isPublicHttpsUrl(value),
-			'Use a public HTTPS image URL or a recipe cover.'
+			(value) =>
+				!value ||
+				value.startsWith('/recipe-covers/') ||
+				value.startsWith('/api/recipe-covers/') ||
+				/^https?:\/\//.test(value),
+			'Use an HTTP image URL or a recipe cover.'
 		),
-	time: cookingTime,
+	time: quantity,
 	servings: z.number().min(1).max(10000),
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
@@ -59,13 +51,9 @@ const recipe = z.object({
 		.max(250),
 	steps: z.array(text).max(200),
 	nutrition,
-	source: z
-		.string()
-		.max(4000)
-		.refine((value) => !value || isPublicHttpsUrl(value), 'Use a public HTTPS source URL.')
-		.optional(),
+	source: z.string().max(4000).optional(),
 	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
-	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
+	importNotes: z.array(z.string().max(1000)).max(50).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
@@ -96,12 +84,11 @@ const meal = z.object({
 	servings: z.number().min(1).max(10000),
 	completedAt: z.iso
 		.datetime()
-		.max(50)
 		.optional()
 		.describe(
 			'Read-only ISO completion timestamp preserved on already-cooked meals and ignored on uncompleted meals; use meal.complete to finish a planned meal.'
 		),
-	leftoverServings: leftoverQuantity
+	leftoverServings: quantity
 		.optional()
 		.describe(
 			'Remaining leftover servings on an already-cooked meal (clamped between 0 and servings); ignored on uncompleted meals.'
@@ -122,22 +109,17 @@ const preferences = z
 		allergies: z.string().max(500),
 		maxTime: z.number().nonnegative().max(100000),
 		complexity: z.string().max(80),
-		cuisines: z.array(z.string().trim().min(1).max(80)).max(8),
+		cuisines: z.array(z.string().max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
 		theme: z.string().max(80),
 		dark: z.boolean(),
 		provider: z.string().max(100),
 		model: z.string().max(200),
-		reasoning: z
-			.object({
-				effort: z
-					.string()
-					.regex(/^[a-z_]{1,24}$/)
-					.optional(),
-				enabled: z.boolean().optional(),
-				budgetTokens: z.number().int().min(0).max(32768).optional()
-			})
-			.strict(),
+		reasoning: z.object({
+			effort: z.string().max(24).optional(),
+			enabled: z.boolean().optional(),
+			budgetTokens: z.number().int().min(0).max(32768).optional()
+		}),
 		ratings: z.record(id, z.number().min(0).max(5)),
 		chatgptAccountId: z.string().max(100),
 		usePersonalAI: z.boolean()
@@ -155,7 +137,7 @@ export const ButlerCommandSchema = z.discriminatedUnion('type', [
 		.object({
 			type: z.literal('meal.complete'),
 			id: id.describe('ID of the planned meal in kitchen.meals to mark cooked.'),
-			leftoverServings: leftoverQuantity
+			leftoverServings: quantity
 				.optional()
 				.describe('Portions saved as leftovers from 0 up to the meal servings; defaults to 0.'),
 			deductPantry: z
@@ -422,13 +404,9 @@ export function applyButlerCommands(
 				refreshShoppingWeek(state, calendarKey(start), now);
 				break;
 			}
-			case 'preferences.update': {
-				const updates = Object.fromEntries(
-					Object.entries(command.preferences).filter(([, value]) => value !== undefined)
-				);
-				state.preferences = { ...state.preferences, ...updates };
+			case 'preferences.update':
+				state.preferences = { ...state.preferences, ...command.preferences };
 				break;
-			}
 			case 'recipe.open':
 				requireId(state.recipes, command.id);
 				effects.push(command);

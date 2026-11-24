@@ -1152,11 +1152,30 @@
 				void retrySync();
 			}, 500);
 	});
+	function safeBrowserStorage(kind: 'localStorage' | 'sessionStorage'): Storage | null {
+		try {
+			return typeof window !== 'undefined' ? window[kind] : (globalThis[kind] ?? null);
+		} catch {
+			return null;
+		}
+	}
+	function createMemoryStorageFallback(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
+		const entries = new Map<string, string>();
+		return {
+			getItem: (key) => entries.get(key) ?? null,
+			setItem: (key, value) => {
+				entries.set(key, String(value));
+			},
+			removeItem: (key) => {
+				entries.delete(key);
+			}
+		};
+	}
 	onMount(() => {
 		online = navigator.onLine;
 		kitchenSync = createKitchenSync({
-			storage: localStorage,
-			sessionStorage: globalThis.sessionStorage,
+			storage: safeBrowserStorage('localStorage') ?? createMemoryStorageFallback(),
+			sessionStorage: safeBrowserStorage('sessionStorage'),
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
@@ -1462,10 +1481,10 @@
 		}
 	}
 	function exportPendingChanges() {
-		const snapshot = kitchenSync?.snapshot();
-		if (snapshot)
+		const backup = kitchenSync?.exportBackup();
+		if (backup)
 			download(
-				JSON.stringify(snapshot.local, null, 2),
+				JSON.stringify(backup, null, 2),
 				'flavorithm-pending-kitchen.json',
 				'application/json'
 			);
@@ -1562,9 +1581,7 @@
 			additions.push({
 				id: crypto.randomUUID(),
 				name,
-				quantity: Number.isFinite(item.quantity)
-					? Math.max(0, Math.min(1_000_000, item.quantity))
-					: 1,
+				quantity: Math.min(1_000_000, item.quantity),
 				unit,
 				category: item.category.slice(0, 100),
 				checked: true
@@ -2836,9 +2853,6 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
-	function normalizeUnitInput(value: string | null | undefined): string {
-		return String(value ?? '').slice(0, 40);
-	}
 	function commitInlineEdits() {
 		if (pantryDraft) void savePantryEdit(false);
 		if (editingShoppingId) {
@@ -3540,18 +3554,29 @@
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
 			cancelScan(true);
 			if (user) {
-				const encodedId = encodeURIComponent(user.id);
-				for (const key of Object.keys(localStorage)) {
-					if (
-						key.startsWith('flavorithm-') &&
-						(key.includes(`:${user.id}:`) || key.includes(`:${encodedId}:`))
-					)
-						localStorage.removeItem(key);
+				try {
+					const store = safeBrowserStorage('localStorage');
+					if (store) {
+						const encodedId = encodeURIComponent(user.id);
+						for (const key of Object.keys(store)) {
+							if (
+								key.startsWith('flavorithm-') &&
+								(key.includes(`:${user.id}:`) || key.includes(`:${encodedId}:`))
+							)
+								store.removeItem(key);
+						}
+					}
+				} catch {
+					// Ignore blocked browser storage when clearing account keys.
 				}
 			}
 			kitchenSync?.clearContext();
 			clearHouseholdViewState();
-			localStorage.removeItem('flavorithm-last-account');
+			try {
+				safeBrowserStorage('localStorage')?.removeItem('flavorithm-last-account');
+			} catch {
+				// Ignore blocked browser storage.
+			}
 			user = null;
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
@@ -4308,12 +4333,7 @@
 													><span>Unit</span><input
 														type="text"
 														maxlength="40"
-														bind:value={
-															() => pantryDraft!.unit,
-															(value) => {
-																pantryDraft!.unit = normalizeUnitInput(value);
-															}
-														}
+														bind:value={pantryDraft.unit}
 														onkeydown={handlePantryInputKeydown}
 													/></label
 												><label class="pantry-field"
@@ -4321,24 +4341,13 @@
 														type="text"
 														maxlength="100"
 														list="pantry-category-suggestions"
-														bind:value={
-															() => pantryDraft!.category,
-															(value) => {
-																pantryDraft!.category = String(value ?? '').slice(0, 100);
-															}
-														}
+														bind:value={pantryDraft.category}
 														onkeydown={handlePantryInputKeydown}
 													/></label
 												><label class="pantry-field"
 													><span>Best before</span><input
 														type="date"
-														maxlength="50"
-														bind:value={
-															() => pantryDraft!.expires,
-															(value) => {
-																pantryDraft!.expires = String(value ?? '').slice(0, 50);
-															}
-														}
+														bind:value={pantryDraft.expires}
 														onkeydown={handlePantryInputKeydown}
 													/></label
 												>

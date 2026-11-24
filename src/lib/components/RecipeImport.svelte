@@ -13,7 +13,6 @@
 		type ImportSession
 	} from '#lib/import-session.ts';
 	import { revealMotion } from '#lib/motion.ts';
-	import { isPublicHttpsRecipeUrl, sanitizeImportNotes } from '#lib/recipe-collection.ts';
 	import {
 		createDraftBaseline,
 		describeInvalidControl,
@@ -311,7 +310,7 @@
 			if (alive && generation === captureGeneration && session === targetSession && result) {
 				targetSession.draft = result.recipe;
 				targetSession.baseline = createDraftBaseline(result.recipe);
-				targetSession.assumptions = sanitizeImportNotes(result.assumptions);
+				targetSession.assumptions = result.assumptions;
 				targetSession.reviewingDraft = true;
 				nutritionOpen = !isValidNutrition(result.recipe.nutrition);
 				await tick();
@@ -709,8 +708,8 @@
 				retryAvailable = false;
 			}}>Discard draft</button
 		>
-		{#if draft.source?.trim() && isPublicHttpsRecipeUrl(draft.source.trim())}<p class="field-help">
-				<a href={draft.source.trim()} target="_blank" rel="noreferrer">Original source</a>
+		{#if draft.source}<p class="field-help">
+				<a href={draft.source} target="_blank" rel="noreferrer">Original source</a>
 			</p>{:else}<p class="field-help">
 				{draft.provenance === 'web-import'
 					? 'Imported from a recipe webpage.'

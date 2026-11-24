@@ -1,9 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState, createNewUserState } from '../src/lib/data.ts';
-import { createKitchenSync, type SyncStatus } from '../src/lib/client-sync.ts';
+import {
+	createKitchenSync,
+	MAX_SYNC_CONTINUATIONS,
+	type SyncStatus
+} from '../src/lib/client-sync.ts';
+import { validateKitchenState } from '../src/lib/state-schema.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import type { KitchenTransport } from '../src/lib/offline-sync.ts';
+
+function requireValidState(state: AppState): AppState {
+	const parsed = validateKitchenState(state);
+	assert.ok(parsed, 'Expected kitchen state to satisfy shared schema');
+	return parsed;
+}
 
 function memoryStorage() {
 	const values = new Map<string, string>();
@@ -615,38 +626,353 @@ test('stage rejects malformed kitchen snapshots at the client boundary before st
 	assert.equal(sync.statuses.at(-1)?.error, '');
 });
 
-test('reloading one offline tab five times reuses one writer slot in localStorage', async () => {
+test('duplicated tabs sharing one sessionStorage get distinct writer IDs and never overwrite each other', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
 	const storage = memoryStorage();
-	const sessionStorage = memoryStorage();
+	const sharedSessionStorage = memoryStorage();
+	sharedSessionStorage.setItem('flavorithm-writer-id:v1', 'inherited-opener-writer');
 
-	const initialTab = harness({ user, storage, sessionStorage });
-	initialTab.controller.initialize(user, base, 'v1');
-	const firstEdit = structuredClone(base);
-	firstEdit.preferences.maxTime = 15;
-	initialTab.controller.stage(firstEdit);
-	initialTab.controller.clearContext();
+	const tabA = harness({ user, storage, sessionStorage: sharedSessionStorage });
+	const tabB = harness({ user, storage, sessionStorage: sharedSessionStorage });
+	assert.equal(sharedSessionStorage.getItem('flavorithm-writer-id:v1'), null);
 
-	for (let reload = 1; reload <= 5; reload += 1) {
-		const tab = harness({ user, storage, sessionStorage });
-		assert.equal(tab.controller.restore(user), true);
-		const next = structuredClone(tab.state);
-		next.preferences.maxTime = 15 + reload * 5;
-		next.pantry = [{ id: 'salt', name: 'salt', quantity: reload, unit: 'tsp', category: 'Spices' }];
-		tab.controller.stage(next);
-		const journalKeys = [...storage.values.keys()].filter((key) =>
-			key.startsWith('flavorithm-pending-journal:')
-		);
-		assert.equal(journalKeys.length, 1);
-		tab.controller.clearContext();
-	}
+	tabA.controller.initialize(user, base, 'v1');
+	tabB.controller.initialize(user, base, 'v1');
 
-	const savedReloads: AppState[] = [];
-	const onlineTab = harness({
+	const editA = structuredClone(base);
+	editA.pantry.push({
+		id: 'tab-a-oil',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		category: 'Pantry'
+	});
+	tabA.controller.stage(editA);
+
+	const editB = structuredClone(base);
+	editB.shopping.push({
+		id: 'tab-b-milk',
+		name: 'oat milk',
+		quantity: 2,
+		unit: 'carton',
+		category: 'Dairy',
+		checked: false
+	});
+	tabB.controller.stage(editB);
+
+	const journalKeys = [...storage.values.keys()].filter((key) =>
+		key.startsWith('flavorithm-pending-journal:')
+	);
+	assert.equal(journalKeys.length, 2);
+
+	let serverState = structuredClone(base);
+	let serverEtag = 'v1';
+	const syncTab = harness({
 		user,
 		storage,
-		sessionStorage,
+		sessionStorage: sharedSessionStorage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = 'v2';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+	assert.equal(syncTab.controller.restore(user), true);
+	await syncTab.controller.sync();
+	assert.deepEqual(
+		serverState.pantry.map((item) => item.id),
+		['tab-a-oil']
+	);
+	assert.deepEqual(
+		serverState.shopping.map((item) => item.id),
+		['tab-b-milk']
+	);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+});
+
+test('createKitchenSync survives SecurityError when reading blocked global sessionStorage', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const originalSessionDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+	const originalWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+	try {
+		const throwingSessionHost = {};
+		Object.defineProperty(throwingSessionHost, 'sessionStorage', {
+			configurable: true,
+			get() {
+				throw Object.assign(new Error('Access is denied for this document.'), {
+					name: 'SecurityError'
+				});
+			}
+		});
+		Object.defineProperty(globalThis, 'window', {
+			configurable: true,
+			value: throwingSessionHost
+		});
+		Object.defineProperty(globalThis, 'sessionStorage', {
+			configurable: true,
+			get() {
+				throw Object.assign(new Error('Access is denied for this document.'), {
+					name: 'SecurityError'
+				});
+			}
+		});
+
+		const savedStates: AppState[] = [];
+		const controller = createKitchenSync({
+			storage,
+			getUser: () => user,
+			getState: () => base,
+			setState: () => {},
+			onStatus: () => {},
+			transport: () => ({
+				identity: { userId: user.id, householdId: user.householdId },
+				get: async () => ({
+					state: structuredClone(base),
+					etag: 'v1',
+					userId: user.id,
+					householdId: user.householdId
+				}),
+				put: async (state) => {
+					const validated = requireValidState(state);
+					savedStates.push(validated);
+					return { state: structuredClone(validated), etag: 'v2' };
+				}
+			})
+		});
+		controller.initialize(user, base, 'v1');
+		const edited = structuredClone(base);
+		edited.preferences.maxTime = 25;
+		controller.stage(edited);
+		await controller.sync();
+		assert.equal(savedStates.at(-1)?.preferences.maxTime, 25);
+	} finally {
+		if (originalWindowDescriptor) {
+			Object.defineProperty(globalThis, 'window', originalWindowDescriptor);
+		} else {
+			Reflect.deleteProperty(globalThis, 'window');
+		}
+		if (originalSessionDescriptor) {
+			Object.defineProperty(globalThis, 'sessionStorage', originalSessionDescriptor);
+		} else {
+			Reflect.deleteProperty(globalThis, 'sessionStorage');
+		}
+	}
+});
+
+test('legacy stored recipes do not block unrelated kitchen saves while new invalid edits still fail', async () => {
+	const user = makeUser();
+	const storage = memoryStorage();
+	const legacyRemote = createInitialState();
+	legacyRemote.recipes[0].image = '/recipe-covers/legacy-cover-id';
+	legacyRemote.recipes[1].image = 'http://legacy.example/soup.jpg';
+	legacyRemote.recipes[1].importNotes = ['x'.repeat(350)];
+	(legacyRemote.preferences as Record<string, unknown>).connectionId = 'host-chatgpt';
+	legacyRemote.preferences.reasoning = { effort: 'legacy-unknown' };
+
+	let serverState = structuredClone(legacyRemote);
+	let serverEtag = 'v1';
+	const sync = harness({
+		user,
+		storage,
+		reactiveStage: true,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = 'v2';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, legacyRemote, 'v1');
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	// Even a caller still holding the raw legacy snapshot can stage multiple sequential valid edits.
+	const editOne = structuredClone(legacyRemote);
+	editOne.pantry.push({
+		id: 'garlic',
+		name: 'garlic',
+		quantity: 4,
+		unit: 'clove',
+		category: 'Produce'
+	});
+	sync.controller.stage(editOne);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	const editTwo = structuredClone(editOne);
+	editTwo.recipes[1].title = 'Updated Legacy Soup Title';
+	sync.controller.stage(editTwo);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	// Newly introduced invalid mutations on top of the legacy baseline are still rejected.
+	const newlyInvalid = structuredClone(editTwo);
+	newlyInvalid.recipes[0].image = 'http://attacker.example/new-bad.jpg';
+	sync.controller.stage(newlyInvalid);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+	assert.equal(sync.controller.snapshot()?.local.recipes[1].title, 'Updated Legacy Soup Title');
+
+	await sync.controller.sync();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	assert.equal(serverState.recipes[0].image, '');
+	assert.equal(serverState.recipes[1].image, '');
+	assert.equal(serverState.recipes[1].title, 'Updated Legacy Soup Title');
+	assert.equal(
+		serverState.pantry.some((item) => item.id === 'garlic'),
+		true
+	);
+});
+
+test('exportBackup includes quarantined journal entries alongside or after pending edits', async () => {
+	const user = makeUser('backup-u', 'backup-h');
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const sync = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => ({
+				state: requireValidState(state),
+				etag: 'v2'
+			})
+		})
+	});
+	sync.controller.initialize(user, base, 'v1');
+	assert.equal(sync.controller.exportBackup(), null);
+
+	const edited = structuredClone(base);
+	edited.pantry.push({ id: 'rice', name: 'rice', quantity: 2, unit: 'lb', category: 'Grains' });
+	sync.controller.stage(edited);
+	const plainBackup = sync.controller.exportBackup();
+	assert.ok(plainBackup && 'pantry' in plainBackup);
+	assert.equal(plainBackup.pantry[0]?.id, 'rice');
+
+	const corruptKey = `flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:lost-tab`;
+	storage.setItem(corruptKey, '{"broken":true');
+	await sync.controller.sync();
+
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.match(sync.statuses.at(-1)?.error || '', /quarantined/);
+	assert.equal(sync.controller.quarantined().length, 1);
+
+	const quarantinedOnlyBackup = sync.controller.exportBackup();
+	assert.ok(quarantinedOnlyBackup && 'quarantined' in quarantinedOnlyBackup);
+	assert.equal('pending' in quarantinedOnlyBackup, false);
+	assert.equal(quarantinedOnlyBackup.quarantined[0]?.slot, 'lost-tab');
+	assert.equal(quarantinedOnlyBackup.quarantined[0]?.raw, '{"broken":true');
+
+	const secondEdit = structuredClone(sync.state);
+	secondEdit.preferences.maxTime = 20;
+	sync.controller.stage(secondEdit);
+	const combinedBackup = sync.controller.exportBackup();
+	assert.ok(combinedBackup && 'quarantined' in combinedBackup);
+	assert.equal(combinedBackup.pending?.preferences.maxTime, 20);
+	assert.equal(combinedBackup.quarantined.length, 1);
+});
+
+test('sync bounds self-recursion and suppresses silent removeItem no-ops', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	let serverState = structuredClone(base);
+	let version = 1;
+	let puts = 0;
+
+	let controller!: ReturnType<typeof createKitchenSync>;
+	let currentState = structuredClone(base);
+	const statuses: SyncStatus[] = [];
+	let mutateInFlight = false;
+
+	controller = createKitchenSync({
+		storage: memoryStorage(),
+		getUser: () => user,
+		getState: () => currentState,
+		setState: (state) => {
+			currentState = structuredClone(state);
+		},
+		onStatus: (status) => statuses.push(status),
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: `v${version}`,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				puts += 1;
+				version += 1;
+				serverState = requireValidState(state);
+				if (mutateInFlight) {
+					const next = structuredClone(serverState);
+					next.preferences.maxTime = serverState.preferences.maxTime + 1;
+					currentState = next;
+					controller.stage(next);
+				}
+				return { state: structuredClone(serverState), etag: `v${version}` };
+			}
+		})
+	});
+
+	controller.initialize(user, base, 'v1');
+	mutateInFlight = true;
+	const first = structuredClone(base);
+	first.preferences.maxTime = 50;
+	controller.stage(first);
+	await controller.sync();
+	for (let tick = 0; tick < 40; tick += 1) {
+		await Promise.resolve();
+	}
+	mutateInFlight = false;
+
+	assert.equal(puts, MAX_SYNC_CONTINUATIONS + 1);
+	assert.equal(statuses.at(-1)?.pending, true);
+	assert.equal(
+		statuses.at(-1)?.error,
+		'Kitchen changes are updating rapidly. Retry sync to finish saving.'
+	);
+
+	// Also verify a storage implementation whose removeItem silently no-ops never loops PUTs.
+	const stickyStorage = memoryStorage();
+	stickyStorage.removeItem = () => {};
+	let stickyPuts = 0;
+	const stickySync = harness({
+		user,
+		storage: stickyStorage,
 		transport: () => ({
 			identity: { userId: user.id, householdId: user.householdId },
 			get: async () => ({
@@ -656,36 +982,97 @@ test('reloading one offline tab five times reuses one writer slot in localStorag
 				householdId: user.householdId
 			}),
 			put: async (state) => {
-				savedReloads.push(structuredClone(state));
-				return { state: structuredClone(state), etag: 'v2' };
+				stickyPuts += 1;
+				return { state: requireValidState(state), etag: 'v2' };
 			}
 		})
 	});
-	assert.equal(onlineTab.controller.restore(user), true);
-	await onlineTab.controller.sync();
-	assert.equal(savedReloads.at(-1)?.preferences.maxTime, 40);
-	assert.equal(savedReloads.at(-1)?.pantry[0]?.quantity, 5);
+	stickySync.controller.initialize(user, base, 'v1');
+	const stickyEdit = structuredClone(base);
+	stickyEdit.preferences.maxTime = 30;
+	stickySync.controller.stage(stickyEdit);
+	await stickySync.controller.sync();
+	for (let tick = 0; tick < 10; tick += 1) {
+		await Promise.resolve();
+	}
+	assert.equal(stickyPuts, 1);
+	assert.equal(stickySync.statuses.at(-1)?.pending, false);
 	assert.equal(
-		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
-			.length,
-		0
+		stickySync.statuses.at(-1)?.error,
+		'The server saved these changes, but acknowledged journal entries could not be retired.'
 	);
+});
 
-	const brokenSession = {
-		getItem: () => {
-			throw new Error('SecurityError');
-		},
-		setItem: () => {
-			throw new Error('SecurityError');
-		},
-		removeItem: () => {
-			throw new Error('SecurityError');
+test('sync writes confirmed baseline before retiring journal and retries baseline when quota frees up', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const operations: string[] = [];
+	const storage = memoryStorage();
+	const originalSet = storage.setItem;
+	const originalRemove = storage.removeItem;
+	let tightQuota = false;
+	storage.setItem = (key, value) => {
+		if (key.startsWith('flavorithm-confirmed:')) {
+			operations.push('setConfirmed');
+			const activeJournalCount = [...storage.values.keys()].filter((entry) =>
+				entry.startsWith('flavorithm-pending-journal:')
+			).length;
+			if (tightQuota && activeJournalCount > 0) {
+				throw new Error('QuotaExceededError');
+			}
 		}
+		originalSet(key, value);
 	};
-	const fallbackTab = harness({ user, storage, sessionStorage: brokenSession });
-	fallbackTab.controller.initialize(user, base, 'v2');
-	fallbackTab.controller.stage(firstEdit);
-	assert.equal(fallbackTab.controller.snapshot()?.local.preferences.maxTime, 15);
+	storage.removeItem = (key) => {
+		if (key.startsWith('flavorithm-pending-journal:')) {
+			operations.push('removeJournal');
+		}
+		originalRemove(key);
+	};
+
+	let serverState = structuredClone(base);
+	let serverEtag = 'v1';
+	const sync = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = serverEtag === 'v1' ? 'v2' : 'v3';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	operations.length = 0;
+
+	const firstEdit = structuredClone(base);
+	firstEdit.preferences.maxTime = 30;
+	sync.controller.stage(firstEdit);
+	await sync.controller.sync();
+	assert.deepEqual(operations, ['setConfirmed', 'removeJournal']);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	operations.length = 0;
+	tightQuota = true;
+	const secondEdit = structuredClone(sync.state);
+	secondEdit.preferences.maxTime = 20;
+	sync.controller.stage(secondEdit);
+	await sync.controller.sync();
+	assert.deepEqual(operations, ['setConfirmed', 'removeJournal', 'setConfirmed']);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	const persistedConfirmed = JSON.parse(
+		storage.getItem(`flavorithm-confirmed:v1:${user.id}:${user.householdId}`) || 'null'
+	);
+	assert.equal(persistedConfirmed?.state.preferences.maxTime, 20);
 });
 
 test('online sync saves valid edits and quarantines a corrupt slot under isolated keys', async () => {
