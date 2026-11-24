@@ -1,8 +1,11 @@
 # GitHub automation
 
-CI checks types, tests, the production build, the container build, and both
-server and SSO smoke tests on pushes and pull requests. Runs use Ubuntu 24.04
-and Node 24, have a 20-minute timeout, and cancel superseded runs.
+CI checks Svelte/TypeScript types (including the service worker, `server.mjs`,
+and `scripts/*.mjs`), unit tests, the production build, the container build, and
+both HTTP and SSO smoke tests against the hardened `flavorithm:ci` container on
+pushes and pull requests. Runs use Ubuntu 24.04 and Node 24, have a 20-minute
+timeout, and cancel superseded pull-request runs while letting `main`, manual,
+and scheduled runs finish.
 
 Dependabot checks npm packages, GitHub Actions, the Dockerfile, and
 `deploy/skynet/compose.override.yml` weekly. Minor and patch npm updates are
@@ -17,16 +20,19 @@ a production dependency audit, on pull requests, main pushes, and weekly.
 CodeQL results appear under GitHub's Security tab. The audit fails for high
 or critical production dependency vulnerabilities.
 
-After a successful CI push run on main, Publish container checks out that
-exact verified commit and publishes:
+After both the CI and Security push runs on main succeed for a commit, Publish
+container checks that the commit tag is not already in GitHub Container
+Registry, checks out that exact verified commit, and publishes:
 
 ```text
 ghcr.io/sgerner/flavorithm:sha-<full-commit-sha>
 ```
 
-Only this publish job receives package write permission. Pull-request runs
-cannot trigger publication. Commit tags avoid a delayed run overwriting a
-newer release tag. The workflow uses the built-in GITHUB_TOKEN, so no registry
+A read-only gate job checks workflow status and existing registry manifests
+first; only the publish job receives package write permission. Pull-request,
+scheduled, and manual runs cannot trigger publication. Per-commit concurrency
+and commit tags avoid duplicate pushes or a delayed run overwriting a newer
+release tag. The workflow uses the built-in GITHUB_TOKEN, so no registry
 password needs to be configured. Package visibility and access are controlled
 separately in GitHub Packages; publishing does not make a package public.
 

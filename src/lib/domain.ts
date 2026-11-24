@@ -1,36 +1,54 @@
 import type { Ingredient, Meal, Recipe, ShoppingItem } from './types';
 
-export type UnitInfo = { dimension: string; factor: number; display: string };
+export type UnitSystem = 'metric' | 'customary' | 'count' | 'custom';
+export type UnitInfo = { dimension: string; factor: number; display: string; system: UnitSystem };
 
 const unitAliases: Record<string, UnitInfo> = {};
+const canonicalUnits: UnitInfo[] = [];
 
-function addUnits(dimension: string, factor: number, display: string, aliases: string[]) {
-	for (const alias of aliases) unitAliases[alias] = { dimension, factor, display };
+function addUnits(
+	dimension: string,
+	system: UnitSystem,
+	factor: number,
+	display: string,
+	aliases: string[]
+) {
+	const info: UnitInfo = { dimension, factor, display, system };
+	canonicalUnits.push(info);
+	for (const alias of aliases) unitAliases[alias] = info;
 }
 
-addUnits('mass', 1, 'g', ['g', 'gram', 'grams']);
-addUnits('mass', 1000, 'kg', ['kg', 'kilogram', 'kilograms']);
-addUnits('mass', 0.001, 'mg', ['mg', 'milligram', 'milligrams']);
-addUnits('mass', 28.349523125, 'oz', ['oz', 'ounce', 'ounces']);
-addUnits('mass', 453.59237, 'lb', ['lb', 'lbs', 'pound', 'pounds']);
-addUnits('volume', 1, 'ml', ['ml', 'milliliter', 'milliliters', 'millilitre', 'millilitres']);
-addUnits('volume', 1000, 'l', ['l', 'liter', 'liters', 'litre', 'litres']);
-addUnits('volume', 4.928921594, 'tsp', ['tsp', 'teaspoon', 'teaspoons']);
-addUnits('volume', 14.78676478, 'tbsp', ['tbsp', 'tablespoon', 'tablespoons']);
-addUnits('volume', 236.5882365, 'cup', ['cup', 'cups']);
-addUnits('volume', 29.5735295625, 'fl oz', [
+addUnits('mass', 'metric', 1, 'g', ['g', 'gram', 'grams']);
+addUnits('mass', 'metric', 1000, 'kg', ['kg', 'kilogram', 'kilograms']);
+addUnits('mass', 'metric', 0.001, 'mg', ['mg', 'milligram', 'milligrams']);
+addUnits('mass', 'customary', 28.349523125, 'oz', ['oz', 'ounce', 'ounces']);
+addUnits('mass', 'customary', 453.59237, 'lb', ['lb', 'lbs', 'pound', 'pounds']);
+addUnits('volume', 'metric', 1, 'ml', [
+	'ml',
+	'milliliter',
+	'milliliters',
+	'millilitre',
+	'millilitres'
+]);
+addUnits('volume', 'metric', 1000, 'l', ['l', 'liter', 'liters', 'litre', 'litres']);
+addUnits('volume', 'customary', 4.928921594, 'tsp', ['tsp', 'teaspoon', 'teaspoons']);
+addUnits('volume', 'customary', 14.78676478, 'tbsp', ['tbsp', 'tablespoon', 'tablespoons']);
+addUnits('volume', 'customary', 236.5882365, 'cup', ['cup', 'cups']);
+addUnits('volume', 'customary', 29.5735295625, 'fl oz', [
 	'fl oz',
 	'fl. oz',
 	'fluid oz',
 	'fluid ounce',
 	'fluid ounces'
 ]);
-addUnits('volume', 473.176473, 'pt', ['pt', 'pint', 'pints']);
-addUnits('volume', 946.352946, 'qt', ['qt', 'quart', 'quarts']);
-addUnits('volume', 3785.411784, 'gal', ['gal', 'gallon', 'gallons']);
-addUnits('count', 1, 'each', [
+addUnits('volume', 'customary', 473.176473, 'pt', ['pt', 'pint', 'pints']);
+addUnits('volume', 'customary', 946.352946, 'qt', ['qt', 'quart', 'quarts']);
+addUnits('volume', 'customary', 3785.411784, 'gal', ['gal', 'gallon', 'gallons']);
+addUnits('count', 'count', 1, 'each', [
 	'ea',
 	'each',
+	'item',
+	'items',
 	'piece',
 	'pieces',
 	'whole',
@@ -40,12 +58,49 @@ addUnits('count', 1, 'each', [
 	'medium',
 	'large'
 ]);
-addUnits('count:clove', 1, 'clove', ['clove', 'cloves']);
-addUnits('count:head', 1, 'head', ['head', 'heads', 'small head', 'medium head', 'large head']);
-addUnits('count:slice', 1, 'slice', ['slice', 'slices']);
-addUnits('count:can', 1, 'can', ['can', 'cans']);
-addUnits('count:pinch', 1, 'pinch', ['pinch', 'pinches']);
-addUnits('count:dash', 1, 'dash', ['dash', 'dashes']);
+addUnits('count:bunch', 'count', 1, 'bunch', ['bunch', 'bunches']);
+addUnits('count:clove', 'count', 1, 'clove', ['clove', 'cloves']);
+addUnits('count:head', 'count', 1, 'head', [
+	'head',
+	'heads',
+	'small head',
+	'medium head',
+	'large head'
+]);
+addUnits('count:slice', 'count', 1, 'slice', ['slice', 'slices']);
+addUnits('count:can', 'count', 1, 'can', ['can', 'cans']);
+addUnits('count:pinch', 'count', 1, 'pinch', ['pinch', 'pinches']);
+addUnits('count:dash', 'count', 1, 'dash', ['dash', 'dashes']);
+
+const sortedUnitAliases = Object.keys(unitAliases).sort((a, b) => b.length - a.length);
+
+const unicodeFractions: Record<string, number> = {
+	'¼': 1 / 4,
+	'½': 1 / 2,
+	'¾': 3 / 4,
+	'⅐': 1 / 7,
+	'⅑': 1 / 9,
+	'⅒': 1 / 10,
+	'⅓': 1 / 3,
+	'⅔': 2 / 3,
+	'⅕': 1 / 5,
+	'⅖': 2 / 5,
+	'⅗': 3 / 5,
+	'⅘': 4 / 5,
+	'⅙': 1 / 6,
+	'⅚': 5 / 6,
+	'⅛': 1 / 8,
+	'⅜': 3 / 8,
+	'⅝': 5 / 8,
+	'⅞': 7 / 8
+};
+
+export type ParsedIngredient = {
+	name: string;
+	quantity: number;
+	unit: string;
+	category: string;
+};
 
 const ingredientAliases: Record<string, string> = {
 	avocadoes: 'avocado',
@@ -108,58 +163,246 @@ export function normalizeName(name: string): string {
 export function unitInfo(unit: string): UnitInfo {
 	const cleaned = cleanText(unit);
 	return (
-		unitAliases[cleaned] ?? { dimension: `unit:${cleaned}`, factor: 1, display: cleaned || 'each' }
+		unitAliases[cleaned] ?? {
+			dimension: `unit:${cleaned}`,
+			factor: 1,
+			display: cleaned || 'each',
+			system: 'custom'
+		}
 	);
 }
 
-function roundQuantity(value: number): number {
-	const rounded = Math.round(value * 100) / 100;
+const MIN_READABLE_SHOPPING_QUANTITY = 0.05;
+const BASE_REMAINDER_EPSILON = 0.00001;
+
+function roundParsedQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
 	return Object.is(rounded, -0) ? 0 : rounded;
 }
 
-function calendarDate(value: string): { year: number; month: number; day: number } | undefined {
-	const cleaned = value.trim();
-	const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(cleaned);
-	if (dateOnly) {
-		const year = Number(dateOnly[1]);
-		const month = Number(dateOnly[2]) - 1;
-		const day = Number(dateOnly[3]);
-		const parsed = new Date(0);
-		parsed.setFullYear(year, month, day);
-		parsed.setHours(0, 0, 0, 0);
-		if (parsed.getFullYear() !== year || parsed.getMonth() !== month || parsed.getDate() !== day)
-			return undefined;
-		return { year, month, day };
+function parseLeadingQuantity(text: string): { quantity: number; rest: string } | undefined {
+	const mixedAscii = /^(\d+)(?:\s+|-)(\d+)\s*[\/⁄]\s*(\d+)(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
+	if (mixedAscii) {
+		const whole = Number(mixedAscii[1]);
+		const num = Number(mixedAscii[2]);
+		const den = Number(mixedAscii[3]);
+		const rest = mixedAscii[4].trim();
+		if (!rest) return undefined;
+		if (den <= 0) return { quantity: 0, rest };
+		return { quantity: roundParsedQuantity(whole + num / den), rest };
 	}
-	const parsed = new Date(cleaned);
-	if (!Number.isFinite(parsed.getTime())) return undefined;
-	return { year: parsed.getFullYear(), month: parsed.getMonth(), day: parsed.getDate() };
+
+	const mixedUnicode = /^(\d+)(?:\s+|-)?([¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
+	if (mixedUnicode) {
+		const whole = Number(mixedUnicode[1]);
+		const frac = unicodeFractions[mixedUnicode[2]] ?? 0;
+		const rest = mixedUnicode[3].trim();
+		if (!rest) return undefined;
+		return { quantity: roundParsedQuantity(whole + frac), rest };
+	}
+
+	const asciiFraction = /^(\d+)\s*[\/⁄]\s*(\d+)(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
+	if (asciiFraction) {
+		const num = Number(asciiFraction[1]);
+		const den = Number(asciiFraction[2]);
+		const rest = asciiFraction[3].trim();
+		if (!rest) return undefined;
+		if (den <= 0) return { quantity: 0, rest };
+		return { quantity: roundParsedQuantity(num / den), rest };
+	}
+
+	const singleUnicode = /^([¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞])(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
+	if (singleUnicode) {
+		const frac = unicodeFractions[singleUnicode[1]] ?? 0;
+		const rest = singleUnicode[2].trim();
+		if (!rest) return undefined;
+		return { quantity: roundParsedQuantity(frac), rest };
+	}
+
+	const decimal = /^(\d+(?:\.\d+)?|\.\d+)(?=\s|[a-zA-Z]|$)(.*)$/.exec(text);
+	if (decimal) {
+		const quantity = Number(decimal[1]);
+		const rest = decimal[2].trim();
+		if (!rest || !Number.isFinite(quantity)) return undefined;
+		return { quantity: roundParsedQuantity(quantity), rest };
+	}
+
+	return undefined;
 }
 
-function dateOrdinal(date: { year: number; month: number; day: number }): number {
+export function parseIngredientLine(raw: string): ParsedIngredient | undefined {
+	let working = raw.trim().replace(/\s+/g, ' ');
+	working = working.replace(/^[-*•]\s+/, '').trim();
+	working = working.replace(/[.,;:]$/, '').trim();
+	if (!working || /^\[[^\[\]]*\]$/.test(working)) return undefined;
+
+	let category = 'Pantry';
+	const categoryMatch = /^(.*?)\s*\[([^\[\]]*)\]\s*$/.exec(working);
+	if (categoryMatch && categoryMatch[1].trim()) {
+		working = categoryMatch[1]
+			.trim()
+			.replace(/[.,;:]$/, '')
+			.trim();
+		const parsedCategory = categoryMatch[2].trim().replace(/\s+/g, ' ').slice(0, 60);
+		if (parsedCategory) category = parsedCategory;
+	}
+	if (!working || /^[\d\s\/⁄.\-¼½¾⅐⅑⅒⅓⅔⅕⅖⅗⅘⅙⅚⅛⅜⅝⅞]+$/.test(working)) return undefined;
+
+	const leading = parseLeadingQuantity(working);
+	if (!leading) {
+		const name = working.slice(0, 100).trim();
+		return name ? { name, quantity: 1, unit: 'each', category } : undefined;
+	}
+	if (!(leading.quantity > 0)) return undefined;
+
+	const { quantity, rest } = leading;
+	const lowerRest = rest.toLowerCase();
+	for (const alias of sortedUnitAliases) {
+		if (!lowerRest.startsWith(alias)) continue;
+		const afterAlias = rest.slice(alias.length);
+		if (!/^\.?\s+/.test(afterAlias)) continue;
+		let candidateName = afterAlias.replace(/^\.?\s+/, '').trim();
+		if (/^of$/i.test(candidateName)) candidateName = '';
+		else candidateName = candidateName.replace(/^of\s+/i, '').trim();
+		candidateName = candidateName
+			.replace(/[.,;:]$/, '')
+			.trim()
+			.slice(0, 100)
+			.trim();
+		if (candidateName) {
+			return {
+				name: candidateName,
+				quantity,
+				unit: unitAliases[alias].display,
+				category
+			};
+		}
+	}
+
+	const fallbackName = rest
+		.replace(/^of\s+/i, '')
+		.replace(/[.,;:]$/, '')
+		.trim()
+		.slice(0, 100)
+		.trim();
+	return fallbackName ? { name: fallbackName, quantity, unit: 'each', category } : undefined;
+}
+
+export function parseIngredientLines(input: string): ParsedIngredient[] {
+	return input
+		.split(/[,;\r\n]+(?![^\[\]]*\])/)
+		.map((segment) => parseIngredientLine(segment))
+		.filter((item): item is ParsedIngredient => item !== undefined);
+}
+
+export function roundShoppingQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
+	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function selectShoppingUnit(
+	remainingBase: number,
+	seenUnits: Iterable<UnitInfo>
+): UnitInfo | undefined {
+	const seenByDisplay = new Map<string, UnitInfo>();
+	for (const unit of seenUnits) seenByDisplay.set(unit.display, unit);
+	const sortedSeen = [...seenByDisplay.values()].sort((a, b) => b.factor - a.factor);
+	if (sortedSeen.length === 0) return undefined;
+
+	const readableSeen = sortedSeen.find(
+		(unit) => roundShoppingQuantity(remainingBase / unit.factor) >= MIN_READABLE_SHOPPING_QUANTITY
+	);
+	if (readableSeen) return readableSeen;
+
+	const anchor = sortedSeen[sortedSeen.length - 1];
+	const smallerUnits = canonicalUnits
+		.filter(
+			(unit) =>
+				unit.dimension === anchor.dimension &&
+				unit.system === anchor.system &&
+				unit.factor < anchor.factor
+		)
+		.sort((a, b) => b.factor - a.factor);
+	return (
+		smallerUnits.find(
+			(unit) => roundShoppingQuantity(remainingBase / unit.factor) >= MIN_READABLE_SHOPPING_QUANTITY
+		) ??
+		smallerUnits[smallerUnits.length - 1] ??
+		anchor
+	);
+}
+
+/**
+ * Clamp negligible base remainders up to 0.00001 to zero, pick a readable unit
+ * from the seen units or downscale within its unit system, and round to 0.000001.
+ */
+export function resolveShoppingQuantity(
+	rawRemainingBase: number,
+	seenUnits: Iterable<UnitInfo>
+): { quantity: number; unit: UnitInfo } | undefined {
+	if (!Number.isFinite(rawRemainingBase) || rawRemainingBase <= BASE_REMAINDER_EPSILON)
+		return undefined;
+	const unit = selectShoppingUnit(rawRemainingBase, seenUnits);
+	if (!unit) return undefined;
+	const quantity = roundShoppingQuantity(rawRemainingBase / unit.factor);
+	if (quantity <= 0) return undefined;
+	return { quantity, unit };
+}
+
+/**
+ * Format scaled recipe ingredient quantities: at most two decimal places from 0.1 upward,
+ * and two significant digits in plain decimal form for positive values below 0.1.
+ */
+export function formatRecipeQuantity(value: number): string {
+	if (!Number.isFinite(value)) return '—';
+	if (value <= 0) return '0';
+	if (value >= 0.1) return String(Number(value.toFixed(2)));
+	const precise = value.toPrecision(2);
+	const exponential = /^(\d)(?:\.(\d+))?e-(\d+)$/i.exec(precise);
+	if (exponential) {
+		const digits = `${exponential[1]}${exponential[2] ?? ''}`.replace(/0+$/, '');
+		return `0.${'0'.repeat(Number(exponential[3]) - 1)}${digits}`;
+	}
+	return String(Number(precise));
+}
+
+export type CalendarDate = { year: number; month: number; day: number };
+
+const ISO_CALENDAR_DATE_RE =
+	/^(\d{4})-(\d{2})-(\d{2})(?:T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?)?$/i;
+
+export function parseCalendarDate(value: string): CalendarDate | undefined {
+	const match = ISO_CALENDAR_DATE_RE.exec(value.trim());
+	if (!match) return undefined;
+	const year = Number(match[1]);
+	const month = Number(match[2]) - 1;
+	const day = Number(match[3]);
+	const parsed = new Date(0);
+	parsed.setUTCFullYear(year, month, day);
+	parsed.setUTCHours(0, 0, 0, 0);
+	if (
+		parsed.getUTCFullYear() !== year ||
+		parsed.getUTCMonth() !== month ||
+		parsed.getUTCDate() !== day
+	)
+		return undefined;
+	return { year, month, day };
+}
+
+export function dateOrdinal(date: CalendarDate): number {
 	const utcDate = new Date(0);
 	utcDate.setUTCFullYear(date.year, date.month, date.day);
 	utcDate.setUTCHours(0, 0, 0, 0);
 	return Math.floor(utcDate.getTime() / 86_400_000);
 }
 
-function localDateKey(value: Date): string | undefined {
-	if (!Number.isFinite(value.getTime())) return undefined;
-	return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}`;
-}
-
-function expiredBefore(expires: string | undefined, date: string | undefined): boolean {
-	if (!expires?.trim() || !date?.trim()) return false;
-	const expiryDate = calendarDate(expires);
-	const scheduledDate = calendarDate(date);
-	return Boolean(
-		expiryDate && scheduledDate && dateOrdinal(expiryDate) < dateOrdinal(scheduledDate)
-	);
+function localCalendarDate(value: Date): CalendarDate {
+	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
 }
 
 type ShoppingRequirement = {
 	quantityBase: number;
-	mealDate?: string;
+	mealOrdinal?: number;
 	canUsePantry: boolean;
 };
 
@@ -174,25 +417,32 @@ export function buildShoppingList(
 	meals?: Meal[],
 	now: Date = new Date()
 ): ShoppingItem[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const todayOrdinal = dateOrdinal(localCalendarDate(safeNow));
 	const recipesById = new Map(recipes.map((recipe) => [recipe.id, recipe]));
-	const requested: Array<{ recipe: Recipe; servings: number; mealDate?: string }> =
+	const requested: Array<{ recipe: Recipe; servings: number; mealOrdinal?: number }> =
 		meals === undefined
 			? recipes.map((recipe) => ({
 					recipe,
 					servings: recipe.servings,
-					mealDate: localDateKey(now)
+					mealOrdinal: todayOrdinal
 				}))
 			: meals.flatMap((meal) => {
 					const recipe = recipesById.get(meal.recipeId);
-					return recipe && Number.isFinite(meal.servings) && meal.servings > 0
-						? [
-								{
-									recipe,
-									servings: meal.servings,
-									mealDate: meal.date.trim() ? meal.date : localDateKey(now)
-								}
-							]
-						: [];
+					if (!recipe || !Number.isFinite(meal.servings) || !(meal.servings > 0)) return [];
+					const trimmedDate = meal.date.trim();
+					const parsedMealDate = trimmedDate ? parseCalendarDate(trimmedDate) : undefined;
+					return [
+						{
+							recipe,
+							servings: meal.servings,
+							mealOrdinal: trimmedDate
+								? parsedMealDate
+									? Math.max(todayOrdinal, dateOrdinal(parsedMealDate))
+									: undefined
+								: todayOrdinal
+						}
+					];
 				});
 
 	const buckets = new Map<
@@ -201,14 +451,14 @@ export function buildShoppingList(
 			name: string;
 			normalizedName: string;
 			dimension: string;
-			unit: UnitInfo;
+			units: UnitInfo[];
 			quantityBase: number;
 			pantryBase: number;
 			requirements: ShoppingRequirement[];
 		}
 	>();
 
-	for (const { recipe, servings, mealDate } of requested) {
+	for (const { recipe, servings, mealOrdinal } of requested) {
 		const hasServingBaseline = Number.isFinite(recipe.servings) && recipe.servings > 0;
 		const scale = hasServingBaseline ? servings / recipe.servings : 1;
 		for (const ingredient of recipe.ingredients) {
@@ -225,18 +475,19 @@ export function buildShoppingList(
 				name: ingredient.name.trim(),
 				normalizedName,
 				dimension: unit.dimension,
-				unit,
+				units: [],
 				quantityBase: 0,
 				pantryBase: 0,
 				requirements: []
 			};
+			bucket.units.push(unit);
 			const quantityBase = ingredient.quantity * scale * unit.factor;
 			bucket.quantityBase += quantityBase;
 			bucket.requirements.push({
 				quantityBase,
-				mealDate,
+				mealOrdinal,
 				// Without a recipe serving baseline, pantry stock cannot prove this request is covered.
-				canUsePantry: hasServingBaseline && Boolean(mealDate && calendarDate(mealDate))
+				canUsePantry: hasServingBaseline && mealOrdinal !== undefined
 			});
 			buckets.set(key, bucket);
 		}
@@ -244,18 +495,27 @@ export function buildShoppingList(
 
 	const pantryByBucket = new Map<
 		string,
-		Array<{ quantityBase: number; expires?: string; index: number }>
+		Array<{ quantityBase: number; expiryOrdinal?: number; index: number }>
 	>();
 	for (const item of pantry) {
 		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
+		const rawExpires = item.expires?.trim();
+		let expiryOrdinal: number | undefined;
+		if (rawExpires) {
+			const parsedExpiry = parseCalendarDate(rawExpires);
+			if (!parsedExpiry) continue;
+			expiryOrdinal = dateOrdinal(parsedExpiry);
+		}
 		const normalizedName = normalizeName(item.name);
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		if (!buckets.has(key)) continue;
+		const bucket = buckets.get(key);
+		if (!bucket) continue;
+		bucket.units.push(unit);
 		const lots = pantryByBucket.get(key) ?? [];
 		lots.push({
 			quantityBase: item.quantity * unit.factor,
-			expires: item.expires,
+			expiryOrdinal,
 			index: lots.length
 		});
 		pantryByBucket.set(key, lots);
@@ -263,25 +523,25 @@ export function buildShoppingList(
 
 	for (const [key, bucket] of buckets) {
 		const lots = (pantryByBucket.get(key) ?? []).sort((a, b) => {
-			const expiryA = a.expires ? calendarDate(a.expires) : undefined;
-			const expiryB = b.expires ? calendarDate(b.expires) : undefined;
-			const priorityA = expiryA ? dateOrdinal(expiryA) : Number.MAX_SAFE_INTEGER;
-			const priorityB = expiryB ? dateOrdinal(expiryB) : Number.MAX_SAFE_INTEGER;
+			const priorityA = a.expiryOrdinal ?? Number.MAX_SAFE_INTEGER;
+			const priorityB = b.expiryOrdinal ?? Number.MAX_SAFE_INTEGER;
 			return priorityA - priorityB || a.index - b.index;
 		});
 		const requirements = [...bucket.requirements].sort((a, b) => {
-			const dateA = a.mealDate ? calendarDate(a.mealDate) : undefined;
-			const dateB = b.mealDate ? calendarDate(b.mealDate) : undefined;
-			const orderA = dateA ? dateOrdinal(dateA) : Number.MAX_SAFE_INTEGER;
-			const orderB = dateB ? dateOrdinal(dateB) : Number.MAX_SAFE_INTEGER;
+			const orderA = a.mealOrdinal ?? Number.MAX_SAFE_INTEGER;
+			const orderB = b.mealOrdinal ?? Number.MAX_SAFE_INTEGER;
 			return orderA - orderB;
 		});
 		for (const requirement of requirements) {
-			if (!requirement.canUsePantry) continue;
+			if (!requirement.canUsePantry || requirement.mealOrdinal === undefined) continue;
 			let need = requirement.quantityBase;
 			for (const lot of lots) {
 				if (need <= 0) break;
-				if (!(lot.quantityBase > 0) || expiredBefore(lot.expires, requirement.mealDate)) continue;
+				if (
+					!(lot.quantityBase > 0) ||
+					(lot.expiryOrdinal !== undefined && lot.expiryOrdinal < requirement.mealOrdinal)
+				)
+					continue;
 				const used = Math.min(need, lot.quantityBase);
 				lot.quantityBase -= used;
 				need -= used;
@@ -291,17 +551,22 @@ export function buildShoppingList(
 	}
 
 	return [...buckets.values()]
-		.map((bucket) => {
-			const remainingBase = Math.max(0, bucket.quantityBase - bucket.pantryBase);
-			return {
-				id: `shopping-${bucket.normalizedName.replace(/[^a-z0-9]+/g, '-')}-${bucket.unit.display.replace(/[^a-z0-9]+/g, '-')}`,
-				name: bucket.name,
-				quantity: roundQuantity(remainingBase / bucket.unit.factor),
-				unit: bucket.unit.display,
-				checked: false
-			};
+		.flatMap((bucket) => {
+			const resolved = resolveShoppingQuantity(
+				bucket.quantityBase - bucket.pantryBase,
+				bucket.units
+			);
+			if (!resolved) return [];
+			return [
+				{
+					id: `shopping-${bucket.normalizedName.replace(/[^a-z0-9]+/g, '-')}-${resolved.unit.display.replace(/[^a-z0-9]+/g, '-')}`,
+					name: bucket.name,
+					quantity: resolved.quantity,
+					unit: resolved.unit.display,
+					checked: false
+				}
+			];
 		})
-		.filter((item) => item.quantity > 0)
 		.sort((a, b) => a.name.localeCompare(b.name));
 }
 

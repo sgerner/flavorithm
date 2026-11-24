@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   verify:
@@ -40,7 +40,90 @@ jobs:
         run: npm run build
       - name: Build production container
         run: docker build --tag flavorithm:ci .
-      - name: Smoke-test production server
-        run: npm run test:smoke
+      - name: Verify container readiness check
+        run: |
+          docker run --rm \
+            --init \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            flavorithm:ci npm run readiness
+      - name: Smoke-test production container
+        run: |
+          container="flavorithm-ci-smoke"
+          volume="flavorithm-ci-smoke-data"
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs "$container" || true
+            fi
+            docker stop "$container" >/dev/null 2>&1 || true
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            docker volume rm -f "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker rm -f "$container" >/dev/null 2>&1 || true
+          docker volume rm -f "$volume" >/dev/null 2>&1 || true
+          docker volume create "$volume" >/dev/null
+          docker run -d \
+            --name "$container" \
+            --init \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -v "$volume:/app/data" \
+            -p 127.0.0.1:5187:3000 \
+            -e ORIGIN=http://127.0.0.1:5187 \
+            -e FLAVORITHM_DB_PATH=/app/data/flavorithm.sqlite \
+            -e FLAVORITHM_AUTH_MODE=local \
+            -e FLAVORITHM_CHATGPT_AUTH_FLOW=local \
+            -e RESEND_API_KEY= \
+            -e BRAVE_SEARCH_API_KEY= \
+            flavorithm:ci >/dev/null
+          FLAVORITHM_SMOKE_URL=http://127.0.0.1:5187 npm run test:smoke
       - name: Smoke-test SSO proxy authentication
-        run: npm run test:sso
+        run: |
+          container="flavorithm-ci-sso"
+          volume="flavorithm-ci-sso-data"
+          sso_secret="$(openssl rand -hex 32)"
+          cleanup() {
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              docker logs "$container" || true
+            fi
+            docker stop "$container" >/dev/null 2>&1 || true
+            docker rm -f "$container" >/dev/null 2>&1 || true
+            docker volume rm -f "$volume" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker rm -f "$container" >/dev/null 2>&1 || true
+          docker volume rm -f "$volume" >/dev/null 2>&1 || true
+          docker volume create "$volume" >/dev/null
+          docker run -d \
+            --name "$container" \
+            --init \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=32m \
+            --cap-drop ALL \
+            --security-opt no-new-privileges:true \
+            -v "$volume:/app/data" \
+            -p 127.0.0.1:5188:3000 \
+            -e ORIGIN=https://kitchen.example.test \
+            -e FLAVORITHM_DB_PATH=/app/data/flavorithm.sqlite \
+            -e FLAVORITHM_AUTH_MODE=proxy \
+            -e FLAVORITHM_PROXY_SHARED_SECRET="$sso_secret" \
+            -e FLAVORITHM_PROXY_SECRET_HEADER=x-flavorithm-proxy-secret \
+            -e FLAVORITHM_PROXY_SUBJECT_HEADER=x-authentik-uid \
+            -e FLAVORITHM_PROXY_EMAIL_HEADER=x-authentik-email \
+            -e FLAVORITHM_PROXY_NAME_HEADER=x-authentik-name \
+            -e FLAVORITHM_PROXY_ISSUER=smoke:authentik \
+            -e FLAVORITHM_PROXY_LOGOUT_URL= \
+            -e RESEND_API_KEY= \
+            -e BRAVE_SEARCH_API_KEY= \
+            flavorithm:ci >/dev/null
+          FLAVORITHM_SMOKE_URL=http://127.0.0.1:5188 \
+            FLAVORITHM_PROXY_SHARED_SECRET="$sso_secret" \
+            ORIGIN=https://kitchen.example.test \
+            npm run test:sso

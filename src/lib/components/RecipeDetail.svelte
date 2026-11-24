@@ -1,5 +1,7 @@
 <script lang="ts">
+	import { formatRecipeQuantity } from '#lib/domain.ts';
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
@@ -69,12 +71,7 @@
 			servingCount = initialServings ?? recipe.servings;
 		}
 	});
-	let validServings = $derived(
-		typeof servingCount === 'number' &&
-			Number.isInteger(servingCount) &&
-			servingCount >= 1 &&
-			servingCount <= 24
-	);
+	let validServings = $derived(isValidServings(servingCount));
 </script>
 
 <div class="modal-backdrop" transition:backdropMotion|global>
@@ -96,7 +93,9 @@
 			>
 		</div>
 		<div class="detail-body">
-			<div class="eyebrow">{recipe.cuisine} · {recipe.difficulty}</div>
+			{#if recipe.cuisine || recipe.difficulty}<div class="eyebrow">
+					{[recipe.cuisine, recipe.difficulty].filter(Boolean).join(' · ')}
+				</div>{/if}
 			<h2>{recipe.title}</h2>
 			<p class="muted">{recipe.description}</p>
 			{#if recipe.importNotes?.length}<details class="import-notes">
@@ -108,7 +107,7 @@
 			<div class="detail-meta">
 				<span><Clock size={16} />{recipe.time} min</span><span
 					><Users size={16} />{recipe.servings} servings</span
-				><span><ChefHat size={16} />{recipe.difficulty}</span>
+				>{#if recipe.difficulty}<span><ChefHat size={16} />{recipe.difficulty}</span>{/if}
 			</div>
 			<div class="detail-actions">
 				<button
@@ -139,7 +138,7 @@
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
 			{#if !validServings}<p class="field-help" id="servings-help">
-					Enter 1–24 servings to plan or shop.
+					Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.
 				</p>{/if}
 			<div class="tabs">
 				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
@@ -156,7 +155,7 @@
 									aria-label="Servings"
 									type="number"
 									min="1"
-									max="24"
+									max={MAX_SERVINGS}
 									step="1"
 									aria-invalid={!validServings}
 									bind:value={servingCount}
@@ -167,7 +166,7 @@
 							{#each recipe.ingredients as item}<li>
 									<span
 										>{validServings && servingCount !== undefined
-											? +((item.quantity * servingCount) / recipe.servings).toFixed(2)
+											? formatRecipeQuantity((item.quantity * servingCount) / recipe.servings)
 											: '—'}
 										{item.unit}</span
 									>{item.name}
@@ -199,7 +198,9 @@
 				</div>
 			{:else}<div class="nutrition-panel" transition:revealMotion|global>
 					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
-							Ingredients or servings changed. Refresh this estimate before relying on it.
+							{Object.values(recipe.nutrition).every((value) => value === 0)
+								? 'Nutrition values have not been entered yet. Edit the recipe or refresh this estimate before relying on it.'
+								: 'Ingredients or servings changed. Refresh this estimate before relying on it.'}
 						</p>{/if}
 					<label class="servings nutrition-selector"
 						>Show nutrition for<select bind:value={nutritionMode}
@@ -290,6 +291,9 @@
 		min-height: 44px;
 		padding-inline: 12px;
 		white-space: nowrap;
+	}
+	.servings input {
+		width: 76px;
 	}
 	.nutrition-stale {
 		padding: 10px 12px;

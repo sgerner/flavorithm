@@ -15,6 +15,7 @@
 	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
+	import { previewButlerCommand } from '#lib/butler-actions.ts';
 	import {
 		createButlerChat,
 		type ButlerChatAction as Action,
@@ -254,32 +255,8 @@
 			if (chat.alive && token === chat.generation) applying = '';
 		}
 	}
-	function words(value: string) {
-		return value.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[._-]/g, ' ');
-	}
-
-	function preview(command: unknown): string {
-		function format(value: unknown, depth = 0): string {
-			if (Array.isArray(value))
-				return value.map((item, i) => `${i + 1}. ${format(item, depth)}`).join('\n');
-			if (value && typeof value === 'object')
-				return Object.entries(value)
-					.filter(([key]) => key !== 'type' && key !== 'id' && key !== 'image')
-					.map(([key, item]) => {
-						if (key === 'recipeId')
-							return `Recipe: ${kitchen.recipes.find((recipe) => recipe.id === item)?.title ?? String(item)}`;
-						return `${words(key)}: ${typeof item === 'object' ? '\n' : ''}${format(item, depth + 1)}`;
-					})
-					.join('\n');
-			return typeof value === 'boolean' ? (value ? 'Yes' : 'No') : String(value ?? '');
-		}
-		const record = command as Record<string, unknown>;
-		const target = record?.id;
-		const name =
-			kitchen.recipes.find((item) => item.id === target)?.title ??
-			kitchen.pantry.find((item) => item.id === target)?.name ??
-			kitchen.shopping.find((item) => item.id === target)?.name;
-		return [name, format(command)].filter(Boolean).join('\n') || 'Kitchen update';
+	function preview(command: unknown, batch: unknown[] = []): string {
+		return previewButlerCommand(command, kitchen, batch);
 	}
 </script>
 
@@ -395,7 +372,10 @@
 											role="region"
 											aria-label={labels?.details ?? `${action.title} details`}
 										>
-											{#each action.commands as command}<pre>{preview(command)}</pre>{/each}
+											{#each action.commands as command}<pre>{preview(
+														command,
+														action.commands
+													)}</pre>{/each}
 										</div>
 									</details>
 									{#if action.status === 'pending'}
@@ -536,7 +516,8 @@
 		border: 1px solid var(--line);
 		border-radius: 18px;
 		box-shadow: 0 18px 70px #0003;
-		overflow: hidden;
+		overflow-x: hidden;
+		overflow-y: auto;
 	}
 	header {
 		display: flex;
@@ -780,6 +761,7 @@
 	.butler-error {
 		margin: 0 12px 8px;
 		padding: 10px;
+		flex-shrink: 0;
 		border: 1px solid var(--line);
 		border-radius: 8px;
 		font-size: 12px;
@@ -893,12 +875,65 @@
 			width: calc(100vw - 16px);
 			height: calc(var(--chat-viewport-height, 100dvh) - 20px - env(safe-area-inset-bottom));
 			border-radius: 14px;
+			overflow-y: auto;
 		}
 		.butler-transcript {
 			padding: 12px;
 		}
 		textarea {
 			font-size: 16px;
+		}
+	}
+	@media (max-height: 420px) {
+		.butler-panel {
+			bottom: calc(var(--chat-viewport-bottom, 0px) + 8px + env(safe-area-inset-bottom));
+			height: calc(var(--chat-viewport-height, 100dvh) - 20px - env(safe-area-inset-bottom));
+			overflow-y: auto;
+		}
+		header {
+			padding: 4px 10px;
+			gap: 8px;
+		}
+		header :global(.basil-avatar) {
+			max-width: 28px;
+			max-height: 28px;
+		}
+		h2 {
+			font-size: 16px;
+			line-height: 1.15;
+		}
+		header p {
+			margin: 1px 0 0;
+			font-size: 10px;
+			line-height: 1.2;
+		}
+		header .icon-button {
+			min-width: 32px;
+			min-height: 32px;
+			padding: 6px;
+		}
+		.butler-transcript {
+			min-height: 64px;
+			padding: 8px 12px;
+		}
+		.butler-working {
+			min-height: 28px;
+		}
+		.butler-error {
+			margin: 0 12px 6px;
+			padding: 8px 10px;
+		}
+		form {
+			margin-bottom: 6px;
+			padding: 4px 6px;
+		}
+		textarea {
+			max-height: 40px;
+			padding: 4px;
+		}
+		.sync-line:empty {
+			min-height: 0;
+			padding: 0;
 		}
 	}
 	.butler-panel.motion-paused,
