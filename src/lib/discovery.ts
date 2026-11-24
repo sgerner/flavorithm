@@ -105,6 +105,42 @@ function scoreRecipe(
 	return score;
 }
 
+function ratedSignals(recipes: Recipe[], preferences: Preferences): RatedRecipe[] {
+	return recipes.flatMap((recipe) => {
+		const rating = recipeRating(recipe, preferences);
+		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
+	});
+}
+
+/** Filter and rank local recipes with positive pantryScores against stocked or targeted expiring ingredients. */
+export function rankPantryRecipes(
+	recipes: Recipe[],
+	pantry: Ingredient[],
+	preferences: Preferences,
+	targetIngredients?: Ingredient[],
+	now: Date = new Date()
+): Recipe[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const pantryIndex = indexUsablePantry(pantry, safeNow);
+	const matchIndex =
+		targetIngredients !== undefined ? indexUsablePantry(targetIngredients, safeNow) : pantryIndex;
+	if (!matchIndex.size) return [];
+	const rated = ratedSignals(recipes, preferences);
+
+	return recipes
+		.flatMap((recipe, index) => {
+			const targetMatch = pantryScores(recipe, matchIndex, safeNow);
+			if (targetMatch.available <= 0) return [];
+			const score =
+				targetMatch.available * 18 +
+				targetMatch.expiring * 8 +
+				scoreRecipe(recipe, pantryIndex, preferences, rated, safeNow);
+			return [{ recipe, index, score }];
+		})
+		.sort((a, b) => b.score - a.score || a.index - b.index)
+		.map(({ recipe }) => recipe);
+}
+
 /** Rank suggestions from explicit preferences, past ratings, and usable pantry ingredients. */
 export function rankRecipes(
 	recipes: Recipe[],
@@ -113,11 +149,7 @@ export function rankRecipes(
 	now: Date = new Date()
 ): Recipe[] {
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
-	const rated: RatedRecipe[] = recipes.flatMap((recipe) => {
-		const rating = recipeRating(recipe, preferences);
-		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
-	});
-
+	const rated = ratedSignals(recipes, preferences);
 	const pantryIndex = indexUsablePantry(pantry, safeNow);
 	return recipes
 		.map((recipe, index) => ({

@@ -138,6 +138,9 @@ export function filterPantryItems(
 	const selectedExpiry = (filters.expiry ?? 'all').trim().toLowerCase() || 'all';
 	return pantry.filter((item) => {
 		const itemCategory = item.category?.trim() || 'Pantry';
+		if (selectedExpiry === 'soon' && !(item.quantity > 0)) {
+			return false;
+		}
 		if (selectedExpiry !== 'all' && expiryStatus(item.expires, now) !== selectedExpiry) {
 			return false;
 		}
@@ -524,6 +527,72 @@ export function transferPurchasedItemsToPantry(
 			})),
 		createId
 	);
+}
+
+/** Move selected or all depleted pantry items into the shopping list without duplicating compatible unchecked entries. */
+export function restockDepletedPantryItems(
+	pantry: Ingredient[],
+	shopping: ShoppingItem[],
+	selectedIds?: Iterable<string>,
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): { pantry: Ingredient[]; shopping: ShoppingItem[]; restockedCount: number; addedCount: number } {
+	const selection = selectedIds ? new Set(selectedIds) : undefined;
+	const nextPantry: Ingredient[] = [];
+	const uncheckedShopping = shopping.filter((item) => !item.checked).map((item) => ({ ...item }));
+	const checkedShopping = shopping.filter((item) => item.checked).map((item) => ({ ...item }));
+	const addedShopping: ShoppingItem[] = [];
+	const usedIds = new Set(shopping.map((item) => item.id));
+	const uncheckedKeys = new Set<string>();
+	for (const entry of uncheckedShopping) {
+		if (!entry.name.trim()) continue;
+		uncheckedKeys.add(bucketKey(entry.name, entry.unit.trim() || 'piece'));
+	}
+
+	let restockedCount = 0;
+	let addedCount = 0;
+	for (const item of pantry) {
+		const isSelected = !selection || selection.has(item.id);
+		const isDepleted = Number.isFinite(item.quantity) && item.quantity <= 0;
+		const name = item.name.trim().slice(0, 200);
+		if (!isSelected || !isDepleted || !name) {
+			nextPantry.push({ ...item });
+			continue;
+		}
+
+		const unit = item.unit.trim().slice(0, 40) || 'piece';
+		const key = bucketKey(name, unit);
+		if (!uncheckedKeys.has(key)) {
+			if (
+				uncheckedShopping.length + checkedShopping.length + addedShopping.length >=
+				MAX_SHOPPING_ITEMS
+			) {
+				nextPantry.push({ ...item });
+				continue;
+			}
+			uncheckedKeys.add(key);
+			const baseId = createId();
+			let id = baseId;
+			let suffix = 2;
+			while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+			usedIds.add(id);
+			addedShopping.push({
+				id,
+				name,
+				quantity: 1,
+				unit,
+				checked: false
+			});
+			addedCount++;
+		}
+		restockedCount++;
+	}
+
+	return {
+		pantry: nextPantry,
+		shopping: [...uncheckedShopping, ...addedShopping, ...checkedShopping],
+		restockedCount,
+		addedCount
+	};
 }
 
 function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
