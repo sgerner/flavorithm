@@ -933,20 +933,21 @@ test('connection API offers device auth, supports configured hosted OAuth, and f
 	assert.equal((await route.GET(anonymous as never)).status, 401);
 });
 
-test('mid-TTL upstream 401 refreshes once across concurrent callers, retries routes, preserves transient credentials, and remaps personal reauth to 422', async () => {
+test('mid-TTL upstream 401 refreshes once across concurrent callers, retries routes, preserves transient credentials, and remaps personal reauth to 409', async () => {
 	const modelsRoute = await import('../src/routes/api/models/+server.ts');
 	const aiRoute = await import('../src/routes/api/ai/+server.ts');
 	const storage = await import('../src/lib/server/oauth-storage.ts');
 	const { defaultPreferences, seedRecipes } = await import('../src/lib/data.ts');
 	const user = await createLocalUser('oauth-mid-ttl-recovery@example.com');
 
-	// Unauthenticated callers still receive HTTP 401.
+	// Unauthenticated callers still receive HTTP 401 with code session_expired.
 	const unauthModels = await modelsRoute.GET({
 		locals: { user: null },
 		fetch: async () => Response.json({}),
 		url: new URL('http://127.0.0.1:3000/api/models')
 	} as never);
 	assert.equal(unauthModels.status, 401);
+	assert.equal((await unauthModels.json()).code, 'session_expired');
 	const unauthAI = await aiRoute.POST({
 		locals: { user: null },
 		fetch: async () => Response.json({}),
@@ -957,6 +958,7 @@ test('mid-TTL upstream 401 refreshes once across concurrent callers, retries rou
 		})
 	} as never);
 	assert.equal(unauthAI.status, 401);
+	assert.equal((await unauthAI.json()).code, 'session_expired');
 
 	const authUrl = await beginFlow(user);
 	const connected = await callbackFor(authUrl, { issuedClientId: 'oaiapp_mid_ttl' });
@@ -1083,7 +1085,7 @@ test('mid-TTL upstream 401 refreshes once across concurrent callers, retries rou
 		)
 		.run(user.user.id, account.id);
 
-	// Retry also returning 401 clears credentials and remaps signed-in response to 422 chatgpt_reauth_required.
+	// Retry also returning 401 clears personal credentials and remaps signed-in response to 409 chatgpt_reauth_required.
 	const retryRejected = await aiRoute.POST({
 		locals: { user: user.user },
 		fetch: async () => Response.json({ error: { message: 'Still invalid' } }, { status: 401 }),
@@ -1099,12 +1101,12 @@ test('mid-TTL upstream 401 refreshes once across concurrent callers, retries rou
 			})
 		})
 	} as never);
-	assert.equal(retryRejected.status, 422);
+	assert.equal(retryRejected.status, 409);
 	assert.equal((await retryRejected.json()).code, 'chatgpt_reauth_required');
 	assert.equal(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope, null);
 	assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, false);
 
-	// Subsequent signed-in model catalog calls while disconnected also return 422 chatgpt_reauth_required.
+	// Subsequent signed-in model catalog calls while disconnected also return 409 chatgpt_reauth_required.
 	const disconnectedModels = await modelsRoute.GET({
 		locals: { user: user.user },
 		fetch: async () => Response.json({}),
@@ -1112,7 +1114,7 @@ test('mid-TTL upstream 401 refreshes once across concurrent callers, retries rou
 			`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
 		)
 	} as never);
-	assert.equal(disconnectedModels.status, 422);
+	assert.equal(disconnectedModels.status, 409);
 	assert.equal((await disconnectedModels.json()).code, 'chatgpt_reauth_required');
 });
 
@@ -1497,19 +1499,37 @@ test('in-process coalescing shares strictly one network refresh across concurren
 	}
 });
 
-test('mapSignedInAIRouteError enforces one signed-in error contract across personal ChatGPT, Host AI, API-key 401s, and 429 Retry-After', async () => {
+test('mapSignedInAIRouteError enforces one signed-in 401/409/503 error contract across personal ChatGPT, Host AI, API-key 401s, and 429 Retry-After', async () => {
 	const { AIRequestError } = await import('../src/lib/server/ai.ts');
 	const { ChatGPTInferenceError } = await import('../src/lib/server/chatgpt-inference.ts');
 	const { mapSignedInAIRouteError } = await import('../src/lib/server/ai-route-errors.ts');
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const hostOwner = await createLocalUser('oauth-host-contract@example.com');
+	const hostAccount = storage.saveChatGPTAccount({
+		userId: hostOwner.user.id,
+		mode: 'local',
+		clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+		subject: 'host-contract-sub',
+		email: 'host-contract@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'host-contract-access',
+			refreshToken: 'host-contract-refresh',
+			idToken: 'host-contract-id',
+			codexAccountId: 'acct-host-contract'
+		},
+		expiresAt: Date.now() + 3_600_000,
+		earliestRefreshAt: 0
+	});
 
 	const apiKey401 = mapSignedInAIRouteError(new AIRequestError('Provider rejected API key.', 401), {
 		userId: 'user-1',
 		isChatGPTProvider: false,
 		fallbackMessage: 'AI failed'
 	});
-	assert.equal(apiKey401.status, 422);
+	assert.equal(apiKey401.status, 409);
 	assert.equal(apiKey401.headers.get('cache-control'), 'no-store');
-	assert.equal((await apiKey401.json()).code, 'provider_auth_error');
+	assert.equal((await apiKey401.json()).code, 'provider_auth');
 
 	const chatgpt401 = mapSignedInAIRouteError(
 		new ChatGPTInferenceError('Reconnect.', 401, 'token_expired'),
@@ -1520,20 +1540,48 @@ test('mapSignedInAIRouteError enforces one signed-in error contract across perso
 			fallbackMessage: 'AI failed'
 		}
 	);
-	assert.equal(chatgpt401.status, 422);
+	assert.equal(chatgpt401.status, 409);
 	assert.equal((await chatgpt401.json()).code, 'chatgpt_reauth_required');
 
-	const host401 = mapSignedInAIRouteError(
-		new oauth.ChatGPTOAuthError(403, 'Scope missing.', 'chatgpt_plan_scope_missing'),
+	const hostNonTerminal401 = mapSignedInAIRouteError(
+		new ChatGPTInferenceError('Upstream unauthorized.', 401, 'token_expired'),
 		{
 			userId: 'user-1',
 			usingHostAI: true,
+			hostTarget: { userId: hostOwner.user.id, accountId: hostAccount.id },
 			isChatGPTProvider: true,
 			fallbackMessage: 'Models failed'
 		}
 	);
-	assert.equal(host401.status, 503);
-	assert.equal((await host401.json()).code, 'host_ai_unavailable');
+	assert.equal(hostNonTerminal401.status, 503);
+	assert.equal((await hostNonTerminal401.json()).code, 'host_ai_unavailable');
+	assert.ok(
+		storage.getChatGPTAccount(hostOwner.user.id, hostAccount.id)?.credentialEnvelope,
+		'non-terminal 401 on shared host never clears host credentials'
+	);
+
+	const hostTerminalRefresh = mapSignedInAIRouteError(
+		new oauth.ChatGPTOAuthError(
+			401,
+			'Reconnect this ChatGPT account to continue.',
+			'chatgpt_account_reauth_required',
+			'invalid_grant'
+		),
+		{
+			userId: 'user-1',
+			usingHostAI: true,
+			hostTarget: { userId: hostOwner.user.id, accountId: hostAccount.id },
+			isChatGPTProvider: true,
+			fallbackMessage: 'Models failed'
+		}
+	);
+	assert.equal(hostTerminalRefresh.status, 503);
+	assert.equal((await hostTerminalRefresh.json()).code, 'host_ai_unavailable');
+	assert.equal(
+		storage.getChatGPTAccount(hostOwner.user.id, hostAccount.id)?.credentialEnvelope,
+		null,
+		'terminal refresh code clears host credentials through leased helper'
+	);
 
 	const rateLimited = mapSignedInAIRouteError(
 		Object.assign(new AIRequestError('Rate limit reached.', 429), {

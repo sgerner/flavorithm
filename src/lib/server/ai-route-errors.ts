@@ -1,6 +1,11 @@
 import { AIRequestError } from '#lib/server/ai.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
-import { ChatGPTOAuthError, clearUnusableChatGPTCredentials } from '#lib/server/chatgpt-oauth.ts';
+import {
+	ChatGPTOAuthError,
+	clearTerminalChatGPTCredentials,
+	clearUnusableChatGPTCredentials,
+	isTerminalChatGPTRefreshCode
+} from '#lib/server/chatgpt-oauth.ts';
 import { ApiError } from '#lib/server/db.ts';
 
 export const HOST_UNAVAILABLE_MESSAGE =
@@ -16,6 +21,13 @@ const HOST_UNRECOVERABLE_CODES = new Set([
 	'chatpass_v2_invalid_authorization_context'
 ]);
 
+export function sessionExpiredResponse(): Response {
+	return Response.json(
+		{ error: 'Authentication required', code: 'session_expired' },
+		{ status: 401 }
+	);
+}
+
 export function hostUnavailableResponse(): Response {
 	return Response.json(
 		{ error: HOST_UNAVAILABLE_MESSAGE, code: 'host_ai_unavailable' },
@@ -24,13 +36,13 @@ export function hostUnavailableResponse(): Response {
 }
 
 /**
- * Unified signed-in error contract shared across `/api/ai` and `/api/models`:
- * - Reserves HTTP 401 strictly for unauthenticated Flavorithm sessions (`locals.user === null`).
- * - Maps unrecoverable shared Host AI credential/grant errors to HTTP 503 (`host_ai_unavailable`)
- *   and clears the unusable host credential envelope under lease without leaking host details.
- * - Maps personal ChatGPT OAuth/Codex credential rejections to HTTP 422 (`chatgpt_reauth_required`).
- * - Maps non-ChatGPT API-key 401 rejections to HTTP 422 (`provider_auth_error` or preserved `.code`)
- *   so signed-in requests never trigger client SSO session-expiry loops.
+ * Unified signed-in provider-error contract (401 / 409 / 503) shared across `/api/ai` and `/api/models`:
+ * - Reserves HTTP 401 (`code: 'session_expired'`) strictly for unauthenticated Flavorithm sessions.
+ * - Maps shared Host AI credential/grant failures to HTTP 503 (`host_ai_unavailable`), clearing
+ *   host credentials only on a terminal OAuth refresh code via a lease-taking helper.
+ * - Maps personal ChatGPT OAuth/Codex credential rejections to HTTP 409 (`chatgpt_reauth_required`).
+ * - Maps non-ChatGPT API-key 401 rejections to HTTP 409 (`provider_auth` or preserved `.code`)
+ *   so signed-in requests never trigger client session-expiry handling.
  * - Preserves `.code` and `429` `Retry-After` headers across all other route errors.
  */
 export function mapSignedInAIRouteError(
@@ -61,8 +73,14 @@ export function mapSignedInAIRouteError(
 			context.usingHostAI &&
 			(error.status === 401 || (code !== undefined && HOST_UNRECOVERABLE_CODES.has(code)))
 		) {
-			if (context.hostTarget) {
-				clearUnusableChatGPTCredentials(context.hostTarget.userId, context.hostTarget.accountId);
+			const terminalRefreshCode =
+				error instanceof ChatGPTOAuthError ? error.providerErrorCode : undefined;
+			if (context.hostTarget && isTerminalChatGPTRefreshCode(terminalRefreshCode)) {
+				clearTerminalChatGPTCredentials(
+					context.hostTarget.userId,
+					context.hostTarget.accountId,
+					terminalRefreshCode
+				);
 			}
 			return hostUnavailableResponse();
 		}
@@ -79,9 +97,9 @@ export function mapSignedInAIRouteError(
 			return Response.json(
 				{
 					error: error.message,
-					code: isChatGPTError ? 'chatgpt_reauth_required' : (code ?? 'provider_auth_error')
+					code: isChatGPTError ? 'chatgpt_reauth_required' : (code ?? 'provider_auth')
 				},
-				{ status: 422, headers: { 'cache-control': 'no-store' } }
+				{ status: 409, headers: { 'cache-control': 'no-store' } }
 			);
 		}
 		const headers =

@@ -482,7 +482,7 @@ test('reconnectKitchen performs 1 /api/state read whether household identity cha
 	assert.equal(serverState2.pantry[0]?.name, 'Bread flour');
 });
 
-test('reconcileChatGPTPreferences clears stale host-chatgpt model and reasoning when Host AI becomes unavailable and runConcurrentModelCatalog awaits async onResult', async () => {
+test('reconcileChatGPTPreferences clears stale host-chatgpt model while preserving personal reasoning and runConcurrentModelCatalog awaits async onResult', async () => {
 	const preferences: Preferences = {
 		...defaultPreferences,
 		provider: 'chatgpt',
@@ -496,7 +496,7 @@ test('reconcileChatGPTPreferences clears stale host-chatgpt model and reasoning 
 	});
 	assert.equal(preferences.chatgptAccountId, 'personal-1');
 	assert.equal(preferences.model, '');
-	assert.equal(preferences.reasoning, undefined);
+	assert.deepEqual(preferences.reasoning, { effort: 'high' });
 
 	let reportedAccountId: string | null = null;
 	let asyncCompleted = false;

@@ -582,7 +582,7 @@ test('mid-TTL revoked Codex token refreshes once, rebuilds codexSubscriptionFetc
 	assert.equal(f.state.refreshes, 1);
 	assert.equal(oauth.listChatGPTAccounts(owner.userId)[0]?.connected, true);
 
-	// When retry also returns 401, clear credentials and return 422 chatgpt_reauth_required.
+	// When retry also returns 401, clear credentials and return 409 chatgpt_reauth_required.
 	const failedRetry = await modelsRoute.GET({
 		locals: { user: owner.user },
 		url: new URL(
@@ -593,7 +593,7 @@ test('mid-TTL revoked Codex token refreshes once, rebuilds codexSubscriptionFetc
 			return Response.json({ error: { message: 'Still unauthorized' } }, { status: 401 });
 		}) as typeof fetch
 	} as any);
-	assert.equal(failedRetry.status, 422);
+	assert.equal(failedRetry.status, 409);
 	assert.equal((await failedRetry.json()).code, 'chatgpt_reauth_required');
 	assert.equal(storage.getChatGPTAccount(owner.userId, polled.accountId)?.credentialEnvelope, null);
 	assert.equal(oauth.listChatGPTAccounts(owner.userId)[0]?.connected, false);

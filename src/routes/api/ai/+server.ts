@@ -1,5 +1,5 @@
-import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
-import { hostUnavailableResponse, mapSignedInAIRouteError } from '#lib/server/ai-route-errors.ts';
+import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
+import { mapSignedInAIRouteError, sessionExpiredResponse } from '#lib/server/ai-route-errors.ts';
 import { withChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import type { RequestHandler } from './$types';
 import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
@@ -16,7 +16,7 @@ export const POST: RequestHandler = async (event) => {
 	try {
 		assertSameOrigin(event.request);
 		user = event.locals.user;
-		if (!user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
+		if (!user) return sessionExpiredResponse();
 		const currentUser = user;
 		consumeRateLimit(`ai-user:${currentUser.id}`, 30, 60 * 60 * 1000);
 
@@ -34,14 +34,46 @@ export const POST: RequestHandler = async (event) => {
 			throw new AIRequestError('Request body must contain valid JSON.');
 		}
 
-		const isSearch = Boolean(
-			body && typeof body === 'object' && 'action' in body && body.action === 'search'
-		);
-		const host = getHostAI();
-		if (host && body && typeof body === 'object' && !isSearch) {
-			usingHostAI = true;
-			hostTarget = { userId: host.userId, accountId: host.accountId };
-			body = { ...body, provider: 'chatgpt', model: host.model, connectionId: host.accountId };
+		const isObjectBody = Boolean(body && typeof body === 'object' && !Array.isArray(body));
+		const record = isObjectBody ? (body as Record<string, unknown>) : null;
+		const isSearch = record?.action === 'search';
+		const host = isSearch ? null : getHostAIFor(currentUser.id);
+
+		if (record && !isSearch) {
+			const explicitPersonal = record.usePersonalAI === true;
+			const explicitHost =
+				record.usePersonalAI === false || record.connectionId === HOST_CONNECTION_ID;
+			const hasPersonalApiKey =
+				typeof record.provider === 'string' &&
+				record.provider !== 'chatgpt' &&
+				typeof record.apiKey === 'string' &&
+				record.apiKey.trim().length > 0;
+			const hasPersonalChatGPT =
+				record.provider === 'chatgpt' &&
+				typeof record.connectionId === 'string' &&
+				record.connectionId.trim().length > 0 &&
+				record.connectionId !== HOST_CONNECTION_ID;
+			const usePersonal =
+				explicitPersonal || (!explicitHost && (hasPersonalApiKey || hasPersonalChatGPT));
+
+			if (host && !usePersonal) {
+				const {
+					reasoning: _reasoning,
+					apiKey: _apiKey,
+					usePersonalAI: _usePersonalAI,
+					...rest
+				} = record;
+				body = {
+					...rest,
+					provider: 'chatgpt',
+					model: host.model,
+					connectionId: host.accountId
+				};
+				usingHostAI = true;
+				hostTarget = { userId: host.userId, accountId: host.accountId };
+			} else if (!host && explicitHost) {
+				throw new ApiError(400, 'Host AI is not enabled. Connect a personal model in Settings.');
+			}
 		}
 
 		isChatGPTProvider = Boolean(
@@ -57,13 +89,17 @@ export const POST: RequestHandler = async (event) => {
 				'connectionId' in body && typeof body.connectionId === 'string' ? body.connectionId : '';
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
 			if (!usingHostAI && accountId === HOST_CONNECTION_ID) {
-				usingHostAI = true;
-				return hostUnavailableResponse();
+				throw new ApiError(
+					400,
+					host
+						? 'Select a personal ChatGPT account or another provider.'
+						: 'Host AI is not enabled. Connect a personal model in Settings.'
+				);
 			}
 			if (!usingHostAI) personalAccountId = accountId;
 			const result = await withChatGPTConnection(
-				host?.userId ?? currentUser.id,
-				accountId,
+				usingHostAI && host ? host.userId : currentUser.id,
+				usingHostAI && host ? host.accountId : accountId,
 				event.fetch,
 				(resolved) =>
 					runAIRequest(
@@ -72,7 +108,8 @@ export const POST: RequestHandler = async (event) => {
 						undefined,
 						{ accessToken: resolved.accessToken, codex: resolved.codex },
 						event.request.signal
-					)
+					),
+				{ sharedHost: usingHostAI }
 			);
 			return Response.json(result, {
 				headers: { 'cache-control': 'no-store' }

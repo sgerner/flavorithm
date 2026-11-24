@@ -1,5 +1,5 @@
-import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
-import { hostUnavailableResponse, mapSignedInAIRouteError } from '#lib/server/ai-route-errors.ts';
+import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
+import { mapSignedInAIRouteError, sessionExpiredResponse } from '#lib/server/ai-route-errors.ts';
 import { withChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { listChatGPTModels } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
@@ -7,7 +7,7 @@ import type { RequestHandler } from './$types';
 import { getPublicModelCatalog } from '#lib/server/ai.ts';
 
 export const GET: RequestHandler = async ({ locals, fetch, url }) => {
-	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
+	if (!locals.user) return sessionExpiredResponse();
 	const currentUser = locals.user;
 	let usingHostAI = false;
 	let hostTarget: { userId: string; accountId: string } | null = null;
@@ -18,12 +18,16 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 		if (isChatGPTProvider) {
 			const accountId = url.searchParams.get('accountId');
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			if (accountId === HOST_CONNECTION_ID) {
-				usingHostAI = true;
-				const host = getHostAI();
+			const isHostAccount = accountId === HOST_CONNECTION_ID;
+			const host = isHostAccount ? getHostAIFor(currentUser.id) : null;
+			if (isHostAccount) {
 				if (!host) {
-					return hostUnavailableResponse();
+					return Response.json(
+						{ providers: [{ id: 'chatgpt', name: 'ChatGPT plan', models: [] }] },
+						{ headers: { 'cache-control': 'no-store' } }
+					);
 				}
+				usingHostAI = true;
 				hostTarget = { userId: host.userId, accountId: host.accountId };
 			} else {
 				personalAccountId = accountId;
@@ -34,7 +38,8 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 					hostTarget?.userId ?? currentUser.id,
 					hostTarget?.accountId ?? accountId,
 					fetch,
-					(connection) => listChatGPTModels(connection.accessToken, connection.fetcher)
+					(connection) => listChatGPTModels(connection.accessToken, connection.fetcher),
+					{ sharedHost: usingHostAI }
 				),
 				catalogPromise
 			]);

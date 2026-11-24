@@ -1,6 +1,7 @@
 import {
 	configureHostAI,
 	getHostAI,
+	getHostAIFor,
 	isHostAdmin,
 	HOST_CONNECTION_ID
 } from '#lib/server/host-ai.ts';
@@ -64,14 +65,15 @@ export const GET: RequestHandler = async (event) => {
 		return Response.json({ error: 'Authentication required' }, { status: 401 });
 	const address = clientAddress(event);
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
+	const host = getHostAIFor(event.locals.user.id);
 	return Response.json(
 		{
 			hostAdmin: isHostAdmin(event.locals.user.id),
-			host: getHostAI() ? { model: getHostAI()!.model } : null,
+			host: host ? { model: host.model } : null,
 			configured: availability.mode !== 'unavailable',
 			mode: availability.mode,
 			accounts: [
-				...(getHostAI()
+				...(host
 					? [
 							{
 								id: HOST_CONNECTION_ID,

@@ -1,4 +1,8 @@
-import type { ConnectionModel, ConnectionProvider } from '#lib/ai-connections.ts';
+import {
+	HOST_CONNECTION_ID,
+	type ConnectionModel,
+	type ConnectionProvider
+} from '#lib/ai-connections.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
 
 export type ChatGPTAccountSummary = {
@@ -27,29 +31,35 @@ export function reconcileChatGPTPreferences(
 	preferences: Preferences,
 	chatGPT: ChatGPTConnectionSummary
 ): void {
-	const wasHost = preferences.chatgptAccountId === 'host-chatgpt';
-	if (chatGPT.host) {
-		preferences.provider = 'chatgpt';
-		preferences.chatgptAccountId = 'host-chatgpt';
-		preferences.model = chatGPT.host.model;
-	} else if (wasHost) {
-		preferences.model = '';
-		preferences.reasoning = undefined;
+	const personalAccounts = chatGPT.accounts.filter((account) => account.id !== HOST_CONNECTION_ID);
+	if (preferences.chatgptAccountId === HOST_CONNECTION_ID) {
+		preferences.chatgptAccountId = undefined;
+		if (preferences.provider === 'chatgpt') preferences.model = '';
 	}
-	if (!chatGPT.accounts.some((account) => account.id === preferences.chatgptAccountId)) {
+	if (
+		personalAccounts.length &&
+		(preferences.provider === 'chatgpt' || preferences.chatgptAccountId) &&
+		!personalAccounts.some((account) => account.id === preferences.chatgptAccountId)
+	) {
 		preferences.chatgptAccountId =
-			chatGPT.accounts.find((account) => account.connected && account.planEnabled)?.id ||
-			chatGPT.accounts[0]?.id;
+			personalAccounts.find((account) => account.connected && account.planEnabled)?.id ||
+			personalAccounts[0]?.id;
+	} else if (!personalAccounts.length && preferences.chatgptAccountId) {
+		preferences.chatgptAccountId = undefined;
 	}
 }
 
 /** Return the selected ChatGPT account ID only when ChatGPT plan inference is active and entitled. */
 export function entitledChatGPTAccountId(
-	preferences: Pick<Preferences, 'provider' | 'chatgptAccountId'>,
-	accounts: ChatGPTAccountSummary[]
+	preferences: Pick<Preferences, 'provider' | 'chatgptAccountId' | 'usePersonalAI'>,
+	accounts: ChatGPTAccountSummary[],
+	host?: { model: string } | null
 ): string | null {
+	if (host && !preferences.usePersonalAI) return null;
 	const accountId = preferences.chatgptAccountId;
-	if (preferences.provider !== 'chatgpt' || !accountId) return null;
+	if (preferences.provider !== 'chatgpt' || !accountId || accountId === HOST_CONNECTION_ID) {
+		return null;
+	}
 	const account = accounts.find((candidate) => candidate.id === accountId);
 	return account?.connected && account.planEnabled ? accountId : null;
 }

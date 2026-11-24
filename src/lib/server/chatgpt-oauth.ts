@@ -58,11 +58,18 @@ export const REFRESH_FAILURE_COOLDOWN_MS = 10_000;
 
 export class ChatGPTOAuthError extends ApiError {
 	readonly code: string;
+	readonly providerErrorCode?: string;
 
-	constructor(status: number, message: string, code = 'chatgpt_oauth_error') {
+	constructor(
+		status: number,
+		message: string,
+		code = 'chatgpt_oauth_error',
+		providerErrorCode?: string
+	) {
 		super(status, message);
 		this.name = 'ChatGPTOAuthError';
 		this.code = code;
+		if (providerErrorCode) this.providerErrorCode = providerErrorCode;
 	}
 }
 
@@ -1311,6 +1318,10 @@ const TERMINAL_REFRESH_ERROR_CODES = new Set([
 	'refresh_token_reused'
 ]);
 
+export function isTerminalChatGPTRefreshCode(code: string | undefined): boolean {
+	return Boolean(code && TERMINAL_REFRESH_ERROR_CODES.has(code));
+}
+
 function parseRetryAfterMs(value: string | null | undefined, now = Date.now()): number | null {
 	if (!value) return null;
 	const trimmed = value.trim();
@@ -1547,7 +1558,8 @@ async function refreshAccountAccessToken(
 					throw new ChatGPTOAuthError(
 						401,
 						'Reconnect this ChatGPT account to continue.',
-						'chatgpt_account_reauth_required'
+						'chatgpt_account_reauth_required',
+						errorCode
 					);
 				}
 				return failTransientRefresh(response.headers.get('retry-after'));
@@ -1731,6 +1743,27 @@ function clearMissingCodexAccountCredentials(userId: string, accountId: string):
 	}
 }
 
+export function clearTerminalChatGPTCredentials(
+	userId: string,
+	accountId: string,
+	errorCode: string | undefined
+): boolean {
+	if (!isTerminalChatGPTRefreshCode(errorCode)) return false;
+	const account = getChatGPTAccount(userId, accountId);
+	if (!account?.credentialEnvelope) return false;
+	const leaseToken = randomUUID();
+	if (!claimChatGPTRefreshLease(userId, accountId, leaseToken, Date.now() + REFRESH_LEASE_MS)) {
+		return false;
+	}
+	try {
+		const latest = getChatGPTAccount(userId, accountId);
+		if (!latest?.credentialEnvelope) return false;
+		return clearChatGPTCredentials(userId, accountId, leaseToken);
+	} finally {
+		releaseChatGPTRefreshLease(userId, accountId, leaseToken);
+	}
+}
+
 export function clearUnusableChatGPTCredentials(userId: string, accountId: string): void {
 	const account = getChatGPTAccount(userId, accountId);
 	if (!account?.credentialEnvelope) return;
@@ -1809,7 +1842,8 @@ export async function withChatGPTConnection<T>(
 	userId: string,
 	accountId: string,
 	fetcher: typeof fetch,
-	operation: (connection: Awaited<ReturnType<typeof getChatGPTConnection>>) => Promise<T>
+	operation: (connection: Awaited<ReturnType<typeof getChatGPTConnection>>) => Promise<T>,
+	options?: { sharedHost?: boolean }
 ): Promise<T> {
 	let connection = await getChatGPTConnection(userId, accountId, fetcher);
 	try {
@@ -1827,7 +1861,11 @@ export async function withChatGPTConnection<T>(
 		try {
 			return await operation(connection);
 		} catch (retryError) {
-			if (retryError instanceof ChatGPTInferenceError && retryError.status === 401) {
+			if (
+				retryError instanceof ChatGPTInferenceError &&
+				retryError.status === 401 &&
+				!options?.sharedHost
+			) {
 				clearRejectedChatGPTAccessToken(userId, accountId, refreshedToken);
 			}
 			throw retryError;
