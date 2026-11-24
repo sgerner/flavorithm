@@ -5552,18 +5552,15 @@
 		flex: 1 1 220px;
 		max-width: 320px;
 		min-height: 44px;
-		padding: 0 12px;
-		border: 1px solid var(--line);
-		background: var(--surface);
 	}
 	.pantry-search input {
 		width: 100%;
 		min-width: 0;
 		font-size: 14px;
-		padding: 9px 0;
+		padding: 9px 10px;
 	}
 	.pantry-categories {
-		padding-bottom: 2px;
+		padding-bottom: 4px;
 	}
 	.expiry-filters {
 		display: flex;
@@ -5577,14 +5574,16 @@
 		align-items: center;
 		gap: 9px;
 		padding: 8px 12px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		font-size: 14px;
 	}
 	.expiry-filters button.active {
-		background: var(--green);
-		color: var(--paper);
-		border-color: var(--green);
+		padding: 7px 11px;
+		background: var(--chip-active-bg);
+		color: var(--ink);
+		border: 2px solid var(--chip-active-border);
+		font-weight: 700;
 	}
 	.expiry-filters button span {
 		min-width: 22px;
@@ -5764,7 +5763,7 @@
 		font-weight: 400;
 		color: var(--ink);
 		background: var(--surface);
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 	}
 	.filtered-pantry-empty {
 		padding: 32px 12px;
@@ -5783,13 +5782,13 @@
 	.shopping-name {
 		width: 100%;
 		min-width: 0;
-		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		padding: 4px 5px;
 		font-weight: 500;
 	}
-	.shopping-name:focus {
-		border-color: var(--line);
+	input.shopping-name {
+		padding: 7px 8px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
 	}
 	.shopping-source {
 		padding-left: 5px;
@@ -5806,18 +5805,15 @@
 	.shopping-quantity input {
 		min-width: 0;
 		width: 72px;
-		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		padding: 7px 6px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
 		text-align: right;
 		font-size: 14px;
 	}
 	.shopping-quantity input:last-child {
 		width: 70px;
 		text-align: left;
-	}
-	.shopping-quantity input:focus {
-		border-color: var(--line);
 	}
 	.calendar-meal-actions {
 		min-height: 34px;
@@ -5912,7 +5908,7 @@
 		min-height: 44px;
 		padding: 12px 14px;
 		margin: 22px 0;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		cursor: pointer;
 		font-size: 14px;
@@ -5922,7 +5918,7 @@
 		height: 24px;
 		flex: 0 0 24px;
 		margin-top: 1px;
-		accent-color: var(--green);
+		accent-color: var(--ink);
 	}
 	.cook-option span {
 		display: flex;
@@ -5968,6 +5964,9 @@
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
+		}
+		.expiry-filters button.active {
+			padding-inline: 5px;
 		}
 		.ingredient-meta {
 			flex-direction: row;
