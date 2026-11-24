@@ -4,6 +4,7 @@ import { createInitialState } from '../src/lib/data.ts';
 import { applyButlerCommands } from '../src/lib/butler.ts';
 import {
 	buildButlerActions,
+	previewButlerCommand,
 	reconcileButlerUndoViews,
 	resolveButlerControlTarget
 } from '../src/lib/butler-actions.ts';
@@ -265,6 +266,76 @@ test('invalid command payloads fail validation', () => {
 		buildButlerActions([{ type: 'recipe.upsert', recipe: { id: 'bad' } }], kitchen)
 	);
 	assert.throws(() => buildButlerActions([{ type: 'ui', action: 'execute' }], kitchen));
+	assert.throws(() =>
+		buildButlerActions([{ type: 'meal.complete', id: kitchen.meals[0].id }], kitchen)
+	);
+});
+
+test('meal completion and leftover cards and previews show recipe title, deduction status, and leftover count', () => {
+	const kitchen = createInitialState();
+	const meal = kitchen.meals[0];
+	const recipe = kitchen.recipes.find((item) => item.id === meal.recipeId)!;
+
+	const [deductAction] = buildButlerActions(
+		[{ type: 'meal.complete', id: meal.id, deductPantry: true }],
+		kitchen
+	);
+	assert.equal(deductAction.label, 'Complete meal');
+	assert.equal(deductAction.title, recipe.title);
+	assert.match(deductAction.summary, /Deducts pantry stock/);
+	assert.match(deductAction.summary, /0 leftovers/);
+	const deductPreview = previewButlerCommand(
+		deductAction.commands[0],
+		kitchen,
+		deductAction.commands
+	);
+	assert.match(deductPreview, new RegExp(recipe.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+	assert.match(deductPreview, /Pantry deduction: Deducts pantry stock/);
+	assert.match(deductPreview, /Leftover servings: 0/);
+	assert.doesNotMatch(deductPreview, /Kitchen update/);
+
+	const [skipAction] = buildButlerActions(
+		[{ type: 'meal.complete', id: meal.id, deductPantry: false, leftoverServings: 1 }],
+		kitchen
+	);
+	assert.equal(skipAction.title, recipe.title);
+	assert.match(skipAction.summary, /Pantry stock unchanged/);
+	assert.match(skipAction.summary, /1 leftover\b/);
+	const skipPreview = previewButlerCommand(skipAction.commands[0], kitchen, skipAction.commands);
+	assert.match(skipPreview, /Pantry deduction: Pantry stock unchanged/);
+	assert.match(skipPreview, /Leftover servings: 1/);
+
+	// Cooked meal leftover update card and preview show updated leftover count
+	const cookedKitchen = structuredClone(kitchen);
+	cookedKitchen.meals[0] = {
+		...meal,
+		servings: 3,
+		completedAt: '2026-10-22T18:30:00.000Z',
+		leftoverServings: 3
+	};
+	const [leftoverAction] = buildButlerActions(
+		[
+			{
+				type: 'meal.upsert',
+				meal: { ...cookedKitchen.meals[0], leftoverServings: 2 }
+			}
+		],
+		cookedKitchen
+	);
+	assert.equal(leftoverAction.label, 'Update meal');
+	assert.equal(leftoverAction.title, recipe.title);
+	assert.match(leftoverAction.summary, /2 leftovers/);
+	const leftoverPreview = previewButlerCommand(
+		leftoverAction.commands[0],
+		cookedKitchen,
+		leftoverAction.commands
+	);
+	assert.match(leftoverPreview, /Leftover servings: 2/);
+
+	// Meal deletion preview also resolves the meal's recipe title instead of Kitchen update
+	const deletePreview = previewButlerCommand({ type: 'meal.delete', id: meal.id }, kitchen);
+	assert.match(deletePreview, new RegExp(recipe.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+	assert.doesNotMatch(deletePreview, /Kitchen update/);
 });
 
 test('frozen details keep target names and explicit verbs for meal, pantry, recipe, and shopping deletions before and after apply', () => {
@@ -397,22 +468,22 @@ test('meal completion cards show pantry deductions and leftover counts in summar
 	assert.equal(withDeduction.label, 'Complete meal');
 	assert.equal(withDeduction.title, recipe.title);
 	assert.match(withDeduction.summary, /Lunch · 2026-10-24/);
-	assert.match(withDeduction.summary, /deducts pantry stock/);
-	assert.match(withDeduction.summary, /2 leftover servings/);
+	assert.match(withDeduction.summary, /Deducts pantry stock/);
+	assert.match(withDeduction.summary, /2 leftovers/);
 	assert.match(
 		withDeduction.details[0],
 		new RegExp(
-			`^Complete meal: ${recipe.title} · Lunch · 2026-10-24 · 4 servings · deducts pantry stock · 2 leftover servings$`
+			`^Complete meal: ${recipe.title} · Lunch · 2026-10-24 · 4 servings · Deducts pantry stock · 2 leftover servings$`
 		)
 	);
 
 	assert.match(withoutDeduction.summary, /Dinner · 2026-10-24/);
-	assert.match(withoutDeduction.summary, /no pantry deduction/);
-	assert.match(withoutDeduction.summary, /no leftovers/);
+	assert.match(withoutDeduction.summary, /Pantry stock unchanged/);
+	assert.match(withoutDeduction.summary, /0 leftovers/);
 	assert.match(
 		withoutDeduction.details[0],
 		new RegExp(
-			`^Complete meal: ${recipe.title} · Dinner · 2026-10-24 · 2 servings · no pantry deduction · 0 leftover servings$`
+			`^Complete meal: ${recipe.title} · Dinner · 2026-10-24 · 2 servings · Pantry stock unchanged · 0 leftover servings$`
 		)
 	);
 });
@@ -543,8 +614,23 @@ test('undo reconciliation omits undo for navigation/dialog actions and closes st
 	const unrelatedCleanup = reconcileButlerUndoViews(
 		previous,
 		compoundResult.state,
-		{ selectedId: previous.recipes[1].id },
+		{ selectedId: previous.recipes[1].id, editingPantryId: previous.pantry[0].id },
 		[]
 	);
 	assert.equal(unrelatedCleanup.closeSelected, false);
+	assert.equal(unrelatedCleanup.clearEditingPantry, false);
+
+	const pantryResult = applyButlerCommands(previous, [
+		{
+			type: 'pantry.upsert',
+			item: { ...previous.pantry[0], quantity: previous.pantry[0].quantity + 2 }
+		}
+	]);
+	const pantryCleanup = reconcileButlerUndoViews(
+		previous,
+		pantryResult.state,
+		{ editingPantryId: previous.pantry[0].id },
+		pantryResult.effects
+	);
+	assert.equal(pantryCleanup.clearEditingPantry, true);
 });
