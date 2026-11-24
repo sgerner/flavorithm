@@ -70,19 +70,34 @@ class MockElement {
 	}
 
 	matches(selector: string): boolean {
+		const notTabIndexMinusOne = this.attributes.get('tabindex') !== '-1';
 		if (selector === '[inert]') return this.inert || this.attributes.has('inert');
 		if (selector === '[hidden]') return this.hidden || this.attributes.has('hidden');
 		if (selector === 'button:not([disabled])') return this.tagName === 'BUTTON' && !this.disabled;
+		if (selector === 'button:not([disabled]):not([tabindex="-1"])')
+			return this.tagName === 'BUTTON' && !this.disabled && notTabIndexMinusOne;
 		if (selector === 'a[href]') return this.tagName === 'A' && this.attributes.has('href');
+		if (selector === 'a[href]:not([tabindex="-1"])')
+			return this.tagName === 'A' && this.attributes.has('href') && notTabIndexMinusOne;
 		if (selector === 'input:not([disabled])') return this.tagName === 'INPUT' && !this.disabled;
+		if (selector === 'input:not([disabled]):not([tabindex="-1"])')
+			return this.tagName === 'INPUT' && !this.disabled && notTabIndexMinusOne;
 		if (selector === 'select:not([disabled])') return this.tagName === 'SELECT' && !this.disabled;
+		if (selector === 'select:not([disabled]):not([tabindex="-1"])')
+			return this.tagName === 'SELECT' && !this.disabled && notTabIndexMinusOne;
 		if (selector === 'textarea:not([disabled])')
 			return this.tagName === 'TEXTAREA' && !this.disabled;
+		if (selector === 'textarea:not([disabled]):not([tabindex="-1"])')
+			return this.tagName === 'TEXTAREA' && !this.disabled && notTabIndexMinusOne;
 		if (selector === '[tabindex="0"]') return this.attributes.get('tabindex') === '0';
 		if (selector === '[tabindex]:not([tabindex="-1"])')
-			return this.attributes.has('tabindex') && this.attributes.get('tabindex') !== '-1';
-		if (selector === 'details > summary:first-of-type') {
+			return this.attributes.has('tabindex') && notTabIndexMinusOne;
+		if (
+			selector === 'details > summary:first-of-type' ||
+			selector === 'details > summary:first-of-type:not([tabindex="-1"])'
+		) {
 			if (this.tagName !== 'SUMMARY' || this.parentElement?.tagName !== 'DETAILS') return false;
+			if (selector.endsWith(':not([tabindex="-1"])') && !notTabIndexMinusOne) return false;
 			const firstSummary = this.parentElement.children.find((child) => child.tagName === 'SUMMARY');
 			return firstSummary === this;
 		}

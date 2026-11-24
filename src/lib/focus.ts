@@ -17,7 +17,7 @@ type TrapEntry = {
 };
 
 const FOCUSABLE_SELECTOR =
-	'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),details > summary:first-of-type,[tabindex]:not([tabindex="-1"])';
+	'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),details > summary:first-of-type:not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])';
 
 const activeTraps: TrapEntry[] = [];
 let originalOverflow = '';
@@ -177,7 +177,7 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 				if (activeTraps.length !== 0) return;
 				handoffFocus = null;
 				handoffOverflow = null;
-				if (canRestoreFocus(returnTarget, node)) returnTarget.focus();
+				if (canRestoreFocus(returnTarget, node)) returnTarget.focus({ preventScroll: true });
 			});
 		}
 	}
