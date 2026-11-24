@@ -172,6 +172,7 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
+	import { isStandaloneRecipeUrl } from '#lib/recipe-scraper.ts';
 	import {
 		applyImportedRecipeSave,
 		canAppendImportTranscript,
@@ -2234,6 +2235,9 @@
 				: Boolean(apiKey)) && Boolean(kitchen.preferences.model)
 		);
 	}
+	function hasAIConnection() {
+		return Boolean(user) && hasPersonalAIReady();
+	}
 	async function needAI() {
 		if (!user) {
 			openAuthentication();
@@ -3505,6 +3509,38 @@
 		input: { url?: string; prompt: string; image?: string },
 		signal: AbortSignal
 	) {
+		const explicitUrl = input.url?.trim() || undefined;
+		const trimmedPrompt = input.prompt.trim();
+		const standaloneUrl = !input.image
+			? explicitUrl
+				? !trimmedPrompt
+					? explicitUrl
+					: undefined
+				: isStandaloneRecipeUrl(trimmedPrompt)
+					? trimmedPrompt
+					: undefined
+			: undefined;
+		if (standaloneUrl) {
+			const connected = hasAIConnection();
+			return request(
+				'/api/recipe-import',
+				{
+					url: standaloneUrl,
+					...(connected
+						? {
+								...(kitchen.preferences.provider === 'chatgpt'
+									? { connectionId: kitchen.preferences.chatgptAccountId }
+									: { apiKey }),
+								provider: kitchen.preferences.provider,
+								model: kitchen.preferences.model,
+								reasoning: kitchen.preferences.reasoning
+							}
+						: {})
+				},
+				'POST',
+				signal
+			);
+		}
 		if (!(await needAI())) {
 			resumeDialog = 'import';
 			return null;
