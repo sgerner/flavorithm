@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState } from '../src/lib/data.ts';
 import { applyButlerCommands } from '../src/lib/butler.ts';
-import { buildButlerActions } from '../src/lib/butler-actions.ts';
+import { buildButlerActions, previewButlerCommand } from '../src/lib/butler-actions.ts';
 
 test('independent recipe and pantry changes become readable individual cards', () => {
 	const kitchen = createInitialState();
@@ -261,6 +261,76 @@ test('invalid command payloads fail validation', () => {
 		buildButlerActions([{ type: 'recipe.upsert', recipe: { id: 'bad' } }], kitchen)
 	);
 	assert.throws(() => buildButlerActions([{ type: 'ui', action: 'execute' }], kitchen));
+	assert.throws(() =>
+		buildButlerActions([{ type: 'meal.complete', id: kitchen.meals[0].id }], kitchen)
+	);
+});
+
+test('meal completion and leftover cards and previews show recipe title, deduction status, and leftover count', () => {
+	const kitchen = createInitialState();
+	const meal = kitchen.meals[0];
+	const recipe = kitchen.recipes.find((item) => item.id === meal.recipeId)!;
+
+	const [deductAction] = buildButlerActions(
+		[{ type: 'meal.complete', id: meal.id, deductPantry: true }],
+		kitchen
+	);
+	assert.equal(deductAction.label, 'Complete meal');
+	assert.equal(deductAction.title, recipe.title);
+	assert.match(deductAction.summary, /Deducts pantry stock/);
+	assert.match(deductAction.summary, /0 leftovers/);
+	const deductPreview = previewButlerCommand(
+		deductAction.commands[0],
+		kitchen,
+		deductAction.commands
+	);
+	assert.match(deductPreview, new RegExp(recipe.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+	assert.match(deductPreview, /Pantry deduction: Deducts pantry stock/);
+	assert.match(deductPreview, /Leftover servings: 0/);
+	assert.doesNotMatch(deductPreview, /Kitchen update/);
+
+	const [skipAction] = buildButlerActions(
+		[{ type: 'meal.complete', id: meal.id, deductPantry: false, leftoverServings: 1 }],
+		kitchen
+	);
+	assert.equal(skipAction.title, recipe.title);
+	assert.match(skipAction.summary, /Pantry stock unchanged/);
+	assert.match(skipAction.summary, /1 leftover\b/);
+	const skipPreview = previewButlerCommand(skipAction.commands[0], kitchen, skipAction.commands);
+	assert.match(skipPreview, /Pantry deduction: Pantry stock unchanged/);
+	assert.match(skipPreview, /Leftover servings: 1/);
+
+	// Cooked meal leftover update card and preview show updated leftover count
+	const cookedKitchen = structuredClone(kitchen);
+	cookedKitchen.meals[0] = {
+		...meal,
+		servings: 3,
+		completedAt: '2026-10-22T18:30:00.000Z',
+		leftoverServings: 3
+	};
+	const [leftoverAction] = buildButlerActions(
+		[
+			{
+				type: 'meal.upsert',
+				meal: { ...cookedKitchen.meals[0], leftoverServings: 2 }
+			}
+		],
+		cookedKitchen
+	);
+	assert.equal(leftoverAction.label, 'Update meal');
+	assert.equal(leftoverAction.title, recipe.title);
+	assert.match(leftoverAction.summary, /2 leftovers/);
+	const leftoverPreview = previewButlerCommand(
+		leftoverAction.commands[0],
+		cookedKitchen,
+		leftoverAction.commands
+	);
+	assert.match(leftoverPreview, /Leftover servings: 2/);
+
+	// Meal deletion preview also resolves the meal's recipe title instead of Kitchen update
+	const deletePreview = previewButlerCommand({ type: 'meal.delete', id: meal.id }, kitchen);
+	assert.match(deletePreview, new RegExp(recipe.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+	assert.doesNotMatch(deletePreview, /Kitchen update/);
 });
 
 test('recipe.complete and cook-mode recipe.open produce clear action cards and group related updates', () => {
@@ -273,6 +343,11 @@ test('recipe.complete and cook-mode recipe.open produce clear action cards and g
 	assert.equal(single.title, 'Tomato butter beans with garlicky toast');
 	assert.equal(single.summary, '4 servings · 1 leftover · deduct pantry');
 	assert.equal(single.destructive, false);
+	const singlePreview = previewButlerCommand(single.commands[0], kitchen, single.commands);
+	assert.match(singlePreview, /Tomato butter beans with garlicky toast/);
+	assert.match(singlePreview, /Servings: 4/);
+	assert.match(singlePreview, /Pantry deduction: Deducts pantry stock/);
+	assert.match(singlePreview, /Leftover servings: 1/);
 
 	const [openCook] = buildButlerActions(
 		[{ type: 'recipe.open', id: 'tomato-butter-beans', mode: 'cook' }],

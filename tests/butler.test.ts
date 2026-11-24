@@ -539,6 +539,23 @@ test('butler completes unscheduled recipes, refreshes active week:* shopping sco
 		36
 	);
 
+	assert.throws(
+		() =>
+			applyButlerCommands(current, [
+				{
+					type: 'pantry.upsert',
+					item: {
+						id: 'pantry-spinach',
+						name: 'baby spinach',
+						quantity: 1,
+						unit: 'cups',
+						category: 'Produce'
+					}
+				},
+				{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2 }
+			]),
+		/already deducts recipe ingredients/
+	);
 	assert.throws(() =>
 		applyButlerCommands(current, [
 			{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 1.5 }
@@ -547,6 +564,233 @@ test('butler completes unscheduled recipes, refreshes active week:* shopping sco
 	assert.throws(() =>
 		applyButlerCommands(current, [{ type: 'recipe.complete', id: 'nonexistent-recipe' }])
 	);
+});
+
+test('ButlerResponseSchema JSON schema requires deductPantry on meal.complete and describes completion fields', () => {
+	const schema = z.toJSONSchema(ButlerResponseSchema) as Record<string, any>;
+	const variants: Record<string, any>[] =
+		schema.properties?.commands?.items?.oneOf ?? schema.properties?.commands?.items?.anyOf ?? [];
+	const completeVariant = variants.find(
+		(variant) => variant.properties?.type?.const === 'meal.complete'
+	);
+	assert.ok(completeVariant);
+	assert.ok(completeVariant.required?.includes('deductPantry'));
+	assert.match(String(completeVariant.properties?.deductPantry?.description ?? ''), /pantry/i);
+	assert.match(
+		String(completeVariant.properties?.leftoverServings?.description ?? ''),
+		/leftover/i
+	);
+
+	const upsertVariant = variants.find(
+		(variant) => variant.properties?.type?.const === 'meal.upsert'
+	);
+	assert.ok(upsertVariant);
+	assert.match(
+		String(upsertVariant.properties?.meal?.properties?.completedAt?.description ?? ''),
+		/meal\.complete/
+	);
+	assert.match(
+		String(upsertVariant.properties?.meal?.properties?.leftoverServings?.description ?? ''),
+		/leftover/i
+	);
+
+	const current = createInitialState();
+	assert.throws(() =>
+		applyButlerCommands(current, [{ type: 'meal.complete', id: current.meals[0].id }])
+	);
+});
+
+test('meal.upsert strips completedAt and leftoverServings on uncompleted meals and clamps cooked leftover updates', () => {
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	const plannedId = current.meals[0].id;
+	const strippedExisting = applyButlerCommands(current, [
+		{
+			type: 'meal.upsert',
+			meal: {
+				...current.meals[0],
+				completedAt: '2026-10-23T19:00:00.000Z',
+				leftoverServings: 2
+			}
+		}
+	]).state;
+	const updatedPlanned = strippedExisting.meals.find((meal) => meal.id === plannedId)!;
+	assert.equal(updatedPlanned.completedAt, undefined);
+	assert.equal(updatedPlanned.leftoverServings, undefined);
+
+	const strippedNew = applyButlerCommands(current, [
+		{
+			type: 'meal.upsert',
+			meal: {
+				id: 'sneaky-complete',
+				date: '2026-10-25',
+				slot: 'Lunch',
+				recipeId: recipe.id,
+				servings: 3,
+				completedAt: '2026-10-25T13:00:00.000Z',
+				leftoverServings: 1
+			}
+		}
+	]).state;
+	const createdMeal = strippedNew.meals.find((meal) => meal.id === 'sneaky-complete')!;
+	assert.equal(createdMeal.completedAt, undefined);
+	assert.equal(createdMeal.leftoverServings, undefined);
+
+	const completedAt = '2026-10-22T18:30:00.000Z';
+	const cookedState = applyButlerCommands(
+		current,
+		[{ type: 'meal.complete', id: plannedId, deductPantry: false, leftoverServings: 2 }],
+		new Date(completedAt)
+	).state;
+
+	// Omitted leftoverServings keeps existing count and preserves original completedAt
+	const omittedLeftovers = applyButlerCommands(cookedState, [
+		{
+			type: 'meal.upsert',
+			meal: {
+				id: plannedId,
+				date: '2026-10-24',
+				slot: 'Dinner',
+				recipeId: recipe.id,
+				servings: 3,
+				completedAt: '2026-10-24T20:00:00.000Z'
+			}
+		}
+	]).state;
+	const preservedMeal = omittedLeftovers.meals.find((meal) => meal.id === plannedId)!;
+	assert.equal(preservedMeal.completedAt, completedAt);
+	assert.equal(preservedMeal.leftoverServings, 2);
+
+	// Explicit partial consumption updates leftovers
+	const decremented = applyButlerCommands(omittedLeftovers, [
+		{
+			type: 'meal.upsert',
+			meal: {
+				...preservedMeal,
+				leftoverServings: 1
+			}
+		}
+	]).state;
+	assert.equal(decremented.meals.find((meal) => meal.id === plannedId)?.leftoverServings, 1);
+
+	// Explicit update above servings is clamped within servings
+	const clamped = applyButlerCommands(decremented, [
+		{
+			type: 'meal.upsert',
+			meal: {
+				...preservedMeal,
+				servings: 3,
+				leftoverServings: 9
+			}
+		}
+	]).state;
+	assert.equal(clamped.meals.find((meal) => meal.id === plannedId)?.leftoverServings, 3);
+	assert.equal(clamped.meals.find((meal) => meal.id === plannedId)?.completedAt, completedAt);
+});
+
+test('applyButlerCommands rejects duplicate pantry reductions alongside meal.complete with deductPantry true', () => {
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	current.pantry = [
+		{ id: 'garlic', name: 'garlic', quantity: 8, unit: 'cloves', category: 'Produce' },
+		{ id: 'oil', name: 'olive oil', quantity: 1, unit: 'cup', category: 'Oils' },
+		{ id: 'coffee', name: 'coffee beans', quantity: 200, unit: 'g', category: 'Pantry' }
+	];
+	current.meals = [
+		{ id: 'tonight', date: '2026-10-23', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+
+	// Reducing an existing recipe ingredient before meal.complete(deductPantry: true) fails
+	assert.throws(
+		() =>
+			applyButlerCommands(current, [
+				{
+					type: 'pantry.upsert',
+					item: { id: 'garlic', name: 'garlic', quantity: 5, unit: 'cloves', category: 'Produce' }
+				},
+				{ type: 'meal.complete', id: 'tonight', deductPantry: true }
+			]),
+		/already deducts recipe ingredients/
+	);
+
+	// Reducing via compatible unit conversion (1 cup -> 14 tbsp) fails
+	assert.throws(
+		() =>
+			applyButlerCommands(current, [
+				{
+					type: 'pantry.upsert',
+					item: {
+						id: 'oil',
+						name: 'extra virgin olive oil',
+						quantity: 14,
+						unit: 'tbsp',
+						category: 'Oils'
+					}
+				},
+				{ type: 'meal.complete', id: 'tonight', deductPantry: true }
+			]),
+		/already deducts recipe ingredients/
+	);
+
+	// Reducing or overwriting after meal.complete(deductPantry: true) also fails
+	assert.throws(
+		() =>
+			applyButlerCommands(current, [
+				{ type: 'meal.complete', id: 'tonight', deductPantry: true },
+				{
+					type: 'pantry.upsert',
+					item: { id: 'garlic', name: 'garlic', quantity: 5, unit: 'cloves', category: 'Produce' }
+				}
+			]),
+		/already deducts recipe ingredients/
+	);
+
+	// Deleting an existing recipe ingredient alongside meal.complete(deductPantry: true) fails
+	assert.throws(
+		() =>
+			applyButlerCommands(current, [
+				{ type: 'pantry.delete', id: 'garlic' },
+				{ type: 'meal.complete', id: 'tonight', deductPantry: true }
+			]),
+		/already deducts recipe ingredients/
+	);
+
+	// Adding new stock, increasing existing stock, or reducing unrelated items still succeeds
+	const allowed = applyButlerCommands(current, [
+		{
+			type: 'pantry.upsert',
+			item: { id: 'garlic', name: 'garlic', quantity: 10, unit: 'cloves', category: 'Produce' }
+		},
+		{
+			type: 'pantry.upsert',
+			item: {
+				id: 'new-potatoes',
+				name: 'baby potatoes',
+				quantity: 16,
+				unit: 'oz',
+				category: 'Produce'
+			}
+		},
+		{
+			type: 'pantry.upsert',
+			item: { id: 'coffee', name: 'coffee beans', quantity: 150, unit: 'g', category: 'Pantry' }
+		},
+		{ type: 'meal.complete', id: 'tonight', deductPantry: true }
+	]).state;
+	assert.equal(allowed.pantry.find((item) => item.id === 'garlic')?.quantity, 7);
+	assert.equal(allowed.pantry.find((item) => item.id === 'new-potatoes')?.quantity, 4);
+	assert.equal(allowed.pantry.find((item) => item.id === 'coffee')?.quantity, 150);
+
+	// Manual pantry reduction is permitted when deductPantry is false
+	const manualOnly = applyButlerCommands(current, [
+		{
+			type: 'pantry.upsert',
+			item: { id: 'garlic', name: 'garlic', quantity: 7, unit: 'cloves', category: 'Produce' }
+		},
+		{ type: 'meal.complete', id: 'tonight', deductPantry: false }
+	]).state;
+	assert.equal(manualOnly.pantry.find((item) => item.id === 'garlic')?.quantity, 7);
+	assert.ok(manualOnly.meals[0].completedAt);
 });
 
 test('butler accepts manual provenance, preserves it across edits, and emits recipe-new ui effects', () => {
