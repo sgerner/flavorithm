@@ -497,7 +497,8 @@
 				}}>Return to reviewed draft</button
 			>{/if}
 		<p class="field-help">
-			Uses your connected model. You’ll review quantities and steps before saving.
+			Structured recipe links work without AI; unstructured pages, text, and photos require a
+			connected model. You’ll review quantities and steps before saving.
 		</p>
 	</form>
 {:else}

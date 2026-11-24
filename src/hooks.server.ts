@@ -25,7 +25,11 @@ function isPublicAuthRequest(
 	pathname: string,
 	mode: 'local' | 'oidc' | 'proxy' | 'invalid'
 ): boolean {
-	return pathname === '/api/auth' && (request.method === 'GET' || mode === 'local');
+	if (pathname === '/api/auth' && (request.method === 'GET' || mode === 'local')) return true;
+	if (pathname === '/api/recipe-import' && request.method === 'POST' && mode === 'local') {
+		return true;
+	}
+	return false;
 }
 
 function isHostedChatGPTCallbackRequest(request: Request, pathname: string): boolean {
