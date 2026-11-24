@@ -229,6 +229,7 @@ export function mergeEditedRecipe(
 			saved: true,
 			...(nutritionStale !== undefined ? { nutritionStale } : {})
 		});
+		delete candidate.sampleSaved;
 		if (nutritionStale === undefined) delete candidate.nutritionStale;
 		if (!resolved.resave) {
 			return {
@@ -406,6 +407,7 @@ export function mergeEditedRecipe(
 		nutrition,
 		saved: true
 	});
+	delete merged.sampleSaved;
 	if (nutritionStale !== undefined) merged.nutritionStale = nutritionStale;
 	else delete merged.nutritionStale;
 
@@ -461,7 +463,11 @@ export function toggleSavedRecipe(
 	if (!current) return null;
 	const saved = !current.saved;
 	return {
-		recipes: recipes.map((item) => (item.id === recipeId ? { ...item, saved } : item)),
+		recipes: recipes.map((item) => {
+			if (item.id !== recipeId) return item;
+			const { sampleSaved: _sampleSaved, ...rest } = item;
+			return { ...rest, saved };
+		}),
 		saved
 	};
 }

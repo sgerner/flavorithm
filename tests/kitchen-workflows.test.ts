@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createInitialState, createNewUserState } from '../src/lib/data.ts';
 import { rankPantryRecipes, rankRecipes } from '../src/lib/discovery.ts';
 import {
 	buildShoppingList,
@@ -7,15 +8,21 @@ import {
 	unitInfo as domainUnitInfo
 } from '../src/lib/domain.ts';
 import {
+	backfillSampleData,
+	clearSampleData,
 	completeMeal,
 	convertCompatibleQuantity,
 	cookPlannedMeal,
 	deleteShoppingItem,
 	expiryStatus,
 	filterPantryItems,
+	hasSampleData,
 	listPantryCategories,
 	normalizeIngredientName,
 	normalizePantryDraft,
+	promoteSampleBookmark,
+	promoteSampleIngredient,
+	promoteSampleMeal,
 	normalizeShoppingItem,
 	reconcileShoppingList,
 	refreshWeekShopping,
@@ -28,6 +35,7 @@ import {
 	transferPurchasedItemsToPantry,
 	weekStartForDate
 } from '../src/lib/kitchen-workflows.ts';
+import { validateAppState } from '../src/lib/server/db.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -853,6 +861,257 @@ test('savePlannedMealChanges and cookPlannedMeal guard concurrently completed or
 	assert.equal(rescheduled.state.meals[0].date, '2026-10-29');
 	assert.equal(rescheduled.state.meals[0].slot, 'Lunch');
 	assert.equal(rescheduled.state.meals[0].servings, 4);
+});
+
+test('user purchases never merge into sample pantry lots and merge into user-owned lots', () => {
+	const initial = createInitialState();
+	let nextId = 0;
+	const afterFirstPurchase = transferPurchasedItemsToPantry(
+		initial.pantry,
+		[shopping('buy-oil-1', 'extra virgin olive oil', 2, 'tbsp', true)],
+		() => `user-lot-${++nextId}`
+	);
+	assert.equal(afterFirstPurchase.length, initial.pantry.length + 1);
+	const sampleOil = afterFirstPurchase.find((item) => item.id === 'pantry-olive-oil');
+	const userOil = afterFirstPurchase.find((item) => item.id === 'user-lot-1');
+	assert.ok(sampleOil?.sample);
+	assert.equal(sampleOil.quantity, 0.5);
+	assert.ok(userOil);
+	assert.equal(userOil.sample, undefined);
+	assert.equal(userOil.quantity, 2);
+	assert.equal(userOil.unit, 'tbsp');
+
+	const afterSecondPurchase = transferPurchasedItemsToPantry(
+		afterFirstPurchase,
+		[shopping('buy-oil-2', 'olive oil', 1, 'tbsp', true)],
+		() => `user-lot-${++nextId}`
+	);
+	assert.equal(afterSecondPurchase.length, afterFirstPurchase.length);
+	assert.equal(afterSecondPurchase.find((item) => item.id === 'user-lot-1')?.quantity, 3);
+
+	const cleaned = clearSampleData({ ...initial, pantry: afterSecondPurchase });
+	assert.deepEqual(
+		cleaned.pantry.map((item) => ({ id: item.id, quantity: item.quantity, unit: item.unit })),
+		[{ id: 'user-lot-1', quantity: 3, unit: 'tbsp' }]
+	);
+});
+
+test('selective cleanup removes only sample records and snapshot-guarded Undo restores them', () => {
+	const guest = createInitialState();
+	guest.pantry = transferPurchasedItemsToPantry(
+		guest.pantry,
+		[shopping('real-pasta', 'orzo', 1, 'cup', true)],
+		() => 'user-orzo'
+	);
+	guest.meals.push({
+		id: 'user-wed-dinner',
+		date: guest.meals[0].date,
+		slot: 'Breakfast',
+		recipeId: 'maple-chili-tofu',
+		servings: 3
+	});
+	guest.shopping.push(shopping('manual-tea', 'green tea', 1, 'box', false));
+	const userBookmark = guest.recipes.find((item) => item.id === 'maple-chili-tofu')!;
+	userBookmark.saved = true;
+	const ratedStarter = guest.recipes.find((item) => item.id === 'lemon-herb-chicken')!;
+	ratedStarter.rating = 5;
+	guest.preferences.ratings = { 'lemon-herb-chicken': 5 };
+
+	assert.equal(hasSampleData(guest), true);
+	const previousSnapshot = structuredClone(guest);
+	const cleaned = clearSampleData(guest);
+	const appliedJson = JSON.stringify(cleaned);
+
+	assert.equal(hasSampleData(cleaned), false);
+	assert.deepEqual(
+		cleaned.pantry.map((item) => item.id),
+		['user-orzo']
+	);
+	assert.deepEqual(
+		cleaned.meals.map((meal) => meal.id),
+		['user-wed-dinner']
+	);
+	assert.deepEqual(
+		cleaned.shopping.map((item) => item.id),
+		['manual-tea']
+	);
+	assert.deepEqual(
+		cleaned.recipes.filter((item) => item.saved).map((item) => item.id),
+		['maple-chili-tofu']
+	);
+	assert.equal(cleaned.recipes.find((item) => item.id === 'lemon-herb-chicken')?.rating, 5);
+	assert.equal(cleaned.preferences.ratings?.['lemon-herb-chicken'], 5);
+
+	// Snapshot-guarded Undo restores removed sample records when unchanged, and refuses after edits.
+	let activeKitchen = structuredClone(cleaned);
+	if (JSON.stringify(activeKitchen) === appliedJson)
+		activeKitchen = structuredClone(previousSnapshot);
+	assert.equal(hasSampleData(activeKitchen), true);
+	assert.equal(activeKitchen.pantry.length, 8);
+	assert.equal(activeKitchen.meals.length, 4);
+	assert.equal(activeKitchen.recipes.filter((item) => item.saved).length, 4);
+
+	let mutatedKitchen = structuredClone(cleaned);
+	mutatedKitchen.shopping.push(shopping('later-item', 'milk', 1, 'l', false));
+	const undoAllowed = JSON.stringify(mutatedKitchen) === appliedJson;
+	assert.equal(undoAllowed, false);
+});
+
+test('editing or completing sample records promotes them so cleanup keeps them', () => {
+	const guest = createInitialState();
+	guest.pantry = guest.pantry.map((item) =>
+		item.id === 'pantry-eggs' ? promoteSampleIngredient({ ...item, quantity: 6 }) : item
+	);
+	guest.meals = guest.meals.map((meal) =>
+		meal.id === 'meal-week-tue' ? promoteSampleMeal({ ...meal, servings: 4 }) : meal
+	);
+	guest.recipes = guest.recipes.map((item) =>
+		item.id === 'sesame-salmon-bowls' ? promoteSampleBookmark({ ...item, saved: true }) : item
+	);
+	const afterCook = completeMeal(
+		guest,
+		'meal-week-thu',
+		{ deductPantry: false, leftoverServings: 0 },
+		new Date('2026-10-22T18:00:00Z')
+	);
+
+	const cleaned = clearSampleData(afterCook);
+	assert.deepEqual(
+		cleaned.pantry.map((item) => ({ id: item.id, quantity: item.quantity })),
+		[{ id: 'pantry-eggs', quantity: 6 }]
+	);
+	assert.deepEqual(
+		cleaned.meals.map((meal) => meal.id),
+		['meal-week-tue', 'meal-week-thu']
+	);
+	assert.deepEqual(
+		cleaned.recipes.filter((item) => item.saved).map((item) => item.id),
+		['sesame-salmon-bowls']
+	);
+});
+
+test('legacy backfill tags only exact pantry and bookmark seeds and preserves ambiguous meals', () => {
+	const legacy = createInitialState();
+	for (const item of legacy.pantry) delete item.sample;
+	for (const meal of legacy.meals) delete meal.sample;
+	for (const item of legacy.recipes) delete item.sampleSaved;
+
+	// Simulate guest edits prior to sample metadata support.
+	legacy.pantry.find((item) => item.id === 'pantry-garlic')!.quantity = 3;
+	legacy.pantry.find((item) => item.id === 'pantry-olive-oil')!.name = 'avocado oil';
+	legacy.pantry.push({
+		id: 'custom-basil',
+		name: 'basil',
+		quantity: 1,
+		unit: 'bunch',
+		category: 'Produce'
+	});
+	const movedMeal = legacy.meals.find((meal) => meal.id === 'meal-week-sat')!;
+	const movedDate = new Date(`${movedMeal.date}T12:00:00Z`);
+	movedDate.setUTCDate(movedDate.getUTCDate() + 7);
+	movedMeal.date = movedDate.toISOString().slice(0, 10);
+	legacy.recipes.find((item) => item.id === 'tomato-butter-beans')!.servings = 4;
+	legacy.recipes.find((item) => item.id === 'sesame-salmon-bowls')!.description += ' User note.';
+
+	const backfilled = backfillSampleData(legacy);
+	assert.equal(backfilled.pantry.filter((item) => item.sample).length, 5);
+	assert.equal(backfilled.pantry.find((item) => item.id === 'pantry-garlic')?.sample, undefined);
+	assert.equal(backfilled.pantry.find((item) => item.id === 'pantry-olive-oil')?.sample, undefined);
+	assert.equal(backfilled.pantry.find((item) => item.id === 'custom-basil')?.sample, undefined);
+	assert.equal(backfilled.meals.filter((meal) => meal.sample).length, 0);
+	assert.equal(backfilled.meals.find((meal) => meal.id === 'meal-week-sat')?.date, movedMeal.date);
+	assert.equal(backfilled.recipes.filter((item) => item.sampleSaved).length, 1);
+	assert.equal(
+		backfilled.recipes.find((item) => item.id === 'tomato-butter-beans')?.sampleSaved,
+		undefined
+	);
+	assert.equal(
+		backfilled.recipes.find((item) => item.id === 'sesame-salmon-bowls')?.sampleSaved,
+		undefined
+	);
+
+	const cleaned = clearSampleData(backfilled);
+	assert.deepEqual(
+		cleaned.pantry.map((item) => item.id),
+		['pantry-olive-oil', 'pantry-garlic', 'custom-basil']
+	);
+	assert.deepEqual(
+		cleaned.meals.map((meal) => meal.id),
+		legacy.meals.map((meal) => meal.id)
+	);
+	assert.equal(cleaned.recipes.find((item) => item.id === 'tomato-butter-beans')?.saved, true);
+	assert.equal(cleaned.recipes.find((item) => item.id === 'sesame-salmon-bowls')?.saved, true);
+});
+
+test('registration cleanup strips untouched sample items, validates schemas, and refreshes weekly shopping', () => {
+	const untouchedGuest = createInitialState();
+	assert.ok(validateAppState(untouchedGuest));
+	const cleanUntouched = clearSampleData(untouchedGuest);
+	assert.deepEqual(cleanUntouched, createNewUserState());
+	assert.ok(validateAppState(cleanUntouched));
+
+	// Legacy snapshots without sample properties remain schema-valid too.
+	assert.ok(validateAppState(createNewUserState()));
+
+	// Guest schedules a real meal in the starter week and generates that week's shopping list.
+	const now = new Date(2026, 10, 18, 12);
+	const weekStart = '2026-11-16';
+	const activeGuest = createInitialState();
+	activeGuest.meals = [
+		{
+			id: 'meal-week-tue',
+			date: '2026-11-17',
+			slot: 'Dinner',
+			recipeId: 'lemon-herb-chicken',
+			servings: 2,
+			sample: true
+		},
+		{
+			id: 'user-orzo-dinner',
+			date: '2026-11-19',
+			slot: 'Dinner',
+			recipeId: 'lemon-chickpea-orzo',
+			servings: 2
+		}
+	];
+	activeGuest.shopping = [
+		shopping('manual-berries', 'blueberries', 1, 'pint', false),
+		...reconcileShoppingList(
+			[],
+			buildShoppingList(activeGuest.recipes, activeGuest.pantry, activeGuest.meals, now),
+			`week:${weekStart}`
+		)
+	];
+	// Before cleanup, sample chickpeas and olive oil masked the user meal's chickpea/olive oil needs,
+	// and sample chicken meal added boneless chicken thighs.
+	assert.equal(
+		activeGuest.shopping.some((item) => normalizeIngredientName(item.name) === 'chickpea'),
+		false
+	);
+	assert.equal(
+		activeGuest.shopping.some((item) => normalizeIngredientName(item.name) === 'chicken thigh'),
+		true
+	);
+
+	const registeredState = clearSampleData(activeGuest, now);
+	assert.ok(validateAppState(registeredState));
+	assert.equal(hasSampleData(registeredState), false);
+	assert.equal(
+		registeredState.shopping.some((item) => item.id === 'manual-berries'),
+		true
+	);
+	assert.equal(
+		registeredState.shopping.some((item) => normalizeIngredientName(item.name) === 'chicken thigh'),
+		false
+	);
+	assert.equal(
+		registeredState.shopping.some((item) => normalizeIngredientName(item.name) === 'chickpea'),
+		true
+	);
+	assert.equal(
+		registeredState.shopping.some((item) => normalizeIngredientName(item.name) === 'olive oil'),
+		true
+	);
 });
 
 test('normalizePantryDraft clamps quantities, trims unit to 40 chars, and normalizes optional expiry', () => {
