@@ -186,13 +186,19 @@
 	export async function close() {
 		resetReaction();
 		open = false;
+		await tick();
+		if (!launcher?.closest?.('[inert]')) {
+			launcher?.focus({ preventScroll: true });
+		}
 	}
 	async function toggle() {
-		open = !open;
 		if (open) {
-			await tick();
-			input?.focus();
+			await close();
+			return;
 		}
+		open = true;
+		await tick();
+		input?.focus();
 	}
 	function clear() {
 		if (working || messages.length === 0) return;
@@ -329,7 +335,7 @@
 		class:motion-paused={paused}
 		style={viewportStyle}
 		id="butler-panel"
-		use:focusTrap={{ onEscape: close, fallback: () => launcher }}
+		use:focusTrap={{ onEscape: close, returnFocus: () => launcher }}
 		role="dialog"
 		aria-modal="true"
 		tabindex="-1"

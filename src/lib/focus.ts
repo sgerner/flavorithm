@@ -4,8 +4,24 @@ export type FocusTarget =
 	HTMLElement | string | (() => HTMLElement | null | undefined) | null | undefined;
 
 export type FocusTrapOptions = {
-	onEscape?: () => void;
+	enabled?: boolean;
+	key?: unknown;
+	returnFocus?: FocusTarget;
 	fallback?: FocusTarget;
+	onEscape?: () => void;
+};
+
+type ResolvedTrapOptions = {
+	enabled: boolean;
+	key: unknown;
+	returnFocus?: FocusTarget;
+	fallback?: FocusTarget;
+	onEscape?: () => void;
+};
+
+type TrapEntry = {
+	node: HTMLElement;
+	deactivate: (exiting?: boolean) => void;
 };
 
 export type FocusHandoffOptions = {
@@ -20,7 +36,7 @@ export type FocusHandoffOptions = {
 };
 
 export const FOCUSABLE_SELECTOR =
-	'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),summary:not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])';
+	'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),details > summary:first-of-type:not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])';
 
 const ITEM_SELECTOR =
 	'article,li,[role="listitem"],.pantry-row,.shopping-row,.calendar-meal,.cooked-history-row,.member-row,.invite-row,.draft-ingredient,.draft-step';
@@ -34,22 +50,37 @@ type TriggerSnapshot = {
 	controlIndex: number;
 };
 
+type AncestorAnchor = {
+	el: HTMLElement;
+	parent: HTMLElement;
+	childIndex: number;
+	nextSibling: Element | null;
+	prevSibling: Element | null;
+};
+
 type HandoffSnapshot = {
 	scope: HTMLElement | null;
 	withinEl: HTMLElement | null;
+	rowEl: HTMLElement | null;
 	rowContainer: HTMLElement | null;
 	rowSelector: string;
-	rowIndex: number;
+	rowNextSibling: Element | null;
+	rowPrevSibling: Element | null;
+	rowRawIndex: number;
 	controlSelector: string;
-	controlIndex: number;
-	neighborAfter: HTMLElement | null;
-	neighborBefore: HTMLElement | null;
+	ancestors: AncestorAnchor[];
 };
 
-let activeTraps = 0;
+const activeTraps: TrapEntry[] = [];
+const MAX_RESTORE_MICROTASK_RETRIES = 8;
 let originalOverflow = '';
 let originalFocus: HTMLElement | null = null;
 let originalSnapshot: TriggerSnapshot | null = null;
+let handoffFocus: HTMLElement | null = null;
+let handoffOverflow: string | null = null;
+let handoffSnapshot: TriggerSnapshot | null = null;
+let restoreGeneration = 0;
+let cancelPendingRestore: (() => void) | null = null;
 let lastOutsideFocus: HTMLElement | null = null;
 let trackedDoc: Document | null = null;
 
@@ -60,7 +91,7 @@ function ensureFocusTracker() {
 	document.addEventListener(
 		'focusin',
 		(event) => {
-			if (activeTraps > 0) return;
+			if (activeTraps.length > 0) return;
 			const target = event.target as HTMLElement | null;
 			if (target && target !== document.body && target !== document.documentElement) {
 				lastOutsideFocus = target;
@@ -68,6 +99,17 @@ function ensureFocusTracker() {
 		},
 		true
 	);
+}
+
+function resolveTrapOptions(param?: FocusTrapOptions | boolean): ResolvedTrapOptions {
+	if (typeof param === 'boolean') return { enabled: param, key: undefined };
+	return {
+		enabled: param?.enabled ?? true,
+		key: param?.key,
+		returnFocus: param?.returnFocus,
+		fallback: param?.fallback,
+		onEscape: param?.onEscape
+	};
 }
 
 function escapeIdentifier(value: string) {
@@ -82,20 +124,49 @@ function isInert(el: Element | null | undefined): boolean {
 	return Boolean(el.closest?.('[inert]'));
 }
 
-function isHiddenInClosedDetails(el: Element): boolean {
-	const closed = el.closest?.('details:not([open])');
-	if (!closed) return false;
-	const summary = closed.querySelector?.(':scope > summary');
-	return summary !== el;
+function isDetailsOpen(details: Element): boolean {
+	return Boolean((details as HTMLDetailsElement).open || details.hasAttribute?.('open'));
+}
+
+function isFirstSummaryOfDetails(el: Element): boolean {
+	const parent = el.parentElement;
+	if (!parent || parent.tagName !== 'DETAILS') return false;
+	for (const child of Array.from(parent.children)) {
+		if (child.tagName === 'SUMMARY') return child === el;
+	}
+	return false;
+}
+
+function isHiddenInClosedDetails(el: Element, boundary?: ParentNode | null): boolean {
+	let current: Element | null = el;
+	while (current && current !== boundary) {
+		const parent: HTMLElement | null = current.parentElement;
+		if (parent && parent.tagName === 'DETAILS' && !isDetailsOpen(parent)) {
+			let firstSummary: Element | null = null;
+			for (const child of Array.from(parent.children)) {
+				if (child.tagName === 'SUMMARY') {
+					firstSummary = child;
+					break;
+				}
+			}
+			if (current !== firstSummary) return true;
+		}
+		current = parent;
+	}
+	return false;
 }
 
 function isVisible(el: HTMLElement): boolean {
 	if (el.isConnected === false) return false;
-	if (el.hasAttribute?.('hidden')) return false;
+	if ((el as HTMLElement & { hidden?: boolean }).hidden || el.hasAttribute?.('hidden')) {
+		return false;
+	}
+	if (el.closest?.('[hidden]')) return false;
 	if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
 		try {
 			const style = window.getComputedStyle(el);
 			if (style.display === 'none' || style.visibility === 'hidden') return false;
+			if (el.offsetParent === null && style.position === 'fixed') return true;
 		} catch {
 			// Ignore synthetic test elements unsupported by getComputedStyle.
 		}
@@ -112,6 +183,9 @@ export function isFocusable(el: Element | null | undefined): el is HTMLElement {
 	if (htmlEl.isConnected === false) return false;
 	if (htmlEl.hasAttribute?.('disabled') || isInert(htmlEl)) return false;
 	if (typeof htmlEl.tabIndex === 'number' && htmlEl.tabIndex < 0) return false;
+	if (htmlEl.tagName === 'SUMMARY' && !htmlEl.hasAttribute?.('tabindex')) {
+		if (!isFirstSummaryOfDetails(htmlEl)) return false;
+	}
 	if (isHiddenInClosedDetails(htmlEl)) return false;
 	return isVisible(htmlEl);
 }
@@ -125,6 +199,9 @@ function isProgrammaticallyFocusable(el: Element | null | undefined): el is HTML
 	}
 	if (htmlEl.isConnected === false) return false;
 	if (htmlEl.hasAttribute?.('disabled') || isInert(htmlEl)) return false;
+	if (htmlEl.tagName === 'SUMMARY' && !htmlEl.hasAttribute?.('tabindex')) {
+		if (!isFirstSummaryOfDetails(htmlEl)) return false;
+	}
 	if (isHiddenInClosedDetails(htmlEl)) return false;
 	return isVisible(htmlEl);
 }
@@ -132,8 +209,12 @@ function isProgrammaticallyFocusable(el: Element | null | undefined): el is HTML
 /** Return ordered Tab-focusable descendants within root. */
 export function getFocusableControls(root: ParentNode): HTMLElement[] {
 	if (!root || typeof root.querySelectorAll !== 'function') return [];
-	return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(isFocusable);
+	return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+		(el) => !isHiddenInClosedDetails(el, root) && isFocusable(el)
+	);
 }
+
+export const focusableControls = getFocusableControls;
 
 function selectorForElement(el: HTMLElement): string {
 	const firstClass = el.classList?.[0];
@@ -150,6 +231,16 @@ function matchingChildren(container: HTMLElement | null, selector: string): HTML
 			!isInert(child) &&
 			isVisible(child as HTMLElement)
 	);
+}
+
+function resolveRawFocusElement(target: FocusTarget): HTMLElement | null {
+	if (!target) return null;
+	if (typeof target === 'function') return target() ?? null;
+	if (typeof target === 'string') {
+		if (typeof document === 'undefined') return null;
+		return document.querySelector<HTMLElement>(target);
+	}
+	return target;
 }
 
 function resolveTarget(
@@ -185,7 +276,7 @@ function resolveTarget(
 function focusControlInItem(
 	item: HTMLElement,
 	controlSelector: string,
-	controlIndex: number
+	controlIndex = 0
 ): HTMLElement | null {
 	if (controlSelector) {
 		const matched = Array.from(item.querySelectorAll<HTMLElement>(controlSelector)).find(
@@ -229,6 +320,11 @@ function captureTriggerSnapshot(trigger: HTMLElement | null): TriggerSnapshot | 
 			el.isConnected !== false &&
 			!el.hasAttribute?.('disabled') &&
 			!(typeof el.tabIndex === 'number' && el.tabIndex < 0) &&
+			!(
+				el.tagName === 'SUMMARY' &&
+				!el.hasAttribute?.('tabindex') &&
+				!isFirstSummaryOfDetails(el)
+			) &&
 			!isHiddenInClosedDetails(el) &&
 			isVisible(el)
 	);
@@ -242,11 +338,18 @@ function captureTriggerSnapshot(trigger: HTMLElement | null): TriggerSnapshot | 
 	};
 }
 
-function resolveTrapReturnTarget(fallbackOption?: FocusTarget): HTMLElement | null {
-	if (isProgrammaticallyFocusable(originalFocus)) return originalFocus;
-	if (originalSnapshot) {
+function resolveTrapReturnTarget(
+	savedFocus: HTMLElement | null,
+	savedSnapshot: TriggerSnapshot | null,
+	returnFocusOption?: FocusTarget,
+	fallbackOption?: FocusTarget
+): HTMLElement | null {
+	const explicitReturn = resolveTarget(returnFocusOption);
+	if (explicitReturn) return explicitReturn;
+	if (isProgrammaticallyFocusable(savedFocus)) return savedFocus;
+	if (savedSnapshot) {
 		const { item, container, itemMatcher, itemIndex, controlSelector, controlIndex } =
-			originalSnapshot;
+			savedSnapshot;
 		if (item && item.isConnected !== false && !isInert(item) && isVisible(item)) {
 			const withinSameItem = focusControlInItem(item, controlSelector, controlIndex);
 			if (withinSameItem) return withinSameItem;
@@ -258,8 +361,8 @@ function resolveTrapReturnTarget(fallbackOption?: FocusTarget): HTMLElement | nu
 			if (neighborControl) return neighborControl;
 		}
 	}
-	const explicit = resolveTarget(fallbackOption);
-	if (explicit) return explicit;
+	const explicitFallback = resolveTarget(fallbackOption);
+	if (explicitFallback) return explicitFallback;
 	if (typeof document !== 'undefined') {
 		const landmark = document.getElementById('kitchen-content');
 		if (isProgrammaticallyFocusable(landmark)) return landmark;
@@ -267,40 +370,160 @@ function resolveTrapReturnTarget(fallbackOption?: FocusTarget): HTMLElement | nu
 	return null;
 }
 
-/** Keep keyboard focus in a modal, route Escape, and restore focus to its trigger or fallback. */
-export function focusTrap(node: HTMLElement, options: FocusTrapOptions = {}) {
-	let currentOptions = options;
-	let destroyed = false;
-	ensureFocusTracker();
-	const currentActive = (
-		typeof document !== 'undefined' ? document.activeElement : null
-	) as HTMLElement | null;
-	const previous =
-		currentActive &&
-		(typeof document === 'undefined' ||
-			(currentActive !== document.body && currentActive !== document.documentElement))
-			? currentActive
-			: lastOutsideFocus;
+function hasExternalActiveFocus(
+	preferredTarget: HTMLElement | null,
+	closingNode: HTMLElement
+): boolean {
+	if (typeof document === 'undefined') return false;
+	const active = document.activeElement as HTMLElement | null;
+	if (!active || active === document.body || active === document.documentElement) return false;
+	if (active === preferredTarget || active === closingNode || closingNode.contains?.(active)) {
+		return false;
+	}
+	if (active.closest?.('[inert], [hidden], [data-focus-backdrop]')) return false;
+	return isProgrammaticallyFocusable(active);
+}
+
+function scheduleFocusRestore(
+	closingNode: HTMLElement,
+	savedFocus: HTMLElement | null,
+	savedSnapshot: TriggerSnapshot | null,
+	returnFocusOpt?: FocusTarget,
+	fallbackOpt?: FocusTarget
+) {
+	cancelPendingRestore?.();
+	const token = ++restoreGeneration;
+
+	let restoreObserver: MutationObserver | null = null;
+	let rafId: number | null = null;
+	let cleaned = false;
+
+	const currentPreferred = () => resolveRawFocusElement(returnFocusOpt) ?? savedFocus;
+
+	const onExternalFocusIn = () => {
+		if (hasExternalActiveFocus(currentPreferred(), closingNode)) cleanup();
+	};
+
+	const cleanup = () => {
+		if (cleaned) return;
+		cleaned = true;
+		restoreObserver?.disconnect();
+		restoreObserver = null;
+		if (rafId !== null && typeof cancelAnimationFrame === 'function') {
+			cancelAnimationFrame(rafId);
+		}
+		rafId = null;
+		if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
+			document.removeEventListener('focusin', onExternalFocusIn);
+		}
+		if (cancelPendingRestore === cleanup) cancelPendingRestore = null;
+	};
+	cancelPendingRestore = cleanup;
+
+	const attempt = (): 'done' | 'inert' => {
+		if (cleaned || token !== restoreGeneration || activeTraps.length !== 0) {
+			cleanup();
+			return 'done';
+		}
+		handoffFocus = null;
+		handoffOverflow = null;
+		handoffSnapshot = null;
+
+		const preferred = currentPreferred();
+		if (hasExternalActiveFocus(preferred, closingNode)) {
+			cleanup();
+			return 'done';
+		}
+		if (
+			preferred &&
+			preferred.isConnected !== false &&
+			isVisible(preferred) &&
+			isInert(preferred)
+		) {
+			return 'inert';
+		}
+		const returnTarget = resolveTrapReturnTarget(
+			savedFocus,
+			savedSnapshot,
+			returnFocusOpt,
+			fallbackOpt
+		);
+		returnTarget?.focus({ preventScroll: true });
+		cleanup();
+		return 'done';
+	};
+
+	let retries = 0;
+	const pollMicrotask = () => {
+		if (attempt() !== 'inert') return;
+		const preferred = currentPreferred();
+		if (restoreObserver === null && preferred && typeof MutationObserver !== 'undefined') {
+			restoreObserver = new MutationObserver(() => {
+				attempt();
+			});
+			let current: HTMLElement | null = preferred;
+			while (current) {
+				restoreObserver.observe(current, { attributes: true, attributeFilter: ['inert'] });
+				current = current.parentElement;
+			}
+			if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+				document.addEventListener('focusin', onExternalFocusIn);
+			}
+		}
+		if (rafId === null && typeof requestAnimationFrame === 'function') {
+			rafId = requestAnimationFrame(() => {
+				rafId = null;
+				if (attempt() === 'inert' && restoreObserver === null) cleanup();
+			});
+		}
+		if (retries < MAX_RESTORE_MICROTASK_RETRIES) {
+			retries += 1;
+			queueMicrotask(pollMicrotask);
+		} else if (restoreObserver === null && rafId === null) {
+			cleanup();
+		}
+	};
+
+	queueMicrotask(pollMicrotask);
+}
+
+/** Keep keyboard focus in an active modal or drawer, route Escape, and restore focus on close. */
+export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean) {
+	let currentOptions = resolveTrapOptions(param);
+	let active = false;
+	let focusGeneration = 0;
+	let inertObserver: MutationObserver | null = null;
 	const controls = () => getFocusableControls(node);
 
-	if (activeTraps === 0) {
-		originalOverflow = typeof document !== 'undefined' ? document.body.style.overflow : '';
-		originalFocus = previous;
-		originalSnapshot = captureTriggerSnapshot(previous);
+	function focusInitial(force = false) {
+		const token = ++focusGeneration;
+		const applyFocus = (): boolean => {
+			if (!active || token !== focusGeneration || isInert(node) || node.isConnected === false) {
+				return true;
+			}
+			const current = (
+				typeof document !== 'undefined' ? document.activeElement : null
+			) as HTMLElement | null;
+			if (!force && current && current !== node && node.contains?.(current)) {
+				return true;
+			}
+			(controls()[0] || node).focus({ preventScroll: true });
+			const after = (
+				typeof document !== 'undefined' ? document.activeElement : null
+			) as HTMLElement | null;
+			return Boolean(after && (after === node || node.contains?.(after)));
+		};
+		queueMicrotask(() => {
+			if (!applyFocus() && typeof requestAnimationFrame === 'function') {
+				requestAnimationFrame(() => {
+					if (active && token === focusGeneration) applyFocus();
+				});
+			}
+		});
 	}
-	activeTraps += 1;
-	if (typeof document !== 'undefined') {
-		document.body.style.overflow = 'hidden';
-	}
-
-	queueMicrotask(() => {
-		if (destroyed || node.isConnected === false) return;
-		const active = typeof document !== 'undefined' ? document.activeElement : null;
-		if (active && active !== node && node.contains?.(active)) return;
-		(controls()[0] || node).focus();
-	});
 
 	function keydown(event: KeyboardEvent) {
+		if (!active) return;
 		if (event.key === 'Escape' && !event.defaultPrevented && currentOptions.onEscape) {
 			event.stopPropagation();
 			event.preventDefault();
@@ -311,47 +534,140 @@ export function focusTrap(node: HTMLElement, options: FocusTrapOptions = {}) {
 		const elements = controls();
 		if (!elements.length) {
 			event.preventDefault();
-			node.focus();
+			node.focus({ preventScroll: true });
 			return;
 		}
 		const first = elements[0];
 		const last = elements[elements.length - 1];
-		const active = (
+		const current = (
 			typeof document !== 'undefined' ? document.activeElement : null
 		) as HTMLElement | null;
-		const outside = !active || !node.contains?.(active);
-		if (event.shiftKey && (active === first || active === node || outside)) {
+		const outside = !current || !node.contains?.(current);
+		if (outside) {
 			event.preventDefault();
-			last.focus();
-		} else if (!event.shiftKey && (active === last || outside)) {
+			(event.shiftKey ? last : first).focus({ preventScroll: true });
+		} else if (event.shiftKey && (current === first || current === node)) {
 			event.preventDefault();
-			first.focus();
+			last.focus({ preventScroll: true });
+		} else if (!event.shiftKey && (current === last || current === node)) {
+			event.preventDefault();
+			first.focus({ preventScroll: true });
 		}
 	}
 
-	node.addEventListener('keydown', keydown);
+	function outrostart(event: Event) {
+		if (event.target === node) deactivate(true);
+	}
+
+	const entry: TrapEntry = {
+		node,
+		deactivate
+	};
+
+	function deactivate(exiting = false) {
+		if (!active) {
+			if (exiting) node.removeAttribute?.('aria-modal');
+			return;
+		}
+		active = false;
+		focusGeneration += 1;
+		node.removeEventListener('keydown', keydown);
+		node.removeEventListener('outrostart', outrostart);
+		inertObserver?.disconnect();
+		inertObserver = null;
+		if (exiting) node.removeAttribute?.('aria-modal');
+
+		const index = activeTraps.indexOf(entry);
+		if (index !== -1) activeTraps.splice(index, 1);
+
+		if (activeTraps.length === 0) {
+			if (typeof document !== 'undefined') {
+				document.body.style.overflow = originalOverflow;
+			}
+			const savedFocus = originalFocus;
+			const savedSnapshot = originalSnapshot;
+			const savedOverflow = originalOverflow;
+			const returnFocusOpt = currentOptions.returnFocus;
+			const fallbackOpt = currentOptions.fallback;
+			handoffFocus = savedFocus ?? resolveRawFocusElement(returnFocusOpt);
+			handoffOverflow = savedOverflow;
+			handoffSnapshot = savedSnapshot;
+			originalFocus = null;
+			originalSnapshot = null;
+
+			scheduleFocusRestore(node, savedFocus, savedSnapshot, returnFocusOpt, fallbackOpt);
+		}
+	}
+
+	function activate() {
+		if (active || !currentOptions.enabled || node.isConnected === false || isInert(node)) return;
+		ensureFocusTracker();
+		const currentActive = (
+			typeof document !== 'undefined' ? document.activeElement : null
+		) as HTMLElement | null;
+		const previous =
+			currentActive &&
+			(typeof document === 'undefined' ||
+				(currentActive !== document.body && currentActive !== document.documentElement))
+				? currentActive
+				: lastOutsideFocus;
+		const exitingTraps = activeTraps.filter(
+			(item) => item.node.isConnected === false || isInert(item.node)
+		);
+
+		if (activeTraps.length === 0) {
+			originalOverflow =
+				handoffOverflow ?? (typeof document !== 'undefined' ? document.body.style.overflow : '');
+			const explicitTrigger = resolveRawFocusElement(currentOptions.returnFocus);
+			const trigger = handoffFocus ?? explicitTrigger ?? previous;
+			originalFocus = trigger;
+			originalSnapshot = handoffSnapshot ?? captureTriggerSnapshot(trigger);
+			handoffFocus = null;
+			handoffOverflow = null;
+			handoffSnapshot = null;
+		}
+		restoreGeneration += 1;
+		cancelPendingRestore?.();
+
+		active = true;
+		activeTraps.push(entry);
+		for (const stale of exitingTraps) stale.deactivate(true);
+
+		if (typeof document !== 'undefined') {
+			document.body.style.overflow = 'hidden';
+		}
+		node.addEventListener('keydown', keydown);
+		node.addEventListener('outrostart', outrostart);
+
+		if (typeof MutationObserver !== 'undefined') {
+			inertObserver?.disconnect();
+			inertObserver = new MutationObserver(() => {
+				if (isInert(node)) deactivate(true);
+			});
+			inertObserver.observe(node, { attributes: true, attributeFilter: ['inert'] });
+		}
+
+		focusInitial(false);
+	}
+
+	if (currentOptions.enabled) activate();
 
 	return {
-		update(nextOptions: FocusTrapOptions = {}) {
-			currentOptions = nextOptions;
+		update(nextParam?: FocusTrapOptions | boolean) {
+			const next = resolveTrapOptions(nextParam);
+			const keyChanged = next.key !== currentOptions.key;
+			currentOptions = next;
+			if (currentOptions.enabled && !active) {
+				activate();
+			} else if (!currentOptions.enabled && active) {
+				deactivate(false);
+			} else if (currentOptions.enabled && active && keyChanged) {
+				node.scrollTop = 0;
+				focusInitial(true);
+			}
 		},
 		destroy() {
-			if (destroyed) return;
-			destroyed = true;
-			node.removeEventListener('keydown', keydown);
-			const fallbackOption = currentOptions.fallback;
-			queueMicrotask(() => {
-				activeTraps = Math.max(0, activeTraps - 1);
-				if (activeTraps === 0) {
-					if (typeof document !== 'undefined') {
-						document.body.style.overflow = originalOverflow;
-					}
-					const returnTarget = resolveTrapReturnTarget(fallbackOption);
-					originalFocus = null;
-					originalSnapshot = null;
-					returnTarget?.focus({ preventScroll: true });
-				}
-			});
+			deactivate(true);
 		}
 	};
 }
@@ -416,6 +732,149 @@ export function busyAction(node: HTMLElement, busy = false) {
 	};
 }
 
+function isMatchingActiveRow(
+	el: Element | null | undefined,
+	container: HTMLElement,
+	selector: string
+): el is HTMLElement {
+	return Boolean(
+		el &&
+		el.parentElement === container &&
+		typeof (el as HTMLElement).matches === 'function' &&
+		el.matches(selector) &&
+		!isInert(el) &&
+		isVisible(el as HTMLElement)
+	);
+}
+
+function resolveLazyNeighborRow(snapshot: HandoffSnapshot): HTMLElement | null {
+	const { rowContainer, rowSelector, rowEl, rowNextSibling, rowPrevSibling, rowRawIndex } =
+		snapshot;
+	if (
+		!rowContainer ||
+		!rowSelector ||
+		rowContainer.isConnected === false ||
+		isInert(rowContainer)
+	) {
+		return null;
+	}
+	const siblings = rowContainer.children;
+	let split = Math.min(rowRawIndex, siblings.length);
+	if (rowEl && rowEl.parentElement === rowContainer) {
+		const idx = Array.prototype.indexOf.call(siblings, rowEl);
+		for (let i = idx + 1; i < siblings.length; i++) {
+			if (isMatchingActiveRow(siblings[i], rowContainer, rowSelector)) {
+				return siblings[i] as HTMLElement;
+			}
+		}
+		for (let i = idx - 1; i >= 0; i--) {
+			if (isMatchingActiveRow(siblings[i], rowContainer, rowSelector)) {
+				return siblings[i] as HTMLElement;
+			}
+		}
+		return null;
+	}
+	if (rowNextSibling && rowNextSibling.parentElement === rowContainer) {
+		split = Array.prototype.indexOf.call(siblings, rowNextSibling);
+	} else if (rowPrevSibling && rowPrevSibling.parentElement === rowContainer) {
+		split = Array.prototype.indexOf.call(siblings, rowPrevSibling) + 1;
+	}
+	for (let i = split; i < siblings.length; i++) {
+		if (isMatchingActiveRow(siblings[i], rowContainer, rowSelector)) {
+			return siblings[i] as HTMLElement;
+		}
+	}
+	for (let i = split - 1; i >= 0; i--) {
+		if (isMatchingActiveRow(siblings[i], rowContainer, rowSelector)) {
+			return siblings[i] as HTMLElement;
+		}
+	}
+	return null;
+}
+
+function firstFocusableInSubtree(el: Element): HTMLElement | null {
+	if (isInert(el) || (el as HTMLElement).hasAttribute?.('hidden')) return null;
+	if (typeof el.matches === 'function' && el.matches(FOCUSABLE_SELECTOR) && isFocusable(el)) {
+		return el;
+	}
+	return getFocusableControls(el)[0] ?? null;
+}
+
+function lastFocusableInSubtree(el: Element): HTMLElement | null {
+	if (isInert(el) || (el as HTMLElement).hasAttribute?.('hidden')) return null;
+	const descendants = getFocusableControls(el);
+	if (descendants.length > 0) return descendants[descendants.length - 1];
+	if (typeof el.matches === 'function' && el.matches(FOCUSABLE_SELECTOR) && isFocusable(el)) {
+		return el;
+	}
+	return null;
+}
+
+function resolveLazyDomNeighbor(snapshot: HandoffSnapshot): HTMLElement | null {
+	const { ancestors, withinEl, scope } = snapshot;
+	if (!ancestors.length) return null;
+	const neighborRoot = withinEl ?? scope;
+
+	let anchorIndex = 0;
+	for (let i = ancestors.length - 1; i >= 0; i--) {
+		const el = ancestors[i].el;
+		if (el.isConnected === false || isInert(el) || !isVisible(el)) {
+			anchorIndex = i;
+			break;
+		}
+	}
+
+	for (let level = anchorIndex; level < ancestors.length; level++) {
+		const link = ancestors[level];
+		if (link.parent.isConnected === false || isInert(link.parent)) continue;
+		const siblings = link.parent.children;
+		let startIdx: number;
+		if (link.el.parentElement === link.parent) {
+			startIdx = Array.prototype.indexOf.call(siblings, link.el) + 1;
+		} else if (link.nextSibling && link.nextSibling.parentElement === link.parent) {
+			startIdx = Array.prototype.indexOf.call(siblings, link.nextSibling);
+		} else if (link.prevSibling && link.prevSibling.parentElement === link.parent) {
+			startIdx = Array.prototype.indexOf.call(siblings, link.prevSibling) + 1;
+		} else {
+			startIdx = Math.min(link.childIndex, siblings.length);
+		}
+		for (let i = startIdx; i < siblings.length; i++) {
+			const found = firstFocusableInSubtree(siblings[i]);
+			if (found) return found;
+		}
+	}
+
+	for (let level = anchorIndex; level < ancestors.length; level++) {
+		const link = ancestors[level];
+		if (link.parent.isConnected === false || isInert(link.parent)) continue;
+		const siblings = link.parent.children;
+		let endIdx: number;
+		if (link.el.parentElement === link.parent) {
+			endIdx = Array.prototype.indexOf.call(siblings, link.el) - 1;
+		} else if (link.prevSibling && link.prevSibling.parentElement === link.parent) {
+			endIdx = Array.prototype.indexOf.call(siblings, link.prevSibling);
+		} else if (link.nextSibling && link.nextSibling.parentElement === link.parent) {
+			endIdx = Array.prototype.indexOf.call(siblings, link.nextSibling) - 1;
+		} else {
+			endIdx = Math.min(link.childIndex, siblings.length) - 1;
+		}
+		for (let i = endIdx; i >= 0; i--) {
+			const found = lastFocusableInSubtree(siblings[i]);
+			if (found) return found;
+		}
+		if (
+			link.parent !== neighborRoot &&
+			typeof link.parent.matches === 'function' &&
+			link.parent.matches(FOCUSABLE_SELECTOR) &&
+			isFocusable(link.parent)
+		) {
+			return link.parent;
+		}
+	}
+
+	return null;
+}
+
 /** Hand off keyboard focus when a toggle, list row button, or conditional control unmounts. */
 export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {}) {
 	let currentOptions = options;
@@ -436,43 +895,42 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 			? ((node.closest?.(rowSelector) as HTMLElement | null) ?? null)
 			: null;
 		const rowContainer = rowEl?.parentElement ?? null;
-		const rows = rowSelector ? matchingChildren(rowContainer, rowSelector) : [];
-		const rowIndex = rowEl ? Math.max(0, rows.indexOf(rowEl)) : 0;
-		const rowControls = rowEl ? getFocusableControls(rowEl) : [];
+		const rowSiblings = rowContainer?.children;
+		const rowRawIndex =
+			rowEl && rowSiblings ? Array.prototype.indexOf.call(rowSiblings, rowEl) : -1;
 
-		let neighborAfter: HTMLElement | null = null;
-		let neighborBefore: HTMLElement | null = null;
 		const neighborRoot = withinEl ?? scope;
-		if (neighborRoot) {
-			const all = getFocusableControls(neighborRoot);
-			const excluded = rowEl ?? node;
-			const nodePos = all.indexOf(node);
-			if (nodePos !== -1) {
-				for (let i = nodePos + 1; i < all.length; i++) {
-					if (!excluded.contains?.(all[i]) && all[i] !== excluded) {
-						neighborAfter = all[i];
-						break;
-					}
-				}
-				for (let i = nodePos - 1; i >= 0; i--) {
-					if (!excluded.contains?.(all[i]) && all[i] !== excluded) {
-						neighborBefore = all[i];
-						break;
-					}
-				}
-			}
+		const ancestors: AncestorAnchor[] = [];
+		let cur: HTMLElement | null = rowEl ?? node;
+		while (cur && cur !== neighborRoot) {
+			const parent: HTMLElement | null = cur.parentElement;
+			if (!parent) break;
+			const siblings = parent.children;
+			const idx = Array.prototype.indexOf.call(siblings, cur);
+			ancestors.push({
+				el: cur,
+				parent,
+				childIndex: Math.max(0, idx),
+				nextSibling: idx !== -1 && idx + 1 < siblings.length ? siblings[idx + 1] : null,
+				prevSibling: idx > 0 ? siblings[idx - 1] : null
+			});
+			cur = parent;
 		}
 
 		snapshot = {
 			scope,
 			withinEl,
+			rowEl,
 			rowContainer,
 			rowSelector,
-			rowIndex,
+			rowNextSibling:
+				rowSiblings && rowRawIndex !== -1 && rowRawIndex + 1 < rowSiblings.length
+					? rowSiblings[rowRawIndex + 1]
+					: null,
+			rowPrevSibling: rowSiblings && rowRawIndex > 0 ? rowSiblings[rowRawIndex - 1] : null,
+			rowRawIndex: Math.max(0, rowRawIndex),
 			controlSelector: selectorForElement(node),
-			controlIndex: Math.max(0, rowControls.indexOf(node)),
-			neighborAfter,
-			neighborBefore
+			ancestors
 		};
 	}
 
@@ -487,17 +945,7 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 
 	function resolveHandoffTarget(): HTMLElement | null {
 		if (!snapshot) return null;
-		const {
-			scope,
-			withinEl,
-			rowContainer,
-			rowSelector,
-			rowIndex,
-			controlSelector,
-			controlIndex,
-			neighborAfter,
-			neighborBefore
-		} = snapshot;
+		const { scope, withinEl, rowSelector, controlSelector } = snapshot;
 
 		if (
 			scope &&
@@ -516,14 +964,13 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 		const fallbackScopes = [activeWithin, scope, docRoot];
 
 		if (rowSelector) {
-			const remaining = matchingChildren(rowContainer, rowSelector);
-			if (remaining.length > 0) {
-				const neighborRow = remaining[Math.min(rowIndex, remaining.length - 1)];
+			const neighborRow = resolveLazyNeighborRow(snapshot);
+			if (neighborRow) {
 				if (currentOptions.target) {
 					const targeted = resolveTarget(currentOptions.target, [neighborRow]);
 					if (targeted) return targeted;
 				}
-				const rowMatch = focusControlInItem(neighborRow, controlSelector, controlIndex);
+				const rowMatch = focusControlInItem(neighborRow, controlSelector);
 				if (rowMatch) return rowMatch;
 			}
 			const fallbackFromRow = resolveTarget(currentOptions.fallback, fallbackScopes);
@@ -536,8 +983,8 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 			if (fallback) return fallback;
 		}
 
-		if (isFocusable(neighborAfter)) return neighborAfter;
-		if (isFocusable(neighborBefore)) return neighborBefore;
+		const lazyNeighbor = resolveLazyDomNeighbor(snapshot);
+		if (lazyNeighbor) return lazyNeighbor;
 		if (activeWithin) {
 			const firstInWithin = getFocusableControls(activeWithin)[0];
 			if (firstInWithin) return firstInWithin;
@@ -553,7 +1000,7 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 		hadFocus = false;
 		if (!isFocusDropped()) return;
 		const target = resolveHandoffTarget();
-		target?.focus();
+		target?.focus({ preventScroll: true });
 	}
 
 	function onFocusIn() {
@@ -563,7 +1010,15 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 
 	function onFocusOut(event: FocusEvent) {
 		const related = event.relatedTarget as HTMLElement | null;
-		if (related && isProgrammaticallyFocusable(related) && !node.contains?.(related)) {
+		if (
+			related &&
+			(typeof document === 'undefined' ||
+				(related !== document.body && related !== document.documentElement)) &&
+			related.isConnected !== false &&
+			!related.hasAttribute?.('disabled') &&
+			!isInert(related) &&
+			!node.contains?.(related)
+		) {
 			hadFocus = false;
 			return;
 		}

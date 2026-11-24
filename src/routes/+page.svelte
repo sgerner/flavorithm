@@ -3722,6 +3722,27 @@
 			busy = false;
 		}
 	}
+	function handleWindowKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape' || e.defaultPrevented) return;
+		const wasMobileNav = mobileNav;
+		mobileNav = false;
+		if (editingRecipe) {
+			editingRecipe = null;
+			editingRecipeMode = 'edit';
+		} else if (modal) {
+			closeDialog();
+		} else if (selected) {
+			selected = null;
+			selectedMealServings = undefined;
+		} else if (butlerOpen) {
+			void butlerChat?.close();
+		} else if (!wasMobileNav && pantryDraft) {
+			void cancelPantryEdit();
+		} else if (!wasMobileNav && page === 'shopping' && editingShoppingId) {
+			e.preventDefault();
+			void cancelEditingShoppingItem();
+		}
+	}
 </script>
 
 {#if ready}
@@ -3744,30 +3765,7 @@
 	><title>{nav.find((item) => item.id === page)?.name || 'Discover'} · Flavorithm</title
 	></svelte:head
 >
-<svelte:window
-	onkeydown={(e) => {
-		if (e.key === 'Escape' && !e.defaultPrevented) {
-			if (modal) {
-				closeDialog();
-			} else if (editingRecipe) {
-				editingRecipe = null;
-				editingRecipeMode = 'edit';
-			} else if (selected) {
-				selected = null;
-				selectedMealServings = undefined;
-			} else if (butlerOpen) {
-				void butlerChat?.close();
-			} else if (mobileNav) {
-				mobileNav = false;
-			} else if (pantryDraft) {
-				void cancelPantryEdit();
-			} else if (page === 'shopping' && editingShoppingId) {
-				e.preventDefault();
-				void cancelEditingShoppingItem();
-			}
-		}
-	}}
-/>
+<svelte:window onkeydown={handleWindowKeydown} />
 <input
 	class="visually-hidden"
 	tabindex="-1"
