@@ -11,8 +11,9 @@ import {
 } from '../src/lib/recipe-scraper.ts';
 import {
 	AIRequestError,
+	fetchCaptureRecipePage,
 	importRecipeFromUrl,
-	setRecipePageFetcherForTests
+	type SecureRecipePageFetcher
 } from '../src/lib/server/ai.ts';
 
 process.env.FLAVORITHM_DB_PATH = ':memory:';
@@ -407,7 +408,7 @@ test('importRecipeFromUrl falls back to connected AI on unstructured pages with 
 			assert.equal(error.status, 422);
 			assert.match(
 				error.message,
-				/Create an account and connect a model in Settings.*paste the recipe text/i
+				/Sign in and connect a model in Settings.*paste the recipe text/i
 			);
 			return true;
 		}
@@ -512,7 +513,7 @@ test('importRecipeFromUrl falls back to connected AI on unstructured pages with 
 	assert.deepEqual(fallbackDraft.assumptions, ['Estimated servings at 4.']);
 });
 
-test('hooks.server and POST /api/recipe-import allow local guests and keyless users while enforcing OIDC/proxy auth, origin, SSRF, and rate limits', async () => {
+test('hooks.server and POST /api/recipe-import require sessions across all auth modes while allowing keyless imports and enforcing origin, SSRF, and rate limits', async () => {
 	const structuredHtml = structuredPageHtml({
 		'@context': 'https://schema.org',
 		'@type': 'Recipe',
@@ -530,7 +531,7 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 
 	const unstructuredHtml = `<!doctype html><html><body><main><h1>Plain Note</h1><p>Toast bread and top with ricotta and honey.</p></main></body></html>`;
 
-	setRecipePageFetcherForTests(async (url) => {
+	const mockPageFetcher: SecureRecipePageFetcher = async (url) => {
 		if (url.includes('unstructured')) {
 			return new Response(unstructuredHtml, {
 				status: 200,
@@ -541,7 +542,7 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 			status: 200,
 			headers: { 'content-type': 'text/html' }
 		});
-	});
+	};
 
 	const prevAuthMode = process.env.FLAVORITHM_AUTH_MODE;
 	const prevOidcIssuer = process.env.FLAVORITHM_OIDC_ISSUER;
@@ -550,39 +551,65 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 	const prevProxySecret = process.env.FLAVORITHM_PROXY_SHARED_SECRET;
 
 	try {
-		// 1. Local mode guest passes hooks.handle and imports structured URL without an account or AI key.
+		// 1. Local mode rejects unauthenticated POST /api/recipe-import with 401 (both hooks.handle and route handler).
 		process.env.FLAVORITHM_AUTH_MODE = 'local';
+		let unauthFetches = 0;
 		const guestEvent = createRouteEvent({
 			ip: '198.51.100.10',
 			body: { url: 'https://recipes.example.com/smashed-potatoes' }
 		});
 		const guestResponse = await hooks.handle({
 			event: guestEvent as never,
-			resolve: async (ev) => recipeImportRoute.POST(ev as never)
+			resolve: async (ev) =>
+				recipeImportRoute.POST(ev as never, {
+					pageFetcher: async (url, policy, signal) => {
+						unauthFetches += 1;
+						return mockPageFetcher(url, policy, signal);
+					}
+				})
 		});
-		assert.equal(guestResponse.status, 200);
-		const guestPayload = await guestResponse.json();
-		assert.equal(guestPayload.recipe.title, 'Crispy Smashed Potatoes');
-		assert.deepEqual(guestPayload.recipe.ingredients[0], {
-			name: 'baby potatoes',
-			quantity: 1.5,
-			unit: 'lb'
-		});
+		assert.equal(guestResponse.status, 401);
+		assert.equal(unauthFetches, 0);
 
-		// 2. Signed-in user without AI keys imports structured URL cleanly.
+		const directUnauthResponse = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: '198.51.100.10',
+				body: { url: 'https://recipes.example.com/smashed-potatoes' }
+			}) as never,
+			{
+				pageFetcher: async () => {
+					unauthFetches += 1;
+					return new Response(structuredHtml, { headers: { 'content-type': 'text/html' } });
+				}
+			}
+		);
+		assert.equal(directUnauthResponse.status, 401);
+		assert.equal(unauthFetches, 0);
+
+		// 2. Signed-in user without AI keys imports structured URL cleanly via hooks.handle + route handler.
 		const member = await backend.registerUser(
 			'Keyless Cook',
 			'keyless-cook@example.test',
 			'a strong keyless cook password'
 		);
-		const memberEvent = createRouteEvent({
+		const memberCookieEvent = createRouteEvent({
 			ip: '198.51.100.11',
-			user: member.user,
 			body: { url: 'https://recipes.example.com/smashed-potatoes' }
 		});
-		const memberResponse = await recipeImportRoute.POST(memberEvent as never);
+		memberCookieEvent.cookies.get = ((name: string) =>
+			name === 'flavorithm_session' ? member.token : undefined) as never;
+		const memberResponse = await hooks.handle({
+			event: memberCookieEvent as never,
+			resolve: async (ev) => recipeImportRoute.POST(ev as never, { pageFetcher: mockPageFetcher })
+		});
 		assert.equal(memberResponse.status, 200);
-		assert.equal((await memberResponse.json()).recipe.title, 'Crispy Smashed Potatoes');
+		const memberPayload = await memberResponse.json();
+		assert.equal(memberPayload.recipe.title, 'Crispy Smashed Potatoes');
+		assert.deepEqual(memberPayload.recipe.ingredients[0], {
+			name: 'baby potatoes',
+			quantity: 1.5,
+			unit: 'lb'
+		});
 
 		// 3. OIDC mode rejects unauthenticated POST /api/recipe-import with 401.
 		process.env.FLAVORITHM_AUTH_MODE = 'oidc';
@@ -596,7 +623,7 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 		});
 		const oidcGuestResponse = await hooks.handle({
 			event: oidcGuestEvent as never,
-			resolve: async (ev) => recipeImportRoute.POST(ev as never)
+			resolve: async (ev) => recipeImportRoute.POST(ev as never, { pageFetcher: mockPageFetcher })
 		});
 		assert.equal(oidcGuestResponse.status, 401);
 
@@ -610,7 +637,7 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 		});
 		const proxyGuestResponse = await hooks.handle({
 			event: proxyGuestEvent as never,
-			resolve: async (ev) => recipeImportRoute.POST(ev as never)
+			resolve: async (ev) => recipeImportRoute.POST(ev as never, { pageFetcher: mockPageFetcher })
 		});
 		assert.equal(proxyGuestResponse.status, 401);
 
@@ -652,7 +679,9 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 				throw new Error('Host AI must not be called for structured recipe pages');
 			}
 		});
-		const structuredWithHostRes = await recipeImportRoute.POST(structuredWithHostEvent as never);
+		const structuredWithHostRes = await recipeImportRoute.POST(structuredWithHostEvent as never, {
+			pageFetcher: mockPageFetcher
+		});
 		assert.equal(structuredWithHostRes.status, 200);
 		assert.equal(hostAiCalls, 0);
 
@@ -700,7 +729,8 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 			}
 		});
 		const unstructuredWithHostRes = await recipeImportRoute.POST(
-			unstructuredWithHostEvent as never
+			unstructuredWithHostEvent as never,
+			{ pageFetcher: mockPageFetcher }
 		);
 		assert.equal(unstructuredWithHostRes.status, 200);
 		assert.equal(hostAiCalls, 1);
@@ -713,67 +743,247 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 		const crossOriginRes = await recipeImportRoute.POST(
 			createRouteEvent({
 				ip: '198.51.100.16',
+				user: member.user,
 				headers: { origin: 'https://evil.example' }
-			}) as never
+			}) as never,
+			{ pageFetcher: mockPageFetcher }
 		);
 		assert.equal(crossOriginRes.status, 403);
 
 		const crossSiteFetchRes = await recipeImportRoute.POST(
 			createRouteEvent({
 				ip: '198.51.100.17',
+				user: member.user,
 				headers: { 'sec-fetch-site': 'cross-site' }
-			}) as never
+			}) as never,
+			{ pageFetcher: mockPageFetcher }
 		);
 		assert.equal(crossSiteFetchRes.status, 403);
 
 		const missingAddressRes = await recipeImportRoute.POST(
 			createRouteEvent({
-				ip: null
-			}) as never
+				ip: null,
+				user: member.user
+			}) as never,
+			{ pageFetcher: mockPageFetcher }
 		);
 		assert.equal(missingAddressRes.status, 403);
 
-		// 7. Private/local network targets and non-HTTPS schemes rejected with 400.
+		// 7. Route-level SSRF defences: literal loopback/private, IPv4-mapped IPv6, decimal hosts,
+		// DNS-to-private, DNS failure, and redirects to 169.254.169.254 or invalid targets return 400/502
+		// and never invoke the connected AI provider.
+		const ssrfUser = await backend.registerUser(
+			'SSRF Guard User',
+			'ssrf-guard-user@example.test',
+			'a strong ssrf guard password'
+		);
+		let ssrfProviderCalls = 0;
+		const ssrfProviderSpy: typeof fetch = async () => {
+			ssrfProviderCalls += 1;
+			throw new Error('AI provider must never be called when page fetch is blocked by SSRF guard');
+		};
+
+		let literalPinnedCalls = 0;
+		const literalFetcher: SecureRecipePageFetcher = (url, _policy, signal) =>
+			fetchCaptureRecipePage(url, {
+				signal,
+				resolveAddresses: async () => ['93.184.216.34'],
+				requestPinned: async () => {
+					literalPinnedCalls += 1;
+					return new Response('<html></html>', { headers: { 'content-type': 'text/html' } });
+				}
+			});
+
 		for (const forbiddenUrl of [
 			'http://recipes.example.com/smashed-potatoes',
 			'https://127.0.0.1/secret',
 			'https://192.168.1.20/router',
 			'https://localhost/internal',
-			'https://[::1]/loopback'
+			'https://[::1]/loopback',
+			'https://[::ffff:127.0.0.1]/mapped-loopback',
+			'https://[::ffff:169.254.169.254]/latest/meta-data',
+			'https://2130706433/decimal-loopback',
+			'https://2852039166/decimal-metadata',
+			'https://167772161/decimal-private'
 		]) {
 			const badTargetRes = await recipeImportRoute.POST(
 				createRouteEvent({
 					ip: '198.51.100.18',
-					body: { url: forbiddenUrl }
-				}) as never
+					user: ssrfUser.user,
+					fetcher: ssrfProviderSpy,
+					body: {
+						url: forbiddenUrl,
+						provider: 'openai',
+						model: 'gpt-4o-mini',
+						apiKey: 'sk-ssrf-guard'
+					}
+				}) as never,
+				{ pageFetcher: literalFetcher }
 			);
 			assert.equal(badTargetRes.status, 400, `expected 400 for ${forbiddenUrl}`);
 		}
+		assert.equal(literalPinnedCalls, 0);
+		assert.equal(ssrfProviderCalls, 0);
+
+		// DNS resolving to private IPv4 and IPv4-mapped IPv6 -> 400, no connection opened, no AI call.
+		for (const privateDnsAnswer of [
+			'10.0.0.25',
+			'127.0.0.1',
+			'169.254.169.254',
+			'::ffff:127.0.0.1'
+		]) {
+			let dnsPinnedCalls = 0;
+			const dnsRes = await recipeImportRoute.POST(
+				createRouteEvent({
+					ip: '198.51.100.20',
+					user: ssrfUser.user,
+					fetcher: ssrfProviderSpy,
+					body: {
+						url: 'https://rebind.example.test/recipe',
+						provider: 'openai',
+						model: 'gpt-4o-mini',
+						apiKey: 'sk-ssrf-guard'
+					}
+				}) as never,
+				{
+					pageFetcher: (url, _policy, signal) =>
+						fetchCaptureRecipePage(url, {
+							signal,
+							resolveAddresses: async () => [privateDnsAnswer],
+							requestPinned: async () => {
+								dnsPinnedCalls += 1;
+								return new Response('<html></html>', { headers: { 'content-type': 'text/html' } });
+							}
+						})
+				}
+			);
+			assert.equal(dnsRes.status, 400, `expected 400 for DNS -> ${privateDnsAnswer}`);
+			assert.equal(dnsPinnedCalls, 0);
+			assert.equal(ssrfProviderCalls, 0);
+		}
+
+		// DNS lookup failure -> 502, no AI call.
+		const dnsFailureRes = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: '198.51.100.21',
+				user: ssrfUser.user,
+				fetcher: ssrfProviderSpy,
+				body: {
+					url: 'https://nxdomain.example.test/recipe',
+					provider: 'openai',
+					model: 'gpt-4o-mini',
+					apiKey: 'sk-ssrf-guard'
+				}
+			}) as never,
+			{
+				pageFetcher: (url, _policy, signal) =>
+					fetchCaptureRecipePage(url, {
+						signal,
+						resolveAddresses: async () => {
+							throw new Error('ENOTFOUND nxdomain.example.test');
+						},
+						requestPinned: async () =>
+							new Response('<html></html>', { headers: { 'content-type': 'text/html' } })
+					})
+			}
+		);
+		assert.equal(dnsFailureRes.status, 502);
+		assert.equal(ssrfProviderCalls, 0);
+
+		// Redirect from public host to 169.254.169.254 -> 400, metadata IP never contacted, no AI call.
+		const contactedAddresses: string[] = [];
+		const redirectMetadataRes = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: '198.51.100.22',
+				user: ssrfUser.user,
+				fetcher: ssrfProviderSpy,
+				body: {
+					url: 'https://public.example.test/shortlink',
+					provider: 'openai',
+					model: 'gpt-4o-mini',
+					apiKey: 'sk-ssrf-guard'
+				}
+			}) as never,
+			{
+				pageFetcher: (url, _policy, signal) =>
+					fetchCaptureRecipePage(url, {
+						signal,
+						resolveAddresses: async (hostname) =>
+							hostname === 'public.example.test' ? ['93.184.216.34'] : ['169.254.169.254'],
+						requestPinned: async (_target, address) => {
+							contactedAddresses.push(address);
+							return new Response(null, {
+								status: 302,
+								headers: { location: 'https://169.254.169.254/latest/meta-data/' }
+							});
+						}
+					})
+			}
+		);
+		assert.equal(redirectMetadataRes.status, 400);
+		assert.deepEqual(contactedAddresses, ['93.184.216.34']);
+		assert.equal(ssrfProviderCalls, 0);
+
+		// Redirect without Location header -> 502, no AI call.
+		const redirectMissingLocationRes = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: '198.51.100.23',
+				user: ssrfUser.user,
+				fetcher: ssrfProviderSpy,
+				body: {
+					url: 'https://public.example.test/broken-redirect',
+					provider: 'openai',
+					model: 'gpt-4o-mini',
+					apiKey: 'sk-ssrf-guard'
+				}
+			}) as never,
+			{
+				pageFetcher: (url, _policy, signal) =>
+					fetchCaptureRecipePage(url, {
+						signal,
+						resolveAddresses: async () => ['93.184.216.34'],
+						requestPinned: async () => new Response(null, { status: 302 })
+					})
+			}
+		);
+		assert.equal(redirectMissingLocationRes.status, 502);
+		assert.equal(ssrfProviderCalls, 0);
 
 		// 8. Oversized request body rejected with 413.
 		const oversizedRes = await recipeImportRoute.POST(
 			createRouteEvent({
 				ip: '198.51.100.19',
+				user: member.user,
 				rawBody: JSON.stringify({ url: 'https://recipes.example.com/a', pad: 'x'.repeat(70_000) })
-			}) as never
+			}) as never,
+			{ pageFetcher: mockPageFetcher }
 		);
 		assert.equal(oversizedRes.status, 413);
 
 		// 9. Per-IP sliding-window rate limit enforced (20 requests / 15m -> 21st returns 429).
+		const ipLimitUser = await backend.registerUser(
+			'IP Limit User',
+			'ip-limit-user@example.test',
+			'a strong ip limit user password'
+		);
 		for (let i = 0; i < 20; i += 1) {
 			const okRes = await recipeImportRoute.POST(
 				createRouteEvent({
 					ip: '198.51.100.99',
+					user: ipLimitUser.user,
 					body: { url: 'https://recipes.example.com/smashed-potatoes' }
-				}) as never
+				}) as never,
+				{ pageFetcher: mockPageFetcher }
 			);
 			assert.equal(okRes.status, 200);
 		}
 		const ipLimitedRes = await recipeImportRoute.POST(
 			createRouteEvent({
 				ip: '198.51.100.99',
+				user: ipLimitUser.user,
 				body: { url: 'https://recipes.example.com/smashed-potatoes' }
-			}) as never
+			}) as never,
+			{ pageFetcher: mockPageFetcher }
 		);
 		assert.equal(ipLimitedRes.status, 429);
 
@@ -789,7 +999,8 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 					ip: `203.0.113.${i + 1}`,
 					user: frequentUser.user,
 					body: { url: 'https://recipes.example.com/smashed-potatoes' }
-				}) as never
+				}) as never,
+				{ pageFetcher: mockPageFetcher }
 			);
 			assert.equal(okRes.status, 200);
 		}
@@ -798,11 +1009,11 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 				ip: '203.0.113.250',
 				user: frequentUser.user,
 				body: { url: 'https://recipes.example.com/smashed-potatoes' }
-			}) as never
+			}) as never,
+			{ pageFetcher: mockPageFetcher }
 		);
 		assert.equal(userLimitedRes.status, 429);
 	} finally {
-		setRecipePageFetcherForTests(undefined);
 		if (prevAuthMode === undefined) delete process.env.FLAVORITHM_AUTH_MODE;
 		else process.env.FLAVORITHM_AUTH_MODE = prevAuthMode;
 		if (prevOidcIssuer === undefined) delete process.env.FLAVORITHM_OIDC_ISSUER;
@@ -814,6 +1025,60 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 		if (prevProxySecret === undefined) delete process.env.FLAVORITHM_PROXY_SHARED_SECRET;
 		else process.env.FLAVORITHM_PROXY_SHARED_SECRET = prevProxySecret;
 	}
+});
+
+test('importRecipeFromUrl honours Content-Type and meta HTML charsets for non-UTF-8 recipe pages', async () => {
+	const latin1Markup = `<!doctype html>
+<html>
+  <head>
+    <meta charset="iso-8859-1">
+    <script type="application/ld+json">${JSON.stringify({
+			'@context': 'https://schema.org',
+			'@type': 'Recipe',
+			name: 'Crème Brûlée',
+			description: 'Classic vanilla custard baked at 150°C.',
+			recipeYield: '4 servings',
+			totalTime: 'PT50M',
+			recipeIngredient: ['½ cup crème fraîche', '4 egg yolks', '¼ cup caster sugar'],
+			recipeInstructions: ['Whisk yolks and sugar.', 'Bake at 150°C until set.']
+		})}</script>
+  </head>
+  <body></body>
+</html>`;
+	const latin1Bytes = Buffer.from(latin1Markup, 'latin1');
+
+	const fromHeaderCharset = await importRecipeFromUrl(
+		{ url: 'https://recipes.example.com/creme-brulee' },
+		async () =>
+			new Response(latin1Bytes, {
+				status: 200,
+				headers: { 'content-type': 'text/html; charset=iso-8859-1' }
+			})
+	);
+	assert.equal(fromHeaderCharset.recipe.title, 'Crème Brûlée');
+	assert.equal(fromHeaderCharset.recipe.description, 'Classic vanilla custard baked at 150°C.');
+	assert.deepEqual(fromHeaderCharset.recipe.ingredients[0], {
+		name: 'crème fraîche',
+		quantity: 0.5,
+		unit: 'cup'
+	});
+	assert.deepEqual(fromHeaderCharset.recipe.ingredients[2], {
+		name: 'caster sugar',
+		quantity: 0.25,
+		unit: 'cup'
+	});
+
+	const fromMetaCharset = await importRecipeFromUrl(
+		{ url: 'https://recipes.example.com/creme-brulee-meta' },
+		async () =>
+			new Response(latin1Bytes, {
+				status: 200,
+				headers: { 'content-type': 'text/html' }
+			})
+	);
+	assert.equal(fromMetaCharset.recipe.title, 'Crème Brûlée');
+	assert.equal(fromMetaCharset.recipe.ingredients[0].name, 'crème fraîche');
+	assert.equal(fromMetaCharset.recipe.ingredients[0].quantity, 0.5);
 });
 
 test('importRecipeFromUrl skips unsupported per-100g nutrition and coerces zero-quantity AI fallback ingredients', async () => {
