@@ -6,6 +6,7 @@ import { DatabaseSync } from 'node:sqlite';
 const usage =
 	'Usage: npm run auth:reset-password -- --email <user@example.com> [--db /path/to/flavorithm.sqlite] [--password-stdin]';
 
+/** @param {string[]} args */
 function parseArguments(args) {
 	let email = '';
 	let databasePath = process.env.FLAVORITHM_DB_PATH
@@ -67,6 +68,10 @@ function readStdinPassword() {
 	return raw;
 }
 
+/**
+ * @param {string} databasePath
+ * @param {string} email
+ */
 function inspectTargetAccount(databasePath, email) {
 	if (!existsSync(databasePath) || statSync(databasePath).size === 0) {
 		throw new Error(
