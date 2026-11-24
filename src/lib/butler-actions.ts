@@ -53,7 +53,7 @@ export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerA
 			case 'recipe.complete':
 				share(index, `recipe:${command.id}`);
 				recipeChanges.set(command.id, [...(recipeChanges.get(command.id) ?? []), index]);
-				if (command.deductPantry ?? true) {
+				if (command.deductPantry) {
 					commands.forEach((candidate, candidateIndex) => {
 						if (candidate.type === 'pantry.upsert' || candidate.type === 'pantry.delete')
 							join(index, candidateIndex);
@@ -255,7 +255,7 @@ export function previewButlerCommand(
 		const recipe = findRecipe(recipeId, kitchen, batch);
 		const title = recipe?.title ?? 'Recipe';
 		const servings = typeof record?.servings === 'number' ? record.servings : recipe?.servings;
-		const deductPantry = (record?.deductPantry ?? true) === true;
+		const deductPantry = record?.deductPantry === true;
 		const leftovers =
 			clampLeftovers(
 				typeof record?.leftoverServings === 'number' ? record.leftoverServings : 0,
@@ -356,15 +356,12 @@ function describe(
 		case 'recipe.complete': {
 			const recipe = findRecipe(command.id, kitchen, batch);
 			const servings = command.servings ?? recipe?.servings;
-			const details = [
-				servings ? `${servings} ${servings === 1 ? 'serving' : 'servings'}` : 'Unscheduled',
-				command.leftoverServings ? `${command.leftoverServings} leftover` : '',
-				(command.deductPantry ?? true) ? 'deduct pantry' : 'keep pantry'
-			].filter(Boolean);
+			const deduction = command.deductPantry ? 'Deducts pantry stock' : 'Pantry stock unchanged';
+			const leftovers = clampLeftovers(command.leftoverServings ?? 0, servings) ?? 0;
 			return {
 				label: 'Mark cooked',
 				title: recipe?.title ?? 'Recipe',
-				summary: details.join(' · ')
+				summary: `${servings ? `${servings} ${servings === 1 ? 'serving' : 'servings'}` : 'Unscheduled'} · ${deduction} · ${formatLeftovers(leftovers)}`
 			};
 		}
 		case 'pantry.upsert': {

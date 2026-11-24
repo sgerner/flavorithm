@@ -978,6 +978,11 @@ test('completeRecipe records an Unscheduled completed meal, deducts stock, and r
 	assert.equal(completed.pantry.find((item) => item.id === 'pantry-spinach')?.quantity, 0);
 	assert.ok(validateAppState(completed));
 
+	const omittedDeduction = completeRecipe(initial, 'tomato-butter-beans', {}, now);
+	assert.equal(omittedDeduction.meals.length, initial.meals.length + 1);
+	assert.equal(omittedDeduction.meals.at(-1)?.slot, 'Unscheduled');
+	assert.deepEqual(omittedDeduction.pantry, initial.pantry);
+
 	const withoutDeduction = completeRecipe(
 		initial,
 		'tomato-butter-beans',

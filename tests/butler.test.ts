@@ -509,7 +509,15 @@ test('butler completes unscheduled recipes, refreshes active week:* shopping sco
 
 	const completed = applyButlerCommands(
 		withShopping,
-		[{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2, leftoverServings: 1 }],
+		[
+			{
+				type: 'recipe.complete',
+				id: 'tomato-butter-beans',
+				servings: 2,
+				deductPantry: true,
+				leftoverServings: 1
+			}
+		],
 		now
 	);
 	const spontaneous = completed.state.meals.find((meal) => meal.recipeId === 'tomato-butter-beans');
@@ -529,9 +537,28 @@ test('butler completes unscheduled recipes, refreshes active week:* shopping sco
 		)?.quantity ?? 0;
 	assert.ok(spinachAfter > spinachBefore);
 
+	const withoutDeduction = applyButlerCommands(
+		current,
+		[{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2, deductPantry: false }],
+		now
+	);
+	assert.equal(
+		withoutDeduction.state.meals.find((meal) => meal.recipeId === 'tomato-butter-beans')?.slot,
+		'Unscheduled'
+	);
+	assert.deepEqual(withoutDeduction.state.pantry, current.pantry);
+
 	const batchCompleted = applyButlerCommands(
 		current,
-		[{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 36, leftoverServings: 12 }],
+		[
+			{
+				type: 'recipe.complete',
+				id: 'tomato-butter-beans',
+				servings: 36,
+				deductPantry: false,
+				leftoverServings: 12
+			}
+		],
 		now
 	);
 	assert.equal(
@@ -552,17 +579,24 @@ test('butler completes unscheduled recipes, refreshes active week:* shopping sco
 						category: 'Produce'
 					}
 				},
-				{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2 }
+				{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2, deductPantry: true }
 			]),
 		/already deducts recipe ingredients/
 	);
 	assert.throws(() =>
 		applyButlerCommands(current, [
-			{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 1.5 }
+			{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2 }
 		])
 	);
 	assert.throws(() =>
-		applyButlerCommands(current, [{ type: 'recipe.complete', id: 'nonexistent-recipe' }])
+		applyButlerCommands(current, [
+			{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 1.5, deductPantry: false }
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{ type: 'recipe.complete', id: 'nonexistent-recipe', deductPantry: false }
+		])
 	);
 });
 
@@ -594,9 +628,22 @@ test('ButlerResponseSchema JSON schema requires deductPantry on meal.complete an
 		/leftover/i
 	);
 
+	const recipeCompleteVariant = variants.find(
+		(variant) => variant.properties?.type?.const === 'recipe.complete'
+	);
+	assert.ok(recipeCompleteVariant);
+	assert.ok(recipeCompleteVariant.required?.includes('deductPantry'));
+	assert.match(
+		String(recipeCompleteVariant.properties?.deductPantry?.description ?? ''),
+		/pantry/i
+	);
+
 	const current = createInitialState();
 	assert.throws(() =>
 		applyButlerCommands(current, [{ type: 'meal.complete', id: current.meals[0].id }])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [{ type: 'recipe.complete', id: current.recipes[0].id }])
 	);
 });
 

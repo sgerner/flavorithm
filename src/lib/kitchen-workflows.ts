@@ -657,7 +657,7 @@ export function completeRecipe(
 	const leftoverServings = Number.isFinite(options.leftoverServings)
 		? roundQuantity(Math.min(servings, Math.max(0, options.leftoverServings!)))
 		: 0;
-	const deductPantry = options.deductPantry ?? true;
+	const deductPantry = options.deductPantry ?? false;
 	const createId = options.createId ?? (() => globalThis.crypto.randomUUID());
 
 	const usedIds = new Set(state.meals.map((meal) => meal.id));

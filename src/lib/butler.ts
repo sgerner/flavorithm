@@ -124,13 +124,31 @@ const preferences = z
 export const ButlerCommandSchema = z.discriminatedUnion('type', [
 	z.object({ type: z.literal('recipe.upsert'), recipe }),
 	z.object({ type: z.literal('recipe.delete'), id }),
-	z.object({
-		type: z.literal('recipe.complete'),
-		id,
-		servings: z.number().int().min(1).max(MAX_SERVINGS).optional(),
-		leftoverServings: z.number().int().nonnegative().max(MAX_SERVINGS).optional(),
-		deductPantry: z.boolean().optional()
-	}),
+	z
+		.object({
+			type: z.literal('recipe.complete'),
+			id: id.describe('ID of the recipe in kitchen.recipes to mark cooked.'),
+			servings: z
+				.number()
+				.int()
+				.min(1)
+				.max(MAX_SERVINGS)
+				.optional()
+				.describe('Cooked whole servings; defaults to the recipe servings.'),
+			leftoverServings: z
+				.number()
+				.int()
+				.nonnegative()
+				.max(MAX_SERVINGS)
+				.optional()
+				.describe('Portions saved as leftovers from 0 up to cooked servings; defaults to 0.'),
+			deductPantry: z
+				.boolean()
+				.describe(
+					'Required: true to automatically deduct recipe ingredients from pantry stock, or false to leave pantry stock unchanged.'
+				)
+		})
+		.describe('Record an unscheduled cooked recipe and optionally deduct pantry stock.'),
 	z.object({ type: z.literal('pantry.upsert'), item: pantry }),
 	z.object({ type: z.literal('pantry.delete'), id }),
 	z.object({ type: z.literal('meal.upsert'), meal }),
@@ -308,8 +326,7 @@ export function applyButlerCommands(
 			case 'recipe.complete': {
 				requireId(state.recipes, command.id);
 				const beforePantry = state.pantry;
-				const deductPantry = command.deductPantry ?? true;
-				if (deductPantry) {
+				if (command.deductPantry) {
 					const recipe = state.recipes.find((item) => item.id === command.id);
 					for (const ingredient of recipe?.ingredients ?? []) {
 						if (
@@ -326,7 +343,7 @@ export function applyButlerCommands(
 					command.id,
 					{
 						servings: command.servings,
-						deductPantry,
+						deductPantry: command.deductPantry,
 						leftoverServings: command.leftoverServings ?? 0
 					},
 					now

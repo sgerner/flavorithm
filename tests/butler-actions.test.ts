@@ -264,6 +264,9 @@ test('invalid command payloads fail validation', () => {
 	assert.throws(() =>
 		buildButlerActions([{ type: 'meal.complete', id: kitchen.meals[0].id }], kitchen)
 	);
+	assert.throws(() =>
+		buildButlerActions([{ type: 'recipe.complete', id: kitchen.recipes[0].id }], kitchen)
+	);
 });
 
 test('meal completion and leftover cards and previews show recipe title, deduction status, and leftover count', () => {
@@ -336,18 +339,56 @@ test('meal completion and leftover cards and previews show recipe title, deducti
 test('recipe.complete and cook-mode recipe.open produce clear action cards and group related updates', () => {
 	const kitchen = createInitialState();
 	const [single] = buildButlerActions(
-		[{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 4, leftoverServings: 1 }],
+		[
+			{
+				type: 'recipe.complete',
+				id: 'tomato-butter-beans',
+				servings: 4,
+				deductPantry: true,
+				leftoverServings: 1
+			}
+		],
 		kitchen
 	);
 	assert.equal(single.label, 'Mark cooked');
 	assert.equal(single.title, 'Tomato butter beans with garlicky toast');
-	assert.equal(single.summary, '4 servings · 1 leftover · deduct pantry');
+	assert.equal(single.summary, '4 servings · Deducts pantry stock · 1 leftover');
 	assert.equal(single.destructive, false);
 	const singlePreview = previewButlerCommand(single.commands[0], kitchen, single.commands);
 	assert.match(singlePreview, /Tomato butter beans with garlicky toast/);
 	assert.match(singlePreview, /Servings: 4/);
 	assert.match(singlePreview, /Pantry deduction: Deducts pantry stock/);
 	assert.match(singlePreview, /Leftover servings: 1/);
+
+	const ungroupedWithoutDeduction = buildButlerActions(
+		[
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'extra-coffee',
+					name: 'coffee beans',
+					quantity: 250,
+					unit: 'g',
+					category: 'Pantry'
+				}
+			},
+			{ type: 'recipe.complete', id: 'tomato-butter-beans', deductPantry: false }
+		],
+		kitchen
+	);
+	assert.equal(ungroupedWithoutDeduction.length, 2);
+	assert.equal(ungroupedWithoutDeduction[1].label, 'Mark cooked');
+	assert.equal(
+		ungroupedWithoutDeduction[1].summary,
+		'2 servings · Pantry stock unchanged · 0 leftovers'
+	);
+	const skipPreview = previewButlerCommand(
+		ungroupedWithoutDeduction[1].commands[0],
+		kitchen,
+		ungroupedWithoutDeduction[1].commands
+	);
+	assert.match(skipPreview, /Pantry deduction: Pantry stock unchanged/);
+	assert.match(skipPreview, /Leftover servings: 0/);
 
 	const [openCook] = buildButlerActions(
 		[{ type: 'recipe.open', id: 'tomato-butter-beans', mode: 'cook' }],
@@ -368,7 +409,7 @@ test('recipe.complete and cook-mode recipe.open produce clear action cards and g
 					category: 'Produce'
 				}
 			},
-			{ type: 'recipe.complete', id: 'tomato-butter-beans' },
+			{ type: 'recipe.complete', id: 'tomato-butter-beans', deductPantry: true },
 			{ type: 'preferences.update', preferences: { ratings: { 'tomato-butter-beans': 5 } } }
 		],
 		kitchen
