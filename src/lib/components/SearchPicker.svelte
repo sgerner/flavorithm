@@ -177,16 +177,19 @@
 		display: flex;
 		align-items: center;
 		gap: 10px;
-		border-bottom: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--wash);
 		padding: 0 12px;
-		color: var(--muted);
+		color: var(--icon-subtle);
 	}
 	.search-control:focus-within {
-		outline: 2px solid var(--green);
+		outline: 2px solid var(--focus-outer);
 		outline-offset: 2px;
+		box-shadow: 0 0 0 2px var(--focus-inner);
 	}
-	input {
+	.search-control input,
+	.search-control input:focus,
+	.search-control input:focus-visible {
 		width: 100%;
 		min-width: 0;
 		min-height: 48px;
@@ -195,13 +198,26 @@
 		background: transparent;
 		border: 0;
 		outline: none;
+		box-shadow: none;
 	}
 	input:disabled {
 		opacity: 0.6;
 	}
 	.picker-menu {
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		border-top: 0;
+	}
+	@media (forced-colors: active) {
+		.search-control:focus-within {
+			outline: 2px solid Highlight;
+			outline-offset: 2px;
+			box-shadow: none;
+		}
+		.search-control input:focus,
+		.search-control input:focus-visible {
+			outline: none;
+			box-shadow: none;
+		}
 	}
 	.picker-options {
 		max-height: 260px;

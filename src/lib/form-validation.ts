@@ -61,14 +61,14 @@ export function describeBy(...ids: (string | false | null | undefined)[]): strin
 
 export function fieldAria(baseId: string, options: FieldAriaOptions = {}) {
 	const ids = fieldIds(baseId);
-	const resolvedErrorId = options.errorId?.trim() || ids.errorId;
+	const externalErrorId = options.errorId?.trim() || undefined;
 	const hasErrorText = typeof options.error === 'string' && options.error.trim().length > 0;
 	const isInvalid = Boolean(options.invalid || hasErrorText || options.error === true);
-	const hasErrorId = hasErrorText || (isInvalid && Boolean(options.errorId?.trim()));
 	const describedBy = describeBy(
 		options.hasHelp ? ids.helpId : undefined,
 		...(options.helpIds ?? []),
-		hasErrorId ? resolvedErrorId : undefined
+		hasErrorText ? ids.errorId : undefined,
+		isInvalid ? externalErrorId : undefined
 	);
 	const props: FieldControlProps = {
 		id: ids.id,
@@ -77,11 +77,28 @@ export function fieldAria(baseId: string, options: FieldAriaOptions = {}) {
 	};
 	return {
 		...ids,
-		errorId: resolvedErrorId,
+		errorId: hasErrorText ? ids.errorId : (externalErrorId ?? ids.errorId),
 		describedBy,
 		invalid: isInvalid,
 		props
 	};
+}
+
+export function focusFirstInvalid(container: ParentNode | null | undefined): HTMLElement | null {
+	if (!container) return null;
+	const target = container.querySelector<HTMLElement>(
+		'input[aria-invalid="true"]:not([disabled]),select[aria-invalid="true"]:not([disabled]),textarea[aria-invalid="true"]:not([disabled]),[aria-invalid="true"][tabindex]:not([disabled])'
+	);
+	if (!target) return null;
+	let details = target.closest?.('details') ?? null;
+	while (details) {
+		(details as HTMLDetailsElement).open = true;
+		details = details.parentElement?.closest?.('details') ?? null;
+	}
+	const row = target.closest?.('.field, .draft-ingredient, .draft-step') as HTMLElement | null;
+	(row ?? target).scrollIntoView?.({ block: 'nearest' });
+	target.focus({ preventScroll: true });
+	return target;
 }
 
 export function validateMealDate(value: string): string {
@@ -139,8 +156,14 @@ export function validateRegistrationName(value: string): string {
 	return '';
 }
 
-export function validateEmail(value: string): string {
+export function validateEmail(
+	value: string,
+	mode: 'register' | 'recover' | 'login' = 'register'
+): string {
 	const trimmed = value.trim();
+	if (mode === 'login') {
+		return trimmed ? '' : 'Enter your email address.';
+	}
 	if (!trimmed || trimmed.length > 254 || !EMAIL_PATTERN.test(trimmed)) {
 		return 'Enter a valid email address.';
 	}
@@ -167,11 +190,7 @@ export function validatePassword(
 
 export function validatePantryInput(value: string): string {
 	const bounded = value.slice(0, 20_000);
-	const segments = bounded
-		.split(/[,;\r\n]+(?![^\[\]]*\])/)
-		.map((entry) => entry.trim())
-		.filter(Boolean);
-	if (!segments.length) {
+	if (!/[^\s,;]+/.test(bounded)) {
 		return 'Enter at least one ingredient to add to your pantry.';
 	}
 	if (!parseIngredientLines(bounded).length) {

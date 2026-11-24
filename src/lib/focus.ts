@@ -3,28 +3,12 @@ let activeTraps = 0;
 let originalOverflow = '';
 let originalFocus: HTMLElement | null = null;
 
-export function focusFirstInvalid(container: ParentNode | null | undefined): HTMLElement | null {
-	if (!container) return null;
-	const target = container.querySelector<HTMLElement>(
-		'input[aria-invalid="true"]:not([disabled]),select[aria-invalid="true"]:not([disabled]),textarea[aria-invalid="true"]:not([disabled]),[aria-invalid="true"][tabindex]:not([disabled])'
-	);
-	if (!target) return null;
-	let details = target.closest?.('details') ?? null;
-	while (details) {
-		(details as HTMLDetailsElement).open = true;
-		details = details.parentElement?.closest?.('details') ?? null;
-	}
-	target.scrollIntoView?.({ block: 'nearest' });
-	target.focus();
-	return target;
-}
-
 export function focusTrap(node: HTMLElement) {
 	const previous = document.activeElement as HTMLElement | null;
 	const controls = () =>
 		Array.from(
 			node.querySelectorAll<HTMLElement>(
-				'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+				'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])'
 			)
 		).filter((el) => el.offsetParent !== null);
 	queueMicrotask(() => {
@@ -64,7 +48,7 @@ export function focusTrap(node: HTMLElement) {
 				const returnTarget = originalFocus;
 				queueMicrotask(() => {
 					if (activeTraps === 0 && returnTarget?.isConnected && !returnTarget.closest('[inert]'))
-						returnTarget.focus();
+						returnTarget.focus({ preventScroll: true });
 				});
 			}
 		}

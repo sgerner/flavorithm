@@ -2,11 +2,12 @@
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { tick, untrack } from 'svelte';
-	import { focusFirstInvalid, focusTrap } from '#lib/focus.ts';
+	import { focusTrap } from '#lib/focus.ts';
 	import {
 		NUTRITION_FIELDS,
 		emptyRecipeDraftValidation,
 		fieldAria,
+		focusFirstInvalid,
 		validateRecipeDraftFields
 	} from '#lib/form-validation.ts';
 	import { isValidNutrition } from '#lib/recipe-draft.ts';

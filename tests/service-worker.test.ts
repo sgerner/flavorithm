@@ -1,10 +1,53 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import test from 'node:test';
 import ts from 'typescript';
 
+const formatHost: ts.FormatDiagnosticsHost = {
+	getCanonicalFileName: (fileName) => fileName,
+	getCurrentDirectory: () => process.cwd(),
+	getNewLine: () => '\n'
+};
+
+function typecheckServiceWorker(overrideWorkerSource?: string): readonly ts.Diagnostic[] {
+	if (!existsSync('node_modules/$app/tsconfig/service-worker.json')) {
+		execFileSync(process.execPath, ['node_modules/@sveltejs/kit/svelte-kit.js', 'sync'], {
+			stdio: 'inherit'
+		});
+	}
+	const configPath = resolve('tsconfig.service-worker.json');
+	const workerPath = resolve('src/service-worker.ts');
+	const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
+	const configErrorMessage = configFile.error
+		? ts.formatDiagnostics([configFile.error], formatHost)
+		: 'Could not read tsconfig.service-worker.json';
+	assert.equal(configFile.error, undefined, configErrorMessage);
+	const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, dirname(configPath));
+	assert.equal(parsed.errors.length, 0, ts.formatDiagnostics(parsed.errors, formatHost));
+	const baseHost = ts.createCompilerHost(parsed.options);
+	if (overrideWorkerSource !== undefined) {
+		const originalGetSourceFile = baseHost.getSourceFile.bind(baseHost);
+		baseHost.getSourceFile = (fileName, languageVersion, onError, shouldCreateNewSourceFile) => {
+			if (resolve(fileName) === workerPath) {
+				return ts.createSourceFile(fileName, overrideWorkerSource, languageVersion);
+			}
+			return originalGetSourceFile(fileName, languageVersion, onError, shouldCreateNewSourceFile);
+		};
+	}
+	const program = ts.createProgram({
+		rootNames: parsed.fileNames,
+		options: parsed.options,
+		host: baseHost
+	});
+	return ts.getPreEmitDiagnostics(program);
+}
+
 // Execute the real worker against Fetch/Cache doubles to test the auth boundary, not a copy of it.
+const workerDiagnostics = typecheckServiceWorker();
+assert.equal(workerDiagnostics.length, 0, ts.formatDiagnostics(workerDiagnostics, formatHost));
 const source = ts.transpileModule(readFileSync('src/service-worker.ts', 'utf8'), {
 	compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
 }).outputText;
@@ -289,6 +332,16 @@ test('protected static fetches carry proxy credentials but never cache a login p
 			(request) => request.path === '/_app/test.js' && request.credentials === 'same-origin'
 		)
 	);
+});
+
+test('service worker semantic typecheck rejects invalid route helpers', () => {
+	assert.equal(workerDiagnostics.length, 0);
+	const broken = readFileSync('src/service-worker.ts', 'utf8').replace(
+		"resolve('/')",
+		"resolve('/api')"
+	);
+	const diagnostics = typecheckServiceWorker(broken);
+	assert.ok(diagnostics.some((diagnostic) => diagnostic.code === 2345));
 });
 
 test('manifest.webmanifest validates with application/manifest+json and serves offline', async () => {
