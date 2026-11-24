@@ -1,4 +1,4 @@
-import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
+import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
@@ -13,7 +13,7 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 			const accountId = url.searchParams.get('accountId');
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
 			const isHostAccount = accountId === HOST_CONNECTION_ID;
-			const host = isHostAccount ? getHostAI() : null;
+			const host = isHostAccount ? getHostAIFor(locals.user.id) : null;
 			if (isHostAccount && !host) {
 				return Response.json(
 					{ providers: [{ id: 'chatgpt', name: 'ChatGPT plan', models: [] }] },

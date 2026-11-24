@@ -1,4 +1,4 @@
-import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
+import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import type { RequestHandler } from './$types';
@@ -31,7 +31,7 @@ export const POST: RequestHandler = async (event) => {
 		const isObjectBody = Boolean(body && typeof body === 'object' && !Array.isArray(body));
 		const record = isObjectBody ? (body as Record<string, unknown>) : null;
 		const isSearch = record?.action === 'search';
-		const host = isSearch ? null : getHostAI();
+		const host = isSearch ? null : getHostAIFor(user.id);
 		let usingHost = false;
 
 		if (record && !isSearch) {

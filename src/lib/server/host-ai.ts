@@ -13,6 +13,16 @@ export function isHostAdmin(userId: string): boolean {
 	const configured = process.env.FLAVORITHM_HOST_ADMIN_USER_ID?.trim();
 	return Boolean(configured && configured === userId);
 }
+/** Sharing the host's paid credential with other users requires FLAVORITHM_HOST_AI_SHARED=true. */
+export function isHostAIShared(): boolean {
+	return process.env.FLAVORITHM_HOST_AI_SHARED?.trim() === 'true';
+}
+/** Host AI for a requesting user: the host admin always, everyone else only when sharing is opted in. */
+export function getHostAIFor(userId: string) {
+	const host = getHostAI();
+	if (!host) return null;
+	return host.userId === userId || isHostAIShared() ? host : null;
+}
 export function getHostAI() {
 	const row = db.prepare('SELECT user_id, account_id, model FROM host_ai WHERE id = 1').get() as
 		{ user_id: string; account_id: string; model: string } | undefined;

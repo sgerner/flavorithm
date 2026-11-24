@@ -77,7 +77,8 @@ using the existing device-code flow, choose a model, and select **Use selected
 connection for this host** in AI connection settings. If your deployment uses
 another OAuth flow, set `FLAVORITHM_CHATGPT_AUTH_FLOW=device` for device login.
 
-While enabled, authenticated AI requests use that connection and model by default,
+While enabled, the admin's AI requests use the connection by default. Other users'
+requests use it only when `FLAVORITHM_HOST_AI_SHARED=true` is set; then authenticated AI requests use that connection and model by default,
 including accounts in other households, while ignoring incompatible saved reasoning
 settings and leaving personal preferences untouched. Users can enable a personal AI
 override in settings to use their own API key or ChatGPT subscription instead. Search

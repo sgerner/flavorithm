@@ -43,8 +43,17 @@ test('only the explicitly configured host admin can share an encrypted Codex gra
 		url: new URL('https://flavorithm.example/api/connections/chatgpt'),
 		getClientAddress: () => '127.0.0.1'
 	};
+	const unshared = await (await route.GET(event as any)).json();
+	assert.equal(
+		unshared.host,
+		null,
+		'other users do not see the host connection unless sharing is on'
+	);
+	assert.ok(!unshared.accounts.some((a: { id: string }) => a.id === host.HOST_CONNECTION_ID));
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
 	const response = await route.GET(event as any);
 	const publicState = await response.json();
+	delete process.env.FLAVORITHM_HOST_AI_SHARED;
 	assert.equal(publicState.hostAdmin, false);
 	assert.deepEqual(publicState.host, { model: 'model' });
 	assert.deepEqual(publicState.accounts, [
@@ -61,6 +70,11 @@ test('only the explicitly configured host admin can share an encrypted Codex gra
 	} as any);
 	assert.equal(denied.status, 403);
 	assert.ok(host.getHostAI());
+	assert.ok(host.getHostAIFor(admin.user.id), 'the host admin always uses the host connection');
+	assert.equal(host.getHostAIFor('someone-else'), null, 'sharing is off by default');
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
+	assert.ok(host.getHostAIFor('someone-else'), 'sharing requires explicit opt-in');
+	delete process.env.FLAVORITHM_HOST_AI_SHARED;
 
 	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = other.user.id;
 	assert.equal(host.getHostAI(), null);
@@ -84,6 +98,7 @@ test('host AI acts as an overridable default, strips incompatible personal reaso
 		'correct horse battery'
 	);
 	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = admin.user.id;
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
 
 	const hostGrant = storage.saveChatGPTAccount({
 		userId: admin.user.id,
@@ -396,6 +411,7 @@ test('host AI acts as an overridable default, strips incompatible personal reaso
 
 	host.configureHostAI(admin.user.id);
 	delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+	delete process.env.FLAVORITHM_HOST_AI_SHARED;
 });
 
 test('personal preferences survive Host AI cycles, never persist host-chatgpt, and avoid 404s when Host AI stops', async () => {
@@ -406,6 +422,7 @@ test('personal preferences survive Host AI cycles, never persist host-chatgpt, a
 	);
 	const cook = await db.registerUser('Cook 3', 'host-cook-3@example.com', 'correct horse battery');
 	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = admin.user.id;
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
 
 	const hostGrant = storage.saveChatGPTAccount({
 		userId: admin.user.id,
@@ -564,6 +581,7 @@ test('personal preferences survive Host AI cycles, never persist host-chatgpt, a
 	assert.equal(unownedAiRes.status, 404);
 
 	delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+	delete process.env.FLAVORITHM_HOST_AI_SHARED;
 });
 
 test('client workflow reconciliation and kitchen state sanitization preserve personal AI preferences and usePersonalAI override', async () => {
