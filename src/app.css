@@ -3288,13 +3288,6 @@ html.dark[data-theme='nosh'] {
 	}
 }
 
-@media (prefers-reduced-motion: reduce) {
-	.calendar-grid {
-		scroll-behavior: auto;
-		scroll-snap-type: none;
-	}
-}
-
 .flavor-dialog {
 	border-radius: 0;
 	inset: auto;
@@ -3738,6 +3731,7 @@ html.dark[data-theme='nosh'] {
 		overflow-x: auto;
 		overflow-y: hidden;
 		overscroll-behavior-x: contain;
+		scroll-padding-inline: 16px;
 		scroll-snap-type: x mandatory;
 		-webkit-overflow-scrolling: touch;
 	}
@@ -3783,6 +3777,13 @@ html.dark[data-theme='nosh'] {
 
 	.calendar-meal img {
 		display: none;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.calendar-grid {
+		scroll-behavior: auto;
+		scroll-snap-type: none;
 	}
 }
 
