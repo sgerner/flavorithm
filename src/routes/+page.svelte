@@ -355,7 +355,7 @@
 		editingRecipeMode = 'edit';
 		recipeToDelete = null;
 		resetMealDialogState();
-		pantryDrafts = {};
+		pantryDraft = null;
 		editingShoppingId = '';
 		editingShoppingDraft = null;
 		shoppingFilter = 'all';
