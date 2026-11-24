@@ -25,6 +25,7 @@ const SEARCH_TIMEOUT_MS = 15_000;
 const IMPORT_TIMEOUT_MS = 8_000;
 const MAX_RECIPE_PAGE_BYTES = 1_000_000;
 const MAX_CAPTURE_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_ANTHROPIC_BASE64_BYTES = 5 * 1024 * 1024;
 
 export class AIRequestError extends Error {
 	status: number;
@@ -434,6 +435,12 @@ export function validateAIRequest(
 			if (image.byteLength > MAX_CAPTURE_IMAGE_BYTES) {
 				throw new AIRequestError('Recipe photos must be 5 MB or smaller.', 413);
 			}
+			if (request.provider === 'anthropic' && image.base64.length > MAX_ANTHROPIC_BASE64_BYTES) {
+				throw new AIRequestError(
+					'Photos sent to Anthropic must be 5 MB or smaller after encoding.',
+					413
+				);
+			}
 		}
 		const promptText = request.prompt ?? '';
 		const detectedUrl = !explicitUrl && isStandaloneRecipeUrl(promptText) ? promptText : undefined;
@@ -474,7 +481,16 @@ export function validateAIRequest(
 		if (!request.url) throw new AIRequestError('A recipe URL is required to import a recipe.');
 		validateRecipeUrl(request.url);
 	} else if (request.action === 'vision') {
-		parseDataImage(request.image);
+		const image = parseDataImage(request.image);
+		if (image.byteLength > MAX_CAPTURE_IMAGE_BYTES) {
+			throw new AIRequestError('Ingredient photos must be 5 MB or smaller.', 413);
+		}
+		if (request.provider === 'anthropic' && image.base64.length > MAX_ANTHROPIC_BASE64_BYTES) {
+			throw new AIRequestError(
+				'Photos sent to Anthropic must be 5 MB or smaller after encoding.',
+				413
+			);
+		}
 	} else if (request.action === 'chat') {
 		if (!request.messages?.length || request.messages.at(-1)?.role !== 'user' || !request.context) {
 			throw new AIRequestError(
@@ -600,6 +616,9 @@ export async function runAIRequest(
 
 	const prompt = buildPrompt(request);
 	const image = request.action === 'vision' ? parseDataImage(request.image) : undefined;
+	if (image && image.byteLength > MAX_CAPTURE_IMAGE_BYTES) {
+		throw new AIRequestError('Ingredient photos must be 5 MB or smaller.', 413);
+	}
 	assertRequestActive(requestSignal);
 	onValidated?.();
 	const modelResult = await callProvider(
@@ -1059,6 +1078,12 @@ async function callAnthropic(
 	reasoningActive = Boolean(reasoning && reasoning.enabled !== false),
 	requestSignal?: AbortSignal
 ) {
+	if (image && image.base64.length > MAX_ANTHROPIC_BASE64_BYTES) {
+		throw new AIRequestError(
+			'Photos sent to Anthropic must be 5 MB or smaller after encoding.',
+			413
+		);
+	}
 	const userContent = image
 		? [
 				{
@@ -3200,19 +3225,20 @@ export async function getSupportedModels(
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	const cache = publicCatalogCache;
 	const key = publicCatalogKey(fetcher);
-	const cached = publicCatalogCache.get(key);
+	const cached = cache.get(key);
 	const now = Date.now();
 	if (cached && now < cached.expiresAt) return cached.pending;
 
 	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		if (publicCatalogCache.get(key)?.pending === pending) {
-			publicCatalogCache.delete(key);
+		if (cache.get(key)?.pending === pending) {
+			cache.delete(key);
 		}
 		throw error;
 	});
-	publicCatalogCache.set(key, { pending, expiresAt });
+	cache.set(key, { pending, expiresAt });
 	return pending;
 }
 

@@ -442,17 +442,6 @@
 	.auth-fallback {
 		margin-top: 14px;
 	}
-	.field-help a,
-	.catalog-credit a {
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		text-decoration: underline;
-		text-underline-offset: 3px;
-	}
-	.field-help a {
-		margin-inline-start: 4px;
-	}
 	.catalog-credit {
 		color: var(--muted);
 		font-size: 14px;
