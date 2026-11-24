@@ -147,6 +147,7 @@ test('export serializer strips transient AI and voice API keys while keeping leg
 	const rawState = createInitialState();
 	rawState.preferences.reasoning = { effort: 'high', enabled: true, budgetTokens: 4096 };
 	rawState.preferences.ratings = { [rawState.recipes[0].id]: 5 };
+	rawState.preferences.usePersonalAI = true;
 
 	const pollutedState = {
 		...rawState,
@@ -154,6 +155,9 @@ test('export serializer strips transient AI and voice API keys while keeping leg
 		voiceApiKey: 'gsk-secret-voice-key',
 		preferences: {
 			...rawState.preferences,
+			chatgptAccountId: 'host-chatgpt',
+			provider: 'chatgpt',
+			model: 'gpt-5',
 			apiKey: 'sk-live-secret-nested',
 			voiceApiKey: 'dg-secret-voice-nested',
 			accessToken: 'oauth-token-should-not-export'
@@ -167,6 +171,10 @@ test('export serializer strips transient AI and voice API keys while keeping leg
 	assert.equal(serialized.includes('gsk-secret'), false);
 	assert.equal(serialized.includes('dg-secret'), false);
 	assert.equal(serialized.includes('oauth-token-should-not-export'), false);
+	assert.equal(serialized.includes('host-chatgpt'), false);
+	assert.equal(sanitized.preferences.usePersonalAI, true);
+	assert.equal(sanitized.preferences.chatgptAccountId, undefined);
+	assert.equal(sanitized.preferences.model, '');
 	assert.deepEqual(sanitized.preferences.reasoning, {
 		effort: 'high',
 		enabled: true,

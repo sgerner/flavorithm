@@ -1,3 +1,4 @@
+import { HOST_CONNECTION_ID } from '#lib/ai-connections.ts';
 import { createNewUserState } from '#lib/data.ts';
 import {
 	mergeKitchenStates,
@@ -147,6 +148,7 @@ export function sanitizeExportUser(user: User | null | undefined): User | undefi
 }
 
 function sanitizePreferences(preferences: Preferences): Preferences {
+	const isHostAccount = preferences.chatgptAccountId === HOST_CONNECTION_ID;
 	const sanitized: Preferences = {
 		diet: preferences.diet,
 		allergies: preferences.allergies,
@@ -159,7 +161,7 @@ function sanitizePreferences(preferences: Preferences): Preferences {
 		theme: preferences.theme,
 		dark: Boolean(preferences.dark),
 		provider: preferences.provider,
-		model: preferences.model
+		model: isHostAccount && preferences.provider === 'chatgpt' ? '' : preferences.model
 	};
 	if (preferences.reasoning && typeof preferences.reasoning === 'object') {
 		const reasoning: NonNullable<Preferences['reasoning']> = {
@@ -182,8 +184,11 @@ function sanitizePreferences(preferences: Preferences): Preferences {
 		}
 		sanitized.ratings = ratings;
 	}
-	if (typeof preferences.chatgptAccountId === 'string') {
+	if (typeof preferences.chatgptAccountId === 'string' && !isHostAccount) {
 		sanitized.chatgptAccountId = preferences.chatgptAccountId;
+	}
+	if (typeof preferences.usePersonalAI === 'boolean') {
+		sanitized.usePersonalAI = preferences.usePersonalAI;
 	}
 	return sanitized;
 }
