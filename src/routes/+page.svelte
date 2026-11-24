@@ -279,6 +279,7 @@
 	let toastUndo = $state<(() => void) | null>(null);
 	let toastActionLabel = $state('Undo');
 	let toastVersion = 0;
+	let exporting = $state(false);
 	let busy = $state(false);
 	let scanBusy = $state(false);
 	let scanController: AbortController | undefined;
@@ -3291,10 +3292,15 @@
 		);
 	}
 	async function exportKitchen() {
+		if (exporting) return;
+		exporting = true;
 		try {
 			commitInlineEdits();
 			const currentUser = user ? ($state.snapshot(user) as User) : null;
 			const currentState = $state.snapshot(kitchen) as AppState;
+			if (ready && currentUser && (!managedAuth || kitchenLoaded)) {
+				kitchenSync?.stage(sanitizeKitchenState(currentState));
+			}
 			const result = await exportKitchenArchive({
 				user: currentUser,
 				state: currentState,
@@ -3302,28 +3308,14 @@
 				pendingSnapshot: currentUser ? (kitchenSync?.snapshot() ?? null) : null,
 				hasPendingSync: currentUser ? pendingSync : false,
 				storage: currentUser ? localStorage : null,
-				fetchAccountExport: currentUser
-					? async () => {
-							const response = await fetch('/api/export', {
-								headers: { Accept: 'application/json' },
-								redirect: 'manual',
-								signal: AbortSignal.timeout(8000)
-							});
-							if (!response.ok || response.type === 'opaqueredirect' || response.redirected) {
-								throw new Error(`Export endpoint returned ${response.status}`);
-							}
-							return (await response.json()) as {
-								exportedAt?: string;
-								user?: User | null;
-								state?: AppState | null;
-							};
-						}
-					: undefined
+				fetcher: currentUser ? fetch : undefined
 			});
 			download(result.json, result.filename, 'application/json');
 			notify(result.notice);
 		} catch (e) {
 			notify((e as Error).message || 'Could not export your kitchen.');
+		} finally {
+			exporting = false;
 		}
 	}
 	function download(content: string, filename: string, type: string) {
