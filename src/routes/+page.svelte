@@ -864,6 +864,34 @@
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
 		});
 	}
+	function consumeLeftoverServing(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		const next = Math.max(0, Math.round((previous - 1) * 100) / 100);
+		meal.leftoverServings = next;
+		notify(
+			next > 0
+				? `1 leftover serving used · ${next} remaining.`
+				: 'Last leftover serving marked used.',
+			() => {
+				const target = kitchen.meals.find((entry) => entry.id === mealId);
+				if (target && target.leftoverServings === next) target.leftoverServings = previous;
+				else notify('Leftovers changed again. Review the current count before editing.');
+			}
+		);
+	}
+	function clearMealLeftovers(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		meal.leftoverServings = 0;
+		notify('Leftovers marked used.', () => {
+			const target = kitchen.meals.find((entry) => entry.id === mealId);
+			if (target && target.leftoverServings === 0) target.leftoverServings = previous;
+			else notify('Leftovers changed again. Review the current count before editing.');
+		});
+	}
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
 		kitchen.meals = kitchen.meals.filter((entry) => entry.id !== meal.id);
@@ -3989,10 +4017,13 @@
 										<div class="cooked-history-actions">
 											{#if meal.leftoverServings}<button
 													class="text-button"
-													onclick={() => {
-														meal.leftoverServings = 0;
-														notify('Leftovers marked used.');
-													}}>Use leftovers <Check size={15} /></button
+													aria-label={`Use 1 leftover of ${recipe.title}`}
+													onclick={() => consumeLeftoverServing(meal)}>Use 1 leftover</button
+												><button
+													class="text-button"
+													aria-label={`Clear leftovers for ${recipe.title}`}
+													onclick={() => clearMealLeftovers(meal)}
+													>Clear leftovers <Check size={15} /></button
 												>{/if}<button
 												class="text-button"
 												onclick={() => {
