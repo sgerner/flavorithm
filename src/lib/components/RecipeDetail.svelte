@@ -109,6 +109,10 @@
 					><Users size={16} />{recipe.servings} servings</span
 				>{#if recipe.difficulty}<span><ChefHat size={16} />{recipe.difficulty}</span>{/if}
 			</div>
+			{#if recipe.hidden || recipe.tags.length}<ul class="recipe-tags">
+					{#if recipe.hidden}<li class="recipe-badge">Hidden</li>{/if}
+					{#each recipe.tags as tag}<li class="recipe-badge">{tag}</li>{/each}
+				</ul>{/if}
 			<div class="detail-actions">
 				<button
 					class="primary"
