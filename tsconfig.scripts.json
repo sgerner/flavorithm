@@ -1,0 +1,8 @@
+{
+	"extends": "./tsconfig.json",
+	"include": ["server.mjs", "scripts/*.mjs"],
+	"exclude": ["build"],
+	"compilerOptions": {
+		"types": ["node", "$app/types"]
+	}
+}
