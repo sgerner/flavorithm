@@ -1,3 +1,4 @@
+import { applyRecipeRating } from '#lib/recipe-detail.ts';
 import type { Preferences, Recipe } from '#lib/types.ts';
 
 export const MAX_RECIPES = 250;
@@ -469,19 +470,29 @@ export function rateRecipeById(
 	recipes: Recipe[],
 	preferences: Preferences,
 	recipeId: string,
-	rating: number
+	rating: number | undefined
 ): { recipes: Recipe[]; preferences: Preferences } | null {
 	const current = recipes.find((item) => item.id === recipeId);
 	if (!current) return null;
+	const nextRecipe = { ...current };
+	const nextRatings = applyRecipeRating(nextRecipe, preferences.ratings, rating);
+	const nextPreferences: Preferences = { ...preferences };
+	if (nextRatings === undefined) delete nextPreferences.ratings;
+	else nextPreferences.ratings = nextRatings;
 	return {
-		recipes: recipes.map((item) => (item.id === recipeId ? { ...item, rating } : item)),
-		preferences: {
-			...preferences,
-			ratings: { ...(preferences.ratings ?? {}), [recipeId]: rating }
-		}
+		recipes: recipes.map((item) => (item.id === recipeId ? nextRecipe : item)),
+		preferences: nextPreferences
 	};
 }
 
+/**
+ * Apply a completed per-serving nutrition refresh by recipe ID.
+ *
+ * Intentionally discards the newly returned `nutrition` and sets `nutritionStale: true` if
+ * `servings` or `ingredients` changed on the live recipe while the AI request was in flight,
+ * because the response was estimated for the stale `requested` snapshot rather than the
+ * current recipe quantities.
+ */
 export function applyNutritionRefresh(
 	recipes: Recipe[],
 	recipeId: string,

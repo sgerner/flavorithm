@@ -240,6 +240,69 @@ export function reconcileShoppingList(
 	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
+export type ShoppingItemSnapshot = Pick<ShoppingItem, 'name' | 'quantity' | 'unit'>;
+
+export interface ShoppingItemDraft {
+	name: string;
+	quantity: number | null;
+	unit: string;
+}
+
+/** Clamp and trim a shopping item's editable fields so inline edits remain valid. */
+export function normalizeShoppingItem(
+	item: ShoppingItem,
+	draft?: ShoppingItemDraft | null
+): ShoppingItem {
+	const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
+	const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
+	const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
+	const rawQuantity: unknown = draft ? draft.quantity : item.quantity;
+	const parsed =
+		rawQuantity === null ||
+		rawQuantity === undefined ||
+		(typeof rawQuantity === 'string' && !rawQuantity.trim())
+			? Number.NaN
+			: Number(rawQuantity);
+	const fallbackQuantity =
+		Number.isFinite(item.quantity) &&
+		item.quantity >= 0.01 &&
+		item.quantity <= MAX_SHOPPING_QUANTITY
+			? item.quantity
+			: 1;
+	const quantity = Number.isFinite(parsed)
+		? Math.max(0.01, Math.min(parsed, MAX_SHOPPING_QUANTITY))
+		: fallbackQuantity;
+	item.name = name;
+	item.unit = unit;
+	item.quantity = quantity;
+	if (draft) {
+		draft.name = name;
+		draft.unit = unit;
+		draft.quantity = quantity;
+	}
+	return item;
+}
+
+/** Capture a shopping item's editable fields before inline editing begins. */
+export function snapshotShoppingItem(item: ShoppingItem): ShoppingItemSnapshot {
+	return {
+		name: item.name,
+		quantity: item.quantity,
+		unit: item.unit
+	};
+}
+
+/** Restore a shopping item's editable fields from a pre-edit snapshot. */
+export function revertShoppingItem(
+	item: ShoppingItem,
+	snapshot: ShoppingItemSnapshot
+): ShoppingItem {
+	item.name = snapshot.name;
+	item.quantity = snapshot.quantity;
+	item.unit = snapshot.unit;
+	return normalizeShoppingItem(item);
+}
+
 const MAX_SHOPPING_ITEMS = 1_000;
 
 function formatDateKey(date: Date): string {
@@ -615,28 +678,50 @@ export function completeMeal(
 	return { ...state, meals, pantry };
 }
 
-function formatCalendarKey(date: Date): string {
-	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseStrictDateKey(
+	value: string
+): { year: number; month: number; day: number } | undefined {
+	const trimmed = value.trim();
+	if (!DATE_KEY_RE.test(trimmed)) return undefined;
+	return parseCalendarDate(trimmed);
 }
 
-export function weekStartForDate(value: string): string {
-	const date = new Date(`${value}T12:00:00`);
-	if (Number.isNaN(date.getTime())) return value;
-	date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
-	return formatCalendarKey(date);
+function formatUtcCalendarKey(date: Date): string {
+	return `${String(date.getUTCFullYear()).padStart(4, '0')}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
 }
 
-export function refreshWeekShoppingInState(
-	state: AppState,
+export function weekStartForDate(value: string | Date): string | undefined {
+	const parsed =
+		value instanceof Date
+			? calendarDate(value)
+			: typeof value === 'string'
+				? parseStrictDateKey(value)
+				: undefined;
+	if (!parsed) return undefined;
+	const date = new Date(0);
+	date.setUTCFullYear(parsed.year, parsed.month, parsed.day);
+	date.setUTCHours(12, 0, 0, 0);
+	date.setUTCDate(date.getUTCDate() - ((date.getUTCDay() + 6) % 7));
+	return formatUtcCalendarKey(date);
+}
+
+export function refreshWeekShopping(
+	state: Pick<AppState, 'recipes' | 'pantry' | 'meals' | 'shopping'>,
 	startDate: string,
 	now: Date = new Date()
 ): ShoppingItem[] {
-	const start = new Date(`${startDate}T12:00:00`);
-	if (Number.isNaN(start.getTime())) return state.shopping;
+	const trimmed = typeof startDate === 'string' ? startDate.trim() : '';
+	const parsed = parseStrictDateKey(trimmed);
+	if (!parsed) return state.shopping;
+	const start = new Date(0);
+	start.setUTCFullYear(parsed.year, parsed.month, parsed.day);
+	start.setUTCHours(12, 0, 0, 0);
 	const dates = Array.from({ length: 7 }, (_, index) => {
 		const day = new Date(start);
-		day.setDate(day.getDate() + index);
-		return formatCalendarKey(day);
+		day.setUTCDate(day.getUTCDate() + index);
+		return formatUtcCalendarKey(day);
 	});
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const meals = state.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
@@ -644,7 +729,7 @@ export function refreshWeekShoppingInState(
 		meals.some((meal) => meal.recipeId === recipe.id)
 	);
 	const additions = buildShoppingList(recipes, state.pantry, meals, safeNow);
-	return reconcileShoppingList(state.shopping, additions, `week:${startDate}`);
+	return reconcileShoppingList(state.shopping, additions, `week:${trimmed}`);
 }
 
 export function schedulePlannedMeal(
@@ -660,9 +745,15 @@ export function schedulePlannedMeal(
 	| { status: 'scheduled'; state: AppState; meal: Meal }
 	| { status: 'missing-recipe'; state: AppState }
 	| { status: 'invalid-date'; state: AppState }
+	| { status: 'invalid-slot'; state: AppState }
 	| { status: 'invalid-servings'; state: AppState } {
-	if (!input.date || !['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
+	const normalizedDate = typeof input.date === 'string' ? input.date.trim() : '';
+	const weekStart = weekStartForDate(normalizedDate);
+	if (!weekStart) {
 		return { status: 'invalid-date', state };
+	}
+	if (!['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
+		return { status: 'invalid-slot', state };
 	}
 	const recipe = input.recipeId
 		? state.recipes.find((item) => item.id === input.recipeId)
@@ -673,14 +764,14 @@ export function schedulePlannedMeal(
 	}
 	const meal: Meal = {
 		id: input.id ?? globalThis.crypto.randomUUID(),
-		date: input.date,
+		date: normalizedDate,
 		slot: input.slot,
 		recipeId: recipe.id,
 		servings: input.servings
 	};
 	const nextMeals = [...state.meals, meal];
 	const nextWithMeals = { ...state, meals: nextMeals };
-	const shopping = refreshWeekShoppingInState(nextWithMeals, weekStartForDate(input.date));
+	const shopping = refreshWeekShopping(nextWithMeals, weekStart);
 	return { status: 'scheduled', state: { ...nextWithMeals, shopping }, meal };
 }
 
@@ -696,27 +787,34 @@ export function savePlannedMealChanges(
 	| { status: 'updated'; state: AppState }
 	| { status: 'missing'; state: AppState }
 	| { status: 'completed'; state: AppState }
+	| { status: 'invalid-date'; state: AppState }
 	| { status: 'invalid-slot'; state: AppState }
 	| { status: 'invalid-servings'; state: AppState } {
 	const meal = state.meals.find((item) => item.id === input.mealId);
 	if (!meal) return { status: 'missing', state };
 	if (meal.completedAt) return { status: 'completed', state };
-	if (!input.date || !['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
+	const normalizedDate = typeof input.date === 'string' ? input.date.trim() : '';
+	const nextWeek = weekStartForDate(normalizedDate);
+	if (!nextWeek) {
+		return { status: 'invalid-date', state };
+	}
+	if (!['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
 		return { status: 'invalid-slot', state };
 	}
 	if (!isValidServings(input.servings)) {
 		return { status: 'invalid-servings', state };
 	}
 	const previousWeek = weekStartForDate(meal.date);
-	const nextWeek = weekStartForDate(input.date);
 	const meals = state.meals.map((item) =>
 		item.id === input.mealId
-			? { ...item, date: input.date, slot: input.slot, servings: Math.round(input.servings) }
+			? { ...item, date: normalizedDate, slot: input.slot, servings: Math.round(input.servings) }
 			: item
 	);
 	let nextState: AppState = { ...state, meals };
 	for (const weekStart of new Set([previousWeek, nextWeek])) {
-		nextState = { ...nextState, shopping: refreshWeekShoppingInState(nextState, weekStart) };
+		if (weekStart) {
+			nextState = { ...nextState, shopping: refreshWeekShopping(nextState, weekStart) };
+		}
 	}
 	return { status: 'updated', state: nextState };
 }
@@ -753,7 +851,8 @@ export function cookPlannedMeal(
 		},
 		now
 	);
-	const shopping = refreshWeekShoppingInState(completed, weekStartForDate(meal.date));
+	const weekStart = weekStartForDate(meal.date);
+	const shopping = weekStart ? refreshWeekShopping(completed, weekStart, now) : completed.shopping;
 	const recipe = completed.recipes.find((item) => item.id === meal.recipeId);
 	return { status: 'cooked', state: { ...completed, shopping }, meal, recipe };
 }

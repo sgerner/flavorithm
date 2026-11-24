@@ -283,6 +283,11 @@ test('ID-keyed recipe helpers update cloned arrays, skip missing recipes, and de
 	assert.ok(rated);
 	assert.equal(rated.recipes[0].rating, 4);
 	assert.equal(rated.preferences.ratings?.soup, 4);
+	const cleared = rateRecipeById(rated.recipes, rated.preferences, 'soup', undefined);
+	assert.ok(cleared);
+	assert.equal(cleared.recipes[0].rating, undefined);
+	assert.equal('rating' in cleared.recipes[0], false);
+	assert.equal(cleared.preferences.ratings?.soup, undefined);
 	assert.equal(rateRecipeById(clonedAfterSync, state.preferences, 'missing', 4), null);
 
 	const freshNutrition = {
@@ -306,23 +311,46 @@ test('ID-keyed recipe helpers update cloned arrays, skip missing recipes, and de
 	assert.deepEqual(refreshedClean.recipes[0].nutrition, freshNutrition);
 	assert.equal(refreshedClean.recipes[0].nutritionStale, false);
 
-	const editedInFlight = [
+	// Mid-flight servings change discards stale AI nutrition even when latest.nutritionStale was false:
+	const servingsChangedInFlight = [
 		{
 			...clonedAfterSync[0],
 			servings: clonedAfterSync[0].servings + 2,
-			nutritionStale: true
+			nutritionStale: false
 		}
 	];
-	const refreshedStale = applyNutritionRefresh(
-		editedInFlight,
+	const refreshedServingsStale = applyNutritionRefresh(
+		servingsChangedInFlight,
 		'soup',
 		{ servings: clonedAfterSync[0].servings, ingredients: clonedAfterSync[0].ingredients },
 		freshNutrition
 	);
-	assert.ok(refreshedStale);
-	assert.equal(refreshedStale.nutritionStale, true);
-	assert.equal(refreshedStale.recipes[0].nutritionStale, true);
-	assert.deepEqual(refreshedStale.recipes[0].nutrition, clonedAfterSync[0].nutrition);
+	assert.ok(refreshedServingsStale);
+	assert.equal(refreshedServingsStale.nutritionStale, true);
+	assert.equal(refreshedServingsStale.recipes[0].nutritionStale, true);
+	assert.deepEqual(refreshedServingsStale.recipes[0].nutrition, clonedAfterSync[0].nutrition);
+
+	// Mid-flight ingredients change also discards stale AI nutrition and sets nutritionStale: true:
+	const ingredientsChangedInFlight = [
+		{
+			...clonedAfterSync[0],
+			ingredients: [
+				...clonedAfterSync[0].ingredients,
+				{ name: 'heavy cream', quantity: 0.5, unit: 'cup' }
+			],
+			nutritionStale: false
+		}
+	];
+	const refreshedIngredientsStale = applyNutritionRefresh(
+		ingredientsChangedInFlight,
+		'soup',
+		{ servings: clonedAfterSync[0].servings, ingredients: clonedAfterSync[0].ingredients },
+		freshNutrition
+	);
+	assert.ok(refreshedIngredientsStale);
+	assert.equal(refreshedIngredientsStale.nutritionStale, true);
+	assert.equal(refreshedIngredientsStale.recipes[0].nutritionStale, true);
+	assert.deepEqual(refreshedIngredientsStale.recipes[0].nutrition, clonedAfterSync[0].nutrition);
 	assert.equal(
 		applyNutritionRefresh(
 			clonedAfterSync,

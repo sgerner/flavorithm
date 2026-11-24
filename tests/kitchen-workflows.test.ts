@@ -16,12 +16,17 @@ import {
 	listPantryCategories,
 	normalizeIngredientName,
 	normalizePantryDraft,
+	normalizeShoppingItem,
 	reconcileShoppingList,
+	refreshWeekShopping,
 	restockDepletedPantryItems,
 	restoreShoppingItem,
+	revertShoppingItem,
 	savePlannedMealChanges,
 	schedulePlannedMeal,
-	transferPurchasedItemsToPantry
+	snapshotShoppingItem,
+	transferPurchasedItemsToPantry,
+	weekStartForDate
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
 
@@ -1054,6 +1059,71 @@ test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and 
 	);
 });
 
+test('normalizeShoppingItem trims, bounds lengths, and clamps or defaults quantities', () => {
+	const blank = shopping('blank', '   ', null as unknown as number, '  ', false, 'recipe:soup');
+	normalizeShoppingItem(blank);
+	assert.equal(blank.name, 'Shopping item');
+	assert.equal(blank.unit, 'piece');
+	assert.equal(blank.quantity, 1);
+
+	const oversized = shopping(
+		'long',
+		`  ${'a'.repeat(240)}  `,
+		5_000_000,
+		` ${'u'.repeat(50)} `,
+		true
+	);
+	normalizeShoppingItem(oversized);
+	assert.equal(oversized.name, 'a'.repeat(200));
+	assert.equal(oversized.unit, 'u'.repeat(40));
+	assert.equal(oversized.quantity, 1_000_000);
+
+	const tiny = shopping('tiny', ' garlic ', 0, ' cloves ', false);
+	normalizeShoppingItem(tiny);
+	assert.equal(tiny.name, 'garlic');
+	assert.equal(tiny.unit, 'cloves');
+	assert.equal(tiny.quantity, 0.01);
+
+	const nonFinite = shopping('nan', 'salt', Number.NaN, 'tsp', false);
+	normalizeShoppingItem(nonFinite);
+	assert.equal(nonFinite.quantity, 1);
+
+	const withDraft = shopping('draft-item', 'San Marzano tomatoes', 2.5, 'cans', false);
+	const validDraft = { name: '  Roma tomatoes  ', quantity: 4, unit: ' lb ' };
+	normalizeShoppingItem(withDraft, validDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'lb');
+	assert.deepEqual(validDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'lb' });
+
+	const clearedDraft = { name: '   ', quantity: null, unit: '   ' };
+	normalizeShoppingItem(withDraft, clearedDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'piece');
+	assert.deepEqual(clearedDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'piece' });
+});
+
+test('snapshotShoppingItem and revertShoppingItem restore pre-edit fields while keeping row metadata', () => {
+	const item = shopping('row-1', 'Olive oil', 2, 'tbsp', false, 'week:2026-10-19');
+	const snapshot = snapshotShoppingItem(item);
+
+	item.name = '   ';
+	normalizeShoppingItem(item);
+	item.name = 'Garlic';
+	item.quantity = 12;
+	item.unit = 'cloves';
+	item.checked = true;
+
+	revertShoppingItem(item, snapshot);
+	assert.equal(item.id, 'row-1');
+	assert.equal(item.name, 'Olive oil');
+	assert.equal(item.quantity, 2);
+	assert.equal(item.unit, 'tbsp');
+	assert.equal(item.checked, true);
+	assert.equal(item.sourceKey, 'week:2026-10-19');
+});
+
 test('restockDepletedPantryItems moves selected or all zero-quantity rows while keeping stored name and unit', () => {
 	const initialPantry = [
 		pantry('chickpeas', 0, 'can (15 oz)'),
@@ -1261,4 +1331,102 @@ test('filterPantryItems excludes zero-quantity rows from Expiring soon while kee
 		),
 		['spinach-depleted', 'rice-stocked']
 	);
+});
+
+test('weekStartForDate accepts YYYY-MM-DD strings and Dates and returns undefined for malformed dates', () => {
+	assert.equal(weekStartForDate('2026-10-19'), '2026-10-19');
+	assert.equal(weekStartForDate('2026-10-22'), '2026-10-19');
+	assert.equal(weekStartForDate('2026-10-25'), '2026-10-19');
+	assert.equal(weekStartForDate(new Date(2026, 9, 25, 23, 30)), '2026-10-19');
+	assert.equal(weekStartForDate('2024-02-29'), '2024-02-26');
+
+	for (const malformed of [
+		'',
+		'   ',
+		'not-a-date',
+		'2026-02-30',
+		'2026-13-01',
+		'2026-00-10',
+		'2026-10-32',
+		'2026/10/22',
+		'2026-10-22T00:00:00Z'
+	]) {
+		assert.equal(weekStartForDate(malformed), undefined, `expected undefined for "${malformed}"`);
+	}
+	assert.equal(weekStartForDate(new Date(Number.NaN)), undefined);
+});
+
+test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar dates without mutating state', () => {
+	const pasta = recipe({
+		id: 'pasta',
+		servings: 2,
+		ingredients: [{ name: 'spaghetti', quantity: 200, unit: 'g' }]
+	});
+	const initial = state({ recipes: [pasta] });
+
+	for (const badDate of [
+		'',
+		'   ',
+		'not-a-date',
+		'2026-02-30',
+		'2026-13-01',
+		'2026/10/22',
+		'2026-10-22T00:00:00Z'
+	]) {
+		const attempt = schedulePlannedMeal(initial, {
+			recipeId: 'pasta',
+			date: badDate,
+			slot: 'Dinner',
+			servings: 2
+		});
+		assert.equal(attempt.status, 'invalid-date', `expected invalid-date for "${badDate}"`);
+		assert.equal(attempt.state, initial);
+		assert.equal(attempt.state.meals.length, 0);
+		assert.equal(attempt.state.shopping.length, 0);
+	}
+
+	const invalidSlotAttempt = schedulePlannedMeal(initial, {
+		recipeId: 'pasta',
+		date: '2026-10-22',
+		slot: 'Snack',
+		servings: 2
+	});
+	assert.equal(invalidSlotAttempt.status, 'invalid-slot');
+	assert.equal(invalidSlotAttempt.state, initial);
+
+	const scheduled = schedulePlannedMeal(initial, {
+		id: 'meal-1',
+		recipeId: 'pasta',
+		date: '  2026-10-22  ',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(scheduled.status, 'scheduled');
+	if (scheduled.status !== 'scheduled') return;
+	assert.equal(scheduled.meal.date, '2026-10-22');
+	assert.equal(scheduled.state.shopping.length, 1);
+	assert.equal(scheduled.state.shopping[0].sourceKey, 'week:2026-10-19');
+
+	for (const badDate of [
+		'',
+		'   ',
+		'not-a-date',
+		'2026-02-30',
+		'2026-13-01',
+		'2026/10/22',
+		'2026-10-22T00:00:00Z'
+	]) {
+		const editAttempt = savePlannedMealChanges(scheduled.state, {
+			mealId: 'meal-1',
+			date: badDate,
+			slot: 'Dinner',
+			servings: 4
+		});
+		assert.equal(editAttempt.status, 'invalid-date', `expected invalid-date for "${badDate}"`);
+		assert.equal(editAttempt.state, scheduled.state);
+		assert.equal(editAttempt.state.meals[0].date, '2026-10-22');
+		assert.equal(editAttempt.state.meals[0].servings, 2);
+	}
+
+	assert.equal(refreshWeekShopping(scheduled.state, '2026-02-30'), scheduled.state.shopping);
 });

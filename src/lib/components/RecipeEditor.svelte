@@ -15,7 +15,16 @@
 	import { tick, untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
-	import { Check, Plus, X } from '@lucide/svelte';
+	import {
+		describeInvalidControl,
+		hasRecipeEditorChanges,
+		insertDraftItem,
+		MAX_DRAFT_INGREDIENTS,
+		MAX_DRAFT_STEPS,
+		moveDraftItem,
+		openClosedImportNotes
+	} from '#lib/recipe-draft.ts';
+	import { ArrowDown, ArrowUp, Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
 	let {
 		recipe,
@@ -32,8 +41,10 @@
 		cancel: () => void;
 		save: (recipe: Recipe, options?: RecipeMergeOptions) => RecipeEditorSaveResult | void;
 	} = $props();
-	let draft = $state<Recipe>(untrack(() => cloneRecipe(recipe)));
-	let tagsText = $state(draft.tags.join(', '));
+	const initialDraft = untrack(() => cloneRecipe(recipe));
+	const initialTagsText = initialDraft.tags.join(', ');
+	let draft = $state<Recipe>(cloneRecipe(initialDraft));
+	let tagsText = $state(initialTagsText);
 	let error = $state('');
 	let conflicts = $state<RecipeFieldConflict[]>([]);
 	let promptedRemoval = $state<'unsaved' | 'deleted' | null>(null);
@@ -42,9 +53,15 @@
 	);
 	let activeRemoval = $derived(mode === 'edit' ? (remoteRemoval ?? promptedRemoval) : null);
 	let uploading = $state(false);
+	let confirmingDiscard = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let alertBox = $state<HTMLElement>();
 	let errorBox = $state<HTMLElement>();
+	let formEl = $state<HTMLFormElement>();
+	let nutritionDetails = $state<HTMLDetailsElement>();
+	let cancelButton = $state<HTMLButtonElement>();
+	let keepEditingButton = $state<HTMLButtonElement>();
+	let pendingInvalid: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null = null;
 	$effect(() => {
 		if (!remoteRemoval && promptedRemoval && liveRecipe?.saved) {
 			promptedRemoval = null;
@@ -68,11 +85,155 @@
 		const text = String(value);
 		return text.length > 180 ? `${text.slice(0, 180)}…` : text;
 	}
+	function scrollAndFocus(row: HTMLElement | undefined, control: HTMLElement | null | undefined) {
+		row?.scrollIntoView({ block: 'nearest' });
+		control?.scrollIntoView({ block: 'nearest' });
+		control?.focus({ preventScroll: true });
+	}
+	async function addIngredient(afterIndex?: number) {
+		const inserted = insertDraftItem(
+			draft.ingredients,
+			afterIndex ?? draft.ingredients.length - 1,
+			{ name: '', quantity: 1, unit: 'piece' },
+			MAX_DRAFT_INGREDIENTS
+		);
+		if (!inserted) return;
+		confirmingDiscard = false;
+		draft.ingredients = inserted.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLInputElement>('.ingredient-name'));
+	}
+	async function moveIngredient(index: number, direction: -1 | 1) {
+		const moved = moveDraftItem(draft.ingredients, index, direction);
+		if (!moved) return;
+		confirmingDiscard = false;
+		draft.ingredients = moved.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLInputElement>('.ingredient-name')
+		);
+	}
+	async function removeIngredient(index: number) {
+		confirmingDiscard = false;
+		draft.ingredients = draft.ingredients.filter((_, i) => i !== index);
+		await tick();
+		const rows = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLInputElement>('.ingredient-name')?.focus({ preventScroll: true });
+		} else {
+			formEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[0]
+				?.focus({ preventScroll: true });
+		}
+	}
+	async function addStep(afterIndex?: number) {
+		const inserted = insertDraftItem(
+			draft.steps,
+			afterIndex ?? draft.steps.length - 1,
+			'',
+			MAX_DRAFT_STEPS
+		);
+		if (!inserted) return;
+		confirmingDiscard = false;
+		draft.steps = inserted.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-step')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLTextAreaElement>('textarea'));
+	}
+	async function moveStep(index: number, direction: -1 | 1) {
+		const moved = moveDraftItem(draft.steps, index, direction);
+		if (!moved) return;
+		confirmingDiscard = false;
+		draft.steps = moved.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-step')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLTextAreaElement>('textarea')
+		);
+	}
+	async function removeStep(index: number) {
+		confirmingDiscard = false;
+		draft.steps = draft.steps.filter((_, i) => i !== index);
+		await tick();
+		const rows = formEl?.querySelectorAll<HTMLElement>('.draft-step');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLTextAreaElement>('textarea')?.focus({ preventScroll: true });
+		} else {
+			formEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[1]
+				?.focus({ preventScroll: true });
+		}
+	}
+	async function handleInvalid(event: Event) {
+		const target = event.target;
+		if (!(
+			target instanceof HTMLInputElement ||
+			target instanceof HTMLTextAreaElement ||
+			target instanceof HTMLSelectElement
+		)) {
+			return;
+		}
+		openClosedImportNotes(target);
+		if (nutritionDetails?.open) nutritionOpen = true;
+		event.preventDefault();
+		if (pendingInvalid) return;
+		pendingInvalid = target;
+		confirmingDiscard = false;
+		error = describeInvalidControl(target);
+		await tick();
+		const control = pendingInvalid;
+		pendingInvalid = null;
+		scrollAndFocus(
+			control.closest<HTMLElement>('.field, .draft-ingredient, .draft-step') ?? undefined,
+			control
+		);
+	}
+	async function requestCancel() {
+		if (
+			!hasRecipeEditorChanges(
+				{ draft: initialDraft, tagsText: initialTagsText },
+				{ draft, tagsText }
+			)
+		) {
+			cancel();
+			return;
+		}
+		confirmingDiscard = true;
+		await tick();
+		keepEditingButton?.scrollIntoView({ block: 'nearest' });
+		keepEditingButton?.focus({ preventScroll: true });
+	}
+	async function keepEditing() {
+		confirmingDiscard = false;
+		await tick();
+		cancelButton?.focus({ preventScroll: true });
+	}
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
 		if (!canUploadCover || !file) return;
 		uploading = true;
+		confirmingDiscard = false;
 		error = '';
 		try {
 			const body = await prepareCover(file);
@@ -104,14 +265,16 @@
 	function isNutritionValid(target: Recipe): boolean {
 		return nutritionFields.every(
 			([key]) =>
+				typeof target.nutrition[key] === 'number' &&
 				Number.isFinite(target.nutrition[key]) &&
 				target.nutrition[key] >= 0 &&
 				target.nutrition[key] <= 1000000
 		);
 	}
 	let nutritionOpen = $state(untrack(() => !isNutritionValid(draft)));
-	function buildValidatedDraft(): Recipe | null {
+	async function buildValidatedDraft(): Promise<Recipe | null> {
 		error = '';
+		confirmingDiscard = false;
 		const title = draft.title.trim();
 		const tags = [
 			...new Set(
@@ -138,7 +301,14 @@
 				return null;
 			}
 		}
-		const nutritionValid = isNutritionValid(draft);
+		const invalidNutritionIndex = nutritionFields.findIndex(
+			([key]) =>
+				typeof draft.nutrition[key] !== 'number' ||
+				!Number.isFinite(draft.nutrition[key]) ||
+				draft.nutrition[key] < 0 ||
+				draft.nutrition[key] > 1000000
+		);
+		const nutritionValid = invalidNutritionIndex === -1;
 		if (
 			!title ||
 			title.length > 200 ||
@@ -149,7 +319,7 @@
 			draft.servings < 1 ||
 			draft.servings > 10000 ||
 			!ingredients.length ||
-			ingredients.length > 60 ||
+			ingredients.length > MAX_DRAFT_INGREDIENTS ||
 			ingredients.some(
 				(item) =>
 					!item.name ||
@@ -161,7 +331,7 @@
 					item.quantity > 1000000
 			) ||
 			!steps.length ||
-			steps.length > 40 ||
+			steps.length > MAX_DRAFT_STEPS ||
 			steps.some((step) => step.length > 10000) ||
 			tags.length > 30 ||
 			tags.some((tag) => tag.length > 100) ||
@@ -170,6 +340,16 @@
 			if (!nutritionValid) nutritionOpen = true;
 			error =
 				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
+			if (invalidNutritionIndex !== -1 && nutritionDetails) {
+				nutritionDetails.open = true;
+				await tick();
+				const input =
+					nutritionDetails.querySelectorAll<HTMLInputElement>('input')[invalidNutritionIndex];
+				scrollAndFocus(input?.closest<HTMLElement>('.field') ?? undefined, input);
+			} else {
+				await tick();
+				errorBox?.scrollIntoView({ block: 'nearest' });
+			}
 			return null;
 		}
 		return cloneRecipe({
@@ -186,7 +366,8 @@
 	}
 	async function submitDraft(options?: RecipeMergeOptions) {
 		if (uploading) return;
-		const validated = buildValidatedDraft();
+		if (options && formEl && !formEl.checkValidity()) return;
+		const validated = await buildValidatedDraft();
 		if (!validated) {
 			await tick();
 			errorBox?.scrollIntoView({ block: 'nearest' });
@@ -309,7 +490,12 @@
 				</div>
 			</section>
 		{/if}
-		<form onsubmit={saveDraft} novalidate>
+		<form
+			bind:this={formEl}
+			onsubmit={saveDraft}
+			oninvalidcapture={handleInvalid}
+			oninput={() => (confirmingDiscard = false)}
+		>
 			<div class="draft-summary">
 				<label class="field draft-title"
 					>Title<input bind:value={draft.title} required maxlength="200" /></label
@@ -367,6 +553,7 @@
 							class="text-button"
 							disabled={uploading}
 							onclick={() => {
+								confirmingDiscard = false;
 								draft.image = '';
 							}}>Remove cover</button
 						>{/if}
@@ -398,9 +585,8 @@
 				<button
 					class="text-button"
 					type="button"
-					disabled={draft.ingredients.length >= 60}
-					onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
-					><Plus size={17} />Add</button
+					disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+					onclick={() => void addIngredient()}><Plus size={17} />Add</button
 				>
 			</div>
 			<div class="draft-ingredients">
@@ -431,41 +617,98 @@
 							maxlength="40"
 							placeholder="Unit"
 						/>
-						<button
-							class="icon-button"
-							type="button"
-							aria-label={`Remove ingredient ${i + 1}`}
-							onclick={() =>
-								(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
-							><X size={18} /></button
-						>
+						<div class="draft-row-actions">
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move ingredient ${i + 1} up`}
+								disabled={i === 0}
+								onclick={() => void moveIngredient(i, -1)}><ArrowUp size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move ingredient ${i + 1} down`}
+								disabled={i === draft.ingredients.length - 1}
+								onclick={() => void moveIngredient(i, 1)}><ArrowDown size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Insert below ingredient ${i + 1}`}
+								disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+								onclick={() => void addIngredient(i)}><Plus size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Remove ingredient ${i + 1}`}
+								onclick={() => void removeIngredient(i)}><X size={18} /></button
+							>
+						</div>
 					</div>{/each}
 			</div>
+			<button
+				class="secondary draft-list-add"
+				type="button"
+				disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+				onclick={() => void addIngredient()}><Plus size={17} />Add ingredient</button
+			>
 			<div class="draft-section-heading">
 				<h3>Steps</h3>
 				<button
 					class="text-button"
 					type="button"
-					disabled={draft.steps.length >= 40}
-					onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
+					disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+					onclick={() => void addStep()}><Plus size={17} />Add</button
 				>
 			</div>
-			{#each draft.steps as step, i}<div class="draft-step">
-					<span>{i + 1}</span><textarea
-						aria-label={`Step ${i + 1}`}
-						bind:value={draft.steps[i]}
-						required
-						maxlength="10000"
-						rows="2"></textarea>
-					<button
-						class="icon-button"
-						type="button"
-						aria-label={`Remove step ${i + 1}`}
-						onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
-						><X size={18} /></button
-					>
-				</div>{/each}
-			<details class="import-notes" bind:open={nutritionOpen}>
+			<div class="draft-steps">
+				{#each draft.steps as _, i}<div class="draft-step">
+						<span>{i + 1}</span><textarea
+							aria-label={`Step ${i + 1}`}
+							bind:value={draft.steps[i]}
+							required
+							maxlength="10000"
+							rows="2"></textarea>
+						<div class="draft-row-actions">
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move step ${i + 1} up`}
+								disabled={i === 0}
+								onclick={() => void moveStep(i, -1)}><ArrowUp size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move step ${i + 1} down`}
+								disabled={i === draft.steps.length - 1}
+								onclick={() => void moveStep(i, 1)}><ArrowDown size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Insert below step ${i + 1}`}
+								disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+								onclick={() => void addStep(i)}><Plus size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Remove step ${i + 1}`}
+								onclick={() => void removeStep(i)}><X size={18} /></button
+							>
+						</div>
+					</div>{/each}
+			</div>
+			<button
+				class="secondary draft-list-add"
+				type="button"
+				disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+				onclick={() => void addStep()}><Plus size={17} />Add step</button
+			>
+			<details class="import-notes" bind:this={nutritionDetails} bind:open={nutritionOpen}>
 				<summary>Nutrition estimates</summary>
 				<p>
 					Estimated values per serving. Ingredient or serving changes will mark these values as
@@ -485,11 +728,31 @@
 				</div>
 			</details>
 			{#if error}<p class="error" role="alert" bind:this={errorBox}>{error}</p>{/if}
-			<div class="draft-footer">
-				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
-				<button class="primary" type="submit" disabled={uploading}
-					><Check size={18} />{mode === 'create' ? 'Save recipe' : 'Save changes'}</button
-				>
+			<div class="draft-footer" class:confirming-discard={confirmingDiscard}>
+				{#if confirmingDiscard}
+					<p class="discard-prompt" role="status">Discard unsaved changes?</p>
+					<div class="draft-footer-actions">
+						<button
+							class="secondary"
+							type="button"
+							bind:this={keepEditingButton}
+							onclick={() => void keepEditing()}>Keep editing</button
+						>
+						<button class="primary danger-button" type="button" onclick={cancel}
+							>Discard changes</button
+						>
+					</div>
+				{:else}
+					<button
+						class="secondary"
+						type="button"
+						bind:this={cancelButton}
+						onclick={() => void requestCancel()}>Cancel</button
+					>
+					<button class="primary" type="submit" disabled={uploading}
+						><Check size={18} />{mode === 'create' ? 'Save recipe' : 'Save changes'}</button
+					>
+				{/if}
 			</div>
 		</form>
 	</div>
