@@ -239,6 +239,7 @@ const recipeSchema = z.object({
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
+	sampleSaved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
 
@@ -277,7 +278,8 @@ const appStateSchema = z.object({
 				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				category: z.string().max(100),
-				expires: z.string().max(50).optional()
+				expires: z.string().max(50).optional(),
+				sample: z.boolean().optional()
 			})
 		)
 		.max(1_000),
@@ -291,7 +293,8 @@ const appStateSchema = z.object({
 				recipeId: z.string().max(100),
 				servings: z.number().min(1).max(10_000),
 				completedAt: z.string().max(50).optional(),
-				leftoverServings: z.number().min(0).max(10_000).optional()
+				leftoverServings: z.number().finite().min(0).max(10_000).optional(),
+				sample: z.boolean().optional()
 			})
 		)
 		.max(1_000),
