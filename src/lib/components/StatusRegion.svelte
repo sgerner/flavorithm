@@ -5,24 +5,40 @@
 	import {
 		statusStore,
 		dismissToast,
+		isToastVisibleForOwner,
 		runToastUndo,
 		setToastFocused,
 		setToastHovered
 	} from '#lib/status.ts';
 
-	let { modal = false, muted = false }: { modal?: boolean; muted?: boolean } = $props();
+	let {
+		modal = false,
+		open = true,
+		muted = false,
+		owner
+	}: {
+		modal?: boolean;
+		open?: boolean;
+		muted?: boolean;
+		owner?: string;
+	} = $props();
 
 	const isModal = untrack(() => modal);
 	const scopeId = $props.id();
-	const unregister =
-		typeof window !== 'undefined' && isModal ? statusStore.registerModal(scopeId) : undefined;
+	let unregisterModal: (() => void) | undefined =
+		typeof window !== 'undefined' && isModal && untrack(() => open)
+			? statusStore.registerModal(scopeId)
+			: undefined;
 
 	onDestroy(() => {
-		unregister?.();
+		unregisterModal?.();
+		unregisterModal = undefined;
 	});
 
 	let isActive = $derived(
-		!muted && (modal ? $statusStore.activeScope === scopeId : $statusStore.activeScope === 'root')
+		!muted &&
+			open &&
+			(modal ? $statusStore.activeScope === scopeId : $statusStore.activeScope === 'root')
 	);
 
 	let baselineVersion = $state(
@@ -34,7 +50,7 @@
 	);
 	let containerReady = $state(untrack(() => !isModal));
 	let wasActive = untrack(
-		() => !muted && (isModal ? true : statusStore.state.activeScope === 'root')
+		() => !muted && open && (isModal ? true : statusStore.state.activeScope === 'root')
 	);
 
 	if (typeof window !== 'undefined' && isModal) {
@@ -44,6 +60,17 @@
 	}
 
 	$effect.pre(() => {
+		if (typeof window !== 'undefined' && isModal) {
+			if (!open && unregisterModal) {
+				unregisterModal();
+				unregisterModal = undefined;
+			} else if (open && !$statusStore.modalScopes.includes(scopeId)) {
+				unregisterModal = statusStore.registerModal(scopeId);
+			}
+		}
+		if ($statusStore.version < baselineVersion) {
+			baselineVersion = $statusStore.version;
+		}
 		const activeNow = isActive;
 		if (activeNow && !wasActive) {
 			const snap = statusStore.state;
@@ -57,51 +84,76 @@
 	);
 	let slot0 = $derived(shouldAnnounce ? $statusStore.buffers[0] : '');
 	let slot1 = $derived(shouldAnnounce ? $statusStore.buffers[1] : '');
+	let effectiveOwner = $derived(owner ?? $statusStore.owner);
+	let visibleToast = $derived(
+		isActive && isToastVisibleForOwner($statusStore.toast, effectiveOwner)
+			? $statusStore.toast
+			: null
+	);
+
+	function trackToastNode(node: HTMLElement, toastId: number) {
+		const onEnter = () => setToastHovered(true);
+		const onLeave = () => setToastHovered(false);
+		node.addEventListener('pointerenter', onEnter);
+		node.addEventListener('pointerleave', onLeave);
+		const unsubscribe = statusStore.subscribe((snap) => {
+			const activeForScope = isModal ? snap.activeScope === scopeId : snap.activeScope === 'root';
+			if (!activeForScope || !snap.toast || snap.toast.id !== toastId) {
+				node.remove();
+			}
+		});
+		return {
+			destroy() {
+				unsubscribe();
+				node.removeEventListener('pointerenter', onEnter);
+				node.removeEventListener('pointerleave', onLeave);
+			}
+		};
+	}
 </script>
 
 <div
 	class="visually-hidden"
-	role={isActive ? 'status' : undefined}
-	aria-live={isActive ? 'polite' : 'off'}
+	role="status"
+	aria-live="polite"
 	aria-atomic="true"
-	aria-hidden={!isActive || undefined}
 	data-status-slot="0"
 >
 	{slot0}
 </div>
 <div
 	class="visually-hidden"
-	role={isActive ? 'status' : undefined}
-	aria-live={isActive ? 'polite' : 'off'}
+	role="status"
+	aria-live="polite"
 	aria-atomic="true"
-	aria-hidden={!isActive || undefined}
 	data-status-slot="1"
 >
 	{slot1}
 </div>
 
-{#if isActive && $statusStore.toast}
-	<div
-		class="toast"
-		class:modal-toast={modal}
-		role="region"
-		aria-label="Notification"
-		transition:revealMotion|global={{ y: 25, duration: 250 }}
-		onpointerenter={() => setToastHovered(true)}
-		onpointerleave={() => setToastHovered(false)}
-		onfocusin={() => setToastFocused(true)}
-		onfocusout={(event) => {
-			const next = event.relatedTarget as Node | null;
-			if (!next || !event.currentTarget.contains(next)) setToastFocused(false);
-		}}
-	>
-		<span aria-hidden="true">✳</span>
-		<span class="toast-message">{$statusStore.toast.message}</span>
-		{#if $statusStore.toast.undo}
-			<button type="button" class="toast-undo" onclick={runToastUndo}>Undo</button>
-		{/if}
-		<button type="button" onclick={dismissToast} aria-label="Dismiss notification"
-			><X size={16} aria-hidden="true" /></button
+{#if visibleToast}
+	{#key visibleToast.id}
+		<div
+			class="toast"
+			class:modal-toast={modal}
+			use:trackToastNode={visibleToast.id}
+			in:revealMotion={{ y: 25, duration: 250 }}
+			onfocusin={() => setToastFocused(true)}
+			onfocusout={(event) => {
+				const next = event.relatedTarget as Node | null;
+				if (!next || !event.currentTarget.contains(next)) setToastFocused(false);
+			}}
 		>
-	</div>
+			<span aria-hidden="true">✳</span>
+			<span class="toast-message">{visibleToast.message}</span>
+			{#if visibleToast.undo}
+				<button type="button" class="toast-undo" onclick={() => runToastUndo(effectiveOwner)}
+					>Undo</button
+				>
+			{/if}
+			<button type="button" onclick={dismissToast} aria-label="Dismiss notification"
+				><X size={16} aria-hidden="true" /></button
+			>
+		</div>
+	{/key}
 {/if}

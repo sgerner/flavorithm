@@ -1,6 +1,7 @@
 export type ToastItem = {
 	id: number;
 	message: string;
+	owner: string;
 	undo: (() => void) | null;
 };
 
@@ -9,6 +10,7 @@ export type StatusSnapshot = {
 	activeSlot: 0 | 1;
 	version: number;
 	freshInCurrentTurn: boolean;
+	owner: string;
 	toast: ToastItem | null;
 	activeScope: string;
 	modalScopes: string[];
@@ -18,8 +20,16 @@ export type AnnounceOptions = {
 	debounce?: number;
 };
 
+export type NotifyOptions = {
+	owner?: string;
+};
+
 const DEFAULT_TOAST_DURATION_MS = 4200;
 const DEFAULT_SEARCH_DEBOUNCE_MS = 300;
+
+export function isToastVisibleForOwner(toast: ToastItem | null, owner: string): boolean {
+	return Boolean(toast && toast.owner === owner);
+}
 
 export function formatUndoAnnouncement(message: string): string {
 	const trimmed = message.trim();
@@ -99,7 +109,7 @@ export function formatWebSearchStatus(count: number): string {
 	return `${count} online recipe${count === 1 ? '' : 's'} found.`;
 }
 
-export function createStatusStore(options?: { toastDurationMs?: number }) {
+export function createStatusStore(options?: { toastDurationMs?: number; initialOwner?: string }) {
 	const toastDurationMs = options?.toastDurationMs ?? DEFAULT_TOAST_DURATION_MS;
 	const subscribers = new Set<(value: StatusSnapshot) => void>();
 
@@ -108,6 +118,7 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 	let version = 0;
 	let freshInCurrentTurn = false;
 	let freshTurnToken = 0;
+	let currentOwner = options?.initialOwner ?? '';
 	let toastId = 0;
 	let toast: ToastItem | null = null;
 	let modalScopes: string[] = [];
@@ -122,7 +133,8 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 			activeSlot,
 			version,
 			freshInCurrentTurn,
-			toast,
+			owner: currentOwner,
+			toast: isToastVisibleForOwner(toast, currentOwner) ? toast : null,
 			activeScope: modalScopes.length ? modalScopes[modalScopes.length - 1] : 'root',
 			modalScopes: [...modalScopes]
 		};
@@ -149,6 +161,7 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 
 	function scheduleToastAutoHide() {
 		clearToastTimer();
+		// Untimed Undo toasts stay visible while the owner remains active and are cleared on reset/owner change.
 		if (!toast || toast.undo || toastHovered || toastFocused) return;
 		const expectedId = toast.id;
 		toastTimer = setTimeout(() => {
@@ -194,10 +207,27 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 
 	function announceDeferred(resolveMessage: () => string, delayMs = DEFAULT_SEARCH_DEBOUNCE_MS) {
 		clearDebounce();
+		const expectedOwner = currentOwner;
 		debounceTimer = setTimeout(() => {
 			debounceTimer = undefined;
+			if (currentOwner !== expectedOwner) return;
 			commitAnnouncement(resolveMessage());
 		}, delayMs);
+	}
+
+	function setOwner(nextOwner: string) {
+		if (currentOwner === nextOwner) return;
+		currentOwner = nextOwner;
+		clearDebounce();
+		clearToastTimer();
+		buffers = ['', ''];
+		activeSlot = 1;
+		freshInCurrentTurn = false;
+		freshTurnToken += 1;
+		toast = null;
+		toastHovered = false;
+		toastFocused = false;
+		emit();
 	}
 
 	function dismissToast() {
@@ -209,9 +239,11 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 		emit();
 	}
 
-	function notify(message: string, undo?: () => void) {
+	function notify(message: string, undo?: () => void, notifyOptions?: NotifyOptions) {
 		const trimmed = message.trim();
 		if (!trimmed) return;
+		const toastOwner = notifyOptions?.owner ?? currentOwner;
+		if (toastOwner !== currentOwner) return;
 		clearDebounce();
 		clearToastTimer();
 		toastHovered = false;
@@ -220,6 +252,7 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 		toast = {
 			id,
 			message: trimmed,
+			owner: toastOwner,
 			undo: undo ?? null
 		};
 		commitAnnouncement(undo ? formatUndoAnnouncement(trimmed) : trimmed);
@@ -228,8 +261,12 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 		}
 	}
 
-	function runToastUndo() {
-		if (!toast?.undo) return;
+	function runToastUndo(expectedOwner = currentOwner): boolean {
+		if (!toast?.undo) return false;
+		if (toast.owner !== currentOwner || toast.owner !== expectedOwner) {
+			dismissToast();
+			return false;
+		}
 		const callback = toast.undo;
 		clearToastTimer();
 		toastHovered = false;
@@ -237,6 +274,7 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 		toast = null;
 		emit();
 		callback();
+		return true;
 	}
 
 	function setToastHovered(hovered: boolean) {
@@ -296,6 +334,7 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 		},
 		announce,
 		announceDeferred,
+		setOwner,
 		notify,
 		dismissToast,
 		runToastUndo,
@@ -309,8 +348,10 @@ export function createStatusStore(options?: { toastDurationMs?: number }) {
 export const statusStore = createStatusStore();
 export const announce = statusStore.announce;
 export const announceDeferred = statusStore.announceDeferred;
+export const setStatusOwner = statusStore.setOwner;
 export const notifyStatus = statusStore.notify;
 export const dismissToast = statusStore.dismissToast;
 export const runToastUndo = statusStore.runToastUndo;
 export const setToastHovered = statusStore.setToastHovered;
 export const setToastFocused = statusStore.setToastFocused;
+export const resetStatus = statusStore.reset;

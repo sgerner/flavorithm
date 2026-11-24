@@ -367,7 +367,7 @@
 							analysis.
 						</p>
 					</div>
-					<button class="text-button full" onclick={nutrition} disabled={busy} aria-busy={busy}
+					<button class="text-button full" onclick={nutrition} disabled={busy}
 						>Refresh nutrition estimate with AI</button
 					>
 				</div>{/if}

@@ -2,7 +2,6 @@
 	import { ArrowUpRight, RefreshCw, Check, Copy } from '@lucide/svelte';
 	import SearchPicker from './SearchPicker.svelte';
 	import { revealMotion } from '#lib/motion.ts';
-	import { announce } from '#lib/status.ts';
 	import type { Preferences } from '#lib/types.ts';
 	import {
 		searchConnections,
@@ -79,7 +78,6 @@
 				})
 			});
 			if (!response.ok) throw new Error((await response.json()).error);
-			announce(enabled ? 'Host AI connection enabled.' : 'Host AI connection disabled.');
 			onrefresh();
 		} catch (error) {
 			hostError = (error as Error).message;
@@ -461,17 +459,6 @@
 	}
 	.auth-fallback {
 		margin-top: 14px;
-	}
-	.field-help a,
-	.catalog-credit a {
-		display: inline-flex;
-		align-items: center;
-		gap: 3px;
-		text-decoration: underline;
-		text-underline-offset: 3px;
-	}
-	.field-help a {
-		margin-inline-start: 4px;
 	}
 	.catalog-credit {
 		color: var(--muted);

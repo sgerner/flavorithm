@@ -6,7 +6,8 @@ import {
 	formatRecipeStatus,
 	formatShoppingStatus,
 	formatUndoAnnouncement,
-	formatWebSearchStatus
+	formatWebSearchStatus,
+	isToastVisibleForOwner
 } from '../src/lib/status.ts';
 
 const wait = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -64,9 +65,9 @@ test('debounces rapid search announcements and cancels pending debounce on immed
 	store.reset();
 });
 
-test('Undo toasts announce Undo available and persist indefinitely with zero automatic timeout', async (t) => {
+test('Undo toasts announce Undo available and persist indefinitely for the active owner with zero automatic timeout', (t) => {
 	t.mock.timers.enable({ apis: ['setTimeout'] });
-	const store = createStatusStore({ toastDurationMs: 4200 });
+	const store = createStatusStore({ toastDurationMs: 4200, initialOwner: 'user-a:hh-1' });
 	let undone = 0;
 
 	store.notify('Planned meal removed.', () => {
@@ -79,16 +80,110 @@ test('Undo toasts announce Undo available and persist indefinitely with zero aut
 	);
 	assert.ok(store.state.toast);
 	assert.equal(store.state.toast.message, 'Planned meal removed.');
+	assert.equal(store.state.toast.owner, 'user-a:hh-1');
 	assert.equal(typeof store.state.toast.undo, 'function');
 
-	// Advance far beyond 10 seconds (e.g., 60 seconds) — Undo toast must remain visible
+	// Advance far beyond 10 seconds (e.g., 60 seconds) — Undo toast remains visible for the same owner
 	t.mock.timers.tick(60_000);
 	assert.ok(store.state.toast);
 	assert.equal(store.state.toast.message, 'Planned meal removed.');
 
-	store.runToastUndo();
+	assert.equal(store.runToastUndo('user-a:hh-1'), true);
 	assert.equal(undone, 1);
 	assert.equal(store.state.toast, null);
+
+	store.reset();
+});
+
+test('toasts do not survive reset/logout and Undo after reset is a no-op', (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const store = createStatusStore({ toastDurationMs: 4200, initialOwner: 'user-a:hh-1' });
+	let undone = 0;
+
+	store.notify('Olive oil removed.', () => {
+		undone += 1;
+	});
+	assert.ok(store.state.toast);
+
+	// Simulate sign-out / account deletion resetting the status store and transitioning to guest
+	store.reset();
+	store.setOwner('guest:');
+
+	assert.equal(store.state.toast, null);
+	assert.deepEqual(store.state.buffers, ['', '']);
+	assert.equal(store.runToastUndo(), false);
+	assert.equal(undone, 0);
+
+	// Sign-out confirmation notification for guest still announces and auto-hides normally
+	store.notify('Signed out. Your household is safely saved.');
+	const guestState = store.state;
+	assert.equal(guestState.version, 1);
+	assert.equal(
+		guestState.buffers[guestState.activeSlot],
+		'Signed out. Your household is safely saved.'
+	);
+	assert.ok(guestState.toast);
+	assert.equal(guestState.toast.owner, 'guest:');
+	assert.equal(guestState.toast.undo, null);
+
+	t.mock.timers.tick(4201);
+	assert.equal(store.state.toast, null);
+
+	store.reset();
+});
+
+test('cross-owner Undo toast is hidden with no visible Undo button and cross-owner Undo is a no-op', async () => {
+	const store = createStatusStore({ toastDurationMs: 4200, initialOwner: 'user-a:hh-1' });
+	let undone = 0;
+
+	store.notify('Milk removed.', () => {
+		undone += 1;
+	});
+	const userAToast = store.state.toast;
+	assert.ok(userAToast);
+	assert.equal(isToastVisibleForOwner(userAToast, 'user-a:hh-1'), true);
+	assert.equal(isToastVisibleForOwner(userAToast, 'user-b:hh-2'), false);
+
+	// Even before setOwner runs, a cross-owner Undo attempt (e.g. stale caller) is a no-op and hides the toast
+	store.notify('Bread removed.', () => {
+		undone += 1;
+	});
+	assert.equal(store.runToastUndo('user-b:hh-2'), false);
+	assert.equal(undone, 0);
+	assert.equal(store.state.toast, null);
+
+	// Switching owner/household clears any active untimed Undo toast so User B sees neither banner nor Undo button
+	store.notify('Eggs removed.', () => {
+		undone += 1;
+	});
+	store.announceDeferred(() => '4 recipes shown.', 30);
+	store.setOwner('user-b:hh-2');
+
+	const userBState = store.state;
+	assert.equal(userBState.owner, 'user-b:hh-2');
+	assert.equal(userBState.toast, null);
+	assert.equal(isToastVisibleForOwner(userBState.toast, 'user-b:hh-2'), false);
+	assert.equal(store.runToastUndo(), false);
+	assert.equal(undone, 0);
+
+	// Stale in-flight async notification tagged with User A's owner is ignored after switching to User B
+	store.notify(
+		'3 ingredients added to your pantry.',
+		() => {
+			undone += 1;
+		},
+		{ owner: 'user-a:hh-1' }
+	);
+	assert.equal(store.state.toast, null);
+	assert.equal(store.runToastUndo(), false);
+	assert.equal(undone, 0);
+
+	await wait(45);
+	assert.equal(
+		store.state.buffers[store.state.activeSlot],
+		'',
+		'Pending debounced search from previous owner does not fire for new owner'
+	);
 
 	store.reset();
 });

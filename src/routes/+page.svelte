@@ -93,14 +93,19 @@
 		expiryStatus,
 		filterPantryItems,
 		listPantryCategories,
-		normalizePantryDraft,
 		normalizeIngredientName,
+		normalizePantryDraft,
+		normalizeShoppingItem,
 		reconcileShoppingList,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
+		revertShoppingItem,
+		snapshotShoppingItem,
 		transferPurchasedItemsToPantry,
 		unitInfo,
-		type PantryDraft
+		type PantryDraft,
+		type ShoppingItemDraft,
+		type ShoppingItemSnapshot
 	} from '#lib/kitchen-workflows.ts';
 	import { rankPantryRecipes, rankRecipes } from '#lib/discovery.ts';
 	import {
@@ -130,7 +135,8 @@
 		formatRecipeStatus,
 		formatShoppingStatus,
 		formatWebSearchStatus,
-		notifyStatus
+		notifyStatus,
+		statusStore
 	} from '#lib/status.ts';
 	import {
 		VoiceCapture,
@@ -172,7 +178,14 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
-	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
+	import {
+		applyImportedRecipeSave,
+		canAppendImportTranscript,
+		cloneImportSession,
+		isReviewingImportDraft,
+		replaceImportSessionWithUrl
+	} from '#lib/import-session.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -394,6 +407,7 @@
 		clearHouseholdViewState();
 		kitchenSync?.clearContext();
 		user = null;
+		syncStatusOwner(true);
 		editingRecipe = null;
 		editingRecipeMode = 'edit';
 		kitchen = createInitialState();
@@ -518,7 +532,11 @@
 		return () => clearVoiceSession();
 	});
 	$effect(() => {
-		if (voiceTarget && modal !== voiceTarget && (voiceStarting || voiceState !== 'idle')) {
+		if (
+			voiceTarget &&
+			(voiceStarting || voiceState !== 'idle') &&
+			(modal !== voiceTarget || (voiceTarget === 'import' && isReviewingImportDraft(importSession)))
+		) {
 			clearVoiceSession();
 		}
 	});
@@ -604,12 +622,8 @@
 	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
-	let editingShoppingDraft = $state<{
-		id: string;
-		name: string;
-		quantity: number | null;
-		unit: string;
-	} | null>(null);
+	let editingShoppingDraft = $state<(ShoppingItemDraft & { id: string }) | null>(null);
+	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -645,6 +659,7 @@
 			if (nextUser) kitchen = createNewUserState();
 		}
 		user = nextUser;
+		if (changedIdentity) syncStatusOwner(true);
 		if (managedAuth && !user) {
 			clearManagedIdentity();
 			renewManagedSession({ status: 401 });
@@ -965,26 +980,79 @@
 	function dateKey(date: Date) {
 		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 	}
-	function notify(message: string, undo?: () => void) {
-		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+	let statusOwner = $derived(`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`);
+	function syncStatusOwner(resetState = false) {
+		if (resetState) statusStore.reset();
+		statusStore.setOwner(statusOwner);
+	}
+	$effect.pre(() => {
+		statusStore.setOwner(statusOwner);
+	});
+	function notify(message: string, undo?: () => void, owner = statusOwner) {
+		if (owner === statusOwner) statusStore.setOwner(statusOwner);
 		notifyStatus(
 			message,
 			undo
 				? () => {
-						if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
+						if (owner === statusOwner) undo();
 					}
-				: undefined
+				: undefined,
+			{ owner }
 		);
 	}
-	function removeShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId === item.id) {
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+	function applyShoppingEdit(item: AppState['shopping'][number]) {
+		normalizeShoppingItem(item, editingShoppingDraft?.id === item.id ? editingShoppingDraft : null);
+	}
+	function clearEditingShoppingState() {
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+		editingShoppingSnapshot = null;
+	}
+	async function startEditingShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId && editingShoppingId !== item.id) {
+			const active = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
+			if (active) applyShoppingEdit(active);
 		}
+		editingShoppingSnapshot = snapshotShoppingItem(item);
+		editingShoppingId = item.id;
+		editingShoppingDraft = {
+			id: item.id,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit
+		};
+		await tick();
+		document
+			.querySelector<HTMLInputElement>(`[data-shopping-name="${CSS.escape(item.id)}"]`)
+			?.focus();
+	}
+	async function finishEditingShoppingItem(item: AppState['shopping'][number]) {
+		const id = item.id;
+		applyShoppingEdit(item);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	async function cancelEditingShoppingItem() {
+		const id = editingShoppingId;
+		if (!id) return;
+		const active = kitchen.shopping.find((entry) => entry.id === id);
+		if (active && editingShoppingSnapshot) revertShoppingItem(active, editingShoppingSnapshot);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	function removeShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId === item.id) clearEditingShoppingState();
 		const removed = structuredClone($state.snapshot(item));
 		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		notify(`${item.name} removed.`, () => {
+			if (editingShoppingId === removed.id) clearEditingShoppingState();
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
+			if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+				clearEditingShoppingState();
 		});
 	}
 	function consumeLeftoverServing(meal: Meal) {
@@ -1230,6 +1298,7 @@
 				const nextUser: User | null = data.user ?? null;
 				if (!nextUser) {
 					user = null;
+					syncStatusOwner();
 					kitchenSync?.clearContext();
 					localStorage.removeItem('flavorithm-last-account');
 					if (managedAuth) {
@@ -1241,6 +1310,7 @@
 					clearHouseholdViewState();
 					kitchen = createNewUserState();
 					user = nextUser;
+					syncStatusOwner(true);
 					showStarter = false;
 					kitchenSync?.prepare(nextUser);
 					kitchenLoaded = true;
@@ -1312,6 +1382,7 @@
 							clearHouseholdViewState();
 							kitchen = createNewUserState();
 							user = cached;
+							syncStatusOwner(true);
 							showStarter = false;
 							kitchenLoaded = true;
 							kitchenSync?.restore(cached);
@@ -1442,8 +1513,7 @@
 	}
 
 	function freshKitchen() {
-		editingShoppingId = '';
-		editingShoppingDraft = null;
+		clearEditingShoppingState();
 		kitchen.pantry = [];
 		kitchen.meals = [];
 		kitchen.shopping = [];
@@ -1544,7 +1614,6 @@
 		}
 		busy = true;
 		error = '';
-		announce('Opening your kitchen…');
 		try {
 			syncing = true;
 			commitInlineEdits();
@@ -1561,6 +1630,7 @@
 			stateEtag = null;
 			kitchen = guestKitchen ?? createNewUserState();
 			user = authenticatedUser;
+			syncStatusOwner(true);
 			kitchenSync?.prepare(authenticatedUser);
 			kitchenLoaded = true;
 			saveLastAccount(authenticatedUser);
@@ -1647,6 +1717,7 @@
 			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
+			syncStatusOwner(true);
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
 			inviteCode = '';
@@ -2296,7 +2367,6 @@
 		if (!needAI()) return;
 		busy = true;
 		error = '';
-		announce('Generating recipes…');
 		try {
 			const result = await ai('generate');
 			kitchen.recipes = insertRecipes(kitchen.recipes, result.recipes);
@@ -2422,7 +2492,10 @@
 			return;
 		}
 		voiceError = '';
-		if (voiceTarget === 'import') activeVoiceImportSession = importSession;
+		if (voiceTarget === 'import') {
+			importSession.reviewingDraft = false;
+			activeVoiceImportSession = importSession;
+		}
 		await voiceCapture.retry({
 			provider: plan.provider,
 			model: voiceModel,
@@ -2437,10 +2510,13 @@
 	}
 	async function startDictation(forRecipe: boolean) {
 		if (voiceBusy) return;
-		if (forRecipe && !modal) {
-			mobileNav = false;
-			error = '';
-			modal = 'import';
+		if (forRecipe) {
+			importSession.reviewingDraft = false;
+			if (!modal) {
+				mobileNav = false;
+				error = '';
+				modal = 'import';
+			}
 		}
 		const plan = planVoiceStart({
 			forRecipe,
@@ -2466,6 +2542,9 @@
 		resumeDialog = '';
 		voiceStarting = true;
 		voiceTarget = plan.targetDialog;
+		if (plan.targetDialog === 'import') {
+			importSession.reviewingDraft = false;
+		}
 		if (modal !== plan.targetDialog) {
 			mobileNav = false;
 			error = '';
@@ -2482,12 +2561,24 @@
 				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
-				if (voiceCapture !== capture || user?.id !== owner || modal !== targetDialog) return;
-				voiceError = '';
+				if (voiceCapture !== capture) return;
 				if (targetDialog === 'import') {
-					if (importSession !== activeVoiceImportSession || importSession.draft) return;
+					if (
+						!activeVoiceImportSession ||
+						!canAppendImportTranscript({
+							modal,
+							currentSession: importSession,
+							startedSession: activeVoiceImportSession,
+							currentUserId: user?.id,
+							startedUserId: owner
+						})
+					)
+						return;
+					voiceError = '';
 					importSession.text = appendDictatedText('import', importSession.text, text);
 				} else {
+					if (user?.id !== owner || modal !== 'pantry') return;
+					voiceError = '';
 					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
 				}
@@ -2679,6 +2770,8 @@
 		);
 		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -2690,6 +2783,8 @@
 		kitchen.shopping = kitchen.shopping.filter(
 			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
 		);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		if (kitchen.preferences.ratings) {
 			const ratings = { ...kitchen.preferences.ratings };
 			delete ratings[recipe.id];
@@ -2707,57 +2802,12 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
-	function startEditingShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId && editingShoppingId !== item.id) {
-			const previous = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (previous) normalizeShoppingItem(previous);
-		}
-		editingShoppingId = item.id;
-		editingShoppingDraft = {
-			id: item.id,
-			name: item.name,
-			quantity: item.quantity,
-			unit: item.unit
-		};
-	}
-	function finishEditingShoppingItem(item: AppState['shopping'][number]) {
-		normalizeShoppingItem(item);
-		editingShoppingId = '';
-		editingShoppingDraft = null;
-	}
-	function normalizeShoppingItem(item: AppState['shopping'][number]) {
-		const draft = editingShoppingDraft?.id === item.id ? editingShoppingDraft : null;
-		const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
-		const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
-		const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
-		const rawQuantity = draft ? draft.quantity : item.quantity;
-		const parsed =
-			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
-				? Number.NaN
-				: Number(rawQuantity);
-		const fallbackQuantity =
-			Number.isFinite(item.quantity) && item.quantity >= 0.01 && item.quantity <= 1_000_000
-				? item.quantity
-				: 1;
-		const quantity = Number.isFinite(parsed)
-			? Math.max(0.01, Math.min(parsed, 1_000_000))
-			: fallbackQuantity;
-		item.name = name;
-		item.unit = unit;
-		item.quantity = quantity;
-		if (draft) {
-			draft.name = name;
-			draft.unit = unit;
-			draft.quantity = quantity;
-		}
-	}
 	function commitInlineEdits() {
 		if (pantryDraft) void savePantryEdit(false);
 		if (editingShoppingId) {
 			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (item) normalizeShoppingItem(item);
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+			if (item) applyShoppingEdit(item);
+			clearEditingShoppingState();
 		}
 	}
 	function addShoppingQuickItem() {
@@ -2847,6 +2897,7 @@
 			notify('Enter a valid serving count before making a shopping list.');
 			return;
 		}
+		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
@@ -3007,6 +3058,8 @@
 			) {
 				kitchen.pantry = previousPantry;
 				kitchen.shopping = previousShopping;
+				if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+					clearEditingShoppingState();
 			} else {
 				notify('Your kitchen changed again. Review the current items before editing.');
 			}
@@ -3161,7 +3214,6 @@
 		if (!canManageHousehold || !memberToRemove) return;
 		householdBusy = true;
 		error = '';
-		announce('Removing household member…');
 		try {
 			await request('/api/household', {
 				action: 'removeMember',
@@ -3204,7 +3256,6 @@
 		const confirmed = confirmReplace === true;
 		householdBusy = true;
 		error = '';
-		announce('Joining household…');
 		let joinedHousehold = false;
 		try {
 			syncing = true;
@@ -3219,6 +3270,7 @@
 					}),
 				onMutated: () => {
 					joinedHousehold = true;
+					statusStore.reset();
 					kitchenSync?.clearContext();
 					clearAIConnectionState();
 					clearHouseholdViewState();
@@ -3254,7 +3306,6 @@
 	async function refreshNutrition() {
 		if (!selected || !needAI()) return;
 		busy = true;
-		announce('Refreshing nutrition estimate…');
 		try {
 			const result = await ai('nutrition', { recipe: selected });
 			selected.nutrition = result.nutrition;
@@ -3316,8 +3367,18 @@
 	}
 	function importRecipe(url: string) {
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = { ...emptyImportSession(), url };
+		const { session, previous } = replaceImportSessionWithUrl($state.snapshot(importSession), url);
+		importSession = session;
 		openImport();
+		if (previous) {
+			notify('Recipe link loaded. Undo to restore your previous import.', () => {
+				if (voiceTarget === 'import') clearVoiceSession();
+				importSession = cloneImportSession(previous);
+				resumeDialog = '';
+				error = '';
+				modal = 'import';
+			});
+		}
 	}
 	async function captureImport(
 		input: { url?: string; prompt: string; image?: string },
@@ -3330,22 +3391,51 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const nutritionStale =
-			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
-		const saved = { ...recipe, saved: true, nutritionStale };
-		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		const previousPage = page;
+		const previousQuery = query;
+		const previousFilter = filter;
+		const applied = applyImportedRecipeSave(
+			$state.snapshot(kitchen),
+			$state.snapshot(importSession),
+			recipe
+		);
+		kitchen.recipes = applied.nextRecipes;
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = emptyImportSession();
+		importSession = applied.nextSession;
 		resumeDialog = '';
 		modal = '';
-		selected = saved;
+		selected = applied.saved;
 		page = 'saved';
 		query = '';
 		filter = 'For you';
 		notify(
-			nutritionStale
+			applied.saved.nutritionStale
 				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
-				: 'Recipe saved to your collection.'
+				: 'Recipe saved to your collection.',
+			() => {
+				const rolledBack = applied.rollback($state.snapshot(kitchen));
+				if (!rolledBack.ok) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				if (voiceTarget === 'import') clearVoiceSession();
+				kitchen = rolledBack.kitchen;
+				if (selected?.id === applied.saved.id) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				if (editingRecipeMode === 'edit' && editingRecipe?.id === applied.saved.id) {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}
+				importSession = rolledBack.session;
+				resumeDialog = '';
+				error = '';
+				page = previousPage;
+				query = previousQuery;
+				filter = previousFilter;
+				modal = 'import';
+			}
 		);
 	}
 	async function exportKitchen() {
@@ -3369,7 +3459,6 @@
 		if (managedAuth) return;
 		busy = true;
 		error = '';
-		announce('Deleting your account…');
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -3386,6 +3475,7 @@
 			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
+			syncStatusOwner(true);
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
 			inviteCode = '';
@@ -3419,7 +3509,6 @@
 		if (!user || user.emailVerified || !capabilities.emailDelivery) return;
 		verificationBusy = true;
 		error = '';
-		announce('Sending verification email…');
 		try {
 			await request('/api/auth', { action: 'requestEmailVerification' });
 			await refreshAuth();
@@ -3443,7 +3532,6 @@
 		}
 		busy = true;
 		error = '';
-		announce(modal === 'reset' ? 'Resetting password…' : 'Sending password reset link…');
 		try {
 			if (modal === 'reset') {
 				await request('/api/auth', { action: 'resetPassword', token: resetToken, password });
@@ -3468,7 +3556,6 @@
 		busy = true;
 		householdBusy = true;
 		error = '';
-		announce('Leaving household…');
 		let leftHousehold = false;
 		try {
 			syncing = true;
@@ -3478,6 +3565,7 @@
 				mutateHousehold: () => request('/api/household', { action: 'leave' }),
 				onMutated: () => {
 					leftHousehold = true;
+					statusStore.reset();
 					kitchenSync?.clearContext();
 					clearAIConnectionState();
 					clearHouseholdViewState();
@@ -3583,7 +3671,8 @@
 <svelte:window
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
-			if (!modal && !selected && !editingRecipe && !mobileNav && pantryDraft) {
+			const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
+			if (!overlayOpen && pantryDraft) {
 				void cancelPantryEdit();
 			}
 			mobileNav = false;
@@ -3591,6 +3680,10 @@
 			selected = null;
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
+			if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
+				e.preventDefault();
+				void cancelEditingShoppingItem();
+			}
 		}
 	}}
 />
@@ -4439,6 +4532,15 @@
 									class:active={shoppingFilter === option.id}
 									aria-pressed={shoppingFilter === option.id}
 									onclick={() => {
+										if (option.id === 'unpurchased' && editingShoppingId) {
+											const active = kitchen.shopping.find(
+												(entry) => entry.id === editingShoppingId
+											);
+											if (active?.checked) {
+												applyShoppingEdit(active);
+												clearEditingShoppingState();
+											}
+										}
 										shoppingFilter = option.id;
 										announceShoppingFilter();
 									}}>{option.label}<span>{option.count}</span></button
@@ -4466,67 +4568,89 @@
 								out:fadeMotion={{ duration: 120 }}
 							>
 								<button
+									type="button"
+									role="checkbox"
+									aria-checked={item.checked}
 									class="check-box"
 									class:checked={item.checked}
 									aria-label={`Mark ${item.name} ${item.checked ? 'needed' : 'purchased'}`}
-									onclick={() => (item.checked = !item.checked)}
+									onclick={() => {
+										item.checked = !item.checked;
+										if (
+											shoppingFilter === 'unpurchased' &&
+											item.checked &&
+											editingShoppingId === item.id
+										) {
+											applyShoppingEdit(item);
+											clearEditingShoppingState();
+										}
+									}}
 									>{#if item.checked}<Check size={16} />{/if}</button
 								>
-								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<div
-										class="shopping-item-edit"
+								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<form
+										class="shopping-edit-form"
+										novalidate
+										onsubmit={(e) => {
+											e.preventDefault();
+											void finishEditingShoppingItem(item);
+										}}
 									>
-										<input
-											class="shopping-name"
-											aria-label="Shopping item name"
-											bind:value={editingShoppingDraft.name}
-											maxlength="200"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
-									</div>
-									<span class="shopping-quantity"
-										><input
-											aria-label={`Quantity of ${item.name}`}
-											type="number"
-											min="0.01"
-											max="1000000"
-											step="0.01"
-											bind:value={editingShoppingDraft.quantity}
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><input
-											aria-label={`Unit for ${item.name}`}
-											bind:value={editingShoppingDraft.unit}
-											maxlength="40"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/></span
-									>
-									<button class="text-button" onclick={() => finishEditingShoppingItem(item)}
-										>Done</button
-									>
+										<div class="shopping-item-edit">
+											<input
+												class="shopping-name"
+												data-shopping-name={item.id}
+												aria-label="Shopping item name"
+												bind:value={editingShoppingDraft.name}
+												maxlength="200"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
+										</div>
+										<span class="shopping-quantity"
+											><input
+												aria-label={`Quantity of ${item.name}`}
+												type="number"
+												min="0.01"
+												max="1000000"
+												step="0.01"
+												bind:value={editingShoppingDraft.quantity}
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><input
+												aria-label={`Unit for ${item.name}`}
+												bind:value={editingShoppingDraft.unit}
+												maxlength="40"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/></span
+										>
+										<button type="submit" class="text-button">Done</button>
+									</form>
 								{:else}
 									<div class="shopping-item-edit">
-										<b class="shopping-name">{item.name}</b><small class="shopping-source"
-											>{shoppingSourceLabel(item.sourceKey)}</small
-										>
+										<button
+											type="button"
+											tabindex="-1"
+											class="shopping-name"
+											onclick={() => (item.checked = !item.checked)}>{item.name}</button
+										><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
 									</div>
 									<span class="shopping-quantity"
 										>{item.quantity}
 										{item.unit}<button
+											type="button"
 											class="text-button"
+											data-shopping-edit={item.id}
 											aria-label={`Edit ${item.name}`}
-											onclick={() => startEditingShoppingItem(item)}>Edit</button
+											onclick={() => void startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
 								{/if}
 								<button
+									type="button"
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
 									onclick={() => removeShoppingItem(item)}><X size={15} /></button
@@ -4558,7 +4682,10 @@
 		</div>
 	</main>
 </div>
-<StatusRegion muted={Boolean(modal || selected || editingRecipe || butlerOpen)} />
+<StatusRegion
+	owner={statusOwner}
+	muted={Boolean(modal || selected || editingRecipe || butlerOpen)}
+/>
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
 		initialServings={selectedMealServings ?? selected.servings}
@@ -4626,7 +4753,10 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if modal === voiceTarget && voiceBusy}<div class="voice-session" in:revealMotion>
+				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceBusy}<div
+						class="voice-session"
+						in:revealMotion
+					>
 						<p role="status" aria-live="polite">
 							{voiceStarting
 								? 'Opening microphone…'
@@ -4643,7 +4773,7 @@
 								>Cancel voice</button
 							>
 						</div>
-					</div>{:else if modal === voiceTarget && voiceRetained}<div
+					</div>{:else if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceRetained}<div
 						class="voice-session voice-recovery"
 						in:revealMotion
 					>
@@ -4840,7 +4970,6 @@
 							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary full"
 							disabled={busy}
-							aria-busy={busy}
 							>{busy
 								? 'Opening your kitchen…'
 								: authMode === 'register'
@@ -4899,7 +5028,6 @@
 					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 						class="primary full"
 						disabled={busy}
-						aria-busy={busy}
 						onclick={generate}
 						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
 					>
@@ -4947,7 +5075,6 @@
 									</p>{:else}<button
 										class="secondary"
 										disabled={!capabilities.emailDelivery || verificationBusy}
-										aria-busy={verificationBusy}
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
 									>{#if !capabilities.emailDelivery}<p class="field-help">
@@ -5036,14 +5163,7 @@
 				{:else if modal === 'household'}<span class="dialog-spark">✳</span>
 					<h2>Your household</h2>
 					<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
-					<p
-						class="field-help"
-						class:visually-hidden={!householdBusy}
-						role="status"
-						aria-live="polite"
-					>
-						{householdBusy ? 'Updating household…' : ''}
-					</p>
+					{#if householdBusy}<p class="field-help" role="status">Updating household…</p>{/if}
 					<div class="household-members">
 						{#each members as member (member.id)}<div class="member-row">
 								<span class="profile-avatar"
@@ -5111,7 +5231,6 @@
 					<button
 						class="secondary full"
 						disabled={householdBusy || !joinCode.trim()}
-						aria-busy={householdBusy}
 						onclick={() => join()}>Join household <ArrowRight size={17} /></button
 					>
 					{#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -5152,7 +5271,6 @@
 						><button
 							class="primary danger-action"
 							disabled={householdBusy}
-							aria-busy={householdBusy}
 							onclick={() => join(true)}>{householdBusy ? 'Joining…' : 'Replace kitchen'}</button
 						>
 					</div>
@@ -5175,7 +5293,6 @@
 						><button
 							class="primary danger-action"
 							disabled={householdBusy}
-							aria-busy={householdBusy}
 							onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button
 						>
 					</div>
@@ -5205,7 +5322,6 @@
 						><button
 							class="primary danger-action"
 							disabled={busy || householdBusy}
-							aria-busy={busy || householdBusy}
 							onclick={leaveHousehold}
 							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
 						>
@@ -5227,8 +5343,7 @@
 							/></label
 						>{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary danger-button full"
-							disabled={busy}
-							aria-busy={busy}>Permanently delete my account</button
+							disabled={busy}>Permanently delete my account</button
 						>
 					</form>
 				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
@@ -5260,7 +5375,6 @@
 							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
 							class="primary full"
 							disabled={busy}
-							aria-busy={busy}
 							>{busy
 								? 'One moment…'
 								: modal === 'reset'
@@ -5435,7 +5549,7 @@
 						{/if}
 					</div>
 				{/if}
-				<StatusRegion modal />
+				<StatusRegion modal open={Boolean(modal)} owner={statusOwner} />
 			</div>
 		{/key}
 	</div>{/if}
@@ -5525,18 +5639,15 @@
 		flex: 1 1 220px;
 		max-width: 320px;
 		min-height: 44px;
-		padding: 0 12px;
-		border: 1px solid var(--line);
-		background: var(--surface);
 	}
 	.pantry-search input {
 		width: 100%;
 		min-width: 0;
 		font-size: 14px;
-		padding: 9px 0;
+		padding: 9px 10px;
 	}
 	.pantry-categories {
-		padding-bottom: 2px;
+		padding-bottom: 4px;
 	}
 	.expiry-filters {
 		display: flex;
@@ -5550,14 +5661,16 @@
 		align-items: center;
 		gap: 9px;
 		padding: 8px 12px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		font-size: 14px;
 	}
 	.expiry-filters button.active {
-		background: var(--green);
-		color: var(--paper);
-		border-color: var(--green);
+		padding: 7px 11px;
+		background: var(--chip-active-bg);
+		color: var(--ink);
+		border: 2px solid var(--chip-active-border);
+		font-weight: 700;
 	}
 	.expiry-filters button span {
 		min-width: 22px;
@@ -5737,7 +5850,7 @@
 		font-weight: 400;
 		color: var(--ink);
 		background: var(--surface);
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 	}
 	.filtered-pantry-empty {
 		padding: 32px 12px;
@@ -5746,6 +5859,9 @@
 		min-height: 44px;
 		padding: 8px 14px;
 	}
+	.shopping-edit-form {
+		display: contents;
+	}
 	.shopping-item-edit {
 		min-width: 100px;
 		flex: 1 1 180px;
@@ -5753,16 +5869,29 @@
 		flex-direction: column;
 		gap: 3px;
 	}
-	.shopping-name {
+	button.shopping-name {
 		width: 100%;
 		min-width: 0;
+		min-height: 44px;
 		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		display: flex;
+		align-items: center;
+		text-align: left;
 		font-weight: 500;
+		overflow-wrap: anywhere;
 	}
-	.shopping-name:focus {
-		border-color: var(--line);
+	.shopping-row.checked button.shopping-name {
+		color: var(--muted);
+	}
+	input.shopping-name {
+		width: 100%;
+		min-width: 0;
+		min-height: 44px;
+		padding: 7px 5px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
+		font-size: 16px;
+		font-weight: 500;
 	}
 	.shopping-source {
 		padding-left: 5px;
@@ -5778,19 +5907,17 @@
 	}
 	.shopping-quantity input {
 		min-width: 0;
+		min-height: 44px;
 		width: 72px;
-		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		padding: 7px 5px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
 		text-align: right;
-		font-size: 14px;
+		font-size: 16px;
 	}
 	.shopping-quantity input:last-child {
 		width: 70px;
 		text-align: left;
-	}
-	.shopping-quantity input:focus {
-		border-color: var(--line);
 	}
 	.calendar-meal-actions {
 		min-height: 34px;
@@ -5885,7 +6012,7 @@
 		min-height: 44px;
 		padding: 12px 14px;
 		margin: 22px 0;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		cursor: pointer;
 		font-size: 14px;
@@ -5895,7 +6022,7 @@
 		height: 24px;
 		flex: 0 0 24px;
 		margin-top: 1px;
-		accent-color: var(--green);
+		accent-color: var(--ink);
 	}
 	.cook-option span {
 		display: flex;
@@ -5941,6 +6068,9 @@
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
+		}
+		.expiry-filters button.active {
+			padding-inline: 5px;
 		}
 		.ingredient-meta {
 			flex-direction: row;
@@ -6001,15 +6131,10 @@
 		}
 		.shopping-item-edit {
 			flex-basis: calc(100% - 66px);
-			order: 2;
 		}
 		.shopping-quantity {
-			order: 3;
 			flex: 1 1 auto;
 			margin-left: 44px !important;
-		}
-		.shopping-row > .icon-button {
-			order: 4;
 		}
 		.cooked-history-row {
 			grid-template-columns: 46px minmax(0, 1fr);
