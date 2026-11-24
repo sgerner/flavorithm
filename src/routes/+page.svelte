@@ -167,7 +167,14 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
-	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
+	import {
+		applyImportedRecipeSave,
+		canAppendImportTranscript,
+		cloneImportSession,
+		isReviewingImportDraft,
+		replaceImportSessionWithUrl
+	} from '#lib/import-session.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -501,7 +508,11 @@
 		return () => clearVoiceSession();
 	});
 	$effect(() => {
-		if (voiceTarget && modal !== voiceTarget && (voiceStarting || voiceState !== 'idle')) {
+		if (
+			voiceTarget &&
+			(voiceStarting || voiceState !== 'idle') &&
+			(modal !== voiceTarget || (voiceTarget === 'import' && isReviewingImportDraft(importSession)))
+		) {
 			clearVoiceSession();
 		}
 	});
@@ -2406,7 +2417,10 @@
 			return;
 		}
 		voiceError = '';
-		if (voiceTarget === 'import') activeVoiceImportSession = importSession;
+		if (voiceTarget === 'import') {
+			importSession.reviewingDraft = false;
+			activeVoiceImportSession = importSession;
+		}
 		await voiceCapture.retry({
 			provider: plan.provider,
 			model: voiceModel,
@@ -2421,10 +2435,13 @@
 	}
 	async function startDictation(forRecipe: boolean) {
 		if (voiceBusy) return;
-		if (forRecipe && !modal) {
-			mobileNav = false;
-			error = '';
-			modal = 'import';
+		if (forRecipe) {
+			importSession.reviewingDraft = false;
+			if (!modal) {
+				mobileNav = false;
+				error = '';
+				modal = 'import';
+			}
 		}
 		const plan = planVoiceStart({
 			forRecipe,
@@ -2450,6 +2467,9 @@
 		resumeDialog = '';
 		voiceStarting = true;
 		voiceTarget = plan.targetDialog;
+		if (plan.targetDialog === 'import') {
+			importSession.reviewingDraft = false;
+		}
 		if (modal !== plan.targetDialog) {
 			mobileNav = false;
 			error = '';
@@ -2466,12 +2486,24 @@
 				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
-				if (voiceCapture !== capture || user?.id !== owner || modal !== targetDialog) return;
-				voiceError = '';
+				if (voiceCapture !== capture) return;
 				if (targetDialog === 'import') {
-					if (importSession !== activeVoiceImportSession || importSession.draft) return;
+					if (
+						!activeVoiceImportSession ||
+						!canAppendImportTranscript({
+							modal,
+							currentSession: importSession,
+							startedSession: activeVoiceImportSession,
+							currentUserId: user?.id,
+							startedUserId: owner
+						})
+					)
+						return;
+					voiceError = '';
 					importSession.text = appendDictatedText('import', importSession.text, text);
 				} else {
+					if (user?.id !== owner || modal !== 'pantry') return;
+					voiceError = '';
 					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
 				}
@@ -3259,8 +3291,18 @@
 	}
 	function importRecipe(url: string) {
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = { ...emptyImportSession(), url };
+		const { session, previous } = replaceImportSessionWithUrl($state.snapshot(importSession), url);
+		importSession = session;
 		openImport();
+		if (previous) {
+			notify('Recipe link loaded. Undo to restore your previous import.', () => {
+				if (voiceTarget === 'import') clearVoiceSession();
+				importSession = cloneImportSession(previous);
+				resumeDialog = '';
+				error = '';
+				modal = 'import';
+			});
+		}
 	}
 	async function captureImport(
 		input: { url?: string; prompt: string; image?: string },
@@ -3273,22 +3315,51 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const nutritionStale =
-			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
-		const saved = { ...recipe, saved: true, nutritionStale };
-		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		const previousPage = page;
+		const previousQuery = query;
+		const previousFilter = filter;
+		const applied = applyImportedRecipeSave(
+			$state.snapshot(kitchen),
+			$state.snapshot(importSession),
+			recipe
+		);
+		kitchen.recipes = applied.nextRecipes;
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = emptyImportSession();
+		importSession = applied.nextSession;
 		resumeDialog = '';
 		modal = '';
-		selected = saved;
+		selected = applied.saved;
 		page = 'saved';
 		query = '';
 		filter = 'For you';
 		notify(
-			nutritionStale
+			applied.saved.nutritionStale
 				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
-				: 'Recipe saved to your collection.'
+				: 'Recipe saved to your collection.',
+			() => {
+				const rolledBack = applied.rollback($state.snapshot(kitchen));
+				if (!rolledBack.ok) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				if (voiceTarget === 'import') clearVoiceSession();
+				kitchen = rolledBack.kitchen;
+				if (selected?.id === applied.saved.id) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				if (editingRecipeMode === 'edit' && editingRecipe?.id === applied.saved.id) {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}
+				importSession = rolledBack.session;
+				resumeDialog = '';
+				error = '';
+				page = previousPage;
+				query = previousQuery;
+				filter = previousFilter;
+				modal = 'import';
+			}
 		);
 	}
 	async function exportKitchen() {
@@ -4510,8 +4581,12 @@
 	{scanBusy ? 'Scanning photo for ingredients…' : toast}
 </div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
-			onclick={() => (toast = '')}
+		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}>Undo</button
+			>{/if}<button
+			onclick={() => {
+				toast = '';
+				toastUndo = null;
+			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
@@ -4582,7 +4657,10 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if modal === voiceTarget && voiceBusy}<div class="voice-session" in:revealMotion>
+				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceBusy}<div
+						class="voice-session"
+						in:revealMotion
+					>
 						<p role="status" aria-live="polite">
 							{voiceStarting
 								? 'Opening microphone…'
@@ -4599,7 +4677,7 @@
 								>Cancel voice</button
 							>
 						</div>
-					</div>{:else if modal === voiceTarget && voiceRetained}<div
+					</div>{:else if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceRetained}<div
 						class="voice-session voice-recovery"
 						in:revealMotion
 					>
