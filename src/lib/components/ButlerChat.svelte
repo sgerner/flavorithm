@@ -15,7 +15,11 @@
 	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
-	import { buildButlerActions, type ButlerAction } from '#lib/butler-actions.ts';
+	import {
+		buildButlerActions,
+		previewButlerCommand,
+		type ButlerAction
+	} from '#lib/butler-actions.ts';
 	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
 	import type { AppState, Recipe } from '#lib/types.ts';
 
@@ -299,32 +303,8 @@
 			if (alive && token === generation) applying = '';
 		}
 	}
-	function words(value: string) {
-		return value.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[._-]/g, ' ');
-	}
-
-	function preview(command: unknown): string {
-		function format(value: unknown, depth = 0): string {
-			if (Array.isArray(value))
-				return value.map((item, i) => `${i + 1}. ${format(item, depth)}`).join('\n');
-			if (value && typeof value === 'object')
-				return Object.entries(value)
-					.filter(([key]) => key !== 'type' && key !== 'id' && key !== 'image')
-					.map(([key, item]) => {
-						if (key === 'recipeId')
-							return `Recipe: ${kitchen.recipes.find((recipe) => recipe.id === item)?.title ?? String(item)}`;
-						return `${words(key)}: ${typeof item === 'object' ? '\n' : ''}${format(item, depth + 1)}`;
-					})
-					.join('\n');
-			return typeof value === 'boolean' ? (value ? 'Yes' : 'No') : String(value ?? '');
-		}
-		const record = command as Record<string, unknown>;
-		const target = record?.id;
-		const name =
-			kitchen.recipes.find((item) => item.id === target)?.title ??
-			kitchen.pantry.find((item) => item.id === target)?.name ??
-			kitchen.shopping.find((item) => item.id === target)?.name;
-		return [name, format(command)].filter(Boolean).join('\n') || 'Kitchen update';
+	function preview(command: unknown, batch: unknown[] = []): string {
+		return previewButlerCommand(command, kitchen, batch);
 	}
 </script>
 
@@ -437,7 +417,10 @@
 											role="region"
 											aria-label={labels?.details ?? `${action.title} details`}
 										>
-											{#each action.commands as command}<pre>{preview(command)}</pre>{/each}
+											{#each action.commands as command}<pre>{preview(
+														command,
+														action.commands
+													)}</pre>{/each}
 										</div>
 									</details>
 									{#if action.status === 'pending'}
