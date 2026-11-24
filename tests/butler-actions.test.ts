@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState } from '../src/lib/data.ts';
-import { applyButlerCommands } from '../src/lib/butler.ts';
+import { applyButlerCommands, resolvePantryUpsertTargetId } from '../src/lib/butler.ts';
 import { buildButlerActions, previewButlerCommand } from '../src/lib/butler-actions.ts';
 
 test('independent recipe and pantry changes become readable individual cards', () => {
@@ -445,4 +445,175 @@ test('pantry changes group with matching generated shopping removals while manua
 	assert.equal(actions[0].commands.length, 2);
 	assert.equal(actions[1].commands.length, 1);
 	assert.equal(actions[1].title, 'paper napkins');
+});
+
+test('pantry merge target helper keeps card grouping and applied pantry merges identical across all cases', () => {
+	const kitchen = createInitialState();
+	kitchen.pantry = [
+		{ id: 'oil-stock', name: 'olive oil', quantity: 0.5, unit: 'cup', category: 'Oils' },
+		{
+			id: 'sample-rice',
+			name: 'jasmine rice',
+			quantity: 2,
+			unit: 'cups',
+			category: 'Grains',
+			sample: true
+		},
+		{
+			id: 'expiring-milk',
+			name: 'milk',
+			quantity: 1,
+			unit: 'l',
+			category: 'Dairy',
+			expires: '2026-10-28'
+		}
+	];
+	kitchen.shopping = [];
+
+	const cases: Array<{
+		label: string;
+		item: {
+			id: string;
+			name: string;
+			quantity: number;
+			unit: string;
+			category: string;
+			expires?: string;
+		};
+		expectedTargetId: string;
+		probeExistingId: string;
+	}> = [
+		{
+			label: 'alias + compatible unit merges into user-owned non-expiring stock',
+			item: {
+				id: 'new-ev-oil',
+				name: 'extra virgin olive oil',
+				quantity: 4,
+				unit: 'tbsp',
+				category: 'Oils'
+			},
+			expectedTargetId: 'oil-stock',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'zero-quantity compatible upsert targets existing non-expiring stock',
+			item: {
+				id: 'zero-ev-oil',
+				name: 'extra virgin olive oil',
+				quantity: 0,
+				unit: 'tbsp',
+				category: 'Oils'
+			},
+			expectedTargetId: 'oil-stock',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'incompatible unit dimension creates a separate pantry row',
+			item: {
+				id: 'oil-grams',
+				name: 'olive oil',
+				quantity: 100,
+				unit: 'g',
+				category: 'Oils'
+			},
+			expectedTargetId: 'oil-grams',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'incoming expiring lot stays separate from non-expiring stock',
+			item: {
+				id: 'oil-expiring-lot',
+				name: 'olive oil',
+				quantity: 0.25,
+				unit: 'cup',
+				category: 'Oils',
+				expires: '2026-10-30'
+			},
+			expectedTargetId: 'oil-expiring-lot',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'existing expiring lot is not merged into by new non-expiring stock',
+			item: {
+				id: 'fresh-milk',
+				name: 'milk',
+				quantity: 500,
+				unit: 'ml',
+				category: 'Dairy'
+			},
+			expectedTargetId: 'fresh-milk',
+			probeExistingId: 'expiring-milk'
+		},
+		{
+			label: 'sample-tagged starter stock is not merged into by new user groceries',
+			item: {
+				id: 'bought-rice',
+				name: 'jasmine rice',
+				quantity: 1,
+				unit: 'cup',
+				category: 'Grains'
+			},
+			expectedTargetId: 'bought-rice',
+			probeExistingId: 'sample-rice'
+		},
+		{
+			label: 'blank unit stays separate',
+			item: {
+				id: 'blank-unit-oil',
+				name: 'olive oil',
+				quantity: 1,
+				unit: '',
+				category: 'Oils'
+			},
+			expectedTargetId: 'blank-unit-oil',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'existing ID updates that row in place',
+			item: {
+				id: 'sample-rice',
+				name: 'jasmine rice',
+				quantity: 3,
+				unit: 'cups',
+				category: 'Grains'
+			},
+			expectedTargetId: 'sample-rice',
+			probeExistingId: 'sample-rice'
+		}
+	];
+
+	for (const testCase of cases) {
+		const targetId = resolvePantryUpsertTargetId(kitchen.pantry, testCase.item);
+		assert.equal(targetId, testCase.expectedTargetId, testCase.label);
+
+		// Card grouping joins with pantry.delete(probeExistingId) iff targetId === probeExistingId.
+		const grouped = buildButlerActions(
+			[
+				{ type: 'pantry.upsert', item: testCase.item },
+				{ type: 'pantry.delete', id: testCase.probeExistingId }
+			],
+			kitchen
+		);
+		assert.equal(
+			grouped.length,
+			targetId === testCase.probeExistingId ? 1 : 2,
+			`${testCase.label}: card grouping`
+		);
+
+		// Applied state mutates or creates exclusively targetId.
+		const applied = applyButlerCommands(kitchen, [
+			{ type: 'pantry.upsert', item: testCase.item }
+		]).state;
+		assert.ok(
+			applied.pantry.some((entry) => entry.id === targetId),
+			`${testCase.label}: target row exists`
+		);
+		if (targetId !== testCase.item.id) {
+			assert.equal(
+				applied.pantry.some((entry) => entry.id === testCase.item.id),
+				false,
+				`${testCase.label}: merged item does not create duplicate row`
+			);
+		}
+	}
 });

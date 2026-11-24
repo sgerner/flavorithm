@@ -168,6 +168,7 @@ test('butler prompt contract enforces saved recipes, importNotes attribution, an
 
 	for (const badCommand of [
 		{ type: 'preferences.update', preferences: { provider: 'anthropic', model: 'claude' } },
+		{ type: 'preferences.update', preferences: { usePersonalAI: true } },
 		{
 			type: 'recipe.upsert',
 			recipe: { ...kitchen.recipes[0], source: 'Inspired by a local bistro' }

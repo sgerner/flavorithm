@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { ButlerCommandSchema, type ButlerCommand } from './butler.ts';
-import { normalizeName, unitInfo } from './domain.ts';
+import { ButlerCommandSchema, resolvePantryUpsertTargetId, type ButlerCommand } from './butler.ts';
+import { normalizeName } from './domain.ts';
 import type { AppState } from './types.ts';
 
 export type ButlerAction = {
@@ -60,20 +60,9 @@ export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerA
 			case 'recipe.open':
 				share(index, `recipe:${command.id}`);
 				break;
-			case 'pantry.upsert': {
-				const existingById = kitchen.pantry.some((value) => value.id === command.item.id);
-				const mergeTarget =
-					!existingById && !command.item.expires?.trim() && command.item.unit.trim()
-						? kitchen.pantry.find(
-								(value) =>
-									normalizeName(value.name) === normalizeName(command.item.name) &&
-									unitInfo(value.unit).dimension === unitInfo(command.item.unit).dimension &&
-									!value.expires?.trim()
-							)
-						: undefined;
-				share(index, `pantry:${mergeTarget?.id ?? command.item.id}`);
+			case 'pantry.upsert':
+				share(index, `pantry:${resolvePantryUpsertTargetId(kitchen.pantry, command.item)}`);
 				break;
-			}
 			case 'pantry.delete':
 				share(index, `pantry:${command.id}`);
 				break;

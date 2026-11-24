@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { createInitialState } from '../src/lib/data.ts';
-import { applyButlerCommands, ButlerResponseSchema } from '../src/lib/butler.ts';
+import {
+	applyButlerCommands,
+	ButlerCommandSchema,
+	ButlerResponseSchema
+} from '../src/lib/butler.ts';
 
 test('butler proposals apply atomically and validate references', () => {
 	const current = createInitialState();
@@ -1105,6 +1109,7 @@ test('validation rejects AI connection mutations and sync-invalid fields while a
 		model: 'claude-sonnet-4-5',
 		reasoning: { effort: 'medium', enabled: true, budgetTokens: 2048 },
 		chatgptAccountId: 'acct-123',
+		usePersonalAI: true,
 		ratings: { [current.recipes[0].id]: 4 }
 	};
 	const baseRecipe = current.recipes[0];
@@ -1114,6 +1119,7 @@ test('validation rejects AI connection mutations and sync-invalid fields while a
 		{ model: 'gpt-4o' },
 		{ reasoning: { effort: 'high' } },
 		{ chatgptAccountId: 'other-account' },
+		{ usePersonalAI: false },
 		{ cuisines: [''] }
 	]) {
 		assert.throws(() =>
@@ -1203,7 +1209,222 @@ test('validation rejects AI connection mutations and sync-invalid fields while a
 		budgetTokens: 2048
 	});
 	assert.equal(accepted.preferences.chatgptAccountId, 'acct-123');
+	assert.equal(accepted.preferences.usePersonalAI, true);
 	assert.equal(accepted.preferences.ratings?.[baseRecipe.id], 4);
 	assert.equal(accepted.preferences.ratings?.['basil-stew'], 5);
 	assert.ok(validateAppState(accepted));
+});
+
+test('checked generated shopping rows survive pantry upserts and deletes while unchecked weekly deficits recalculate', () => {
+	const current = createInitialState();
+	const recipe = {
+		...current.recipes[0],
+		id: 'herb-salad',
+		servings: 2,
+		ingredients: [
+			{ name: 'olive oil', quantity: 0.5, unit: 'cup' },
+			{ name: 'scallions', quantity: 4, unit: 'each' },
+			{ name: 'lemon', quantity: 2, unit: 'each' }
+		]
+	};
+	current.recipes = [recipe];
+	current.pantry = [];
+	current.meals = [
+		{ id: 'friday-salad', date: '2026-10-23', slot: 'Dinner', recipeId: 'herb-salad', servings: 2 }
+	];
+	current.shopping = [];
+	const now = new Date('2026-10-21T12:00:00Z');
+
+	const generated = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	const oilItem = generated.shopping.find((item) => item.name === 'olive oil')!;
+	const lemonItem = generated.shopping.find((item) => item.name === 'lemon')!;
+
+	// Check off a partial olive oil purchase (0.25 cup of 0.5 cup needed), a full lemon purchase, and a recipe-scoped row.
+	const withCheckedRows = applyButlerCommands(
+		generated,
+		[
+			{
+				type: 'shopping.upsert',
+				item: { ...oilItem, id: 'checked-week-oil', quantity: 0.25, checked: true }
+			},
+			{
+				type: 'shopping.upsert',
+				item: { ...lemonItem, checked: true }
+			},
+			{
+				type: 'shopping.upsert',
+				item: {
+					id: 'checked-recipe-pepper',
+					name: 'black pepper',
+					quantity: 1,
+					unit: 'jar',
+					checked: true,
+					sourceKey: 'recipe:herb-salad'
+				}
+			},
+			{
+				type: 'shopping.upsert',
+				item: {
+					id: 'manual-foil',
+					name: 'aluminum foil',
+					quantity: 1,
+					unit: 'roll',
+					checked: false
+				}
+			},
+			{ type: 'shopping.generate', weekStart: '2026-10-19' }
+		],
+		now
+	).state;
+
+	const checkedWeekOil = withCheckedRows.shopping.find((item) => item.id === 'checked-week-oil')!;
+	const checkedWeekLemon = withCheckedRows.shopping.find((item) => item.id === lemonItem.id)!;
+	const checkedRecipePepper = withCheckedRows.shopping.find(
+		(item) => item.id === 'checked-recipe-pepper'
+	)!;
+	assert.equal(checkedWeekOil.checked, true);
+	assert.equal(checkedWeekLemon.checked, true);
+	assert.equal(
+		withCheckedRows.shopping.find((item) => item.name === 'olive oil' && !item.checked)?.quantity,
+		0.25
+	);
+
+	// Upsert pantry items covering olive oil completely and scallions partially: all checked generated rows survive intact.
+	const afterUpsert = applyButlerCommands(
+		withCheckedRows,
+		[
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'pantry-ev-oil',
+					name: 'extra virgin olive oil',
+					quantity: 1,
+					unit: 'cup',
+					category: 'Oils'
+				}
+			},
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'pantry-scallions',
+					name: 'green onions',
+					quantity: 2,
+					unit: 'each',
+					category: 'Produce'
+				}
+			}
+		],
+		now
+	).state;
+
+	assert.deepEqual(
+		afterUpsert.shopping.find((item) => item.id === 'checked-week-oil'),
+		checkedWeekOil
+	);
+	assert.deepEqual(
+		afterUpsert.shopping.find((item) => item.id === lemonItem.id),
+		checkedWeekLemon
+	);
+	assert.deepEqual(
+		afterUpsert.shopping.find((item) => item.id === 'checked-recipe-pepper'),
+		checkedRecipePepper
+	);
+	assert.equal(
+		afterUpsert.shopping.find((item) => item.id === 'manual-foil')?.name,
+		'aluminum foil'
+	);
+	assert.equal(
+		afterUpsert.shopping.find((item) => item.name === 'olive oil' && !item.checked),
+		undefined
+	);
+	assert.equal(
+		afterUpsert.shopping.find((item) => item.name === 'scallions' && !item.checked)?.quantity,
+		2
+	);
+	assert.equal(
+		afterUpsert.shopping.find((item) => item.name === 'lemon' && !item.checked),
+		undefined
+	);
+
+	// Deleting pantry stock recalculates unchecked deficits while continuing to preserve checked generated rows.
+	const afterDelete = applyButlerCommands(
+		afterUpsert,
+		[{ type: 'pantry.delete', id: 'pantry-scallions' }],
+		now
+	).state;
+	assert.deepEqual(
+		afterDelete.shopping.find((item) => item.id === 'checked-week-oil'),
+		checkedWeekOil
+	);
+	assert.deepEqual(
+		afterDelete.shopping.find((item) => item.id === lemonItem.id),
+		checkedWeekLemon
+	);
+	assert.equal(
+		afterDelete.shopping.find((item) => item.name === 'scallions' && !item.checked)?.quantity,
+		4
+	);
+});
+
+test('meal.complete requires explicit deductPantry and leaves pantry untouched when deductPantry is false', () => {
+	const now = new Date('2026-10-23T18:30:00.000Z');
+	const current = createInitialState();
+	const recipe = {
+		...current.recipes[0],
+		id: 'garlic-pasta',
+		servings: 2,
+		ingredients: [
+			{ name: 'garlic', quantity: 4, unit: 'cloves' },
+			{ name: 'olive oil', quantity: 2, unit: 'tbsp' }
+		]
+	};
+	current.recipes = [recipe];
+	current.pantry = [
+		{ id: 'garlic', name: 'garlic', quantity: 6, unit: 'cloves', category: 'Produce' }
+	];
+	current.meals = [
+		{ id: 'dinner-1', date: '2026-10-23', slot: 'Dinner', recipeId: 'garlic-pasta', servings: 2 }
+	];
+	current.shopping = [];
+
+	const withWeeklyShopping = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	const beforeSnapshot = structuredClone(withWeeklyShopping);
+	assert.ok(withWeeklyShopping.shopping.some((item) => item.name === 'olive oil'));
+
+	// Omitting deductPantry (or passing undefined) is rejected and never defaults on or off.
+	assert.equal(
+		ButlerCommandSchema.safeParse({ type: 'meal.complete', id: 'dinner-1' }).success,
+		false
+	);
+	assert.equal(
+		ButlerCommandSchema.safeParse({
+			type: 'meal.complete',
+			id: 'dinner-1',
+			deductPantry: undefined
+		}).success,
+		false
+	);
+	assert.throws(() =>
+		applyButlerCommands(withWeeklyShopping, [{ type: 'meal.complete', id: 'dinner-1' }], now)
+	);
+	assert.deepEqual(withWeeklyShopping, beforeSnapshot);
+
+	// Explicit deductPantry: false marks the meal cooked, leaves pantry untouched, and clears weekly shopping demand.
+	const completedWithoutDeduction = applyButlerCommands(
+		withWeeklyShopping,
+		[{ type: 'meal.complete', id: 'dinner-1', deductPantry: false, leftoverServings: 1 }],
+		now
+	).state;
+	assert.equal(completedWithoutDeduction.meals[0].completedAt, now.toISOString());
+	assert.equal(completedWithoutDeduction.meals[0].leftoverServings, 1);
+	assert.deepEqual(completedWithoutDeduction.pantry, withWeeklyShopping.pantry);
+	assert.equal(completedWithoutDeduction.shopping.length, 0);
 });

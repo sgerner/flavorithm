@@ -31,7 +31,7 @@
 <script lang="ts">
 	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
 	import { focusTrap } from '#lib/focus.ts';
 	import {
@@ -42,6 +42,7 @@
 		motionDuration,
 		prefersReducedMotion
 	} from '#lib/motion.ts';
+	import { calendarDayScrollLeft, weekOffsetFromStarts } from '#lib/planner.ts';
 	import { flip } from 'svelte/animate';
 	import {
 		ArrowRight,
@@ -87,19 +88,28 @@
 		preferenceSummary
 	} from '#lib/domain.ts';
 	import {
+		backfillSampleData,
+		clearSampleData,
 		completeMeal,
 		deleteShoppingItem,
 		expiryStatus,
 		filterPantryItems,
+		hasSampleData,
 		listPantryCategories,
-		normalizePantryDraft,
 		normalizeIngredientName,
+		normalizePantryDraft,
+		promoteSampleIngredient,
+		normalizeShoppingItem,
 		reconcileShoppingList,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
+		revertShoppingItem,
+		snapshotShoppingItem,
 		transferPurchasedItemsToPantry,
 		unitInfo,
-		type PantryDraft
+		type PantryDraft,
+		type ShoppingItemDraft,
+		type ShoppingItemSnapshot
 	} from '#lib/kitchen-workflows.ts';
 	import { rankPantryRecipes, rankRecipes } from '#lib/discovery.ts';
 	import {
@@ -113,6 +123,7 @@
 		insertRecipes,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
+	import { applyRecipeRating } from '#lib/recipe-detail.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -131,7 +142,15 @@
 		type VoiceState
 	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
-	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import {
+		CHATGPT_OAUTH_POLL_INTERVAL_MS,
+		CHATGPT_OAUTH_TTL_MS,
+		HOST_CONNECTION_ID,
+		startConnectionPoll,
+		type ConnectionModel,
+		type ConnectionPollHandle,
+		type ConnectionProvider
+	} from '#lib/ai-connections.ts';
 	import {
 		entitledChatGPTAccountId,
 		reconcileChatGPTPreferences,
@@ -142,7 +161,8 @@
 		runSignedInHydration
 	} from '#lib/client-workflows.ts';
 	import {
-		migrateGuestKitchenOnSignup,
+		clearGuestData,
+		clearGuestKitchen,
 		quarantineLegacyKitchen,
 		sanitizeKitchenState
 	} from '#lib/guest-storage.ts';
@@ -152,10 +172,19 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
-	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
+	import { isStandaloneRecipeUrl } from '#lib/recipe-scraper.ts';
+	import {
+		applyImportedRecipeSave,
+		canAppendImportTranscript,
+		cloneImportSession,
+		isReviewingImportDraft,
+		replaceImportSessionWithUrl
+	} from '#lib/import-session.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
+	let hasSampleRecords = $state(true);
 	let user = $state<User | null>(null);
 	let ready = $state(false);
 	let kitchenLoaded = $state(false);
@@ -169,6 +198,7 @@
 	let providerLoginUrl = $derived(authMetadataLoaded ? runtimeLoginUrl : data.loginUrl);
 	let providerLogoutUrl = $derived(authMetadataLoaded ? runtimeLogoutUrl : data.logoutUrl);
 	let online = $state(true);
+	let syncReady = $state(false);
 	let pendingSync = $state(false);
 	let sendingSync = $state(false);
 	let syncErrors = $state('');
@@ -346,22 +376,44 @@
 		}
 		modal = 'auth';
 	}
+	function clearHouseholdViewState() {
+		selected = null;
+		selectedMealServings = undefined;
+		editingRecipe = null;
+		editingRecipeMode = 'edit';
+		recipeToDelete = null;
+		resetMealDialogState();
+		pantryDraft = null;
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+		shoppingFilter = 'all';
+		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+	}
+	function saveLastAccount(account: User) {
+		if (managedAuth) return;
+		try {
+			localStorage.setItem('flavorithm-last-account', JSON.stringify(account));
+		} catch {}
+	}
 	function clearManagedIdentity() {
 		cancelScan(true);
 		clearVoiceSession();
 		pantryInput = '';
 		resumeDialog = '';
 		clearAIConnectionState();
+		clearHouseholdViewState();
 		kitchenSync?.clearContext();
 		user = null;
 		editingRecipe = null;
 		editingRecipeMode = 'edit';
 		kitchen = createInitialState();
+		hasSampleRecords = true;
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
 		showStarter = false;
 		stateEtag = null;
 		localStorage.removeItem('flavorithm-last-account');
+		clearGuestData(localStorage);
 		quarantineLegacyKitchen(localStorage);
 		members = [];
 		householdInvites = [];
@@ -464,7 +516,11 @@
 		return () => clearVoiceSession();
 	});
 	$effect(() => {
-		if (voiceTarget && modal !== voiceTarget && (voiceStarting || voiceState !== 'idle')) {
+		if (
+			voiceTarget &&
+			(voiceStarting || voiceState !== 'idle') &&
+			(modal !== voiceTarget || (voiceTarget === 'import' && isReviewingImportDraft(importSession)))
+		) {
 			clearVoiceSession();
 		}
 	});
@@ -489,6 +545,7 @@
 		accounts: ChatGPTAccount[];
 	}>({ configured: false, mode: 'unavailable', accounts: [] });
 	let connectionBusy = $state(false);
+	let connectionActive = $state(false);
 	let chatGPTAuthorizationUrl = $state('');
 	let chatGPTDevice = $state<{
 		loginId: string;
@@ -497,13 +554,21 @@
 		expiresAt: number;
 		interval: number;
 	} | null>(null);
-	let connectionPoll: ReturnType<typeof setInterval> | undefined;
+	let connectionPoll: ConnectionPollHandle | undefined;
 	let connectionPopup: Window | null = null;
-	let connectionPollCount = 0;
 	let connectionAttempt = 0;
-	let activeChatGPTAccount = $derived(
-		chatGPT.accounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
+	let personalChatGPTAccounts = $derived(
+		chatGPT.accounts.filter((a) => a.id !== HOST_CONNECTION_ID)
 	);
+	let activeChatGPTAccount = $derived(
+		personalChatGPTAccounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
+	);
+	let usingHostAI = $derived(Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI));
+	$effect(() => {
+		if (modal !== 'settings' && (connectionActive || chatGPTDevice || chatGPTAuthorizationUrl)) {
+			void cancelChatGPTDevice();
+		}
+	});
 
 	let providers = $state<ConnectionProvider[]>([]);
 	let accountModels = $state<ConnectionModel[]>([]);
@@ -525,6 +590,10 @@
 	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
+	let calendarGrid = $state<HTMLDivElement | undefined>();
+	let previousPage = '';
+	let pendingPlannerScrollDate = '';
+	let calendarScrollToken = 0;
 	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
@@ -541,12 +610,8 @@
 	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
-	let editingShoppingDraft = $state<{
-		id: string;
-		name: string;
-		quantity: number | null;
-		unit: string;
-	} | null>(null);
+	let editingShoppingDraft = $state<(ShoppingItemDraft & { id: string }) | null>(null);
+	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -557,20 +622,31 @@
 		const previousMode = installationAuthMode;
 		const previousUser = user;
 		updateAuthMetadata(data);
+		capabilities = {
+			emailDelivery: Boolean(data.capabilities?.emailDelivery),
+			recipeSearch: Boolean(data.capabilities?.recipeSearch)
+		};
+		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
+		const nextUser: User | null = data.user ?? null;
 		const modeChanged = previousMode !== installationAuthMode;
-		const changedIdentity = Boolean(
-			(previousUser &&
-				(previousUser.id !== data.user?.id ||
-					previousUser.householdId !== data.user?.householdId)) ||
-			(modeChanged && managedAuth && data.user)
-		);
+		const changedIdentity =
+			Boolean(previousUser) !== Boolean(nextUser) ||
+			Boolean(
+				previousUser &&
+				nextUser &&
+				(previousUser.id !== nextUser.id || previousUser.householdId !== nextUser.householdId)
+			) ||
+			Boolean(modeChanged && managedAuth && nextUser);
 		if (modeChanged && managedAuth) clearManagedIdentity();
 		if (changedIdentity) {
 			cancelScan(true);
 			kitchenSync?.clearContext();
 			clearAIConnectionState();
+			clearHouseholdViewState();
+			stateEtag = null;
+			if (nextUser) kitchen = createNewUserState();
 		}
-		user = data.user ?? null;
+		user = nextUser;
 		if (managedAuth && !user) {
 			clearManagedIdentity();
 			renewManagedSession({ status: 401 });
@@ -578,23 +654,46 @@
 		let stateLoaded = false;
 		if (changedIdentity) {
 			if (user) {
-				const latest = await request('/api/state');
-				adoptKitchen(latest.state || createNewUserState());
+				const snapshotUser = $state.snapshot(user);
+				showStarter = false;
+				kitchenSync?.prepare(snapshotUser);
 				kitchenLoaded = true;
-				stateLoaded = true;
+				saveLastAccount(snapshotUser);
+				try {
+					const latest = await request('/api/state');
+					adoptKitchen(latest.state || createNewUserState());
+					kitchenLoaded = true;
+					stateLoaded = true;
+					if (online && kitchenSync?.snapshot()) await retrySync();
+				} catch (e) {
+					kitchenSync?.failLoad((e as Error).message);
+					throw e;
+				}
 			} else if (managedAuth) {
 				clearManagedIdentity();
 			} else {
 				kitchen = createInitialState();
+				hasSampleRecords = true;
 				localStorage.removeItem('flavorithm-last-account');
 				kitchenLoaded = true;
 			}
+		} else if (user && !syncReady) {
+			const snapshotUser = $state.snapshot(user);
+			showStarter = false;
+			kitchenSync?.prepare(snapshotUser);
+			kitchenLoaded = true;
+			saveLastAccount(snapshotUser);
+			try {
+				const latest = await request('/api/state');
+				adoptKitchen(latest.state || createNewUserState());
+				kitchenLoaded = true;
+				stateLoaded = true;
+				if (online && kitchenSync?.snapshot()) await retrySync();
+			} catch (e) {
+				kitchenSync?.failLoad((e as Error).message);
+				throw e;
+			}
 		}
-		capabilities = {
-			emailDelivery: Boolean(data.capabilities?.emailDelivery),
-			recipeSearch: Boolean(data.capabilities?.recipeSearch)
-		};
-		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
 		return { ...data, stateLoaded };
 	}
 	const nav = [
@@ -713,7 +812,15 @@
 		const normalized = normalizePantryDraft(draft);
 		kitchen.pantry = kitchen.pantry.map((item) => {
 			if (item.id !== draft.id) return item;
+			const currentCategory = item.category.trim() || 'Pantry';
+			const currentExpires = item.expires?.trim().slice(0, 50) || undefined;
+			const changed =
+				item.quantity !== normalized.quantity ||
+				item.unit !== normalized.unit ||
+				currentCategory !== normalized.category ||
+				currentExpires !== normalized.expires;
 			const updated: AppState['pantry'][number] = {
+				...(changed ? promoteSampleIngredient(item) : item),
 				id: item.id,
 				name: item.name,
 				quantity: normalized.quantity,
@@ -721,8 +828,10 @@
 				category: normalized.category
 			};
 			if (normalized.expires) updated.expires = normalized.expires;
+			else delete updated.expires;
 			return updated;
 		});
+		hasSampleRecords = hasSampleData(kitchen);
 		const editedId = draft.id;
 		pantryDraft = null;
 		if (!restoreFocus) return;
@@ -754,6 +863,7 @@
 	function removePantryItem(item: AppState['pantry'][number]) {
 		if (pantryDraft?.id === item.id) pantryDraft = null;
 		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
+		hasSampleRecords = hasSampleData(kitchen);
 	}
 	function resetPantryFilters() {
 		pantryQuery = '';
@@ -854,15 +964,59 @@
 			undo ? 10000 : 4200
 		);
 	}
-	function removeShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId === item.id) {
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+	function applyShoppingEdit(item: AppState['shopping'][number]) {
+		normalizeShoppingItem(item, editingShoppingDraft?.id === item.id ? editingShoppingDraft : null);
+	}
+	function clearEditingShoppingState() {
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+		editingShoppingSnapshot = null;
+	}
+	async function startEditingShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId && editingShoppingId !== item.id) {
+			const active = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
+			if (active) applyShoppingEdit(active);
 		}
+		editingShoppingSnapshot = snapshotShoppingItem(item);
+		editingShoppingId = item.id;
+		editingShoppingDraft = {
+			id: item.id,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit
+		};
+		await tick();
+		document
+			.querySelector<HTMLInputElement>(`[data-shopping-name="${CSS.escape(item.id)}"]`)
+			?.focus();
+	}
+	async function finishEditingShoppingItem(item: AppState['shopping'][number]) {
+		const id = item.id;
+		applyShoppingEdit(item);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	async function cancelEditingShoppingItem() {
+		const id = editingShoppingId;
+		if (!id) return;
+		const active = kitchen.shopping.find((entry) => entry.id === id);
+		if (active && editingShoppingSnapshot) revertShoppingItem(active, editingShoppingSnapshot);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	function removeShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId === item.id) clearEditingShoppingState();
 		const removed = structuredClone($state.snapshot(item));
 		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		notify(`${item.name} removed.`, () => {
+			if (editingShoppingId === removed.id) clearEditingShoppingState();
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
+			if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+				clearEditingShoppingState();
 		});
 	}
 	function consumeLeftoverServing(meal: Meal) {
@@ -896,6 +1050,7 @@
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
 		kitchen.meals = kitchen.meals.filter((entry) => entry.id !== meal.id);
+		hasSampleRecords = hasSampleData(kitchen);
 		refreshWeekShopping(weekStartForDate(meal.date));
 		notify('Planned meal removed.', () => {
 			if (
@@ -903,6 +1058,7 @@
 				!kitchen.meals.some((entry) => entry.id === removed.id)
 			) {
 				kitchen.meals.push(removed);
+				hasSampleRecords = hasSampleData(kitchen);
 				refreshWeekShopping(weekStartForDate(removed.date));
 			}
 		});
@@ -959,6 +1115,19 @@
 		page;
 		if (ready) window.scrollTo({ top: 0, behavior: 'instant' });
 	});
+	$effect(() => {
+		const currentPage = page;
+		const enteringPlanner = currentPage === 'planner' && previousPage !== 'planner';
+		previousPage = currentPage;
+		if (!enteringPlanner) return;
+		if (pendingPlannerScrollDate) {
+			pendingPlannerScrollDate = '';
+			return;
+		}
+		if (untrack(() => weekOffset === 0)) {
+			void scrollCalendarToDate(dateKey(new Date()), true);
+		}
+	});
 	let stateEtag: string | null = null;
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
@@ -978,7 +1147,7 @@
 		}
 		if (user) kitchenSync?.stage(sanitized);
 		clearTimeout(saveTimer);
-		if (user && !syncing && online)
+		if (user && pendingSync && !syncing && !syncErrors && online)
 			saveTimer = setTimeout(() => {
 				void retrySync();
 			}, 500);
@@ -990,9 +1159,12 @@
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				kitchen = sanitizeKitchenState(state);
+				const sanitized = sanitizeKitchenState(state);
+				kitchen = sanitized;
+				hasSampleRecords = hasSampleData(sanitized);
 			},
 			onStatus: (status) => {
+				syncReady = status.ready;
 				pendingSync = status.pending;
 				sendingSync = status.syncing;
 				conflicts = status.conflicts;
@@ -1039,21 +1211,26 @@
 		});
 		if (managedAuth) {
 			localStorage.removeItem('flavorithm-last-account');
+			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			showStarter = false;
 		} else {
+			const started = localStorage.getItem('flavorithm-started') === 'yes';
 			try {
 				// The legacy key could contain a signed-in household. Preserve it separately without loading it.
 				quarantineLegacyKitchen(localStorage);
 				const local = localStorage.getItem('flavorithm-guest-kitchen');
 				if (local) {
 					const sanitized = sanitizeKitchenState(JSON.parse(local));
-					if (!themes.includes(sanitized.preferences.theme)) sanitized.preferences.theme = 'nosh';
-					kitchen = sanitized;
+					const loaded = started ? sanitized : backfillSampleData(sanitized);
+					if (!themes.includes(loaded.preferences.theme)) loaded.preferences.theme = 'nosh';
+					kitchen = loaded;
+					hasSampleRecords = hasSampleData(loaded);
 				}
 			} catch {}
-			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
+			showStarter = !started;
 			kitchenLoaded = true;
 		}
 		ready = true;
@@ -1079,8 +1256,10 @@
 				updateAuthMetadata(data);
 				if (managedAuth) {
 					localStorage.removeItem('flavorithm-last-account');
+					clearGuestData(localStorage);
 					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
+					hasSampleRecords = true;
 					kitchenLoaded = false;
 					showStarter = false;
 				}
@@ -1089,8 +1268,9 @@
 					recipeSearch: Boolean(data.capabilities?.recipeSearch)
 				};
 				syncing = true;
-				user = data.user ?? null;
-				if (!user) {
+				const nextUser: User | null = data.user ?? null;
+				if (!nextUser) {
+					user = null;
 					kitchenSync?.clearContext();
 					localStorage.removeItem('flavorithm-last-account');
 					if (managedAuth) {
@@ -1099,30 +1279,51 @@
 					}
 					syncing = false;
 				} else {
-					const owner = data.user.id;
+					clearHouseholdViewState();
+					kitchen = createNewUserState();
+					user = nextUser;
+					showStarter = false;
+					kitchenSync?.prepare(nextUser);
+					kitchenLoaded = true;
+					saveLastAccount(nextUser);
+					const owner = nextUser.id;
 					const attempt = connectionAttempt;
-					await runSignedInHydration({
-						returnFromChatGPT,
-						fetchState: () => request('/api/state'),
-						fetchConnections: () => request('/api/connections/chatgpt'),
-						adoptState: (saved) => {
-							adoptKitchen(saved.state || createNewUserState());
-							kitchenLoaded = true;
-							user = data.user ?? null;
-							if (user) showStarter = false;
-							syncing = false;
-						},
-						openSettings: () => openSettings(),
-						onConnections: (result) => {
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							chatGPT = result;
-							reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
-						},
-						onConnectionsError: () => {
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.');
+					try {
+						await runSignedInHydration({
+							returnFromChatGPT,
+							fetchState: () => request('/api/state'),
+							fetchConnections: () => request('/api/connections/chatgpt'),
+							adoptState: (saved) => {
+								adoptKitchen(saved.state || createNewUserState());
+								kitchenLoaded = true;
+								showStarter = false;
+								syncing = false;
+							},
+							openSettings: async () => {
+								if (online && kitchenSync?.snapshot()) await retrySync();
+								await openSettings();
+							},
+							onConnections: (result) => {
+								if (attempt !== connectionAttempt || user?.id !== owner) return;
+								chatGPT = result;
+								reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+							},
+							onConnectionsError: () => {
+								if (attempt !== connectionAttempt || user?.id !== owner) return;
+								notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.');
+							}
+						});
+						if (!returnFromChatGPT && online && kitchenSync?.snapshot()) {
+							await retrySync();
 						}
-					});
+					} catch (stateError) {
+						syncing = false;
+						kitchenSync?.failLoad((stateError as Error).message);
+						if (managedAuth) renewManagedSession(stateError);
+						notify(
+							'Could not load your kitchen. New edits will stay on this device until sync succeeds.'
+						);
+					}
 				}
 				if (verificationToken && !managedAuth) {
 					try {
@@ -1149,8 +1350,13 @@
 					try {
 						const cached = JSON.parse(localStorage.getItem('flavorithm-last-account') || 'null');
 						if (cached?.id && cached?.householdId) {
+							clearHouseholdViewState();
+							kitchen = createNewUserState();
 							user = cached;
+							showStarter = false;
+							kitchenLoaded = true;
 							kitchenSync?.restore(cached);
+							if (online) kitchenSync?.failLoad((error as Error).message);
 						}
 					} catch {}
 				}
@@ -1193,20 +1399,19 @@
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
-			clearInterval(connectionPoll);
+			connectionPoll?.stop();
+			connectionPopup?.close();
 			cancelScan(true);
 			voiceCapture?.cancel();
 		};
 	});
 	function adoptKitchen(state: AppState) {
 		const sanitized = sanitizeKitchenState(state);
+		hasSampleRecords = hasSampleData(sanitized);
 		if (user && kitchenSync) {
-			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), sanitized, stateEtag || '');
-			if (!managedAuth) {
-				try {
-					localStorage.setItem('flavorithm-last-account', JSON.stringify(user));
-				} catch {}
-			}
+			const snapshotUser = $state.snapshot(user);
+			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
+			saveLastAccount(snapshotUser);
 		} else kitchen = sanitized;
 	}
 	async function retrySync(prefer?: 'local' | 'remote', expectedEtag?: string | null) {
@@ -1247,6 +1452,7 @@
 				retrySync: () => retrySync()
 			});
 		} catch (e) {
+			kitchenSync?.failLoad((e as Error).message);
 			syncErrors = (e as Error).message;
 			if (managedAuth) {
 				clearManagedIdentity();
@@ -1278,19 +1484,41 @@
 	}
 
 	function freshKitchen() {
-		editingShoppingId = '';
-		editingShoppingDraft = null;
-		kitchen.pantry = [];
-		kitchen.meals = [];
-		kitchen.shopping = [];
-		kitchen.recipes = kitchen.recipes.map((r) => ({ ...r, rating: undefined, saved: false }));
+		clearEditingShoppingState();
+		if (!hasSampleData(kitchen)) {
+			hasSampleRecords = false;
+			showStarter = false;
+			if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
+			return;
+		}
+		const previousKitchen = sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)));
+		const wasShowingStarter = showStarter;
+		const previousStarted =
+			!user && !managedAuth ? localStorage.getItem('flavorithm-started') : null;
+		kitchen = clearSampleData(previousKitchen);
+		hasSampleRecords = hasSampleData(kitchen);
 		pantryDraft = null;
 		resetPantryFilters();
+		const appliedSnapshot = JSON.stringify(kitchen);
 		showStarter = false;
-		localStorage.setItem('flavorithm-started', 'yes');
-		page = 'pantry';
-		modal = 'pantry';
-		notify('Sample pantry and meal plan cleared. Starter recipes kept.');
+		if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
+		if (modal === 'settings') closeDialog();
+		notify('Sample data cleared.', () => {
+			if (JSON.stringify(kitchen) === appliedSnapshot) {
+				pantryDraft = null;
+				clearEditingShoppingState();
+				kitchen = previousKitchen;
+				hasSampleRecords = hasSampleData(previousKitchen);
+				if (wasShowingStarter && !user && !managedAuth) {
+					showStarter = true;
+					if (previousStarted === null) localStorage.removeItem('flavorithm-started');
+					else localStorage.setItem('flavorithm-started', previousStarted);
+				}
+				notify('Sample data restored.');
+			} else {
+				notify('Your kitchen changed again. Review the current values before editing.');
+			}
+		});
 	}
 	function navigate(id: string) {
 		commitInlineEdits();
@@ -1310,7 +1538,7 @@
 		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
 		const existingKeys = new Set(
 			kitchen.pantry
-				.filter((item) => !item.expires?.trim())
+				.filter((item) => !item.sample && !item.expires?.trim())
 				.map(
 					(item) => `${normalizeIngredientName(item.name)}\u0000${unitInfo(item.unit).dimension}`
 				)
@@ -1379,67 +1607,77 @@
 			syncing = true;
 			commitInlineEdits();
 			clearTimeout(saveTimer);
-			const guestKitchen =
-				authMode === 'register' ? sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))) : null;
+			const isRegister = authMode === 'register';
+			const guestKitchen = isRegister
+				? clearSampleData(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))))
+				: null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
-			user = result.user;
-			let migratedSynced = true;
-			if (guestKitchen) {
-				const migrated = await migrateGuestKitchenOnSignup({
-					guestState: guestKitchen,
-					loadInitialState: async () => {
-						const saved = await request('/api/state');
-						return { state: saved.state || null, etag: stateEtag || '' };
-					},
-					adoptBaseline: (baseline, etag) => {
-						stateEtag = etag || null;
-						adoptKitchen(baseline);
-					},
-					stage: (next) => {
-						kitchen = next;
-						kitchenSync?.stage(next);
-					},
-					sync: async () => {
-						await kitchenSync?.sync();
-					},
-					hasPendingFailure: () => Boolean(syncErrors || kitchenSync?.snapshot())
-				});
-				kitchen = migrated.state;
-				kitchenLoaded = true;
-				migratedSynced = migrated.synced;
-			} else {
-				const saved = await request('/api/state');
-				if (saved.state) adoptKitchen(saved.state);
-				else {
-					kitchen = createNewUserState();
-					await request('/api/state', { state: kitchen }, 'PUT');
-					adoptKitchen(kitchen);
-				}
-				kitchenLoaded = true;
-			}
-			user = result.user;
-			showStarter = false;
-			syncing = false;
-			await refreshConnections().catch(() =>
-				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
-			);
+			const authenticatedUser: User = result.user;
 			password = '';
+			showStarter = false;
+			clearHouseholdViewState();
+			stateEtag = null;
+			kitchen = guestKitchen ?? createNewUserState();
+			hasSampleRecords = hasSampleData(kitchen);
+			user = authenticatedUser;
+			kitchenSync?.prepare(authenticatedUser);
+			kitchenLoaded = true;
+			saveLastAccount(authenticatedUser);
+			if (guestKitchen) {
+				kitchen = guestKitchen;
+				hasSampleRecords = hasSampleData(guestKitchen);
+				kitchenSync?.stage(guestKitchen);
+				if (!syncErrors) {
+					clearGuestKitchen(localStorage);
+					clearGuestData(localStorage);
+				}
+			}
+			let stateLoaded = false;
+			try {
+				const saved = await request('/api/state');
+				if (guestKitchen) {
+					adoptKitchen(saved.state || createNewUserState());
+					if (!saved.state && !kitchenSync?.snapshot()) {
+						const created = await request('/api/state', { state: guestKitchen }, 'PUT');
+						adoptKitchen(created.state || guestKitchen);
+					} else {
+						await kitchenSync?.sync();
+					}
+				} else if (saved.state) {
+					adoptKitchen(saved.state);
+					if (online && kitchenSync?.snapshot()) await retrySync();
+				} else {
+					const initial = createNewUserState();
+					const created = await request('/api/state', { state: initial }, 'PUT');
+					adoptKitchen(created.state || initial);
+					if (online && kitchenSync?.snapshot()) await retrySync();
+				}
+				stateLoaded = true;
+			} catch (stateError) {
+				kitchenSync?.failLoad((stateError as Error).message);
+			}
+			syncing = false;
+			if (stateLoaded) {
+				await refreshConnections().catch(() =>
+					notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
+				);
+			}
 			if (resumeDialog) {
 				const target = resumeDialog;
 				resumeDialog = '';
 				modal = target;
 			} else {
 				modal = '';
-				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
+				if (isRegister && stateLoaded && !kitchen.preferences.onboardingStatus) openOnboarding();
 			}
-			const firstName = user?.name.split(' ')[0] || 'chef';
-			if (guestKitchen && !migratedSynced) {
-				notify(
-					`Welcome, ${firstName}. Your kitchen is saved on this device and will sync when you reconnect.`
-				);
-			} else {
-				notify(`Welcome to your kitchen, ${firstName}.`);
-			}
+			const syncedCleanly =
+				stateLoaded && !(guestKitchen && (syncErrors || kitchenSync?.snapshot()));
+			const firstName = authenticatedUser.name.split(' ')[0] || 'chef';
+			notify(
+				syncedCleanly
+					? `Welcome to your kitchen, ${firstName}.`
+					: 'Account ready. Kitchen sync failed—your items are saved on this device.'
+			);
 		} catch (e) {
 			error = (e as Error).message;
 		} finally {
@@ -1466,6 +1704,7 @@
 			await flushKitchen();
 			await request('/api/auth', { action: 'logout' });
 			kitchenSync?.clearContext();
+			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
 			editingRecipe = null;
@@ -1483,14 +1722,11 @@
 			pantryDraft = null;
 			resetPantryFilters();
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
-			clearInterval(connectionPoll);
-			connectionBusy = false;
-			chatGPTAuthorizationUrl = '';
-			chatGPTDevice = null;
-			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 			stateEtag = null;
 			syncing = false;
 			modal = '';
@@ -1502,14 +1738,17 @@
 
 	function clearAIConnectionState() {
 		connectionAttempt++;
+		connectionActive = false;
 		apiKey = '';
 		providers = [];
 		accountModels = [];
 		catalogVersion++;
 		catalogLoading = false;
 		catalogError = '';
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
@@ -1524,7 +1763,8 @@
 		await runConcurrentModelCatalog({
 			connectionsTask,
 			isCurrent: () => version === catalogVersion && user?.id === owner,
-			getEntitledAccountId: () => entitledChatGPTAccountId(kitchen.preferences, chatGPT.accounts),
+			getEntitledAccountId: () =>
+				entitledChatGPTAccountId(kitchen.preferences, chatGPT.accounts, chatGPT.host),
 			fetchPublicCatalog: () => request('/api/models'),
 			fetchAccountCatalog: (accountId) =>
 				request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`),
@@ -1586,23 +1826,36 @@
 						document.getElementById(headingId)?.focus();
 					}
 				: undefined,
+			onAuthError: (e) => {
+				if (online || syncErrors) error = (e as Error).message;
+			},
 			onError: (e) => {
-				error = (e as Error).message;
+				error ||= (e as Error).message;
 			}
 		});
 	}
 	async function changeConnection(providerId?: string) {
 		if (providerId === kitchen.preferences.provider) return;
+		const currentDevice = chatGPTDevice;
 		connectionAttempt++;
+		connectionActive = false;
 		if (providerId && providerId !== kitchen.preferences.provider) {
 			apiKey = '';
 			kitchen.preferences.provider = providerId;
 		}
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
+		if (currentDevice && user) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
 		kitchen.preferences.model = '';
 		kitchen.preferences.reasoning = undefined;
 		accountModels = [];
@@ -1618,16 +1871,31 @@
 			openAuthentication();
 			return;
 		}
+		const currentDevice = chatGPTDevice;
 		const attempt = ++connectionAttempt;
 		const owner = user.id;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
+		if (currentDevice) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
+		connectionActive = true;
 		connectionBusy = true;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
 		error = '';
-		connectionPopup =
+		const popup =
 			chatGPT.mode === 'device'
 				? null
 				: window.open('about:blank', 'flavorithm-chatgpt-connect', 'popup,width=620,height=780');
+		connectionPopup = popup;
+		const isCurrentInSettings = () =>
+			attempt === connectionAttempt && user?.id === owner && modal === 'settings';
 		try {
 			const previousAccounts = new Map(chatGPT.accounts.map((a) => [a.id, a.updatedAt]));
 			const previous = JSON.stringify(chatGPT.accounts);
@@ -1636,51 +1904,83 @@
 				accountId,
 				reconsent
 			});
-			if (attempt !== connectionAttempt || user?.id !== owner) return;
+			if (!isCurrentInSettings()) {
+				popup?.close();
+				if (connectionPopup === popup) connectionPopup = null;
+				if (result?.kind === 'device' && user?.id === owner) {
+					void request('/api/connections/chatgpt', {
+						action: 'cancel',
+						loginId: result.loginId
+					}).catch(() => {});
+				}
+				return;
+			}
 			if (result.kind === 'device') {
 				chatGPTDevice = result;
-				clearInterval(connectionPoll);
-				let polling = false;
-				connectionPoll = setInterval(async () => {
-					if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-					polling = true;
-					try {
-						const connected = await request('/api/connections/chatgpt', {
-							action: 'poll',
-							loginId: result.loginId
-						});
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						if (connected.connected) {
-							clearInterval(connectionPoll);
+				connectionPoll = startConnectionPoll({
+					intervalMs: result.interval * 1000,
+					expiresAt: result.expiresAt,
+					attempt,
+					getAttempt: () => connectionAttempt,
+					owner,
+					getOwner: () => user?.id,
+					isOpen: () => modal === 'settings',
+					poll: async ({ expired, stop }) => {
+						try {
+							const connected = await request('/api/connections/chatgpt', {
+								action: 'poll',
+								loginId: result.loginId
+							});
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							if (connected.connected) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								await refreshConnections();
+								if (attempt !== connectionAttempt || user?.id !== owner) return false;
+								kitchen.preferences.chatgptAccountId = connected.accountId;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify('ChatGPT connected. Choose a model.');
+								return false;
+							}
+							if (expired) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								error = 'ChatGPT authorization expired. Start again.';
+								return false;
+							}
+						} catch (e) {
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							const status = (e as { status?: number }).status;
+							// Keep the original login alive through brief deployment/network outages.
+							if (
+								chatGPTDevice &&
+								!expired &&
+								Date.now() < result.expiresAt &&
+								(status === undefined || status === 429 || status >= 500)
+							)
+								return;
+							stop();
+							connectionActive = false;
 							connectionBusy = false;
 							chatGPTDevice = null;
-							await refreshConnections();
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							kitchen.preferences.chatgptAccountId = connected.accountId;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							notify('ChatGPT connected. Choose a model.');
+							error = (e as Error).message;
+							return false;
 						}
-					} catch (e) {
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						const status = (e as { status?: number }).status;
-						// Keep the original login alive through brief deployment/network outages.
-						if (
-							chatGPTDevice &&
-							Date.now() < result.expiresAt &&
-							(status === undefined || status === 429 || status >= 500)
-						)
-							return;
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTDevice = null;
-						error = (e as Error).message;
-					} finally {
-						polling = false;
 					}
-				}, result.interval * 1000);
+				});
 				return;
 			}
 
@@ -1694,67 +1994,91 @@
 			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
+				connectionActive = false;
 				window.location.assign(result.authorizationUrl);
 				return;
 			}
-			clearInterval(connectionPoll);
-			connectionPollCount = 0;
-			let polling = false;
-			connectionPoll = setInterval(async () => {
-				if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-				polling = true;
-				try {
-					await refreshConnections();
-					if (attempt !== connectionAttempt || user?.id !== owner) return;
-					connectionPollCount++;
-					const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
-					if (connectionChanged || connectionPopup?.closed) {
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTAuthorizationUrl = '';
-						chatGPTDevice = null;
-						const account = chatGPT.accounts.find(
-							(a) =>
-								a.connected &&
-								(accountId
-									? a.id === accountId
-									: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
-						);
-						if (account && connectionChanged) {
-							kitchen.preferences.chatgptAccountId = account.id;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							connectionPopup?.close();
-							notify(
-								account.planEnabled
-									? 'ChatGPT connected. Choose a model to cook with your plan.'
-									: 'ChatGPT signed in. Enable plan usage to generate recipes.'
-							);
-						} else if (!connectionChanged) {
-							notify('The authorization window closed. Your previous connection is unchanged.');
+			const expiresAt =
+				typeof result.expiresAt === 'number' ? result.expiresAt : Date.now() + CHATGPT_OAUTH_TTL_MS;
+			connectionPoll = startConnectionPoll({
+				intervalMs: CHATGPT_OAUTH_POLL_INTERVAL_MS,
+				expiresAt,
+				attempt,
+				getAttempt: () => connectionAttempt,
+				owner,
+				getOwner: () => user?.id,
+				isOpen: () => modal === 'settings',
+				poll: async ({ expired, stop }) => {
+					try {
+						await refreshConnections();
+						if (!isCurrentInSettings()) {
+							stop();
+							return false;
 						}
-					}
-					if (connectionPollCount >= 400) {
-						clearInterval(connectionPoll);
+						const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
+						if (connectionChanged || connectionPopup?.closed) {
+							stop();
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							const account = chatGPT.accounts.find(
+								(a) =>
+									a.id !== HOST_CONNECTION_ID &&
+									a.connected &&
+									(accountId
+										? a.id === accountId
+										: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
+							);
+							if (account && connectionChanged) {
+								connectionPopup?.close();
+								connectionPopup = null;
+								kitchen.preferences.chatgptAccountId = account.id;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify(
+									account.planEnabled
+										? 'ChatGPT connected. Choose a model to cook with your plan.'
+										: 'ChatGPT signed in. Enable plan usage to generate recipes.'
+								);
+							} else if (!connectionChanged) {
+								connectionPopup = null;
+								notify('The authorization window closed. Your previous connection is unchanged.');
+							}
+							return false;
+						}
+						if (expired) {
+							stop();
+							connectionPopup?.close();
+							connectionPopup = null;
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							error = 'The connection window timed out. Try connecting again.';
+							return false;
+						}
+					} catch (e) {
+						stop();
+						if (!isCurrentInSettings()) return false;
+						connectionPopup?.close();
+						connectionPopup = null;
+						connectionActive = false;
 						connectionBusy = false;
 						chatGPTAuthorizationUrl = '';
 						chatGPTDevice = null;
-						error = 'The connection window timed out. Try connecting again.';
+						error = (e as Error).message;
+						return false;
 					}
-				} catch (e) {
-					clearInterval(connectionPoll);
-					connectionBusy = false;
-					chatGPTAuthorizationUrl = '';
-					chatGPTDevice = null;
-					error = (e as Error).message;
-				} finally {
-					polling = false;
 				}
-			}, 1500);
+			});
 		} catch (e) {
-			connectionPopup?.close();
+			popup?.close();
+			if (connectionPopup === popup) connectionPopup = null;
+			if (!isCurrentInSettings()) return;
+			connectionActive = false;
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
 			chatGPTDevice = null;
@@ -1764,10 +2088,15 @@
 	async function cancelChatGPTDevice() {
 		const current = chatGPTDevice;
 		connectionAttempt++;
-		clearInterval(connectionPoll);
+		connectionActive = false;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
+		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
-		if (current) {
+		if (current && user) {
 			try {
 				await request('/api/connections/chatgpt', { action: 'cancel', loginId: current.loginId });
 			} catch {
@@ -1811,7 +2140,18 @@
 			chatGPTDevice = null;
 		}
 	}
-	function needAI() {
+	function hasPersonalAIReady() {
+		const isPlan = kitchen.preferences.provider === 'chatgpt';
+		return (
+			(isPlan
+				? Boolean(activeChatGPTAccount?.connected && activeChatGPTAccount.planEnabled)
+				: Boolean(apiKey)) && Boolean(kitchen.preferences.model)
+		);
+	}
+	function hasAIConnection() {
+		return Boolean(user) && hasPersonalAIReady();
+	}
+	async function needAI() {
 		if (!user) {
 			openAuthentication();
 			notify(
@@ -1821,12 +2161,14 @@
 			);
 			return false;
 		}
+		if (usingHostAI) return true;
+		if (!kitchen.preferences.usePersonalAI && !hasPersonalAIReady()) {
+			await refreshConnections().catch(() => {});
+			if (usingHostAI) return true;
+		}
 		const isPlan = kitchen.preferences.provider === 'chatgpt';
-		if (
-			(isPlan ? !activeChatGPTAccount?.connected || !activeChatGPTAccount.planEnabled : !apiKey) ||
-			!kitchen.preferences.model
-		) {
-			openSettings(true);
+		if (!hasPersonalAIReady()) {
+			void openSettings(true);
 			notify(
 				isPlan
 					? 'Connect your ChatGPT plan and choose an available model.'
@@ -1837,31 +2179,54 @@
 		return true;
 	}
 	async function ai(action: string, extra: Record<string, unknown> = {}, signal?: AbortSignal) {
-		return request(
-			'/api/ai',
-			{
-				action,
-				...(kitchen.preferences.provider === 'chatgpt'
-					? { connectionId: kitchen.preferences.chatgptAccountId }
-					: { apiKey }),
-				provider: kitchen.preferences.provider,
-				model: kitchen.preferences.model,
-				reasoning: kitchen.preferences.reasoning,
-				...(action === 'capture' || action === 'chat'
-					? {}
+		const isSearch = action === 'search';
+		const useHost = !isSearch && Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI);
+		const buildPayload = (hostMode: boolean) => ({
+			action,
+			...(isSearch
+				? {}
+				: hostMode && chatGPT.host
+					? {
+							usePersonalAI: false,
+							provider: 'chatgpt',
+							model: chatGPT.host.model,
+							connectionId: HOST_CONNECTION_ID
+						}
 					: {
-							pantry: kitchen.pantry.filter(
-								(item) => item.quantity > 0 && expiryStatus(item.expires) !== 'expired'
-							),
-							preferences: kitchen.preferences,
-							recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
-							prompt
+							usePersonalAI: true,
+							...(kitchen.preferences.provider === 'chatgpt'
+								? { connectionId: kitchen.preferences.chatgptAccountId }
+								: { apiKey }),
+							provider: kitchen.preferences.provider,
+							model: kitchen.preferences.model,
+							reasoning: kitchen.preferences.reasoning
 						}),
-				...extra
-			},
-			'POST',
-			signal
-		);
+			...(action === 'capture' || action === 'chat' || isSearch
+				? {}
+				: {
+						pantry: kitchen.pantry.filter(
+							(item) => item.quantity > 0 && expiryStatus(item.expires) !== 'expired'
+						),
+						preferences: kitchen.preferences,
+						recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
+						prompt
+					}),
+			...extra
+		});
+		try {
+			return await request('/api/ai', buildPayload(useHost), 'POST', signal);
+		} catch (err) {
+			if (useHost && (err as { status?: number })?.status === 400) {
+				await refreshConnections().catch(() => {});
+				if (!chatGPT.host) {
+					if (hasPersonalAIReady()) {
+						return await request('/api/ai', buildPayload(false), 'POST', signal);
+					}
+					void openSettings(true);
+				}
+			}
+			throw err;
+		}
 	}
 	let butlerChat = $state<ButlerChat>();
 	let butlerOpen = $state(false);
@@ -1879,7 +2244,7 @@
 		signal?: AbortSignal,
 		recipeDrafts: Recipe[] = []
 	) {
-		if (!needAI()) {
+		if (!(await needAI())) {
 			butlerChat?.close();
 			throw new Error('Sign in and connect a model in Settings to speak with Basil.');
 		}
@@ -1922,6 +2287,7 @@
 		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
+		hasSampleRecords = hasSampleData(kitchen);
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
@@ -1948,8 +2314,10 @@
 		}
 		const appliedSnapshot = JSON.stringify(kitchen);
 		notify('Basil’s changes applied.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) kitchen = previousKitchen;
-			else notify('Your kitchen changed again. Review the current values before editing.');
+			if (JSON.stringify(kitchen) === appliedSnapshot) {
+				kitchen = previousKitchen;
+				hasSampleRecords = hasSampleData(previousKitchen);
+			} else notify('Your kitchen changed again. Review the current values before editing.');
 		});
 		return appliedSnapshot;
 	}
@@ -2029,7 +2397,7 @@
 	}
 
 	async function generate() {
-		if (!needAI()) return;
+		if (!(await needAI())) return;
 		busy = true;
 		error = '';
 		try {
@@ -2051,7 +2419,7 @@
 		const file = input?.files?.[0];
 		if (input) input.value = '';
 		if (imageInput) imageInput.value = '';
-		if (!file || scanBusy || busy || voiceBusy || !needAI()) return;
+		if (!file || scanBusy || busy || voiceBusy || !(await needAI())) return;
 		const generation = ++scanGeneration;
 		const currentController = new AbortController();
 		scanController = currentController;
@@ -2156,7 +2524,10 @@
 			return;
 		}
 		voiceError = '';
-		if (voiceTarget === 'import') activeVoiceImportSession = importSession;
+		if (voiceTarget === 'import') {
+			importSession.reviewingDraft = false;
+			activeVoiceImportSession = importSession;
+		}
 		await voiceCapture.retry({
 			provider: plan.provider,
 			model: voiceModel,
@@ -2171,10 +2542,13 @@
 	}
 	async function startDictation(forRecipe: boolean) {
 		if (voiceBusy) return;
-		if (forRecipe && !modal) {
-			mobileNav = false;
-			error = '';
-			modal = 'import';
+		if (forRecipe) {
+			importSession.reviewingDraft = false;
+			if (!modal) {
+				mobileNav = false;
+				error = '';
+				modal = 'import';
+			}
 		}
 		const plan = planVoiceStart({
 			forRecipe,
@@ -2200,6 +2574,9 @@
 		resumeDialog = '';
 		voiceStarting = true;
 		voiceTarget = plan.targetDialog;
+		if (plan.targetDialog === 'import') {
+			importSession.reviewingDraft = false;
+		}
 		if (modal !== plan.targetDialog) {
 			mobileNav = false;
 			error = '';
@@ -2216,12 +2593,24 @@
 				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
-				if (voiceCapture !== capture || user?.id !== owner || modal !== targetDialog) return;
-				voiceError = '';
+				if (voiceCapture !== capture) return;
 				if (targetDialog === 'import') {
-					if (importSession !== activeVoiceImportSession || importSession.draft) return;
+					if (
+						!activeVoiceImportSession ||
+						!canAppendImportTranscript({
+							modal,
+							currentSession: importSession,
+							startedSession: activeVoiceImportSession,
+							currentUserId: user?.id,
+							startedUserId: owner
+						})
+					)
+						return;
+					voiceError = '';
 					importSession.text = appendDictatedText('import', importSession.text, text);
 				} else {
+					if (user?.id !== owner || modal !== 'pantry') return;
+					voiceError = '';
 					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
 				}
@@ -2243,7 +2632,9 @@
 
 	function saveRecipe(r: Recipe) {
 		r.saved = !r.saved;
+		delete r.sampleSaved;
 		kitchen.recipes = [...kitchen.recipes];
+		hasSampleRecords = hasSampleData(kitchen);
 		notify(r.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
 	function toggleRecipeHidden(recipe: Recipe) {
@@ -2313,8 +2704,9 @@
 		const nutritionChanged =
 			JSON.stringify(previous.nutrition) !== JSON.stringify(updated.nutrition);
 		const zeroNutrition = hasZeroNutrition(updated.nutrition);
+		const { sampleSaved: _sampleSaved, ...cleanUpdated } = updated;
 		const saved = {
-			...updated,
+			...cleanUpdated,
 			saved: true,
 			nutritionStale: nutritionNeedsRefresh
 				? true
@@ -2325,6 +2717,7 @@
 						: previous.nutritionStale
 		};
 		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
+		hasSampleRecords = hasSampleData(kitchen);
 		editingRecipe = null;
 		notify(
 			nutritionNeedsRefresh ? 'Recipe updated. Refresh its nutrition estimate.' : 'Recipe updated.'
@@ -2342,20 +2735,57 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
-	function weekOffsetForDate(value: string) {
-		const target = new Date(`${value}T12:00:00`);
-		if (Number.isNaN(target.getTime())) return weekOffset;
-		target.setDate(target.getDate() - ((target.getDay() + 6) % 7));
-		const currentMonday = new Date();
-		currentMonday.setHours(12, 0, 0, 0);
-		currentMonday.setDate(currentMonday.getDate() - ((currentMonday.getDay() + 6) % 7));
-		const utcTarget = Date.UTC(target.getFullYear(), target.getMonth(), target.getDate());
-		const utcCurrent = Date.UTC(
-			currentMonday.getFullYear(),
-			currentMonday.getMonth(),
-			currentMonday.getDate()
-		);
-		return Math.round((utcTarget - utcCurrent) / (7 * 86_400_000));
+	function weekOffsetForDate(value: string, today = new Date()) {
+		const start = weekStartForDate(value);
+		if (start === value && Number.isNaN(new Date(`${value}T12:00:00`).getTime())) return weekOffset;
+		return weekOffsetFromStarts(start, weekStartForDate(dateKey(today)));
+	}
+	async function scrollCalendarToDate(targetDate: string, instant = false) {
+		const token = ++calendarScrollToken;
+		await tick();
+		if (
+			token !== calendarScrollToken ||
+			page !== 'planner' ||
+			!calendarGrid?.isConnected ||
+			typeof window === 'undefined' ||
+			typeof window.matchMedia !== 'function' ||
+			!window.matchMedia('(max-width: 900px)').matches ||
+			calendarGrid.scrollWidth <= calendarGrid.clientWidth
+		) {
+			return;
+		}
+		const dayCard =
+			Array.from(calendarGrid.querySelectorAll<HTMLElement>('.calendar-day')).find(
+				(day) => day.dataset.date === targetDate
+			) ??
+			(targetDate === dateKey(new Date())
+				? calendarGrid.querySelector<HTMLElement>('.calendar-day.today')
+				: null);
+		if (!dayCard) return;
+		const gridRect = calendarGrid.getBoundingClientRect();
+		const dayRect = dayCard.getBoundingClientRect();
+		const styles = window.getComputedStyle(calendarGrid);
+		const scrollPaddingStart =
+			Number.parseFloat(styles.scrollPaddingInlineStart) ||
+			Number.parseFloat(styles.scrollPaddingLeft) ||
+			0;
+		const left = calendarDayScrollLeft({
+			dayLeft: dayRect.left,
+			gridLeft: gridRect.left,
+			clientLeft: calendarGrid.clientLeft,
+			scrollLeft: calendarGrid.scrollLeft,
+			scrollPaddingStart,
+			scrollWidth: calendarGrid.scrollWidth,
+			clientWidth: calendarGrid.clientWidth
+		});
+		calendarGrid.scrollTo({
+			left,
+			behavior: instant || prefersReducedMotion() ? 'instant' : 'smooth'
+		});
+	}
+	function showCurrentWeek() {
+		weekOffset = 0;
+		void scrollCalendarToDate(dateKey(new Date()));
 	}
 	function resetMealDialogState() {
 		pickingForSlot = false;
@@ -2381,6 +2811,8 @@
 		);
 		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -2389,9 +2821,12 @@
 		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
 		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
 		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
+		hasSampleRecords = hasSampleData(kitchen);
 		kitchen.shopping = kitchen.shopping.filter(
 			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
 		);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		if (kitchen.preferences.ratings) {
 			const ratings = { ...kitchen.preferences.ratings };
 			delete ratings[recipe.id];
@@ -2409,57 +2844,12 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
-	function startEditingShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId && editingShoppingId !== item.id) {
-			const previous = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (previous) normalizeShoppingItem(previous);
-		}
-		editingShoppingId = item.id;
-		editingShoppingDraft = {
-			id: item.id,
-			name: item.name,
-			quantity: item.quantity,
-			unit: item.unit
-		};
-	}
-	function finishEditingShoppingItem(item: AppState['shopping'][number]) {
-		normalizeShoppingItem(item);
-		editingShoppingId = '';
-		editingShoppingDraft = null;
-	}
-	function normalizeShoppingItem(item: AppState['shopping'][number]) {
-		const draft = editingShoppingDraft?.id === item.id ? editingShoppingDraft : null;
-		const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
-		const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
-		const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
-		const rawQuantity = draft ? draft.quantity : item.quantity;
-		const parsed =
-			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
-				? Number.NaN
-				: Number(rawQuantity);
-		const fallbackQuantity =
-			Number.isFinite(item.quantity) && item.quantity >= 0.01 && item.quantity <= 1_000_000
-				? item.quantity
-				: 1;
-		const quantity = Number.isFinite(parsed)
-			? Math.max(0.01, Math.min(parsed, 1_000_000))
-			: fallbackQuantity;
-		item.name = name;
-		item.unit = unit;
-		item.quantity = quantity;
-		if (draft) {
-			draft.name = name;
-			draft.unit = unit;
-			draft.quantity = quantity;
-		}
-	}
 	function commitInlineEdits() {
 		if (pantryDraft) void savePantryEdit(false);
 		if (editingShoppingId) {
 			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (item) normalizeShoppingItem(item);
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+			if (item) applyShoppingEdit(item);
+			clearEditingShoppingState();
 		}
 	}
 	function addShoppingQuickItem() {
@@ -2504,7 +2894,7 @@
 		}
 		const existingKeys = new Set(
 			kitchen.pantry
-				.filter((item) => !item.expires?.trim())
+				.filter((item) => !item.sample && !item.expires?.trim())
 				.map(
 					(item) => `${normalizeIngredientName(item.name)}\u0000${unitInfo(item.unit).dimension}`
 				)
@@ -2549,6 +2939,7 @@
 			notify('Enter a valid serving count before making a shopping list.');
 			return;
 		}
+		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
@@ -2589,11 +2980,13 @@
 			kitchen.meals.push(created);
 			refreshWeekShopping(scheduledWeek);
 			weekOffset = weekOffsetForDate(scheduledDate);
+			if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 			selectedMealServings = undefined;
 			selected = null;
 			resetMealDialogState();
 			modal = '';
 			page = 'planner';
+			void scrollCalendarToDate(scheduledDate);
 			notify(`${recipe.title} scheduled.`, () => {
 				const existing = kitchen.meals.find((entry) => entry.id === created.id);
 				if (!existing) return;
@@ -2636,11 +3029,14 @@
 		meal.date = updatedDate;
 		meal.slot = mealSlot;
 		meal.servings = Math.round(plannedServings);
+		delete meal.sample;
+		hasSampleRecords = hasSampleData(kitchen);
 		refreshWeekShopping(previousWeek);
 		refreshWeekShopping(weekStartForDate(meal.date));
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
 		modal = '';
+		void scrollCalendarToDate(updatedDate);
 		notify('Meal plan updated.');
 	}
 	function openCookDialog(meal: Meal) {
@@ -2670,6 +3066,7 @@
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
+		hasSampleRecords = hasSampleData(kitchen);
 		refreshWeekShopping(startDate);
 		resetMealDialogState();
 		modal = '';
@@ -2686,6 +3083,7 @@
 		if (!result.restockedCount) return;
 		kitchen.pantry = result.pantry;
 		kitchen.shopping = result.shopping;
+		hasSampleRecords = hasSampleData(kitchen);
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
 		const singleName =
@@ -2706,6 +3104,9 @@
 			) {
 				kitchen.pantry = previousPantry;
 				kitchen.shopping = previousShopping;
+				hasSampleRecords = hasSampleData(kitchen);
+				if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+					clearEditingShoppingState();
 			} else {
 				notify('Your kitchen changed again. Review the current items before editing.');
 			}
@@ -2769,11 +3170,13 @@
 		});
 		refreshWeekShopping(weekStartForDate(scheduledDate));
 		weekOffset = weekOffsetForDate(scheduledDate);
+		if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 		selectedMealServings = undefined;
 		selected = null;
 		resetMealDialogState();
 		modal = '';
 		page = 'planner';
+		void scrollCalendarToDate(scheduledDate);
 		notify('Meal scheduled.');
 	}
 	function applyHouseholdRoster(data: {
@@ -2900,6 +3303,7 @@
 		const confirmed = confirmReplace === true;
 		householdBusy = true;
 		error = '';
+		let joinedHousehold = false;
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -2912,6 +3316,13 @@
 						...(confirmed ? { confirmReplace: true } : {})
 					}),
 				onMutated: () => {
+					joinedHousehold = true;
+					kitchenSync?.clearContext();
+					clearAIConnectionState();
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = createNewUserState();
+					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -2932,6 +3343,7 @@
 				modal = 'confirmJoin';
 				return;
 			}
+			if (joinedHousehold) modal = 'household';
 			error = err.message;
 		} finally {
 			syncing = false;
@@ -2939,7 +3351,7 @@
 		}
 	}
 	async function refreshNutrition() {
-		if (!selected || !needAI()) return;
+		if (!selected || !(await needAI())) return;
 		busy = true;
 		try {
 			const result = await ai('nutrition', { recipe: selected });
@@ -2954,6 +3366,16 @@
 		}
 	}
 	function closeDialog() {
+		if (
+			modal === 'settings' &&
+			(connectionActive ||
+				connectionPoll?.active ||
+				connectionPopup ||
+				chatGPTDevice ||
+				chatGPTAuthorizationUrl)
+		) {
+			void cancelChatGPTDevice();
+		}
 		if (modal === 'plan') {
 			selected = null;
 			selectedMealServings = undefined;
@@ -2992,36 +3414,107 @@
 	}
 	function importRecipe(url: string) {
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = { ...emptyImportSession(), url };
+		const { session, previous } = replaceImportSessionWithUrl($state.snapshot(importSession), url);
+		importSession = session;
 		openImport();
+		if (previous) {
+			notify('Recipe link loaded. Undo to restore your previous import.', () => {
+				if (voiceTarget === 'import') clearVoiceSession();
+				importSession = cloneImportSession(previous);
+				resumeDialog = '';
+				error = '';
+				modal = 'import';
+			});
+		}
 	}
 	async function captureImport(
 		input: { url?: string; prompt: string; image?: string },
 		signal: AbortSignal
 	) {
-		if (!needAI()) {
+		const explicitUrl = input.url?.trim() || undefined;
+		const trimmedPrompt = input.prompt.trim();
+		const standaloneUrl = !input.image
+			? explicitUrl
+				? !trimmedPrompt
+					? explicitUrl
+					: undefined
+				: isStandaloneRecipeUrl(trimmedPrompt)
+					? trimmedPrompt
+					: undefined
+			: undefined;
+		if (standaloneUrl) {
+			const connected = hasAIConnection();
+			return request(
+				'/api/recipe-import',
+				{
+					url: standaloneUrl,
+					...(connected
+						? {
+								...(kitchen.preferences.provider === 'chatgpt'
+									? { connectionId: kitchen.preferences.chatgptAccountId }
+									: { apiKey }),
+								provider: kitchen.preferences.provider,
+								model: kitchen.preferences.model,
+								reasoning: kitchen.preferences.reasoning
+							}
+						: {})
+				},
+				'POST',
+				signal
+			);
+		}
+		if (!(await needAI())) {
 			resumeDialog = 'import';
 			return null;
 		}
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const nutritionStale =
-			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
-		const saved = { ...recipe, saved: true, nutritionStale };
-		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		const previousPage = page;
+		const previousQuery = query;
+		const previousFilter = filter;
+		const applied = applyImportedRecipeSave(
+			$state.snapshot(kitchen),
+			$state.snapshot(importSession),
+			recipe
+		);
+		kitchen.recipes = applied.nextRecipes;
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = emptyImportSession();
+		importSession = applied.nextSession;
 		resumeDialog = '';
 		modal = '';
-		selected = saved;
+		selected = applied.saved;
 		page = 'saved';
 		query = '';
 		filter = 'For you';
 		notify(
-			nutritionStale
+			applied.saved.nutritionStale
 				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
-				: 'Recipe saved to your collection.'
+				: 'Recipe saved to your collection.',
+			() => {
+				const rolledBack = applied.rollback($state.snapshot(kitchen));
+				if (!rolledBack.ok) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				if (voiceTarget === 'import') clearVoiceSession();
+				kitchen = rolledBack.kitchen;
+				if (selected?.id === applied.saved.id) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				if (editingRecipeMode === 'edit' && editingRecipe?.id === applied.saved.id) {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}
+				importSession = rolledBack.session;
+				resumeDialog = '';
+				error = '';
+				page = previousPage;
+				query = previousQuery;
+				filter = previousFilter;
+				modal = 'import';
+			}
 		);
 	}
 	async function exportKitchen() {
@@ -3058,6 +3551,7 @@
 				}
 			}
 			kitchenSync?.clearContext();
+			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
 			editingRecipe = null;
@@ -3072,11 +3566,13 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
-			apiKey = '';
+			clearAIConnectionState();
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
 			modal = '';
@@ -3139,6 +3635,7 @@
 		busy = true;
 		householdBusy = true;
 		error = '';
+		let leftHousehold = false;
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -3146,6 +3643,13 @@
 			await runHouseholdTransition({
 				mutateHousehold: () => request('/api/household', { action: 'leave' }),
 				onMutated: () => {
+					leftHousehold = true;
+					kitchenSync?.clearContext();
+					clearAIConnectionState();
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = createNewUserState();
+					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -3161,6 +3665,7 @@
 			notify('You now have your own kitchen.');
 		} catch (e) {
 			syncing = false;
+			if (leftHousehold) modal = 'household';
 			error = (e as Error).message;
 		} finally {
 			syncing = false;
@@ -3242,7 +3747,8 @@
 <svelte:window
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
-			if (!modal && !selected && !editingRecipe && !mobileNav && pantryDraft) {
+			const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
+			if (!overlayOpen && pantryDraft) {
 				void cancelPantryEdit();
 			}
 			mobileNav = false;
@@ -3250,6 +3756,10 @@
 			selected = null;
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
+			if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
+				e.preventDefault();
+				void cancelEditingShoppingItem();
+			}
 		}
 	}}
 />
@@ -3350,6 +3860,7 @@
 			{#if user}<SyncStatus
 					{kitchen}
 					{online}
+					ready={syncReady}
 					pending={pendingSync}
 					syncing={sendingSync}
 					{conflicts}
@@ -3362,7 +3873,7 @@
 					}}
 					exportPending={exportPendingChanges}
 				/>{/if}
-			{#if showStarter}<div class="starter-note">
+			{#if showStarter && hasSampleRecords}<div class="starter-note">
 					<span><Sparkles size={14} /> Sample kitchen</span><button onclick={freshKitchen}
 						>Start fresh <ArrowRight size={13} /></button
 					><button
@@ -3453,8 +3964,9 @@
 					<div class="section-heading">
 						<div>
 							<h2>
-								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span class="small-spark"
-									>✷</span
+								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span
+									class="small-spark"
+									aria-hidden="true">✷</span
 								>
 							</h2>
 						</div>
@@ -3566,9 +4078,7 @@
 											alt={recipe.title}
 											loading={i > 2 ? 'lazy' : 'eager'}
 										/></button
-									>{#if recipe.hidden || recipe.tags[0] || recipe.cuisine}<span class="recipe-badge"
-											>{recipe.hidden ? 'Hidden' : recipe.tags[0] || recipe.cuisine}</span
-										>{/if}<button
+									><button
 										class:saved={recipe.saved}
 										class="save-recipe"
 										onclick={() => saveRecipe(recipe)}
@@ -3590,6 +4100,10 @@
 										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
 									<p>{recipe.description}</p>
+									{#if recipe.hidden || recipe.tags.length}<ul class="recipe-tags">
+											{#if recipe.hidden}<li class="recipe-badge">Hidden</li>{/if}
+											{#each recipe.tags as tag}<li class="recipe-badge">{tag}</li>{/each}
+										</ul>{/if}
 									<div class="recipe-meta">
 										<span><Clock size={14} />{recipe.time} min</span>{#if recipe.difficulty}<span
 												><ChefHat size={14} />{recipe.difficulty}</span
@@ -3652,21 +4166,26 @@
 					>
 				</section>
 				<div class="pantry-summary">
-					<span><b>{kitchen.pantry.length}</b> ingredients</span>
-					{#if kitchen.pantry.some((item) => Number.isFinite(item.quantity) && item.quantity <= 0)}<span
-							class="depleted-actions"
-							><button class="text-button restock-depleted" onclick={() => restockPantryItems()}
-								><ShoppingBasket size={16} />Restock depleted items</button
-							><button
-								class="text-button"
-								onclick={() => {
-									commitInlineEdits();
-									kitchen.pantry = kitchen.pantry.filter(
-										(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
-									);
-								}}>Clear depleted items</button
-							></span
-						>{/if}
+					<span class="pantry-summary-meta"
+						><span><b>{kitchen.pantry.length}</b> ingredients</span
+						>{#if kitchen.pantry.some((item) => Number.isFinite(item.quantity) && item.quantity <= 0)}<span
+								class="depleted-actions"
+								><button class="text-button restock-depleted" onclick={() => restockPantryItems()}
+									><ShoppingBasket size={16} />Restock depleted items</button
+								><button
+									class="text-button"
+									onclick={() => {
+										commitInlineEdits();
+										kitchen.pantry = kitchen.pantry.filter(
+											(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
+										);
+										hasSampleRecords = hasSampleData(kitchen);
+									}}>Clear depleted items</button
+								></span
+							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
+								>Clear sample data</button
+							>{/if}</span
+					>
 					<div>
 						<button
 							class="secondary"
@@ -3756,7 +4275,11 @@
 												<span class="pantry-ingredient">
 													<span class="ingredient-symbol" aria-hidden="true"
 														>{ingredientEmoji(item.name)}</span
-													><b class="pantry-name">{item.name}</b>
+													><span class="ingredient-title-line"
+														><b class="pantry-name">{item.name}</b>{#if item.sample}<small
+																class="sample-badge">Sample</small
+															>{/if}</span
+													>
 												</span>
 												<div class="pantry-edit-actions">
 													<button type="submit" class="primary pantry-done-button">Done</button
@@ -3809,7 +4332,11 @@
 											<span class="ingredient-symbol" aria-hidden="true"
 												>{ingredientEmoji(item.name)}</span
 											><span class="ingredient-meta"
-												><b class="pantry-name">{item.name}</b><span class="ingredient-tags"
+												><span class="ingredient-title-line"
+													><b class="pantry-name">{item.name}</b>{#if item.sample}<small
+															class="sample-badge">Sample</small
+														>{/if}</span
+												><span class="ingredient-tags"
 													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
 													>{#if depleted}<button
 															type="button"
@@ -3898,7 +4425,7 @@
 						</h2>
 						<button class="icon-button" onclick={() => weekOffset++} aria-label="Next week"
 							><ChevronRight size={20} /></button
-						><button class="text-button" onclick={() => (weekOffset = 0)}>This week</button>
+						><button class="text-button" onclick={showCurrentWeek}>This week</button>
 					</div>
 					<button
 						class="secondary"
@@ -3919,11 +4446,12 @@
 					>
 				</div>
 				{#key weekOffset}<div
+						bind:this={calendarGrid}
 						class="calendar-grid"
 						in:revealMotion|global={{ y: 8, duration: 220 }}
 					>
 						{#each week as day}{@const dayKey = dateKey(day)}
-							<div class:today={dayKey === todayKey} class="calendar-day">
+							<div data-date={dayKey} class:today={dayKey === todayKey} class="calendar-day">
 								<div class="day-heading">
 									<span>{weekdayFormatter.format(day)}</span><b>{day.getDate()}</b>
 								</div>
@@ -4069,8 +4597,18 @@
 									type="button"
 									class:active={shoppingFilter === option.id}
 									aria-pressed={shoppingFilter === option.id}
-									onclick={() => (shoppingFilter = option.id)}
-									>{option.label}<span>{option.count}</span></button
+									onclick={() => {
+										if (option.id === 'unpurchased' && editingShoppingId) {
+											const active = kitchen.shopping.find(
+												(entry) => entry.id === editingShoppingId
+											);
+											if (active?.checked) {
+												applyShoppingEdit(active);
+												clearEditingShoppingState();
+											}
+										}
+										shoppingFilter = option.id;
+									}}>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
 						<form
@@ -4095,67 +4633,89 @@
 								out:fadeMotion={{ duration: 120 }}
 							>
 								<button
+									type="button"
+									role="checkbox"
+									aria-checked={item.checked}
 									class="check-box"
 									class:checked={item.checked}
 									aria-label={`Mark ${item.name} ${item.checked ? 'needed' : 'purchased'}`}
-									onclick={() => (item.checked = !item.checked)}
+									onclick={() => {
+										item.checked = !item.checked;
+										if (
+											shoppingFilter === 'unpurchased' &&
+											item.checked &&
+											editingShoppingId === item.id
+										) {
+											applyShoppingEdit(item);
+											clearEditingShoppingState();
+										}
+									}}
 									>{#if item.checked}<Check size={16} />{/if}</button
 								>
-								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<div
-										class="shopping-item-edit"
+								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<form
+										class="shopping-edit-form"
+										novalidate
+										onsubmit={(e) => {
+											e.preventDefault();
+											void finishEditingShoppingItem(item);
+										}}
 									>
-										<input
-											class="shopping-name"
-											aria-label="Shopping item name"
-											bind:value={editingShoppingDraft.name}
-											maxlength="200"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
-									</div>
-									<span class="shopping-quantity"
-										><input
-											aria-label={`Quantity of ${item.name}`}
-											type="number"
-											min="0.01"
-											max="1000000"
-											step="0.01"
-											bind:value={editingShoppingDraft.quantity}
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><input
-											aria-label={`Unit for ${item.name}`}
-											bind:value={editingShoppingDraft.unit}
-											maxlength="40"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/></span
-									>
-									<button class="text-button" onclick={() => finishEditingShoppingItem(item)}
-										>Done</button
-									>
+										<div class="shopping-item-edit">
+											<input
+												class="shopping-name"
+												data-shopping-name={item.id}
+												aria-label="Shopping item name"
+												bind:value={editingShoppingDraft.name}
+												maxlength="200"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
+										</div>
+										<span class="shopping-quantity"
+											><input
+												aria-label={`Quantity of ${item.name}`}
+												type="number"
+												min="0.01"
+												max="1000000"
+												step="0.01"
+												bind:value={editingShoppingDraft.quantity}
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><input
+												aria-label={`Unit for ${item.name}`}
+												bind:value={editingShoppingDraft.unit}
+												maxlength="40"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/></span
+										>
+										<button type="submit" class="text-button">Done</button>
+									</form>
 								{:else}
 									<div class="shopping-item-edit">
-										<b class="shopping-name">{item.name}</b><small class="shopping-source"
-											>{shoppingSourceLabel(item.sourceKey)}</small
-										>
+										<button
+											type="button"
+											tabindex="-1"
+											class="shopping-name"
+											onclick={() => (item.checked = !item.checked)}>{item.name}</button
+										><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
 									</div>
 									<span class="shopping-quantity"
 										>{item.quantity}
 										{item.unit}<button
+											type="button"
 											class="text-button"
+											data-shopping-edit={item.id}
 											aria-label={`Edit ${item.name}`}
-											onclick={() => startEditingShoppingItem(item)}>Edit</button
+											onclick={() => void startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
 								{/if}
 								<button
+									type="button"
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
 									onclick={() => removeShoppingItem(item)}><X size={15} /></button
@@ -4191,8 +4751,12 @@
 	{scanBusy ? 'Scanning photo for ingredients…' : toast}
 </div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
-			onclick={() => (toast = '')}
+		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}>Undo</button
+			>{/if}<button
+			onclick={() => {
+				toast = '';
+				toastUndo = null;
+			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
@@ -4223,10 +4787,15 @@
 		toggleHidden={() => toggleRecipeHidden(selected!)}
 		{busy}
 		rate={(n) => {
-			selected!.rating = n;
-			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
+			kitchen.preferences.ratings = applyRecipeRating(selected!, kitchen.preferences.ratings, n);
+			const stored = kitchen.recipes.find((item) => item.id === selected!.id);
+			if (stored && stored !== selected!) {
+				applyRecipeRating(stored, undefined, n);
+			}
 			kitchen.recipes = [...kitchen.recipes];
-			notify('Rating saved. Future recipes will use your feedback.');
+			notify(
+				n === undefined ? 'Rating cleared.' : 'Rating saved. Future recipes will use your feedback.'
+			);
 		}}
 	/>{/if}
 {#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
@@ -4258,7 +4827,10 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if modal === voiceTarget && voiceBusy}<div class="voice-session" in:revealMotion>
+				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceBusy}<div
+						class="voice-session"
+						in:revealMotion
+					>
 						<p role="status" aria-live="polite">
 							{voiceStarting
 								? 'Opening microphone…'
@@ -4275,7 +4847,7 @@
 								>Cancel voice</button
 							>
 						</div>
-					</div>{:else if modal === voiceTarget && voiceRetained}<div
+					</div>{:else if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceRetained}<div
 						class="voice-session voice-recovery"
 						in:revealMotion
 					>
@@ -4617,10 +5189,22 @@
 							ondisconnect={disconnectChatGPT}
 							onrefresh={refreshAISettings}
 							onsignin={openAuthentication}
+							onoverride={() => {
+								void loadModelCatalog();
+							}}
 						/>
 					</div>
 
-					{#if user}<div class="settings-section">
+					{#if hasSampleRecords}<div class="settings-section">
+							<h3>Sample data</h3>
+							<p class="muted">
+								Remove untouched starter ingredients, planned meals, and saved recipe bookmarks
+								while keeping everything you added or edited.
+							</p>
+							<div class="dialog-actions">
+								<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
+							</div>
+						</div>{/if}{#if user}<div class="settings-section">
 							<h3>Your data</h3>
 							<p class="muted">
 								{managedAuth
@@ -5133,18 +5717,15 @@
 		flex: 1 1 220px;
 		max-width: 320px;
 		min-height: 44px;
-		padding: 0 12px;
-		border: 1px solid var(--line);
-		background: var(--surface);
 	}
 	.pantry-search input {
 		width: 100%;
 		min-width: 0;
 		font-size: 14px;
-		padding: 9px 0;
+		padding: 9px 10px;
 	}
 	.pantry-categories {
-		padding-bottom: 2px;
+		padding-bottom: 4px;
 	}
 	.expiry-filters {
 		display: flex;
@@ -5158,20 +5739,32 @@
 		align-items: center;
 		gap: 9px;
 		padding: 8px 12px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		font-size: 14px;
 	}
 	.expiry-filters button.active {
-		background: var(--green);
-		color: var(--paper);
-		border-color: var(--green);
+		padding: 7px 11px;
+		background: var(--chip-active-bg);
+		color: var(--ink);
+		border: 2px solid var(--chip-active-border);
+		font-weight: 700;
 	}
 	.expiry-filters button span {
 		min-width: 22px;
 		padding: 2px 5px;
 		background: color-mix(in srgb, currentColor 12%, transparent);
 		text-align: center;
+	}
+	.pantry-summary-meta {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 18px;
+	}
+	.pantry-summary-meta > button {
+		min-height: 44px;
+		min-width: 44px;
 	}
 	.pantry-ingredient {
 		min-width: 0;
@@ -5182,6 +5775,22 @@
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 4px;
+	}
+	.ingredient-title-line {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.sample-badge {
+		padding: 1px 6px;
+		border: 1px solid var(--line);
+		background: var(--wash);
+		color: var(--muted);
+		font-size: 11px;
+		font-weight: 500;
+		letter-spacing: 0.4px;
+		text-transform: uppercase;
 	}
 	.pantry-name {
 		overflow-wrap: anywhere;
@@ -5345,7 +5954,7 @@
 		font-weight: 400;
 		color: var(--ink);
 		background: var(--surface);
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 	}
 	.filtered-pantry-empty {
 		padding: 32px 12px;
@@ -5354,6 +5963,9 @@
 		min-height: 44px;
 		padding: 8px 14px;
 	}
+	.shopping-edit-form {
+		display: contents;
+	}
 	.shopping-item-edit {
 		min-width: 100px;
 		flex: 1 1 180px;
@@ -5361,16 +5973,29 @@
 		flex-direction: column;
 		gap: 3px;
 	}
-	.shopping-name {
+	button.shopping-name {
 		width: 100%;
 		min-width: 0;
+		min-height: 44px;
 		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		display: flex;
+		align-items: center;
+		text-align: left;
 		font-weight: 500;
+		overflow-wrap: anywhere;
 	}
-	.shopping-name:focus {
-		border-color: var(--line);
+	.shopping-row.checked button.shopping-name {
+		color: var(--muted);
+	}
+	input.shopping-name {
+		width: 100%;
+		min-width: 0;
+		min-height: 44px;
+		padding: 7px 5px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
+		font-size: 16px;
+		font-weight: 500;
 	}
 	.shopping-source {
 		padding-left: 5px;
@@ -5386,19 +6011,17 @@
 	}
 	.shopping-quantity input {
 		min-width: 0;
+		min-height: 44px;
 		width: 72px;
-		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		padding: 7px 5px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
 		text-align: right;
-		font-size: 14px;
+		font-size: 16px;
 	}
 	.shopping-quantity input:last-child {
 		width: 70px;
 		text-align: left;
-	}
-	.shopping-quantity input:focus {
-		border-color: var(--line);
 	}
 	.calendar-meal-actions {
 		min-height: 34px;
@@ -5493,7 +6116,7 @@
 		min-height: 44px;
 		padding: 12px 14px;
 		margin: 22px 0;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		cursor: pointer;
 		font-size: 14px;
@@ -5503,7 +6126,7 @@
 		height: 24px;
 		flex: 0 0 24px;
 		margin-top: 1px;
-		accent-color: var(--green);
+		accent-color: var(--ink);
 	}
 	.cook-option span {
 		display: flex;
@@ -5549,6 +6172,9 @@
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
+		}
+		.expiry-filters button.active {
+			padding-inline: 5px;
 		}
 		.ingredient-meta {
 			flex-direction: row;
@@ -5609,15 +6235,10 @@
 		}
 		.shopping-item-edit {
 			flex-basis: calc(100% - 66px);
-			order: 2;
 		}
 		.shopping-quantity {
-			order: 3;
 			flex: 1 1 auto;
 			margin-left: 44px !important;
-		}
-		.shopping-row > .icon-button {
-			order: 4;
 		}
 		.cooked-history-row {
 			grid-template-columns: 46px minmax(0, 1fr);
