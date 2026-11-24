@@ -31,7 +31,7 @@
 <script lang="ts">
 	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
 	import { focusTrap } from '#lib/focus.ts';
 	import {
@@ -42,6 +42,7 @@
 		motionDuration,
 		prefersReducedMotion
 	} from '#lib/motion.ts';
+	import { calendarDayScrollLeft, weekOffsetFromStarts } from '#lib/planner.ts';
 	import { flip } from 'svelte/animate';
 	import {
 		ArrowRight,
@@ -113,6 +114,7 @@
 		insertRecipes,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
+	import { applyRecipeRating } from '#lib/recipe-detail.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -141,7 +143,14 @@
 		type VoiceState
 	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
-	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import {
+		CHATGPT_OAUTH_POLL_INTERVAL_MS,
+		CHATGPT_OAUTH_TTL_MS,
+		startConnectionPoll,
+		type ConnectionModel,
+		type ConnectionPollHandle,
+		type ConnectionProvider
+	} from '#lib/ai-connections.ts';
 	import {
 		entitledChatGPTAccountId,
 		reconcileChatGPTPreferences,
@@ -534,6 +543,7 @@
 		accounts: ChatGPTAccount[];
 	}>({ configured: false, mode: 'unavailable', accounts: [] });
 	let connectionBusy = $state(false);
+	let connectionActive = $state(false);
 	let chatGPTAuthorizationUrl = $state('');
 	let chatGPTDevice = $state<{
 		loginId: string;
@@ -542,13 +552,17 @@
 		expiresAt: number;
 		interval: number;
 	} | null>(null);
-	let connectionPoll: ReturnType<typeof setInterval> | undefined;
+	let connectionPoll: ConnectionPollHandle | undefined;
 	let connectionPopup: Window | null = null;
-	let connectionPollCount = 0;
 	let connectionAttempt = 0;
 	let activeChatGPTAccount = $derived(
 		chatGPT.accounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
 	);
+	$effect(() => {
+		if (modal !== 'settings' && (connectionActive || chatGPTDevice || chatGPTAuthorizationUrl)) {
+			void cancelChatGPTDevice();
+		}
+	});
 
 	let providers = $state<ConnectionProvider[]>([]);
 	let accountModels = $state<ConnectionModel[]>([]);
@@ -570,6 +584,10 @@
 	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
+	let calendarGrid = $state<HTMLDivElement | undefined>();
+	let previousPage = '';
+	let pendingPlannerScrollDate = '';
+	let calendarScrollToken = 0;
 	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
@@ -1063,6 +1081,19 @@
 		page;
 		if (ready) window.scrollTo({ top: 0, behavior: 'instant' });
 	});
+	$effect(() => {
+		const currentPage = page;
+		const enteringPlanner = currentPage === 'planner' && previousPage !== 'planner';
+		previousPage = currentPage;
+		if (!enteringPlanner) return;
+		if (pendingPlannerScrollDate) {
+			pendingPlannerScrollDate = '';
+			return;
+		}
+		if (untrack(() => weekOffset === 0)) {
+			void scrollCalendarToDate(dateKey(new Date()), true);
+		}
+	});
 	let stateEtag: string | null = null;
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
@@ -1327,7 +1358,8 @@
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
-			clearInterval(connectionPoll);
+			connectionPoll?.stop();
+			connectionPopup?.close();
 			cancelScan(true);
 			voiceCapture?.cancel();
 		};
@@ -1634,11 +1666,6 @@
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
-			clearInterval(connectionPoll);
-			connectionBusy = false;
-			chatGPTAuthorizationUrl = '';
-			chatGPTDevice = null;
-			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 			stateEtag = null;
 			syncing = false;
 			modal = '';
@@ -1650,14 +1677,17 @@
 
 	function clearAIConnectionState() {
 		connectionAttempt++;
+		connectionActive = false;
 		apiKey = '';
 		providers = [];
 		accountModels = [];
 		catalogVersion++;
 		catalogLoading = false;
 		catalogError = '';
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
@@ -1747,16 +1777,26 @@
 	}
 	async function changeConnection(providerId?: string) {
 		if (providerId === kitchen.preferences.provider) return;
+		const currentDevice = chatGPTDevice;
 		connectionAttempt++;
+		connectionActive = false;
 		if (providerId && providerId !== kitchen.preferences.provider) {
 			apiKey = '';
 			kitchen.preferences.provider = providerId;
 		}
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
+		if (currentDevice && user) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
 		kitchen.preferences.model = '';
 		kitchen.preferences.reasoning = undefined;
 		accountModels = [];
@@ -1772,16 +1812,31 @@
 			openAuthentication();
 			return;
 		}
+		const currentDevice = chatGPTDevice;
 		const attempt = ++connectionAttempt;
 		const owner = user.id;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
+		if (currentDevice) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
+		connectionActive = true;
 		connectionBusy = true;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
 		error = '';
-		connectionPopup =
+		const popup =
 			chatGPT.mode === 'device'
 				? null
 				: window.open('about:blank', 'flavorithm-chatgpt-connect', 'popup,width=620,height=780');
+		connectionPopup = popup;
+		const isCurrentInSettings = () =>
+			attempt === connectionAttempt && user?.id === owner && modal === 'settings';
 		try {
 			const previousAccounts = new Map(chatGPT.accounts.map((a) => [a.id, a.updatedAt]));
 			const previous = JSON.stringify(chatGPT.accounts);
@@ -1790,51 +1845,83 @@
 				accountId,
 				reconsent
 			});
-			if (attempt !== connectionAttempt || user?.id !== owner) return;
+			if (!isCurrentInSettings()) {
+				popup?.close();
+				if (connectionPopup === popup) connectionPopup = null;
+				if (result?.kind === 'device' && user?.id === owner) {
+					void request('/api/connections/chatgpt', {
+						action: 'cancel',
+						loginId: result.loginId
+					}).catch(() => {});
+				}
+				return;
+			}
 			if (result.kind === 'device') {
 				chatGPTDevice = result;
-				clearInterval(connectionPoll);
-				let polling = false;
-				connectionPoll = setInterval(async () => {
-					if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-					polling = true;
-					try {
-						const connected = await request('/api/connections/chatgpt', {
-							action: 'poll',
-							loginId: result.loginId
-						});
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						if (connected.connected) {
-							clearInterval(connectionPoll);
+				connectionPoll = startConnectionPoll({
+					intervalMs: result.interval * 1000,
+					expiresAt: result.expiresAt,
+					attempt,
+					getAttempt: () => connectionAttempt,
+					owner,
+					getOwner: () => user?.id,
+					isOpen: () => modal === 'settings',
+					poll: async ({ expired, stop }) => {
+						try {
+							const connected = await request('/api/connections/chatgpt', {
+								action: 'poll',
+								loginId: result.loginId
+							});
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							if (connected.connected) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								await refreshConnections();
+								if (attempt !== connectionAttempt || user?.id !== owner) return false;
+								kitchen.preferences.chatgptAccountId = connected.accountId;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify('ChatGPT connected. Choose a model.');
+								return false;
+							}
+							if (expired) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								error = 'ChatGPT authorization expired. Start again.';
+								return false;
+							}
+						} catch (e) {
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							const status = (e as { status?: number }).status;
+							// Keep the original login alive through brief deployment/network outages.
+							if (
+								chatGPTDevice &&
+								!expired &&
+								Date.now() < result.expiresAt &&
+								(status === undefined || status === 429 || status >= 500)
+							)
+								return;
+							stop();
+							connectionActive = false;
 							connectionBusy = false;
 							chatGPTDevice = null;
-							await refreshConnections();
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							kitchen.preferences.chatgptAccountId = connected.accountId;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							notify('ChatGPT connected. Choose a model.');
+							error = (e as Error).message;
+							return false;
 						}
-					} catch (e) {
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						const status = (e as { status?: number }).status;
-						// Keep the original login alive through brief deployment/network outages.
-						if (
-							chatGPTDevice &&
-							Date.now() < result.expiresAt &&
-							(status === undefined || status === 429 || status >= 500)
-						)
-							return;
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTDevice = null;
-						error = (e as Error).message;
-					} finally {
-						polling = false;
 					}
-				}, result.interval * 1000);
+				});
 				return;
 			}
 
@@ -1848,67 +1935,90 @@
 			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
+				connectionActive = false;
 				window.location.assign(result.authorizationUrl);
 				return;
 			}
-			clearInterval(connectionPoll);
-			connectionPollCount = 0;
-			let polling = false;
-			connectionPoll = setInterval(async () => {
-				if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-				polling = true;
-				try {
-					await refreshConnections();
-					if (attempt !== connectionAttempt || user?.id !== owner) return;
-					connectionPollCount++;
-					const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
-					if (connectionChanged || connectionPopup?.closed) {
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTAuthorizationUrl = '';
-						chatGPTDevice = null;
-						const account = chatGPT.accounts.find(
-							(a) =>
-								a.connected &&
-								(accountId
-									? a.id === accountId
-									: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
-						);
-						if (account && connectionChanged) {
-							kitchen.preferences.chatgptAccountId = account.id;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							connectionPopup?.close();
-							notify(
-								account.planEnabled
-									? 'ChatGPT connected. Choose a model to cook with your plan.'
-									: 'ChatGPT signed in. Enable plan usage to generate recipes.'
-							);
-						} else if (!connectionChanged) {
-							notify('The authorization window closed. Your previous connection is unchanged.');
+			const expiresAt =
+				typeof result.expiresAt === 'number' ? result.expiresAt : Date.now() + CHATGPT_OAUTH_TTL_MS;
+			connectionPoll = startConnectionPoll({
+				intervalMs: CHATGPT_OAUTH_POLL_INTERVAL_MS,
+				expiresAt,
+				attempt,
+				getAttempt: () => connectionAttempt,
+				owner,
+				getOwner: () => user?.id,
+				isOpen: () => modal === 'settings',
+				poll: async ({ expired, stop }) => {
+					try {
+						await refreshConnections();
+						if (!isCurrentInSettings()) {
+							stop();
+							return false;
 						}
-					}
-					if (connectionPollCount >= 400) {
-						clearInterval(connectionPoll);
+						const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
+						if (connectionChanged || connectionPopup?.closed) {
+							stop();
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							const account = chatGPT.accounts.find(
+								(a) =>
+									a.connected &&
+									(accountId
+										? a.id === accountId
+										: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
+							);
+							if (account && connectionChanged) {
+								connectionPopup?.close();
+								connectionPopup = null;
+								kitchen.preferences.chatgptAccountId = account.id;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify(
+									account.planEnabled
+										? 'ChatGPT connected. Choose a model to cook with your plan.'
+										: 'ChatGPT signed in. Enable plan usage to generate recipes.'
+								);
+							} else if (!connectionChanged) {
+								connectionPopup = null;
+								notify('The authorization window closed. Your previous connection is unchanged.');
+							}
+							return false;
+						}
+						if (expired) {
+							stop();
+							connectionPopup?.close();
+							connectionPopup = null;
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							error = 'The connection window timed out. Try connecting again.';
+							return false;
+						}
+					} catch (e) {
+						stop();
+						if (!isCurrentInSettings()) return false;
+						connectionPopup?.close();
+						connectionPopup = null;
+						connectionActive = false;
 						connectionBusy = false;
 						chatGPTAuthorizationUrl = '';
 						chatGPTDevice = null;
-						error = 'The connection window timed out. Try connecting again.';
+						error = (e as Error).message;
+						return false;
 					}
-				} catch (e) {
-					clearInterval(connectionPoll);
-					connectionBusy = false;
-					chatGPTAuthorizationUrl = '';
-					chatGPTDevice = null;
-					error = (e as Error).message;
-				} finally {
-					polling = false;
 				}
-			}, 1500);
+			});
 		} catch (e) {
-			connectionPopup?.close();
+			popup?.close();
+			if (connectionPopup === popup) connectionPopup = null;
+			if (!isCurrentInSettings()) return;
+			connectionActive = false;
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
 			chatGPTDevice = null;
@@ -1918,10 +2028,15 @@
 	async function cancelChatGPTDevice() {
 		const current = chatGPTDevice;
 		connectionAttempt++;
-		clearInterval(connectionPoll);
+		connectionActive = false;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
+		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
-		if (current) {
+		if (current && user) {
 			try {
 				await request('/api/connections/chatgpt', { action: 'cancel', loginId: current.loginId });
 			} catch {
@@ -2488,20 +2603,57 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
-	function weekOffsetForDate(value: string) {
-		const target = new Date(`${value}T12:00:00`);
-		if (Number.isNaN(target.getTime())) return weekOffset;
-		target.setDate(target.getDate() - ((target.getDay() + 6) % 7));
-		const currentMonday = new Date();
-		currentMonday.setHours(12, 0, 0, 0);
-		currentMonday.setDate(currentMonday.getDate() - ((currentMonday.getDay() + 6) % 7));
-		const utcTarget = Date.UTC(target.getFullYear(), target.getMonth(), target.getDate());
-		const utcCurrent = Date.UTC(
-			currentMonday.getFullYear(),
-			currentMonday.getMonth(),
-			currentMonday.getDate()
-		);
-		return Math.round((utcTarget - utcCurrent) / (7 * 86_400_000));
+	function weekOffsetForDate(value: string, today = new Date()) {
+		const start = weekStartForDate(value);
+		if (start === value && Number.isNaN(new Date(`${value}T12:00:00`).getTime())) return weekOffset;
+		return weekOffsetFromStarts(start, weekStartForDate(dateKey(today)));
+	}
+	async function scrollCalendarToDate(targetDate: string, instant = false) {
+		const token = ++calendarScrollToken;
+		await tick();
+		if (
+			token !== calendarScrollToken ||
+			page !== 'planner' ||
+			!calendarGrid?.isConnected ||
+			typeof window === 'undefined' ||
+			typeof window.matchMedia !== 'function' ||
+			!window.matchMedia('(max-width: 900px)').matches ||
+			calendarGrid.scrollWidth <= calendarGrid.clientWidth
+		) {
+			return;
+		}
+		const dayCard =
+			Array.from(calendarGrid.querySelectorAll<HTMLElement>('.calendar-day')).find(
+				(day) => day.dataset.date === targetDate
+			) ??
+			(targetDate === dateKey(new Date())
+				? calendarGrid.querySelector<HTMLElement>('.calendar-day.today')
+				: null);
+		if (!dayCard) return;
+		const gridRect = calendarGrid.getBoundingClientRect();
+		const dayRect = dayCard.getBoundingClientRect();
+		const styles = window.getComputedStyle(calendarGrid);
+		const scrollPaddingStart =
+			Number.parseFloat(styles.scrollPaddingInlineStart) ||
+			Number.parseFloat(styles.scrollPaddingLeft) ||
+			0;
+		const left = calendarDayScrollLeft({
+			dayLeft: dayRect.left,
+			gridLeft: gridRect.left,
+			clientLeft: calendarGrid.clientLeft,
+			scrollLeft: calendarGrid.scrollLeft,
+			scrollPaddingStart,
+			scrollWidth: calendarGrid.scrollWidth,
+			clientWidth: calendarGrid.clientWidth
+		});
+		calendarGrid.scrollTo({
+			left,
+			behavior: instant || prefersReducedMotion() ? 'instant' : 'smooth'
+		});
+	}
+	function showCurrentWeek() {
+		weekOffset = 0;
+		void scrollCalendarToDate(dateKey(new Date()));
 	}
 	function resetMealDialogState() {
 		pickingForSlot = false;
@@ -2735,11 +2887,13 @@
 			kitchen.meals.push(created);
 			refreshWeekShopping(scheduledWeek);
 			weekOffset = weekOffsetForDate(scheduledDate);
+			if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 			selectedMealServings = undefined;
 			selected = null;
 			resetMealDialogState();
 			modal = '';
 			page = 'planner';
+			void scrollCalendarToDate(scheduledDate);
 			notify(`${recipe.title} scheduled.`, () => {
 				const existing = kitchen.meals.find((entry) => entry.id === created.id);
 				if (!existing) return;
@@ -2787,6 +2941,7 @@
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
 		modal = '';
+		void scrollCalendarToDate(updatedDate);
 		notify('Meal plan updated.');
 	}
 	function openCookDialog(meal: Meal) {
@@ -2915,11 +3070,13 @@
 		});
 		refreshWeekShopping(weekStartForDate(scheduledDate));
 		weekOffset = weekOffsetForDate(scheduledDate);
+		if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 		selectedMealServings = undefined;
 		selected = null;
 		resetMealDialogState();
 		modal = '';
 		page = 'planner';
+		void scrollCalendarToDate(scheduledDate);
 		notify('Meal scheduled.');
 	}
 	function applyHouseholdRoster(data: {
@@ -3111,6 +3268,16 @@
 		}
 	}
 	function closeDialog() {
+		if (
+			modal === 'settings' &&
+			(connectionActive ||
+				connectionPoll?.active ||
+				connectionPopup ||
+				chatGPTDevice ||
+				chatGPTAuthorizationUrl)
+		) {
+			void cancelChatGPTDevice();
+		}
 		if (modal === 'plan') {
 			selected = null;
 			selectedMealServings = undefined;
@@ -3231,7 +3398,7 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
-			apiKey = '';
+			clearAIConnectionState();
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
@@ -4099,7 +4266,7 @@
 						</h2>
 						<button class="icon-button" onclick={() => weekOffset++} aria-label="Next week"
 							><ChevronRight size={20} /></button
-						><button class="text-button" onclick={() => (weekOffset = 0)}>This week</button>
+						><button class="text-button" onclick={showCurrentWeek}>This week</button>
 					</div>
 					<button
 						class="secondary"
@@ -4120,11 +4287,12 @@
 					>
 				</div>
 				{#key weekOffset}<div
+						bind:this={calendarGrid}
 						class="calendar-grid"
 						in:revealMotion|global={{ y: 8, duration: 220 }}
 					>
 						{#each week as day}{@const dayKey = dateKey(day)}
-							<div class:today={dayKey === todayKey} class="calendar-day">
+							<div data-date={dayKey} class:today={dayKey === todayKey} class="calendar-day">
 								<div class="day-heading">
 									<span>{weekdayFormatter.format(day)}</span><b>{day.getDate()}</b>
 								</div>
@@ -4418,10 +4586,15 @@
 		toggleHidden={() => toggleRecipeHidden(selected!)}
 		{busy}
 		rate={(n) => {
-			selected!.rating = n;
-			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
+			kitchen.preferences.ratings = applyRecipeRating(selected!, kitchen.preferences.ratings, n);
+			const stored = kitchen.recipes.find((item) => item.id === selected!.id);
+			if (stored && stored !== selected!) {
+				applyRecipeRating(stored, undefined, n);
+			}
 			kitchen.recipes = [...kitchen.recipes];
-			notify('Rating saved. Future recipes will use your feedback.');
+			notify(
+				n === undefined ? 'Rating cleared.' : 'Rating saved. Future recipes will use your feedback.'
+			);
 		}}
 	/>{/if}
 {#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
