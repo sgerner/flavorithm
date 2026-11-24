@@ -10,9 +10,16 @@
 		focusFirstInvalid,
 		validateRecipeDraftFields
 	} from '#lib/form-validation.ts';
-	import { isValidNutrition } from '#lib/recipe-draft.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
-	import { Check, Plus, X } from '@lucide/svelte';
+	import {
+		hasRecipeEditorChanges,
+		insertDraftItem,
+		isValidNutrition,
+		MAX_DRAFT_INGREDIENTS,
+		MAX_DRAFT_STEPS,
+		moveDraftItem
+	} from '#lib/recipe-draft.ts';
+	import { ArrowDown, ArrowUp, Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
 	import FormField from './FormField.svelte';
 	let {
@@ -28,24 +35,31 @@
 		cancel: () => void;
 		save: (recipe: Recipe) => void;
 	} = $props();
-	let draft = $state<Recipe>(
-		untrack(() => ({
-			...recipe,
-			tags: [...recipe.tags],
-			ingredients: recipe.ingredients.map((item) => ({ ...item })),
-			steps: [...recipe.steps],
-			nutrition: { ...recipe.nutrition }
-		}))
-	);
-	let tagsText = $state(draft.tags.join(', '));
+	const initialDraft = untrack(() => ({
+		...recipe,
+		tags: [...recipe.tags],
+		ingredients: recipe.ingredients.map((item) => ({ ...item })),
+		steps: [...recipe.steps],
+		nutrition: { ...recipe.nutrition }
+	}));
+	const initialTagsText = initialDraft.tags.join(', ');
+	let draft = $state<Recipe>({
+		...initialDraft,
+		tags: [...initialDraft.tags],
+		ingredients: initialDraft.ingredients.map((item) => ({ ...item })),
+		steps: [...initialDraft.steps],
+		nutrition: { ...initialDraft.nutrition }
+	});
+	let tagsText = $state(initialTagsText);
 	let submitted = $state(false);
 	let uploadError = $state('');
 	let uploading = $state(false);
+	let confirmingDiscard = $state(false);
 	let nutritionOpen = $state(untrack(() => !isValidNutrition(draft.nutrition)));
 	let photoInput = $state<HTMLInputElement>();
 	let formEl = $state<HTMLFormElement>();
-	let addIngredientButton = $state<HTMLButtonElement>();
-	let addStepButton = $state<HTMLButtonElement>();
+	let cancelButton = $state<HTMLButtonElement>();
+	let keepEditingButton = $state<HTMLButtonElement>();
 	let validation = $derived(
 		submitted
 			? validateRecipeDraftFields(draft, {
@@ -55,11 +69,131 @@
 				})
 			: emptyRecipeDraftValidation()
 	);
+	function scrollAndFocus(row: HTMLElement | undefined, control: HTMLElement | null | undefined) {
+		row?.scrollIntoView({ block: 'nearest' });
+		control?.scrollIntoView({ block: 'nearest' });
+		control?.focus({ preventScroll: true });
+	}
+	async function addIngredient(afterIndex?: number) {
+		const inserted = insertDraftItem(
+			draft.ingredients,
+			afterIndex ?? draft.ingredients.length - 1,
+			{ name: '', quantity: 1, unit: 'piece' },
+			MAX_DRAFT_INGREDIENTS
+		);
+		if (!inserted) return;
+		confirmingDiscard = false;
+		draft.ingredients = inserted.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLInputElement>('.ingredient-name'));
+	}
+	async function moveIngredient(index: number, direction: -1 | 1) {
+		const moved = moveDraftItem(draft.ingredients, index, direction);
+		if (!moved) return;
+		confirmingDiscard = false;
+		draft.ingredients = moved.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLInputElement>('.ingredient-name')
+		);
+	}
+	async function removeIngredient(index: number) {
+		confirmingDiscard = false;
+		draft.ingredients = draft.ingredients.filter((_, i) => i !== index);
+		await tick();
+		const rows = formEl?.querySelectorAll<HTMLElement>('.draft-ingredient');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLInputElement>('.ingredient-name')?.focus({ preventScroll: true });
+		} else {
+			formEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[0]
+				?.focus({ preventScroll: true });
+		}
+	}
+	async function addStep(afterIndex?: number) {
+		const inserted = insertDraftItem(
+			draft.steps,
+			afterIndex ?? draft.steps.length - 1,
+			'',
+			MAX_DRAFT_STEPS
+		);
+		if (!inserted) return;
+		confirmingDiscard = false;
+		draft.steps = inserted.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-step')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLTextAreaElement>('textarea'));
+	}
+	async function moveStep(index: number, direction: -1 | 1) {
+		const moved = moveDraftItem(draft.steps, index, direction);
+		if (!moved) return;
+		confirmingDiscard = false;
+		draft.steps = moved.items;
+		await tick();
+		const row = formEl?.querySelectorAll<HTMLElement>('.draft-step')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLTextAreaElement>('textarea')
+		);
+	}
+	async function removeStep(index: number) {
+		confirmingDiscard = false;
+		draft.steps = draft.steps.filter((_, i) => i !== index);
+		await tick();
+		const rows = formEl?.querySelectorAll<HTMLElement>('.draft-step');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLTextAreaElement>('textarea')?.focus({ preventScroll: true });
+		} else {
+			formEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[1]
+				?.focus({ preventScroll: true });
+		}
+	}
+	async function requestCancel() {
+		if (
+			!hasRecipeEditorChanges(
+				{ draft: initialDraft, tagsText: initialTagsText },
+				{ draft, tagsText }
+			)
+		) {
+			cancel();
+			return;
+		}
+		confirmingDiscard = true;
+		await tick();
+		keepEditingButton?.scrollIntoView({ block: 'nearest' });
+		keepEditingButton?.focus({ preventScroll: true });
+	}
+	async function keepEditing() {
+		confirmingDiscard = false;
+		await tick();
+		cancelButton?.focus({ preventScroll: true });
+	}
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
 		if (!canUploadCover || !file) return;
 		uploading = true;
+		confirmingDiscard = false;
 		uploadError = '';
 		try {
 			const body = await prepareCover(file);
@@ -82,6 +216,7 @@
 		event.preventDefault();
 		if (uploading) return;
 		uploadError = '';
+		confirmingDiscard = false;
 		const check = validateRecipeDraftFields(draft, {
 			tagsText,
 			checkImage: true,
@@ -92,8 +227,9 @@
 			if (check.hasNutritionErrors) nutritionOpen = true;
 			await tick();
 			if (!focusFirstInvalid(formEl)) {
-				if (check.ingredientsList) addIngredientButton?.focus();
-				else if (check.stepsList) addStepButton?.focus();
+				const addButtons = formEl?.querySelectorAll<HTMLButtonElement>('.draft-list-add');
+				if (check.ingredientsList) addButtons?.[0]?.focus({ preventScroll: true });
+				else if (check.stepsList) addButtons?.[1]?.focus({ preventScroll: true });
 			}
 			return;
 		}
@@ -148,7 +284,12 @@
 				? 'Add a personal recipe to your collection.'
 				: 'Changes are saved to your recipe collection.'}
 		</p>
-		<form novalidate bind:this={formEl} onsubmit={saveDraft}>
+		<form
+			novalidate
+			bind:this={formEl}
+			onsubmit={saveDraft}
+			oninput={() => (confirmingDiscard = false)}
+		>
 			<div class="draft-summary">
 				<FormField id="editor-title" class="draft-title" label="Title" error={validation.title}>
 					{#snippet children(field)}
@@ -203,7 +344,6 @@
 							hidden
 							type="file"
 							accept="image/jpeg,image/png,image/webp"
-							aria-label="Upload cover photo"
 							bind:this={photoInput}
 							onchange={uploadCover}
 							disabled={uploading}
@@ -221,6 +361,7 @@
 							class="text-button"
 							disabled={uploading}
 							onclick={() => {
+								confirmingDiscard = false;
 								draft.image = '';
 							}}>Remove cover</button
 						>{/if}
@@ -268,12 +409,10 @@
 			<div class="draft-section-heading">
 				<h3>Ingredients</h3>
 				<button
-					bind:this={addIngredientButton}
 					class="text-button"
 					type="button"
-					disabled={draft.ingredients.length >= 60}
-					onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
-					><Plus size={17} />Add</button
+					disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+					onclick={() => void addIngredient()}><Plus size={17} />Add</button
 				>
 			</div>
 			{#if validation.ingredientsList}<p class="error" id="editor-ingredients-error">
@@ -315,14 +454,35 @@
 							placeholder="Unit"
 							{...unitAria.props}
 						/>
-						<button
-							class="icon-button"
-							type="button"
-							aria-label={`Remove ingredient ${i + 1}`}
-							onclick={() =>
-								(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
-							><X size={18} /></button
-						>
+						<div class="draft-row-actions">
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move ingredient ${i + 1} up`}
+								disabled={i === 0}
+								onclick={() => void moveIngredient(i, -1)}><ArrowUp size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move ingredient ${i + 1} down`}
+								disabled={i === draft.ingredients.length - 1}
+								onclick={() => void moveIngredient(i, 1)}><ArrowDown size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Insert below ingredient ${i + 1}`}
+								disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+								onclick={() => void addIngredient(i)}><Plus size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Remove ingredient ${i + 1}`}
+								onclick={() => void removeIngredient(i)}><X size={18} /></button
+							>
+						</div>
 					</div>
 					{#if rowError?.name}<p class="error draft-row-error" id={nameAria.errorId}>
 							{rowError.name}
@@ -332,42 +492,77 @@
 							{rowError.unit}
 						</p>{/if}{/each}
 			</div>
+			<button
+				class="secondary draft-list-add"
+				type="button"
+				disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+				onclick={() => void addIngredient()}><Plus size={17} />Add ingredient</button
+			>
 			<div class="draft-section-heading">
 				<h3>Steps</h3>
 				<button
-					bind:this={addStepButton}
 					class="text-button"
 					type="button"
-					disabled={draft.steps.length >= 40}
-					onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
+					disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+					onclick={() => void addStep()}><Plus size={17} />Add</button
 				>
 			</div>
 			{#if validation.stepsList}<p class="error" id="editor-steps-error">
 					{validation.stepsList}
 				</p>{/if}
-			{#each draft.steps as step, i}{@const stepError = validation.steps[i] || ''}{@const stepAria =
-					fieldAria(`editor-step-${i}`, { error: stepError })}
-				<div class="draft-step">
-					<span>{i + 1}</span><textarea
-						aria-label={`Step ${i + 1}`}
-						bind:value={draft.steps[i]}
-						maxlength="10000"
-						rows="2"
-						{...stepAria.props}></textarea>
-					<button
-						class="icon-button"
-						type="button"
-						aria-label={`Remove step ${i + 1}`}
-						onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
-						><X size={18} /></button
-					>
-				</div>
-				{#if stepError}<p class="error draft-row-error" id={stepAria.errorId}>
-						{stepError}
-					</p>{/if}{/each}
+			<div class="draft-steps">
+				{#each draft.steps as _, i}{@const stepError = validation.steps[i] || ''}{@const stepAria =
+						fieldAria(`editor-step-${i}`, { error: stepError })}
+					<div class="draft-step">
+						<span>{i + 1}</span><textarea
+							aria-label={`Step ${i + 1}`}
+							bind:value={draft.steps[i]}
+							maxlength="10000"
+							rows="2"
+							{...stepAria.props}></textarea>
+						<div class="draft-row-actions">
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move step ${i + 1} up`}
+								disabled={i === 0}
+								onclick={() => void moveStep(i, -1)}><ArrowUp size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Move step ${i + 1} down`}
+								disabled={i === draft.steps.length - 1}
+								onclick={() => void moveStep(i, 1)}><ArrowDown size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Insert below step ${i + 1}`}
+								disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+								onclick={() => void addStep(i)}><Plus size={17} /></button
+							>
+							<button
+								class="icon-button"
+								type="button"
+								aria-label={`Remove step ${i + 1}`}
+								onclick={() => void removeStep(i)}><X size={18} /></button
+							>
+						</div>
+					</div>
+					{#if stepError}<p class="error draft-row-error" id={stepAria.errorId}>
+							{stepError}
+						</p>{/if}{/each}
+			</div>
+			<button
+				class="secondary draft-list-add"
+				type="button"
+				disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+				onclick={() => void addStep()}><Plus size={17} />Add step</button
+			>
 			<details class="import-notes" bind:open={nutritionOpen}>
 				<summary>Nutrition estimates</summary>
-				<p>
+				<p id="editor-nutrition-help">
 					Estimated values per serving. Ingredient or serving changes will mark these values as
 					stale.
 				</p>
@@ -375,7 +570,8 @@
 					{#each NUTRITION_FIELDS as [key, label]}<FormField
 							id={`editor-nutrition-${key}`}
 							{label}
-							error={validation.nutrition[key]}
+							helpIds={['editor-nutrition-help']}
+							error={validation.nutrition[key] || ''}
 						>
 							{#snippet children(field)}
 								<input
@@ -393,11 +589,31 @@
 			{#if uploadError || validation.summary}<p class="error" role="alert">
 					{uploadError || validation.summary}
 				</p>{/if}
-			<div class="draft-footer">
-				<button class="secondary" type="button" onclick={cancel}>Cancel</button>
-				<button class="primary" type="submit" disabled={uploading}
-					><Check size={18} />{mode === 'create' ? 'Save recipe' : 'Save changes'}</button
-				>
+			<div class="draft-footer" class:confirming-discard={confirmingDiscard}>
+				{#if confirmingDiscard}
+					<p class="discard-prompt" role="status">Discard unsaved changes?</p>
+					<div class="draft-footer-actions">
+						<button
+							class="secondary"
+							type="button"
+							bind:this={keepEditingButton}
+							onclick={() => void keepEditing()}>Keep editing</button
+						>
+						<button class="primary danger-button" type="button" onclick={cancel}
+							>Discard changes</button
+						>
+					</div>
+				{:else}
+					<button
+						class="secondary"
+						type="button"
+						bind:this={cancelButton}
+						onclick={() => void requestCancel()}>Cancel</button
+					>
+					<button class="primary" type="submit" disabled={uploading}
+						><Check size={18} />{mode === 'create' ? 'Save recipe' : 'Save changes'}</button
+					>
+				{/if}
 			</div>
 		</form>
 	</div>

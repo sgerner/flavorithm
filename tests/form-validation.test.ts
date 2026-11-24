@@ -36,12 +36,14 @@ import {
 	validateRegistrationName
 } from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
+import * as importSessionMod from '../src/lib/import-session.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import * as searchPickerMod from '../src/lib/search-picker.ts';
 import type { AppState, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
@@ -287,11 +289,13 @@ function compileServerModule(
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
+		'#lib/import-session.ts': importSessionMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/search-picker.ts': searchPickerMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
@@ -673,7 +677,8 @@ test('rendered components resolve every aria-describedby and label[for] without 
 		props: {
 			session: {
 				...importCompiled.exports.emptyImportSession(),
-				draft: structuredClone(brokenRecipe)
+				draft: structuredClone(brokenRecipe),
+				reviewingDraft: true
 			},
 			capture: async () => null,
 			save: () => {},
@@ -745,6 +750,38 @@ test('rendered components resolve every aria-describedby and label[for] without 
 		}).body,
 		'AIConnection api-key with catalog error'
 	);
+	assertValidRenderedAccessibility(
+		render(aiConnectionSsrMod.default, {
+			props: {
+				preferences: structuredClone(createInitialState().preferences),
+				apiKey: '',
+				providers: [],
+				accountModels: [],
+				chatGPT: {
+					configured: true,
+					mode: 'device',
+					host: { model: 'gpt-5.4' },
+					accounts: []
+				},
+				signedIn: true,
+				managedAuth: false,
+				busy: false,
+				loading: false,
+				catalogError: '',
+				authorizationUrl: '',
+				device: null,
+				oncancel: () => {},
+				oncopycode: () => {},
+				onselect: () => {},
+				onaccount: () => {},
+				onconnect: () => {},
+				ondisconnect: () => {},
+				onrefresh: () => {},
+				onsignin: () => {}
+			}
+		}).body,
+		'AIConnection host default active'
+	);
 });
 
 // --- +page.svelte modal accessibility & end-to-end login/onboarding harness ---
@@ -814,15 +851,7 @@ const pageSsrCompiled = compileServerModule('src/routes/+page.svelte', hookedPag
 	'#lib/components/VoiceSettings.svelte': voiceSettingsSsrMod,
 	'#lib/components/RecipeImport.svelte': {
 		default: noopComponent,
-		emptyImportSession: () => ({
-			url: '',
-			text: '',
-			photo: '',
-			photoName: '',
-			draft: null,
-			baseline: null,
-			assumptions: []
-		})
+		emptyImportSession: importSessionMod.emptyImportSession
 	}
 });
 
@@ -1022,11 +1051,13 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
+		'#lib/import-session.ts': importSessionMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
@@ -1042,15 +1073,7 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
 			default: noopComponent,
-			emptyImportSession: () => ({
-				url: '',
-				text: '',
-				photo: '',
-				photoName: '',
-				draft: null,
-				baseline: null,
-				assumptions: []
-			})
+			emptyImportSession: importSessionMod.emptyImportSession
 		}
 	};
 

@@ -1,36 +1,10 @@
 <script module lang="ts">
-	import {
-		createDraftBaseline,
-		isValidNutrition,
-		MAX_SERVINGS,
-		NUTRITION_FIELDS,
-		validateRecipeDraft,
-		type RecipeDraftBaseline
-	} from '#lib/recipe-draft.ts';
-	import type { Recipe } from '#lib/types.ts';
-	export type ImportSession = {
-		url: string;
-		text: string;
-		photo: string;
-		photoName: string;
-		draft: Recipe | null;
-		baseline: RecipeDraftBaseline | null;
-		assumptions: string[];
-	};
-	export const emptyImportSession = (): ImportSession => ({
-		url: '',
-		text: '',
-		photo: '',
-		photoName: '',
-		draft: null,
-		baseline: null,
-		assumptions: []
-	});
+	export { emptyImportSession, type ImportSession } from '#lib/import-session.ts';
 </script>
 
 <script lang="ts">
 	import { onDestroy, tick, untrack } from 'svelte';
-	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
+	import { ArrowDown, ArrowUp, Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
 	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import {
 		emptyRecipeDraftValidation,
@@ -39,7 +13,25 @@
 		validateRecipeDraftFields,
 		validateRecipeLink
 	} from '#lib/form-validation.ts';
+	import {
+		clearImportSourceInPlace,
+		emptyImportSession,
+		isReviewingImportDraft,
+		type ImportSession
+	} from '#lib/import-session.ts';
 	import { revealMotion } from '#lib/motion.ts';
+	import {
+		createDraftBaseline,
+		insertDraftItem,
+		isValidNutrition,
+		MAX_DRAFT_INGREDIENTS,
+		MAX_DRAFT_STEPS,
+		MAX_SERVINGS,
+		moveDraftItem,
+		NUTRITION_FIELDS,
+		validateRecipeDraft
+	} from '#lib/recipe-draft.ts';
+	import type { Recipe } from '#lib/types.ts';
 	import FormField from './FormField.svelte';
 	let {
 		session = $bindable(),
@@ -59,7 +51,6 @@
 	} = $props();
 	let busy = $state(false);
 	let reading = $state(false);
-	let reviewingDraft = $state(untrack(() => session.draft !== null));
 	let retryAvailable = $state(false);
 	let error = $state('');
 	let captureSubmitted = $state(false);
@@ -73,8 +64,6 @@
 	let heading = $state<HTMLHeadingElement>();
 	let captureFormEl = $state<HTMLFormElement>();
 	let draftFormEl = $state<HTMLFormElement>();
-	let addIngredientButton = $state<HTMLButtonElement>();
-	let addStepButton = $state<HTMLButtonElement>();
 	let urlError = $derived(captureSubmitted ? validateRecipeLink(session.url) : '');
 	let draftValidation = $derived(
 		draftSubmitted && session.draft
@@ -87,9 +76,139 @@
 	if (untrack(() => session.draft !== null && session.baseline === null)) {
 		session.baseline = untrack(() => createDraftBaseline(session.draft!));
 	}
+	function scrollAndFocus(row: HTMLElement | undefined, control: HTMLElement | null | undefined) {
+		row?.scrollIntoView({ block: 'nearest' });
+		control?.scrollIntoView({ block: 'nearest' });
+		control?.focus({ preventScroll: true });
+	}
+	async function addIngredient(afterIndex?: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		const inserted = insertDraftItem(
+			draft.ingredients,
+			afterIndex ?? draft.ingredients.length - 1,
+			{ name: '', quantity: 1, unit: 'piece' },
+			MAX_DRAFT_INGREDIENTS
+		);
+		if (!inserted) return;
+		draft.ingredients = inserted.items;
+		await tick();
+		if (!alive) return;
+		const row = draftFormEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLInputElement>('.ingredient-name'));
+	}
+	async function moveIngredient(index: number, direction: -1 | 1) {
+		const draft = session.draft;
+		if (!draft) return;
+		const moved = moveDraftItem(draft.ingredients, index, direction);
+		if (!moved) return;
+		draft.ingredients = moved.items;
+		await tick();
+		if (!alive) return;
+		const row = draftFormEl?.querySelectorAll<HTMLElement>('.draft-ingredient')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLInputElement>('.ingredient-name')
+		);
+	}
+	async function removeIngredient(index: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		draft.ingredients = draft.ingredients.filter((_, i) => i !== index);
+		await tick();
+		if (!alive) return;
+		const rows = draftFormEl?.querySelectorAll<HTMLElement>('.draft-ingredient');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLInputElement>('.ingredient-name')?.focus({ preventScroll: true });
+		} else {
+			draftFormEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[0]
+				?.focus({ preventScroll: true });
+		}
+	}
+	async function addStep(afterIndex?: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		const inserted = insertDraftItem(
+			draft.steps,
+			afterIndex ?? draft.steps.length - 1,
+			'',
+			MAX_DRAFT_STEPS
+		);
+		if (!inserted) return;
+		draft.steps = inserted.items;
+		await tick();
+		if (!alive) return;
+		const row = draftFormEl?.querySelectorAll<HTMLElement>('.draft-step')[inserted.index];
+		scrollAndFocus(row, row?.querySelector<HTMLTextAreaElement>('textarea'));
+	}
+	async function moveStep(index: number, direction: -1 | 1) {
+		const draft = session.draft;
+		if (!draft) return;
+		const moved = moveDraftItem(draft.steps, index, direction);
+		if (!moved) return;
+		draft.steps = moved.items;
+		await tick();
+		if (!alive) return;
+		const row = draftFormEl?.querySelectorAll<HTMLElement>('.draft-step')[moved.index];
+		const buttons = row?.querySelectorAll<HTMLButtonElement>('.draft-row-actions > button');
+		const preferred = buttons?.[direction === -1 ? 0 : 1];
+		const fallback = buttons?.[direction === -1 ? 1 : 0];
+		scrollAndFocus(
+			row,
+			preferred && !preferred.disabled
+				? preferred
+				: fallback && !fallback.disabled
+					? fallback
+					: row?.querySelector<HTMLTextAreaElement>('textarea')
+		);
+	}
+	async function removeStep(index: number) {
+		const draft = session.draft;
+		if (!draft) return;
+		draft.steps = draft.steps.filter((_, i) => i !== index);
+		await tick();
+		if (!alive) return;
+		const rows = draftFormEl?.querySelectorAll<HTMLElement>('.draft-step');
+		if (rows?.length) {
+			const row = rows[Math.min(index, rows.length - 1)];
+			row?.querySelector<HTMLTextAreaElement>('textarea')?.focus({ preventScroll: true });
+		} else {
+			draftFormEl
+				?.querySelectorAll<HTMLButtonElement>('.draft-list-add')[1]
+				?.focus({ preventScroll: true });
+		}
+	}
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
+	let observedSession = untrack(() => session);
+	$effect(() => {
+		if (session !== observedSession) {
+			observedSession = session;
+			captureGeneration++;
+			controller?.abort();
+			controller = undefined;
+			busy = false;
+			captureSubmitted = false;
+			draftSubmitted = false;
+			moreDetailsOpen = false;
+			nutritionOpen = session.draft ? !isValidNutrition(session.draft.nutrition) : false;
+			error = '';
+			retryAvailable = false;
+		}
+		if (session.draft !== null && session.baseline === null) {
+			session.baseline = createDraftBaseline(session.draft);
+		}
+	});
 	onDestroy(() => {
 		alive = false;
 		captureGeneration++;
@@ -103,17 +222,18 @@
 		}
 		reading = true;
 		error = '';
+		const targetSession = session;
 		try {
 			const photo = await prepareAIPhoto(file, {
 				unsupportedMessage:
 					'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.'
 			});
-			if (alive) {
-				session.photo = photo;
-				session.photoName = file.name || 'recipe-photo.jpg';
+			if (alive && session === targetSession) {
+				targetSession.photo = photo;
+				targetSession.photoName = file.name || 'recipe-photo.jpg';
 			}
 		} catch (e) {
-			if (alive) {
+			if (alive && session === targetSession) {
 				error = e instanceof Error ? e.message : 'Could not read that photo. Try another file.';
 			}
 		} finally {
@@ -164,61 +284,54 @@
 	}
 	async function prepare(event: SubmitEvent) {
 		event.preventDefault();
-		if (busy || reading || voiceBusy || !alive) return;
 		const url = session.url.trim();
-		const linkCheck = validateRecipeLink(url);
-		if (linkCheck) {
-			captureSubmitted = true;
-			error = '';
-			await tick();
-			focusFirstInvalid(captureFormEl);
+		if (busy || reading || voiceBusy || !alive || (!url && !session.text.trim() && !session.photo))
 			return;
-		}
-		if (!url && !session.text.trim() && !session.photo) {
-			error = 'Add a recipe link, paste recipe text, or attach a photo before creating a draft.';
+		error = '';
+		if (validateRecipeLink(session.url)) {
+			captureSubmitted = true;
 			await tick();
 			focusFirstInvalid(captureFormEl);
 			return;
 		}
 		captureSubmitted = false;
-		error = '';
 		retryAvailable = false;
 		busy = true;
 		const generation = ++captureGeneration;
+		const targetSession = session;
 		const currentController = new AbortController();
 		controller = currentController;
 		try {
 			const result = await capture(
 				{
 					...(url ? { url } : {}),
-					prompt: session.text,
-					...(session.photo ? { image: session.photo } : {})
+					prompt: targetSession.text,
+					...(targetSession.photo ? { image: targetSession.photo } : {})
 				},
 				currentController.signal
 			);
-			if (alive && generation === captureGeneration && result) {
-				session.draft = result.recipe;
-				session.baseline = createDraftBaseline(result.recipe);
-				session.assumptions = result.assumptions;
+			if (alive && generation === captureGeneration && session === targetSession && result) {
+				targetSession.draft = result.recipe;
+				targetSession.baseline = createDraftBaseline(result.recipe);
+				targetSession.assumptions = result.assumptions;
+				targetSession.reviewingDraft = true;
 				draftSubmitted = false;
 				moreDetailsOpen = false;
 				nutritionOpen = !isValidNutrition(result.recipe.nutrition);
-				reviewingDraft = true;
 				await tick();
-				if (alive && generation === captureGeneration) heading?.focus();
+				if (alive && generation === captureGeneration && session === targetSession)
+					heading?.focus();
 			}
 		} catch (e) {
-			if (alive && generation === captureGeneration) {
-				busy = false;
-				controller = undefined;
+			if (alive && generation === captureGeneration && session === targetSession) {
 				error = currentController.signal.aborted
 					? 'Request cancelled. Your input is still here; try again when you’re ready.'
 					: e instanceof Error
 						? e.message
 						: 'Could not create a recipe draft. Please try again.';
 				retryAvailable = true;
-				if (!currentController.signal.aborted) {
-					await tick();
+				await tick();
+				if (alive && generation === captureGeneration && session === targetSession) {
 					focusFirstInvalid(captureFormEl);
 				}
 			}
@@ -250,15 +363,16 @@
 			if (check.hasDetailErrors) moreDetailsOpen = true;
 			if (check.hasNutritionErrors) nutritionOpen = true;
 			await tick();
-			if (!focusFirstInvalid(draftFormEl)) {
-				if (check.ingredientsList) addIngredientButton?.focus();
-				else if (check.stepsList) addStepButton?.focus();
+			if (alive && !focusFirstInvalid(draftFormEl)) {
+				const addButtons = draftFormEl?.querySelectorAll<HTMLButtonElement>('.draft-list-add');
+				if (check.ingredientsList) addButtons?.[0]?.focus({ preventScroll: true });
+				else if (check.stepsList) addButtons?.[1]?.focus({ preventScroll: true });
 			}
 			return;
 		}
 		const validation = validateRecipeDraft(draft, {
 			baseline: session.baseline,
-			assumptions: session.assumptions
+			assumptions: session.assumptions.map((note) => note.trim()).filter(Boolean)
 		});
 		if (!validation.ok) {
 			if (validation.nutritionInvalid) nutritionOpen = true;
@@ -274,12 +388,12 @@
 	}
 </script>
 
-<div class:draft-heading={reviewingDraft && session.draft !== null}>
+<div class:draft-heading={isReviewingImportDraft(session)}>
 	<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">
-		{!reviewingDraft || !session.draft ? 'Import a recipe' : 'Review your recipe'}
+		{!isReviewingImportDraft(session) ? 'Import a recipe' : 'Review your recipe'}
 	</h2>
 </div>
-{#if !reviewingDraft || !session.draft}
+{#if !isReviewingImportDraft(session)}
 	<p class="muted capture-help">
 		Add an optional recipe link to fetch, or paste a recipe and notes.
 	</p>
@@ -365,13 +479,14 @@
 						class="text-button"
 						disabled={busy || reading || voiceBusy}
 						onclick={() => {
-							session = emptyImportSession();
+							clearImportSourceInPlace(session);
 							error = '';
 							captureSubmitted = false;
 							draftSubmitted = false;
 							moreDetailsOpen = false;
-							nutritionOpen = false;
+							nutritionOpen = session.draft ? !isValidNutrition(session.draft.nutrition) : false;
 							retryAvailable = false;
+							if (photoInput) photoInput.value = '';
 						}}>Clear</button
 					>{/if}
 			</div>
@@ -413,16 +528,17 @@
 				disabled={voiceBusy}
 				onclick={() => {
 					error = '';
-					draftSubmitted = false;
-					reviewingDraft = true;
+					captureSubmitted = false;
+					session.reviewingDraft = true;
 				}}>Return to reviewed draft</button
 			>{/if}
 		<p class="field-help" id="import-source-help">
-			Uses your connected model. You’ll review quantities and steps before saving.
+			Structured recipe links work without AI; unstructured pages, text, and photos require a
+			connected model. You’ll review quantities and steps before saving.
 		</p>
 	</form>
 {:else}
-	{@const draft = session.draft}
+	{@const draft = session.draft!}
 	<form novalidate bind:this={draftFormEl} onsubmit={saveDraft} in:revealMotion>
 		<div class="draft-summary">
 			<FormField id="import-title" class="draft-title" label="Title" error={draftValidation.title}>
@@ -466,12 +582,10 @@
 		<div class="draft-section-heading">
 			<h3>Ingredients</h3>
 			<button
-				bind:this={addIngredientButton}
 				class="text-button"
 				type="button"
-				disabled={draft.ingredients.length >= 60}
-				onclick={() => draft.ingredients.push({ name: '', quantity: 1, unit: 'piece' })}
-				><Plus size={17} />Add</button
+				disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+				onclick={() => void addIngredient()}><Plus size={17} />Add</button
 			>
 		</div>
 		{#if draftValidation.ingredientsList}<p class="error" id="import-ingredients-error">
@@ -481,7 +595,9 @@
 			{#each draft.ingredients as item, i}{@const rowError =
 					draftValidation.ingredients[i]}{@const nameAria = fieldAria(
 					`import-ingredient-${i}-name`,
-					{ error: rowError?.name }
+					{
+						error: rowError?.name
+					}
 				)}{@const qtyAria = fieldAria(`import-ingredient-${i}-quantity`, {
 					error: rowError?.quantity
 				})}{@const unitAria = fieldAria(`import-ingredient-${i}-unit`, {
@@ -514,14 +630,35 @@
 						placeholder="Unit"
 						{...unitAria.props}
 					/>
-					<button
-						class="icon-button"
-						type="button"
-						aria-label={`Remove ingredient ${i + 1}`}
-						onclick={() =>
-							(draft.ingredients = draft.ingredients.filter((_, index) => index !== i))}
-						><X size={18} /></button
-					>
+					<div class="draft-row-actions">
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move ingredient ${i + 1} up`}
+							disabled={i === 0}
+							onclick={() => void moveIngredient(i, -1)}><ArrowUp size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move ingredient ${i + 1} down`}
+							disabled={i === draft.ingredients.length - 1}
+							onclick={() => void moveIngredient(i, 1)}><ArrowDown size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Insert below ingredient ${i + 1}`}
+							disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+							onclick={() => void addIngredient(i)}><Plus size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Remove ingredient ${i + 1}`}
+							onclick={() => void removeIngredient(i)}><X size={18} /></button
+						>
+					</div>
 				</div>
 				{#if rowError?.name}<p class="error draft-row-error" id={nameAria.errorId}>
 						{rowError.name}
@@ -531,40 +668,76 @@
 						{rowError.unit}
 					</p>{/if}{/each}
 		</div>
+		<button
+			class="secondary draft-list-add"
+			type="button"
+			disabled={draft.ingredients.length >= MAX_DRAFT_INGREDIENTS}
+			onclick={() => void addIngredient()}><Plus size={17} />Add ingredient</button
+		>
 		<div class="draft-section-heading">
 			<h3>Steps</h3>
 			<button
-				bind:this={addStepButton}
 				class="text-button"
 				type="button"
-				disabled={draft.steps.length >= 40}
-				onclick={() => draft.steps.push('')}><Plus size={17} />Add</button
+				disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+				onclick={() => void addStep()}><Plus size={17} />Add</button
 			>
 		</div>
 		{#if draftValidation.stepsList}<p class="error" id="import-steps-error">
 				{draftValidation.stepsList}
 			</p>{/if}
-		{#each draft.steps as step, i}{@const stepError =
-				draftValidation.steps[i] || ''}{@const stepAria = fieldAria(`import-step-${i}`, {
-				error: stepError
-			})}
-			<div class="draft-step">
-				<span>{i + 1}</span><textarea
-					aria-label={`Step ${i + 1}`}
-					bind:value={draft.steps[i]}
-					maxlength="10000"
-					rows="2"
-					{...stepAria.props}></textarea><button
-					class="icon-button"
-					type="button"
-					aria-label={`Remove step ${i + 1}`}
-					onclick={() => (draft.steps = draft.steps.filter((_, index) => index !== i))}
-					><X size={18} /></button
-				>
-			</div>
-			{#if stepError}<p class="error draft-row-error" id={stepAria.errorId}>
-					{stepError}
-				</p>{/if}{/each}
+		<div class="draft-steps">
+			{#each draft.steps as _, i}{@const stepError =
+					draftValidation.steps[i] || ''}{@const stepAria = fieldAria(`import-step-${i}`, {
+					error: stepError
+				})}
+				<div class="draft-step">
+					<span>{i + 1}</span><textarea
+						aria-label={`Step ${i + 1}`}
+						bind:value={draft.steps[i]}
+						maxlength="10000"
+						rows="2"
+						{...stepAria.props}></textarea>
+					<div class="draft-row-actions">
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move step ${i + 1} up`}
+							disabled={i === 0}
+							onclick={() => void moveStep(i, -1)}><ArrowUp size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Move step ${i + 1} down`}
+							disabled={i === draft.steps.length - 1}
+							onclick={() => void moveStep(i, 1)}><ArrowDown size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Insert below step ${i + 1}`}
+							disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+							onclick={() => void addStep(i)}><Plus size={17} /></button
+						>
+						<button
+							class="icon-button"
+							type="button"
+							aria-label={`Remove step ${i + 1}`}
+							onclick={() => void removeStep(i)}><X size={18} /></button
+						>
+					</div>
+				</div>
+				{#if stepError}<p class="error draft-row-error" id={stepAria.errorId}>
+						{stepError}
+					</p>{/if}{/each}
+		</div>
+		<button
+			class="secondary draft-list-add"
+			type="button"
+			disabled={draft.steps.length >= MAX_DRAFT_STEPS}
+			onclick={() => void addStep()}><Plus size={17} />Add step</button
+		>
 		<details class="import-notes" bind:open={moreDetailsOpen}>
 			<summary>More recipe details</summary>
 			<FormField id="import-description" label="Description" error={draftValidation.description}>
@@ -585,12 +758,15 @@
 		</details>
 		<details class="import-notes" bind:open={nutritionOpen}>
 			<summary>Nutrition estimates</summary>
-			<p>Estimates per serving; re-estimate after ingredient or serving changes.</p>
+			<p id="import-nutrition-help">
+				Estimates per serving; re-estimate after ingredient or serving changes.
+			</p>
 			<div class="draft-summary">
 				{#each NUTRITION_FIELDS as [key, label]}<FormField
 						id={`import-nutrition-${key}`}
 						{label}
-						error={draftValidation.nutrition[key]}
+						helpIds={['import-nutrition-help']}
+						error={draftValidation.nutrition[key] || ''}
 					>
 						{#snippet children(field)}
 							<input
@@ -615,13 +791,12 @@
 				draftSubmitted = false;
 				moreDetailsOpen = false;
 				nutritionOpen = false;
-				reviewingDraft = false;
 				retryAvailable = false;
 			}}>Discard draft</button
 		>
-		{#if draft.source}<p class="muted">
+		{#if draft.source}<p class="field-help">
 				<a href={draft.source} target="_blank" rel="noreferrer">Original source</a>
-			</p>{:else}<p class="muted">
+			</p>{:else}<p class="field-help">
 				{draft.provenance === 'web-import'
 					? 'Imported from a recipe webpage.'
 					: 'AI-generated from your input — no recipe webpage was fetched.'}
@@ -634,7 +809,7 @@
 				class="secondary"
 				type="button"
 				onclick={() => {
-					reviewingDraft = false;
+					session.reviewingDraft = false;
 					draftSubmitted = false;
 					error = '';
 				}}><ChevronLeft size={18} />Back</button

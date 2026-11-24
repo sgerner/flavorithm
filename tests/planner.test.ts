@@ -18,6 +18,7 @@ import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as formValidationMod from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
+import * as importSessionMod from '../src/lib/import-session.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import { calendarDayScrollLeft, weekOffsetFromStarts } from '../src/lib/planner.ts';
@@ -25,6 +26,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -179,6 +181,7 @@ function createModuleMap() {
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
+		'#lib/import-session.ts': importSessionMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
@@ -191,6 +194,7 @@ function createModuleMap() {
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
+		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
@@ -199,15 +203,7 @@ function createModuleMap() {
 		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
 			default: noopComponent,
-			emptyImportSession: () => ({
-				url: '',
-				text: '',
-				photo: '',
-				photoName: '',
-				draft: null,
-				baseline: null,
-				assumptions: []
-			})
+			emptyImportSession: importSessionMod.emptyImportSession
 		}
 	} as Record<string, unknown>;
 }
