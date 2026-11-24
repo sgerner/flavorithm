@@ -93,7 +93,10 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.recipes = [...kitchen.recipes];
 		},
 		logout,
-		deleteAccount
+		deleteAccount,
+		warmModal,
+		warmSettings,
+		applyButler
 	});
 `;
 	return svelteSource.slice(0, instanceEnd) + hook + svelteSource.slice(instanceEnd);
@@ -150,6 +153,9 @@ type PlannerHarnessApi = {
 	rateRecipe: (recipe: Recipe, rating: number) => void;
 	logout: () => Promise<void>;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	warmModal: (key: string) => void;
+	warmSettings: () => void;
+	applyButler: (commands: unknown[], expectedSnapshot: string) => Promise<string>;
 };
 
 const noopComponent = () => {};
@@ -898,4 +904,232 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('+page.svelte warmModal, warmSettings, offline idle reschedule, and applyButler chunk failure handling', async () => {
+	const modMap = createModuleMap();
+	const chunkLoads: string[] = [];
+	let failButlerChunk = true;
+	let mountCleanup: (() => void) | undefined;
+	modMap.svelte = {
+		...svelte,
+		onMount: (fn: () => (() => void) | void) => {
+			mountCleanup = fn() ?? undefined;
+		}
+	};
+	modMap['#lib/components/HouseholdDialog.svelte'] = { default: noopComponent };
+	modMap['#lib/components/PreferencesQuiz.svelte'] = { default: noopComponent };
+
+	const trackedChunks = new Set([
+		'#lib/components/RecipeDetail.svelte',
+		'#lib/components/RecipeImport.svelte',
+		'#lib/components/ButlerChat.svelte',
+		'#lib/components/AIConnection.svelte',
+		'#lib/components/VoiceSettings.svelte',
+		'#lib/components/RecipeEditor.svelte',
+		'#lib/components/HouseholdDialog.svelte',
+		'#lib/components/PreferencesQuiz.svelte',
+		'#lib/butler.ts',
+		'#lib/voice-capture.ts'
+	]);
+
+	const navState: {
+		onLine: boolean;
+		connection: { saveData: boolean; effectiveType?: string };
+	} = {
+		onLine: true,
+		connection: { saveData: true, effectiveType: '4g' }
+	};
+	const idleScheduled = new Map<number, () => void>();
+	const idleCancelled: number[] = [];
+	let nextIdleId = 1;
+	const windowListeners = new Map<string, Set<() => void>>();
+
+	const exports: { default?: any } = {};
+	let api!: PlannerHarnessApi;
+	let initialized = false;
+	const storage = makeMemoryStorage() as unknown as Storage;
+	storage.setItem('flavorithm-started', 'yes');
+
+	const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+	const sandbox: Record<string, unknown> = {
+		exports,
+		require: (id: string) => {
+			if (initialized && trackedChunks.has(id)) {
+				chunkLoads.push(id);
+				if (id === '#lib/butler.ts' && failButlerChunk) {
+					throw new TypeError('Failed to fetch dynamically imported module: butler.js');
+				}
+			}
+			if (id in modMap) return modMap[id];
+			throw new Error(`Unexpected planner dependency ${id}`);
+		},
+		Date,
+		Intl,
+		Map,
+		Set,
+		Number,
+		String,
+		Boolean,
+		Array,
+		Object,
+		Math,
+		JSON,
+		RegExp,
+		Error,
+		RangeError,
+		TypeError,
+		Promise,
+		URL,
+		Response,
+		Request,
+		crypto,
+		console,
+		setTimeout: (fn: () => void, ms?: number) => {
+			const handle = setTimeout(() => {
+				pendingTimers.delete(handle);
+				fn();
+			}, ms);
+			pendingTimers.add(handle);
+			return handle;
+		},
+		clearTimeout: (handle: ReturnType<typeof setTimeout>) => {
+			pendingTimers.delete(handle);
+			clearTimeout(handle);
+		},
+		setInterval,
+		clearInterval,
+		requestIdleCallback: (cb: () => void) => {
+			const id = nextIdleId++;
+			idleScheduled.set(id, cb);
+			return id;
+		},
+		cancelIdleCallback: (id: number) => {
+			idleCancelled.push(id);
+			idleScheduled.delete(id);
+		},
+		localStorage: storage,
+		navigator: navState,
+		document: {
+			documentElement: { dataset: {}, classList: { toggle: () => {} } },
+			activeElement: null,
+			getElementById: () => null
+		},
+		window: {
+			location: {
+				href: 'http://127.0.0.1:4173/',
+				assign: () => {},
+				reload: () => {}
+			},
+			history: { replaceState: () => {} },
+			scrollTo: () => {},
+			addEventListener: (type: string, fn: () => void) => {
+				if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+				windowListeners.get(type)!.add(fn);
+			},
+			removeEventListener: (type: string, fn: () => void) => {
+				windowListeners.get(type)?.delete(fn);
+			}
+		},
+		fetch: async (input: unknown) => {
+			const url = String(input);
+			if (url === '/api/auth') {
+				return new Response(
+					JSON.stringify({
+						user: null,
+						authMode: 'local',
+						capabilities: { emailDelivery: false, recipeSearch: false }
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			});
+		}
+	};
+	sandbox.globalThis = sandbox;
+	sandbox.__onPlannerInit = (instance: PlannerHarnessApi) => {
+		api = instance;
+	};
+	runInNewContext(clientScriptJs, sandbox);
+	const dispose = svelteClient.effect_root(() => {
+		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
+	});
+	initialized = true;
+
+	try {
+		// 1. With saveData = true (or effectiveType = 2g), neither initial idle nor hover/focus warms chunks.
+		assert.equal(idleScheduled.size, 0);
+		api.warmModal('recipeDetail');
+		api.warmSettings();
+		navState.connection = { saveData: false, effectiveType: '2g' };
+		api.warmModal('recipeImport');
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.deepEqual([...chunkLoads], []);
+
+		// 2. With saveData = false and 4g, hover/focus warms and deduplicates.
+		navState.connection = { saveData: false, effectiveType: '4g' };
+		api.warmModal('recipeDetail');
+		api.warmModal('recipeDetail');
+		api.warmSettings();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.deepEqual(
+			[...chunkLoads],
+			[
+				'#lib/components/RecipeDetail.svelte',
+				'#lib/components/VoiceSettings.svelte',
+				'#lib/components/AIConnection.svelte'
+			]
+		);
+
+		// 3. Online/offline window events schedule, cancel on offline, and reschedule remaining chunks on online.
+		for (const fn of windowListeners.get('online') ?? []) fn();
+		assert.equal(idleScheduled.size, 1);
+		// Run first idle slice (recipeDetail is already cached, so 0 new loads; next slice queues recipeImport).
+		const [[firstId, firstCb]] = idleScheduled.entries();
+		idleScheduled.delete(firstId);
+		firstCb();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const [[secondId, secondCb]] = idleScheduled.entries();
+		idleScheduled.delete(secondId);
+		secondCb();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(chunkLoads.includes('#lib/components/RecipeImport.svelte'), true);
+		assert.equal(idleScheduled.size, 1);
+
+		const pendingBeforeOffline = [...idleScheduled.keys()][0];
+		navState.onLine = false;
+		for (const fn of windowListeners.get('offline') ?? []) fn();
+		assert.equal(idleCancelled.includes(pendingBeforeOffline), true);
+		assert.equal(idleScheduled.size, 0);
+
+		navState.onLine = true;
+		for (const fn of windowListeners.get('online') ?? []) fn();
+		assert.equal(idleScheduled.size, 1);
+
+		// 4. applyButler maps dynamic butlerCommands chunk failures to a friendly message, then retries cleanly.
+		const command = {
+			type: 'shopping.upsert',
+			item: { id: 'shop-lemons', name: 'lemons', quantity: 2, unit: 'piece', checked: false }
+		};
+		const snapshot = JSON.stringify(api.kitchen);
+		await assert.rejects(() => api.applyButler([command], snapshot), {
+			message: 'Could not load Basil’s kitchen actions. Check your connection and try again.'
+		});
+		assert.equal(JSON.stringify(api.kitchen), snapshot);
+
+		failButlerChunk = false;
+		const nextSnapshot = await api.applyButler([command], snapshot);
+		assert.notEqual(nextSnapshot, snapshot);
+		assert.equal(
+			api.kitchen.shopping.some((item) => item.name.toLowerCase() === 'lemons'),
+			true
+		);
+	} finally {
+		mountCleanup?.();
+		dispose();
+		for (const handle of pendingTimers) clearTimeout(handle);
+	}
 });

@@ -1,6 +1,7 @@
 /** Keep keyboard focus in a modal and return it to its trigger on close. */
 let activeTraps = 0;
 let settling = false;
+let settleToken = 0;
 let originalOverflow = '';
 let originalFocus: HTMLElement | null = null;
 
@@ -41,6 +42,8 @@ export function focusTrap(node: HTMLElement) {
 				? previous
 				: null;
 	}
+	settleToken += 1;
+	settling = false;
 	activeTraps += 1;
 	document.body.style.overflow = 'hidden';
 	return {
@@ -48,8 +51,10 @@ export function focusTrap(node: HTMLElement) {
 			node.removeEventListener('keydown', keydown);
 			activeTraps -= 1;
 			if (activeTraps === 0) {
+				const token = ++settleToken;
 				settling = true;
 				queueMicrotask(() => {
+					if (token !== settleToken) return;
 					settling = false;
 					if (activeTraps === 0) {
 						document.body.style.overflow = originalOverflow;

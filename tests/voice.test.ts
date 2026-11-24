@@ -4,12 +4,13 @@ process.env.FLAVORITHM_DB_PATH = ':memory:';
 const { transcribeVoice, validateVoiceAudio, localWhisperUrl } =
 	await import('../src/lib/server/voice.ts');
 const {
-	pcmWav,
-	VoiceCapture,
 	appendDictatedText,
+	appendVoiceTranscript,
+	pcmWav,
 	planVoiceRetry,
 	planVoiceStart,
-	resolveClosedDialog
+	resolveClosedDialog,
+	VoiceCapture
 } = await import('../src/lib/voice-capture.ts');
 const { MAX_WAV_BYTES } = await import('../src/lib/voice-config.ts');
 const route = await import('../src/routes/api/voice/+server.ts');
@@ -702,7 +703,7 @@ test('browser dictation stays active across pauses and appends multiple phrases 
 test('voice dialog context helpers preserve pantry/import across Settings and Sign-in redirects and open import for recipe dictation', () => {
 	// Pantry missing cloud key -> redirects to Settings and restores pantry on close
 	const pantryPlan = planVoiceStart({
-		forRecipe: false,
+		target: 'pantry',
 		modal: 'pantry',
 		provider: 'groq',
 		localAvailable: false,
@@ -722,7 +723,7 @@ test('voice dialog context helpers preserve pantry/import across Settings and Si
 
 	// Recipe dictation started with no dialog open -> targets and remembers import
 	const recipeNoModal = planVoiceStart({
-		forRecipe: true,
+		target: 'import',
 		modal: '',
 		provider: 'deepgram',
 		localAvailable: false,
@@ -742,7 +743,7 @@ test('voice dialog context helpers preserve pantry/import across Settings and Si
 
 	// Signed-out cloud voice redirects to auth and restores originating dialog
 	const authRedirect = planVoiceStart({
-		forRecipe: false,
+		target: 'pantry',
 		modal: 'pantry',
 		provider: 'groq',
 		localAvailable: false,
@@ -780,13 +781,40 @@ test('voice dialog context helpers preserve pantry/import across Settings and Si
 		{ action: 'retry', provider: 'groq' }
 	);
 
-	// Appending phrases formats pantry with commas and import with newlines
+	// Appending phrases formats pantry with commas, shopping with commas, and import with newlines
 	let pantryText = '';
 	pantryText = appendDictatedText('pantry', pantryText, '2 eggs');
 	pantryText = appendDictatedText('pantry', pantryText, 'spinach');
 	assert.equal(pantryText, '2 eggs, spinach');
+	assert.equal(appendDictatedText('pantry', '2 oz.', 'cheddar'), '2 oz., cheddar');
+
+	let shoppingText = '';
+	shoppingText = appendDictatedText('shopping', shoppingText, '2 lemons.');
+	shoppingText = appendDictatedText('shopping', shoppingText, 'olive oil.');
+	assert.equal(shoppingText, '2 lemons, olive oil.');
+	assert.equal(appendVoiceTranscript('milk;', '2 avocados'), 'milk, 2 avocados');
 
 	let importText = '1 tbsp olive oil\n';
 	importText = appendDictatedText('import', importText, '2 cloves garlic');
 	assert.equal(importText, '1 tbsp olive oil\n2 cloves garlic');
+
+	// Shopping inline voice returns directly to shopping page (resumeDialog '') after Settings
+	const shoppingPlan = planVoiceStart({
+		target: 'shopping',
+		modal: '',
+		provider: 'groq',
+		localAvailable: false,
+		signedIn: true,
+		apiKey: ''
+	});
+	assert.deepEqual(shoppingPlan, {
+		action: 'settings',
+		targetDialog: 'shopping',
+		resumeDialog: '',
+		message: 'Add a voice API key in Voice input settings.'
+	});
+	assert.deepEqual(resolveClosedDialog('settings', shoppingPlan.resumeDialog), {
+		modal: '',
+		resumeDialog: ''
+	});
 });

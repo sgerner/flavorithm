@@ -433,11 +433,12 @@
 				return m.VoiceCapture;
 			})
 	});
-	const warmModal = (key: Parameters<typeof modalPreloader.preload>[0]) =>
-		modalPreloader.preload(key);
+	const warmModal = (key: Parameters<typeof modalPreloader.warm>[0]) => {
+		modalPreloader.warm(key, typeof navigator !== 'undefined' ? navigator : null);
+	};
 	const warmSettings = () => {
-		modalPreloader.preload('voiceSettings');
-		modalPreloader.preload('aiConnection');
+		warmModal('voiceSettings');
+		warmModal('aiConnection');
 	};
 	async function loadModal(key: LazyModalKey) {
 		modalErrors[key] = '';
@@ -1506,7 +1507,17 @@
 			'butlerCommands',
 			'voiceCapture'
 		] as const;
-		let cancelIdleWarmup = scheduleIdleWarmup(idleModalOrder, (key) => modalPreloader.load(key));
+		const startIdleWarmup = () =>
+			scheduleIdleWarmup(idleModalOrder, (key) => modalPreloader.load(key), {
+				nav: typeof navigator !== 'undefined' ? navigator : undefined,
+				requestIdle:
+					typeof requestIdleCallback === 'function'
+						? (cb, opts) => requestIdleCallback(cb, opts)
+						: undefined,
+				cancelIdle:
+					typeof cancelIdleCallback === 'function' ? (id) => cancelIdleCallback(id) : undefined
+			});
+		let cancelIdleWarmup = startIdleWarmup();
 		const install = (e: Event) => {
 			e.preventDefault();
 			deferredInstall = e;
@@ -1515,7 +1526,7 @@
 			online = navigator.onLine;
 			if (online) {
 				cancelIdleWarmup();
-				cancelIdleWarmup = scheduleIdleWarmup(idleModalOrder, (key) => modalPreloader.load(key));
+				cancelIdleWarmup = startIdleWarmup();
 				void reconnectKitchen();
 			} else {
 				cancelIdleWarmup();
@@ -2461,7 +2472,14 @@
 			);
 		}
 		const activeOwner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
-		const { applyButlerCommands } = await modalPreloader.load('butlerCommands');
+		let applyButlerCommands: (typeof import('#lib/butler.ts'))['applyButlerCommands'];
+		try {
+			({ applyButlerCommands } = await modalPreloader.load('butlerCommands'));
+		} catch {
+			throw new Error(
+				'Could not load Basil’s kitchen actions. Check your connection and try again.'
+			);
+		}
 		if (`${user?.id ?? 'guest'}:${user?.householdId ?? ''}` !== activeOwner) {
 			throw new Error('The active kitchen changed. Ask Basil again.');
 		}
@@ -2715,24 +2733,15 @@
 		});
 	}
 	function dictate() {
-		void startDictation(false);
+		void startDictation('pantry');
 	}
 	function dictateRecipe() {
-		void startDictation(true);
+		void startDictation('import');
 	}
-	async function startDictation(forRecipe: boolean) {
+	async function startDictation(target: VoiceDialog) {
 		if (voiceBusy) return;
-		if (forRecipe) {
-			importSession.reviewingDraft = false;
-			if (!modal) {
-				mobileNav = false;
-				error = '';
-				void loadModal('recipeImport');
-				modal = 'import';
-			}
-		}
 		const plan = planVoiceStart({
-			forRecipe,
+			target,
 			modal,
 			provider: voiceProvider,
 			localAvailable: localVoiceAvailable,
@@ -2754,19 +2763,19 @@
 		clearVoiceSession();
 		resumeDialog = '';
 		voiceStarting = true;
-		voiceTarget = plan.targetDialog;
-		if (plan.targetDialog === 'import') {
+		const targetDialog: VoiceDialog = target;
+		voiceTarget = targetDialog;
+		if (targetDialog === 'import') {
 			importSession.reviewingDraft = false;
 		}
-		if (modal !== plan.targetDialog) {
+		if (modal !== targetDialog) {
 			mobileNav = false;
 			error = '';
-			if (plan.targetDialog === 'import') void loadModal('recipeImport');
-			modal = plan.targetDialog;
+			if (targetDialog === 'import') void loadModal('recipeImport');
+			modal = targetDialog;
 		}
 		activeVoiceImportSession = importSession;
 		const owner = user?.id;
-		const targetDialog = plan.targetDialog;
 		let Capture: VoiceCaptureConstructor;
 		if (VoiceCaptureClass) {
 			Capture = VoiceCaptureClass;

@@ -35,6 +35,7 @@ export type VoiceProvider = (typeof voiceProviders)[number]['id'];
 export type VoiceOptions = { provider: VoiceProvider; model: string; apiKey: string };
 export type VoiceState = 'idle' | 'recording' | 'transcribing';
 export type VoiceDialog = 'pantry' | 'import';
+export type VoiceTarget = VoiceDialog | 'shopping';
 export type ResumeDialog = '' | VoiceDialog;
 export const MAX_VOICE_SECONDS = 120;
 export const MAX_WAV_BYTES = 44 + 16000 * 2 * MAX_VOICE_SECONDS;
@@ -51,33 +52,38 @@ export function resolveVoiceProvider(
 export type VoiceStartPlan =
 	| {
 			action: 'auth';
-			targetDialog: VoiceDialog;
-			resumeDialog: VoiceDialog;
+			targetDialog: VoiceTarget;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
 			action: 'settings';
-			targetDialog: VoiceDialog;
-			resumeDialog: VoiceDialog;
+			targetDialog: VoiceTarget;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
 			action: 'start';
-			targetDialog: VoiceDialog;
+			targetDialog: VoiceTarget;
 			provider: Exclude<VoiceProvider, 'auto'>;
 	  };
 
 export function planVoiceStart(input: {
-	forRecipe: boolean;
+	target?: VoiceTarget;
+	forRecipe?: boolean;
 	modal: string;
 	provider: VoiceProvider;
 	localAvailable: boolean;
 	signedIn: boolean;
 	apiKey: string;
 }): VoiceStartPlan {
-	const targetDialog: VoiceDialog = input.forRecipe ? 'import' : 'pantry';
-	const resumeDialog: VoiceDialog =
-		input.modal === 'pantry' || input.modal === 'import' ? input.modal : targetDialog;
+	const targetDialog: VoiceTarget = input.target ?? (input.forRecipe ? 'import' : 'pantry');
+	const resumeDialog: ResumeDialog =
+		input.modal === 'pantry' || input.modal === 'import'
+			? input.modal
+			: targetDialog === 'shopping'
+				? ''
+				: targetDialog;
 	const resolved = resolveVoiceProvider(input.provider, input.localAvailable, input.signedIn);
 	if (resolved !== 'browser' && !input.signedIn) {
 		return {
@@ -113,12 +119,12 @@ export function planVoiceStart(input: {
 export type VoiceRetryPlan =
 	| {
 			action: 'auth';
-			resumeDialog: VoiceDialog;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
 			action: 'settings';
-			resumeDialog: VoiceDialog;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
@@ -132,14 +138,18 @@ export type VoiceRetryPlan =
 
 export function planVoiceRetry(input: {
 	modal: string;
-	voiceTarget: VoiceDialog;
+	voiceTarget: VoiceTarget;
 	provider: VoiceProvider;
 	localAvailable: boolean;
 	signedIn: boolean;
 	apiKey: string;
 }): VoiceRetryPlan {
-	const resumeDialog: VoiceDialog =
-		input.modal === 'pantry' || input.modal === 'import' ? input.modal : input.voiceTarget;
+	const resumeDialog: ResumeDialog =
+		input.modal === 'pantry' || input.modal === 'import'
+			? input.modal
+			: input.voiceTarget === 'shopping'
+				? ''
+				: input.voiceTarget;
 	if (!input.signedIn) {
 		return {
 			action: 'auth',
@@ -191,12 +201,29 @@ export function resolveClosedDialog(
 	};
 }
 
-export function appendDictatedText(target: VoiceDialog, current: string, incoming: string): string {
+export function appendVoiceTranscript(
+	current: string,
+	transcript: string,
+	separator = ', ',
+	maxLength?: number
+): string {
+	const incoming = transcript.trim();
+	if (!incoming) return maxLength !== undefined ? current.slice(0, maxLength) : current;
+	const existing =
+		separator === '\n' ? current.replace(/\s+$/, '') : current.replace(/[\s,;.]+$/, '');
+	const merged = existing ? `${existing}${separator}${incoming}` : incoming;
+	return maxLength !== undefined ? merged.slice(0, maxLength) : merged;
+}
+
+export function appendDictatedText(target: VoiceTarget, current: string, incoming: string): string {
 	const text = incoming.trim();
-	if (!text) return current;
+	if (!text) return target === 'import' ? current.slice(0, 20000) : current;
 	if (target === 'import') {
 		const base = current.replace(/\s+$/, '');
 		return [base, text].filter(Boolean).join('\n').slice(0, 20000);
+	}
+	if (target === 'shopping') {
+		return appendVoiceTranscript(current, text, ', ', 2000);
 	}
 	const base = current.trim().replace(/,+\s*$/, '');
 	return [base, text].filter(Boolean).join(', ');

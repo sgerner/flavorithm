@@ -1,6 +1,7 @@
 import { MAX_VOICE_SECONDS, type VoiceOptions, type VoiceState } from './voice-config.ts';
 export {
 	appendDictatedText,
+	appendVoiceTranscript,
 	planVoiceRetry,
 	planVoiceStart,
 	resolveClosedDialog,
@@ -9,7 +10,8 @@ export {
 	type VoiceDialog,
 	type VoiceRetryPlan,
 	type VoiceStartPlan,
-	type VoiceState
+	type VoiceState,
+	type VoiceTarget
 } from './voice-config.ts';
 
 class VoiceUserError extends Error {
