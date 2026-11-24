@@ -2,7 +2,6 @@ import { z } from 'zod';
 import type { AppState } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList, normalizeName } from './domain.ts';
-import { clampAllergies, normalizeDiet } from './discovery.ts';
 import {
 	completeMeal,
 	convertCompatibleQuantity,
@@ -103,10 +102,10 @@ const preferences = z
 		diet: z.string().max(200),
 		allergies: z.string().max(500),
 		maxTime: z.number().nonnegative().max(100000),
-		complexity: z.string().max(100),
-		cuisines: z.array(z.string().trim().min(1).max(80)).max(8),
+		complexity: z.string().max(80),
+		cuisines: z.array(z.string().max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
-		theme: z.string().max(100),
+		theme: z.string().max(80),
 		dark: z.boolean(),
 		provider: z.string().max(100),
 		model: z.string().max(200),
@@ -397,16 +396,7 @@ export function applyButlerCommands(
 				break;
 			}
 			case 'preferences.update':
-				state.preferences = {
-					...state.preferences,
-					...command.preferences,
-					...(command.preferences.diet !== undefined
-						? { diet: normalizeDiet(command.preferences.diet) }
-						: {}),
-					...(command.preferences.allergies !== undefined
-						? { allergies: clampAllergies(command.preferences.allergies).trim() }
-						: {})
-				};
+				state.preferences = { ...state.preferences, ...command.preferences };
 				break;
 			case 'recipe.open':
 				requireId(state.recipes, command.id);

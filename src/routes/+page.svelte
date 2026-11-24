@@ -104,10 +104,8 @@
 	} from '#lib/kitchen-workflows.ts';
 	import {
 		DIET_OPTIONS,
-		MAX_ALLERGIES_LENGTH,
 		buildAIRequestPayload,
 		clampAllergies,
-		dietLabel,
 		evaluateRecipeConflicts,
 		normalizeDiet,
 		rankPantryRecipes,
@@ -334,10 +332,6 @@
 	let quizCuisines = $state<string[]>([]);
 	let quizDiet = $state('none');
 	let quizAllergies = $state('');
-	let generateMaxTime = $state(45);
-	let generateDiet = $state('none');
-	let generateAllergies = $state('');
-	let saveGenerateDefaults = $state(false);
 	const cuisineChoices = [
 		'Mediterranean',
 		'Italian',
@@ -353,23 +347,8 @@
 		quizComplexity = kitchen.preferences.complexity;
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
 		quizDiet = normalizeDiet(kitchen.preferences.diet);
-		quizAllergies = clampAllergies(kitchen.preferences.allergies);
+		quizAllergies = kitchen.preferences.allergies;
 		modal = 'onboarding';
-	}
-	function openGenerate() {
-		generateMaxTime = kitchen.preferences.maxTime;
-		generateDiet = normalizeDiet(kitchen.preferences.diet);
-		generateAllergies = clampAllergies(kitchen.preferences.allergies);
-		saveGenerateDefaults = false;
-		error = '';
-		modal = 'generate';
-	}
-	function applyGeneratePreferences() {
-		Object.assign(kitchen.preferences, {
-			maxTime: generateMaxTime,
-			diet: normalizeDiet(generateDiet),
-			allergies: clampAllergies(generateAllergies).trim()
-		});
 	}
 	function openAuthentication() {
 		if (installationAuthMode === 'oidc') {
@@ -462,7 +441,7 @@
 			complexity: quizComplexity,
 			cuisines: [...quizCuisines],
 			diet: normalizeDiet(quizDiet),
-			allergies: clampAllergies(quizAllergies).trim(),
+			allergies: quizAllergies.trim(),
 			onboardingStatus: 'completed'
 		});
 		modal = '';
@@ -2240,7 +2219,7 @@
 				dictateRecipe();
 				break;
 			case 'generate':
-				openGenerate();
+				modal = 'generate';
 				break;
 			case 'search':
 				if (capabilities.recipeSearch) {
@@ -2257,27 +2236,16 @@
 	}
 
 	async function generate() {
-		const bufferedPreferences = {
-			...kitchen.preferences,
-			maxTime: generateMaxTime,
-			diet: normalizeDiet(generateDiet),
-			allergies: clampAllergies(generateAllergies).trim()
-		};
-		const savedDefaults = saveGenerateDefaults;
-		if (savedDefaults) {
-			applyGeneratePreferences();
-			saveGenerateDefaults = false;
-		}
 		if (!needAI()) return;
 		busy = true;
 		error = '';
 		try {
-			const result = await ai('generate', { preferences: bufferedPreferences });
+			const result = await ai('generate');
 			kitchen.recipes = insertRecipes(kitchen.recipes, result.recipes);
 			modal = '';
 			page = 'discover';
 			filter = 'For you';
-			notify(savedDefaults ? 'Preferences saved and recipes generated.' : 'Recipes generated.');
+			notify('Recipes generated.');
 		} catch (e) {
 			error = (e as Error).message;
 			notify(error);
@@ -3770,7 +3738,12 @@
 							<button class="secondary" onclick={() => openImport()}
 								><Plus size={17} />Import</button
 							>
-							<button class="primary" onclick={openGenerate}><Sparkles size={17} /> Generate</button
+							<button
+								class="primary"
+								onclick={() => {
+									modal = 'generate';
+									error = '';
+								}}><Sparkles size={17} /> Generate</button
 							>
 						</div>
 					</div>
@@ -3837,8 +3810,12 @@
 										class="text-button"
 										onclick={() => (priorityPantryIds = [])}>All pantry matches</button
 									>{/if}
-								<button class="secondary" onclick={openGenerate}
-									><Sparkles size={16} /> Generate with AI</button
+								<button
+									class="secondary"
+									onclick={() => {
+										modal = 'generate';
+										error = '';
+									}}><Sparkles size={16} /> Generate with AI</button
 								>
 							</div>
 						</div>
@@ -4685,7 +4662,7 @@
 							<label class="field"
 								>Allergies or ingredients to avoid<input
 									bind:value={quizAllergies}
-									maxlength={MAX_ALLERGIES_LENGTH}
+									maxlength="2000"
 									placeholder="e.g. peanuts, shellfish"
 								/></label
 							>
@@ -4815,16 +4792,18 @@
 					>
 					<div class="two-fields">
 						<label class="field"
-							>Time to cook<select bind:value={generateMaxTime}
-								>{#if ![15, 30, 45, 60, 120].includes(generateMaxTime)}<option
-										value={generateMaxTime}>{generateMaxTime} minutes</option
-									>{/if}<option value={15}>15 minutes</option><option value={30}>30 minutes</option
-								><option value={45}>45 minutes</option><option value={60}>An hour</option><option
-									value={120}>A slow afternoon</option
+							>Time to cook<select bind:value={kitchen.preferences.maxTime}
+								><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option
+									value={45}>45 minutes</option
+								><option value={60}>An hour</option><option value={120}>A slow afternoon</option
 								></select
 							></label
 						><label class="field"
-							>Dietary style<select bind:value={generateDiet}
+							>Dietary style<select
+								bind:value={
+									() => normalizeDiet(kitchen.preferences.diet),
+									(value) => (kitchen.preferences.diet = normalizeDiet(value))
+								}
 								>{#each DIET_OPTIONS as option}<option value={option.value}>{option.label}</option
 									>{/each}</select
 							></label
@@ -4832,36 +4811,20 @@
 					</div>
 					<label class="field"
 						>Allergies & ingredients to avoid<input
-							bind:value={generateAllergies}
-							maxlength={MAX_ALLERGIES_LENGTH}
+							bind:value={kitchen.preferences.allergies}
+							maxlength="2000"
 							placeholder="e.g. peanuts, shellfish"
 						/></label
 					>
-					<label class="cook-option generate-defaults-option"
-						><input type="checkbox" bind:checked={saveGenerateDefaults} /><span
-							><b>Save as my default preferences</b><small
-								>Updates your saved cooking time, dietary style, and allergy notes.</small
-							></span
-						></label
-					>
 					<p class="field-help">
-						Culinary guidance only — check all ingredients, substitutions, and package labels before
-						cooking.
+						Check all ingredients and substitutions against your allergies before cooking.
 					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<div class="dialog-actions">
-						<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
-							class="text-button"
-							type="button"
-							onclick={() => {
-								applyGeneratePreferences();
-								saveGenerateDefaults = false;
-								notify('Preferences saved.');
-							}}>Save defaults</button
-						><button class="primary" type="button" disabled={busy} onclick={generate}
-							><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
-						>
-					</div>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
+						class="primary full"
+						disabled={busy}
+						onclick={generate}
+						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
+					>
 				{:else if modal === 'settings'}
 					<h2>Settings</h2>
 					<div class="settings-section">
@@ -4885,13 +4848,9 @@
 					<div class="settings-section">
 						<h3>Recipe preferences</h3>
 						<p class="muted">
-							{kitchen.preferences.maxTime} minutes · {kitchen.preferences.complexity} · {dietLabel(
-								kitchen.preferences.diet
-							)} · {kitchen.preferences.cuisines?.join(', ') || 'Open to every cuisine'}
-						</p>
-						<p class="muted settings-allergy-line">
-							Allergies & avoidances: {clampAllergies(kitchen.preferences.allergies).trim() ||
-								'None'}
+							{kitchen.preferences.maxTime} minutes · {kitchen.preferences.complexity} · {kitchen.preferences.cuisines?.join(
+								', '
+							) || 'Open to every cuisine'}
 						</p>
 						<button class="secondary" onclick={openOnboarding}
 							>Edit my taste preferences <SlidersHorizontal size={16} /></button
@@ -6071,13 +6030,5 @@
 	}
 	:global(.dark) .picker-conflict-warning {
 		color: #ffb4a2 !important;
-	}
-	.generate-defaults-option {
-		margin: 14px 0 8px;
-	}
-	.settings-allergy-line {
-		margin-top: 4px;
-		margin-bottom: 14px;
-		overflow-wrap: anywhere;
 	}
 </style>

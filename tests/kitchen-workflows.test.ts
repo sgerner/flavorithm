@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { seedRecipes } from '../src/lib/data.ts';
 import {
 	DIET_OPTIONS,
+	clampAllergies,
 	evaluateRecipeConflicts,
 	normalizeDiet,
 	parseAllergies,
@@ -749,6 +750,19 @@ test('normalizes diet values case-insensitively across all canonical lowercase o
 	assert.equal(normalizeDiet('Gluten Free'), 'gluten-free');
 	assert.equal(normalizeDiet('Dairy-Free'), 'dairy-free');
 	assert.equal(normalizeDiet('Low_Carb'), 'low-carb');
+});
+
+test('clampAllergies truncates by Unicode code points without splitting surrogate pairs or emojis', () => {
+	const boundaryEmoji = `${'a'.repeat(499)}🥜 sesame`;
+	const clamped = clampAllergies(boundaryEmoji);
+	assert.equal(clamped, `${'a'.repeat(499)}🥜`);
+	assert.equal(Array.from(clamped).length, 500);
+	assert.equal(clamped.isWellFormed(), true);
+
+	const emojiOnly = clampAllergies('🥜'.repeat(600));
+	assert.equal(Array.from(emojiOnly).length, 500);
+	assert.equal(emojiOnly, '🥜'.repeat(500));
+	assert.equal(emojiOnly.isWellFormed(), true);
 });
 
 test('parses free-text allergies across commas, newlines, and conjunctions with whole-word matching', () => {

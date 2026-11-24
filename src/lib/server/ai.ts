@@ -45,7 +45,13 @@ const IngredientInputSchema = z.object({
 
 const PreferencesInputSchema = z.object({
 	diet: z.string().max(200),
-	allergies: z.string().max(500),
+	allergies: z
+		.string()
+		.max(2_000)
+		.refine(
+			(value) => Array.from(value).length <= 500,
+			'Allergies must be at most 500 characters.'
+		),
 	maxTime: z.number().nonnegative().max(100_000),
 	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),

@@ -1,6 +1,5 @@
 import { COVER_PATH } from './cover-upload.ts';
 import { createInitialState, createNewUserState, defaultPreferences } from './data.ts';
-import { clampAllergies, normalizeDiet } from './discovery.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import type {
 	AppState,
@@ -300,10 +299,8 @@ function sanitizeShopping(value: unknown, fallback: ShoppingItem[]): ShoppingIte
 
 function sanitizePreferences(value: unknown, fallback: Preferences): Preferences {
 	if (!isRecord(value)) return structuredClone(fallback);
-	const diet = normalizeDiet(clampString(value.diet, 200, fallback.diet)).slice(0, 200);
-	const allergies = clampAllergies(
-		typeof value.allergies === 'string' ? value.allergies : fallback.allergies
-	);
+	const diet = clampString(value.diet, 200, fallback.diet);
+	const allergies = clampString(value.allergies, 2_000, fallback.allergies);
 	const maxTime = clampNumber(value.maxTime, 0, 100_000, fallback.maxTime);
 	const complexity = clampString(value.complexity, 100, fallback.complexity);
 	const cuisines = Array.isArray(value.cuisines)

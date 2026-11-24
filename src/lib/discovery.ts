@@ -69,9 +69,21 @@ export function normalizeDiet(value: string | undefined | null): string {
 	return CANONICAL_DIETS[hyphenated] ?? cleaned;
 }
 
-/** Clamp allergy free-text to the 500-character client and server boundary limit. */
+function sliceCodePoints(value: string, maxCodePoints: number): string {
+	if (value.length <= maxCodePoints) return value;
+	let count = 0;
+	let end = 0;
+	for (const char of value) {
+		if (count >= maxCodePoints) break;
+		end += char.length;
+		count += 1;
+	}
+	return value.slice(0, end);
+}
+
+/** Clamp allergy free-text to 500 Unicode code points for matching and AI prompts without splitting surrogate pairs. */
 export function clampAllergies(value: string | undefined | null): string {
-	return typeof value === 'string' ? value.slice(0, MAX_ALLERGIES_LENGTH) : '';
+	return typeof value === 'string' ? sliceCodePoints(value, MAX_ALLERGIES_LENGTH) : '';
 }
 
 /** Resolve a human-readable label for a saved or buffered diet value. */
@@ -900,8 +912,9 @@ function cleanAllergyToken(segment: string): string {
 
 /** Parse free-text allergies on commas, newlines, semicolons, slashes, and conjunctions into normalized tokens. */
 export function parseAllergies(value: string | undefined | null): string[] {
-	if (!value || typeof value !== 'string') return [];
-	const segments = value.split(/(?:[,;\r\n/|•&]+|\s+\b(?:and|or|plus)\b\s+)/i);
+	const bounded = clampAllergies(value);
+	if (!bounded) return [];
+	const segments = bounded.split(/(?:[,;\r\n/|•&]+|\s+\b(?:and|or|plus)\b\s+)/i);
 	const seen = new Set<string>();
 	const result: string[] = [];
 	for (const segment of segments) {

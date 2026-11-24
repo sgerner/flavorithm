@@ -84,7 +84,7 @@ test('accounts, shared household state, invites and owner-safe leave', async () 
 		ifNoneMatch: null
 	});
 	assert.equal(backend.getState(alice.user)?.pantry[0]?.quantity, 4);
-	assert.equal(backend.getState(alice.user)?.preferences.diet, 'vegetarian');
+	assert.equal(backend.getState(alice.user)?.preferences.diet, 'Vegetarian');
 	assert.throws(
 		() => backend.saveState(alice.user, state, { ifMatch: staleAliceTag, ifNoneMatch: null }),
 		{ status: 412 }
@@ -102,7 +102,7 @@ test('accounts, shared household state, invites and owner-safe leave', async () 
 	assert.deepEqual(alicePersonalState.pantry, []);
 	assert.deepEqual(alicePersonalState.meals, []);
 	assert.deepEqual(alicePersonalState.shopping, []);
-	assert.equal(alicePersonalState.preferences.diet, 'vegetarian');
+	assert.equal(alicePersonalState.preferences.diet, 'Vegetarian');
 	assert.deepEqual(alicePersonalState.preferences.cuisines, ['Japanese']);
 	assert.deepEqual(
 		backend
@@ -255,21 +255,21 @@ test('state validation rejects malformed values and registration enforces the UI
 		{ status: 400 }
 	);
 
-	const valid500 = backend.validateAppState({
+	const valid2000 = backend.validateAppState({
 		pantry: [],
 		recipes: [],
 		meals: [],
 		shopping: [],
-		preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(500) }
+		preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(2_000) }
 	});
-	assert.equal(valid500?.preferences.allergies.length, 500);
+	assert.equal(valid2000?.preferences.allergies.length, 2_000);
 	assert.equal(
 		backend.validateAppState({
 			pantry: [],
 			recipes: [],
 			meals: [],
 			shopping: [],
-			preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(501) }
+			preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(2_001) }
 		}),
 		null
 	);
@@ -279,6 +279,8 @@ test('state validation rejects malformed values and registration enforces the UI
 		'legacy-prefs@example.com',
 		'a secure legacy password'
 	);
+	const legacyAllergies = `${'peanuts 🥜, shellfish, '.repeat(75)}tail-marker`;
+	assert.ok(legacyAllergies.length > 500 && legacyAllergies.length <= 2_000);
 	backend
 		.getDatabase()
 		.prepare('UPDATE user_preferences SET preferences_json = ? WHERE user_id = ?')
@@ -286,14 +288,28 @@ test('state validation rejects malformed values and registration enforces the UI
 			JSON.stringify({
 				...data.defaultPreferences,
 				diet: 'Gluten-Free',
-				allergies: 'peanuts, '.repeat(180)
+				allergies: legacyAllergies
 			}),
 			legacyUser.user.id
 		);
 	const loadedLegacy = backend.getState(legacyUser.user);
 	assert.ok(loadedLegacy);
-	assert.equal(loadedLegacy.preferences.diet, 'gluten-free');
-	assert.equal(loadedLegacy.preferences.allergies.length, 500);
+	assert.equal(loadedLegacy.preferences.diet, 'Gluten-Free');
+	assert.equal(loadedLegacy.preferences.allergies, legacyAllergies);
+
+	const validatedLegacy = backend.validateAppState({
+		...loadedLegacy,
+		pantry: [{ id: 'rice', name: 'Rice', quantity: 2, unit: 'cup', category: 'Grains' }]
+	});
+	assert.ok(validatedLegacy);
+	backend.saveState(legacyUser.user, validatedLegacy, {
+		ifMatch: backend.getStateEtag(legacyUser.user),
+		ifNoneMatch: null
+	});
+	const roundTrippedLegacy = backend.getState(legacyUser.user);
+	assert.equal(roundTrippedLegacy?.preferences.diet, 'Gluten-Free');
+	assert.equal(roundTrippedLegacy?.preferences.allergies, legacyAllergies);
+	assert.equal(roundTrippedLegacy?.pantry[0]?.name, 'Rice');
 });
 
 test('account deletion confirms the password and preserves a shared household for remaining members', async () => {

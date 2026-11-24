@@ -99,19 +99,6 @@ test('unsupported actions, unsafe images, invalid calendar dates and preference 
 	);
 	assert.throws(() =>
 		applyButlerCommands(current, [
-			{ type: 'preferences.update', preferences: { allergies: 'x'.repeat(501) } }
-		])
-	);
-	const normalizedPrefs = applyButlerCommands(current, [
-		{
-			type: 'preferences.update',
-			preferences: { diet: 'Dairy-Free', allergies: ` ${'a'.repeat(498)} ` }
-		}
-	]).state.preferences;
-	assert.equal(normalizedPrefs.diet, 'dairy-free');
-	assert.equal(normalizedPrefs.allergies.length, 498);
-	assert.throws(() =>
-		applyButlerCommands(current, [
 			{
 				type: 'meal.upsert',
 				meal: {

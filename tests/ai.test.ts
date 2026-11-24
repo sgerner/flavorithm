@@ -2360,8 +2360,9 @@ test('client AI payloads pass validation across generate, vision, nutrition, sea
 	process.env.BRAVE_SEARCH_API_KEY = 'brave-test-key';
 	try {
 		const kitchen = createInitialState();
+		const storedAllergies = `${'soy 🥜, sesame, '.repeat(60)}tail-marker`;
 		kitchen.preferences.diet = 'Low-Carb';
-		kitchen.preferences.allergies = 'soy, sesame, '.repeat(60);
+		kitchen.preferences.allergies = storedAllergies;
 		kitchen.preferences.complexity = 'Moderate'.padEnd(95, ' ');
 		kitchen.preferences.theme = 'nosh';
 		kitchen.recipes[0].rating = 5;
@@ -2420,22 +2421,42 @@ test('client AI payloads pass validation across generate, vision, nutrition, sea
 				prompt: 'quick dinner',
 				extra
 			});
+			assert.equal(kitchen.preferences.allergies, storedAllergies);
+			const aiAllergies = (payload.preferences as { allergies: string }).allergies;
+			assert.equal(aiAllergies.isWellFormed(), true);
+			assert.ok(Array.from(aiAllergies).length <= 500);
 			await assert.doesNotReject(() => runAIRequest(payload, providerFetcher, pageFetcher));
 		}
 
-		await assert.rejects(
+		activeAction = 'generate';
+		await assert.doesNotReject(() =>
 			runAIRequest(
 				{
 					action: 'generate',
 					provider: 'openai',
 					model: 'gpt-4o-mini',
 					apiKey: 'temporary-test-key',
-					preferences: { ...preferences, allergies: 'x'.repeat(501) }
+					preferences: { ...preferences, allergies: '🥜'.repeat(500) }
 				},
 				providerFetcher
-			),
-			(error: unknown) => error instanceof AIRequestError && error.status === 400
+			)
 		);
+
+		for (const overLimit of ['x'.repeat(501), '🥜'.repeat(501)]) {
+			await assert.rejects(
+				runAIRequest(
+					{
+						action: 'generate',
+						provider: 'openai',
+						model: 'gpt-4o-mini',
+						apiKey: 'temporary-test-key',
+						preferences: { ...preferences, allergies: overLimit }
+					},
+					providerFetcher
+				),
+				(error: unknown) => error instanceof AIRequestError && error.status === 400
+			);
+		}
 	} finally {
 		if (previousBrave === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
 		else process.env.BRAVE_SEARCH_API_KEY = previousBrave;
