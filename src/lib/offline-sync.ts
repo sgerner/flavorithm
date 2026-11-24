@@ -1,6 +1,12 @@
 import type { AppState, User } from '#lib/types.ts';
 
 export type SyncConflict = { path: string; local: unknown; remote: unknown };
+export type FoldedJournalRef = {
+	writerId: string;
+	writeId?: string;
+	updatedAt: number;
+	createdAt?: number;
+};
 export type PendingKitchen = {
 	userId: string;
 	householdId: string;
@@ -14,6 +20,8 @@ export type PendingKitchen = {
 	createdAt?: number;
 	/** Distinguishes a newer write from an acknowledged snapshot in the same writer slot. */
 	writeId?: string;
+	/** Exact ancestor journal versions already folded into this compacted snapshot. */
+	foldedFrom?: FoldedJournalRef[];
 };
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> &
 	Partial<Pick<Storage, 'key' | 'length'>>;
@@ -30,6 +38,18 @@ export type PendingJournalRecord = {
 	keys: Array<{ key: string; pending: PendingKitchen }>;
 };
 export type PendingJournalRead = { records: PendingJournalRecord[]; error: string };
+
+function isFoldedJournalRef(value: unknown): value is FoldedJournalRef {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+	const ref = value as Partial<FoldedJournalRef>;
+	return (
+		typeof ref.writerId === 'string' &&
+		ref.writerId.length > 0 &&
+		Number.isFinite(ref.updatedAt) &&
+		(ref.writeId === undefined || typeof ref.writeId === 'string') &&
+		(ref.createdAt === undefined || Number.isFinite(ref.createdAt))
+	);
+}
 
 function parsePending(value: unknown, user: User): PendingKitchen | null {
 	if (
@@ -48,7 +68,10 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 		((value as PendingKitchen).createdAt !== undefined &&
 			!Number.isFinite((value as PendingKitchen).createdAt)) ||
 		((value as PendingKitchen).writeId !== undefined &&
-			typeof (value as PendingKitchen).writeId !== 'string')
+			typeof (value as PendingKitchen).writeId !== 'string') ||
+		((value as PendingKitchen).foldedFrom !== undefined &&
+			(!Array.isArray((value as PendingKitchen).foldedFrom) ||
+				!(value as PendingKitchen).foldedFrom!.every(isFoldedJournalRef)))
 	) {
 		return null;
 	}
@@ -174,16 +197,32 @@ export function clearPendingJournalRecords(
 	user: User,
 	records: PendingJournalRecord[]
 ): void {
+	let firstError: unknown = null;
+	let hasError = false;
 	for (const record of records) {
 		for (const captured of record.keys) {
-			const current = parsePending(JSON.parse(storage.getItem(captured.key) || 'null'), user);
-			if (current && sameJournalVersion(current, captured.pending))
-				storage.removeItem(captured.key);
+			try {
+				const current = parsePending(JSON.parse(storage.getItem(captured.key) || 'null'), user);
+				if (current && sameJournalVersion(current, captured.pending))
+					storage.removeItem(captured.key);
+			} catch (error) {
+				if (!hasError) {
+					hasError = true;
+					firstError = error;
+				}
+			}
 		}
 	}
+	if (hasError) throw firstError;
 }
 
 export function jsonEqual(a: unknown, b: unknown): boolean {
+	if (a && typeof a === 'object' && typeof (a as { toJSON?: unknown }).toJSON === 'function') {
+		a = (a as { toJSON: () => unknown }).toJSON();
+	}
+	if (b && typeof b === 'object' && typeof (b as { toJSON?: unknown }).toJSON === 'function') {
+		b = (b as { toJSON: () => unknown }).toJSON();
+	}
 	if (a === b) return true;
 	if (typeof a === 'number' && !Number.isFinite(a)) a = null;
 	if (typeof b === 'number' && !Number.isFinite(b)) b = null;
@@ -208,6 +247,7 @@ export function jsonEqual(a: unknown, b: unknown): boolean {
 		const av = aObj[k];
 		if (av === undefined) continue;
 		aDefined += 1;
+		if (!Object.hasOwn(bObj, k)) return false;
 		const bv = bObj[k];
 		if (bv === undefined || !jsonEqual(av, bv)) return false;
 	}
@@ -416,6 +456,40 @@ function segmentsStartWith(prefix: PathSegment[], full: PathSegment[]): boolean 
 	});
 }
 
+function reconcileOrphanedMeals(
+	state: AppState,
+	localBranch: AppState,
+	remoteBranch: AppState,
+	conflicts: DetailedConflict[],
+	prefer?: 'local' | 'remote'
+): void {
+	// Deleting a recipe while someone plans it must never create an orphaned meal.
+	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
+	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
+		conflicts.push({
+			path: `kitchen.meals[${meal.id}].recipeId`,
+			local: describeMealRecipe(localBranch, meal.id, meal.recipeId),
+			remote: describeMealRecipe(remoteBranch, meal.id, meal.recipeId),
+			segments: [
+				{ kind: 'prop', key: 'meals' },
+				{ kind: 'id', id: meal.id },
+				{ kind: 'prop', key: 'recipeId' }
+			],
+			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
+		});
+		// Keep the complete proposed meal available for review and backup until a choice is made.
+		const candidates = prefer
+			? (prefer === 'local' ? localBranch : remoteBranch).recipes
+			: [...localBranch.recipes, ...remoteBranch.recipes];
+		const recipe = candidates.find((item) => item.id === meal.recipeId);
+		if (recipe) {
+			state.recipes.push(structuredClone(recipe));
+			recipeIds.add(recipe.id);
+		}
+	}
+	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+}
+
 function mergeKitchenStatesDetailed(
 	base: AppState,
 	local: AppState,
@@ -508,33 +582,7 @@ function mergeKitchenStatesDetailed(
 		return conflict(path, segments, mine, theirs);
 	};
 	const state = structuredClone(merge(base, local, remote, 'kitchen', [])) as AppState;
-	// Deleting a recipe while someone plans it must never create an orphaned meal.
-	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
-	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
-		conflicts.push({
-			path: `kitchen.meals[${meal.id}].recipeId`,
-			local: describeMealRecipe(local, meal.id, meal.recipeId),
-			remote: describeMealRecipe(remote, meal.id, meal.recipeId),
-			segments: [
-				{ kind: 'prop', key: 'meals' },
-				{ kind: 'id', id: meal.id },
-				{ kind: 'prop', key: 'recipeId' }
-			],
-			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
-		});
-		{
-			// Keep the complete proposed meal available for review and backup until a choice is made.
-			const candidates = prefer
-				? (prefer === 'local' ? local : remote).recipes
-				: [...local.recipes, ...remote.recipes];
-			const recipe = candidates.find((recipe) => recipe.id === meal.recipeId);
-			if (recipe) {
-				state.recipes.push(structuredClone(recipe));
-				recipeIds.add(recipe.id);
-			}
-		}
-	}
-	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+	reconcileOrphanedMeals(state, local, remote, conflicts, prefer);
 	return { state, conflicts };
 }
 
@@ -582,6 +630,76 @@ function assertSameSyncIdentity(
 			{ status: 409 }
 		);
 	}
+}
+
+function matchesFoldedRef(record: PendingJournalRecord, ref: FoldedJournalRef): boolean {
+	if (record.writerId !== ref.writerId) return false;
+	if (ref.writeId !== undefined || record.pending.writeId !== undefined) {
+		return Boolean(ref.writeId && record.pending.writeId && ref.writeId === record.pending.writeId);
+	}
+	return record.pending.updatedAt === ref.updatedAt && record.pending.createdAt === ref.createdAt;
+}
+
+/**
+ * Omit exact ancestor journal versions that were already folded into a surviving compacted entry,
+ * so a partial retirement failure (`removeItem` error) never replays or conflicts against itself.
+ */
+export function filterUnfoldedJournalRecords(
+	records: PendingJournalRecord[]
+): PendingJournalRecord[] {
+	if (records.length <= 1) return records;
+	const byRecency = [...records].sort(
+		(a, b) =>
+			b.pending.updatedAt - a.pending.updatedAt ||
+			(b.pending.createdAt ?? b.pending.updatedAt) - (a.pending.createdAt ?? a.pending.updatedAt) ||
+			b.writerId.localeCompare(a.writerId)
+	);
+	const foldsMap = new Map<PendingJournalRecord, Set<PendingJournalRecord>>(
+		byRecency.map((record) => [record, new Set()])
+	);
+	let hasAnyFoldEdge = false;
+	for (const compactor of byRecency) {
+		for (const ref of compactor.pending.foldedFrom ?? []) {
+			for (const candidate of byRecency) {
+				if (candidate === compactor) continue;
+				if (matchesFoldedRef(candidate, ref)) {
+					foldsMap.get(compactor)!.add(candidate);
+					hasAnyFoldEdge = true;
+				}
+			}
+		}
+	}
+	if (!hasAnyFoldEdge) return records;
+	for (let i = 0; i < byRecency.length; i += 1) {
+		for (let j = i + 1; j < byRecency.length; j += 1) {
+			const newer = byRecency[i];
+			const older = byRecency[j];
+			if (foldsMap.get(newer)!.has(older) && foldsMap.get(older)!.has(newer)) {
+				foldsMap.get(older)!.delete(newer);
+			}
+		}
+	}
+	const surviving = new Set<PendingJournalRecord>();
+	const folded = new Set<PendingJournalRecord>();
+	const settled = () => surviving.size + folded.size >= byRecency.length;
+	while (!settled()) {
+		const remaining = byRecency.filter((record) => !surviving.has(record) && !folded.has(record));
+		const root =
+			remaining.find((candidate) =>
+				remaining.every((other) => other === candidate || !foldsMap.get(other)!.has(candidate))
+			) || remaining[0];
+		surviving.add(root);
+		const queue = [...foldsMap.get(root)!];
+		while (queue.length) {
+			const target = queue.shift()!;
+			if (surviving.has(target) || folded.has(target)) continue;
+			folded.add(target);
+			for (const nested of foldsMap.get(target)!) {
+				if (!surviving.has(nested) && !folded.has(nested)) queue.push(nested);
+			}
+		}
+	}
+	return records.filter((record) => !folded.has(record));
 }
 
 /** Order journal snapshots by causal inclusion first and creation order second. */
@@ -763,29 +881,7 @@ function composeDeltaPair(
 	const composed = compose(firstBase, firstLocal, secondBase, secondLocal, 'kitchen', []);
 	const base = structuredClone(composed.base) as AppState;
 	const local = structuredClone(composed.local) as AppState;
-	const recipeIds = new Set(local.recipes.map((recipe) => recipe.id));
-	for (const meal of local.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
-		conflicts.push({
-			path: `kitchen.meals[${meal.id}].recipeId`,
-			local: describeMealRecipe(secondLocal, meal.id, meal.recipeId),
-			remote: describeMealRecipe(firstLocal, meal.id, meal.recipeId),
-			segments: [
-				{ kind: 'prop', key: 'meals' },
-				{ kind: 'id', id: meal.id },
-				{ kind: 'prop', key: 'recipeId' }
-			],
-			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
-		});
-		const candidates = prefer
-			? (prefer === 'local' ? secondLocal : firstLocal).recipes
-			: [...secondLocal.recipes, ...firstLocal.recipes];
-		const recipe = candidates.find((item) => item.id === meal.recipeId);
-		if (recipe) {
-			local.recipes.push(structuredClone(recipe));
-			recipeIds.add(recipe.id);
-		}
-	}
-	local.meals = local.meals.filter((meal) => recipeIds.has(meal.recipeId));
+	reconcileOrphanedMeals(local, secondLocal, firstLocal, conflicts, prefer);
 	return { base, local, conflicts };
 }
 
@@ -798,8 +894,9 @@ function composePendingKitchenJournalDetailed(
 	local: AppState;
 	conflicts: DetailedConflict[];
 } | null {
-	if (!records.length) return null;
-	const ordered = orderPendingJournalRecords(records);
+	const unfolded = filterUnfoldedJournalRecords(records);
+	if (!unfolded.length) return null;
+	const ordered = orderPendingJournalRecords(unfolded);
 	let effectiveBase = structuredClone(ordered[0].pending.base);
 	let effectiveLocal = structuredClone(ordered[0].pending.local);
 	const rawConflicts: DetailedConflict[] = [];

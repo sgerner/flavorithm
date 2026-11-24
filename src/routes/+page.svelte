@@ -381,6 +381,7 @@
 		editingShoppingDraft = null;
 		shoppingFilter = 'all';
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+		pendingSyncEchoJson = null;
 	}
 	function saveLastAccount(account: User) {
 		if (managedAuth) return;
@@ -1103,6 +1104,7 @@
 		}
 	});
 	let stateEtag: string | null = null;
+	let pendingSyncEchoJson: string | null = null;
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
 	$effect(() => {
@@ -1112,6 +1114,9 @@
 		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
 		if (managedAuth && (!user || !kitchenLoaded)) return;
 		const sanitized = sanitizeKitchenState(JSON.parse(rawSnapshot));
+		const isSyncEcho =
+			pendingSyncEchoJson !== null && JSON.stringify(sanitized) === pendingSyncEchoJson;
+		pendingSyncEchoJson = null;
 		if (!managedAuth && !user && guestPersistenceReady) {
 			try {
 				localStorage.setItem('flavorithm-guest-kitchen', JSON.stringify(sanitized));
@@ -1119,7 +1124,7 @@
 				notify('Device storage is full. Export your kitchen before leaving.');
 			}
 		}
-		if (user) kitchenSync?.stage(sanitized);
+		if (user) kitchenSync?.stage(sanitized, isSyncEcho ? { echo: true } : undefined);
 		clearTimeout(saveTimer);
 		if (user && pendingSync && !syncing && !syncErrors && online)
 			saveTimer = setTimeout(() => {
@@ -1130,11 +1135,12 @@
 		online = navigator.onLine;
 		kitchenSync = createKitchenSync({
 			storage: localStorage,
-			sessionStorage,
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				kitchen = sanitizeKitchenState(state);
+				const nextKitchen = sanitizeKitchenState(state);
+				pendingSyncEchoJson = JSON.stringify(nextKitchen);
+				kitchen = nextKitchen;
 			},
 			onStatus: (status) => {
 				syncReady = status.ready;
@@ -1461,7 +1467,11 @@
 		clearTimeout(saveTimer);
 		await writeChain;
 		if (user && kitchenSync) {
-			kitchenSync.stage(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))));
+			const sanitized = sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)));
+			const isSyncEcho =
+				pendingSyncEchoJson !== null && JSON.stringify(sanitized) === pendingSyncEchoJson;
+			pendingSyncEchoJson = null;
+			kitchenSync.stage(sanitized, isSyncEcho ? { echo: true } : undefined);
 			await kitchenSync.sync();
 			if (kitchenSync.snapshot())
 				throw new Error(

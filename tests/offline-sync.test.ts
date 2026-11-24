@@ -4,6 +4,9 @@ import { createNewUserState } from '../src/lib/data.ts';
 import { completeMeal } from '../src/lib/kitchen-workflows.ts';
 import {
 	clearPendingJournalRecords,
+	composePendingKitchenJournal,
+	filterUnfoldedJournalRecords,
+	jsonEqual,
 	mergeKitchenStates,
 	mergePendingKitchenJournal,
 	readPendingJournal,
@@ -779,4 +782,134 @@ test('mergePendingKitchenJournal anchors cross-tab conflict remote values to ser
 			remote: 60
 		}
 	]);
+});
+
+test('jsonEqual ignores key order and undefined properties while preserving JSON null/array/number/toJSON semantics', () => {
+	// Key order differs from JSON.stringify, while representing the same JSON object.
+	const orderedA = { id: 'p-1', name: 'flour', quantity: 4, nested: { a: 1, b: 2 } };
+	const orderedB = { nested: { b: 2, a: 1 }, quantity: 4, name: 'flour', id: 'p-1' };
+	assert.notEqual(JSON.stringify(orderedA), JSON.stringify(orderedB));
+	assert.equal(jsonEqual(orderedA, orderedB), true);
+
+	// Undefined object properties match omitted properties, but never null or false.
+	const withUndefined = { id: 'r-1', rating: undefined, notes: undefined };
+	const omitted = { id: 'r-1' };
+	assert.equal(jsonEqual(withUndefined, omitted), true);
+	assert.equal(jsonEqual(omitted, withUndefined), true);
+	assert.equal(jsonEqual(withUndefined, { id: 'r-1', rating: null }), false);
+	assert.equal(jsonEqual(withUndefined, { id: 'r-1', rating: false }), false);
+
+	// Arrays and non-finite numbers follow JSON serialization (undefined/NaN/Infinity -> null, -0 === 0).
+	assert.equal(
+		jsonEqual([1, undefined, NaN, Infinity, -Infinity], [1, null, null, null, null]),
+		true
+	);
+	assert.equal(jsonEqual({ count: -0, bad: NaN }, { count: 0, bad: null }), true);
+	assert.equal(jsonEqual([1, 2], [2, 1]), false);
+
+	// Objects with toJSON (such as Date) compare their JSON representation, and Object.prototype keys never collide.
+	assert.equal(jsonEqual(new Date(1_000), new Date(2_000)), false);
+	assert.equal(jsonEqual(new Date('2026-10-22T00:00:00.000Z'), '2026-10-22T00:00:00.000Z'), true);
+	assert.equal(jsonEqual({ toString: 'custom' }, {}), false);
+	assert.equal(jsonEqual({}, { constructor: 'custom' }), false);
+
+	// Reordered keys and undefined optional fields do not manufacture diffs in mergeKitchenStates.
+	const base = createNewUserState();
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 4, unit: 'cup', category: 'Pantry' }];
+	const localReordered = structuredClone(base);
+	localReordered.pantry = [
+		{
+			category: 'Pantry',
+			unit: 'cup',
+			quantity: 4,
+			name: 'flour',
+			id: 'flour',
+			expires: undefined
+		}
+	];
+	const remoteEdited = structuredClone(base);
+	remoteEdited.pantry[0].quantity = 2;
+	const merged = mergeKitchenStates(base, localReordered, remoteEdited);
+	assert.equal(merged.conflicts.length, 0);
+	assert.equal(merged.state.pantry[0].quantity, 2);
+});
+
+test('leftover folded ancestors compose without concurrentPantryQuantity conflicts while preserving newer slot writes', () => {
+	const base = createNewUserState();
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 4, unit: 'cup', category: 'Pantry' }];
+
+	const stepOne = structuredClone(base);
+	stepOne.pantry[0].quantity = 3;
+	const ancestor = journalRecord('z-ancestor', base, stepOne, 1_000);
+
+	// Compacted record written at the same timestamp with lexicographically smaller writerId ('a-compacted' < 'z-ancestor')
+	const stepTwo = structuredClone(stepOne);
+	stepTwo.pantry.push({ id: 'rice', name: 'rice', quantity: 1, unit: 'bag', category: 'Pantry' });
+	const compacted = journalRecord('a-compacted', base, stepTwo, 1_000);
+	compacted.pending.foldedFrom = [
+		{
+			writerId: ancestor.writerId,
+			writeId: ancestor.pending.writeId,
+			updatedAt: ancestor.pending.updatedAt,
+			createdAt: ancestor.pending.createdAt
+		}
+	];
+
+	assert.deepEqual(
+		filterUnfoldedJournalRecords([ancestor, compacted]).map((item) => item.writerId),
+		['a-compacted']
+	);
+	const composed = composePendingKitchenJournal([ancestor, compacted]);
+	assert.ok(composed);
+	assert.equal(composed.conflicts.length, 0);
+	assert.equal(composed.local.pantry.find((item) => item.id === 'flour')?.quantity, 3);
+	assert.ok(composed.local.pantry.some((item) => item.id === 'rice'));
+
+	// If z-ancestor later writes a newer version (different writeId), that newer write is not treated as folded.
+	const newerAncestorState = structuredClone(stepOne);
+	newerAncestorState.shopping.push({
+		id: 'tea',
+		name: 'tea',
+		quantity: 1,
+		unit: 'box',
+		checked: false
+	});
+	const newerWrite = journalRecord('z-ancestor', stepOne, newerAncestorState, 1_001);
+	const withNewer = mergePendingKitchenJournal([newerWrite, compacted], base);
+	assert.equal(withNewer.conflicts.length, 0);
+	assert.deepEqual(
+		withNewer.state.shopping.map((item) => item.id),
+		['tea']
+	);
+});
+
+test('composePendingKitchenJournal and mergePendingKitchenJournal share orphaned-meal protection across cross-tab recipe deletion', () => {
+	const base = createNewUserState();
+	const deletedRecipe = structuredClone(base);
+	deletedRecipe.recipes.shift();
+
+	const plannedMeal = structuredClone(base);
+	plannedMeal.meals.push({
+		id: 'dinner',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		recipeId: base.recipes[0].id,
+		servings: 2
+	});
+
+	const records = [
+		journalRecord('tab-delete', base, deletedRecipe, 10),
+		journalRecord('tab-plan', base, plannedMeal, 20)
+	];
+	const composed = composePendingKitchenJournal(records);
+	assert.ok(composed);
+	assert.equal(composed.conflicts.length, 1);
+	assert.equal(composed.conflicts[0].path, 'kitchen.meals[dinner].recipeId');
+
+	const mergedKeepLocal = mergePendingKitchenJournal(records, deletedRecipe, 'local');
+	assert.equal(mergedKeepLocal.state.meals.length, 1);
+	assert.ok(mergedKeepLocal.state.recipes.some((item) => item.id === base.recipes[0].id));
+
+	const mergedKeepRemote = mergePendingKitchenJournal(records, deletedRecipe, 'remote');
+	assert.equal(mergedKeepRemote.state.meals.length, 0);
 });

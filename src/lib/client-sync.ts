@@ -4,6 +4,8 @@ import {
 	causallyIncludesDelta,
 	clearPendingJournalRecords,
 	composePendingKitchenJournal,
+	filterUnfoldedJournalRecords,
+	type FoldedJournalRef,
 	jsonEqual,
 	MAX_PENDING_JOURNAL_ENTRIES,
 	mergeKitchenStates,
@@ -22,6 +24,10 @@ import {
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> &
 	Partial<Pick<Storage, 'key' | 'length'>>;
 type SessionStorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+export type StageOptions = {
+	/** True only when echoing a state just pushed by `setState` from a reactive UI effect. */
+	echo?: boolean;
+};
 export type SyncStatus = {
 	ready: boolean;
 	pending: boolean;
@@ -70,7 +76,6 @@ type ActiveContext = {
 	error: string;
 };
 
-const WRITER_SESSION_KEY = 'flavorithm-writer-id:v1';
 const WRITER_LEASE_PREFIX = 'flavorithm-writer-lease:v1:';
 const writerLeaseKey = (id: string) => `${WRITER_LEASE_PREFIX}${encodeURIComponent(id)}`;
 export const DEFAULT_WRITER_LEASE_TTL_MS = 120_000;
@@ -135,6 +140,11 @@ function sortRecords(records: PendingJournalRecord[]): PendingJournalRecord[] {
 	);
 }
 
+function firstActivePending(records: PendingJournalRecord[]): PendingKitchen | undefined {
+	const unfolded = filterUnfoldedJournalRecords(records);
+	return unfolded.length ? orderPendingJournalRecords(unfolded)[0].pending : undefined;
+}
+
 function readConfirmed(storage: StorageLike, identity: Identity): ConfirmedKitchen | null {
 	try {
 		const value = JSON.parse(storage.getItem(confirmedKey(identity)) || 'null');
@@ -159,7 +169,7 @@ function readConfirmed(storage: StorageLike, identity: Identity): ConfirmedKitch
  */
 export function createKitchenSync(options: {
 	storage: StorageLike;
-	sessionStorage?: SessionStorageLike;
+	sessionStorage?: SessionStorageLike | null;
 	writerId?: string;
 	now?: () => number;
 	leaseTtlMs?: number;
@@ -176,21 +186,7 @@ export function createKitchenSync(options: {
 	const ownerId = randomId();
 	const memoryRecords = new Map<string, Map<string, MemoryRecord>>();
 	const baselines = new Map<string, ConfirmedKitchen>();
-
-	function readSessionWriterId(): string | null {
-		try {
-			const saved = options.sessionStorage?.getItem(WRITER_SESSION_KEY);
-			return saved && typeof saved === 'string' ? saved : null;
-		} catch {
-			return null;
-		}
-	}
-
-	function persistSessionWriterId(id: string): void {
-		try {
-			options.sessionStorage?.setItem(WRITER_SESSION_KEY, id);
-		} catch {}
-	}
+	const unpersistedBaselines = new Set<string>();
 
 	function readLease(id: string, now = nowOf()): WriterLease | null {
 		try {
@@ -249,9 +245,10 @@ export function createKitchenSync(options: {
 	}
 
 	purgeExpiredLeases();
-	const preferredWriterId = options.writerId || readSessionWriterId();
+	// Each browsing context owns a unique writerId so a duplicated tab can never adopt a frozen live
+	// tab's slot even after its lease TTL expires.
 	let writerId =
-		preferredWriterId && !hasActiveForeignLease(preferredWriterId) ? preferredWriterId : randomId();
+		options.writerId && !hasActiveForeignLease(options.writerId) ? options.writerId : randomId();
 	let leaseHeld = false;
 
 	function acquireOrRefreshLease(): void {
@@ -260,7 +257,6 @@ export function createKitchenSync(options: {
 		if (hasActiveForeignLease(writerId, now)) {
 			writerId = randomId();
 		}
-		persistSessionWriterId(writerId);
 		try {
 			const lease: WriterLease = {
 				ownerId,
@@ -378,20 +374,43 @@ export function createKitchenSync(options: {
 		return { records, durable: allDurable, blocked, error };
 	}
 
+	function resolveLatestBaseline(
+		identity: Identity,
+		key: string,
+		current?: ConfirmedKitchen | null
+	): ConfirmedKitchen | null {
+		const stored = readConfirmed(options.storage, identity);
+		const cached = current ?? baselines.get(key) ?? null;
+		if (stored) {
+			if (!cached || !unpersistedBaselines.has(key) || stored.updatedAt > cached.updatedAt) {
+				baselines.set(key, stored);
+				unpersistedBaselines.delete(key);
+				return stored;
+			}
+		}
+		return cached;
+	}
+
+	function refreshBaseline(context: ActiveContext): ConfirmedKitchen | null {
+		const latest = resolveLatestBaseline(context.identity, context.key, context.baseline);
+		context.baseline = latest;
+		return latest;
+	}
+
 	function aggregatePending(
 		context: ActiveContext,
 		records: PendingJournalRecord[],
 		local: AppState
 	): PendingKitchen | null {
 		if (!records.length) return null;
-		const ordered = orderPendingJournalRecords(records);
-		const first = ordered[0].pending;
+		const baseline = refreshBaseline(context);
+		const first = firstActivePending(records) ?? orderPendingJournalRecords(records)[0].pending;
 		return {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
-			base: clone(context.baseline?.state || first.base || createNewUserState()),
+			base: clone(baseline?.state || first.base || createNewUserState()),
 			local: clone(local),
-			etag: context.baseline?.etag ?? first.etag ?? null,
+			etag: baseline?.etag ?? first.etag ?? null,
 			updatedAt: Math.max(...records.map((record) => record.pending.updatedAt))
 		};
 	}
@@ -430,7 +449,13 @@ export function createKitchenSync(options: {
 		};
 		context.baseline = baseline;
 		baselines.set(context.key, baseline);
-		options.storage.setItem(confirmedKey(context.identity), JSON.stringify(baseline));
+		try {
+			options.storage.setItem(confirmedKey(context.identity), JSON.stringify(baseline));
+			unpersistedBaselines.delete(context.key);
+		} catch (error) {
+			unpersistedBaselines.add(context.key);
+			throw error;
+		}
 	}
 
 	function activate(user: User): ActiveContext | null {
@@ -444,7 +469,7 @@ export function createKitchenSync(options: {
 			identity,
 			key,
 			generation,
-			baseline: baselines.get(key) || readConfirmed(options.storage, identity),
+			baseline: resolveLatestBaseline(identity, key),
 			confirmed: false,
 			loading: false,
 			loadError: '',
@@ -463,8 +488,25 @@ export function createKitchenSync(options: {
 	}
 
 	function acknowledge(context: ActiveContext, records: PendingJournalRecord[]): void {
-		clearPendingJournalRecords(options.storage, context.user, records);
-		forgetAcknowledged(context, records);
+		try {
+			clearPendingJournalRecords(options.storage, context.user, records);
+			forgetAcknowledged(context, records);
+		} catch (error) {
+			const removed = records.filter((record) =>
+				record.keys.every((captured) => {
+					try {
+						const raw = options.storage.getItem(captured.key);
+						if (raw === null) return true;
+						const current = JSON.parse(raw) as PendingKitchen | null;
+						return !current || !sameVersion(current, captured.pending);
+					} catch {
+						return false;
+					}
+				})
+			);
+			if (removed.length) forgetAcknowledged(context, removed);
+			throw error;
+		}
 	}
 
 	function rebaseNewerWriterRecords(
@@ -527,14 +569,13 @@ export function createKitchenSync(options: {
 		context.loading = true;
 		context.confirmed = false;
 		context.loadError = '';
+		const baseline = refreshBaseline(context);
 		const loaded = loadJournal(context);
-		const firstPending = loaded.records.length
-			? orderPendingJournalRecords(loaded.records)[0].pending
-			: undefined;
-		const seed = context.baseline?.state || firstPending?.base || createNewUserState();
+		const firstPending = firstActivePending(loaded.records);
+		const seed = baseline?.state || firstPending?.base || createNewUserState();
 		if (loaded.records.length) {
 			const merged = updateAggregate(context, loaded, seed, undefined, true);
-			context.reviewedEtag = merged.conflicts.length ? (context.baseline?.etag ?? null) : null;
+			context.reviewedEtag = merged.conflicts.length ? (baseline?.etag ?? null) : null;
 			context.reviewedState = merged.conflicts.length ? clone(seed) : null;
 		} else {
 			context.reviewedEtag = null;
@@ -599,24 +640,25 @@ export function createKitchenSync(options: {
 	function restore(user: User): boolean {
 		const context = activate(user);
 		if (!context) return false;
+		const baseline = refreshBaseline(context);
 		const loaded = loadJournal(context);
 		if (loaded.records.length) {
-			const first = orderPendingJournalRecords(loaded.records)[0].pending;
-			const seed = context.baseline?.state || first.base || createNewUserState();
-			const seedEtag = context.baseline?.etag ?? first.etag ?? null;
+			const first = firstActivePending(loaded.records) ?? loaded.records[0].pending;
+			const seed = baseline?.state || first.base || createNewUserState();
+			const seedEtag = baseline?.etag ?? first.etag ?? null;
 			const merged = updateAggregate(context, loaded, seed, undefined, true);
 			context.reviewedEtag = merged.conflicts.length ? seedEtag : null;
 			context.reviewedState = merged.conflicts.length ? clone(seed) : null;
 			emitStatus(context);
 			return true;
 		}
-		if (context.baseline) {
+		if (baseline) {
 			context.reviewedEtag = null;
 			context.reviewedState = null;
-			context.viewState = clone(context.baseline.state);
+			context.viewState = clone(baseline.state);
 			context.error = loaded.error;
 			context.blockedByStorage = loaded.blocked;
-			setContextState(context, context.baseline.state);
+			setContextState(context, baseline.state);
 			emitStatus(context);
 			return true;
 		}
@@ -631,32 +673,127 @@ export function createKitchenSync(options: {
 		return false;
 	}
 
+	function alignRevertedBaselinePantryQuantities(
+		sourceBase: AppState,
+		priorLocal: AppState | null | undefined,
+		nextState: AppState,
+		confirmedState: AppState
+	): AppState {
+		if (!priorLocal) return sourceBase;
+		const priorById = new Map(priorLocal.pantry.map((item) => [item.id, item]));
+		const nextById = new Map(nextState.pantry.map((item) => [item.id, item]));
+		const confirmedById = new Map(confirmedState.pantry.map((item) => [item.id, item]));
+		let adjusted: AppState | null = null;
+		for (let index = 0; index < sourceBase.pantry.length; index += 1) {
+			const baseItem = sourceBase.pantry[index];
+			const priorItem = priorById.get(baseItem.id);
+			const nextItem = nextById.get(baseItem.id);
+			const confirmedItem = confirmedById.get(baseItem.id);
+			if (
+				priorItem &&
+				nextItem &&
+				confirmedItem &&
+				!equal(priorItem.quantity, confirmedItem.quantity) &&
+				equal(nextItem.quantity, confirmedItem.quantity) &&
+				!equal(baseItem.quantity, confirmedItem.quantity)
+			) {
+				adjusted ??= clone(sourceBase);
+				adjusted.pantry[index].quantity = confirmedItem.quantity;
+			}
+		}
+		return adjusted ?? sourceBase;
+	}
+
+	function buildFoldedRefs(
+		loadedRecords: PendingJournalRecord[],
+		ownBefore: PendingJournalRecord | undefined,
+		newlyFolded: PendingJournalRecord[]
+	): FoldedJournalRef[] | undefined {
+		const refs: FoldedJournalRef[] = [];
+		const addRef = (ref: FoldedJournalRef) => {
+			if (ref.writerId === writerId) return;
+			const exists = refs.some((item) =>
+				item.writeId || ref.writeId
+					? item.writerId === ref.writerId && item.writeId === ref.writeId
+					: item.writerId === ref.writerId &&
+						item.updatedAt === ref.updatedAt &&
+						item.createdAt === ref.createdAt
+			);
+			if (!exists && refs.length < MAX_PENDING_JOURNAL_ENTRIES) {
+				refs.push(ref);
+			}
+		};
+		for (const record of newlyFolded) {
+			addRef({
+				writerId: record.writerId,
+				...(record.pending.writeId ? { writeId: record.pending.writeId } : {}),
+				updatedAt: record.pending.updatedAt,
+				...(record.pending.createdAt !== undefined ? { createdAt: record.pending.createdAt } : {})
+			});
+			for (const inherited of record.pending.foldedFrom ?? []) {
+				if (loadedRecords.some((candidate) => candidate.writerId === inherited.writerId)) {
+					addRef(inherited);
+				}
+			}
+		}
+		for (const inherited of ownBefore?.pending.foldedFrom ?? []) {
+			if (loadedRecords.some((candidate) => candidate.writerId === inherited.writerId)) {
+				addRef(inherited);
+			}
+		}
+		return refs.length ? refs : undefined;
+	}
+
 	function findCompactionPlan(
 		context: ActiveContext,
 		loaded: LoadedJournal,
-		own: PendingJournalRecord | undefined,
+		unfoldedRecords: PendingJournalRecord[],
+		alreadyFoldedPeers: PendingJournalRecord[],
+		effectiveOwn: PendingJournalRecord | undefined,
 		viewBase: AppState,
 		next: AppState
 	): {
 		foldableAncestors: PendingJournalRecord[];
+		alreadyFoldedPeers: PendingJournalRecord[];
 		base: AppState;
 		etag: string | null;
 		anchoredToBaseline: boolean;
 	} {
 		const now = nowOf();
-		const defaultBaseSource = own?.pending.base || viewBase;
-		const defaultEtag = own?.pending.etag ?? (context.baseline?.etag || null);
+		const baseline = refreshBaseline(context);
+		const priorLocal = effectiveOwn?.pending.local ?? context.viewState;
+		const rebasedOwnAnchor = (() => {
+			if (!effectiveOwn) return null;
+			if (baseline && effectiveOwn.pending.etag !== baseline.etag) {
+				const rebased = mergeKitchenStates(
+					effectiveOwn.pending.base,
+					effectiveOwn.pending.local,
+					baseline.state
+				);
+				if (!rebased.conflicts.length && equal(rebased.state, effectiveOwn.pending.local)) {
+					return { base: clone(baseline.state), etag: baseline.etag };
+				}
+			}
+			return { base: effectiveOwn.pending.base, etag: effectiveOwn.pending.etag };
+		})();
+		const rawDefaultBase = rebasedOwnAnchor?.base || viewBase;
+		const defaultBaseSource =
+			context.confirmed && baseline
+				? alignRevertedBaselinePantryQuantities(rawDefaultBase, priorLocal, next, baseline.state)
+				: rawDefaultBase;
+		const defaultEtag = rebasedOwnAnchor ? rebasedOwnAnchor.etag : baseline?.etag || null;
 		if (context.syncing) {
 			return {
 				foldableAncestors: [],
+				alreadyFoldedPeers: [],
 				base: clone(defaultBaseSource),
 				etag: defaultEtag,
-				anchoredToBaseline: !!context.baseline && equal(defaultBaseSource, context.baseline.state)
+				anchoredToBaseline: !!baseline && equal(defaultBaseSource, baseline.state)
 			};
 		}
 
 		const memory = writerMemory(context);
-		const peers = loaded.records.filter((record) => record.writerId !== writerId);
+		const peers = unfoldedRecords.filter((record) => record.writerId !== writerId);
 		const ancestorPeers = peers.filter(
 			(record) =>
 				equal(record.pending.base, record.pending.local) ||
@@ -668,6 +805,7 @@ export function createKitchenSync(options: {
 		if (hasLeasedAncestor) {
 			return {
 				foldableAncestors: [],
+				alreadyFoldedPeers,
 				base: clone(defaultBaseSource),
 				etag: defaultEtag,
 				anchoredToBaseline: false
@@ -722,27 +860,63 @@ export function createKitchenSync(options: {
 			keys: []
 		};
 
+		const preservesPeersOnBaseline = (
+			remainingPeers: PendingJournalRecord[],
+			sourceStepBase: AppState
+		): boolean => {
+			if (!baseline) return false;
+			if (!remainingPeers.length || equal(sourceStepBase, baseline.state)) return true;
+			const originalStep: PendingJournalRecord = {
+				...syntheticStep,
+				pending: { ...syntheticStep.pending, base: sourceStepBase, local: next }
+			};
+			const anchoredStep: PendingJournalRecord = {
+				...syntheticStep,
+				pending: {
+					...syntheticStep.pending,
+					base: baseline.state,
+					local: next,
+					etag: baseline.etag
+				}
+			};
+			const withOriginal = composePendingKitchenJournal([...remainingPeers, originalStep]);
+			const withAnchored = composePendingKitchenJournal([...remainingPeers, anchoredStep]);
+			return Boolean(
+				withOriginal &&
+				withAnchored &&
+				!withAnchored.conflicts.length &&
+				equal(withOriginal.local, withAnchored.local)
+			);
+		};
+
 		if (candidates.length) {
+			const candidateIds = new Set(candidates.map((record) => record.writerId));
+			const remainingPeers = peers.filter((record) => !candidateIds.has(record.writerId));
 			const composed = composePendingKitchenJournal([...candidates, syntheticStep]);
 			if (!composed || composed.conflicts.length > 0) {
 				return {
 					foldableAncestors: [],
+					alreadyFoldedPeers,
 					base: clone(defaultBaseSource),
 					etag: defaultEtag,
-					anchoredToBaseline: !!context.baseline && equal(defaultBaseSource, context.baseline.state)
+					anchoredToBaseline: !!baseline && equal(defaultBaseSource, baseline.state)
 				};
 			}
-			if (context.baseline) {
-				const onBaseline = mergeKitchenStates(
-					composed.base,
-					composed.local,
-					context.baseline.state
-				);
-				if (!onBaseline.conflicts.length && equal(onBaseline.state, next)) {
+			if (baseline) {
+				const alignedComposedBase = context.confirmed
+					? alignRevertedBaselinePantryQuantities(composed.base, priorLocal, next, baseline.state)
+					: composed.base;
+				const onBaseline = mergeKitchenStates(alignedComposedBase, composed.local, baseline.state);
+				if (
+					!onBaseline.conflicts.length &&
+					equal(onBaseline.state, next) &&
+					preservesPeersOnBaseline(remainingPeers, alignedComposedBase)
+				) {
 					return {
 						foldableAncestors: candidates,
-						base: clone(context.baseline.state),
-						etag: context.baseline.etag,
+						alreadyFoldedPeers,
+						base: clone(baseline.state),
+						etag: baseline.etag,
 						anchoredToBaseline: true
 					};
 				}
@@ -751,47 +925,56 @@ export function createKitchenSync(options: {
 				const firstOrdered = composed.ordered[0]?.pending;
 				return {
 					foldableAncestors: candidates,
+					alreadyFoldedPeers,
 					base: composed.base,
 					etag: firstOrdered?.etag ?? defaultEtag,
-					anchoredToBaseline: !!context.baseline && equal(composed.base, context.baseline.state)
+					anchoredToBaseline: !!baseline && equal(composed.base, baseline.state)
 				};
 			}
 			return {
 				foldableAncestors: [],
+				alreadyFoldedPeers,
 				base: clone(defaultBaseSource),
 				etag: defaultEtag,
-				anchoredToBaseline: !!context.baseline && equal(defaultBaseSource, context.baseline.state)
+				anchoredToBaseline: !!baseline && equal(defaultBaseSource, baseline.state)
 			};
 		}
 
-		if (context.baseline) {
-			if (equal(defaultBaseSource, context.baseline.state)) {
+		if (baseline) {
+			if (equal(defaultBaseSource, baseline.state)) {
 				return {
 					foldableAncestors: [],
-					base: clone(context.baseline.state),
-					etag: context.baseline.etag,
+					alreadyFoldedPeers,
+					base: clone(baseline.state),
+					etag: baseline.etag,
 					anchoredToBaseline: true
 				};
 			}
-			const onBaseline = mergeKitchenStates(defaultBaseSource, next, context.baseline.state);
-			if (!onBaseline.conflicts.length && equal(onBaseline.state, next)) {
+			const onBaseline = mergeKitchenStates(defaultBaseSource, next, baseline.state);
+			if (
+				!onBaseline.conflicts.length &&
+				equal(onBaseline.state, next) &&
+				preservesPeersOnBaseline(peers, defaultBaseSource)
+			) {
 				return {
 					foldableAncestors: [],
-					base: clone(context.baseline.state),
-					etag: context.baseline.etag,
+					alreadyFoldedPeers,
+					base: clone(baseline.state),
+					etag: baseline.etag,
 					anchoredToBaseline: true
 				};
 			}
 		}
 		return {
 			foldableAncestors: [],
+			alreadyFoldedPeers,
 			base: clone(defaultBaseSource),
 			etag: defaultEtag,
-			anchoredToBaseline: !!context.baseline && equal(defaultBaseSource, context.baseline.state)
+			anchoredToBaseline: !!baseline && equal(defaultBaseSource, baseline.state)
 		};
 	}
 
-	function stage(state: AppState): void {
+	function stage(state: AppState, stageOptions?: StageOptions): void {
 		const context = active;
 		if (!context || !isActive(context)) return;
 		acquireOrRefreshLease();
@@ -801,17 +984,21 @@ export function createKitchenSync(options: {
 			emitStatus(context);
 			return;
 		}
+		const baseline = refreshBaseline(context);
 		const loaded = loadJournal(context);
-		const own = loaded.records.find((record) => record.writerId === writerId);
-		const firstPending = loaded.records.length
-			? orderPendingJournalRecords(loaded.records)[0].pending
-			: undefined;
-		const base = clone(
-			own?.pending.base || context.viewState || context.baseline?.state || createNewUserState()
+		const unfoldedRecords = filterUnfoldedJournalRecords(loaded.records);
+		const unfoldedSet = new Set(unfoldedRecords);
+		const alreadyFoldedPeers = loaded.records.filter(
+			(record) => record.writerId !== writerId && !unfoldedSet.has(record)
 		);
-		const conflictSeed =
-			context.reviewedState || context.baseline?.state || firstPending?.base || base;
-		const conflictSeedEtag = context.baseline?.etag ?? firstPending?.etag ?? null;
+		const own = loaded.records.find((record) => record.writerId === writerId);
+		const effectiveOwn = own && unfoldedSet.has(own) ? own : undefined;
+		const firstPending = firstActivePending(loaded.records);
+		const base = clone(
+			effectiveOwn?.pending.base || context.viewState || baseline?.state || createNewUserState()
+		);
+		const conflictSeed = context.reviewedState || baseline?.state || firstPending?.base || base;
+		const conflictSeedEtag = baseline?.etag ?? firstPending?.etag ?? null;
 		const syncReviewedConflictSeed = (conflicts: SyncConflict[]) => {
 			if (!conflicts.length) {
 				context.reviewedEtag = null;
@@ -821,9 +1008,13 @@ export function createKitchenSync(options: {
 				context.reviewedState = clone(conflictSeed);
 			}
 		};
-		if (equal(next, context.viewState) || (own && equal(next, own.pending.local))) {
+		const isReactiveEcho = Boolean(stageOptions?.echo && equal(next, context.viewState));
+		const isUnchangedState =
+			(!effectiveOwn && equal(next, context.viewState)) ||
+			Boolean(effectiveOwn && equal(next, effectiveOwn.pending.local));
+		if (isReactiveEcho || isUnchangedState) {
 			const previousError = context.error;
-			context.viewState = next;
+			if (!isReactiveEcho && effectiveOwn) context.viewState = next;
 			const merged = updateAggregate(context, loaded, conflictSeed);
 			if (!loaded.error && previousError) context.error = previousError;
 			syncReviewedConflictSeed(merged.conflicts);
@@ -831,24 +1022,35 @@ export function createKitchenSync(options: {
 			return;
 		}
 
-		const plan = findCompactionPlan(context, loaded, own, base, next);
+		const plan = findCompactionPlan(
+			context,
+			loaded,
+			unfoldedRecords,
+			alreadyFoldedPeers,
+			effectiveOwn,
+			base,
+			next
+		);
+		const latestBaseline = context.baseline;
 		const matchesBaseline =
 			!context.syncing &&
-			((plan.anchoredToBaseline && !!context.baseline && equal(next, context.baseline.state)) ||
+			((plan.anchoredToBaseline && !!latestBaseline && equal(next, latestBaseline.state)) ||
 				equal(next, plan.base));
 		if (matchesBaseline) {
-			const toRetire = [...(own ? [own] : []), ...plan.foldableAncestors];
+			const toRetire = [
+				...(own ? [own] : []),
+				...plan.foldableAncestors,
+				...plan.alreadyFoldedPeers
+			];
 			try {
 				if (toRetire.length) acknowledge(context, toRetire);
 				const after = loadJournal(context);
-				const afterFirst = after.records.length
-					? orderPendingJournalRecords(after.records)[0].pending
-					: undefined;
+				const afterFirst = firstActivePending(after.records);
 				context.viewState = next;
 				const merged = updateAggregate(
 					context,
 					after,
-					context.reviewedState || context.baseline?.state || afterFirst?.base || next
+					context.reviewedState || latestBaseline?.state || afterFirst?.base || next
 				);
 				context.viewState = next;
 				syncReviewedConflictSeed(merged.conflicts);
@@ -859,7 +1061,11 @@ export function createKitchenSync(options: {
 			return;
 		}
 
-		const projectedEntries = loaded.records.length - plan.foldableAncestors.length + (own ? 0 : 1);
+		const projectedEntries =
+			loaded.records.length -
+			plan.foldableAncestors.length -
+			plan.alreadyFoldedPeers.length +
+			(own ? 0 : 1);
 		if (!own && projectedEntries > MAX_PENDING_JOURNAL_ENTRIES) {
 			context.blockedByStorage = true;
 			context.error = `This device has reached its ${MAX_PENDING_JOURNAL_ENTRIES}-writer offline journal limit. Reconnect and sync before making more offline edits.`;
@@ -868,16 +1074,19 @@ export function createKitchenSync(options: {
 		}
 
 		const now = nowOf();
+		const ancestorsToRetire = [...plan.foldableAncestors, ...plan.alreadyFoldedPeers];
+		const foldedFrom = buildFoldedRefs(loaded.records, own, ancestorsToRetire);
 		const pending: PendingKitchen = {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
 			base: plan.base,
 			local: next,
 			etag: plan.etag,
-			createdAt: own?.pending.createdAt ?? now,
+			createdAt: effectiveOwn?.pending.createdAt ?? now,
 			updatedAt: now,
 			writerId,
-			writeId: randomId()
+			writeId: randomId(),
+			...(foldedFrom ? { foldedFrom } : {})
 		};
 		context.viewState = next;
 		let durable = false;
@@ -909,9 +1118,9 @@ export function createKitchenSync(options: {
 		};
 		if (durable) {
 			rememberRecord(context, ownRecord, true);
-			if (plan.foldableAncestors.length) {
+			if (ancestorsToRetire.length) {
 				try {
-					acknowledge(context, plan.foldableAncestors);
+					acknowledge(context, ancestorsToRetire);
 				} catch {
 					persistenceError ||=
 						'Compacted offline journal entries could not be retired on this device.';
@@ -921,13 +1130,11 @@ export function createKitchenSync(options: {
 			rememberRecord(context, ownRecord, false);
 		}
 		const after = loadJournal(context);
-		const afterFirst = after.records.length
-			? orderPendingJournalRecords(after.records)[0].pending
-			: undefined;
+		const afterFirst = firstActivePending(after.records);
 		const aggregate = updateAggregate(
 			context,
 			after,
-			context.reviewedState || context.baseline?.state || afterFirst?.base || base
+			context.reviewedState || latestBaseline?.state || afterFirst?.base || base
 		);
 		// Stage is driven by the UI's current state. Keep it as the view even if a different tab has
 		// additional queued deltas that are not reflected in this tab yet.
@@ -943,6 +1150,7 @@ export function createKitchenSync(options: {
 		const context = active;
 		if (!context || !isActive(context) || context.syncing) return;
 		acquireOrRefreshLease();
+		const baseline = refreshBaseline(context);
 		const loaded = loadJournal(context);
 		if (!loaded.records.length) {
 			context.pending = null;
@@ -955,8 +1163,8 @@ export function createKitchenSync(options: {
 			emitStatus(context);
 			return;
 		}
-		const firstPending = orderPendingJournalRecords(loaded.records)[0].pending;
-		const seed = context.baseline?.state || firstPending.base || createNewUserState();
+		const firstPending = firstActivePending(loaded.records) ?? loaded.records[0].pending;
+		const seed = baseline?.state || firstPending.base || createNewUserState();
 		context.pending = aggregatePending(
 			context,
 			loaded.records,
@@ -1109,10 +1317,11 @@ export function createKitchenSync(options: {
 
 	function snapshot(): PendingKitchen | null {
 		if (!active || !isActive(active)) return null;
+		const baseline = refreshBaseline(active);
 		const loaded = loadJournal(active);
 		if (!loaded.records.length) return null;
-		const firstPending = orderPendingJournalRecords(loaded.records)[0].pending;
-		const seed = active.baseline?.state || firstPending.base || createNewUserState();
+		const firstPending = firstActivePending(loaded.records) ?? loaded.records[0].pending;
+		const seed = baseline?.state || firstPending.base || createNewUserState();
 		const merged = mergePendingKitchenJournal(loaded.records, seed, 'local');
 		return aggregatePending(active, loaded.records, merged.state);
 	}
