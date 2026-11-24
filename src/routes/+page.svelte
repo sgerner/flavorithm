@@ -152,6 +152,7 @@
 		type ConnectionProvider
 	} from '#lib/ai-connections.ts';
 	import {
+		consumeHostAIDefaultNotice,
 		entitledChatGPTAccountId,
 		reconcileChatGPTPreferences,
 		runConcurrentModelCatalog,
@@ -295,6 +296,7 @@
 	});
 	let toast = $state('');
 	let toastUndo = $state<(() => void) | null>(null);
+	let toastActionLabel = $state('Undo');
 	let toastVersion = 0;
 	let busy = $state(false);
 	let scanBusy = $state(false);
@@ -943,12 +945,14 @@
 	function dateKey(date: Date) {
 		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 	}
-	function notify(message: string, undo?: () => void) {
+	function notify(message: string, undo?: () => void, actionLabel = 'Undo') {
 		toast = message;
+		toastActionLabel = undo ? actionLabel : 'Undo';
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
 		toastUndo = undo
 			? () => {
 					toastUndo = null;
+					toastActionLabel = 'Undo';
 					toast = '';
 					if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
 				}
@@ -959,6 +963,7 @@
 				if (toastVersion === version) {
 					toast = '';
 					toastUndo = null;
+					toastActionLabel = 'Undo';
 				}
 			},
 			undo ? 10000 : 4200
@@ -1307,6 +1312,7 @@
 								if (attempt !== connectionAttempt || user?.id !== owner) return;
 								chatGPT = result;
 								reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+								maybeNotifyHostAIDefault();
 							},
 							onConnectionsError: () => {
 								if (attempt !== connectionAttempt || user?.id !== owner) return;
@@ -1784,6 +1790,26 @@
 			}
 		});
 	}
+	function maybeNotifyHostAIDefault() {
+		if (
+			!user ||
+			!consumeHostAIDefaultNotice({
+				userId: user.id,
+				storage: typeof localStorage === 'undefined' ? null : localStorage,
+				preferences: kitchen.preferences,
+				chatGPT
+			})
+		) {
+			return;
+		}
+		notify(
+			'Shared host AI is now active by default. Your saved personal AI settings are preserved.',
+			() => {
+				void openSettings('ai');
+			},
+			'Settings'
+		);
+	}
 	async function refreshConnections() {
 		if (!user) return;
 		const owner = user.id;
@@ -1792,6 +1818,7 @@
 		if (attempt !== connectionAttempt || user?.id !== owner) return;
 		chatGPT = result;
 		reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+		maybeNotifyHostAIDefault();
 	}
 	async function refreshAISettings() {
 		error = '';
@@ -4740,11 +4767,13 @@
 	{scanBusy ? 'Scanning photo for ingredients…' : toast}
 </div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}>Undo</button
+		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}
+				>{toastActionLabel}</button
 			>{/if}<button
 			onclick={() => {
 				toast = '';
 				toastUndo = null;
+				toastActionLabel = 'Undo';
 			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
