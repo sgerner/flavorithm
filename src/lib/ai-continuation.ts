@@ -1,12 +1,19 @@
 import type { Preferences, User } from './types.ts';
 
+export const SCAN_PHOTO_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
+export const SCAN_PHOTO_ACCEPT = SCAN_PHOTO_MIME_TYPES.join(',');
+
+export function isSupportedScanPhotoType(mimeType: string): boolean {
+	return (SCAN_PHOTO_MIME_TYPES as readonly string[]).includes(mimeType.toLowerCase());
+}
+
 export type GenerateGuestFilters = Partial<Pick<Preferences, 'maxTime' | 'diet' | 'allergies'>>;
 
 export type PendingAIContinuation =
 	| { kind: 'import' }
 	| { kind: 'generate'; prompt: string; guestFilters?: GenerateGuestFilters }
 	| { kind: 'butler'; prompt: string }
-	| { kind: 'scan' }
+	| { kind: 'scan'; returnToPantryModal?: boolean }
 	| { kind: 'nutrition'; recipeId: string; servings?: number };
 
 export type ChatGPTConnectionStatus = {
@@ -62,6 +69,19 @@ export function resolvePostSetupAction(
 ): PostSetupResolution {
 	if (!continuation) return 'none';
 	return aiReady ? 'resume' : 'settings';
+}
+
+export function shouldOpenPantryOnScanError(args: {
+	aborted: boolean;
+	modal: string;
+	page: string;
+	hasOverlay: boolean;
+	fromContinuation: boolean;
+}): boolean {
+	if (args.aborted) return false;
+	if (args.modal === 'pantry') return true;
+	if (args.modal || args.hasOverlay) return false;
+	return args.page === 'pantry' || args.fromContinuation;
 }
 
 export type ButlerOwnerSnapshot<TMessage = unknown, TDraftRecipe = unknown> = {
