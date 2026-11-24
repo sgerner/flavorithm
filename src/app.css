@@ -405,6 +405,11 @@ main {
 	justify-content: center;
 	padding: 9px 0;
 }
+.shopping-row .text-button {
+	min-width: 44px;
+	min-height: 44px;
+	padding: 9px 10px;
+}
 .text-button:hover {
 	color: #899f50;
 }
@@ -3015,6 +3020,11 @@ html.dark[data-theme='nosh'] {
 
 	.shopping-row > .icon-button {
 		flex: 0 0 44px;
+	}
+
+	.shopping-row .text-button {
+		min-width: 44px;
+		padding-inline: 10px;
 	}
 
 	.check-box {

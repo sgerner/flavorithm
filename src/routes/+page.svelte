@@ -93,14 +93,19 @@
 		expiryStatus,
 		filterPantryItems,
 		listPantryCategories,
-		normalizePantryDraft,
 		normalizeIngredientName,
+		normalizePantryDraft,
+		normalizeShoppingItem,
 		reconcileShoppingList,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
+		revertShoppingItem,
+		snapshotShoppingItem,
 		transferPurchasedItemsToPantry,
 		unitInfo,
-		type PantryDraft
+		type PantryDraft,
+		type ShoppingItemDraft,
+		type ShoppingItemSnapshot
 	} from '#lib/kitchen-workflows.ts';
 	import { rankPantryRecipes, rankRecipes } from '#lib/discovery.ts';
 	import {
@@ -582,12 +587,8 @@
 	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
-	let editingShoppingDraft = $state<{
-		id: string;
-		name: string;
-		quantity: number | null;
-		unit: string;
-	} | null>(null);
+	let editingShoppingDraft = $state<(ShoppingItemDraft & { id: string }) | null>(null);
+	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -928,15 +929,59 @@
 			undo ? 10000 : 4200
 		);
 	}
-	function removeShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId === item.id) {
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+	function applyShoppingEdit(item: AppState['shopping'][number]) {
+		normalizeShoppingItem(item, editingShoppingDraft?.id === item.id ? editingShoppingDraft : null);
+	}
+	function clearEditingShoppingState() {
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+		editingShoppingSnapshot = null;
+	}
+	async function startEditingShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId && editingShoppingId !== item.id) {
+			const active = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
+			if (active) applyShoppingEdit(active);
 		}
+		editingShoppingSnapshot = snapshotShoppingItem(item);
+		editingShoppingId = item.id;
+		editingShoppingDraft = {
+			id: item.id,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit
+		};
+		await tick();
+		document
+			.querySelector<HTMLInputElement>(`[data-shopping-name="${CSS.escape(item.id)}"]`)
+			?.focus();
+	}
+	async function finishEditingShoppingItem(item: AppState['shopping'][number]) {
+		const id = item.id;
+		applyShoppingEdit(item);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	async function cancelEditingShoppingItem() {
+		const id = editingShoppingId;
+		if (!id) return;
+		const active = kitchen.shopping.find((entry) => entry.id === id);
+		if (active && editingShoppingSnapshot) revertShoppingItem(active, editingShoppingSnapshot);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	function removeShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId === item.id) clearEditingShoppingState();
 		const removed = structuredClone($state.snapshot(item));
 		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		notify(`${item.name} removed.`, () => {
+			if (editingShoppingId === removed.id) clearEditingShoppingState();
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
+			if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+				clearEditingShoppingState();
 		});
 	}
 	function consumeLeftoverServing(meal: Meal) {
@@ -1394,8 +1439,7 @@
 	}
 
 	function freshKitchen() {
-		editingShoppingId = '';
-		editingShoppingDraft = null;
+		clearEditingShoppingState();
 		kitchen.pantry = [];
 		kitchen.meals = [];
 		kitchen.shopping = [];
@@ -2619,6 +2663,8 @@
 		);
 		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -2630,6 +2676,8 @@
 		kitchen.shopping = kitchen.shopping.filter(
 			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
 		);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		if (kitchen.preferences.ratings) {
 			const ratings = { ...kitchen.preferences.ratings };
 			delete ratings[recipe.id];
@@ -2647,57 +2695,12 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
-	function startEditingShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId && editingShoppingId !== item.id) {
-			const previous = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (previous) normalizeShoppingItem(previous);
-		}
-		editingShoppingId = item.id;
-		editingShoppingDraft = {
-			id: item.id,
-			name: item.name,
-			quantity: item.quantity,
-			unit: item.unit
-		};
-	}
-	function finishEditingShoppingItem(item: AppState['shopping'][number]) {
-		normalizeShoppingItem(item);
-		editingShoppingId = '';
-		editingShoppingDraft = null;
-	}
-	function normalizeShoppingItem(item: AppState['shopping'][number]) {
-		const draft = editingShoppingDraft?.id === item.id ? editingShoppingDraft : null;
-		const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
-		const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
-		const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
-		const rawQuantity = draft ? draft.quantity : item.quantity;
-		const parsed =
-			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
-				? Number.NaN
-				: Number(rawQuantity);
-		const fallbackQuantity =
-			Number.isFinite(item.quantity) && item.quantity >= 0.01 && item.quantity <= 1_000_000
-				? item.quantity
-				: 1;
-		const quantity = Number.isFinite(parsed)
-			? Math.max(0.01, Math.min(parsed, 1_000_000))
-			: fallbackQuantity;
-		item.name = name;
-		item.unit = unit;
-		item.quantity = quantity;
-		if (draft) {
-			draft.name = name;
-			draft.unit = unit;
-			draft.quantity = quantity;
-		}
-	}
 	function commitInlineEdits() {
 		if (pantryDraft) void savePantryEdit(false);
 		if (editingShoppingId) {
 			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (item) normalizeShoppingItem(item);
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+			if (item) applyShoppingEdit(item);
+			clearEditingShoppingState();
 		}
 	}
 	function addShoppingQuickItem() {
@@ -2787,6 +2790,7 @@
 			notify('Enter a valid serving count before making a shopping list.');
 			return;
 		}
+		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
@@ -2947,6 +2951,8 @@
 			) {
 				kitchen.pantry = previousPantry;
 				kitchen.shopping = previousShopping;
+				if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+					clearEditingShoppingState();
 			} else {
 				notify('Your kitchen changed again. Review the current items before editing.');
 			}
@@ -3513,7 +3519,8 @@
 <svelte:window
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
-			if (!modal && !selected && !editingRecipe && !mobileNav && pantryDraft) {
+			const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
+			if (!overlayOpen && pantryDraft) {
 				void cancelPantryEdit();
 			}
 			mobileNav = false;
@@ -3521,6 +3528,10 @@
 			selected = null;
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
+			if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
+				e.preventDefault();
+				void cancelEditingShoppingItem();
+			}
 		}
 	}}
 />
@@ -4345,8 +4356,18 @@
 									type="button"
 									class:active={shoppingFilter === option.id}
 									aria-pressed={shoppingFilter === option.id}
-									onclick={() => (shoppingFilter = option.id)}
-									>{option.label}<span>{option.count}</span></button
+									onclick={() => {
+										if (option.id === 'unpurchased' && editingShoppingId) {
+											const active = kitchen.shopping.find(
+												(entry) => entry.id === editingShoppingId
+											);
+											if (active?.checked) {
+												applyShoppingEdit(active);
+												clearEditingShoppingState();
+											}
+										}
+										shoppingFilter = option.id;
+									}}>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
 						<form
@@ -4371,67 +4392,89 @@
 								out:fadeMotion={{ duration: 120 }}
 							>
 								<button
+									type="button"
+									role="checkbox"
+									aria-checked={item.checked}
 									class="check-box"
 									class:checked={item.checked}
 									aria-label={`Mark ${item.name} ${item.checked ? 'needed' : 'purchased'}`}
-									onclick={() => (item.checked = !item.checked)}
+									onclick={() => {
+										item.checked = !item.checked;
+										if (
+											shoppingFilter === 'unpurchased' &&
+											item.checked &&
+											editingShoppingId === item.id
+										) {
+											applyShoppingEdit(item);
+											clearEditingShoppingState();
+										}
+									}}
 									>{#if item.checked}<Check size={16} />{/if}</button
 								>
-								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<div
-										class="shopping-item-edit"
+								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<form
+										class="shopping-edit-form"
+										novalidate
+										onsubmit={(e) => {
+											e.preventDefault();
+											void finishEditingShoppingItem(item);
+										}}
 									>
-										<input
-											class="shopping-name"
-											aria-label="Shopping item name"
-											bind:value={editingShoppingDraft.name}
-											maxlength="200"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
-									</div>
-									<span class="shopping-quantity"
-										><input
-											aria-label={`Quantity of ${item.name}`}
-											type="number"
-											min="0.01"
-											max="1000000"
-											step="0.01"
-											bind:value={editingShoppingDraft.quantity}
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><input
-											aria-label={`Unit for ${item.name}`}
-											bind:value={editingShoppingDraft.unit}
-											maxlength="40"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/></span
-									>
-									<button class="text-button" onclick={() => finishEditingShoppingItem(item)}
-										>Done</button
-									>
+										<div class="shopping-item-edit">
+											<input
+												class="shopping-name"
+												data-shopping-name={item.id}
+												aria-label="Shopping item name"
+												bind:value={editingShoppingDraft.name}
+												maxlength="200"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
+										</div>
+										<span class="shopping-quantity"
+											><input
+												aria-label={`Quantity of ${item.name}`}
+												type="number"
+												min="0.01"
+												max="1000000"
+												step="0.01"
+												bind:value={editingShoppingDraft.quantity}
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><input
+												aria-label={`Unit for ${item.name}`}
+												bind:value={editingShoppingDraft.unit}
+												maxlength="40"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/></span
+										>
+										<button type="submit" class="text-button">Done</button>
+									</form>
 								{:else}
 									<div class="shopping-item-edit">
-										<b class="shopping-name">{item.name}</b><small class="shopping-source"
-											>{shoppingSourceLabel(item.sourceKey)}</small
-										>
+										<button
+											type="button"
+											tabindex="-1"
+											class="shopping-name"
+											onclick={() => (item.checked = !item.checked)}>{item.name}</button
+										><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
 									</div>
 									<span class="shopping-quantity"
 										>{item.quantity}
 										{item.unit}<button
+											type="button"
 											class="text-button"
+											data-shopping-edit={item.id}
 											aria-label={`Edit ${item.name}`}
-											onclick={() => startEditingShoppingItem(item)}>Edit</button
+											onclick={() => void startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
 								{/if}
 								<button
+									type="button"
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
 									onclick={() => removeShoppingItem(item)}><X size={15} /></button
@@ -5634,6 +5677,9 @@
 		min-height: 44px;
 		padding: 8px 14px;
 	}
+	.shopping-edit-form {
+		display: contents;
+	}
 	.shopping-item-edit {
 		min-width: 100px;
 		flex: 1 1 180px;
@@ -5641,16 +5687,29 @@
 		flex-direction: column;
 		gap: 3px;
 	}
-	.shopping-name {
+	button.shopping-name {
 		width: 100%;
 		min-width: 0;
-		padding: 4px 5px;
+		min-height: 44px;
+		padding: 8px 5px;
+		display: flex;
+		align-items: center;
+		text-align: left;
 		font-weight: 500;
+		overflow-wrap: anywhere;
+	}
+	.shopping-row.checked button.shopping-name {
+		color: var(--muted);
 	}
 	input.shopping-name {
-		padding: 7px 8px;
+		width: 100%;
+		min-width: 0;
+		min-height: 44px;
+		padding: 7px 5px;
 		border: 1px solid var(--control-border);
 		background: var(--surface);
+		font-size: 16px;
+		font-weight: 500;
 	}
 	.shopping-source {
 		padding-left: 5px;
@@ -5666,12 +5725,13 @@
 	}
 	.shopping-quantity input {
 		min-width: 0;
+		min-height: 44px;
 		width: 72px;
-		padding: 7px 6px;
+		padding: 7px 5px;
 		border: 1px solid var(--control-border);
 		background: var(--surface);
 		text-align: right;
-		font-size: 14px;
+		font-size: 16px;
 	}
 	.shopping-quantity input:last-child {
 		width: 70px;
@@ -5889,15 +5949,10 @@
 		}
 		.shopping-item-edit {
 			flex-basis: calc(100% - 66px);
-			order: 2;
 		}
 		.shopping-quantity {
-			order: 3;
 			flex: 1 1 auto;
 			margin-left: 44px !important;
-		}
-		.shopping-row > .icon-button {
-			order: 4;
 		}
 		.cooked-history-row {
 			grid-template-columns: 46px minmax(0, 1fr);
