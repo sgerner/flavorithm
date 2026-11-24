@@ -122,13 +122,15 @@ function sanitizePantry(value: unknown, fallback: Ingredient[]): Ingredient[] {
 		const category =
 			typeof raw.category === 'string' ? raw.category.slice(0, 100) || 'Pantry' : 'Pantry';
 		const expires = typeof raw.expires === 'string' ? raw.expires.trim().slice(0, 50) : '';
+		const sample = typeof raw.sample === 'boolean' ? raw.sample : undefined;
 		result.push({
 			id,
 			name,
 			quantity,
 			unit,
 			category,
-			...(expires ? { expires } : {})
+			...(expires ? { expires } : {}),
+			...(sample !== undefined ? { sample } : {})
 		});
 	}
 	return result;
@@ -195,7 +197,9 @@ function sanitizeRecipes(value: unknown, fallback: Recipe[]): Recipe[] {
 		const sourceTrimmed = typeof raw.source === 'string' ? raw.source.trim() : '';
 		const source = sourceTrimmed && isPublicHttpsUrl(sourceTrimmed) ? sourceTrimmed : undefined;
 		const provenance =
-			raw.provenance === 'web-import' || raw.provenance === 'ai-generated'
+			raw.provenance === 'web-import' ||
+			raw.provenance === 'ai-generated' ||
+			raw.provenance === 'manual'
 				? raw.provenance
 				: undefined;
 		const importNotes = Array.isArray(raw.importNotes)
@@ -209,6 +213,7 @@ function sanitizeRecipes(value: unknown, fallback: Recipe[]): Recipe[] {
 		const parsedRating = parseFiniteNumber(raw.rating);
 		const rating = parsedRating !== undefined ? Math.min(5, Math.max(0, parsedRating)) : undefined;
 		const saved = typeof raw.saved === 'boolean' ? raw.saved : undefined;
+		const sampleSaved = typeof raw.sampleSaved === 'boolean' ? raw.sampleSaved : undefined;
 		const hidden = typeof raw.hidden === 'boolean' ? raw.hidden : undefined;
 
 		result.push({
@@ -230,6 +235,7 @@ function sanitizeRecipes(value: unknown, fallback: Recipe[]): Recipe[] {
 			...(nutritionStale !== undefined ? { nutritionStale } : {}),
 			...(rating !== undefined ? { rating } : {}),
 			...(saved !== undefined ? { saved } : {}),
+			...(sampleSaved !== undefined ? { sampleSaved } : {}),
 			...(hidden !== undefined ? { hidden } : {})
 		});
 	}
@@ -255,6 +261,7 @@ function sanitizeMeals(value: unknown, fallback: Meal[]): Meal[] {
 		const parsedLeftovers = parseFiniteNumber(raw.leftoverServings);
 		const leftoverServings =
 			parsedLeftovers !== undefined ? Math.min(10_000, Math.max(0, parsedLeftovers)) : undefined;
+		const sample = typeof raw.sample === 'boolean' ? raw.sample : undefined;
 		result.push({
 			id,
 			date,
@@ -262,7 +269,8 @@ function sanitizeMeals(value: unknown, fallback: Meal[]): Meal[] {
 			recipeId,
 			servings,
 			...(completedAt !== undefined ? { completedAt } : {}),
-			...(leftoverServings !== undefined ? { leftoverServings } : {})
+			...(leftoverServings !== undefined ? { leftoverServings } : {}),
+			...(sample !== undefined ? { sample } : {})
 		});
 	}
 	return result;

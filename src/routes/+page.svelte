@@ -88,19 +88,28 @@
 		preferenceSummary
 	} from '#lib/domain.ts';
 	import {
+		backfillSampleData,
+		clearSampleData,
 		completeMeal,
 		deleteShoppingItem,
 		expiryStatus,
 		filterPantryItems,
+		hasSampleData,
 		listPantryCategories,
-		normalizePantryDraft,
 		normalizeIngredientName,
+		normalizePantryDraft,
+		promoteSampleIngredient,
+		normalizeShoppingItem,
 		reconcileShoppingList,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
+		revertShoppingItem,
+		snapshotShoppingItem,
 		transferPurchasedItemsToPantry,
 		unitInfo,
-		type PantryDraft
+		type PantryDraft,
+		type ShoppingItemDraft,
+		type ShoppingItemSnapshot
 	} from '#lib/kitchen-workflows.ts';
 	import { rankPantryRecipes, rankRecipes } from '#lib/discovery.ts';
 	import {
@@ -162,10 +171,18 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
-	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
+	import {
+		applyImportedRecipeSave,
+		canAppendImportTranscript,
+		cloneImportSession,
+		isReviewingImportDraft,
+		replaceImportSessionWithUrl
+	} from '#lib/import-session.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
+	let hasSampleRecords = $state(true);
 	let user = $state<User | null>(null);
 	let ready = $state(false);
 	let kitchenLoaded = $state(false);
@@ -388,6 +405,7 @@
 		editingRecipe = null;
 		editingRecipeMode = 'edit';
 		kitchen = createInitialState();
+		hasSampleRecords = true;
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
 		showStarter = false;
@@ -496,7 +514,11 @@
 		return () => clearVoiceSession();
 	});
 	$effect(() => {
-		if (voiceTarget && modal !== voiceTarget && (voiceStarting || voiceState !== 'idle')) {
+		if (
+			voiceTarget &&
+			(voiceStarting || voiceState !== 'idle') &&
+			(modal !== voiceTarget || (voiceTarget === 'import' && isReviewingImportDraft(importSession)))
+		) {
 			clearVoiceSession();
 		}
 	});
@@ -582,12 +604,8 @@
 	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
-	let editingShoppingDraft = $state<{
-		id: string;
-		name: string;
-		quantity: number | null;
-		unit: string;
-	} | null>(null);
+	let editingShoppingDraft = $state<(ShoppingItemDraft & { id: string }) | null>(null);
+	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -649,6 +667,7 @@
 				clearManagedIdentity();
 			} else {
 				kitchen = createInitialState();
+				hasSampleRecords = true;
 				localStorage.removeItem('flavorithm-last-account');
 				kitchenLoaded = true;
 			}
@@ -787,7 +806,15 @@
 		const normalized = normalizePantryDraft(draft);
 		kitchen.pantry = kitchen.pantry.map((item) => {
 			if (item.id !== draft.id) return item;
+			const currentCategory = item.category.trim() || 'Pantry';
+			const currentExpires = item.expires?.trim().slice(0, 50) || undefined;
+			const changed =
+				item.quantity !== normalized.quantity ||
+				item.unit !== normalized.unit ||
+				currentCategory !== normalized.category ||
+				currentExpires !== normalized.expires;
 			const updated: AppState['pantry'][number] = {
+				...(changed ? promoteSampleIngredient(item) : item),
 				id: item.id,
 				name: item.name,
 				quantity: normalized.quantity,
@@ -795,8 +822,10 @@
 				category: normalized.category
 			};
 			if (normalized.expires) updated.expires = normalized.expires;
+			else delete updated.expires;
 			return updated;
 		});
+		hasSampleRecords = hasSampleData(kitchen);
 		const editedId = draft.id;
 		pantryDraft = null;
 		if (!restoreFocus) return;
@@ -828,6 +857,7 @@
 	function removePantryItem(item: AppState['pantry'][number]) {
 		if (pantryDraft?.id === item.id) pantryDraft = null;
 		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
+		hasSampleRecords = hasSampleData(kitchen);
 	}
 	function resetPantryFilters() {
 		pantryQuery = '';
@@ -928,15 +958,59 @@
 			undo ? 10000 : 4200
 		);
 	}
-	function removeShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId === item.id) {
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+	function applyShoppingEdit(item: AppState['shopping'][number]) {
+		normalizeShoppingItem(item, editingShoppingDraft?.id === item.id ? editingShoppingDraft : null);
+	}
+	function clearEditingShoppingState() {
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+		editingShoppingSnapshot = null;
+	}
+	async function startEditingShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId && editingShoppingId !== item.id) {
+			const active = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
+			if (active) applyShoppingEdit(active);
 		}
+		editingShoppingSnapshot = snapshotShoppingItem(item);
+		editingShoppingId = item.id;
+		editingShoppingDraft = {
+			id: item.id,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit
+		};
+		await tick();
+		document
+			.querySelector<HTMLInputElement>(`[data-shopping-name="${CSS.escape(item.id)}"]`)
+			?.focus();
+	}
+	async function finishEditingShoppingItem(item: AppState['shopping'][number]) {
+		const id = item.id;
+		applyShoppingEdit(item);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	async function cancelEditingShoppingItem() {
+		const id = editingShoppingId;
+		if (!id) return;
+		const active = kitchen.shopping.find((entry) => entry.id === id);
+		if (active && editingShoppingSnapshot) revertShoppingItem(active, editingShoppingSnapshot);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	function removeShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId === item.id) clearEditingShoppingState();
 		const removed = structuredClone($state.snapshot(item));
 		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		notify(`${item.name} removed.`, () => {
+			if (editingShoppingId === removed.id) clearEditingShoppingState();
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
+			if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+				clearEditingShoppingState();
 		});
 	}
 	function consumeLeftoverServing(meal: Meal) {
@@ -970,6 +1044,7 @@
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
 		kitchen.meals = kitchen.meals.filter((entry) => entry.id !== meal.id);
+		hasSampleRecords = hasSampleData(kitchen);
 		refreshWeekShopping(weekStartForDate(meal.date));
 		notify('Planned meal removed.', () => {
 			if (
@@ -977,6 +1052,7 @@
 				!kitchen.meals.some((entry) => entry.id === removed.id)
 			) {
 				kitchen.meals.push(removed);
+				hasSampleRecords = hasSampleData(kitchen);
 				refreshWeekShopping(weekStartForDate(removed.date));
 			}
 		});
@@ -1077,7 +1153,9 @@
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				kitchen = sanitizeKitchenState(state);
+				const sanitized = sanitizeKitchenState(state);
+				kitchen = sanitized;
+				hasSampleRecords = hasSampleData(sanitized);
 			},
 			onStatus: (status) => {
 				syncReady = status.ready;
@@ -1130,19 +1208,23 @@
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			showStarter = false;
 		} else {
+			const started = localStorage.getItem('flavorithm-started') === 'yes';
 			try {
 				// The legacy key could contain a signed-in household. Preserve it separately without loading it.
 				quarantineLegacyKitchen(localStorage);
 				const local = localStorage.getItem('flavorithm-guest-kitchen');
 				if (local) {
 					const sanitized = sanitizeKitchenState(JSON.parse(local));
-					if (!themes.includes(sanitized.preferences.theme)) sanitized.preferences.theme = 'nosh';
-					kitchen = sanitized;
+					const loaded = started ? sanitized : backfillSampleData(sanitized);
+					if (!themes.includes(loaded.preferences.theme)) loaded.preferences.theme = 'nosh';
+					kitchen = loaded;
+					hasSampleRecords = hasSampleData(loaded);
 				}
 			} catch {}
-			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
+			showStarter = !started;
 			kitchenLoaded = true;
 		}
 		ready = true;
@@ -1171,6 +1253,7 @@
 					clearGuestData(localStorage);
 					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
+					hasSampleRecords = true;
 					kitchenLoaded = false;
 					showStarter = false;
 				}
@@ -1318,6 +1401,7 @@
 	});
 	function adoptKitchen(state: AppState) {
 		const sanitized = sanitizeKitchenState(state);
+		hasSampleRecords = hasSampleData(sanitized);
 		if (user && kitchenSync) {
 			const snapshotUser = $state.snapshot(user);
 			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
@@ -1394,19 +1478,41 @@
 	}
 
 	function freshKitchen() {
-		editingShoppingId = '';
-		editingShoppingDraft = null;
-		kitchen.pantry = [];
-		kitchen.meals = [];
-		kitchen.shopping = [];
-		kitchen.recipes = kitchen.recipes.map((r) => ({ ...r, rating: undefined, saved: false }));
+		clearEditingShoppingState();
+		if (!hasSampleData(kitchen)) {
+			hasSampleRecords = false;
+			showStarter = false;
+			if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
+			return;
+		}
+		const previousKitchen = sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)));
+		const wasShowingStarter = showStarter;
+		const previousStarted =
+			!user && !managedAuth ? localStorage.getItem('flavorithm-started') : null;
+		kitchen = clearSampleData(previousKitchen);
+		hasSampleRecords = hasSampleData(kitchen);
 		pantryDraft = null;
 		resetPantryFilters();
+		const appliedSnapshot = JSON.stringify(kitchen);
 		showStarter = false;
-		localStorage.setItem('flavorithm-started', 'yes');
-		page = 'pantry';
-		modal = 'pantry';
-		notify('Sample pantry and meal plan cleared. Starter recipes kept.');
+		if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
+		if (modal === 'settings') closeDialog();
+		notify('Sample data cleared.', () => {
+			if (JSON.stringify(kitchen) === appliedSnapshot) {
+				pantryDraft = null;
+				clearEditingShoppingState();
+				kitchen = previousKitchen;
+				hasSampleRecords = hasSampleData(previousKitchen);
+				if (wasShowingStarter && !user && !managedAuth) {
+					showStarter = true;
+					if (previousStarted === null) localStorage.removeItem('flavorithm-started');
+					else localStorage.setItem('flavorithm-started', previousStarted);
+				}
+				notify('Sample data restored.');
+			} else {
+				notify('Your kitchen changed again. Review the current values before editing.');
+			}
+		});
 	}
 	function navigate(id: string) {
 		commitInlineEdits();
@@ -1426,7 +1532,7 @@
 		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
 		const existingKeys = new Set(
 			kitchen.pantry
-				.filter((item) => !item.expires?.trim())
+				.filter((item) => !item.sample && !item.expires?.trim())
 				.map(
 					(item) => `${normalizeIngredientName(item.name)}\u0000${unitInfo(item.unit).dimension}`
 				)
@@ -1497,7 +1603,7 @@
 			clearTimeout(saveTimer);
 			const isRegister = authMode === 'register';
 			const guestKitchen = isRegister
-				? sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)))
+				? clearSampleData(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))))
 				: null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
 			const authenticatedUser: User = result.user;
@@ -1506,12 +1612,14 @@
 			clearHouseholdViewState();
 			stateEtag = null;
 			kitchen = guestKitchen ?? createNewUserState();
+			hasSampleRecords = hasSampleData(kitchen);
 			user = authenticatedUser;
 			kitchenSync?.prepare(authenticatedUser);
 			kitchenLoaded = true;
 			saveLastAccount(authenticatedUser);
 			if (guestKitchen) {
 				kitchen = guestKitchen;
+				hasSampleRecords = hasSampleData(guestKitchen);
 				kitchenSync?.stage(guestKitchen);
 				if (!syncErrors) {
 					clearGuestKitchen(localStorage);
@@ -1608,6 +1716,7 @@
 			pantryDraft = null;
 			resetPantryFilters();
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
@@ -2134,6 +2243,7 @@
 		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
+		hasSampleRecords = hasSampleData(kitchen);
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
@@ -2154,8 +2264,10 @@
 		}
 		const appliedSnapshot = JSON.stringify(kitchen);
 		notify('Basil’s changes applied.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) kitchen = previousKitchen;
-			else notify('Your kitchen changed again. Review the current values before editing.');
+			if (JSON.stringify(kitchen) === appliedSnapshot) {
+				kitchen = previousKitchen;
+				hasSampleRecords = hasSampleData(previousKitchen);
+			} else notify('Your kitchen changed again. Review the current values before editing.');
 		});
 		return appliedSnapshot;
 	}
@@ -2362,7 +2474,10 @@
 			return;
 		}
 		voiceError = '';
-		if (voiceTarget === 'import') activeVoiceImportSession = importSession;
+		if (voiceTarget === 'import') {
+			importSession.reviewingDraft = false;
+			activeVoiceImportSession = importSession;
+		}
 		await voiceCapture.retry({
 			provider: plan.provider,
 			model: voiceModel,
@@ -2377,10 +2492,13 @@
 	}
 	async function startDictation(forRecipe: boolean) {
 		if (voiceBusy) return;
-		if (forRecipe && !modal) {
-			mobileNav = false;
-			error = '';
-			modal = 'import';
+		if (forRecipe) {
+			importSession.reviewingDraft = false;
+			if (!modal) {
+				mobileNav = false;
+				error = '';
+				modal = 'import';
+			}
 		}
 		const plan = planVoiceStart({
 			forRecipe,
@@ -2406,6 +2524,9 @@
 		resumeDialog = '';
 		voiceStarting = true;
 		voiceTarget = plan.targetDialog;
+		if (plan.targetDialog === 'import') {
+			importSession.reviewingDraft = false;
+		}
 		if (modal !== plan.targetDialog) {
 			mobileNav = false;
 			error = '';
@@ -2422,12 +2543,24 @@
 				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
-				if (voiceCapture !== capture || user?.id !== owner || modal !== targetDialog) return;
-				voiceError = '';
+				if (voiceCapture !== capture) return;
 				if (targetDialog === 'import') {
-					if (importSession !== activeVoiceImportSession || importSession.draft) return;
+					if (
+						!activeVoiceImportSession ||
+						!canAppendImportTranscript({
+							modal,
+							currentSession: importSession,
+							startedSession: activeVoiceImportSession,
+							currentUserId: user?.id,
+							startedUserId: owner
+						})
+					)
+						return;
+					voiceError = '';
 					importSession.text = appendDictatedText('import', importSession.text, text);
 				} else {
+					if (user?.id !== owner || modal !== 'pantry') return;
+					voiceError = '';
 					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
 				}
@@ -2449,7 +2582,9 @@
 
 	function saveRecipe(r: Recipe) {
 		r.saved = !r.saved;
+		delete r.sampleSaved;
 		kitchen.recipes = [...kitchen.recipes];
+		hasSampleRecords = hasSampleData(kitchen);
 		notify(r.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
 	function toggleRecipeHidden(recipe: Recipe) {
@@ -2514,8 +2649,9 @@
 		const nutritionChanged =
 			JSON.stringify(previous.nutrition) !== JSON.stringify(updated.nutrition);
 		const zeroNutrition = hasZeroNutrition(updated.nutrition);
+		const { sampleSaved: _sampleSaved, ...cleanUpdated } = updated;
 		const saved = {
-			...updated,
+			...cleanUpdated,
 			saved: true,
 			nutritionStale: nutritionNeedsRefresh
 				? true
@@ -2526,6 +2662,7 @@
 						: previous.nutritionStale
 		};
 		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
+		hasSampleRecords = hasSampleData(kitchen);
 		editingRecipe = null;
 		notify(
 			nutritionNeedsRefresh ? 'Recipe updated. Refresh its nutrition estimate.' : 'Recipe updated.'
@@ -2619,6 +2756,8 @@
 		);
 		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -2627,9 +2766,12 @@
 		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
 		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
 		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
+		hasSampleRecords = hasSampleData(kitchen);
 		kitchen.shopping = kitchen.shopping.filter(
 			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
 		);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		if (kitchen.preferences.ratings) {
 			const ratings = { ...kitchen.preferences.ratings };
 			delete ratings[recipe.id];
@@ -2647,57 +2789,12 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
-	function startEditingShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId && editingShoppingId !== item.id) {
-			const previous = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (previous) normalizeShoppingItem(previous);
-		}
-		editingShoppingId = item.id;
-		editingShoppingDraft = {
-			id: item.id,
-			name: item.name,
-			quantity: item.quantity,
-			unit: item.unit
-		};
-	}
-	function finishEditingShoppingItem(item: AppState['shopping'][number]) {
-		normalizeShoppingItem(item);
-		editingShoppingId = '';
-		editingShoppingDraft = null;
-	}
-	function normalizeShoppingItem(item: AppState['shopping'][number]) {
-		const draft = editingShoppingDraft?.id === item.id ? editingShoppingDraft : null;
-		const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
-		const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
-		const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
-		const rawQuantity = draft ? draft.quantity : item.quantity;
-		const parsed =
-			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
-				? Number.NaN
-				: Number(rawQuantity);
-		const fallbackQuantity =
-			Number.isFinite(item.quantity) && item.quantity >= 0.01 && item.quantity <= 1_000_000
-				? item.quantity
-				: 1;
-		const quantity = Number.isFinite(parsed)
-			? Math.max(0.01, Math.min(parsed, 1_000_000))
-			: fallbackQuantity;
-		item.name = name;
-		item.unit = unit;
-		item.quantity = quantity;
-		if (draft) {
-			draft.name = name;
-			draft.unit = unit;
-			draft.quantity = quantity;
-		}
-	}
 	function commitInlineEdits() {
 		if (pantryDraft) void savePantryEdit(false);
 		if (editingShoppingId) {
 			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (item) normalizeShoppingItem(item);
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+			if (item) applyShoppingEdit(item);
+			clearEditingShoppingState();
 		}
 	}
 	function addShoppingQuickItem() {
@@ -2742,7 +2839,7 @@
 		}
 		const existingKeys = new Set(
 			kitchen.pantry
-				.filter((item) => !item.expires?.trim())
+				.filter((item) => !item.sample && !item.expires?.trim())
 				.map(
 					(item) => `${normalizeIngredientName(item.name)}\u0000${unitInfo(item.unit).dimension}`
 				)
@@ -2787,6 +2884,7 @@
 			notify('Enter a valid serving count before making a shopping list.');
 			return;
 		}
+		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
@@ -2876,6 +2974,8 @@
 		meal.date = updatedDate;
 		meal.slot = mealSlot;
 		meal.servings = Math.round(plannedServings);
+		delete meal.sample;
+		hasSampleRecords = hasSampleData(kitchen);
 		refreshWeekShopping(previousWeek);
 		refreshWeekShopping(weekStartForDate(meal.date));
 		weekOffset = weekOffsetForDate(updatedDate);
@@ -2911,6 +3011,7 @@
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
+		hasSampleRecords = hasSampleData(kitchen);
 		refreshWeekShopping(startDate);
 		resetMealDialogState();
 		modal = '';
@@ -2927,6 +3028,7 @@
 		if (!result.restockedCount) return;
 		kitchen.pantry = result.pantry;
 		kitchen.shopping = result.shopping;
+		hasSampleRecords = hasSampleData(kitchen);
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
 		const singleName =
@@ -2947,6 +3049,9 @@
 			) {
 				kitchen.pantry = previousPantry;
 				kitchen.shopping = previousShopping;
+				hasSampleRecords = hasSampleData(kitchen);
+				if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+					clearEditingShoppingState();
 			} else {
 				notify('Your kitchen changed again. Review the current items before editing.');
 			}
@@ -3162,6 +3267,7 @@
 					clearHouseholdViewState();
 					stateEtag = null;
 					kitchen = createNewUserState();
+					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -3253,8 +3359,18 @@
 	}
 	function importRecipe(url: string) {
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = { ...emptyImportSession(), url };
+		const { session, previous } = replaceImportSessionWithUrl($state.snapshot(importSession), url);
+		importSession = session;
 		openImport();
+		if (previous) {
+			notify('Recipe link loaded. Undo to restore your previous import.', () => {
+				if (voiceTarget === 'import') clearVoiceSession();
+				importSession = cloneImportSession(previous);
+				resumeDialog = '';
+				error = '';
+				modal = 'import';
+			});
+		}
 	}
 	async function captureImport(
 		input: { url?: string; prompt: string; image?: string },
@@ -3267,22 +3383,51 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const nutritionStale =
-			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
-		const saved = { ...recipe, saved: true, nutritionStale };
-		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		const previousPage = page;
+		const previousQuery = query;
+		const previousFilter = filter;
+		const applied = applyImportedRecipeSave(
+			$state.snapshot(kitchen),
+			$state.snapshot(importSession),
+			recipe
+		);
+		kitchen.recipes = applied.nextRecipes;
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = emptyImportSession();
+		importSession = applied.nextSession;
 		resumeDialog = '';
 		modal = '';
-		selected = saved;
+		selected = applied.saved;
 		page = 'saved';
 		query = '';
 		filter = 'For you';
 		notify(
-			nutritionStale
+			applied.saved.nutritionStale
 				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
-				: 'Recipe saved to your collection.'
+				: 'Recipe saved to your collection.',
+			() => {
+				const rolledBack = applied.rollback($state.snapshot(kitchen));
+				if (!rolledBack.ok) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				if (voiceTarget === 'import') clearVoiceSession();
+				kitchen = rolledBack.kitchen;
+				if (selected?.id === applied.saved.id) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				if (editingRecipeMode === 'edit' && editingRecipe?.id === applied.saved.id) {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}
+				importSession = rolledBack.session;
+				resumeDialog = '';
+				error = '';
+				page = previousPage;
+				query = previousQuery;
+				filter = previousFilter;
+				modal = 'import';
+			}
 		);
 	}
 	async function exportKitchen() {
@@ -3338,6 +3483,7 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
+			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
@@ -3416,6 +3562,7 @@
 					clearHouseholdViewState();
 					stateEtag = null;
 					kitchen = createNewUserState();
+					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -3513,7 +3660,8 @@
 <svelte:window
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
-			if (!modal && !selected && !editingRecipe && !mobileNav && pantryDraft) {
+			const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
+			if (!overlayOpen && pantryDraft) {
 				void cancelPantryEdit();
 			}
 			mobileNav = false;
@@ -3521,6 +3669,10 @@
 			selected = null;
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
+			if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
+				e.preventDefault();
+				void cancelEditingShoppingItem();
+			}
 		}
 	}}
 />
@@ -3634,7 +3786,7 @@
 					}}
 					exportPending={exportPendingChanges}
 				/>{/if}
-			{#if showStarter}<div class="starter-note">
+			{#if showStarter && hasSampleRecords}<div class="starter-note">
 					<span><Sparkles size={14} /> Sample kitchen</span><button onclick={freshKitchen}
 						>Start fresh <ArrowRight size={13} /></button
 					><button
@@ -3927,21 +4079,26 @@
 					>
 				</section>
 				<div class="pantry-summary">
-					<span><b>{kitchen.pantry.length}</b> ingredients</span>
-					{#if kitchen.pantry.some((item) => Number.isFinite(item.quantity) && item.quantity <= 0)}<span
-							class="depleted-actions"
-							><button class="text-button restock-depleted" onclick={() => restockPantryItems()}
-								><ShoppingBasket size={16} />Restock depleted items</button
-							><button
-								class="text-button"
-								onclick={() => {
-									commitInlineEdits();
-									kitchen.pantry = kitchen.pantry.filter(
-										(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
-									);
-								}}>Clear depleted items</button
-							></span
-						>{/if}
+					<span class="pantry-summary-meta"
+						><span><b>{kitchen.pantry.length}</b> ingredients</span
+						>{#if kitchen.pantry.some((item) => Number.isFinite(item.quantity) && item.quantity <= 0)}<span
+								class="depleted-actions"
+								><button class="text-button restock-depleted" onclick={() => restockPantryItems()}
+									><ShoppingBasket size={16} />Restock depleted items</button
+								><button
+									class="text-button"
+									onclick={() => {
+										commitInlineEdits();
+										kitchen.pantry = kitchen.pantry.filter(
+											(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
+										);
+										hasSampleRecords = hasSampleData(kitchen);
+									}}>Clear depleted items</button
+								></span
+							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
+								>Clear sample data</button
+							>{/if}</span
+					>
 					<div>
 						<button
 							class="secondary"
@@ -4031,7 +4188,11 @@
 												<span class="pantry-ingredient">
 													<span class="ingredient-symbol" aria-hidden="true"
 														>{ingredientEmoji(item.name)}</span
-													><b class="pantry-name">{item.name}</b>
+													><span class="ingredient-title-line"
+														><b class="pantry-name">{item.name}</b>{#if item.sample}<small
+																class="sample-badge">Sample</small
+															>{/if}</span
+													>
 												</span>
 												<div class="pantry-edit-actions">
 													<button type="submit" class="primary pantry-done-button">Done</button
@@ -4084,7 +4245,11 @@
 											<span class="ingredient-symbol" aria-hidden="true"
 												>{ingredientEmoji(item.name)}</span
 											><span class="ingredient-meta"
-												><b class="pantry-name">{item.name}</b><span class="ingredient-tags"
+												><span class="ingredient-title-line"
+													><b class="pantry-name">{item.name}</b>{#if item.sample}<small
+															class="sample-badge">Sample</small
+														>{/if}</span
+												><span class="ingredient-tags"
 													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
 													>{#if depleted}<button
 															type="button"
@@ -4345,8 +4510,18 @@
 									type="button"
 									class:active={shoppingFilter === option.id}
 									aria-pressed={shoppingFilter === option.id}
-									onclick={() => (shoppingFilter = option.id)}
-									>{option.label}<span>{option.count}</span></button
+									onclick={() => {
+										if (option.id === 'unpurchased' && editingShoppingId) {
+											const active = kitchen.shopping.find(
+												(entry) => entry.id === editingShoppingId
+											);
+											if (active?.checked) {
+												applyShoppingEdit(active);
+												clearEditingShoppingState();
+											}
+										}
+										shoppingFilter = option.id;
+									}}>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
 						<form
@@ -4371,67 +4546,89 @@
 								out:fadeMotion={{ duration: 120 }}
 							>
 								<button
+									type="button"
+									role="checkbox"
+									aria-checked={item.checked}
 									class="check-box"
 									class:checked={item.checked}
 									aria-label={`Mark ${item.name} ${item.checked ? 'needed' : 'purchased'}`}
-									onclick={() => (item.checked = !item.checked)}
+									onclick={() => {
+										item.checked = !item.checked;
+										if (
+											shoppingFilter === 'unpurchased' &&
+											item.checked &&
+											editingShoppingId === item.id
+										) {
+											applyShoppingEdit(item);
+											clearEditingShoppingState();
+										}
+									}}
 									>{#if item.checked}<Check size={16} />{/if}</button
 								>
-								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<div
-										class="shopping-item-edit"
+								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<form
+										class="shopping-edit-form"
+										novalidate
+										onsubmit={(e) => {
+											e.preventDefault();
+											void finishEditingShoppingItem(item);
+										}}
 									>
-										<input
-											class="shopping-name"
-											aria-label="Shopping item name"
-											bind:value={editingShoppingDraft.name}
-											maxlength="200"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
-									</div>
-									<span class="shopping-quantity"
-										><input
-											aria-label={`Quantity of ${item.name}`}
-											type="number"
-											min="0.01"
-											max="1000000"
-											step="0.01"
-											bind:value={editingShoppingDraft.quantity}
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><input
-											aria-label={`Unit for ${item.name}`}
-											bind:value={editingShoppingDraft.unit}
-											maxlength="40"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/></span
-									>
-									<button class="text-button" onclick={() => finishEditingShoppingItem(item)}
-										>Done</button
-									>
+										<div class="shopping-item-edit">
+											<input
+												class="shopping-name"
+												data-shopping-name={item.id}
+												aria-label="Shopping item name"
+												bind:value={editingShoppingDraft.name}
+												maxlength="200"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
+										</div>
+										<span class="shopping-quantity"
+											><input
+												aria-label={`Quantity of ${item.name}`}
+												type="number"
+												min="0.01"
+												max="1000000"
+												step="0.01"
+												bind:value={editingShoppingDraft.quantity}
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><input
+												aria-label={`Unit for ${item.name}`}
+												bind:value={editingShoppingDraft.unit}
+												maxlength="40"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/></span
+										>
+										<button type="submit" class="text-button">Done</button>
+									</form>
 								{:else}
 									<div class="shopping-item-edit">
-										<b class="shopping-name">{item.name}</b><small class="shopping-source"
-											>{shoppingSourceLabel(item.sourceKey)}</small
-										>
+										<button
+											type="button"
+											tabindex="-1"
+											class="shopping-name"
+											onclick={() => (item.checked = !item.checked)}>{item.name}</button
+										><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
 									</div>
 									<span class="shopping-quantity"
 										>{item.quantity}
 										{item.unit}<button
+											type="button"
 											class="text-button"
+											data-shopping-edit={item.id}
 											aria-label={`Edit ${item.name}`}
-											onclick={() => startEditingShoppingItem(item)}>Edit</button
+											onclick={() => void startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
 								{/if}
 								<button
+									type="button"
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
 									onclick={() => removeShoppingItem(item)}><X size={15} /></button
@@ -4467,8 +4664,12 @@
 	{scanBusy ? 'Scanning photo for ingredients…' : toast}
 </div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
-			onclick={() => (toast = '')}
+		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}>Undo</button
+			>{/if}<button
+			onclick={() => {
+				toast = '';
+				toastUndo = null;
+			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
@@ -4539,7 +4740,10 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if modal === voiceTarget && voiceBusy}<div class="voice-session" in:revealMotion>
+				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceBusy}<div
+						class="voice-session"
+						in:revealMotion
+					>
 						<p role="status" aria-live="polite">
 							{voiceStarting
 								? 'Opening microphone…'
@@ -4556,7 +4760,7 @@
 								>Cancel voice</button
 							>
 						</div>
-					</div>{:else if modal === voiceTarget && voiceRetained}<div
+					</div>{:else if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceRetained}<div
 						class="voice-session voice-recovery"
 						in:revealMotion
 					>
@@ -4901,7 +5105,16 @@
 						/>
 					</div>
 
-					{#if user}<div class="settings-section">
+					{#if hasSampleRecords}<div class="settings-section">
+							<h3>Sample data</h3>
+							<p class="muted">
+								Remove untouched starter ingredients, planned meals, and saved recipe bookmarks
+								while keeping everything you added or edited.
+							</p>
+							<div class="dialog-actions">
+								<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
+							</div>
+						</div>{/if}{#if user}<div class="settings-section">
 							<h3>Your data</h3>
 							<p class="muted">
 								{managedAuth
@@ -5453,6 +5666,16 @@
 		background: color-mix(in srgb, currentColor 12%, transparent);
 		text-align: center;
 	}
+	.pantry-summary-meta {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 8px 18px;
+	}
+	.pantry-summary-meta > button {
+		min-height: 44px;
+		min-width: 44px;
+	}
 	.pantry-ingredient {
 		min-width: 0;
 	}
@@ -5462,6 +5685,22 @@
 		flex-direction: column;
 		align-items: flex-start;
 		gap: 4px;
+	}
+	.ingredient-title-line {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.sample-badge {
+		padding: 1px 6px;
+		border: 1px solid var(--line);
+		background: var(--wash);
+		color: var(--muted);
+		font-size: 11px;
+		font-weight: 500;
+		letter-spacing: 0.4px;
+		text-transform: uppercase;
 	}
 	.pantry-name {
 		overflow-wrap: anywhere;
@@ -5616,6 +5855,9 @@
 		min-height: 44px;
 		padding: 8px 14px;
 	}
+	.shopping-edit-form {
+		display: contents;
+	}
 	.shopping-item-edit {
 		min-width: 100px;
 		flex: 1 1 180px;
@@ -5623,16 +5865,29 @@
 		flex-direction: column;
 		gap: 3px;
 	}
-	.shopping-name {
+	button.shopping-name {
 		width: 100%;
 		min-width: 0;
-		padding: 4px 5px;
+		min-height: 44px;
+		padding: 8px 5px;
+		display: flex;
+		align-items: center;
+		text-align: left;
 		font-weight: 500;
+		overflow-wrap: anywhere;
+	}
+	.shopping-row.checked button.shopping-name {
+		color: var(--muted);
 	}
 	input.shopping-name {
-		padding: 7px 8px;
+		width: 100%;
+		min-width: 0;
+		min-height: 44px;
+		padding: 7px 5px;
 		border: 1px solid var(--control-border);
 		background: var(--surface);
+		font-size: 16px;
+		font-weight: 500;
 	}
 	.shopping-source {
 		padding-left: 5px;
@@ -5648,12 +5903,13 @@
 	}
 	.shopping-quantity input {
 		min-width: 0;
+		min-height: 44px;
 		width: 72px;
-		padding: 7px 6px;
+		padding: 7px 5px;
 		border: 1px solid var(--control-border);
 		background: var(--surface);
 		text-align: right;
-		font-size: 14px;
+		font-size: 16px;
 	}
 	.shopping-quantity input:last-child {
 		width: 70px;
@@ -5864,15 +6120,10 @@
 		}
 		.shopping-item-edit {
 			flex-basis: calc(100% - 66px);
-			order: 2;
 		}
 		.shopping-quantity {
-			order: 3;
 			flex: 1 1 auto;
 			margin-left: 44px !important;
-		}
-		.shopping-row > .icon-button {
-			order: 4;
 		}
 		.cooked-history-row {
 			grid-template-columns: 46px minmax(0, 1fr);
