@@ -12,7 +12,11 @@ import {
 
 export const GET: RequestHandler = async ({ locals }) => {
 	try {
-		if (!locals.user) return Response.json({ error: 'Authentication required' }, { status: 401 });
+		if (!locals.user)
+			return Response.json(
+				{ error: 'Authentication required', code: 'session_expired' },
+				{ status: 401 }
+			);
 		const state = getState(locals.user);
 		return Response.json(
 			{ state, userId: locals.user.id, householdId: locals.user.householdId },
@@ -26,7 +30,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 export const PUT: RequestHandler = async ({ request, locals }) => {
 	try {
 		assertSameOrigin(request);
-		if (!locals.user) throw new ApiError(401, 'Authentication required');
+		if (!locals.user) throw new ApiError(401, 'Authentication required', 'session_expired');
 		const body = await readJson(request);
 		if (typeof body !== 'object' || body === null || !('state' in body))
 			throw new ApiError(400, 'A state object is required');

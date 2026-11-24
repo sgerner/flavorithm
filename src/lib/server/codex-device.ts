@@ -33,8 +33,8 @@ type Attempt = {
 	result?: { connected: true; accountId: string; planEnabled: true };
 };
 
-function fail(status: number, message: string): never {
-	throw new ApiError(status, message);
+function fail(status: number, message: string, code?: string): never {
+	throw new ApiError(status, message, code);
 }
 async function providerJson(url: string, body: object | URLSearchParams, fetcher: typeof fetch) {
 	let response: Response;
@@ -89,7 +89,7 @@ async function providerJson(url: string, body: object | URLSearchParams, fetcher
 }
 function live(userId: string, session: string) {
 	if (!isSessionBindingActive(userId, session))
-		fail(401, 'Your Flavorithm session expired. Sign in again.');
+		fail(401, 'Your Flavorithm session expired. Sign in again.', 'session_expired');
 }
 export function codexTokenExpiry(token: string, expiresIn?: unknown): number {
 	let exp = 0;

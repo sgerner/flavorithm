@@ -29,11 +29,15 @@ function upstreamFailure(value: unknown, status = 502): ChatGPTInferenceError {
 	const code =
 		body?.error?.code || body?.response?.error?.code || (value as { code?: string })?.code;
 	if (code && knownErrors[code])
-		return new ChatGPTInferenceError(knownErrors[code], /limit/.test(code) ? 429 : status, code);
+		return new ChatGPTInferenceError(
+			knownErrors[code],
+			/limit/.test(code) ? 429 : status === 401 ? 502 : status,
+			code
+		);
 	if (status === 401)
 		return new ChatGPTInferenceError(
 			'Your ChatGPT connection needs to be renewed. Reconnect the selected account.',
-			401,
+			502,
 			code
 		);
 	if (status === 403)

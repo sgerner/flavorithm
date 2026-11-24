@@ -171,9 +171,26 @@ test('client-supplied bearer value cannot activate ChatGPT plan inference withou
 					return new Response();
 				}
 			),
-		{ status: 401 }
+		{ status: 409, code: 'provider_auth' }
 	);
 	assert.equal(called, false);
+});
+
+test('upstream ChatGPT 401 responses map to 502 instead of Flavorithm session 401', async () => {
+	await assert.rejects(
+		() =>
+			chatGPTResponse(options, async () =>
+				Response.json({ error: { message: 'token expired' } }, { status: 401 })
+			),
+		{ status: 502 }
+	);
+	await assert.rejects(
+		() =>
+			listChatGPTModels('expired-token', async () =>
+				Response.json({ error: { code: 'subscription_sharing_invalid_user' } }, { status: 401 })
+			),
+		{ status: 502, code: 'subscription_sharing_invalid_user' }
+	);
 });
 
 test('recipe generation uses the server-resolved ChatGPT token and includes actual taste ratings', async () => {

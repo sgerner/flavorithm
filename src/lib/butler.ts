@@ -121,7 +121,8 @@ const preferences = z
 			budgetTokens: z.number().int().min(0).max(32768).optional()
 		}),
 		ratings: z.record(id, z.number().min(0).max(5)),
-		chatgptAccountId: z.string().max(100)
+		chatgptAccountId: z.string().max(100),
+		usePersonalAI: z.boolean()
 	})
 	.partial()
 	.strict();

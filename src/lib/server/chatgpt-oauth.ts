@@ -1534,9 +1534,18 @@ export async function getChatGPTConnection(
 	accountId: string,
 	fetcher: typeof fetch
 ) {
-	const accessToken = await getChatGPTAccessToken(userId, accountId);
+	let accessToken: string;
+	try {
+		accessToken = await getChatGPTAccessToken(userId, accountId);
+	} catch (error) {
+		if (error instanceof ChatGPTOAuthError && error.status === 401) {
+			throw new ChatGPTOAuthError(409, error.message, 'provider_auth');
+		}
+		throw error;
+	}
 	const account = getChatGPTAccount(userId, accountId);
-	if (!account?.credentialEnvelope) throw new ApiError(401, 'Reconnect your ChatGPT account.');
+	if (!account?.credentialEnvelope)
+		throw new ApiError(409, 'Reconnect your ChatGPT account.', 'provider_auth');
 	if (account.clientId !== CODEX_CLIENT_ID) return { accessToken, fetcher, codex: false };
 	const credentials = decryptChatGPTCredentials(
 		userId,
@@ -1544,7 +1553,8 @@ export async function getChatGPTConnection(
 		account.mode,
 		account.credentialEnvelope
 	);
-	if (!credentials.codexAccountId) throw new ApiError(401, 'Reconnect your Codex subscription.');
+	if (!credentials.codexAccountId)
+		throw new ApiError(409, 'Reconnect your Codex subscription.', 'provider_auth');
 	return {
 		accessToken,
 		codex: true,

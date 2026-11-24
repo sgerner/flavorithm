@@ -117,7 +117,7 @@ export const POST: RequestHandler = async (event) => {
 		if (!ip) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`auth-ip:${ip}`, 20, 15 * 60 * 1000);
 		if (payload.action === 'deleteAccount') {
-			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
+			if (!event.locals.user) throw new ApiError(401, 'Authentication required', 'session_expired');
 			consumeRateLimit(`delete-account:${event.locals.user.id}`, 5, 15 * 60 * 1000);
 			await deleteUserAccount(event.locals.user.id, payload.password);
 			event.cookies.delete('flavorithm_session', { path: '/' });
@@ -148,7 +148,7 @@ export const POST: RequestHandler = async (event) => {
 			});
 		}
 		if (payload.action === 'requestEmailVerification') {
-			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
+			if (!event.locals.user) throw new ApiError(401, 'Authentication required', 'session_expired');
 			const apiKey = process.env.RESEND_API_KEY?.trim();
 			const from = process.env.EMAIL_FROM?.trim();
 			if (!apiKey || !from) {

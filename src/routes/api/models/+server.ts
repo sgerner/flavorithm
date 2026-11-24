@@ -1,4 +1,4 @@
-import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
+import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
@@ -8,18 +8,29 @@ import { AIRequestError, getPublicModelCatalog, resolvePublicFetcher } from '#li
 export const GET: RequestHandler = async (event) => {
 	const { locals, url } = event;
 	const catalogFetcher = resolvePublicFetcher(event);
-	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
+	if (!locals.user)
+		return Response.json(
+			{ error: 'Authentication required', code: 'session_expired' },
+			{ status: 401 }
+		);
 
 	try {
 		if (url.searchParams.get('connection') === 'chatgpt') {
 			const accountId = url.searchParams.get('accountId');
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			const host = accountId === HOST_CONNECTION_ID ? getHostAI() : null;
+			const isHostAccount = accountId === HOST_CONNECTION_ID;
+			const host = isHostAccount ? getHostAIFor(locals.user.id) : null;
+			if (isHostAccount && !host) {
+				return Response.json(
+					{ providers: [{ id: 'chatgpt', name: 'ChatGPT plan', models: [] }] },
+					{ headers: { 'cache-control': 'no-store' } }
+				);
+			}
 			const catalogPromise = getPublicModelCatalog(catalogFetcher).catch(() => null);
 			const connection = await getChatGPTConnection(
-				host?.userId ?? locals.user.id,
-				host?.accountId ?? accountId,
-				catalogFetcher
+				host ? host.userId : locals.user.id,
+				host ? host.accountId : accountId,
+				event.fetch
 			);
 			const [result, catalogData] = await Promise.all([
 				listChatGPTModels(connection.accessToken, connection.fetcher),
@@ -40,9 +51,15 @@ export const GET: RequestHandler = async (event) => {
 		});
 	} catch (error) {
 		if (error instanceof ApiError || error instanceof ChatGPTInferenceError)
-			return Response.json({ error: error.message }, { status: error.status });
+			return Response.json(
+				error.code ? { error: error.message, code: error.code } : { error: error.message },
+				{ status: error.status }
+			);
 		if (error instanceof AIRequestError) {
-			return Response.json({ error: error.message }, { status: error.status });
+			return Response.json(
+				error.code ? { error: error.message, code: error.code } : { error: error.message },
+				{ status: error.status }
+			);
 		}
 		return Response.json({ error: 'The model catalog could not be loaded.' }, { status: 500 });
 	}

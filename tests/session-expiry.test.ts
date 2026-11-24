@@ -35,8 +35,12 @@ registerHooks({
 
 const backendPath: string = '../src/lib/server/db.ts';
 const backend = await import(backendPath);
+const oauthStorage = await import('../src/lib/server/oauth-storage.ts');
+const { AIRequestError, runAIRequest } = await import('../src/lib/server/ai.ts');
 const authRoute = await import('../src/routes/api/auth/+server.ts');
 const stateRoute = await import('../src/routes/api/state/+server.ts');
+const aiRoute = await import('../src/routes/api/ai/+server.ts');
+const modelsRoute = await import('../src/routes/api/models/+server.ts');
 const syncStatusPath: string = '../src/lib/components/SyncStatus.svelte';
 const { default: SyncStatus } = await import(syncStatusPath);
 
@@ -124,6 +128,29 @@ function createServerClient() {
 				etag: response.headers.get('etag') || '',
 				data: await response.json()
 			};
+		},
+		async postAI(body: Record<string, unknown>, fetcher: typeof fetch = fetch) {
+			const response = await aiRoute.POST({
+				locals: currentLocals(),
+				fetch: fetcher,
+				request: new Request('https://flavorithm.example/api/ai', {
+					method: 'POST',
+					headers: {
+						origin: 'https://flavorithm.example',
+						'content-type': 'application/json'
+					},
+					body: JSON.stringify(body)
+				})
+			} as never);
+			return { status: response.status, data: await response.json() };
+		},
+		async getModels(search = '', fetcher: typeof fetch = fetch) {
+			const response = await modelsRoute.GET({
+				locals: currentLocals(),
+				fetch: fetcher,
+				url: new URL(`https://flavorithm.example/api/models${search}`)
+			} as never);
+			return { status: response.status, data: await response.json() };
 		}
 	};
 }
@@ -183,9 +210,12 @@ function createClientHarness(
 				if (!online) throw new Error('Offline');
 				const res = await server.getState();
 				if (res.status !== 200) {
-					if (res.status === 401 && user) markSessionExpired(true);
+					if (res.status === 401 && user && res.data?.code === 'session_expired') {
+						markSessionExpired(true);
+					}
 					throw Object.assign(new Error(res.data.error || 'Could not load your kitchen.'), {
-						status: res.status
+						status: res.status,
+						code: res.data.code
 					});
 				}
 				return {
@@ -206,9 +236,12 @@ function createClientHarness(
 					etag || null
 				);
 				if (res.status !== 200) {
-					if (res.status === 401 && user) markSessionExpired(true);
+					if (res.status === 401 && user && res.data?.code === 'session_expired') {
+						markSessionExpired(true);
+					}
 					throw Object.assign(new Error(res.data.error || 'Could not sync your kitchen.'), {
-						status: res.status
+						status: res.status,
+						code: res.data.code
 					});
 				}
 				return { state: res.data.state, etag: res.etag };
@@ -492,6 +525,43 @@ function createClientHarness(
 			mutator(next);
 			kitchen = next;
 			runReactivePersistence();
+		},
+		async callAI(body: Record<string, unknown>, fetcher?: typeof fetch) {
+			const res = await server.postAI(body, fetcher);
+			if (res.status < 200 || res.status >= 300) {
+				if (res.status === 401 && user && res.data?.code === 'session_expired') {
+					markSessionExpired(true);
+				}
+				throw Object.assign(
+					new Error(res.data.error || 'Something went wrong. Please try again.'),
+					{
+						status: res.status,
+						code: res.data.code
+					}
+				);
+			}
+			return res.data;
+		},
+		async callModels(search = '', fetcher?: typeof fetch) {
+			const res = await server.getModels(search, fetcher);
+			if (res.status < 200 || res.status >= 300) {
+				if (
+					res.status < 500 &&
+					res.status === 401 &&
+					user &&
+					res.data?.code === 'session_expired'
+				) {
+					markSessionExpired(true);
+				}
+				throw Object.assign(
+					new Error(res.data.error || 'Something went wrong. Please try again.'),
+					{
+						status: res.status,
+						code: res.data.code
+					}
+				);
+			}
+			return res.data;
 		},
 		retrySync,
 		mount,
@@ -815,4 +885,165 @@ test('signing out or registering during sessionExpired isolates prior journals a
 		JSON.parse(storage.getItem('flavorithm-guest-kitchen')!).pantry,
 		customGuest.pantry
 	);
+});
+
+test('provider credential errors on /api/ai and /api/models keep sessionExpired false and sync active while real session_expired 401s pause sync', async () => {
+	const server = createServerClient();
+	const storage = createStorage();
+	const app = createClientHarness(server, storage);
+	await app.mount();
+
+	const password = 'A very strong test password 123!';
+	await server.postAuth(
+		{ action: 'register', name: 'Provider Tester', email: 'provider-auth@example.test', password },
+		'10.0.0.5'
+	);
+	await app.authenticate({
+		action: 'login',
+		email: 'provider-auth@example.test',
+		password,
+		ip: '10.0.0.5'
+	});
+	assert.equal(app.sessionExpired, false);
+
+	// 1. Missing ChatGPT connection context throws 409 provider_auth ("Connect a ChatGPT account before using your plan.") — never 401.
+	await assert.rejects(
+		() =>
+			runAIRequest({
+				action: 'vision',
+				provider: 'chatgpt',
+				model: 'gpt-4o-mini',
+				image: 'data:image/png;base64,aGVsbG8='
+			}),
+		(err: unknown) =>
+			err instanceof AIRequestError &&
+			err.status === 409 &&
+			err.code === 'provider_auth' &&
+			/Connect a ChatGPT account/i.test(err.message)
+	);
+
+	// 2. Expired ChatGPT OAuth token (no refresh token) returns 409 provider_auth on /api/ai and /api/models without expiring the Flavorithm session.
+	const expiredAccount = oauthStorage.saveChatGPTAccount({
+		userId: app.user!.id,
+		mode: 'local',
+		clientId: 'dynamic_agent_client',
+		subject: 'expired-oauth-subject',
+		email: 'provider-auth@example.test',
+		scopes: ['openid', 'chatgpt.tokens.use.direct'],
+		credentials: {
+			accessToken: 'expired-access-token',
+			refreshToken: '',
+			idToken: 'expired-id-token'
+		},
+		expiresAt: Date.now() - 60_000,
+		earliestRefreshAt: 0
+	});
+
+	await assert.rejects(
+		() =>
+			app.callAI({
+				action: 'vision',
+				usePersonalAI: true,
+				provider: 'chatgpt',
+				connectionId: expiredAccount.id,
+				model: 'gpt-4o-mini',
+				image: 'data:image/png;base64,aGVsbG8='
+			}),
+		{
+			status: 409,
+			code: 'provider_auth',
+			message: 'Reconnect this ChatGPT account to continue.'
+		}
+	);
+	assert.equal(app.sessionExpired, false);
+	assert.equal(app.notifications.length, 0);
+
+	await assert.rejects(
+		() => app.callModels(`?connection=chatgpt&accountId=${encodeURIComponent(expiredAccount.id)}`),
+		{
+			status: 409,
+			code: 'provider_auth',
+			message: 'Reconnect this ChatGPT account to continue.'
+		}
+	);
+	assert.equal(app.sessionExpired, false);
+
+	// 3. Upstream OpenAI 401 with an active local token maps to 502 on /api/ai without expiring the Flavorithm session.
+	const liveAccount = oauthStorage.saveChatGPTAccount({
+		userId: app.user!.id,
+		mode: 'local',
+		clientId: 'dynamic_agent_client_live',
+		subject: 'live-oauth-subject',
+		email: 'provider-auth@example.test',
+		scopes: ['openid', 'chatgpt.tokens.use.direct'],
+		credentials: {
+			accessToken: 'live-access-token',
+			refreshToken: 'live-refresh-token',
+			idToken: 'live-id-token'
+		},
+		expiresAt: Date.now() + 3_600_000,
+		earliestRefreshAt: 0
+	});
+	await assert.rejects(
+		() =>
+			app.callAI(
+				{
+					action: 'vision',
+					usePersonalAI: true,
+					provider: 'chatgpt',
+					connectionId: liveAccount.id,
+					model: 'gpt-4o-mini',
+					image: 'data:image/png;base64,aGVsbG8='
+				},
+				async () => Response.json({ error: { message: 'upstream 401' } }, { status: 401 })
+			),
+		{
+			status: 502,
+			message: 'Your ChatGPT connection needs to be renewed. Reconnect the selected account.'
+		}
+	);
+	assert.equal(app.sessionExpired, false);
+	assert.equal(app.notifications.length, 0);
+
+	// Kitchen sync continues scheduling and syncing edits after provider errors.
+	const syncCountBeforeEdit = app.autoSyncCount;
+	app.mutateKitchen((draft) => {
+		draft.pantry = [
+			{ id: 'synced-olive-oil', name: 'olive oil', quantity: 1, unit: 'bottle', category: 'Pantry' }
+		];
+	});
+	assert.equal(app.autoSyncCount, syncCountBeforeEdit + 1);
+	await app.retrySync();
+	assert.equal(app.syncStatus.pending, false);
+	const persisted = await server.getState();
+	assert.equal(persisted.status, 200);
+	assert.equal(persisted.data.state.pantry[0].id, 'synced-olive-oil');
+
+	// 4. Genuine Flavorithm session expiry returns 401 with code: 'session_expired', setting sessionExpired = true and pausing auto-sync.
+	server.expireSession();
+	await assert.rejects(
+		() =>
+			app.callAI({
+				action: 'vision',
+				usePersonalAI: true,
+				provider: 'chatgpt',
+				connectionId: liveAccount.id,
+				model: 'gpt-4o-mini',
+				image: 'data:image/png;base64,aGVsbG8='
+			}),
+		{
+			status: 401,
+			code: 'session_expired',
+			message: 'Authentication required'
+		}
+	);
+	assert.equal(app.sessionExpired, true);
+	assert.equal(app.notifications.length, 1);
+
+	const syncCountDuringExpired = app.autoSyncCount;
+	app.mutateKitchen((draft) => {
+		draft.pantry[0].quantity = 3;
+	});
+	assert.equal(app.autoSyncCount, syncCountDuringExpired);
+	assert.equal(app.syncStatus.pending, true);
 });

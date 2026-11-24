@@ -5,7 +5,10 @@ import { MAX_WAV_BYTES } from '#lib/voice-config.ts';
 const headers = { 'cache-control': 'no-store' };
 export const GET: RequestHandler = async ({ locals, fetch: eventFetch, request }) => {
 	if (!locals.user)
-		return Response.json({ error: 'Sign in to configure voice input.' }, { status: 401, headers });
+		return Response.json(
+			{ error: 'Sign in to configure voice input.', code: 'session_expired' },
+			{ status: 401, headers }
+		);
 	return Response.json(
 		{ localAvailable: await probeLocalWhisper(eventFetch ?? fetch, request?.signal) },
 		{ headers }
@@ -14,7 +17,8 @@ export const GET: RequestHandler = async ({ locals, fetch: eventFetch, request }
 export const POST: RequestHandler = async ({ request, locals, fetch }) => {
 	try {
 		assertSameOrigin(request);
-		if (!locals.user) throw new ApiError(401, 'Sign in to use voice transcription.');
+		if (!locals.user)
+			throw new ApiError(401, 'Sign in to use voice transcription.', 'session_expired');
 		consumeRateLimit(`voice:${locals.user.id}`, 30, 60 * 60 * 1000);
 		const contentType = request.headers.get('content-type') || '';
 		if (!contentType.startsWith('multipart/form-data;'))
@@ -53,7 +57,8 @@ export const POST: RequestHandler = async ({ request, locals, fetch }) => {
 		return Response.json(
 			{
 				error:
-					error instanceof ApiError ? error.message : 'Voice transcription could not be completed.'
+					error instanceof ApiError ? error.message : 'Voice transcription could not be completed.',
+				...(error instanceof ApiError && error.code ? { code: error.code } : {})
 			},
 			{ status: error instanceof ApiError ? error.status : 500, headers }
 		);

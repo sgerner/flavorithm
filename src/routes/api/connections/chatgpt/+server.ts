@@ -1,6 +1,7 @@
 import {
 	configureHostAI,
 	getHostAI,
+	getHostAIFor,
 	isHostAdmin,
 	HOST_CONNECTION_ID
 } from '#lib/server/host-ai.ts';
@@ -52,7 +53,10 @@ function handleError(error: unknown): Response {
 		return Response.json({ error: error.message, code: error.code }, { status: error.status });
 	}
 	if (error instanceof ApiError)
-		return Response.json({ error: error.message }, { status: error.status });
+		return Response.json(
+			error.code ? { error: error.message, code: error.code } : { error: error.message },
+			{ status: error.status }
+		);
 	return Response.json(
 		{ error: 'The ChatGPT connection request could not be completed.' },
 		{ status: 500 }
@@ -61,17 +65,21 @@ function handleError(error: unknown): Response {
 
 export const GET: RequestHandler = async (event) => {
 	if (!event.locals.user)
-		return Response.json({ error: 'Authentication required' }, { status: 401 });
+		return Response.json(
+			{ error: 'Authentication required', code: 'session_expired' },
+			{ status: 401 }
+		);
 	const address = clientAddress(event);
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
+	const host = getHostAIFor(event.locals.user.id);
 	return Response.json(
 		{
 			hostAdmin: isHostAdmin(event.locals.user.id),
-			host: getHostAI() ? { model: getHostAI()!.model } : null,
+			host: host ? { model: host.model } : null,
 			configured: availability.mode !== 'unavailable',
 			mode: availability.mode,
 			accounts: [
-				...(getHostAI()
+				...(host
 					? [
 							{
 								id: HOST_CONNECTION_ID,
@@ -97,7 +105,7 @@ export const POST: RequestHandler = async (event) => {
 		const fetchSite = event.request.headers.get('sec-fetch-site');
 		if (fetchSite && fetchSite !== 'same-origin')
 			throw new ApiError(403, 'Cross-origin request rejected');
-		if (!event.locals.user) throw new ApiError(401, 'Authentication required');
+		if (!event.locals.user) throw new ApiError(401, 'Authentication required', 'session_expired');
 		const address = clientAddress(event);
 		if (!address) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`chatgpt-connection-ip:${address}`, 600, 15 * 60 * 1000);
@@ -137,7 +145,7 @@ export const POST: RequestHandler = async (event) => {
 
 		const sessionToken = event.cookies.get('flavorithm_session');
 		const sessionBinding = getSessionBinding(sessionToken);
-		if (!sessionBinding) throw new ApiError(401, 'Authentication required');
+		if (!sessionBinding) throw new ApiError(401, 'Authentication required', 'session_expired');
 		if (parsed.data.action === 'poll' || parsed.data.action === 'cancel') {
 			consumeRateLimit(`chatgpt-device:${event.locals.user.id}`, 400, 15 * 60 * 1000);
 			const input = {

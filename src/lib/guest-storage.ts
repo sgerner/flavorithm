@@ -1,3 +1,4 @@
+import { HOST_CONNECTION_ID } from './ai-connections.ts';
 import { COVER_PATH } from './cover-upload.ts';
 import { createInitialState, createNewUserState, defaultPreferences, themes } from './data.ts';
 import { backfillSampleData, clearSampleData } from './kitchen-workflows.ts';
@@ -520,7 +521,15 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 			: fallback.theme;
 	const dark = typeof value.dark === 'boolean' ? value.dark : fallback.dark;
 	const provider = clampString(value.provider, 100, fallback.provider);
-	const model = clampString(value.model, 200, fallback.model);
+	const rawChatgptAccountId =
+		typeof value.chatgptAccountId === 'string' && value.chatgptAccountId
+			? value.chatgptAccountId.slice(0, 100)
+			: undefined;
+	const isHostAccount = rawChatgptAccountId === HOST_CONNECTION_ID;
+	const chatgptAccountId = isHostAccount ? undefined : rawChatgptAccountId;
+	const model =
+		isHostAccount && provider === 'chatgpt' ? '' : clampString(value.model, 200, fallback.model);
+	const usePersonalAI = typeof value.usePersonalAI === 'boolean' ? value.usePersonalAI : undefined;
 
 	let reasoning: Preferences['reasoning'] | undefined;
 	if (isRecord(value.reasoning)) {
@@ -543,11 +552,6 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 			};
 		}
 	}
-
-	const chatgptAccountId =
-		typeof value.chatgptAccountId === 'string' && value.chatgptAccountId
-			? value.chatgptAccountId.slice(0, 100)
-			: undefined;
 
 	let ratings: Record<string, number> | undefined;
 	if (isRecord(value.ratings)) {
@@ -573,6 +577,7 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 		model,
 		...(reasoning !== undefined ? { reasoning } : {}),
 		...(chatgptAccountId !== undefined ? { chatgptAccountId } : {}),
+		...(usePersonalAI !== undefined ? { usePersonalAI } : {}),
 		...(ratings !== undefined ? { ratings } : {})
 	};
 }

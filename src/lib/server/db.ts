@@ -4,6 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
+import { HOST_CONNECTION_ID } from '#lib/ai-connections.ts';
 import { createNewUserState } from '#lib/data.ts';
 import { COVER_PATH } from '#lib/cover-upload.ts';
 import { MAX_RECIPES } from '#lib/recipe-collection.ts';
@@ -264,6 +265,7 @@ const preferencesSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
+	usePersonalAI: z.boolean().optional(),
 	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
@@ -395,7 +397,7 @@ function getCurrentUser(userId: string): DbUserRow | undefined {
 
 function assertCurrentHousehold(user: User): DbUserRow {
 	const current = getCurrentUser(user.id);
-	if (!current) throw new ApiError(401, 'Authentication required');
+	if (!current) throw new ApiError(401, 'Authentication required', 'session_expired');
 	if (current.household_id !== user.householdId)
 		throw new ApiError(409, 'Your household changed. Reload the latest kitchen and try again.');
 	return current;
@@ -797,7 +799,7 @@ export function resolveExternalIdentity(input: {
 				'UPDATE external_identities SET email = ?, updated_at = ? WHERE issuer = ? AND subject = ?'
 			).run(email, now, issuer, subject);
 			const updated = getCurrentUser(identity.id);
-			if (!updated) throw new ApiError(401, 'Authentication required');
+			if (!updated) throw new ApiError(401, 'Authentication required', 'session_expired');
 			db.exec('COMMIT');
 			return toUser(updated);
 		}
@@ -1055,7 +1057,7 @@ export function issueEmailVerification(userId: string): { email: string; token: 
 		const user = db
 			.prepare('SELECT email, email_verified_at FROM users WHERE id = ?')
 			.get(userId) as { email: string; email_verified_at: number | null } | undefined;
-		if (!user) throw new ApiError(401, 'Authentication required');
+		if (!user) throw new ApiError(401, 'Authentication required', 'session_expired');
 		if (user.email_verified_at != null) {
 			db.exec('COMMIT');
 			return null;
@@ -1138,6 +1140,12 @@ export function consumeRateLimit(key: string, limit: number, windowMs: number): 
 	current.count += 1;
 }
 
+function sanitizePersonalPreferences(preferences: Preferences): Preferences {
+	if (preferences.chatgptAccountId !== HOST_CONNECTION_ID) return preferences;
+	const { chatgptAccountId: _hostAccountId, ...rest } = preferences;
+	return rest.provider === 'chatgpt' ? { ...rest, model: '' } : rest;
+}
+
 export function getState(user: User): AppState | null {
 	assertCurrentHousehold(user);
 	const row = db
@@ -1149,9 +1157,11 @@ export function getState(user: User): AppState | null {
 		const preferenceRow = db
 			.prepare('SELECT preferences_json FROM user_preferences WHERE user_id = ?')
 			.get(user.id) as { preferences_json: string } | undefined;
-		const preferences = preferenceRow
-			? (JSON.parse(preferenceRow.preferences_json) as Preferences)
-			: DEFAULT_PREFERENCES;
+		const preferences = sanitizePersonalPreferences(
+			preferenceRow
+				? (JSON.parse(preferenceRow.preferences_json) as Preferences)
+				: DEFAULT_PREFERENCES
+		);
 		const ratings = preferences.ratings ?? {};
 		const recipes = shared.recipes.map((recipe) => {
 			const { rating: _householdRating, ...householdRecipe } = recipe;
@@ -1191,7 +1201,8 @@ export function saveState(
 		return sharedRecipe;
 	});
 	const shared = { ...stateWithoutPreferences, recipes: sharedRecipes };
-	const personalPreferences: Preferences = { ...preferences, ratings };
+	const sanitizedPreferences = sanitizePersonalPreferences(preferences);
+	const personalPreferences: Preferences = { ...sanitizedPreferences, ratings };
 	const now = Date.now();
 	db.exec('BEGIN IMMEDIATE');
 	try {
@@ -1232,7 +1243,7 @@ export function saveState(
       ON CONFLICT(user_id) DO UPDATE SET preferences_json = excluded.preferences_json, version = user_preferences.version + 1, updated_at = excluded.updated_at`
 		).run(user.id, JSON.stringify(personalPreferences), now);
 		db.exec('COMMIT');
-		return value;
+		return { ...value, preferences: sanitizedPreferences };
 	} catch (error) {
 		db.exec('ROLLBACK');
 		throw error;
@@ -1441,7 +1452,7 @@ export function leaveHousehold(user: User): User {
 	}
 	const row = db.prepare('SELECT household_id FROM users WHERE id = ?').get(user.id) as
 		{ household_id: string } | undefined;
-	if (!row) throw new ApiError(401, 'Authentication required');
+	if (!row) throw new ApiError(401, 'Authentication required', 'session_expired');
 	return { ...user, householdId: row.household_id };
 }
 
