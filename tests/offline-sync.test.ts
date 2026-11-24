@@ -899,3 +899,138 @@ test('mergePendingKitchenJournal anchors cross-tab conflict remote values to ser
 		}
 	]);
 });
+
+test('clamping pantry drift during meal deduction raises a conflict instead of silently disagreeing with stock', async () => {
+	const base = createNewUserState();
+	const recipe = base.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'flour', quantity: 1.5, unit: 'cup' }];
+	base.pantry = [{ id: 'flour', name: 'flour', quantity: 2, unit: 'cup', category: 'Pantry' }];
+	base.meals = [
+		{ id: 'meal-one', date: '2026-10-22', slot: 'Dinner', recipeId: recipe.id, servings: 2 },
+		{ id: 'meal-two', date: '2026-10-23', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+
+	// 1. Completed meal deducts 1.5 cups locally while household manually reduces flour to 1 cup:
+	//    1 - 1.5 = -0.5 clamps to 0, so merge surfaces a pantry quantity conflict.
+	const cookedLocal = completeMeal(
+		structuredClone(base),
+		'meal-one',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-22T18:00:00.000Z')
+	);
+	const reducedRemote = structuredClone(base);
+	reducedRemote.pantry[0].quantity = 1;
+
+	const manualDrift = mergeKitchenStates(base, cookedLocal, reducedRemote);
+	assert.deepEqual(manualDrift.conflicts, [
+		{
+			path: 'kitchen.pantry[flour].quantity',
+			local: 0.5,
+			remote: 1
+		}
+	]);
+	assert.equal(manualDrift.state.pantry[0].quantity, 0);
+	assert.equal(
+		mergeKitchenStates(base, cookedLocal, reducedRemote, 'local').state.pantry[0].quantity,
+		0.5
+	);
+	assert.equal(
+		mergeKitchenStates(base, cookedLocal, reducedRemote, 'remote').state.pantry[0].quantity,
+		1
+	);
+
+	let writes = 0;
+	let server = structuredClone(reducedRemote);
+	const transport = {
+		identity: { userId: 'a', householdId: 'home' },
+		get: async () => ({
+			state: structuredClone(server),
+			etag: 'v2',
+			userId: 'a',
+			householdId: 'home'
+		}),
+		put: async (state: typeof server) => {
+			writes += 1;
+			server = structuredClone(state);
+			return { state: structuredClone(server), etag: 'v3' };
+		}
+	};
+	const record: PendingJournalRecord = {
+		writerId: 'tab-1',
+		pending: {
+			userId: 'a',
+			householdId: 'home',
+			base,
+			local: cookedLocal,
+			etag: 'v1',
+			updatedAt: 1
+		},
+		keys: []
+	};
+	const halted = await syncPendingKitchenJournal([record], transport);
+	assert.equal(halted.saved, false);
+	assert.equal(writes, 0);
+	assert.deepEqual(halted.conflicts, [
+		{
+			path: 'kitchen.pantry[flour].quantity',
+			local: 0.5,
+			remote: 1
+		}
+	]);
+
+	const resolvedLocal = await syncPendingKitchenJournal([record], transport, 'local', 'v2');
+	assert.equal(resolvedLocal.saved, true);
+	assert.equal(writes, 1);
+	assert.equal(server.pantry[0].quantity, 0.5);
+
+	// 2. Two concurrent completed meals whose combined deductions (1.5 + 1.5 = 3) exceed stock (2):
+	const cookedRemote = completeMeal(
+		structuredClone(base),
+		'meal-two',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-23T18:00:00.000Z')
+	);
+	const overConsumed = mergeKitchenStates(base, cookedLocal, cookedRemote);
+	assert.deepEqual(overConsumed.conflicts, [
+		{
+			path: 'kitchen.pantry[flour].quantity',
+			local: 0.5,
+			remote: 0.5
+		}
+	]);
+	assert.equal(overConsumed.state.pantry[0].quantity, 0);
+
+	// 3. Concurrent pantry deletion vs meal deduction raises an item conflict, whereas single-branch
+	//    completion + restock deletion merges cleanly with zero conflicts.
+	const deletedRemote = structuredClone(base);
+	deletedRemote.pantry = [];
+	const deletedConflict = mergeKitchenStates(base, cookedLocal, deletedRemote);
+	assert.equal(deletedConflict.conflicts.length, 1);
+	assert.equal(deletedConflict.conflicts[0].path, 'kitchen.pantry[flour]');
+	assert.equal(
+		mergeKitchenStates(base, cookedLocal, deletedRemote, 'local').state.pantry[0]?.quantity,
+		0.5
+	);
+	assert.equal(
+		mergeKitchenStates(base, cookedLocal, deletedRemote, 'remote').state.pantry.length,
+		0
+	);
+
+	const singleBranchDepleted = structuredClone(base);
+	singleBranchDepleted.pantry[0].quantity = 1.5;
+	const cookedAndDepleted = completeMeal(
+		singleBranchDepleted,
+		'meal-one',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-22T18:00:00.000Z')
+	);
+	cookedAndDepleted.pantry = [];
+	const singleBranchMerged = mergeKitchenStates(
+		singleBranchDepleted,
+		cookedAndDepleted,
+		structuredClone(singleBranchDepleted)
+	);
+	assert.equal(singleBranchMerged.conflicts.length, 0);
+	assert.equal(singleBranchMerged.state.pantry.length, 0);
+});

@@ -281,23 +281,6 @@ function restoreMealPantryDeductions(base: AppState, snapshot: AppState): AppSta
 	return restored;
 }
 
-function applyMealPantryDeductions(pantry: Ingredient[], meals: Meal[]): Ingredient[] {
-	if (!meals.length) return pantry;
-	const result = pantry.map((item) => ({ ...item }));
-	const pantryById = new Map(result.map((item) => [item.id, item]));
-	for (const meal of meals) {
-		for (const deduction of meal.pantryDeductions ?? []) {
-			if (!Number.isFinite(deduction.quantity) || !(deduction.quantity > 0)) continue;
-			const target = pantryById.get(deduction.pantryId);
-			if (!target) continue;
-			const delta = convertCompatibleQuantity(deduction.quantity, deduction.unit, target.unit);
-			if (delta === undefined) continue;
-			target.quantity = roundPantryQuantity(Math.max(0, target.quantity - delta));
-		}
-	}
-	return result;
-}
-
 const isWeekScope = (sourceKey: unknown): sourceKey is string =>
 	typeof sourceKey === 'string' && sourceKey.startsWith('week:');
 
@@ -427,6 +410,180 @@ function segmentsStartWith(prefix: PathSegment[], full: PathSegment[]): boolean 
 			? other.kind === 'prop' && segment.key === other.key
 			: other.kind === 'id' && segment.id === other.id;
 	});
+}
+
+function resolveOrphanedMeals(
+	state: Pick<AppState, 'meals' | 'recipes'>,
+	localSnapshot: AppState,
+	remoteSnapshot: AppState,
+	conflicts: DetailedConflict[],
+	prefer?: 'local' | 'remote'
+): void {
+	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
+	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
+		conflicts.push({
+			path: `kitchen.meals[${meal.id}].recipeId`,
+			local: describeMealRecipe(localSnapshot, meal.id, meal.recipeId),
+			remote: describeMealRecipe(remoteSnapshot, meal.id, meal.recipeId),
+			segments: [
+				{ kind: 'prop', key: 'meals' },
+				{ kind: 'id', id: meal.id },
+				{ kind: 'prop', key: 'recipeId' }
+			],
+			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
+		});
+		// Keep the complete proposed meal available for review and backup until a choice is made.
+		const candidates = prefer
+			? (prefer === 'local' ? localSnapshot : remoteSnapshot).recipes
+			: [...localSnapshot.recipes, ...remoteSnapshot.recipes];
+		const recipe = candidates.find((item) => item.id === meal.recipeId);
+		if (recipe) {
+			state.recipes.push(structuredClone(recipe));
+			recipeIds.add(recipe.id);
+		}
+	}
+	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+}
+
+function applyMealPantryDeductions(
+	pantry: Ingredient[],
+	meals: Meal[],
+	options?: {
+		base: AppState;
+		local: AppState;
+		remote: AppState;
+		prefer?: 'local' | 'remote';
+		conflicts: DetailedConflict[];
+	}
+): Ingredient[] {
+	if (!meals.length) return pantry;
+	const result = pantry.map((item) => ({ ...item }));
+	const pantryById = new Map(result.map((item) => [item.id, item]));
+	const rawQuantityById = new Map(result.map((item) => [item.id, item.quantity]));
+	const clampedIds = new Set<string>();
+	const incompatibleIds = new Set<string>();
+	const missingIds = new Set<string>();
+
+	for (const meal of meals) {
+		for (const deduction of meal.pantryDeductions ?? []) {
+			if (!Number.isFinite(deduction.quantity) || !(deduction.quantity > 0)) continue;
+			const target = pantryById.get(deduction.pantryId);
+			if (!target) {
+				missingIds.add(deduction.pantryId);
+				continue;
+			}
+			const delta = convertCompatibleQuantity(deduction.quantity, deduction.unit, target.unit);
+			if (delta === undefined) {
+				incompatibleIds.add(target.id);
+				continue;
+			}
+			const previousRaw = rawQuantityById.get(target.id) ?? target.quantity;
+			const rawDiff = previousRaw - delta;
+			const nextRaw = Math.abs(rawDiff) <= 1e-9 ? 0 : roundPantryQuantity(rawDiff);
+			rawQuantityById.set(target.id, nextRaw);
+			const nextClamped = roundPantryQuantity(Math.max(0, nextRaw));
+			target.quantity = nextClamped;
+			if (nextClamped !== nextRaw) {
+				clampedIds.add(target.id);
+			}
+		}
+	}
+
+	if (!options || equal(options.local, options.remote)) {
+		return result;
+	}
+
+	const { base, local, remote, prefer, conflicts } = options;
+	const localById = new Map(local.pantry.map((item) => [item.id, item]));
+	const remoteById = new Map(remote.pantry.map((item) => [item.id, item]));
+	const bothBranchesDiverged = !equal(local, base) && !equal(remote, base);
+
+	for (const pantryId of missingIds) {
+		const localItem = localById.get(pantryId);
+		const remoteItem = remoteById.get(pantryId);
+		if (!bothBranchesDiverged || Boolean(localItem) === Boolean(remoteItem)) continue;
+		const itemSegments: PathSegment[] = [
+			{ kind: 'prop', key: 'pantry' },
+			{ kind: 'id', id: pantryId }
+		];
+		if (!conflicts.some((entry) => segmentsStartWith(entry.segments, itemSegments))) {
+			conflicts.push({
+				path: `kitchen.pantry[${pantryId}]`,
+				local: localItem ? structuredClone(localItem) : undefined,
+				remote: remoteItem ? structuredClone(remoteItem) : undefined,
+				segments: itemSegments
+			});
+		}
+		const chosen = prefer === 'local' ? localItem : remoteItem;
+		if (chosen && !pantryById.has(pantryId)) {
+			const cloned = structuredClone(chosen);
+			result.push(cloned);
+			pantryById.set(pantryId, cloned);
+		}
+	}
+
+	for (const pantryId of incompatibleIds) {
+		const localItem = localById.get(pantryId);
+		const remoteItem = remoteById.get(pantryId);
+		if (!bothBranchesDiverged) continue;
+		const itemSegments: PathSegment[] = [
+			{ kind: 'prop', key: 'pantry' },
+			{ kind: 'id', id: pantryId }
+		];
+		for (let index = conflicts.length - 1; index >= 0; index -= 1) {
+			if (
+				!equal(conflicts[index].segments, itemSegments) &&
+				segmentsStartWith(itemSegments, conflicts[index].segments)
+			) {
+				conflicts.splice(index, 1);
+			}
+		}
+		if (!conflicts.some((entry) => segmentsStartWith(entry.segments, itemSegments))) {
+			conflicts.push({
+				path: `kitchen.pantry[${pantryId}]`,
+				local: localItem ? structuredClone(localItem) : undefined,
+				remote: remoteItem ? structuredClone(remoteItem) : undefined,
+				segments: itemSegments
+			});
+		}
+		const chosen = prefer === 'local' ? localItem : remoteItem;
+		const index = result.findIndex((item) => item.id === pantryId);
+		if (chosen && index !== -1) {
+			const cloned = structuredClone(chosen);
+			result[index] = cloned;
+			pantryById.set(pantryId, cloned);
+		} else if (!chosen && index !== -1) {
+			result.splice(index, 1);
+			pantryById.delete(pantryId);
+		}
+	}
+
+	for (const pantryId of clampedIds) {
+		const target = pantryById.get(pantryId);
+		if (!target) continue;
+		const quantitySegments: PathSegment[] = [
+			{ kind: 'prop', key: 'pantry' },
+			{ kind: 'id', id: pantryId },
+			{ kind: 'prop', key: 'quantity' }
+		];
+		const localQuantity = localById.get(pantryId)?.quantity;
+		const remoteQuantity = remoteById.get(pantryId)?.quantity;
+		if (!conflicts.some((entry) => segmentsStartWith(entry.segments, quantitySegments))) {
+			conflicts.push({
+				path: `kitchen.pantry[${pantryId}].quantity`,
+				local: localQuantity,
+				remote: remoteQuantity,
+				segments: quantitySegments
+			});
+		}
+		if (prefer === 'local' && typeof localQuantity === 'number') {
+			target.quantity = localQuantity;
+		} else if (prefer === 'remote' && typeof remoteQuantity === 'number') {
+			target.quantity = remoteQuantity;
+		}
+	}
+
+	return result;
 }
 
 function mergeKitchenStatesDetailed(
@@ -581,45 +738,19 @@ function mergeKitchenStatesDetailed(
 		merge(base, localNormalized, remoteNormalized, 'kitchen', [])
 	) as AppState;
 	// Deleting a recipe while someone plans it must never create an orphaned meal.
-	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
-	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
-		conflicts.push({
-			path: `kitchen.meals[${meal.id}].recipeId`,
-			local: describeMealRecipe(local, meal.id, meal.recipeId),
-			remote: describeMealRecipe(remote, meal.id, meal.recipeId),
-			segments: [
-				{ kind: 'prop', key: 'meals' },
-				{ kind: 'id', id: meal.id },
-				{ kind: 'prop', key: 'recipeId' }
-			],
-			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
-		});
-		{
-			// Keep the complete proposed meal available for review and backup until a choice is made.
-			const candidates = prefer
-				? (prefer === 'local' ? local : remote).recipes
-				: [...local.recipes, ...remote.recipes];
-			const recipe = candidates.find((recipe) => recipe.id === meal.recipeId);
-			if (recipe) {
-				state.recipes.push(structuredClone(recipe));
-				recipeIds.add(recipe.id);
-			}
+	resolveOrphanedMeals(state, local, remote, conflicts, prefer);
+	state.meals = state.meals.map((meal) => {
+		if (!meal.completedAt) {
+			const next = { ...meal };
+			delete next.leftoverServings;
+			delete next.pantryDeductions;
+			return next;
 		}
-	}
-	state.meals = state.meals
-		.filter((meal) => recipeIds.has(meal.recipeId))
-		.map((meal) => {
-			if (!meal.completedAt) {
-				const next = { ...meal };
-				delete next.leftoverServings;
-				delete next.pantryDeductions;
-				return next;
-			}
-			return {
-				...meal,
-				leftoverServings: clampLeftoverServings(meal.leftoverServings, meal.servings)
-			};
-		});
+		return {
+			...meal,
+			leftoverServings: clampLeftoverServings(meal.leftoverServings, meal.servings)
+		};
+	});
 
 	const baseMealsById = new Map(base.meals.map((meal) => [meal.id, meal]));
 	const acceptedNewCompletions = state.meals.filter(
@@ -628,7 +759,19 @@ function mergeKitchenStatesDetailed(
 			!baseMealsById.get(meal.id)?.completedAt &&
 			Boolean(meal.pantryDeductions?.length)
 	);
-	state.pantry = applyMealPantryDeductions(state.pantry, acceptedNewCompletions);
+	state.pantry = applyMealPantryDeductions(state.pantry, acceptedNewCompletions, {
+		base,
+		local,
+		remote,
+		prefer,
+		conflicts
+	});
+	for (const entry of conflicts) {
+		if (entry.path === 'kitchen.pantry' || entry.path.startsWith('kitchen.pantry[')) {
+			entry.local = getAtSegments(local, entry.segments);
+			entry.remote = getAtSegments(remote, entry.segments);
+		}
+	}
 
 	if (!equal(local, remote)) {
 		const reconciledScopes = new Set<string>();

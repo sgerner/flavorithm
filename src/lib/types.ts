@@ -7,6 +7,7 @@ export type Ingredient = {
 	unit: string;
 	category: string;
 	expires?: string;
+	sample?: boolean;
 };
 export type RecipeIngredient = { name: string; quantity: number; unit: string };
 export type Recipe = {
@@ -37,6 +38,7 @@ export type Recipe = {
 	nutritionStale?: boolean;
 	rating?: number;
 	saved?: boolean;
+	sampleSaved?: boolean;
 	hidden?: boolean;
 };
 export type PantryDeduction = {
@@ -54,6 +56,7 @@ export type Meal = {
 	completedAt?: string;
 	leftoverServings?: number;
 	pantryDeductions?: PantryDeduction[];
+	sample?: boolean;
 };
 export type ShoppingItem = {
 	id: string;
@@ -78,6 +81,7 @@ export type Preferences = {
 	reasoning?: ReasoningSettings;
 	ratings?: Record<string, number>;
 	chatgptAccountId?: string;
+	usePersonalAI?: boolean;
 };
 export type AppState = {
 	pantry: Ingredient[];

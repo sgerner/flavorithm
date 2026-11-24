@@ -1,3 +1,4 @@
+import { HOST_CONNECTION_ID } from './ai-connections.ts';
 import { COVER_PATH } from './cover-upload.ts';
 import { createInitialState, createNewUserState, defaultPreferences } from './data.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
@@ -13,6 +14,10 @@ import type {
 } from './types.ts';
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+type RemovableStorage = Pick<Storage, 'removeItem'>;
+
+const GUEST_KITCHEN_KEY = 'flavorithm-guest-kitchen';
+const GUEST_STARTED_KEY = 'flavorithm-started';
 
 /** Preserve ambiguous pre-isolation data without exposing it as a guest kitchen. */
 export function quarantineLegacyKitchen(storage: StorageLike): void {
@@ -25,6 +30,25 @@ export function quarantineLegacyKitchen(storage: StorageLike): void {
 		storage.removeItem('flavorithm-kitchen');
 	} catch {
 		// A failed backup must leave the original available for manual recovery.
+	}
+}
+
+/** Remove saved guest kitchen state once it has been staged into an account or discarded. */
+export function clearGuestKitchen(storage: RemovableStorage): void {
+	try {
+		storage.removeItem(GUEST_KITCHEN_KEY);
+	} catch {
+		// Restricted storage must not block account transitions.
+	}
+}
+
+/** Clear all guest-only browser keys, including the sample-kitchen dismissal flag. */
+export function clearGuestData(storage: RemovableStorage): void {
+	clearGuestKitchen(storage);
+	try {
+		storage.removeItem(GUEST_STARTED_KEY);
+	} catch {
+		// Restricted storage must not block account transitions.
 	}
 }
 
@@ -100,13 +124,15 @@ function sanitizePantry(value: unknown, fallback: Ingredient[]): Ingredient[] {
 		const category =
 			typeof raw.category === 'string' ? raw.category.slice(0, 100) || 'Pantry' : 'Pantry';
 		const expires = typeof raw.expires === 'string' ? raw.expires.trim().slice(0, 50) : '';
+		const sample = typeof raw.sample === 'boolean' ? raw.sample : undefined;
 		result.push({
 			id,
 			name,
 			quantity,
 			unit,
 			category,
-			...(expires ? { expires } : {})
+			...(expires ? { expires } : {}),
+			...(sample !== undefined ? { sample } : {})
 		});
 	}
 	return result;
@@ -189,6 +215,7 @@ function sanitizeRecipes(value: unknown, fallback: Recipe[]): Recipe[] {
 		const parsedRating = parseFiniteNumber(raw.rating);
 		const rating = parsedRating !== undefined ? Math.min(5, Math.max(0, parsedRating)) : undefined;
 		const saved = typeof raw.saved === 'boolean' ? raw.saved : undefined;
+		const sampleSaved = typeof raw.sampleSaved === 'boolean' ? raw.sampleSaved : undefined;
 		const hidden = typeof raw.hidden === 'boolean' ? raw.hidden : undefined;
 
 		result.push({
@@ -210,6 +237,7 @@ function sanitizeRecipes(value: unknown, fallback: Recipe[]): Recipe[] {
 			...(nutritionStale !== undefined ? { nutritionStale } : {}),
 			...(rating !== undefined ? { rating } : {}),
 			...(saved !== undefined ? { saved } : {}),
+			...(sampleSaved !== undefined ? { sampleSaved } : {}),
 			...(hidden !== undefined ? { hidden } : {})
 		});
 	}
@@ -258,6 +286,7 @@ function sanitizeMeals(value: unknown, fallback: Meal[]): Meal[] {
 			}
 			if (!pantryDeductions.length) pantryDeductions = undefined;
 		}
+		const sample = typeof raw.sample === 'boolean' ? raw.sample : undefined;
 		result.push({
 			id,
 			date,
@@ -266,7 +295,8 @@ function sanitizeMeals(value: unknown, fallback: Meal[]): Meal[] {
 			servings,
 			...(completedAt !== undefined ? { completedAt } : {}),
 			...(leftoverServings !== undefined ? { leftoverServings } : {}),
-			...(pantryDeductions !== undefined ? { pantryDeductions } : {})
+			...(pantryDeductions !== undefined ? { pantryDeductions } : {}),
+			...(sample !== undefined ? { sample } : {})
 		});
 	}
 	return result;
@@ -324,7 +354,15 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 			: fallback.theme;
 	const dark = typeof value.dark === 'boolean' ? value.dark : fallback.dark;
 	const provider = clampString(value.provider, 100, fallback.provider);
-	const model = clampString(value.model, 200, fallback.model);
+	const rawChatgptAccountId =
+		typeof value.chatgptAccountId === 'string' && value.chatgptAccountId
+			? value.chatgptAccountId.slice(0, 100)
+			: undefined;
+	const isHostAccount = rawChatgptAccountId === HOST_CONNECTION_ID;
+	const chatgptAccountId = isHostAccount ? undefined : rawChatgptAccountId;
+	const model =
+		isHostAccount && provider === 'chatgpt' ? '' : clampString(value.model, 200, fallback.model);
+	const usePersonalAI = typeof value.usePersonalAI === 'boolean' ? value.usePersonalAI : undefined;
 
 	let reasoning: Preferences['reasoning'] | undefined;
 	if (isRecord(value.reasoning)) {
@@ -347,11 +385,6 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 			};
 		}
 	}
-
-	const chatgptAccountId =
-		typeof value.chatgptAccountId === 'string' && value.chatgptAccountId
-			? value.chatgptAccountId.slice(0, 100)
-			: undefined;
 
 	let ratings: Record<string, number> | undefined;
 	if (isRecord(value.ratings)) {
@@ -377,6 +410,7 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 		model,
 		...(reasoning !== undefined ? { reasoning } : {}),
 		...(chatgptAccountId !== undefined ? { chatgptAccountId } : {}),
+		...(usePersonalAI !== undefined ? { usePersonalAI } : {}),
 		...(ratings !== undefined ? { ratings } : {})
 	};
 }
