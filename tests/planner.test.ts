@@ -8,6 +8,7 @@ import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
 import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
+import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
@@ -176,6 +177,7 @@ function createModuleMap() {
 		'#lib/butler.ts': butlerMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
+		'#lib/ai-connections.ts': aiConnectionsMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
