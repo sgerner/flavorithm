@@ -11,6 +11,7 @@ import * as svelteAnimate from 'svelte/animate';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
+import * as coverUploadMod from '../src/lib/cover-upload.ts';
 import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
@@ -157,6 +158,7 @@ function createModuleMap() {
 		'svelte/internal/disclose-version': {},
 		'svelte/internal/server': svelteServer,
 		'@lucide/svelte': iconProxy,
+		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
 		'#lib/motion.ts': {
