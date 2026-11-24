@@ -11,14 +11,25 @@ const composeYaml = readFileSync(new URL('../compose.yml', import.meta.url), 'ut
 const healthcheckMatch = composeYaml.match(/fetch\('([^']+)'\)/);
 assert.equal(healthcheckMatch?.[1], 'http://127.0.0.1:3000/api/auth');
 
+// Exercise the built server against a disposable in-memory database or an external URL.
+const externalUrl = process.env.FLAVORITHM_SMOKE_URL?.trim();
+const baseUrl = externalUrl ? new URL(externalUrl).origin : 'http://127.0.0.1:5187';
+const origin = process.env.ORIGIN ? new URL(process.env.ORIGIN).origin : baseUrl;
+
+/**
+ * @param {string} path
+ * @param {{ method?: string; headers?: import('node:http').OutgoingHttpHeaders; body?: string | Buffer }} [options]
+ * @returns {Promise<{ status: number | undefined; headers: import('node:http').IncomingHttpHeaders; body: Buffer }>}
+ */
 function rawHttp(path, { method = 'GET', headers = {}, body } = {}) {
+	const targetUrl = new URL(path, baseUrl);
 	const payload = body === undefined ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(body);
 	return new Promise((resolve, reject) => {
 		const req = httpRequest(
 			{
-				hostname: '127.0.0.1',
-				port: 5187,
-				path,
+				hostname: targetUrl.hostname,
+				port: targetUrl.port || 80,
+				path: `${targetUrl.pathname}${targetUrl.search}`,
 				method,
 				agent: false,
 				headers: {
@@ -28,8 +39,9 @@ function rawHttp(path, { method = 'GET', headers = {}, body } = {}) {
 				}
 			},
 			(res) => {
+				/** @type {Buffer[]} */
 				const chunks = [];
-				res.on('data', (chunk) => chunks.push(chunk));
+				res.on('data', (chunk) => chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)));
 				res.on('end', () =>
 					resolve({
 						status: res.statusCode,
@@ -46,42 +58,44 @@ function rawHttp(path, { method = 'GET', headers = {}, body } = {}) {
 	});
 }
 
-// Exercise the built server against a disposable, in-memory database.
-const origin = 'http://127.0.0.1:5187';
-const server = spawn(process.execPath, ['server.mjs'], {
-	env: {
-		...process.env,
-		HOST: '127.0.0.1',
-		PORT: '5187',
-		ORIGIN: origin,
-		FLAVORITHM_DB_PATH: ':memory:',
-		FLAVORITHM_AUTH_MODE: 'local',
-		// Keep this smoke entirely offline; device endpoints are exercised with signed mocks.
-		FLAVORITHM_CHATGPT_AUTH_FLOW: 'local',
-		RESEND_API_KEY: '',
-		BRAVE_SEARCH_API_KEY: ''
-	},
-	stdio: ['ignore', 'pipe', 'pipe']
-});
+const server = externalUrl
+	? null
+	: spawn(process.execPath, ['server.mjs'], {
+			env: {
+				...process.env,
+				HOST: '127.0.0.1',
+				PORT: '5187',
+				ORIGIN: origin,
+				FLAVORITHM_DB_PATH: ':memory:',
+				FLAVORITHM_AUTH_MODE: 'local',
+				// Keep this smoke entirely offline; device endpoints are exercised with signed mocks.
+				FLAVORITHM_CHATGPT_AUTH_FLOW: 'local',
+				RESEND_API_KEY: '',
+				BRAVE_SEARCH_API_KEY: ''
+			},
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
 let serverOutput = '';
-server.stdout.on('data', (chunk) => (serverOutput += chunk));
-server.stderr.on('data', (chunk) => (serverOutput += chunk));
+if (server) {
+	server.stdout.on('data', (chunk) => (serverOutput += chunk));
+	server.stderr.on('data', (chunk) => (serverOutput += chunk));
+}
 const password = 'Only a disposable test password 123!';
 try {
-	for (let i = 0; i < 100; i++) {
-		if (server.exitCode !== null) throw new Error(`Test server stopped: ${serverOutput}`);
+	for (let i = 0; i < 150; i++) {
+		if (server && server.exitCode !== null) throw new Error(`Test server stopped: ${serverOutput}`);
 		try {
-			const response = await fetch(origin);
+			const response = await fetch(baseUrl);
 			if (response.ok) break;
 		} catch {}
-		if (i === 99) throw new Error('Test server did not start');
+		if (i === 149) throw new Error('Test server did not start');
 		await pause(100);
 	}
-	const home = await fetch(origin);
+	const home = await fetch(baseUrl);
 	const homeHtml = await home.text();
 	assert.match(homeHtml, /Flavorithm/);
-	assert.match(home.headers.get('content-security-policy'), /script-src 'self'/);
-	assert.match(home.headers.get('permissions-policy'), /microphone=\(self\)/);
+	assert.match(home.headers.get('content-security-policy') ?? '', /script-src 'self'/);
+	assert.match(home.headers.get('permissions-policy') ?? '', /microphone=\(self\)/);
 	// Verify wire-level br/gzip/identity compression, HEAD /, and precompressed immutable assets.
 	const rawHomeIdentity = await rawHttp('/', { headers: { 'Accept-Encoding': 'identity' } });
 	const rawHomeBr = await rawHttp('/', { headers: { 'Accept-Encoding': 'br, gzip, deflate' } });
@@ -91,6 +105,7 @@ try {
 	assert.equal(rawHomeBr.headers['content-encoding'], 'br');
 	assert.match(String(rawHomeBr.headers['vary']), /Accept-Encoding/i);
 	assert.ok(rawHomeBr.body.byteLength < rawHomeIdentity.body.byteLength);
+	/** @param {Buffer} buffer */
 	const normalizeHtmlNonce = (buffer) =>
 		buffer.toString('utf8').replace(/nonce="[^"]+"/g, 'nonce="csp"');
 	assert.equal(
@@ -133,13 +148,13 @@ try {
 	assert.equal(rawAuthSmall.headers['content-encoding'], undefined);
 	assert.ok(rawAuthSmall.body.byteLength < 1024);
 
-	const manifest = await fetch(`${origin}/manifest.webmanifest`);
+	const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
 	assert.equal(manifest.status, 200);
 	assert.equal((await manifest.json()).orientation, 'any');
-	assert.equal((await fetch(`${origin}/service-worker.js`)).status, 200);
-	const healthProbe = await fetch(`${origin}/api/auth`);
+	assert.equal((await fetch(`${baseUrl}/service-worker.js`)).status, 200);
+	const healthProbe = await fetch(`${baseUrl}/api/auth`);
 	assert.equal(healthProbe.status, 200);
-	assert.match(healthProbe.headers.get('cache-control'), /no-store/);
+	assert.match(healthProbe.headers.get('cache-control') ?? '', /no-store/);
 	assert.deepEqual(await healthProbe.json(), {
 		user: null,
 		authMode: 'local',
@@ -147,62 +162,77 @@ try {
 		logoutUrl: null,
 		capabilities: { emailDelivery: false, recipeSearch: false }
 	});
-	const brokenOrigin = 'http://127.0.0.1:5189';
-	const brokenServer = spawn(process.execPath, ['server.mjs'], {
-		env: {
-			...process.env,
-			HOST: '127.0.0.1',
-			PORT: '5189',
-			ORIGIN: brokenOrigin,
-			FLAVORITHM_DB_PATH: ':memory:',
-			FLAVORITHM_AUTH_MODE: 'proxy',
-			FLAVORITHM_PROXY_SHARED_SECRET: '',
-			RESEND_API_KEY: '',
-			BRAVE_SEARCH_API_KEY: ''
-		},
-		stdio: ['ignore', 'pipe', 'pipe']
-	});
-	let brokenOutput = '';
-	brokenServer.stdout.on('data', (chunk) => (brokenOutput += chunk));
-	brokenServer.stderr.on('data', (chunk) => (brokenOutput += chunk));
-	try {
-		let brokenProbe;
-		for (let i = 0; i < 100; i++) {
-			if (brokenServer.exitCode !== null)
-				throw new Error(`Broken-auth test server stopped: ${brokenOutput}`);
-			try {
-				brokenProbe = await fetch(`${brokenOrigin}/api/auth`);
-				break;
-			} catch {}
-			if (i === 99) throw new Error('Broken-auth test server did not start');
-			await pause(100);
-		}
-		assert.equal(brokenProbe.status, 503);
-		assert.equal((await fetch(`${brokenOrigin}/manifest.webmanifest`)).status, 200);
-	} finally {
-		if (brokenServer.exitCode === null && brokenServer.signalCode === null) {
-			brokenServer.kill('SIGTERM');
-			await new Promise((resolve) => brokenServer.once('exit', resolve));
+	if (!externalUrl) {
+		const brokenOrigin = 'http://127.0.0.1:5189';
+		const brokenServer = spawn(process.execPath, ['server.mjs'], {
+			env: {
+				...process.env,
+				HOST: '127.0.0.1',
+				PORT: '5189',
+				ORIGIN: brokenOrigin,
+				FLAVORITHM_DB_PATH: ':memory:',
+				FLAVORITHM_AUTH_MODE: 'proxy',
+				FLAVORITHM_PROXY_SHARED_SECRET: '',
+				RESEND_API_KEY: '',
+				BRAVE_SEARCH_API_KEY: ''
+			},
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
+		let brokenOutput = '';
+		brokenServer.stdout.on('data', (chunk) => (brokenOutput += chunk));
+		brokenServer.stderr.on('data', (chunk) => (brokenOutput += chunk));
+		try {
+			/** @type {Response | undefined} */
+			let brokenProbe;
+			for (let i = 0; i < 100; i++) {
+				if (brokenServer.exitCode !== null)
+					throw new Error(`Broken-auth test server stopped: ${brokenOutput}`);
+				try {
+					brokenProbe = await fetch(`${brokenOrigin}/api/auth`);
+					break;
+				} catch {}
+				if (i === 99) throw new Error('Broken-auth test server did not start');
+				await pause(100);
+			}
+			assert.ok(brokenProbe);
+			assert.equal(brokenProbe.status, 503);
+			assert.equal((await fetch(`${brokenOrigin}/manifest.webmanifest`)).status, 200);
+		} finally {
+			if (brokenServer.exitCode === null && brokenServer.signalCode === null) {
+				brokenServer.kill('SIGTERM');
+				await new Promise((resolve) => brokenServer.once('exit', resolve));
+			}
 		}
 	}
-	let anonymous = await fetch(`${origin}/api/state`);
+	let anonymous = await fetch(`${baseUrl}/api/state`);
 	assert.equal(anonymous.status, 401);
-	assert.match(anonymous.headers.get('cache-control'), /no-store/);
+	assert.match(anonymous.headers.get('cache-control') ?? '', /no-store/);
 	function client() {
 		let cookie = '';
+		/**
+		 * @param {string} path
+		 * @param {unknown} [body]
+		 * @param {string} [method]
+		 * @param {Record<string, string | null>} [extra]
+		 */
 		const call = async function (
 			path,
 			body,
 			method = body === undefined ? 'GET' : 'POST',
 			extra = {}
 		) {
-			const response = await fetch(origin + path, {
+			/** @type {Record<string, string>} */
+			const extraHeaders = {};
+			for (const [key, value] of Object.entries(extra)) {
+				if (typeof value === 'string') extraHeaders[key] = value;
+			}
+			const response = await fetch(baseUrl + path, {
 				method,
 				headers: {
 					Origin: origin,
 					...(body === undefined ? {} : { 'Content-Type': 'application/json' }),
 					...(cookie ? { Cookie: cookie } : {}),
-					...extra
+					...extraHeaders
 				},
 				body: body === undefined ? undefined : JSON.stringify(body)
 			});
@@ -229,21 +259,36 @@ try {
 	assert.deepEqual(initial.data.state.meals, []);
 	const connections = await owner('/api/connections/chatgpt');
 	assert.equal(connections.response.status, 200);
-	assert.equal(connections.data.mode, 'local');
 	assert.deepEqual(connections.data.accounts, []);
-	const started = await owner('/api/connections/chatgpt', { action: 'start' });
-	assert.equal(started.response.status, 200);
-	const authorization = new URL(started.data.authorizationUrl);
-	assert.equal(authorization.origin, 'https://auth.openai.com');
-	assert.equal(authorization.searchParams.get('client_id'), 'dynamic_agent_client');
-	assert.ok(authorization.searchParams.get('scope').includes('chatgpt.tokens.use.direct'));
-	assert.match(authorization.searchParams.get('ext_agent_host_id'), /^urn:uuid:/);
-	const callback = new URL(authorization.searchParams.get('redirect_uri'));
-	assert.equal(callback.hostname, '127.0.0.1');
-	assert.equal(callback.pathname, '/auth/callback');
-	callback.searchParams.set('state', authorization.searchParams.get('state'));
-	callback.searchParams.set('error', 'access_denied');
-	assert.equal((await fetch(callback)).status, 200);
+	if (connections.data.mode === 'local' || !externalUrl) {
+		assert.equal(connections.data.mode, 'local');
+		const started = await owner('/api/connections/chatgpt', { action: 'start' });
+		assert.equal(started.response.status, 200);
+		const authorization = new URL(started.data.authorizationUrl);
+		assert.equal(authorization.origin, 'https://auth.openai.com');
+		assert.equal(authorization.searchParams.get('client_id'), 'dynamic_agent_client');
+		const scope = authorization.searchParams.get('scope');
+		assert.ok(scope?.includes('chatgpt.tokens.use.direct'));
+		assert.match(authorization.searchParams.get('ext_agent_host_id') ?? '', /^urn:uuid:/);
+		const redirectUri = authorization.searchParams.get('redirect_uri');
+		assert.ok(redirectUri);
+		const callback = new URL(redirectUri);
+		assert.equal(callback.hostname, '127.0.0.1');
+		assert.equal(callback.pathname, '/auth/callback');
+		const stateParam = authorization.searchParams.get('state');
+		assert.ok(stateParam);
+		callback.searchParams.set('state', stateParam);
+		callback.searchParams.set('error', 'access_denied');
+		assert.equal((await fetch(callback)).status, 200);
+	} else {
+		assert.ok(['device', 'hosted', 'unavailable'].includes(connections.data.mode));
+		if (connections.data.mode === 'unavailable') {
+			assert.equal(
+				(await owner('/api/connections/chatgpt', { action: 'start' })).response.status,
+				503
+			);
+		}
+	}
 	assert.equal(
 		(await owner('/api/models?connection=chatgpt&accountId=not-owned')).response.status,
 		404
@@ -455,5 +500,8 @@ try {
 		'Production HTTP smoke test passed: auth, sessions, shared state, private ratings, ETags, CSRF, export, deletion, PWA assets, OAuth start/denial, account isolation, and security headers.'
 	);
 } finally {
-	server.kill('SIGTERM');
+	if (server && server.exitCode === null && server.signalCode === null) {
+		server.kill('SIGTERM');
+		await new Promise((resolve) => server.once('exit', resolve));
+	}
 }

@@ -60,7 +60,6 @@ export function negotiateEncoding(acceptEncodingHeader) {
 	}
 	return bestEncoding;
 }
-
 /**
  * Checks whether a `Content-Type` header represents a compressible media type.
  *
@@ -458,8 +457,8 @@ async function startServer() {
 	process.env.HOST_HEADER = 'x-flavorithm-host';
 	process.env.PORT_HEADER = '';
 	process.env.BODY_SIZE_LIMIT ||= '10M';
-	const handlerModulePath = './build/handler.js';
-	const { handler } = await import(handlerModulePath);
+	/** @type {{ handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => unknown }} */
+	const { handler } = await import(/** @type {string} */ ('./build/handler.js'));
 	const server = createServer((req, res) => {
 		req.headers['x-flavorithm-protocol'] = configuredOrigin.protocol.slice(0, -1);
 		req.headers['x-flavorithm-host'] = configuredOrigin.host;

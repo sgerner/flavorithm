@@ -149,3 +149,34 @@ test('Basil can revise an unsaved recipe card in the same conversation', async (
 	assert.equal(updated.recipes.filter((recipe) => recipe.id === draft.id).length, 1);
 	assert.equal(updated.recipes.find((recipe) => recipe.id === draft.id)?.servings, 6);
 });
+
+test('butler chat prompt and schema require explicit deductPantry and forbid duplicate deductions', async () => {
+	await runAIRequest(
+		request,
+		provider(
+			{
+				reply: 'Ready to mark supper cooked and deduct pantry stock.',
+				commands: [{ type: 'meal.complete', id: 'meal-1', deductPantry: true, leftoverServings: 1 }]
+			},
+			(body) => {
+				const system = String(body.messages[0].content);
+				assert.match(system, /always use meal\.complete—never meal\.upsert/);
+				assert.match(system, /always set deductPantry explicitly/);
+				assert.match(system, /Never pair meal\.complete \(with deductPantry set to true\)/);
+				assert.match(system, /leftoverServings/);
+				assert.match(system, /"required":\["type","id","deductPantry"\]/);
+			}
+		)
+	);
+
+	await assert.rejects(
+		runAIRequest(
+			request,
+			provider({
+				reply: 'Missing deduction flag.',
+				commands: [{ type: 'meal.complete', id: 'meal-1' }]
+			})
+		),
+		(error: unknown) => error instanceof AIRequestError && error.status === 502
+	);
+});
