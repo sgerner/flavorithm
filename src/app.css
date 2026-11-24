@@ -405,6 +405,11 @@ main {
 	justify-content: center;
 	padding: 9px 0;
 }
+.shopping-row .text-button {
+	min-width: 44px;
+	min-height: 44px;
+	padding: 9px 10px;
+}
 .text-button:hover {
 	color: #899f50;
 }
@@ -1416,6 +1421,11 @@ main {
 	display: grid;
 	place-items: center;
 	margin-left: 10px;
+}
+.toast .toast-undo {
+	font-weight: 600;
+	text-decoration: underline;
+	text-underline-offset: 3px;
 }
 .recipe-dialog {
 	max-width: 980px;
@@ -3017,6 +3027,11 @@ html.dark[data-theme='nosh'] {
 		flex: 0 0 44px;
 	}
 
+	.shopping-row .text-button {
+		min-width: 44px;
+		padding-inline: 10px;
+	}
+
 	.check-box {
 		width: 44px;
 		height: 44px;
@@ -3181,7 +3196,7 @@ html.dark[data-theme='nosh'] {
 	.toast button {
 		min-width: 44px;
 		min-height: 44px;
-		flex: 0 0 44px;
+		flex: 0 0 auto;
 	}
 
 	.onboarding-intro {
