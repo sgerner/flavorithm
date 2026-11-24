@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createNewUserState } from '../src/lib/data.ts';
-import { createKitchenSync } from '../src/lib/client-sync.ts';
+import { createInitialState, createNewUserState } from '../src/lib/data.ts';
+import { createKitchenSync, type SyncStatus } from '../src/lib/client-sync.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import type { KitchenTransport } from '../src/lib/offline-sync.ts';
 
@@ -51,13 +51,7 @@ function harness(args: {
 	const storage = args.storage || memoryStorage();
 	let currentUser = args.user;
 	let currentState = structuredClone(args.initial || createNewUserState());
-	const statuses: Array<{
-		pending: boolean;
-		syncing: boolean;
-		conflicts: unknown[];
-		reviewedEtag: string | null;
-		error: string;
-	}> = [];
+	const statuses: SyncStatus[] = [];
 	const setStates: AppState[] = [];
 	const controller = createKitchenSync({
 		storage,
@@ -783,6 +777,263 @@ test('baselineError and afterSaveError remain visible after reactive microtasks 
 	assert.equal(
 		sync.statuses.at(-1)?.error,
 		'The server saved these changes, but the confirmed state could not be saved on this device.'
+	);
+});
+
+test('prepare, failLoad, and clearContext keep ready false until baseline confirmation', () => {
+	const user = makeUser();
+	const staleGuest = createInitialState();
+	staleGuest.pantry.push({
+		id: 'stale-item',
+		name: 'leftover kale',
+		quantity: 1,
+		unit: 'bunch',
+		category: 'Produce'
+	});
+	const sync = harness({ user, initial: staleGuest });
+	assert.equal(sync.controller.prepare(user), true);
+	assert.deepEqual(sync.state, createNewUserState());
+	assert.deepEqual(sync.statuses.at(-1), {
+		ready: false,
+		pending: false,
+		syncing: true,
+		conflicts: [],
+		reviewedEtag: null,
+		error: ''
+	});
+
+	sync.controller.failLoad('Kitchen unavailable');
+	assert.deepEqual(sync.statuses.at(-1), {
+		ready: false,
+		pending: false,
+		syncing: false,
+		conflicts: [],
+		reviewedEtag: null,
+		error: 'Kitchen unavailable'
+	});
+
+	// An unchanged stage call from a reactive effect must not erase the load error.
+	sync.controller.stage(sync.state);
+	assert.equal(sync.statuses.at(-1)?.ready, false);
+	assert.equal(sync.statuses.at(-1)?.error, 'Kitchen unavailable');
+
+	sync.controller.initialize(user, createNewUserState(), 'v1');
+	assert.equal(sync.statuses.at(-1)?.ready, true);
+	assert.equal(sync.statuses.at(-1)?.syncing, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	sync.controller.clearContext();
+	assert.deepEqual(sync.statuses.at(-1), {
+		ready: false,
+		pending: false,
+		syncing: false,
+		conflicts: [],
+		reviewedEtag: null,
+		error: ''
+	});
+});
+
+test('unconfirmed edits stage against createNewUserState, export via snapshot, and merge with remote state', async () => {
+	const user = makeUser('user-join', 'shared-home');
+	const priorHouseholdState = createNewUserState();
+	priorHouseholdState.pantry.push({
+		id: 'old-home-item',
+		name: 'saffron',
+		quantity: 1,
+		unit: 'pinch',
+		category: 'Spices'
+	});
+	const remoteHouseholdState = createNewUserState();
+	remoteHouseholdState.pantry.push({
+		id: 'shared-beans',
+		name: 'black beans',
+		quantity: 2,
+		unit: 'can',
+		category: 'Canned goods'
+	});
+	remoteHouseholdState.preferences.allergies = 'shellfish';
+
+	const storage = memoryStorage();
+	let server = structuredClone(remoteHouseholdState);
+	const sync = harness({
+		user,
+		storage,
+		initial: priorHouseholdState,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'shared-v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (next) => {
+				server = structuredClone(next);
+				return { state: structuredClone(server), etag: 'shared-v2' };
+			}
+		})
+	});
+
+	sync.controller.prepare(user);
+	assert.equal(sync.state.pantry.length, 0);
+	sync.controller.failLoad('503 Service Unavailable');
+	assert.equal(sync.statuses.at(-1)?.ready, false);
+
+	const provisionalEdit = structuredClone(sync.state);
+	provisionalEdit.shopping.push({
+		id: 'new-milk',
+		name: 'oat milk',
+		quantity: 1,
+		unit: 'carton',
+		checked: false
+	});
+	provisionalEdit.preferences.maxTime = 25;
+	sync.controller.stage(provisionalEdit);
+
+	const journalKeys = [...storage.values.keys()].filter((key) =>
+		key.startsWith(
+			`flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`
+		)
+	);
+	assert.equal(journalKeys.length, 1);
+
+	const exported = sync.controller.snapshot();
+	assert.ok(exported);
+	assert.equal(exported.etag, null);
+	assert.deepEqual(exported.base, createNewUserState());
+	assert.deepEqual(
+		exported.local.shopping.map((item) => item.id),
+		['new-milk']
+	);
+
+	await sync.controller.sync();
+	assert.equal(sync.statuses.at(-1)?.ready, true);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	assert.equal(sync.controller.snapshot(), null);
+	assert.deepEqual(
+		server.pantry.map((item) => item.id),
+		['shared-beans']
+	);
+	assert.deepEqual(
+		server.shopping.map((item) => item.id),
+		['new-milk']
+	);
+	assert.equal(server.preferences.allergies, 'shellfish');
+	assert.equal(server.preferences.maxTime, 25);
+});
+
+test('guest signup staged into a provisional context keeps all guest items when GET /api/state fails', async () => {
+	const user = makeUser('new-account', 'new-household');
+	const guestKitchen = createInitialState();
+	guestKitchen.pantry.push({
+		id: 'guest-tahini',
+		name: 'tahini',
+		quantity: 1,
+		unit: 'jar',
+		category: 'Oils & condiments'
+	});
+	guestKitchen.shopping.push({
+		id: 'guest-lemons',
+		name: 'lemons',
+		quantity: 4,
+		unit: 'whole',
+		checked: false
+	});
+	guestKitchen.preferences.diet = 'vegetarian';
+
+	const storage = memoryStorage();
+	let server = createNewUserState();
+	const signupTab = harness({
+		user,
+		storage,
+		initial: guestKitchen,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'init-v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (next) => {
+				server = structuredClone(next);
+				return { state: structuredClone(server), etag: 'init-v2' };
+			}
+		})
+	});
+
+	signupTab.controller.prepare(user);
+	signupTab.state = guestKitchen;
+	signupTab.controller.stage(guestKitchen);
+	signupTab.controller.failLoad('Could not load your kitchen.');
+
+	assert.equal(signupTab.statuses.at(-1)?.ready, false);
+	assert.equal(signupTab.statuses.at(-1)?.pending, true);
+	assert.equal(signupTab.statuses.at(-1)?.error, 'Could not load your kitchen.');
+	assert.deepEqual(signupTab.controller.snapshot()?.local, guestKitchen);
+
+	// Reload or sign-in on another controller before sync must also retain the full guest kitchen.
+	const signedInAgain = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: 'init-v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (next) => {
+				server = structuredClone(next);
+				return { state: structuredClone(server), etag: 'init-v2' };
+			}
+		})
+	});
+	signedInAgain.controller.prepare(user);
+	assert.deepEqual(signedInAgain.state, guestKitchen);
+	signedInAgain.controller.initialize(user, createNewUserState(), 'init-v1');
+	assert.deepEqual(signedInAgain.state, guestKitchen);
+	await signedInAgain.controller.sync();
+
+	assert.deepEqual(server, guestKitchen);
+	assert.equal(signedInAgain.controller.snapshot(), null);
+	assert.equal(signedInAgain.statuses.at(-1)?.ready, true);
+});
+
+test('proxy-wrapped user objects and conflicting initialize loads preserve local edits and snapshot values', () => {
+	const rawUser = makeUser('proxy-user', 'proxy-home');
+	const proxyUser = new Proxy(rawUser, {});
+	const storage = memoryStorage();
+	const sync = harness({ user: proxyUser, storage });
+
+	assert.equal(sync.controller.prepare(proxyUser), true);
+	const localEdit = createNewUserState();
+	localEdit.preferences.maxTime = 15;
+	localEdit.shopping.push({
+		id: 'cardamom',
+		name: 'cardamom pods',
+		quantity: 1,
+		unit: 'jar',
+		checked: false
+	});
+	sync.controller.stage(localEdit);
+
+	const remoteConflict = createNewUserState();
+	remoteConflict.preferences.maxTime = 60;
+	sync.controller.initialize(proxyUser, remoteConflict, 'v-remote');
+
+	// Re-staging the UI state from a reactive effect must keep the conflict intact and retain local values for backup.
+	sync.controller.stage(sync.state);
+	assert.equal(sync.state.preferences.maxTime, 15);
+	assert.equal(sync.statuses.at(-1)?.ready, true);
+	assert.equal(sync.statuses.at(-1)?.reviewedEtag, 'v-remote');
+	assert.equal(sync.statuses.at(-1)?.conflicts.length, 1);
+	assert.equal(sync.controller.snapshot()?.local.preferences.maxTime, 15);
+	assert.deepEqual(
+		sync.controller.snapshot()?.local.shopping.map((item) => item.id),
+		['cardamom']
 	);
 });
 

@@ -6,6 +6,7 @@
 	let {
 		kitchen,
 		online,
+		ready,
 		pending,
 		syncing,
 		conflicts,
@@ -16,6 +17,7 @@
 	}: {
 		kitchen: AppState;
 		online: boolean;
+		ready: boolean;
 		pending: boolean;
 		syncing: boolean;
 		conflicts: SyncConflict[];
@@ -109,7 +111,7 @@
 	}
 </script>
 
-{#if online && !pending && !syncing && !conflicts.length && !error}
+{#if online && ready && !pending && !syncing && !conflicts.length && !error}
 	<p class="muted" role="status">Kitchen saved</p>
 {:else}
 	<section class="sync-notice" aria-label="Kitchen synchronization" in:revealMotion|global>
@@ -124,11 +126,14 @@
 						? 'Kitchen sync failed. Your changes are pending.'
 						: 'Changes pending on this device. Waiting to sync.'}</span
 				>
-			{:else}<span
+			{:else if error}<span
 					>{error.includes('invalid')
 						? 'That kitchen change was rejected. No pending changes are queued.'
-						: 'Kitchen storage or sync needs attention. No pending changes are queued.'}</span
-				>{/if}
+						: !ready
+							? 'Kitchen sync failed. No pending changes are queued.'
+							: 'Kitchen storage or sync needs attention. No pending changes are queued.'}</span
+				>
+			{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
 		</div>
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		{#if pending && !(review && conflicts.length)}
