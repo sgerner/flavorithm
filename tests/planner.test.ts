@@ -17,6 +17,7 @@ import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
+import * as importSessionMod from '../src/lib/import-session.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import { calendarDayScrollLeft, weekOffsetFromStarts } from '../src/lib/planner.ts';
@@ -62,6 +63,7 @@ function injectPlannerHook(svelteSource: string): string {
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
 		get deductPantry() { return deductPantry; },
+		setDeductPantry: (value: boolean) => { deductPantry = value; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
 		get recipesById() { return recipesById; },
@@ -75,6 +77,7 @@ function injectPlannerHook(svelteSource: string): string {
 		openRecipePicker,
 		choosePickedRecipe,
 		openCookDialog,
+		markMealCooked,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
 		saveMealChanges,
@@ -123,6 +126,7 @@ type PlannerHarnessApi = {
 	readonly week: Date[];
 	weekOffset: number;
 	readonly deductPantry: boolean;
+	setDeductPantry: (value: boolean) => void;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
 	readonly mealsByDateSlot: Map<string, Meal[]>;
@@ -139,6 +143,7 @@ type PlannerHarnessApi = {
 	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
 	choosePickedRecipe: (recipe: Recipe) => void;
 	openCookDialog: (meal: Meal) => void;
+	markMealCooked: (event?: SubmitEvent) => void;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
 	saveMealChanges: () => void;
@@ -174,6 +179,7 @@ function createModuleMap() {
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
+		'#lib/import-session.ts': importSessionMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
@@ -194,15 +200,7 @@ function createModuleMap() {
 		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
 			default: noopComponent,
-			emptyImportSession: () => ({
-				url: '',
-				text: '',
-				photo: '',
-				photoName: '',
-				draft: null,
-				baseline: null,
-				assumptions: []
-			})
+			emptyImportSession: importSessionMod.emptyImportSession
 		}
 	} as Record<string, unknown>;
 }
@@ -802,17 +800,41 @@ test('marking a meal cooked keeps pantry deduction opt-in', () => {
 	try {
 		const { api } = harness;
 		const recipe = makeRecipe('r-cook', 'Weeknight Pasta');
-		const meal: Meal = {
-			id: 'meal-cook',
+		const firstMeal: Meal = {
+			id: 'meal-cook-1',
 			date: '2026-11-23',
 			slot: 'Dinner',
 			recipeId: recipe.id,
 			servings: recipe.servings
 		};
-		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
+		const secondMeal: Meal = {
+			id: 'meal-cook-2',
+			date: '2026-11-24',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: recipe.servings
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			pantry: [{ id: 'p-oil', name: 'olive oil', quantity: 4, unit: 'tbsp', category: 'Pantry' }],
+			recipes: [recipe],
+			meals: [firstMeal, secondMeal]
+		};
 
-		api.openCookDialog(meal);
+		api.openCookDialog(firstMeal);
+		assert.equal(api.deductPantry, false);
 
+		api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === firstMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 4);
+		assert.equal(api.deductPantry, false);
+
+		api.openCookDialog(secondMeal);
+		assert.equal(api.deductPantry, false);
+		api.setDeductPantry(true);
+		api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === secondMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 3);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();

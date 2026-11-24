@@ -241,6 +241,69 @@ export function reconcileShoppingList(
 	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
+export type ShoppingItemSnapshot = Pick<ShoppingItem, 'name' | 'quantity' | 'unit'>;
+
+export interface ShoppingItemDraft {
+	name: string;
+	quantity: number | null;
+	unit: string;
+}
+
+/** Clamp and trim a shopping item's editable fields so inline edits remain valid. */
+export function normalizeShoppingItem(
+	item: ShoppingItem,
+	draft?: ShoppingItemDraft | null
+): ShoppingItem {
+	const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
+	const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
+	const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
+	const rawQuantity: unknown = draft ? draft.quantity : item.quantity;
+	const parsed =
+		rawQuantity === null ||
+		rawQuantity === undefined ||
+		(typeof rawQuantity === 'string' && !rawQuantity.trim())
+			? Number.NaN
+			: Number(rawQuantity);
+	const fallbackQuantity =
+		Number.isFinite(item.quantity) &&
+		item.quantity >= 0.01 &&
+		item.quantity <= MAX_SHOPPING_QUANTITY
+			? item.quantity
+			: 1;
+	const quantity = Number.isFinite(parsed)
+		? Math.max(0.01, Math.min(parsed, MAX_SHOPPING_QUANTITY))
+		: fallbackQuantity;
+	item.name = name;
+	item.unit = unit;
+	item.quantity = quantity;
+	if (draft) {
+		draft.name = name;
+		draft.unit = unit;
+		draft.quantity = quantity;
+	}
+	return item;
+}
+
+/** Capture a shopping item's editable fields before inline editing begins. */
+export function snapshotShoppingItem(item: ShoppingItem): ShoppingItemSnapshot {
+	return {
+		name: item.name,
+		quantity: item.quantity,
+		unit: item.unit
+	};
+}
+
+/** Restore a shopping item's editable fields from a pre-edit snapshot. */
+export function revertShoppingItem(
+	item: ShoppingItem,
+	snapshot: ShoppingItemSnapshot
+): ShoppingItem {
+	item.name = snapshot.name;
+	item.quantity = snapshot.quantity;
+	item.unit = snapshot.unit;
+	return normalizeShoppingItem(item);
+}
+
 const MAX_SHOPPING_ITEMS = 1_000;
 
 function formatDateKey(date: Date): string {
@@ -628,7 +691,8 @@ function weekWindowDates(startDate: string): Set<string> | undefined {
 }
 
 /** Return the Monday YYYY-MM-DD calendar key for a local date string or Date instance. */
-export function weekStartForDate(value: string | Date): string {
+export function weekStartForDate(value: string | Date | undefined): string {
+	if (!value) return '';
 	if (typeof value === 'string') {
 		const parsed = parseCalendarKey(value);
 		if (!parsed) return value;
@@ -671,9 +735,10 @@ function affectedWeekStarts(shopping: ShoppingItem[], dates: Iterable<string>): 
 /** Refresh one weekly shopping-list scope from incomplete planned meals in that 7-day window. */
 export function refreshWeekShopping(
 	state: AppState,
-	startDate: string,
+	startDate: string | undefined,
 	now: Date = new Date()
 ): AppState {
+	if (!startDate) return state;
 	const dates = weekWindowDates(startDate);
 	if (!dates) return state;
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();

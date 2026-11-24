@@ -243,17 +243,22 @@ export function applyButlerCommands(
 	const effects: ButlerEffect[] = [];
 	const touchedWeeks = new Set<string>();
 	const touchedRecipes = new Set<string>();
-	let pantryChangedAfterShoppingRefresh = false;
+	let pantryChanged = false;
 	const pantryMutations: PantryMutation[] = [];
 	const deductedIngredientNames = new Set<string>();
 	const deductedPantryIds = new Set<string>();
 
-	const recordShoppingWeeks = (nextState: AppState) => {
+	const recordShoppingScopes = (nextState: AppState) => {
 		for (const item of nextState.shopping) {
 			const week = item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1];
 			if (week) touchedWeeks.add(week);
+			const recipeId = item.sourceKey?.match(/^recipe:(.+)$/)?.[1];
+			if (recipeId && nextState.recipes.some((recipe) => recipe.id === recipeId)) {
+				touchedRecipes.add(recipeId);
+			}
 		}
 	};
+	recordShoppingScopes(state);
 
 	for (const command of commands) {
 		switch (command.type) {
@@ -265,7 +270,7 @@ export function applyButlerCommands(
 				}
 				touchedRecipes.add(command.recipe.id);
 				state = upsertRecipe(state, command.recipe, now);
-				recordShoppingWeeks(state);
+				recordShoppingScopes(state);
 				break;
 			}
 			case 'recipe.delete':
@@ -275,7 +280,7 @@ export function applyButlerCommands(
 				}
 				touchedRecipes.delete(command.id);
 				state = deleteRecipe(state, command.id, now);
-				recordShoppingWeeks(state);
+				recordShoppingScopes(state);
 				break;
 			case 'pantry.upsert':
 				pantryMutations.push({
@@ -286,8 +291,7 @@ export function applyButlerCommands(
 					afterDeduction: deductedPantryIds.has(command.item.id)
 				});
 				state = { ...state, pantry: upsert(state.pantry, command.item) };
-				if (touchedWeeks.size > 0 || touchedRecipes.size > 0)
-					pantryChangedAfterShoppingRefresh = true;
+				pantryChanged = true;
 				break;
 			case 'pantry.delete':
 				requireId(state.pantry, command.id);
@@ -297,8 +301,7 @@ export function applyButlerCommands(
 					beforeStep: state.pantry.find((item) => item.id === command.id)
 				});
 				state = { ...state, pantry: state.pantry.filter((item) => item.id !== command.id) };
-				if (touchedWeeks.size > 0 || touchedRecipes.size > 0)
-					pantryChangedAfterShoppingRefresh = true;
+				pantryChanged = true;
 				break;
 			case 'meal.upsert': {
 				requireId(state.recipes, command.meal.recipeId);
@@ -308,7 +311,7 @@ export function applyButlerCommands(
 					touchedWeeks.add(weekStartForDate(command.meal.date));
 				}
 				state = upsertMeal(state, command.meal, now);
-				recordShoppingWeeks(state);
+				recordShoppingScopes(state);
 				break;
 			}
 			case 'meal.delete': {
@@ -316,7 +319,7 @@ export function applyButlerCommands(
 				const removed = state.meals.find((item) => item.id === command.id);
 				if (removed) touchedWeeks.add(weekStartForDate(removed.date));
 				state = deleteMeal(state, command.id, now);
-				recordShoppingWeeks(state);
+				recordShoppingScopes(state);
 				break;
 			}
 			case 'meal.complete': {
@@ -351,7 +354,7 @@ export function applyButlerCommands(
 						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
 					}
 				}
-				recordShoppingWeeks(state);
+				recordShoppingScopes(state);
 				break;
 			}
 			case 'shopping.upsert':
@@ -422,7 +425,8 @@ export function applyButlerCommands(
 			}
 		}
 	}
-	if (pantryChangedAfterShoppingRefresh) {
+	if (pantryChanged) {
+		recordShoppingScopes(state);
 		for (const week of touchedWeeks) state = refreshWeekShopping(state, week, now);
 		for (const recipeId of touchedRecipes) state = refreshRecipeShopping(state, recipeId, now);
 	}

@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { z } from 'zod';
 import { createInitialState } from '../src/lib/data.ts';
-import { applyButlerCommands, ButlerResponseSchema } from '../src/lib/butler.ts';
+import {
+	applyButlerCommands,
+	ButlerCommandSchema,
+	ButlerResponseSchema
+} from '../src/lib/butler.ts';
 
 test('butler proposals apply atomically and validate references', () => {
 	const current = createInitialState();
@@ -959,4 +963,149 @@ test('recipe.delete retains checked recipe purchases and shopping.delete refresh
 	assert.equal(refreshedCarrot.checked, false);
 	assert.equal(refreshedCarrot.quantity, 4);
 	assert.equal(refreshedCarrot.sourceKey, 'week:2026-10-19');
+});
+
+test('pantry.upsert and pantry.delete refresh touched and existing shopping scopes regardless of command order', () => {
+	const now = new Date('2026-10-23T12:00:00Z');
+	const base = createInitialState();
+	const recipe = structuredClone(base.recipes[0]);
+	recipe.id = 'roast';
+	recipe.servings = 2;
+	recipe.ingredients = [
+		{ name: 'carrot', quantity: 4, unit: 'each' },
+		{ name: 'garlic', quantity: 2, unit: 'clove' }
+	];
+	base.recipes = [recipe];
+	base.pantry = [];
+	base.meals = [];
+	base.shopping = [];
+
+	const pantryCommand = {
+		type: 'pantry.upsert' as const,
+		item: { id: 'p-carrot', name: 'carrot', quantity: 3, unit: 'each', category: 'Produce' }
+	};
+	const mealCommand = {
+		type: 'meal.upsert' as const,
+		meal: {
+			id: 'fri-dinner',
+			date: '2026-10-23',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: 2
+		}
+	};
+
+	const pantryFirst = applyButlerCommands(base, [pantryCommand, mealCommand], now).state;
+	const mealFirst = applyButlerCommands(base, [mealCommand, pantryCommand], now).state;
+	assert.deepEqual(pantryFirst.shopping, mealFirst.shopping);
+	assert.deepEqual(
+		mealFirst.shopping.map(({ name, quantity, unit, sourceKey }) => ({
+			name,
+			quantity,
+			unit,
+			sourceKey
+		})),
+		[
+			{ name: 'carrot', quantity: 1, unit: 'each', sourceKey: 'week:2026-10-19' },
+			{ name: 'garlic', quantity: 2, unit: 'clove', sourceKey: 'week:2026-10-19' }
+		]
+	);
+
+	// Standalone pantry.upsert does not invent shopping scopes when shopping is empty
+	const emptyShoppingPantryOnly = applyButlerCommands(base, [pantryCommand], now).state;
+	assert.deepEqual(emptyShoppingPantryOnly.shopping, []);
+
+	// Standalone pantry.upsert and pantry.delete refresh existing week:* and recipe:* scopes
+	const withScopes = structuredClone(mealFirst);
+	withScopes.shopping.push(
+		{
+			id: 'recipe-carrot',
+			name: 'carrot',
+			quantity: 4,
+			unit: 'each',
+			checked: false,
+			sourceKey: `recipe:${recipe.id}`
+		},
+		{
+			id: 'recipe-garlic',
+			name: 'garlic',
+			quantity: 2,
+			unit: 'clove',
+			checked: false,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	);
+	const stockedAllCarrots = applyButlerCommands(
+		withScopes,
+		[
+			{
+				type: 'pantry.upsert',
+				item: { id: 'p-carrot', name: 'carrot', quantity: 4, unit: 'each', category: 'Produce' }
+			}
+		],
+		now
+	).state;
+	assert.equal(
+		stockedAllCarrots.shopping.some((item) => item.name === 'carrot'),
+		false
+	);
+	assert.equal(stockedAllCarrots.shopping.filter((item) => item.name === 'garlic').length, 2);
+
+	const afterDeleteCarrots = applyButlerCommands(
+		stockedAllCarrots,
+		[{ type: 'pantry.delete', id: 'p-carrot' }],
+		now
+	).state;
+	assert.equal(
+		afterDeleteCarrots.shopping.find(
+			(item) => item.sourceKey === 'week:2026-10-19' && item.name === 'carrot'
+		)?.quantity,
+		4
+	);
+	assert.equal(
+		afterDeleteCarrots.shopping.find(
+			(item) => item.sourceKey === `recipe:${recipe.id}` && item.name === 'carrot'
+		)?.quantity,
+		4
+	);
+});
+
+test('meal.complete rejects omitted deductPantry and keeps pantry unchanged when deductPantry is false', () => {
+	const now = new Date('2026-10-23T18:00:00Z');
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'garlic', quantity: 2, unit: 'cloves' }];
+	current.pantry = [
+		{ id: 'p-garlic', name: 'garlic', quantity: 6, unit: 'cloves', category: 'Produce' }
+	];
+	current.meals = [
+		{ id: 'tonight', date: '2026-10-23', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+	current.shopping = [];
+	const snapshot = structuredClone(current);
+
+	assert.equal(
+		ButlerCommandSchema.safeParse({ type: 'meal.complete', id: 'tonight' }).success,
+		false
+	);
+	assert.equal(
+		ButlerResponseSchema.safeParse({
+			reply: 'Marked cooked.',
+			commands: [{ type: 'meal.complete', id: 'tonight' }]
+		}).success,
+		false
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [{ type: 'meal.complete', id: 'tonight' }], now)
+	);
+	assert.deepEqual(current, snapshot);
+
+	const withoutDeduction = applyButlerCommands(
+		current,
+		[{ type: 'meal.complete', id: 'tonight', deductPantry: false }],
+		now
+	).state;
+	assert.equal(withoutDeduction.meals[0].completedAt, now.toISOString());
+	assert.equal(withoutDeduction.pantry[0].quantity, 6);
 });
