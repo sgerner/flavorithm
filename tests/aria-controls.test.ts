@@ -17,6 +17,7 @@ import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
+import * as importSessionMod from '../src/lib/import-session.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import type { SyncConflict } from '../src/lib/offline-sync.ts';
 import * as plannerMod from '../src/lib/planner.ts';
@@ -24,6 +25,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import type { AppState, Recipe } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -223,6 +225,14 @@ function loadServerComponent(
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
+			if (id.startsWith('#lib/')) {
+				return nodeRequire(
+					new URL(`../src/lib/${id.slice('#lib/'.length)}`, import.meta.url).pathname
+				);
+			}
 			throw new Error(`Unexpected SSR dependency ${id}`);
 		},
 		Date,
@@ -642,11 +652,13 @@ test('+page.svelte renders unique ids, valid aria-labelledby groups, explicit pa
 				'#lib/planner.ts': plannerMod,
 				'#lib/data.ts': dataMod,
 				'#lib/domain.ts': domainMod,
+				'#lib/import-session.ts': importSessionMod,
 				'#lib/kitchen-workflows.ts': workflowsMod,
 				'#lib/discovery.ts': discoveryMod,
 				'#lib/recipe-collection.ts': recipeCollectionMod,
 				'#lib/recipe-detail.ts': recipeDetailMod,
 				'#lib/recipe-draft.ts': recipeDraftMod,
+				'#lib/recipe-scraper.ts': scraperMod,
 				'#lib/butler.ts': butlerMod,
 				'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 				'#lib/voice-config.ts': voiceConfigMod,
@@ -668,15 +680,7 @@ test('+page.svelte renders unique ids, valid aria-labelledby groups, explicit pa
 				'#lib/components/RecipeImport.svelte': {
 					__esModule: true,
 					default: noopComponent,
-					emptyImportSession: () => ({
-						url: '',
-						text: '',
-						photo: '',
-						photoName: '',
-						draft: null,
-						baseline: null,
-						assumptions: []
-					})
+					emptyImportSession: importSessionMod.emptyImportSession
 				}
 			},
 			{
