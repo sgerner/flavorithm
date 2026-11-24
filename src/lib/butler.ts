@@ -7,6 +7,9 @@ import {
 	completeMeal,
 	completeRecipe,
 	convertCompatibleQuantity,
+	promoteSampleBookmark,
+	promoteSampleIngredient,
+	promoteSampleMeal,
 	reconcileShoppingList
 } from './kitchen-workflows.ts';
 
@@ -56,6 +59,7 @@ const recipe = z.object({
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
+	sampleSaved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
 const date = z
@@ -71,7 +75,8 @@ const pantry = z.object({
 	quantity,
 	unit: z.string().max(40),
 	category: z.string().max(80),
-	expires: z.union([date, z.literal('')]).optional()
+	expires: z.union([date, z.literal('')]).optional(),
+	sample: z.boolean().optional()
 });
 const meal = z.object({
 	id,
@@ -89,7 +94,8 @@ const meal = z.object({
 		.optional()
 		.describe(
 			'Remaining leftover servings on an already-cooked meal (clamped between 0 and servings); ignored on uncompleted meals.'
-		)
+		),
+	sample: z.boolean().optional()
 });
 const shopping = z.object({
 	id,
@@ -117,7 +123,8 @@ const preferences = z
 			budgetTokens: z.number().int().min(0).max(32768).optional()
 		}),
 		ratings: z.record(id, z.number().min(0).max(5)),
-		chatgptAccountId: z.string().max(100)
+		chatgptAccountId: z.string().max(100),
+		usePersonalAI: z.boolean()
 	})
 	.partial()
 	.strict();
@@ -295,7 +302,7 @@ export function applyButlerCommands(
 		switch (command.type) {
 			case 'recipe.upsert': {
 				const previous = state.recipes.find((item) => item.id === command.recipe.id);
-				const updated = { ...command.recipe };
+				const updated = promoteSampleBookmark({ ...command.recipe });
 				if (previous?.provenance === 'manual') updated.provenance = 'manual';
 				else if (updated.provenance === undefined && previous?.provenance)
 					updated.provenance = previous.provenance;
@@ -356,16 +363,18 @@ export function applyButlerCommands(
 				}
 				break;
 			}
-			case 'pantry.upsert':
+			case 'pantry.upsert': {
+				const promoted = promoteSampleIngredient(command.item);
 				pantryMutations.push({
 					kind: 'upsert',
-					beforeCurrent: current.pantry.find((item) => item.id === command.item.id),
-					beforeStep: state.pantry.find((item) => item.id === command.item.id),
-					after: command.item,
-					afterDeduction: deductedPantryIds.has(command.item.id)
+					beforeCurrent: current.pantry.find((item) => item.id === promoted.id),
+					beforeStep: state.pantry.find((item) => item.id === promoted.id),
+					after: promoted,
+					afterDeduction: deductedPantryIds.has(promoted.id)
 				});
-				state.pantry = upsert(state.pantry, command.item);
+				state.pantry = upsert(state.pantry, promoted);
 				break;
+			}
 			case 'pantry.delete':
 				requireId(state.pantry, command.id);
 				pantryMutations.push({
@@ -382,7 +391,7 @@ export function applyButlerCommands(
 					completedAt: _completedAt,
 					leftoverServings: requestedLeftovers,
 					...baseMeal
-				} = command.meal;
+				} = promoteSampleMeal(command.meal);
 				if (previous?.completedAt) {
 					const rawLeftovers = requestedLeftovers ?? previous.leftoverServings;
 					const leftoverServings =
