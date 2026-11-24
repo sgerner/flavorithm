@@ -5,6 +5,7 @@
 	let {
 		kitchen,
 		online,
+		ready,
 		pending,
 		syncing,
 		conflicts,
@@ -15,6 +16,7 @@
 	}: {
 		kitchen: AppState;
 		online: boolean;
+		ready: boolean;
 		pending: boolean;
 		syncing: boolean;
 		conflicts: SyncConflict[];
@@ -24,7 +26,7 @@
 		error?: string;
 	} = $props();
 	let review = $state(false);
-	let saved = $derived(online && !pending && !syncing && !conflicts.length && !error);
+	let saved = $derived(online && ready && !pending && !syncing && !conflicts.length && !error);
 	let conflictLabels = $derived.by(() => {
 		const counts = new Map<string, number>();
 		return conflicts.map((conflict) => {
@@ -128,11 +130,11 @@
 			>
 		{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
 		{:else if syncing}<RefreshCw size={18} aria-hidden="true" /><span>Syncing your kitchen…</span>
-		{:else}<span
-				>{error
-					? 'Kitchen sync failed. Your changes are pending.'
-					: 'Changes pending on this device. Waiting to sync.'}</span
-			>{/if}
+		{:else if error}<span
+				>{pending ? 'Kitchen sync failed. Your changes are pending.' : 'Kitchen sync failed.'}</span
+			>
+		{:else if pending}<span>Changes pending on this device. Waiting to sync.</span>
+		{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
 	</div>
 	{#if !saved}
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
