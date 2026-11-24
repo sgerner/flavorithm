@@ -3659,7 +3659,7 @@
 			resetAccountForms(result.user);
 			notify(
 				emailChanged
-					? 'Account email updated. Verification has been reset for the new address.'
+					? 'Account email updated. Other sessions have been signed out and verification has been reset.'
 					: 'Display name updated.'
 			);
 		} catch (e) {
@@ -5286,7 +5286,7 @@
 									>
 									<p class="field-help">
 										{profileEmailChanged
-											? 'Confirm with your current password to update your email. Verification status resets for a new address.'
+											? 'Confirm with your current password to update your email. Other sessions sign out and verification resets.'
 											: 'Required only when changing your email address.'}
 									</p>
 									{#if profileError}<p class="error" role="alert">{profileError}</p>{/if}
@@ -5670,12 +5670,13 @@
 							</p>
 							<div class="invite-code">
 								<code
-									>npm run auth:reset-password -- --email {email.trim() || 'you@example.com'}</code
+									>npm run auth:reset-password -- --email {email.trim() || 'you@example.com'} --password-stdin</code
 								>
 							</div>
 							<p class="field-help">
-								Add <code>--password-stdin</code> to pipe a chosen password, or ask the server operator
-								to configure email delivery for reset links.
+								Pipe a replacement password via standard input (10–128 characters) to keep it out of
+								shell history and scrollback, or ask the server operator to configure email
+								delivery.
 							</p>
 						</div>
 						{#if error}<p class="error" role="alert">{error}</p>{/if}

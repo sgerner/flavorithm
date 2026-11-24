@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash, randomBytes } from 'node:crypto';
 import { test } from 'node:test';
 
 process.env.FLAVORITHM_DB_PATH = ':memory:';
@@ -661,9 +662,13 @@ test('local password rotation keeps a rotated session while revoking other sessi
 	);
 });
 
-test('local profile updates validate passwords on email changes, clear verification, and block collisions', async () => {
+test('local profile updates validate passwords on email changes, revoke other sessions, clear verification, and block collisions', async () => {
 	const account = await backend.registerUser(
 		'Original Name',
+		'profile-user@example.com',
+		'profile secure password'
+	);
+	const otherSession = await backend.loginUser(
 		'profile-user@example.com',
 		'profile secure password'
 	);
@@ -677,10 +682,12 @@ test('local profile updates validate passwords on email changes, clear verificat
 		name: '  Updated Chef  ',
 		email: 'PROFILE-USER@example.com'
 	});
-	assert.equal(renamed.name, 'Updated Chef');
-	assert.equal(renamed.email, 'profile-user@example.com');
-	assert.equal(renamed.emailVerified, true);
+	assert.equal(renamed.user.name, 'Updated Chef');
+	assert.equal(renamed.user.email, 'profile-user@example.com');
+	assert.equal(renamed.user.emailVerified, true);
+	assert.equal(renamed.token, undefined);
 	assert.equal(backend.getUserFromSession(account.token)?.name, 'Updated Chef');
+	assert.equal(backend.getUserFromSession(otherSession.token)?.name, 'Updated Chef');
 
 	await assert.rejects(
 		() => backend.updateAccountProfile(account.user.id, { email: 'new-address@example.com' }),
@@ -708,18 +715,29 @@ test('local profile updates validate passwords on email changes, clear verificat
 		email: 'New-Address@Example.com',
 		currentPassword: 'profile secure password'
 	});
-	assert.equal(reEmail.name, 'Chef Deux');
-	assert.equal(reEmail.email, 'new-address@example.com');
-	assert.equal(reEmail.emailVerified, false);
+	assert.equal(reEmail.user.name, 'Chef Deux');
+	assert.equal(reEmail.user.email, 'new-address@example.com');
+	assert.equal(reEmail.user.emailVerified, false);
+	assert.ok(reEmail.token);
+	assert.notEqual(reEmail.token, account.token);
+	assert.notEqual(reEmail.token, otherSession.token);
+	assert.equal(backend.getUserFromSession(account.token), null);
+	assert.equal(backend.getUserFromSession(otherSession.token), null);
+	assert.equal(backend.getUserFromSession(reEmail.token)?.email, 'new-address@example.com');
 
 	const pendingNewVerify = backend.issueEmailVerification(account.user.id)!;
 	const pendingReset = backend.issuePasswordReset('new-address@example.com')!;
+	const thirdDevice = await backend.loginUser('new-address@example.com', 'profile secure password');
 	const thirdEmail = await backend.updateAccountProfile(account.user.id, {
 		email: 'third-address@example.com',
 		currentPassword: 'profile secure password'
 	});
-	assert.equal(thirdEmail.email, 'third-address@example.com');
-	assert.equal(thirdEmail.emailVerified, false);
+	assert.equal(thirdEmail.user.email, 'third-address@example.com');
+	assert.equal(thirdEmail.user.emailVerified, false);
+	assert.ok(thirdEmail.token);
+	assert.equal(backend.getUserFromSession(reEmail.token), null);
+	assert.equal(backend.getUserFromSession(thirdDevice.token), null);
+	assert.equal(backend.getUserFromSession(thirdEmail.token)?.email, 'third-address@example.com');
 	assert.throws(() => backend.verifyEmailToken(pendingNewVerify.token), { status: 400 });
 	await assert.rejects(
 		() => backend.resetUserPassword(pendingReset.token, 'replacement secure password 123'),
@@ -744,5 +762,127 @@ test('local profile updates validate passwords on email changes, clear verificat
 	await assert.rejects(
 		() => backend.resetLocalUserPassword('unknown@example.com', 'operator secure password'),
 		{ status: 404 }
+	);
+});
+
+test('concurrent password changes and concurrent email changes each allow exactly one winner', async () => {
+	const pwRaceAccount = await backend.registerUser(
+		'Race User',
+		'pw-race@example.com',
+		'starting race password'
+	);
+	const pwOutcomes = await Promise.allSettled([
+		backend.rotateUserCredentials(
+			pwRaceAccount.user.id,
+			'starting race password',
+			'first candidate password'
+		),
+		backend.rotateUserCredentials(
+			pwRaceAccount.user.id,
+			'starting race password',
+			'second candidate password'
+		)
+	]);
+	const pwFulfilled = pwOutcomes.filter(
+		(outcome): outcome is PromiseFulfilledResult<{ token: string }> =>
+			outcome.status === 'fulfilled'
+	);
+	const pwRejected = pwOutcomes.filter(
+		(outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected'
+	);
+	assert.equal(pwFulfilled.length, 1);
+	assert.equal(pwRejected.length, 1);
+	assert.equal((pwRejected[0].reason as { status?: number }).status, 409);
+	assert.match(String((pwRejected[0].reason as { message?: string }).message), /password changed/i);
+	assert.equal(
+		backend.getUserFromSession(pwFulfilled[0].value.token)?.id,
+		pwRaceAccount.user.id,
+		'winning password change keeps its newly issued session'
+	);
+
+	const emailRaceAccount = await backend.registerUser(
+		'Email Race User',
+		'email-race@example.com',
+		'email race password'
+	);
+	const emailOutcomes = await Promise.allSettled([
+		backend.updateAccountProfile(emailRaceAccount.user.id, {
+			email: 'email-race-one@example.com',
+			currentPassword: 'email race password'
+		}),
+		backend.updateAccountProfile(emailRaceAccount.user.id, {
+			email: 'email-race-two@example.com',
+			currentPassword: 'email race password'
+		})
+	]);
+	const emailFulfilled = emailOutcomes.filter(
+		(
+			outcome
+		): outcome is PromiseFulfilledResult<{
+			user: { email: string };
+			token?: string;
+		}> => outcome.status === 'fulfilled'
+	);
+	const emailRejected = emailOutcomes.filter(
+		(outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected'
+	);
+	assert.equal(emailFulfilled.length, 1);
+	assert.equal(emailRejected.length, 1);
+	assert.equal((emailRejected[0].reason as { status?: number }).status, 409);
+	assert.ok(emailFulfilled[0].value.token);
+	assert.equal(
+		backend.getUserFromSession(emailFulfilled[0].value.token)?.email,
+		emailFulfilled[0].value.user.email,
+		'winning email change keeps its rotated session and chosen address'
+	);
+
+	const crossRaceAccount = await backend.registerUser(
+		'Cross Race User',
+		'cross-race@example.com',
+		'cross race password'
+	);
+	const crossOutcomes = await Promise.allSettled([
+		backend.rotateUserCredentials(
+			crossRaceAccount.user.id,
+			'cross race password',
+			'rotated cross password'
+		),
+		backend.updateAccountProfile(crossRaceAccount.user.id, {
+			email: 'cross-race-updated@example.com',
+			currentPassword: 'cross race password'
+		})
+	]);
+	// If rotateUserCredentials commits first, updateAccountProfile sees the changed password_hash and rejects with 409.
+	const crossRejected = crossOutcomes.filter(
+		(outcome): outcome is PromiseRejectedResult => outcome.status === 'rejected'
+	);
+	for (const failure of crossRejected) {
+		assert.equal((failure.reason as { status?: number }).status, 409);
+	}
+});
+
+test('pre-deploy SHA-256 password reset token rows are rejected with invalid or expired', async () => {
+	const legacyAccount = await backend.registerUser(
+		'Legacy Reset User',
+		'legacy-reset@example.com',
+		'legacy initial password'
+	);
+	const preDeployLinkValue = randomBytes(32).toString('base64url');
+	const legacyRowDigest = createHash('sha256').update(preDeployLinkValue).digest('hex');
+	const now = Date.now();
+	backend
+		.getDatabase()
+		.prepare(
+			'INSERT INTO password_reset_tokens(token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
+		)
+		.run(legacyRowDigest, legacyAccount.user.id, now + 60 * 60 * 1000, now);
+
+	await assert.rejects(
+		() => backend.resetUserPassword(preDeployLinkValue, 'fresh replacement password'),
+		(error: unknown) =>
+			typeof error === 'object' &&
+			error !== null &&
+			(error as { status?: number }).status === 400 &&
+			/invalid or expired/i.test(String((error as { message?: string }).message))
 	);
 });

@@ -150,12 +150,15 @@ export const POST: RequestHandler = async (event) => {
 		if (payload.action === 'updateAccountProfile') {
 			if (!event.locals.user) throw new ApiError(401, 'Authentication required');
 			consumeRateLimit(`account-profile:${event.locals.user.id}`, 10, 15 * 60 * 1000);
-			const user = await updateAccountProfile(event.locals.user.id, {
+			const result = await updateAccountProfile(event.locals.user.id, {
 				name: payload.name,
 				email: payload.email,
 				currentPassword: payload.currentPassword
 			});
-			return Response.json({ user });
+			if (result.token && result.expiresAt !== undefined) {
+				setSessionCookie(event.cookies, event.request, result.token, result.expiresAt);
+			}
+			return Response.json({ user: result.user });
 		}
 		if (payload.action === 'requestPasswordReset') {
 			const apiKey = process.env.RESEND_API_KEY?.trim();

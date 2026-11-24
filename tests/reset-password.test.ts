@@ -166,3 +166,56 @@ test('CLI password reset rejects CLI password flags, missing databases, unknown 
 		rmSync(directory, { recursive: true, force: true });
 	}
 });
+
+test('CLI password reset --password-stdin succeeds without printing secrets and revokes active sessions', () => {
+	const directory = mkdtempSync(join(tmpdir(), 'flavorithm-reset-stdin-'));
+	const databasePath = join(directory, 'stdin-success.sqlite');
+	const initialPassword = 'initial stdin account password';
+	const replacementPassword = 'piped stdin replacement password';
+	try {
+		const setup = runInlineWithDb(
+			databasePath,
+			`
+			import assert from 'node:assert/strict';
+			import { registerUser, loginUser, issuePasswordReset, getDatabase } from './src/lib/server/db.ts';
+			const registered = await registerUser('Stdin Cook', 'stdin-cook@example.test', ${JSON.stringify(initialPassword)});
+			const secondSession = await loginUser('stdin-cook@example.test', ${JSON.stringify(initialPassword)});
+			const reset = issuePasswordReset('stdin-cook@example.test');
+			assert.ok(registered.token);
+			assert.ok(secondSession.token);
+			assert.ok(reset?.token);
+			getDatabase().close();
+			`
+		);
+		assert.equal(setup.status, 0, setup.stderr);
+
+		const result = runReset(
+			['--email=STDIN-COOK@example.test', `--db=${databasePath}`, '--password-stdin'],
+			`${replacementPassword}\r\n`
+		);
+		assert.equal(result.status, 0, result.stderr);
+		assert.match(result.stdout, /Reset local password for stdin-cook@example\.test/);
+		assert.match(result.stdout, /Revoked all active sessions and pending password reset links/);
+		assert.doesNotMatch(result.stdout, /Generated password/);
+		assert.equal(result.stdout.includes(replacementPassword), false);
+		assert.equal(result.stderr.includes(replacementPassword), false);
+
+		const verify = runInlineWithDb(
+			databasePath,
+			`
+			import assert from 'node:assert/strict';
+			import { loginUser, getDatabase } from './src/lib/server/db.ts';
+			const db = getDatabase();
+			assert.equal((db.prepare('SELECT COUNT(*) AS count FROM sessions').get()).count, 0);
+			assert.equal((db.prepare('SELECT COUNT(*) AS count FROM password_reset_tokens').get()).count, 0);
+			await assert.rejects(() => loginUser('stdin-cook@example.test', ${JSON.stringify(initialPassword)}), { status: 401 });
+			const freshSession = await loginUser('stdin-cook@example.test', ${JSON.stringify(replacementPassword)});
+			assert.equal(freshSession.user.email, 'stdin-cook@example.test');
+			db.close();
+			`
+		);
+		assert.equal(verify.status, 0, verify.stderr);
+	} finally {
+		rmSync(directory, { recursive: true, force: true });
+	}
+});

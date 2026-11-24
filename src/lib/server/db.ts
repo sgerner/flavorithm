@@ -1034,12 +1034,15 @@ export async function rotateUserCredentials(
 	try {
 		const current = db
 			.prepare(
-				'SELECT id, name, email, household_id, email_verified_at, sso_only FROM users WHERE id = ?'
+				'SELECT id, name, email, household_id, email_verified_at, password_hash, sso_only FROM users WHERE id = ?'
 			)
-			.get(userId) as (DbUserRow & { sso_only: number }) | undefined;
+			.get(userId) as (DbUserRow & { password_hash: string; sso_only: number }) | undefined;
 		if (!current) throw new ApiError(401, 'Authentication required');
 		if (current.sso_only) {
 			throw new ApiError(403, 'Local password authentication is disabled for this account.');
+		}
+		if (current.password_hash !== row.password_hash) {
+			throw new ApiError(409, 'Your password changed. Try again.');
 		}
 		db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
 		db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(userId);
@@ -1057,7 +1060,7 @@ export async function rotateUserCredentials(
 export async function updateAccountProfile(
 	userId: string,
 	input: { name?: string; email?: string; currentPassword?: string }
-): Promise<User> {
+): Promise<{ user: User; token?: string; expiresAt?: number }> {
 	if (input.name === undefined && input.email === undefined) {
 		throw new ApiError(400, 'Provide a display name or email address to update');
 	}
@@ -1095,18 +1098,20 @@ export async function updateAccountProfile(
 	try {
 		const current = db
 			.prepare(
-				'SELECT id, name, email, household_id, email_verified_at, sso_only FROM users WHERE id = ?'
+				'SELECT id, name, email, household_id, email_verified_at, password_hash, sso_only FROM users WHERE id = ?'
 			)
-			.get(userId) as (DbUserRow & { sso_only: number }) | undefined;
+			.get(userId) as (DbUserRow & { password_hash: string; sso_only: number }) | undefined;
 		if (!current) throw new ApiError(401, 'Authentication required');
 		if (current.sso_only) {
 			throw new ApiError(403, 'Local account profile controls are disabled for this account.');
 		}
-		const currentEmailChanged = nextEmail !== current.email.toLowerCase();
-		if (currentEmailChanged && !emailChanged) {
+		if (emailChanged && current.password_hash !== row.password_hash) {
+			throw new ApiError(409, 'Your password changed. Try again.');
+		}
+		if (current.email.toLowerCase() !== row.email.toLowerCase()) {
 			throw new ApiError(409, 'Your account changed. Reload Settings and try again.');
 		}
-		if (currentEmailChanged) {
+		if (emailChanged) {
 			const collision = db
 				.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id <> ?')
 				.get(nextEmail, userId) as { id: string } | undefined;
@@ -1120,13 +1125,19 @@ export async function updateAccountProfile(
 			);
 			db.prepare('DELETE FROM email_verification_tokens WHERE user_id = ?').run(userId);
 			db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(userId);
-		} else {
-			db.prepare('UPDATE users SET name = ? WHERE id = ?').run(nextName, userId);
+			db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+			const updated = getCurrentUser(userId);
+			if (!updated) throw new ApiError(401, 'Authentication required');
+			const user = toUser(updated);
+			const session = createSession(user);
+			db.exec('COMMIT');
+			return { user, ...session };
 		}
+		db.prepare('UPDATE users SET name = ? WHERE id = ?').run(nextName, userId);
 		const updated = getCurrentUser(userId);
 		if (!updated) throw new ApiError(401, 'Authentication required');
 		db.exec('COMMIT');
-		return toUser(updated);
+		return { user: toUser(updated) };
 	} catch (error) {
 		db.exec('ROLLBACK');
 		if (String(error).includes('UNIQUE constraint failed: users.email')) {

@@ -221,17 +221,17 @@ Provider API keys are entered in Settings and are not configured through environ
 
 Authentication mode is selected by the server operator. See [SSO and trusted proxy setup](docs/sso.md) for provider setup, identity mapping, and logout behavior.
 
-In `local` authentication mode, signed-in users can update their display name, change their email address (after confirming their current password), and rotate their password from **Settings**. Changing a password rotates the active browser session and revokes sessions on other devices plus pending reset links. When Resend is not configured, operators can recover a locked-out local account from a host or container terminal:
+In `local` authentication mode, signed-in users can update their display name, change their email address (after confirming their current password), and rotate their password from **Settings**. Changing an email address or password rotates the active browser session and revokes sessions on other devices plus pending reset links. When Resend is not configured, operators can recover a locked-out local account from a host or container terminal (prefer `--password-stdin` so replacement passwords stay out of shell arguments, history, and terminal scrollback):
 
 ```sh
-# Print a one-time generated replacement password and revoke active sessions:
+# Prompt silently and pipe a chosen password (10–128 characters) via standard input:
+read -rs NEW_PASSWORD && printf '%s\n' "$NEW_PASSWORD" | npm run auth:reset-password -- --email cook@example.com --password-stdin; unset NEW_PASSWORD
+
+# In Docker Compose (reading from standard input):
+read -rs NEW_PASSWORD && printf '%s\n' "$NEW_PASSWORD" | docker exec -i flavorithm npm run auth:reset-password -- --email cook@example.com --password-stdin; unset NEW_PASSWORD
+
+# Or omit --password-stdin to generate and print a one-time replacement password:
 npm run auth:reset-password -- --email cook@example.com
-
-# Or read a chosen password (10–128 characters) from standard input without putting secrets in shell arguments:
-printf '%s\n' 'a-new-secure-passphrase' | npm run auth:reset-password -- --email cook@example.com --password-stdin
-
-# In Docker Compose:
-docker exec -i flavorithm npm run auth:reset-password -- --email cook@example.com
 ```
 
 Pass `--db /path/to/flavorithm.sqlite` when targeting a non-default database file (such as `data/flavorithm.dev.sqlite` from `npm run seed:dev`).
@@ -306,7 +306,7 @@ The automated tests cover application logic and use mocked provider/network resp
 | Hosted ChatGPT OAuth is unavailable                      | For device-code login, enable the grant in ChatGPT security settings or ask your workspace admin. For registered SIWC, check the issued client, callback, and encryption key. See the [OAuth guide](docs/chatgpt-oauth.md). |
 | Model catalog or AI operation fails                      | Check the selected connection, model support, account consent or API key, provider availability, network access, and provider quota. Image recognition requires a vision-capable model.                                     |
 | Online recipe search returns no results                  | Configure `BRAVE_SEARCH_API_KEY`; search also requires a signed-in account and internet access.                                                                                                                             |
-| Password recovery reports it is not configured           | Set `RESEND_API_KEY`, `EMAIL_FROM` to a verified sender, and a valid public `ORIGIN`, or run `npm run auth:reset-password -- --email <user@example.com>` on the server.                                                     |
+| Password recovery reports it is not configured           | Set `RESEND_API_KEY`, `EMAIL_FROM` to a verified sender, and a valid public `ORIGIN`, or pipe a new password to `npm run auth:reset-password -- --email <user@example.com> --password-stdin` on the server.                 |
 | Pantry dictation does not start                          | Grant microphone access on HTTPS or localhost. In Settings → Voice input, choose local Whisper or a cloud transcription provider for browsers without SpeechRecognition.                                                    |
 | Purchased list does not subtract an item from the pantry | Automatic subtraction requires a recognized compatible ingredient name and unit. Review and edit the generated list as needed.                                                                                              |
 
