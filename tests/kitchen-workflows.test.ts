@@ -15,9 +15,12 @@ import {
 	listPantryCategories,
 	normalizeIngredientName,
 	normalizePantryDraft,
+	normalizeShoppingItem,
 	reconcileShoppingList,
 	restockDepletedPantryItems,
 	restoreShoppingItem,
+	revertShoppingItem,
+	snapshotShoppingItem,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -929,6 +932,71 @@ test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and 
 		fallbackRanked.map((item) => item.id),
 		['blank-lot', 'invalid-lot']
 	);
+});
+
+test('normalizeShoppingItem trims, bounds lengths, and clamps or defaults quantities', () => {
+	const blank = shopping('blank', '   ', null as unknown as number, '  ', false, 'recipe:soup');
+	normalizeShoppingItem(blank);
+	assert.equal(blank.name, 'Shopping item');
+	assert.equal(blank.unit, 'piece');
+	assert.equal(blank.quantity, 1);
+
+	const oversized = shopping(
+		'long',
+		`  ${'a'.repeat(240)}  `,
+		5_000_000,
+		` ${'u'.repeat(50)} `,
+		true
+	);
+	normalizeShoppingItem(oversized);
+	assert.equal(oversized.name, 'a'.repeat(200));
+	assert.equal(oversized.unit, 'u'.repeat(40));
+	assert.equal(oversized.quantity, 1_000_000);
+
+	const tiny = shopping('tiny', ' garlic ', 0, ' cloves ', false);
+	normalizeShoppingItem(tiny);
+	assert.equal(tiny.name, 'garlic');
+	assert.equal(tiny.unit, 'cloves');
+	assert.equal(tiny.quantity, 0.01);
+
+	const nonFinite = shopping('nan', 'salt', Number.NaN, 'tsp', false);
+	normalizeShoppingItem(nonFinite);
+	assert.equal(nonFinite.quantity, 1);
+
+	const withDraft = shopping('draft-item', 'San Marzano tomatoes', 2.5, 'cans', false);
+	const validDraft = { name: '  Roma tomatoes  ', quantity: 4, unit: ' lb ' };
+	normalizeShoppingItem(withDraft, validDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'lb');
+	assert.deepEqual(validDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'lb' });
+
+	const clearedDraft = { name: '   ', quantity: null, unit: '   ' };
+	normalizeShoppingItem(withDraft, clearedDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'piece');
+	assert.deepEqual(clearedDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'piece' });
+});
+
+test('snapshotShoppingItem and revertShoppingItem restore pre-edit fields while keeping row metadata', () => {
+	const item = shopping('row-1', 'Olive oil', 2, 'tbsp', false, 'week:2026-10-19');
+	const snapshot = snapshotShoppingItem(item);
+
+	item.name = '   ';
+	normalizeShoppingItem(item);
+	item.name = 'Garlic';
+	item.quantity = 12;
+	item.unit = 'cloves';
+	item.checked = true;
+
+	revertShoppingItem(item, snapshot);
+	assert.equal(item.id, 'row-1');
+	assert.equal(item.name, 'Olive oil');
+	assert.equal(item.quantity, 2);
+	assert.equal(item.unit, 'tbsp');
+	assert.equal(item.checked, true);
+	assert.equal(item.sourceKey, 'week:2026-10-19');
 });
 
 test('restockDepletedPantryItems moves selected or all zero-quantity rows while keeping stored name and unit', () => {

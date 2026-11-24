@@ -2820,19 +2820,20 @@ export function resolvePublicFetcher(event: { fetch: Fetcher; isSubRequest?: boo
 }
 
 export function getPublicModelCatalog(fetcher: Fetcher = fetch): Promise<SupportedModelResponse> {
+	const cache = publicCatalogCache;
 	const key = publicCatalogKey(fetcher);
-	const cached = publicCatalogCache.get(key);
+	const cached = cache.get(key);
 	const now = Date.now();
 	if (cached && now < cached.expiresAt) return cached.pending;
 
 	const expiresAt = now + PUBLIC_MODEL_CATALOG_TTL_MS;
 	const pending = getSupportedModels(fetcher).catch((error) => {
-		if (publicCatalogCache.get(key)?.pending === pending) {
-			publicCatalogCache.delete(key);
+		if (cache.get(key)?.pending === pending) {
+			cache.delete(key);
 		}
 		throw error;
 	});
-	publicCatalogCache.set(key, { pending, expiresAt });
+	cache.set(key, { pending, expiresAt });
 	return pending;
 }
 

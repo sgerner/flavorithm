@@ -6,6 +6,8 @@ import { buildShoppingList } from '../src/lib/domain.ts';
 import { writePendingJournal } from '../src/lib/offline-sync.ts';
 import {
 	clearAccountStorage,
+	clearGuestData,
+	clearGuestKitchen,
 	migrateGuestKitchenOnSignup,
 	quarantineLegacyKitchen,
 	readCachedAccount,
@@ -284,6 +286,33 @@ test('resolveLocalAuthTransition and resolveRegistrationGuestSeed isolate expire
 	assert.equal(
 		seededDuringExpiry.pantry.some((item) => item.id === 'secret-truffle'),
 		false
+	);
+});
+
+test('clearGuestKitchen and clearGuestData remove only guest keys and tolerate storage errors', () => {
+	const values = new Map([
+		['flavorithm-guest-kitchen', '{"pantry":["eggs"]}'],
+		['flavorithm-started', 'yes'],
+		['flavorithm-last-account', '{"id":"user-1"}'],
+		['flavorithm-legacy-kitchen-backup', '{"legacy":true}']
+	]);
+	clearGuestKitchen(memoryStorage(values));
+	assert.equal(values.has('flavorithm-guest-kitchen'), false);
+	assert.equal(values.get('flavorithm-started'), 'yes');
+
+	values.set('flavorithm-guest-kitchen', '{"pantry":["milk"]}');
+	clearGuestData(memoryStorage(values));
+	assert.equal(values.has('flavorithm-guest-kitchen'), false);
+	assert.equal(values.has('flavorithm-started'), false);
+	assert.equal(values.get('flavorithm-last-account'), '{"id":"user-1"}');
+	assert.equal(values.get('flavorithm-legacy-kitchen-backup'), '{"legacy":true}');
+
+	assert.doesNotThrow(() =>
+		clearGuestData({
+			removeItem: () => {
+				throw new Error('Storage restricted');
+			}
+		})
 	);
 });
 
