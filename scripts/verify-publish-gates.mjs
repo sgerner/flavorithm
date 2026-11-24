@@ -2,6 +2,43 @@ import { appendFileSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+/**
+ * @typedef {{
+ *   id?: unknown;
+ *   name?: unknown;
+ *   path?: unknown;
+ *   head_sha?: unknown;
+ *   head_branch?: unknown;
+ *   event?: unknown;
+ *   status?: unknown;
+ *   conclusion?: unknown;
+ *   run_number: number;
+ *   run_attempt?: unknown;
+ *   head_repository?: {
+ *     full_name?: unknown;
+ *     fork?: unknown;
+ *   } | null;
+ * }} WorkflowRunRecord
+ */
+
+/**
+ * @typedef {{
+ *   repository?: { full_name?: string | null } | null;
+ *   workflow_run?: (Record<string, unknown> & {
+ *     event?: unknown;
+ *     head_branch?: unknown;
+ *     head_sha?: unknown;
+ *     status?: unknown;
+ *     conclusion?: unknown;
+ *     head_repository?: {
+ *       full_name?: unknown;
+ *       fork?: unknown;
+ *     } | null;
+ *   }) | null;
+ * }} WorkflowRunEventPayload
+ */
+
+/** @type {ReadonlyArray<readonly [string, string]>} */
 const REQUIRED_WORKFLOWS = [
 	['CI', '.github/workflows/ci.yml'],
 	['Security', '.github/workflows/security.yml']
@@ -19,12 +56,21 @@ const COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/i;
 const MAX_PAGES = 50;
 const PER_PAGE = 100;
 
+/**
+ * @param {unknown} rawPath
+ * @returns {string}
+ */
 export function normalizeWorkflowPath(rawPath) {
 	if (typeof rawPath !== 'string') return '';
 	const atIndex = rawPath.indexOf('@');
 	return (atIndex === -1 ? rawPath : rawPath.slice(0, atIndex)).replace(/^\/+/, '');
 }
 
+/**
+ * @param {string | null | undefined} linkHeader
+ * @param {string} expectedOrigin
+ * @returns {URL | null}
+ */
 function parseNextLink(linkHeader, expectedOrigin) {
 	if (typeof linkHeader !== 'string' || !linkHeader.trim()) return null;
 	for (const segment of linkHeader.split(',')) {
@@ -40,6 +86,11 @@ function parseNextLink(linkHeader, expectedOrigin) {
 	return null;
 }
 
+/**
+ * @param {WorkflowRunRecord} candidate
+ * @param {WorkflowRunRecord | undefined} current
+ * @returns {boolean}
+ */
 function isNewerRun(candidate, current) {
 	if (!current) return true;
 	if (candidate.run_number !== current.run_number) {
@@ -50,13 +101,25 @@ function isNewerRun(candidate, current) {
 	if (candidateAttempt !== currentAttempt) {
 		return candidateAttempt > currentAttempt;
 	}
-	return (candidate.id ?? 0) > (current.id ?? 0);
+	const candidateId = typeof candidate.id === 'number' ? candidate.id : 0;
+	const currentId = typeof current.id === 'number' ? current.id : 0;
+	return candidateId > currentId;
 }
 
+/**
+ * @param {{
+ *   githubApiBase: URL;
+ *   repository: string;
+ *   headSha: string;
+ *   token: string;
+ *   fetchImpl: typeof fetch;
+ * }} options
+ * @returns {Promise<unknown[]>}
+ */
 async function fetchWorkflowRuns({ githubApiBase, repository, headSha, token, fetchImpl }) {
 	const baseHref = githubApiBase.href.replace(/\/+$/, '');
 	const [owner, repo] = repository.split('/');
-	const makePageUrl = (page) => {
+	const makePageUrl = (/** @type {number} */ page) => {
 		const url = new URL(`${baseHref}/repos/${owner}/${repo}/actions/runs`);
 		url.searchParams.set('head_sha', headSha);
 		url.searchParams.set('event', 'push');
@@ -66,8 +129,10 @@ async function fetchWorkflowRuns({ githubApiBase, repository, headSha, token, fe
 		return url;
 	};
 
+	/** @type {unknown[]} */
 	const runs = [];
 	let page = 1;
+	/** @type {URL | null} */
 	let nextUrl = makePageUrl(page);
 
 	while (nextUrl) {
@@ -87,7 +152,9 @@ async function fetchWorkflowRuns({ githubApiBase, repository, headSha, token, fe
 		if (!response.ok) {
 			throw new Error(`GitHub workflow runs request failed (${response.status}).`);
 		}
-		const data = await response.json();
+		const data = /** @type {{ workflow_runs?: unknown; total_count?: unknown } | null} */ (
+			await response.json()
+		);
 		if (!Array.isArray(data?.workflow_runs)) {
 			throw new Error('GitHub workflow runs response did not contain a workflow_runs array.');
 		}
@@ -112,6 +179,17 @@ async function fetchWorkflowRuns({ githubApiBase, repository, headSha, token, fe
 	return runs;
 }
 
+/**
+ * @param {{
+ *   ghcrBase: URL;
+ *   repository: string;
+ *   actor: string;
+ *   token: string;
+ *   tag: string;
+ *   fetchImpl: typeof fetch;
+ * }} options
+ * @returns {Promise<boolean>}
+ */
 async function checkGhcrTagExists({ ghcrBase, repository, actor, token, tag, fetchImpl }) {
 	const baseHref = ghcrBase.href.replace(/\/+$/, '');
 	const imageRepository = repository.toLowerCase();
@@ -132,7 +210,9 @@ async function checkGhcrTagExists({ ghcrBase, repository, actor, token, tag, fet
 	if (!tokenResponse.ok) {
 		throw new Error(`GHCR token login failed (${tokenResponse.status}).`);
 	}
-	const tokenPayload = await tokenResponse.json();
+	const tokenPayload = /** @type {{ token?: unknown; access_token?: unknown } | null} */ (
+		await tokenResponse.json()
+	);
 	const registryToken = tokenPayload?.token || tokenPayload?.access_token;
 	if (typeof registryToken !== 'string' || !registryToken.trim()) {
 		throw new Error('GHCR token login response did not include a pull token.');
@@ -153,19 +233,30 @@ async function checkGhcrTagExists({ ghcrBase, repository, actor, token, tag, fet
 	throw new Error(`GHCR manifest inspection failed (${manifestResponse.status}).`);
 }
 
+/**
+ * @param {{
+ *   env?: NodeJS.ProcessEnv;
+ *   event?: WorkflowRunEventPayload;
+ *   fetchImpl?: typeof fetch;
+ * }} [options]
+ * @returns {Promise<{ ready: boolean; reason: string }>}
+ */
 export async function verifyPublishGates({ env = process.env, event, fetchImpl = fetch } = {}) {
 	const token = env.GITHUB_TOKEN?.trim() ?? '';
 	if (!token) {
 		throw new Error('GITHUB_TOKEN is required to verify publish gates.');
 	}
 
+	/** @type {WorkflowRunEventPayload | undefined} */
 	let parsedEvent = event;
 	if (!parsedEvent) {
 		const eventPath = env.GITHUB_EVENT_PATH?.trim();
 		if (!eventPath) {
 			throw new Error('GITHUB_EVENT_PATH is required to read the workflow_run payload.');
 		}
-		parsedEvent = JSON.parse(readFileSync(eventPath, 'utf8'));
+		parsedEvent = /** @type {WorkflowRunEventPayload} */ (
+			JSON.parse(readFileSync(eventPath, 'utf8'))
+		);
 	}
 
 	if (env.GITHUB_EVENT_NAME && env.GITHUB_EVENT_NAME !== 'workflow_run') {
@@ -219,11 +310,16 @@ export async function verifyPublishGates({ env = process.env, event, fetchImpl =
 		fetchImpl
 	});
 
+	/** @type {Map<string, WorkflowRunRecord>} */
 	const latestByPath = new Map();
 	const requiredPaths = new Set(REQUIRED_WORKFLOWS.map(([, path]) => path));
 
-	for (const run of runs) {
-		if (!run || typeof run !== 'object') continue;
+	for (const rawRun of runs) {
+		if (!rawRun || typeof rawRun !== 'object') continue;
+		const run =
+			/** @type {Record<string, unknown> & { head_repository?: { fork?: unknown; full_name?: unknown } | null }} */ (
+				rawRun
+			);
 		if (typeof run.head_sha === 'string' && run.head_sha.toLowerCase() !== headSha) continue;
 		if (typeof run.event === 'string' && run.event !== 'push') continue;
 		if (typeof run.head_branch === 'string' && run.head_branch !== 'main') continue;
@@ -239,8 +335,9 @@ export async function verifyPublishGates({ env = process.env, event, fetchImpl =
 		if (typeof run.run_number !== 'number' || !Number.isFinite(run.run_number)) {
 			throw new Error(`Workflow run for ${normalizedPath} is missing a numeric run_number.`);
 		}
-		if (isNewerRun(run, latestByPath.get(normalizedPath))) {
-			latestByPath.set(normalizedPath, run);
+		const typedRun = /** @type {WorkflowRunRecord} */ (run);
+		if (isNewerRun(typedRun, latestByPath.get(normalizedPath))) {
+			latestByPath.set(normalizedPath, typedRun);
 		}
 	}
 
@@ -283,6 +380,11 @@ export async function verifyPublishGates({ env = process.env, event, fetchImpl =
 	};
 }
 
+/**
+ * @param {string} message
+ * @param {string} secret
+ * @returns {string}
+ */
 function redactSecret(message, secret) {
 	if (!secret) return message;
 	return message.replaceAll(secret, '[redacted]');
