@@ -2655,6 +2655,8 @@ main {
 	.secondary,
 	.cream-button,
 	.text-button,
+	.use-first,
+	.restock-item,
 	.icon-button,
 	.save-recipe,
 	.check-box,
@@ -2665,6 +2667,8 @@ main {
 		min-height: 44px;
 	}
 
+	.use-first,
+	.restock-item,
 	.icon-button,
 	.save-recipe,
 	.check-box,
@@ -4196,6 +4200,11 @@ main {
 }
 .member-role {
 	padding: 4px 7px;
+}
+.expiry-badge.depleted {
+	background: var(--wash);
+	color: var(--ink);
+	font-weight: 600;
 }
 .expiry-badge.soon {
 	background: var(--warning-surface);
