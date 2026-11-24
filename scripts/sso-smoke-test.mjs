@@ -3,60 +3,85 @@ import { spawn } from 'node:child_process';
 import { setTimeout as pause } from 'node:timers/promises';
 
 // A disposable built-server test. This is a fixture secret, never a deployment credential.
-const secret = 'test-only-proxy-boundary-secret-do-not-use-in-production';
-const origin = 'https://kitchen.example.test';
-const address = 'http://127.0.0.1:5188';
-const server = spawn(process.execPath, ['server.mjs'], {
-	env: {
-		...process.env,
-		HOST: '127.0.0.1',
-		PORT: '5188',
-		ORIGIN: origin,
-		FLAVORITHM_DB_PATH: ':memory:',
-		FLAVORITHM_AUTH_MODE: 'proxy',
-		FLAVORITHM_PROXY_SHARED_SECRET: secret,
-		FLAVORITHM_PROXY_SECRET_HEADER: 'x-flavorithm-proxy-secret',
-		FLAVORITHM_PROXY_SUBJECT_HEADER: 'x-authentik-uid',
-		FLAVORITHM_PROXY_EMAIL_HEADER: 'x-authentik-email',
-		FLAVORITHM_PROXY_NAME_HEADER: 'x-authentik-name',
-		FLAVORITHM_PROXY_ISSUER: 'smoke:authentik',
-		FLAVORITHM_PROXY_LOGOUT_URL: '',
-		RESEND_API_KEY: '',
-		BRAVE_SEARCH_API_KEY: ''
-	},
-	stdio: ['ignore', 'pipe', 'pipe']
-});
+const externalUrl = process.env.FLAVORITHM_SMOKE_URL?.trim();
+const secret =
+	process.env.FLAVORITHM_PROXY_SHARED_SECRET ||
+	'test-only-proxy-boundary-secret-do-not-use-in-production';
+const origin = process.env.ORIGIN
+	? new URL(process.env.ORIGIN).origin
+	: 'https://kitchen.example.test';
+const address = externalUrl ? new URL(externalUrl).origin : 'http://127.0.0.1:5188';
+const server = externalUrl
+	? null
+	: spawn(process.execPath, ['server.mjs'], {
+			env: {
+				...process.env,
+				HOST: '127.0.0.1',
+				PORT: '5188',
+				ORIGIN: origin,
+				FLAVORITHM_DB_PATH: ':memory:',
+				FLAVORITHM_AUTH_MODE: 'proxy',
+				FLAVORITHM_PROXY_SHARED_SECRET: secret,
+				FLAVORITHM_PROXY_SECRET_HEADER: 'x-flavorithm-proxy-secret',
+				FLAVORITHM_PROXY_SUBJECT_HEADER: 'x-authentik-uid',
+				FLAVORITHM_PROXY_EMAIL_HEADER: 'x-authentik-email',
+				FLAVORITHM_PROXY_NAME_HEADER: 'x-authentik-name',
+				FLAVORITHM_PROXY_ISSUER: 'smoke:authentik',
+				FLAVORITHM_PROXY_LOGOUT_URL: '',
+				RESEND_API_KEY: '',
+				BRAVE_SEARCH_API_KEY: ''
+			},
+			stdio: ['ignore', 'pipe', 'pipe']
+		});
 let output = '';
-server.stdout.on('data', (chunk) => (output += chunk));
-server.stderr.on('data', (chunk) => (output += chunk));
+if (server) {
+	server.stdout.on('data', (chunk) => (output += chunk));
+	server.stderr.on('data', (chunk) => (output += chunk));
+}
+/**
+ * @param {string} subject
+ * @param {string} [email]
+ * @returns {Record<string, string>}
+ */
 const identity = (subject, email = `${subject}@example.test`) => ({
 	'x-flavorithm-proxy-secret': secret,
 	'x-authentik-uid': subject,
 	'x-authentik-email': email,
 	'x-authentik-name': 'SSO Test User'
 });
-async function request(path, headers = {}, body, method = body ? 'POST' : 'GET') {
+/**
+ * @param {string} path
+ * @param {Record<string, string | null | undefined>} [headers]
+ * @param {unknown} [body]
+ * @param {string} [method]
+ */
+async function request(path, headers = {}, body = undefined, method = body ? 'POST' : 'GET') {
+	/** @type {Record<string, string>} */
+	const extraHeaders = {};
+	for (const [key, value] of Object.entries(headers)) {
+		if (typeof value === 'string') extraHeaders[key] = value;
+	}
 	return fetch(address + path, {
 		method,
 		redirect: 'manual',
 		headers: {
 			Origin: origin,
 			...(body ? { 'Content-Type': 'application/json' } : {}),
-			...headers
+			...extraHeaders
 		},
 		body: body ? JSON.stringify(body) : undefined
 	});
 }
 
 try {
-	for (let attempt = 0; attempt < 100; attempt++) {
-		if (server.exitCode !== null)
+	for (let attempt = 0; attempt < 150; attempt++) {
+		if (server && server.exitCode !== null)
 			throw new Error(`SSO server stopped: ${output.replaceAll(secret, '[redacted]')}`);
 		try {
 			await request('/api/auth');
 			break;
 		} catch {
-			if (attempt === 99) throw new Error('SSO smoke server did not start');
+			if (attempt === 149) throw new Error('SSO smoke server did not start');
 			await pause(100);
 		}
 	}
@@ -75,7 +100,7 @@ try {
 
 	const firstResponse = await request('/api/auth', identity('first'));
 	assert.equal(firstResponse.status, 200);
-	assert.match(firstResponse.headers.get('cache-control'), /no-store/);
+	assert.match(firstResponse.headers.get('cache-control') ?? '', /no-store/);
 	const first = (await firstResponse.json()).user;
 	const cookie = firstResponse.headers.get('set-cookie')?.split(';')[0];
 	assert.ok(cookie, 'SSO creates a session binding for model connections');
@@ -86,7 +111,7 @@ try {
 	assert.equal((await seeded.json()).state.recipes.length, 8);
 	const home = await request('/', identity('first'));
 	assert.equal(home.status, 200);
-	assert.match(home.headers.get('cache-control'), /no-store/);
+	assert.match(home.headers.get('cache-control') ?? '', /no-store/);
 	assert.equal(
 		(await request('/api/state', { Cookie: cookie })).status,
 		401,
@@ -135,7 +160,7 @@ try {
 		'SSO smoke passed: automatic provisioning, trusted proxy boundary, cookie bypass rejection, account isolation, local-auth blocking, and seeded state.'
 	);
 } finally {
-	if (server.exitCode === null && server.signalCode === null) {
+	if (server && server.exitCode === null && server.signalCode === null) {
 		server.kill('SIGTERM');
 		await new Promise((resolve) => server.once('exit', resolve));
 	}
