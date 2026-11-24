@@ -3,7 +3,10 @@ import assert from 'node:assert/strict';
 import { createInitialState } from '../src/lib/data.ts';
 import { applyButlerCommands } from '../src/lib/butler.ts';
 import {
+	MAX_COMMAND_DETAIL_LENGTH,
 	buildButlerActions,
+	buildButlerHistory,
+	formatButlerHistoryContent,
 	previewButlerCommand,
 	reconcileButlerUndoViews,
 	resolveButlerControlTarget
@@ -629,8 +632,125 @@ test('undo reconciliation omits undo for navigation/dialog actions and closes st
 	const pantryCleanup = reconcileButlerUndoViews(
 		previous,
 		pantryResult.state,
-		{ editingPantryId: previous.pantry[0].id },
+		{
+			editingPantryId: previous.pantry[0].id,
+			editingRecipeId: 'manual-draft-unsaved',
+			editingRecipeMode: 'create'
+		},
 		pantryResult.effects
 	);
 	assert.equal(pantryCleanup.clearEditingPantry, true);
+	assert.equal(pantryCleanup.closeEditor, false);
+
+	// Even without editingRecipeMode specified, an unsaved draft absent from both snapshots is not treated as stale.
+	const implicitDraftCleanup = reconcileButlerUndoViews(
+		previous,
+		pantryResult.state,
+		{
+			editingRecipeId: 'manual-draft-unsaved',
+			selectedId: 'untracked-recipe',
+			editingShoppingId: 'untracked-shopping'
+		},
+		pantryResult.effects
+	);
+	assert.equal(implicitDraftCleanup.closeEditor, false);
+	assert.equal(implicitDraftCleanup.closeSelected, false);
+	assert.equal(implicitDraftCleanup.clearEditingShopping, false);
+});
+
+test('recipe.upsert detail lines truncate verbose ingredient and step text cleanly within MAX_COMMAND_DETAIL_LENGTH', () => {
+	const kitchen = createInitialState();
+	const verboseRecipe = {
+		...kitchen.recipes[0],
+		id: 'feast-braise',
+		title: 'Slow-Braised Sunday Short Ribs with Roasted Garlic Polenta and Gremolata Herb Drizzle',
+		ingredients: Array.from({ length: 12 }, (_, index) => ({
+			name: `hand-trimmed heirloom culinary ingredient number ${index + 1} with extra preparation notes`,
+			quantity: index + 1,
+			unit: 'tablespoons'
+		})),
+		steps: Array.from(
+			{ length: 9 },
+			(_, index) =>
+				`Carefully sear batch ${index + 1} over medium-high heat in a heavy enameled Dutch oven until deeply browned on every side before deglazing.`
+		)
+	};
+
+	const [action] = buildButlerActions([{ type: 'recipe.upsert', recipe: verboseRecipe }], kitchen);
+	assert.equal(action.details.length, 1);
+	const detail = action.details[0];
+	assert.equal(detail.includes('\n'), false);
+	assert.ok(
+		detail.length <= MAX_COMMAND_DETAIL_LENGTH,
+		`expected detail length ${detail.length} <= ${MAX_COMMAND_DETAIL_LENGTH}`
+	);
+	assert.match(detail, /^Add recipe: Slow-Braised Sunday Short Ribs/);
+	assert.equal(detail.includes('Ingredients:'), true);
+	assert.equal(detail.includes('(+8 more)'), true);
+	assert.equal(detail.includes('Steps:'), true);
+	assert.equal(detail.includes('(+6 more)'), true);
+});
+
+test('buildButlerHistory splits [User applied] mutations from [User opened] UI/navigation actions and slices retry windows', () => {
+	const kitchen = createInitialState();
+	const [pantryAction, navAction, signOutAction, dismissedAction] = buildButlerActions(
+		[
+			{
+				type: 'pantry.upsert',
+				item: { id: 'basil-salt', name: 'Sea Salt', quantity: 1, unit: 'box', category: 'Spices' }
+			},
+			{ type: 'navigate', page: 'planner' },
+			{ type: 'ui', action: 'sign-out' },
+			{ type: 'recipe.delete', id: kitchen.recipes[0].id }
+		],
+		kitchen
+	);
+
+	const mixedContent = formatButlerHistoryContent({
+		content: 'Here are the actions you asked for.',
+		actions: [
+			{ ...pantryAction, status: 'applied' },
+			{ ...navAction, status: 'applied' },
+			{ ...signOutAction, status: 'applied' },
+			{ ...dismissedAction, status: 'dismissed' }
+		]
+	});
+	assert.equal(
+		mixedContent,
+		'Here are the actions you asked for.\n\n[User applied: Sea Salt]\n[User opened: Meal planner; Sign out]'
+	);
+
+	const pendingOnlyContent = formatButlerHistoryContent({
+		content: 'Nothing clicked yet.',
+		actions: [{ ...pantryAction, status: 'pending' }]
+	});
+	assert.equal(pendingOnlyContent, 'Nothing clicked yet.');
+
+	const messages = Array.from({ length: 22 }, (_, index) =>
+		index % 2 === 0
+			? { role: 'user' as const, content: `Prompt ${index}` }
+			: {
+					role: 'assistant' as const,
+					content: `Reply ${index}`,
+					actions:
+						index === 19
+							? [{ ...pantryAction, status: 'applied' as const }]
+							: index === 21
+								? [{ ...navAction, status: 'applied' as const }]
+								: undefined
+				}
+	);
+	messages.push({ role: 'user', content: 'Failed trailing prompt' });
+
+	const normalHistory = buildButlerHistory(messages, false);
+	assert.equal(normalHistory.length, 20);
+	assert.equal(normalHistory[0].content, 'Reply 3');
+	assert.equal(normalHistory[18].content, 'Reply 21\n\n[User opened: Meal planner]');
+	assert.equal(normalHistory[19].content, 'Failed trailing prompt');
+
+	const retryHistory = buildButlerHistory(messages, true);
+	assert.equal(retryHistory.length, 20);
+	assert.equal(retryHistory[0].content, 'Prompt 2');
+	assert.equal(retryHistory[17].content, 'Reply 19\n\n[User applied: Sea Salt]');
+	assert.equal(retryHistory[19].content, 'Reply 21\n\n[User opened: Meal planner]');
 });

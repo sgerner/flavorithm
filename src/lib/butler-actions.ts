@@ -24,6 +24,7 @@ export type ButlerControlResolution =
 export type ButlerOpenViewState = {
 	selectedId?: string | null;
 	editingRecipeId?: string | null;
+	editingRecipeMode?: 'create' | 'edit';
 	recipeToDeleteId?: string | null;
 	modal?: string;
 	cookingMealId?: string;
@@ -31,6 +32,27 @@ export type ButlerOpenViewState = {
 	editingPantryId?: string | null;
 	editingShoppingId?: string;
 };
+
+export type ButlerHistoryAction = {
+	title: string;
+	status: 'pending' | 'applied' | 'dismissed';
+	commands: ButlerCommand[];
+};
+
+export type ButlerHistoryInputMessage = {
+	role: 'user' | 'assistant';
+	content: string;
+	actions?: readonly ButlerHistoryAction[];
+};
+
+export type ButlerHistoryTurn = {
+	role: 'user' | 'assistant';
+	content: string;
+};
+
+export const MAX_COMMAND_DETAIL_LENGTH = 360;
+const MAX_RECIPE_DETAIL_INGREDIENTS = 4;
+const MAX_RECIPE_DETAIL_STEPS = 3;
 
 export type ButlerUndoViewCleanup = {
 	changedKitchen: boolean;
@@ -131,6 +153,38 @@ export function isButlerKitchenMutation(command: ButlerCommand): boolean {
 	return !['navigate', 'recipe.open', 'ui'].includes(command.type);
 }
 
+/** Append `[User applied: ...]` and/or `[User opened: ...]` notes for applied action cards on a turn. */
+export function formatButlerHistoryContent(
+	message: Pick<ButlerHistoryInputMessage, 'content' | 'actions'>
+): string {
+	const applied = message.actions
+		?.filter(
+			(action) => action.status === 'applied' && action.commands.some(isButlerKitchenMutation)
+		)
+		.map((action) => action.title);
+	const opened = message.actions
+		?.filter(
+			(action) => action.status === 'applied' && !action.commands.some(isButlerKitchenMutation)
+		)
+		.map((action) => action.title);
+	const notes = [
+		applied?.length ? `[User applied: ${applied.join('; ')}]` : '',
+		opened?.length ? `[User opened: ${opened.join('; ')}]` : ''
+	].filter(Boolean);
+	return notes.length ? `${message.content}\n\n${notes.join('\n')}` : message.content;
+}
+
+/** Build the prior 20-turn Basil conversation history with split `[User applied]`/`[User opened]` annotations. */
+export function buildButlerHistory(
+	messages: readonly ButlerHistoryInputMessage[],
+	retry = false
+): ButlerHistoryTurn[] {
+	return messages.slice(retry ? -21 : -20, retry ? -1 : undefined).map((message) => ({
+		role: message.role,
+		content: formatButlerHistoryContent(message)
+	}));
+}
+
 function isDestructiveCommand(command: ButlerCommand): boolean {
 	return (
 		command.type.endsWith('.delete') ||
@@ -204,36 +258,47 @@ export function reconcileButlerUndoViews(
 			revertedShoppingIds.add(id);
 	}
 
-	const closeSelected = Boolean(
-		view.selectedId && (!prevRecipes.has(view.selectedId) || revertedRecipeIds.has(view.selectedId))
-	);
-	const closeEditor = Boolean(
-		view.editingRecipeId &&
-		(!prevRecipes.get(view.editingRecipeId)?.saved || revertedRecipeIds.has(view.editingRecipeId))
-	);
-	const clearRecipeToDelete = Boolean(
-		view.recipeToDeleteId &&
-		(!prevRecipes.get(view.recipeToDeleteId)?.saved || revertedRecipeIds.has(view.recipeToDeleteId))
+	const isStaleId = <T>(
+		id: string | null | undefined,
+		prev: Map<string, T>,
+		appliedMap: Map<string, T>,
+		reverted: Set<string>
+	): boolean => Boolean(id && ((!prev.has(id) && appliedMap.has(id)) || reverted.has(id)));
+
+	const closeSelected = isStaleId(view.selectedId, prevRecipes, appliedRecipes, revertedRecipeIds);
+	const closeEditor =
+		view.editingRecipeMode === 'create'
+			? false
+			: isStaleId(view.editingRecipeId, prevRecipes, appliedRecipes, revertedRecipeIds);
+	const clearRecipeToDelete = isStaleId(
+		view.recipeToDeleteId,
+		prevRecipes,
+		appliedRecipes,
+		revertedRecipeIds
 	);
 	const isMealStale = (mealId?: string) => {
 		if (!mealId) return false;
 		const prevMeal = prevMeals.get(mealId);
 		const appliedMeal = appliedMeals.get(mealId);
-		if (!prevMeal || prevMeal.completedAt) return true;
+		if (!prevMeal && appliedMeal) return true;
 		if (revertedMealIds.has(mealId)) return true;
-		if (revertedRecipeIds.has(prevMeal.recipeId)) return true;
+		if (prevMeal && revertedRecipeIds.has(prevMeal.recipeId)) return true;
 		if (appliedMeal && revertedRecipeIds.has(appliedMeal.recipeId)) return true;
 		return false;
 	};
 	const clearCookingMeal = isMealStale(view.cookingMealId);
 	const clearEditingMeal = isMealStale(view.editingMealId);
-	const clearEditingPantry = Boolean(
-		view.editingPantryId &&
-		(!prevPantry.has(view.editingPantryId) || revertedPantryIds.has(view.editingPantryId))
+	const clearEditingPantry = isStaleId(
+		view.editingPantryId,
+		prevPantry,
+		appliedPantry,
+		revertedPantryIds
 	);
-	const clearEditingShopping = Boolean(
-		view.editingShoppingId &&
-		(!prevShopping.has(view.editingShoppingId) || revertedShoppingIds.has(view.editingShoppingId))
+	const clearEditingShopping = isStaleId(
+		view.editingShoppingId,
+		prevShopping,
+		appliedShopping,
+		revertedShoppingIds
 	);
 	const closeModal = Boolean(
 		(view.modal === 'plan' && closeSelected) ||
@@ -444,6 +509,13 @@ function cleanInline(value: string): string {
 	return value.replace(/\s+/g, ' ').trim();
 }
 
+function truncateInline(value: string, maxLength: number): string {
+	const cleaned = cleanInline(value);
+	if (cleaned.length <= maxLength) return cleaned;
+	if (maxLength <= 1) return cleaned.slice(0, Math.max(0, maxLength));
+	return `${cleaned.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
 function clampLeftovers(value: number | undefined, servings?: number): number | undefined {
 	if (value === undefined || !Number.isFinite(value)) return undefined;
 	const upper = servings !== undefined && Number.isFinite(servings) ? Math.max(0, servings) : value;
@@ -644,146 +716,157 @@ function formatCommandDetail(
 	lookup: LookupState,
 	description: Omit<ButlerAction, 'id' | 'details' | 'commands' | 'destructive'>
 ): string {
-	switch (command.type) {
-		case 'recipe.upsert': {
-			const recipe = command.recipe;
-			const exists = hasExistingRecord(
-				recipe.id,
-				lookup.initialRecipes,
-				lookup.proposedRecipes,
-				lookup.deletedRecipes
-			);
-			const verb = exists ? 'Update recipe' : 'Add recipe';
-			const meta = [
-				`${recipe.time} min`,
-				`${recipe.servings} serving${recipe.servings === 1 ? '' : 's'}`,
-				cleanInline(recipe.difficulty),
-				cleanInline(recipe.cuisine)
-			].filter(Boolean);
-			const ingredients = recipe.ingredients.length
-				? `Ingredients: ${recipe.ingredients
-						.map((item) => cleanInline(`${item.quantity} ${item.unit} ${item.name}`))
-						.join(', ')}`
-				: '';
-			const steps = recipe.steps.length
-				? `Steps: ${recipe.steps
-						.map((step, index) => `${index + 1}. ${cleanInline(step)}`)
-						.join(' ')}`
-				: '';
-			return [
-				`${verb}: ${cleanInline(recipe.title)}`,
-				...meta,
-				...(ingredients ? [ingredients] : []),
-				...(steps ? [steps] : [])
-			].join(' · ');
-		}
-		case 'recipe.delete': {
-			const recipe = findRecipe(command.id, lookup);
-			const title = cleanInline(recipe?.title ?? command.id);
-			const mealCount = lookup.initialMealCountByRecipe.get(command.id) ?? 0;
-			const mealNote = mealCount
-				? ` · removes ${mealCount} scheduled meal${mealCount === 1 ? '' : 's'}`
-				: '';
-			return `Remove recipe: ${title}${mealNote}`;
-		}
-		case 'pantry.upsert': {
-			const item = command.item;
-			const exists = hasExistingRecord(
-				item.id,
-				lookup.initialPantry,
-				lookup.proposedPantry,
-				lookup.deletedPantry
-			);
-			const verb = exists ? 'Update pantry item' : 'Add pantry item';
-			const parts = [
-				`${verb}: ${cleanInline(item.name)}`,
-				cleanInline(`${item.quantity} ${item.unit}`),
-				cleanInline(item.category),
-				item.expires ? `expires ${cleanInline(item.expires)}` : ''
-			].filter(Boolean);
-			return parts.join(' · ');
-		}
-		case 'pantry.delete': {
-			const item = findPantryItem(command.id, lookup);
-			if (!item) return `Remove pantry item: ${cleanInline(command.id)}`;
-			return `Remove pantry item: ${cleanInline(item.name)} · ${cleanInline(`${item.quantity} ${item.unit}`)}`;
-		}
-		case 'meal.upsert': {
-			const exists = hasExistingRecord(
-				command.meal.id,
-				lookup.initialMeals,
-				lookup.proposedMeals,
-				lookup.deletedMeals
-			);
-			const existing = exists ? findMeal(command.meal.id, lookup) : undefined;
-			const verb = exists ? 'Update meal' : 'Schedule meal';
-			const recipeTitle = cleanInline(
-				findRecipe(command.meal.recipeId, lookup)?.title ?? command.meal.recipeId
-			);
-			const leftovers = existing?.completedAt
-				? clampLeftovers(
-						command.meal.leftoverServings ?? existing.leftoverServings,
-						command.meal.servings
-					)
-				: undefined;
-			const leftoverSuffix =
-				leftovers !== undefined
-					? ` · ${leftovers} leftover serving${leftovers === 1 ? '' : 's'}`
+	const raw = (() => {
+		switch (command.type) {
+			case 'recipe.upsert': {
+				const recipe = command.recipe;
+				const exists = hasExistingRecord(
+					recipe.id,
+					lookup.initialRecipes,
+					lookup.proposedRecipes,
+					lookup.deletedRecipes
+				);
+				const verb = exists ? 'Update recipe' : 'Add recipe';
+				const meta = [
+					`${recipe.time} min`,
+					`${recipe.servings} serving${recipe.servings === 1 ? '' : 's'}`,
+					truncateInline(recipe.difficulty, 24),
+					truncateInline(recipe.cuisine, 32)
+				].filter(Boolean);
+				const visibleIngredients = recipe.ingredients
+					.slice(0, MAX_RECIPE_DETAIL_INGREDIENTS)
+					.map((item) => truncateInline(`${item.quantity} ${item.unit} ${item.name}`, 32));
+				const extraIngredients = recipe.ingredients.length - visibleIngredients.length;
+				const ingredients = visibleIngredients.length
+					? `Ingredients: ${truncateInline(visibleIngredients.join(', '), 84)}${
+							extraIngredients > 0 ? ` (+${extraIngredients} more)` : ''
+						}`
 					: '';
-			return `${verb}: ${recipeTitle} · ${command.meal.slot} · ${command.meal.date} · ${command.meal.servings} serving${command.meal.servings === 1 ? '' : 's'}${leftoverSuffix}`;
-		}
-		case 'meal.delete': {
-			const meal = findMeal(command.id, lookup);
-			if (!meal) return `Remove meal: ${cleanInline(command.id)}`;
-			const recipeTitle = cleanInline(findRecipe(meal.recipeId, lookup)?.title ?? meal.recipeId);
-			return `Remove meal: ${recipeTitle} · ${meal.slot} · ${meal.date} · ${meal.servings} serving${meal.servings === 1 ? '' : 's'}`;
-		}
-		case 'meal.complete': {
-			const meal = findMeal(command.id, lookup);
-			const { deductNote, leftoverDetail } = formatMealCompletionNotes(command, meal?.servings);
-			if (!meal) {
-				return `Complete meal: ${cleanInline(command.id)} · ${deductNote} · ${leftoverDetail}`;
+				const visibleSteps = recipe.steps
+					.slice(0, MAX_RECIPE_DETAIL_STEPS)
+					.map((step, index) => `${index + 1}. ${truncateInline(step, 48)}`);
+				const extraSteps = recipe.steps.length - visibleSteps.length;
+				const steps = visibleSteps.length
+					? `Steps: ${truncateInline(visibleSteps.join(' '), 92)}${
+							extraSteps > 0 ? ` (+${extraSteps} more)` : ''
+						}`
+					: '';
+				return [
+					`${verb}: ${truncateInline(recipe.title, 64)}`,
+					...meta,
+					...(ingredients ? [ingredients] : []),
+					...(steps ? [steps] : [])
+				].join(' · ');
 			}
-			const recipeTitle = cleanInline(findRecipe(meal.recipeId, lookup)?.title ?? meal.recipeId);
-			return `Complete meal: ${recipeTitle} · ${meal.slot} · ${meal.date} · ${meal.servings} serving${meal.servings === 1 ? '' : 's'} · ${deductNote} · ${leftoverDetail}`;
+			case 'recipe.delete': {
+				const recipe = findRecipe(command.id, lookup);
+				const title = cleanInline(recipe?.title ?? command.id);
+				const mealCount = lookup.initialMealCountByRecipe.get(command.id) ?? 0;
+				const mealNote = mealCount
+					? ` · removes ${mealCount} scheduled meal${mealCount === 1 ? '' : 's'}`
+					: '';
+				return `Remove recipe: ${title}${mealNote}`;
+			}
+			case 'pantry.upsert': {
+				const item = command.item;
+				const exists = hasExistingRecord(
+					item.id,
+					lookup.initialPantry,
+					lookup.proposedPantry,
+					lookup.deletedPantry
+				);
+				const verb = exists ? 'Update pantry item' : 'Add pantry item';
+				const parts = [
+					`${verb}: ${cleanInline(item.name)}`,
+					cleanInline(`${item.quantity} ${item.unit}`),
+					cleanInline(item.category),
+					item.expires ? `expires ${cleanInline(item.expires)}` : ''
+				].filter(Boolean);
+				return parts.join(' · ');
+			}
+			case 'pantry.delete': {
+				const item = findPantryItem(command.id, lookup);
+				if (!item) return `Remove pantry item: ${cleanInline(command.id)}`;
+				return `Remove pantry item: ${cleanInline(item.name)} · ${cleanInline(`${item.quantity} ${item.unit}`)}`;
+			}
+			case 'meal.upsert': {
+				const exists = hasExistingRecord(
+					command.meal.id,
+					lookup.initialMeals,
+					lookup.proposedMeals,
+					lookup.deletedMeals
+				);
+				const existing = exists ? findMeal(command.meal.id, lookup) : undefined;
+				const verb = exists ? 'Update meal' : 'Schedule meal';
+				const recipeTitle = cleanInline(
+					findRecipe(command.meal.recipeId, lookup)?.title ?? command.meal.recipeId
+				);
+				const leftovers = existing?.completedAt
+					? clampLeftovers(
+							command.meal.leftoverServings ?? existing.leftoverServings,
+							command.meal.servings
+						)
+					: undefined;
+				const leftoverSuffix =
+					leftovers !== undefined
+						? ` · ${leftovers} leftover serving${leftovers === 1 ? '' : 's'}`
+						: '';
+				return `${verb}: ${recipeTitle} · ${command.meal.slot} · ${command.meal.date} · ${command.meal.servings} serving${command.meal.servings === 1 ? '' : 's'}${leftoverSuffix}`;
+			}
+			case 'meal.delete': {
+				const meal = findMeal(command.id, lookup);
+				if (!meal) return `Remove meal: ${cleanInline(command.id)}`;
+				const recipeTitle = cleanInline(findRecipe(meal.recipeId, lookup)?.title ?? meal.recipeId);
+				return `Remove meal: ${recipeTitle} · ${meal.slot} · ${meal.date} · ${meal.servings} serving${meal.servings === 1 ? '' : 's'}`;
+			}
+			case 'meal.complete': {
+				const meal = findMeal(command.id, lookup);
+				const { deductNote, leftoverDetail } = formatMealCompletionNotes(command, meal?.servings);
+				if (!meal) {
+					return `Complete meal: ${cleanInline(command.id)} · ${deductNote} · ${leftoverDetail}`;
+				}
+				const recipeTitle = cleanInline(findRecipe(meal.recipeId, lookup)?.title ?? meal.recipeId);
+				return `Complete meal: ${recipeTitle} · ${meal.slot} · ${meal.date} · ${meal.servings} serving${meal.servings === 1 ? '' : 's'} · ${deductNote} · ${leftoverDetail}`;
+			}
+			case 'shopping.upsert': {
+				const item = command.item;
+				const exists = hasExistingRecord(
+					item.id,
+					lookup.initialShopping,
+					lookup.proposedShopping,
+					lookup.deletedShopping
+				);
+				const verb = exists ? 'Update shopping item' : 'Add shopping item';
+				return [
+					`${verb}: ${cleanInline(item.name)}`,
+					cleanInline(`${item.quantity} ${item.unit}`),
+					item.checked ? 'purchased' : ''
+				]
+					.filter(Boolean)
+					.join(' · ');
+			}
+			case 'shopping.delete': {
+				const item = findShoppingItem(command.id, lookup);
+				if (!item) return `Remove shopping item: ${cleanInline(command.id)}`;
+				return `Remove shopping item: ${cleanInline(item.name)} · ${cleanInline(`${item.quantity} ${item.unit}`)}`;
+			}
+			case 'shopping.generate': {
+				const weekLabel = command.weekStart ? `Week of ${command.weekStart}` : 'Current week';
+				return `Update shopping list: ${weekLabel} · refresh from meal plan and pantry`;
+			}
+			case 'preferences.update':
+				return `Update preferences: ${formatPreferencesSummary(command.preferences, lookup)}`;
+			case 'recipe.open': {
+				const recipeTitle = cleanInline(findRecipe(command.id, lookup)?.title ?? command.id);
+				return `Open recipe: ${recipeTitle} · ${command.mode ?? 'detail'} view`;
+			}
+			case 'navigate':
+				return `${description.label}: Navigate to ${description.title}`;
+			case 'ui':
+				return `${description.label}: ${description.summary}`;
 		}
-		case 'shopping.upsert': {
-			const item = command.item;
-			const exists = hasExistingRecord(
-				item.id,
-				lookup.initialShopping,
-				lookup.proposedShopping,
-				lookup.deletedShopping
-			);
-			const verb = exists ? 'Update shopping item' : 'Add shopping item';
-			return [
-				`${verb}: ${cleanInline(item.name)}`,
-				cleanInline(`${item.quantity} ${item.unit}`),
-				item.checked ? 'purchased' : ''
-			]
-				.filter(Boolean)
-				.join(' · ');
-		}
-		case 'shopping.delete': {
-			const item = findShoppingItem(command.id, lookup);
-			if (!item) return `Remove shopping item: ${cleanInline(command.id)}`;
-			return `Remove shopping item: ${cleanInline(item.name)} · ${cleanInline(`${item.quantity} ${item.unit}`)}`;
-		}
-		case 'shopping.generate': {
-			const weekLabel = command.weekStart ? `Week of ${command.weekStart}` : 'Current week';
-			return `Update shopping list: ${weekLabel} · refresh from meal plan and pantry`;
-		}
-		case 'preferences.update':
-			return `Update preferences: ${formatPreferencesSummary(command.preferences, lookup)}`;
-		case 'recipe.open': {
-			const recipeTitle = cleanInline(findRecipe(command.id, lookup)?.title ?? command.id);
-			return `Open recipe: ${recipeTitle} · ${command.mode ?? 'detail'} view`;
-		}
-		case 'navigate':
-			return `${description.label}: Navigate to ${description.title}`;
-		case 'ui':
-			return `${description.label}: ${description.summary}`;
-	}
+	})();
+	return truncateInline(raw, MAX_COMMAND_DETAIL_LENGTH);
 }
 
 function describe(

@@ -91,6 +91,40 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [recipe.id]: rating };
 			kitchen.recipes = [...kitchen.recipes];
 		},
+		get modal() { return modal; },
+		set modal(value: string) { modal = value; },
+		get pendingExport() { return pendingExport; },
+		set pendingExport(value: 'kitchen' | 'shopping' | 'pending' | null) { pendingExport = value; },
+		get toast() { return toast; },
+		get toastUndo() { return toastUndo; },
+		get selected() { return selected; },
+		set selected(value: Recipe | null) { selected = value; },
+		get editingRecipe() { return editingRecipe; },
+		set editingRecipe(value: Recipe | null) { editingRecipe = value; },
+		get editingRecipeMode() { return editingRecipeMode; },
+		set editingRecipeMode(value: 'create' | 'edit') { editingRecipeMode = value; },
+		get pendingSync() { return pendingSync; },
+		set pendingSync(value: boolean) { pendingSync = value; },
+		setPendingSyncSnapshot: (localState: AppState | null) => {
+			kitchenSync = localState
+				? ({
+						snapshot: () => ({
+							local: localState,
+							base: null,
+							etag: null,
+							updatedAt: '2026-11-24T12:00:00.000Z'
+						}),
+						clearContext: () => {},
+						stage: () => {},
+						flush: async () => {}
+					} as any)
+				: null;
+		},
+		applyButler,
+		openButlerControl,
+		confirmPendingExport,
+		openNewRecipe,
+		closeDialog,
 		logout,
 		deleteAccount
 	});
@@ -147,6 +181,22 @@ type PlannerHarnessApi = {
 	setPlannedDraft: (date: string, slot: string, servings: number) => void;
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
+	modal: string;
+	pendingExport: 'kitchen' | 'shopping' | 'pending' | null;
+	readonly toast: string;
+	readonly toastUndo: (() => void) | null;
+	selected: Recipe | null;
+	editingRecipe: Recipe | null;
+	editingRecipeMode: 'create' | 'edit';
+	pendingSync: boolean;
+	setPendingSyncSnapshot: (localState: AppState | null) => void;
+	applyButler: (commands: unknown[], expectedSnapshot: string) => string;
+	openButlerControl: (
+		target: Extract<butlerMod.ButlerCommand, { type: 'ui' }>['action']
+	) => boolean;
+	confirmPendingExport: () => Promise<void>;
+	openNewRecipe: () => void;
+	closeDialog: () => void;
 	logout: () => Promise<void>;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
 };
@@ -190,13 +240,14 @@ function createModuleMap() {
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
-		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
-		'#lib/components/ButlerChat.svelte': { default: noopComponent },
-		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
-		'#lib/components/SyncStatus.svelte': { default: noopComponent },
-		'#lib/components/AIConnection.svelte': { default: noopComponent },
-		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
+		'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/SyncStatus.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/AIConnection.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/VoiceSettings.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
+			__esModule: true,
 			default: noopComponent,
 			emptyImportSession: importSessionMod.emptyImportSession
 		}
@@ -309,6 +360,35 @@ function createReactivePlanner() {
 	const exports: { default?: any } = {};
 	let api!: PlannerHarnessApi;
 	const assignedUrls: string[] = [];
+	const downloads: { filename: string; content: string; type: string }[] = [];
+	const blobByUrl = new Map<string, { content: string; type: string }>();
+	let blobSeq = 0;
+	const CustomURL = Object.assign(
+		function (...args: ConstructorParameters<typeof URL>) {
+			return new URL(...args);
+		},
+		{
+			canParse: URL.canParse?.bind(URL),
+			parse: URL.parse?.bind(URL),
+			createObjectURL: (blob: Blob) => {
+				const url = `blob:test/${++blobSeq}`;
+				const meta = (blob as unknown as { __testParts?: string[]; type: string }).__testParts;
+				blobByUrl.set(url, { content: (meta ?? []).join(''), type: blob.type });
+				return url;
+			},
+			revokeObjectURL: (url: string) => {
+				blobByUrl.delete(url);
+			}
+		}
+	);
+	class TestBlob {
+		__testParts: string[];
+		type: string;
+		constructor(parts: unknown[] = [], options?: { type?: string }) {
+			this.__testParts = parts.map((part) => String(part));
+			this.type = options?.type ?? '';
+		}
+	}
 	const storage = makeMemoryStorage();
 	const sandbox: Record<string, unknown> = {
 		exports,
@@ -331,7 +411,8 @@ function createReactivePlanner() {
 		Error,
 		RangeError,
 		Promise,
-		URL,
+		URL: CustomURL,
+		Blob: TestBlob,
 		Response,
 		Request,
 		crypto,
@@ -342,6 +423,24 @@ function createReactivePlanner() {
 		clearInterval,
 		localStorage: storage,
 		navigator: { onLine: true },
+		document: {
+			createElement: (tag: string) => {
+				const anchor = {
+					tagName: tag.toUpperCase(),
+					href: '',
+					download: '',
+					click: () => {
+						const entry = blobByUrl.get(anchor.href);
+						downloads.push({
+							filename: anchor.download,
+							content: entry?.content ?? '',
+							type: entry?.type ?? ''
+						});
+					}
+				};
+				return anchor;
+			}
+		},
 		window: {
 			location: {
 				assign: (url: string) => assignedUrls.push(url),
@@ -349,11 +448,19 @@ function createReactivePlanner() {
 			},
 			scrollTo: () => {}
 		},
-		fetch: async () =>
-			new Response(JSON.stringify({ ok: true }), {
+		fetch: async (input: unknown) => {
+			const path = String(input);
+			if (path === '/api/export') {
+				return new Response(JSON.stringify({ exported: true, version: 1 }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				});
+			}
+			return new Response(JSON.stringify({ ok: true }), {
 				status: 200,
 				headers: { 'content-type': 'application/json' }
-			})
+			});
+		}
 	};
 	sandbox.globalThis = sandbox;
 	sandbox.__onPlannerInit = (instance: PlannerHarnessApi) => {
@@ -363,7 +470,7 @@ function createReactivePlanner() {
 	const dispose = svelteClient.effect_root(() => {
 		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
 	});
-	return { api, assignedUrls, storage, dispose };
+	return { api, assignedUrls, downloads, storage, dispose };
 }
 
 test('unmodified +page.svelte compiles cleanly and avoids linear recipe scans and per-item toLocaleDateString in planner', () => {
@@ -895,4 +1002,242 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('Butler sign-out modal, export confirmation modal, and undo-toast presence render accurately in +page.svelte', () => {
+	// 1. Sign-out modal for signed-in local user
+	const signedInSignOut = renderPlannerHtml((planner) => {
+		planner.user = {
+			id: 'u-local',
+			name: 'Alex',
+			email: 'alex@example.test',
+			householdId: 'h-local'
+		};
+		planner.runtimeAuthMode = 'local';
+		planner.applyButler([{ type: 'ui', action: 'sign-out' }], JSON.stringify(planner.kitchen));
+	});
+	assert.equal(signedInSignOut.api.modal, 'signOut');
+	assert.equal(signedInSignOut.api.toastUndo, null);
+	assert.match(signedInSignOut.html, /Sign out of your kitchen\?/);
+	assert.match(signedInSignOut.html, />Stay signed in<\/button>/);
+	assert.match(signedInSignOut.html, /Sign out<\/button>/);
+	assert.doesNotMatch(signedInSignOut.html, />Undo<\/button>/);
+
+	// 2. Sign-out modal for managed proxy user without logout URL and signed-out guest
+	const proxySignOut = renderPlannerHtml((planner) => {
+		planner.user = {
+			id: 'u-proxy',
+			name: 'Pat',
+			email: 'pat@example.test',
+			householdId: 'h-proxy'
+		};
+		planner.runtimeAuthMode = 'proxy';
+		planner.runtimeLogoutUrl = null;
+		planner.modal = 'signOut';
+	});
+	assert.match(proxySignOut.html, /Sign-out is managed by your organization's access proxy\./);
+
+	const guestSignOut = renderPlannerHtml((planner) => {
+		planner.user = null;
+		planner.modal = 'signOut';
+	});
+	assert.match(guestSignOut.html, /You are already signed out on this device\./);
+
+	// 3. Export modal across shopping, kitchen, and pending (disabled vs enabled)
+	const shoppingExport = renderPlannerHtml((planner) => {
+		planner.kitchen.shopping = [
+			{ id: 's-1', name: 'Lemons', quantity: 3, unit: 'each', checked: false }
+		];
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-shopping' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.equal(shoppingExport.api.modal, 'export');
+	assert.equal(shoppingExport.api.pendingExport, 'shopping');
+	assert.equal(shoppingExport.api.toastUndo, null);
+	assert.match(shoppingExport.html, /Export shopping list\?/);
+	assert.match(shoppingExport.html, /flavorithm-shopping\.txt/);
+	assert.doesNotMatch(shoppingExport.html, />Undo<\/button>/);
+
+	const kitchenExport = renderPlannerHtml((planner) => {
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-kitchen' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.equal(kitchenExport.api.modal, 'export');
+	assert.equal(kitchenExport.api.pendingExport, 'kitchen');
+	assert.match(kitchenExport.html, /Export kitchen data\?/);
+	assert.match(kitchenExport.html, /flavorithm-kitchen\.json/);
+
+	const emptyPendingExport = renderPlannerHtml((planner) => {
+		planner.pendingSync = false;
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-pending' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.match(
+		emptyPendingExport.html,
+		/There are no unsynced pending changes to export right now\./
+	);
+	const emptyPendingDialog = emptyPendingExport.html.slice(
+		emptyPendingExport.html.indexOf('aria-label="Export data"')
+	);
+	assert.equal(emptyPendingDialog.includes('<button class="primary" disabled'), true);
+	assert.equal(emptyPendingDialog.includes('Export pending changes</button>'), true);
+
+	const activePendingExport = renderPlannerHtml((planner) => {
+		planner.pendingSync = true;
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-pending' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.match(activePendingExport.html, /flavorithm-pending-kitchen\.json/);
+	const activePendingDialog = activePendingExport.html.slice(
+		activePendingExport.html.indexOf('aria-label="Export data"')
+	);
+	assert.equal(activePendingDialog.includes('<button class="primary" disabled'), false);
+	assert.equal(activePendingDialog.includes('Export pending changes</button>'), true);
+
+	// 4. Undo-toast presence: mutation shows Undo button, navigation omits Undo button
+	const mutationRender = renderPlannerHtml((planner) => {
+		planner.applyButler(
+			[
+				{
+					type: 'pantry.upsert',
+					item: { id: 'p-salt', name: 'Kosher salt', quantity: 1, unit: 'box', category: 'Spices' }
+				}
+			],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.equal(typeof mutationRender.api.toastUndo, 'function');
+	assert.match(mutationRender.html, /Basil’s changes applied\./);
+	assert.match(mutationRender.html, />Undo<\/button>/);
+
+	const navRender = renderPlannerHtml((planner) => {
+		planner.applyButler([{ type: 'navigate', page: 'shopping' }], JSON.stringify(planner.kitchen));
+	});
+	assert.equal(navRender.api.toastUndo, null);
+	assert.match(navRender.html, /Opened in your kitchen\./);
+	assert.doesNotMatch(navRender.html, />Undo<\/button>/);
+});
+
+test('applyButler gates sign-out and confirmPendingExport downloads and preserves create-mode recipe drafts on undo', async () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api, downloads } = harness;
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [makeRecipe('r-existing', 'Existing Soup')],
+			shopping: [{ id: 'shop-milk', name: 'Milk', quantity: 2, unit: 'L', checked: false }]
+		};
+		api.user = {
+			id: 'u-1',
+			name: 'Alex',
+			email: 'alex@example.test',
+			householdId: 'h-1'
+		};
+
+		// Sign-out UI command opens confirmation modal without ending the session or offering Undo.
+		api.applyButler([{ type: 'ui', action: 'sign-out' }], JSON.stringify(api.kitchen));
+		assert.equal(api.modal, 'signOut');
+		assert.equal(api.user?.id, 'u-1');
+		assert.equal(api.toast, 'Confirm this action to continue.');
+		assert.equal(api.toastUndo, null);
+		api.closeDialog();
+		assert.equal(api.modal, '');
+
+		// Export shopping opens confirmation modal without downloading until confirmPendingExport runs.
+		api.applyButler([{ type: 'ui', action: 'export-shopping' }], JSON.stringify(api.kitchen));
+		assert.equal(api.modal, 'export');
+		assert.equal(api.pendingExport, 'shopping');
+		assert.equal(downloads.length, 0);
+		await api.confirmPendingExport();
+		assert.equal(api.modal, '');
+		assert.equal(api.pendingExport, null);
+		assert.equal(downloads.length, 1);
+		assert.equal(downloads[0].filename, 'flavorithm-shopping.txt');
+		assert.match(downloads[0].content, /☐ 2 L Milk/);
+
+		// Export kitchen fetches /api/export only upon confirmation.
+		api.applyButler([{ type: 'ui', action: 'export-kitchen' }], JSON.stringify(api.kitchen));
+		assert.equal(api.modal, 'export');
+		assert.equal(api.pendingExport, 'kitchen');
+		assert.equal(downloads.length, 1);
+		await api.confirmPendingExport();
+		assert.equal(downloads.length, 2);
+		assert.equal(downloads[1].filename, 'flavorithm-kitchen.json');
+		assert.match(downloads[1].content, /"exported": true/);
+
+		// Export pending downloads staged local state when present, and notifies when absent.
+		api.setPendingSyncSnapshot(api.kitchen);
+		api.applyButler([{ type: 'ui', action: 'export-pending' }], JSON.stringify(api.kitchen));
+		await api.confirmPendingExport();
+		assert.equal(downloads.length, 3);
+		assert.equal(downloads[2].filename, 'flavorithm-pending-kitchen.json');
+
+		api.setPendingSyncSnapshot(null);
+		api.pendingExport = 'pending';
+		await api.confirmPendingExport();
+		assert.equal(downloads.length, 3);
+		assert.equal(api.toast, 'There are no pending changes to export.');
+
+		// Open a create-mode recipe editor draft, edit its title, apply an unrelated Basil mutation, and undo.
+		api.openNewRecipe();
+		assert.equal(api.editingRecipeMode, 'create');
+		assert.ok(api.editingRecipe);
+		const draftId = api.editingRecipe.id;
+		api.editingRecipe.title = 'My Unsaved Focaccia Draft';
+
+		api.applyButler(
+			[
+				{
+					type: 'pantry.upsert',
+					item: {
+						id: 'p-rosemary',
+						name: 'Rosemary',
+						quantity: 2,
+						unit: 'sprigs',
+						category: 'Produce'
+					}
+				}
+			],
+			JSON.stringify(api.kitchen)
+		);
+		assert.equal(api.kitchen.pantry.length, 1);
+		assert.equal(api.toast, 'Basil’s changes applied.');
+		assert.equal(typeof api.toastUndo, 'function');
+
+		api.toastUndo!();
+		assert.equal(api.kitchen.pantry.length, 0);
+		assert.equal(api.editingRecipeMode, 'create');
+		assert.equal(api.editingRecipe?.id, draftId);
+		assert.equal(api.editingRecipe?.title, 'My Unsaved Focaccia Draft');
+
+		// Conversely, undoing a compound recipe upsert + open closes the newly created recipe view.
+		const createdRecipe = { ...makeRecipe('r-basil-new', 'Basil Risotto'), image: '' };
+		api.applyButler(
+			[
+				{ type: 'recipe.upsert', recipe: createdRecipe },
+				{ type: 'recipe.open', id: createdRecipe.id, mode: 'edit' }
+			],
+			JSON.stringify(api.kitchen)
+		);
+		assert.equal(api.editingRecipeMode, 'edit');
+		assert.equal(api.editingRecipe?.id, createdRecipe.id);
+		assert.equal(typeof api.toastUndo, 'function');
+
+		api.toastUndo!();
+		assert.equal(
+			api.kitchen.recipes.some((item) => item.id === createdRecipe.id),
+			false
+		);
+		assert.equal(api.editingRecipe, null);
+	} finally {
+		harness.dispose();
+	}
 });

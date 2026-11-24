@@ -19,7 +19,7 @@
 	import ChatMarkdown from './ChatMarkdown.svelte';
 	import {
 		buildButlerActions,
-		isButlerKitchenMutation,
+		buildButlerHistory,
 		type ButlerAction
 	} from '#lib/butler-actions.ts';
 	import { focusTrap } from '#lib/focus.ts';
@@ -213,29 +213,7 @@
 		if (!prompt || working || !owner) return;
 		resetReaction();
 		const token = ++generation;
-		const history = messages
-			.slice(retry ? -21 : -20, retry ? -1 : undefined)
-			.map(({ role, content, actions }) => {
-				const applied = actions
-					?.filter(
-						(action) => action.status === 'applied' && action.commands.some(isButlerKitchenMutation)
-					)
-					.map((action) => action.title);
-				const opened = actions
-					?.filter(
-						(action) =>
-							action.status === 'applied' && !action.commands.some(isButlerKitchenMutation)
-					)
-					.map((action) => action.title);
-				const notes = [
-					applied?.length ? `[User applied: ${applied.join('; ')}]` : '',
-					opened?.length ? `[User opened: ${opened.join('; ')}]` : ''
-				].filter(Boolean);
-				return {
-					role,
-					content: notes.length ? `${content}\n\n${notes.join('\n')}` : content
-				};
-			});
+		const history = buildButlerHistory(messages, retry);
 		for (const message of messages)
 			for (const action of message.actions ?? [])
 				if (action.status === 'pending') action.status = 'dismissed';

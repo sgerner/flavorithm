@@ -2231,6 +2231,7 @@
 					{
 						selectedId: selected?.id,
 						editingRecipeId: editingRecipe?.id,
+						editingRecipeMode,
 						recipeToDeleteId: recipeToDelete?.id,
 						modal,
 						cookingMealId,
