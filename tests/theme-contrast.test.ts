@@ -71,6 +71,35 @@ function resolveColor(expr: string, vars: Record<string, string>, dark: boolean)
 		const [lightExpr, darkExpr] = splitTopLevelComma(value.slice(11, -1));
 		return resolveColor(dark ? darkExpr : lightExpr, vars, dark);
 	}
+	if (value.startsWith('color-mix(') && value.endsWith(')')) {
+		const [space, rest] = splitTopLevelComma(value.slice(10, -1));
+		assert.equal(space, 'in srgb', `Unsupported color-mix color space: ${space}`);
+		const [firstArg, secondArg] = splitTopLevelComma(rest);
+		const parseWeighted = (arg: string): { color: Rgb; weight: number | null } => {
+			const trimmed = arg.trim();
+			const lastSpace = trimmed.lastIndexOf(' ');
+			if (lastSpace !== -1 && trimmed.endsWith('%')) {
+				const pct = parseFloat(trimmed.slice(lastSpace + 1, -1));
+				if (!Number.isNaN(pct)) {
+					return {
+						color: resolveColor(trimmed.slice(0, lastSpace).trim(), vars, dark),
+						weight: pct / 100
+					};
+				}
+			}
+			return { color: resolveColor(trimmed, vars, dark), weight: null };
+		};
+		const a = parseWeighted(firstArg);
+		const b = parseWeighted(secondArg);
+		const w1 = a.weight ?? (b.weight !== null ? 1 - b.weight : 0.5);
+		const w2 = b.weight ?? 1 - w1;
+		const sum = w1 + w2 || 1;
+		return [
+			(a.color[0] * w1 + b.color[0] * w2) / sum,
+			(a.color[1] * w1 + b.color[1] * w2) / sum,
+			(a.color[2] * w1 + b.color[2] * w2) / sum
+		];
+	}
 	if (value.startsWith('var(') && value.endsWith(')')) {
 		const name = value.slice(4, -1).trim();
 		const target = vars[name];
@@ -403,6 +432,12 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 			const dangerFill = resolveColor('var(--danger-fill)', vars, dark);
 			const dangerFillHover = resolveColor('var(--danger-fill-hover)', vars, dark);
 			const onDangerFill = resolveColor('var(--on-danger-fill)', vars, dark);
+			const controlBorder = resolveColor('var(--control-border)', vars, dark);
+			const iconSubtle = resolveColor('var(--icon-subtle)', vars, dark);
+			const chipActiveBg = resolveColor('var(--chip-active-bg)', vars, dark);
+			const chipActiveBorder = resolveColor('var(--chip-active-border)', vars, dark);
+			const focusInner = resolveColor('var(--focus-inner)', vars, dark);
+			const focusOuter = resolveColor('var(--focus-outer)', vars, dark);
 
 			const surfaces: Array<[string, Rgb]> = [
 				['--paper', paper],
@@ -420,6 +455,16 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 				if (mutedRatio < 4.5)
 					failures.push(`${mode} --muted on ${surfaceName} = ${mutedRatio.toFixed(2)}`);
 
+				const iconSubtleRatio = contrastRatio(iconSubtle, bg);
+				if (iconSubtleRatio < 4.5)
+					failures.push(`${mode} --icon-subtle on ${surfaceName} = ${iconSubtleRatio.toFixed(2)}`);
+
+				const controlBorderRatio = contrastRatio(controlBorder, bg);
+				if (controlBorderRatio < 3)
+					failures.push(
+						`${mode} --control-border on ${surfaceName} = ${controlBorderRatio.toFixed(2)}`
+					);
+
 				const greenRatio = contrastRatio(green, bg);
 				if (greenRatio < 4.5)
 					failures.push(`${mode} --green text/chip on ${surfaceName} = ${greenRatio.toFixed(2)}`);
@@ -432,6 +477,20 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 				if (dangerTextRatio < 4.5)
 					failures.push(`${mode} --danger-ink on ${surfaceName} = ${dangerTextRatio.toFixed(2)}`);
 			}
+
+			const chipActiveTextRatio = contrastRatio(ink, chipActiveBg);
+			if (chipActiveTextRatio < 4.5)
+				failures.push(`${mode} --ink on --chip-active-bg = ${chipActiveTextRatio.toFixed(2)}`);
+
+			const chipActiveBorderRatio = contrastRatio(chipActiveBorder, chipActiveBg);
+			if (chipActiveBorderRatio < 3)
+				failures.push(
+					`${mode} --chip-active-border on --chip-active-bg = ${chipActiveBorderRatio.toFixed(2)}`
+				);
+
+			const focusRingRatio = contrastRatio(focusOuter, focusInner);
+			if (focusRingRatio < 3)
+				failures.push(`${mode} --focus-outer on --focus-inner = ${focusRingRatio.toFixed(2)}`);
 
 			const primaryRatio = contrastRatio(onGreen, green);
 			if (primaryRatio < 4.5)
@@ -490,6 +549,7 @@ test('zero custom foreground declarations lack a paired or theme-verified backgr
 		'currentColor',
 		'var(--ink)',
 		'var(--muted)',
+		'var(--icon-subtle)',
 		'var(--green)',
 		'var(--on-green)',
 		'var(--on-accent)',

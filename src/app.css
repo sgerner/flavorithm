@@ -53,6 +53,12 @@ html.dark {
 	--danger-fill-hover: #822516;
 	--on-danger-fill: #fffaf8;
 	--brand: var(--color-primary-600);
+	--control-border: color-mix(in srgb, var(--ink) 86%, var(--paper));
+	--icon-subtle: color-mix(in srgb, var(--ink) 86%, var(--paper));
+	--chip-active-bg: color-mix(in srgb, var(--ink) 12%, var(--paper));
+	--chip-active-border: var(--ink);
+	--focus-inner: var(--paper);
+	--focus-outer: var(--ink);
 	color: var(--ink);
 	background: var(--paper);
 	font-synthesis: none;
@@ -233,16 +239,18 @@ a {
 		opacity 0.2s;
 }
 button:focus-visible,
-a:focus-visible {
-	outline: 2px solid var(--green);
-	outline-offset: 4px;
-}
-[tabindex='0']:focus-visible,
-input:focus,
+a:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+summary:focus-visible,
+[tabindex]:where(:not([tabindex='-1'])):focus-visible,
+input:where(:not([type='checkbox']):not([type='radio']):not([type='file'])):focus,
 textarea:focus,
 select:focus {
-	outline: 2px solid var(--green);
+	outline: 2px solid var(--focus-outer);
 	outline-offset: 2px;
+	box-shadow: 0 0 0 2px var(--focus-inner);
 }
 a {
 	color: inherit;
@@ -267,13 +275,17 @@ textarea,
 select {
 	color: var(--ink);
 	background: var(--surface);
-	border: 1px solid var(--line);
+	border: 1px solid var(--control-border);
 	border-radius: 0;
 }
 input::placeholder,
 textarea::placeholder {
 	color: var(--muted);
 	opacity: 1;
+}
+input[type='checkbox'],
+input[type='radio'] {
+	accent-color: var(--ink);
 }
 button svg,
 span svg,
@@ -335,12 +347,8 @@ nav button:hover {
 }
 nav button.current,
 .primary,
-.filter-tabs button.active,
 .calendar-day.today .day-heading,
-.check-box.checked,
-.theme-grid button.active,
-.steps-list li button.done,
-.quiz-options.quiz-time input:checked + span {
+.steps-list li button.done {
 	background: var(--green);
 	color: var(--on-green);
 }
@@ -375,7 +383,7 @@ nav small {
 }
 .mode-toggle {
 	margin-left: auto;
-	border: 1px solid var(--muted);
+	border: 1px solid var(--icon-subtle);
 	width: 23px;
 	height: 13px;
 	position: relative;
@@ -386,7 +394,7 @@ nav small {
 	display: block;
 	width: 7px;
 	height: 7px;
-	background: var(--muted);
+	background: var(--icon-subtle);
 	border-radius: 50%;
 	position: absolute;
 	left: 2px;
@@ -613,9 +621,10 @@ main {
 }
 .inspiration-banner :is(button, a):focus-visible {
 	outline-color: #f6f5e8;
+	box-shadow: 0 0 0 2px #294b37;
 }
 .banner-icon {
-	border: 1px solid #9ab09b;
+	border: 1px solid color-mix(in srgb, #f6f5e8 65%, #294b37);
 	color: #f6f5e8;
 	min-width: 44px;
 	min-height: 44px;
@@ -683,7 +692,7 @@ main {
 	color: var(--green);
 }
 .secondary {
-	border: 1px solid var(--line);
+	border: 1px solid var(--control-border);
 	background: transparent;
 }
 .secondary:hover:not(:disabled) {
@@ -711,6 +720,7 @@ main {
 .filter-tabs button {
 	font-size: 14px;
 	padding: 8px 11px;
+	border: 1px solid transparent;
 	white-space: nowrap;
 	display: flex;
 	gap: 5px;
@@ -719,25 +729,31 @@ main {
 .filter-tabs button:not(.active):hover {
 	background: var(--wash);
 }
+.filter-tabs button.active {
+	padding: 7px 10px;
+	background: var(--chip-active-bg);
+	color: var(--ink);
+	border: 2px solid var(--chip-active-border);
+	font-weight: 700;
+}
 .search-box {
 	display: flex;
 	align-items: center;
 	gap: 7px;
 	min-height: 44px;
-	color: var(--muted);
+	color: var(--icon-subtle);
 	flex-shrink: 1;
 }
 .search-box input {
 	appearance: none;
 	-webkit-appearance: none;
-	border: 0;
-	background: none;
-	padding: 7px 0;
+	border: 1px solid var(--control-border);
+	background: var(--surface);
+	padding: 7px 10px;
 	font-size: 14px;
-	width: 148px;
+	width: 164px;
 	min-width: 80px;
 	min-height: 44px;
-	outline-offset: 3px;
 }
 .search-box input::-webkit-search-decoration,
 .search-box input::-webkit-search-cancel-button,
@@ -756,7 +772,7 @@ main {
 	height: 44px;
 	min-height: 44px;
 	padding: 0;
-	color: var(--muted);
+	color: var(--icon-subtle);
 }
 .search-clear:hover {
 	color: var(--ink);
@@ -776,11 +792,23 @@ main {
 	overflow: hidden;
 	background: var(--wash);
 }
+.recipe-image:has(.image-open:focus-visible) {
+	outline: 2px solid var(--focus-outer);
+	outline-offset: 2px;
+	box-shadow: 0 0 0 2px var(--focus-inner);
+}
 .image-open {
 	width: 100%;
 	height: 100%;
 	padding: 0;
 	display: block;
+}
+.image-open:focus-visible {
+	outline: 2px solid var(--focus-outer);
+	outline-offset: -4px;
+	box-shadow:
+		inset 0 0 0 2px var(--focus-inner),
+		inset 0 0 0 6px var(--focus-inner);
 }
 .recipe-image img {
 	height: 100%;
@@ -1093,8 +1121,8 @@ main {
 	width: 100%;
 	height: 34px;
 	margin-top: 14px;
-	color: var(--muted);
-	border: 1px dashed var(--line);
+	color: var(--icon-subtle);
+	border: 1px dashed var(--control-border);
 }
 .add-meal:hover {
 	background: var(--wash);
@@ -1178,14 +1206,16 @@ main {
 	align-items: center;
 	gap: 9px;
 	padding: 8px 12px;
-	border: 1px solid var(--line);
+	border: 1px solid var(--control-border);
 	background: var(--surface);
 	font-size: 14px;
 }
 .shopping-filters button.active {
-	background: var(--green);
-	color: var(--on-green);
-	border-color: var(--green);
+	padding: 7px 11px;
+	background: var(--chip-active-bg);
+	color: var(--ink);
+	border: 2px solid var(--chip-active-border);
+	font-weight: 700;
 }
 .shopping-filters button span {
 	min-width: 22px;
@@ -1212,13 +1242,16 @@ main {
 .check-box {
 	width: 20px;
 	height: 20px;
-	border: 1px solid var(--muted);
+	border: 1px solid var(--control-border);
+	background: var(--surface);
 	display: grid;
 	place-items: center;
 	padding: 0;
 }
 .check-box.checked {
-	border-color: var(--green);
+	background: var(--ink);
+	border-color: var(--ink);
+	color: var(--paper);
 }
 .shopping-row.checked b {
 	text-decoration: line-through;
@@ -1231,12 +1264,13 @@ main {
 	border-bottom: 1px solid var(--line);
 	padding: 10px 0;
 	margin: 0;
+	color: var(--icon-subtle);
 }
 .inline-add input {
-	background: none;
-	border: 0;
+	background: var(--surface);
+	border: 1px solid var(--control-border);
 	width: 100%;
-	padding: 10px 0;
+	padding: 10px 12px;
 	font-size: 14px;
 }
 .shopping-complete {
@@ -1339,6 +1373,18 @@ main {
 	line-height: 1.7;
 	margin: 8px 0 20px;
 }
+:is(.field-help, p, li, blockquote)
+	a:not(.brand):not(.primary):not(.secondary):not(.cream-button):not(.text-button) {
+	text-decoration: underline;
+	text-decoration-thickness: from-font;
+	text-underline-offset: 3px;
+}
+:is(.field-help, p, li, blockquote)
+	a:not(.brand):not(.primary):not(.secondary):not(.cream-button):not(.text-button)
+	svg {
+	display: inline;
+	vertical-align: -0.125em;
+}
 .dialog-actions {
 	display: flex;
 	align-items: center;
@@ -1387,11 +1433,14 @@ main {
 	justify-content: space-between;
 	padding: 10px;
 	font-size: 14px;
-	border: 1px solid var(--line);
+	border: 1px solid var(--control-border);
 	text-transform: capitalize;
 }
 .theme-grid button.active {
-	border-color: var(--green);
+	background: var(--ink);
+	border-color: var(--ink);
+	color: var(--paper);
+	font-weight: 700;
 }
 .member-row {
 	display: flex;
@@ -1507,6 +1556,7 @@ main {
 }
 .toast button:focus-visible {
 	outline-color: var(--paper);
+	box-shadow: 0 0 0 2px var(--ink);
 }
 .recipe-dialog {
 	max-width: 980px;
@@ -2165,8 +2215,6 @@ main {
 	}
 	.search-box {
 		width: 100%;
-		background: var(--wash);
-		padding: 0 10px;
 	}
 	.search-box.has-clear {
 		padding-right: 0;
@@ -2177,7 +2225,7 @@ main {
 		min-width: 0;
 		min-height: 44px;
 		font-size: 14px;
-		padding: 9px 0;
+		padding: 9px 10px;
 	}
 	.search-box input::-webkit-search-cancel-button {
 		-webkit-appearance: none;
@@ -2436,7 +2484,7 @@ main {
 	min-width: 44px;
 	min-height: 44px;
 	padding: 8px 12px;
-	border: 1px solid var(--line);
+	border: 1px solid var(--control-border);
 	font-size: 16px;
 }
 .sync-notice {
@@ -2528,7 +2576,7 @@ main {
 	min-width: 0;
 	min-height: 44px;
 	padding: 7px 9px;
-	border: 1px solid var(--line);
+	border: 1px solid var(--control-border);
 	background: var(--surface);
 	font-size: 14px;
 	line-height: 1.35;
@@ -2545,7 +2593,7 @@ main {
 	width: 20px;
 	height: 20px;
 	margin: 0;
-	accent-color: var(--green);
+	accent-color: var(--ink);
 }
 
 .quiz-options.quiz-time .quiz-option {
@@ -2564,6 +2612,8 @@ main {
 	margin: 0;
 	opacity: 0;
 	cursor: pointer;
+	outline: none;
+	box-shadow: none;
 }
 
 .quiz-options.quiz-time .quiz-option span {
@@ -2572,17 +2622,21 @@ main {
 	width: 100%;
 	min-height: 44px;
 	padding: 5px 2px;
-	border: 1px solid var(--line);
+	border: 1px solid var(--control-border);
 	background: var(--wash);
 }
 
 .quiz-options.quiz-time input:checked + span {
-	border-color: var(--green);
+	background: var(--ink);
+	border-color: var(--ink);
+	color: var(--paper);
+	font-weight: 700;
 }
 
 .quiz-options.quiz-time .quiz-option:focus-within {
-	outline: 2px solid var(--green);
+	outline: 2px solid var(--focus-outer);
 	outline-offset: 2px;
+	box-shadow: 0 0 0 2px var(--focus-inner);
 }
 
 .quiz-help {
@@ -2789,6 +2843,10 @@ main {
 	.filter-tabs button {
 		font-size: 14px;
 		padding: 8px 10px;
+	}
+
+	.filter-tabs button.active {
+		padding: 7px 9px;
 	}
 
 	.search-box input {
@@ -3038,6 +3096,10 @@ main {
 		font-size: 13px;
 	}
 
+	.shopping-filters button.active {
+		padding-inline: 7px;
+	}
+
 	.shopping-row {
 		gap: 8px;
 		padding: 10px 0;
@@ -3278,7 +3340,7 @@ main {
 		width: 20px;
 		height: 20px;
 		min-width: 20px;
-		accent-color: var(--green);
+		accent-color: var(--ink);
 	}
 
 	.quiz-option span {
@@ -3393,13 +3455,6 @@ main {
 
 	.quiz-options.quiz-complexity {
 		grid-template-columns: repeat(2, minmax(0, 1fr));
-	}
-}
-
-@media (prefers-reduced-motion: reduce) {
-	.calendar-grid {
-		scroll-behavior: auto;
-		scroll-snap-type: none;
 	}
 }
 
@@ -3609,7 +3664,7 @@ main {
 		min-width: 0;
 		min-height: 56px;
 		padding: 5px 3px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--wash);
 		color: var(--ink);
 		font-size: 14px;
@@ -3707,6 +3762,7 @@ main {
 		width: 100%;
 		flex-wrap: nowrap;
 		gap: 5px;
+		padding: 4px;
 		overflow-x: auto;
 		overflow-y: hidden;
 		overscroll-behavior-x: contain;
@@ -3846,6 +3902,7 @@ main {
 		overflow-x: auto;
 		overflow-y: hidden;
 		overscroll-behavior-x: contain;
+		scroll-padding-inline: 16px;
 		scroll-snap-type: x mandatory;
 		-webkit-overflow-scrolling: touch;
 	}
@@ -3891,6 +3948,13 @@ main {
 
 	.calendar-meal img {
 		display: none;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.calendar-grid {
+		scroll-behavior: auto;
+		scroll-snap-type: none;
 	}
 }
 
@@ -3984,8 +4048,9 @@ main {
 
 .capture-tools input[type='file']:focus-visible + label,
 .capture-tools label:focus-within {
-	outline: 2px solid var(--green);
-	outline-offset: 3px;
+	outline: 2px solid var(--focus-outer);
+	outline-offset: 2px;
+	box-shadow: 0 0 0 2px var(--focus-inner);
 }
 
 .capture-photo {
@@ -4371,10 +4436,14 @@ main {
 	padding: 0.75rem 1rem;
 	background: var(--paper);
 	color: var(--ink);
+	border: 1px solid var(--control-border);
 	transform: translateY(-200%);
 }
 .skip-link:focus {
 	transform: translateY(0);
+	outline: 2px solid var(--focus-outer);
+	outline-offset: 2px;
+	box-shadow: 0 0 0 2px var(--focus-inner);
 }
 .shopping-row.checked .shopping-name {
 	text-decoration: line-through;
@@ -4382,11 +4451,23 @@ main {
 @media (forced-colors: active) {
 	button:focus-visible,
 	a:focus-visible,
-	[tabindex='0']:focus-visible,
-	input:focus,
+	input:focus-visible,
+	textarea:focus-visible,
+	select:focus-visible,
+	summary:focus-visible,
+	[tabindex]:where(:not([tabindex='-1'])):focus-visible,
+	input:where(:not([type='checkbox']):not([type='radio']):not([type='file'])):focus,
 	textarea:focus,
-	select:focus {
+	select:focus,
+	.skip-link:focus,
+	.recipe-image:has(.image-open:focus-visible),
+	.image-open:focus-visible,
+	.quiz-options.quiz-time .quiz-option:focus-within,
+	.capture-tools input[type='file']:focus-visible + label,
+	.capture-tools label:focus-within {
 		outline: 2px solid Highlight;
+		outline-offset: 2px;
+		box-shadow: none;
 	}
 	nav button.current,
 	.primary,
