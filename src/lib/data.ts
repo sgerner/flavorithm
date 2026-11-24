@@ -409,32 +409,37 @@ function dateAtWeekday(day: number): string {
 }
 
 export function createInitialState(): AppState {
-	const recipes = structuredClone(seedRecipes);
+	const recipes = structuredClone(seedRecipes).map((recipe) =>
+		recipe.saved ? { ...recipe, sampleSaved: true } : recipe
+	);
 	const meals: Meal[] = [
 		{
 			id: 'meal-week-tue',
 			date: dateAtWeekday(1),
 			slot: 'Dinner',
 			recipeId: 'lemon-herb-chicken',
-			servings: 2
+			servings: 2,
+			sample: true
 		},
 		{
 			id: 'meal-week-thu',
 			date: dateAtWeekday(3),
 			slot: 'Dinner',
 			recipeId: 'lemon-chickpea-orzo',
-			servings: 2
+			servings: 2,
+			sample: true
 		},
 		{
 			id: 'meal-week-sat',
 			date: dateAtWeekday(5),
 			slot: 'Lunch',
 			recipeId: 'sesame-salmon-bowls',
-			servings: 2
+			servings: 2,
+			sample: true
 		}
 	];
 	return {
-		pantry: structuredClone(seedPantry),
+		pantry: structuredClone(seedPantry).map((item) => ({ ...item, sample: true })),
 		recipes,
 		meals,
 		shopping: [],
