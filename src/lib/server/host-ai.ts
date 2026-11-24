@@ -1,3 +1,4 @@
+import { HOST_CONNECTION_ID } from '#lib/ai-connections.ts';
 import { CODEX_CLIENT_ID } from './codex-device.ts';
 import { ApiError, getDatabase } from '#lib/server/db.ts';
 import { getChatGPTAccount } from './oauth-storage.ts';
@@ -7,10 +8,20 @@ db.exec(`CREATE TABLE IF NOT EXISTS host_ai (
  id INTEGER PRIMARY KEY CHECK(id = 1), user_id TEXT NOT NULL,
  account_id TEXT NOT NULL, model TEXT NOT NULL
 )`);
-export const HOST_CONNECTION_ID = 'host-chatgpt';
+export { HOST_CONNECTION_ID };
 export function isHostAdmin(userId: string): boolean {
 	const configured = process.env.FLAVORITHM_HOST_ADMIN_USER_ID?.trim();
 	return Boolean(configured && configured === userId);
+}
+/** Sharing the host's paid credential with other users requires FLAVORITHM_HOST_AI_SHARED=true. */
+export function isHostAIShared(): boolean {
+	return process.env.FLAVORITHM_HOST_AI_SHARED?.trim() === 'true';
+}
+/** Host AI for a requesting user: the host admin always, everyone else only when sharing is opted in. */
+export function getHostAIFor(userId: string) {
+	const host = getHostAI();
+	if (!host) return null;
+	return host.userId === userId || isHostAIShared() ? host : null;
 }
 export function getHostAI() {
 	const row = db.prepare('SELECT user_id, account_id, model FROM host_ai WHERE id = 1').get() as

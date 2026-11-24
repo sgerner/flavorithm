@@ -26,8 +26,10 @@ export function hasAIConnection(args: {
 	preferences: Pick<Preferences, 'provider' | 'model'>;
 	apiKey: string;
 	activeChatGPTAccount?: ChatGPTConnectionStatus;
+	usingHostAI?: boolean;
 }): boolean {
 	if (!args.user) return false;
+	if (args.usingHostAI) return true;
 	const isPlan = args.preferences.provider === 'chatgpt';
 	if (
 		(isPlan

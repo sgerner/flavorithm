@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createInitialState, seedRecipes } from '../src/lib/data.ts';
+import { createInitialState, createNewUserState, seedRecipes } from '../src/lib/data.ts';
 import { rankRecipes } from '../src/lib/discovery.ts';
 import {
 	buildShoppingList,
@@ -12,7 +12,11 @@ import {
 	preferenceSummary,
 	unitInfo
 } from '../src/lib/domain.ts';
-import { completeMeal, transferPurchasedItemsToPantry } from '../src/lib/kitchen-workflows.ts';
+import {
+	clearSampleData,
+	completeMeal,
+	transferPurchasedItemsToPantry
+} from '../src/lib/kitchen-workflows.ts';
 import type { Ingredient, Meal, Recipe } from '../src/lib/types.ts';
 
 function recipe(overrides: Partial<Recipe> = {}): Recipe {
@@ -342,6 +346,67 @@ test('starter recipes have distinct Unsplash images, complete cooking directions
 	first.pantry[0].quantity += 1;
 	assert.notEqual(first.pantry[0].quantity, second.pantry[0].quantity);
 	assert.notEqual(first.recipes[0].ingredients, second.recipes[0].ingredients);
+});
+
+test('createInitialState tags all seven starter staples, three meals, and three bookmarks while new user state has none', () => {
+	const initial = createInitialState();
+	assert.equal(initial.pantry.length, 7);
+	assert.ok(initial.pantry.every((item) => item.sample === true));
+	assert.equal(initial.meals.length, 3);
+	assert.ok(initial.meals.every((meal) => meal.sample === true));
+	assert.equal(initial.recipes.filter((item) => item.saved).length, 3);
+	assert.equal(initial.recipes.filter((item) => item.sampleSaved).length, 3);
+	assert.ok(initial.recipes.every((item) => Boolean(item.sampleSaved) === Boolean(item.saved)));
+
+	const cleanAccount = createNewUserState();
+	assert.deepEqual(cleanAccount.pantry, []);
+	assert.deepEqual(cleanAccount.meals, []);
+	assert.deepEqual(cleanAccount.shopping, []);
+	assert.ok(cleanAccount.recipes.every((item) => !item.saved && !item.sampleSaved));
+});
+
+test('shopping deductions and recipe discovery ignore unowned sample stock after sample cleanup', () => {
+	const guest = createInitialState();
+	// Guest actually owns only extra-firm tofu and broccoli, not the preloaded sample staples.
+	guest.pantry.push(
+		{ id: 'real-tofu', name: 'extra-firm tofu', quantity: 12, unit: 'oz', category: 'Protein' },
+		{ id: 'real-broccoli', name: 'broccoli', quantity: 1, unit: 'large head', category: 'Produce' }
+	);
+	const orzoRecipe = guest.recipes.find((item) => item.id === 'lemon-chickpea-orzo')!;
+
+	// While sample staples remain, chickpeas and olive oil are subtracted from shopping.
+	const skewedShopping = buildShoppingList([orzoRecipe], guest.pantry);
+	assert.equal(
+		skewedShopping.some((item) => item.name === 'chickpeas'),
+		false
+	);
+	assert.equal(
+		skewedShopping.some((item) => item.name === 'olive oil'),
+		false
+	);
+
+	const cleaned = clearSampleData(guest);
+	const accurateShopping = buildShoppingList([orzoRecipe], cleaned.pantry);
+	assert.equal(
+		accurateShopping.some((item) => item.name === 'chickpeas'),
+		true
+	);
+	assert.equal(
+		accurateShopping.some((item) => item.name === 'olive oil'),
+		true
+	);
+	assert.equal(accurateShopping.find((item) => item.name === 'baby spinach')?.quantity, 3);
+
+	// Discovery ranking after cleanup uses only real owned tofu and broccoli rather than sample staples.
+	const neutralPreferences = {
+		...cleaned.preferences,
+		maxTime: 0,
+		complexity: '',
+		diet: 'none',
+		cuisines: []
+	};
+	const rankedAfterCleanup = rankRecipes(cleaned.recipes, cleaned.pantry, neutralPreferences);
+	assert.equal(rankedAfterCleanup[0].id, 'maple-chili-tofu');
 });
 
 test('parseIngredientLines parses fractions, connectors, categories, and trailing-name unit rules', () => {
