@@ -1106,7 +1106,7 @@ export function buildAIRequestPayload(
 			? {}
 			: {
 					pantry: kitchen.pantry
-						.filter((item) => expiryStatus(item.expires, now) !== 'expired')
+						.filter((item) => item.quantity > 0 && expiryStatus(item.expires, now) !== 'expired')
 						.slice(0, 300),
 					preferences: sanitizePreferencesForAI(kitchen.preferences),
 					recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
@@ -1235,6 +1235,59 @@ function scoreRecipe(
 	return score;
 }
 
+type PantryIndex = Map<string, { item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]>;
+
+function buildPantryIndex(pantry: Ingredient[], now: Date): PantryIndex {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const pantryIndex: PantryIndex = new Map();
+	for (const item of pantry) {
+		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
+		const expiry = expiryStatus(item.expires, safeNow);
+		if (expiry === 'expired' || (Boolean(item.expires?.trim()) && expiry === 'unknown')) continue;
+		const key = normalizeIngredientName(item.name);
+		const entries = pantryIndex.get(key) ?? [];
+		entries.push({ item, expiry });
+		pantryIndex.set(key, entries);
+	}
+	return pantryIndex;
+}
+
+function ratedSignals(recipes: Recipe[], preferences: Preferences): RatedRecipe[] {
+	return recipes.flatMap((recipe) => {
+		const rating = recipeRating(recipe, preferences);
+		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
+	});
+}
+
+/** Filter and rank local recipes with positive pantryScores against stocked or targeted expiring ingredients. */
+export function rankPantryRecipes(
+	recipes: Recipe[],
+	pantry: Ingredient[],
+	preferences: Preferences,
+	targetIngredients?: Ingredient[],
+	now: Date = new Date()
+): Recipe[] {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const pantryIndex = buildPantryIndex(pantry, safeNow);
+	const matchIndex =
+		targetIngredients !== undefined ? buildPantryIndex(targetIngredients, safeNow) : pantryIndex;
+	if (!matchIndex.size) return [];
+	const rated = ratedSignals(recipes, preferences);
+
+	return recipes
+		.flatMap((recipe, index) => {
+			const targetMatch = pantryScores(recipe, matchIndex);
+			if (targetMatch.available <= 0) return [];
+			const score =
+				targetMatch.available * 18 +
+				targetMatch.expiring * 8 +
+				scoreRecipe(recipe, pantryIndex, preferences, rated);
+			return [{ recipe, index, score }];
+		})
+		.sort((a, b) => b.score - a.score || a.index - b.index)
+		.map(({ recipe }) => recipe);
+}
+
 /** Rank suggestions from explicit preferences, past ratings, and usable pantry ingredients. */
 export function rankRecipes(
 	recipes: Recipe[],
@@ -1247,25 +1300,8 @@ export function rankRecipes(
 	const eligible = options?.includeConflicts
 		? recipes
 		: recipes.filter((recipe) => !evaluateRecipeConflicts(recipe, preferences).hasConflict);
-
-	const rated: RatedRecipe[] = recipes.flatMap((recipe) => {
-		const rating = recipeRating(recipe, preferences);
-		return rating === undefined ? [] : [{ recipe, signal: (rating - 3) / 2 }];
-	});
-
-	const pantryIndex = new Map<
-		string,
-		{ item: Ingredient; expiry: ReturnType<typeof expiryStatus> }[]
-	>();
-	for (const item of pantry) {
-		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-		const expiry = expiryStatus(item.expires, safeNow);
-		if (expiry === 'expired' || (Boolean(item.expires?.trim()) && expiry === 'unknown')) continue;
-		const key = normalizeIngredientName(item.name);
-		const entries = pantryIndex.get(key) ?? [];
-		entries.push({ item, expiry });
-		pantryIndex.set(key, entries);
-	}
+	const rated = ratedSignals(recipes, preferences);
+	const pantryIndex = buildPantryIndex(pantry, safeNow);
 	return eligible
 		.map((recipe, index) => ({
 			recipe,

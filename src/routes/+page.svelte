@@ -94,6 +94,7 @@
 		normalizePantryDraft,
 		normalizeIngredientName,
 		reconcileShoppingList,
+		restockDepletedPantryItems,
 		restoreShoppingItem,
 		transferPurchasedItemsToPantry,
 		unitInfo,
@@ -107,6 +108,7 @@
 		dietLabel,
 		evaluateRecipeConflicts,
 		normalizeDiet,
+		rankPantryRecipes,
 		rankRecipes
 	} from '#lib/discovery.ts';
 	import {
@@ -182,8 +184,10 @@
 	let conflicts = $state<SyncConflict[]>([]);
 	let reviewedEtag = $state<string | null>(null);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
+	const PANTRY_FILTER = 'From my pantry';
 	let page = $state('discover');
 	let filter = $state(DEFAULT_RECIPE_FILTER);
+	let priorityPantryIds = $state<string[]>([]);
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
 	let lastActivePill = $state<'filter' | 'hidden'>('filter');
@@ -204,6 +208,7 @@
 	function resetRecipeFilters() {
 		const next = resetRecipeFilterState();
 		lastActivePill = 'filter';
+		priorityPantryIds = [];
 		filter = next.filter;
 		query = next.query;
 		showHiddenRecipes = next.showHiddenRecipes;
@@ -653,6 +658,18 @@
 		'vox',
 		'wintry'
 	];
+	let activePriorityPantry = $derived(
+		priorityPantryIds.length
+			? kitchen.pantry.filter(
+					(item) =>
+						priorityPantryIds.includes(item.id) &&
+						Number.isFinite(item.quantity) &&
+						item.quantity > 0 &&
+						expiryStatus(item.expires) !== 'expired' &&
+						!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown')
+				)
+			: []
+	);
 	let recipes = $derived.by(() => {
 		const matches = kitchen.recipes.filter(
 			(r) =>
@@ -667,6 +684,14 @@
 				(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
 				(filter !== 'High protein' || (!r.nutritionStale && r.nutrition.protein >= 25))
 		);
+		if (filter === PANTRY_FILTER) {
+			return rankPantryRecipes(
+				matches,
+				kitchen.pantry,
+				kitchen.preferences,
+				activePriorityPantry.length ? activePriorityPantry : undefined
+			);
+		}
 		if (filter === 'For you') {
 			const includeConflicts = page === 'saved' || Boolean(query.trim());
 			return rankRecipes(matches, kitchen.pantry, kitchen.preferences, new Date(), {
@@ -714,7 +739,7 @@
 		await tick();
 		document.querySelector<HTMLInputElement>('.pantry-row.editing input[type="number"]')?.focus();
 	}
-	async function savePantryEdit() {
+	async function savePantryEdit(restoreFocus = true) {
 		const draft = pantryDraft;
 		if (!draft) return;
 		const normalized = normalizePantryDraft(draft);
@@ -732,6 +757,7 @@
 		});
 		const editedId = draft.id;
 		pantryDraft = null;
+		if (!restoreFocus) return;
 		await tick();
 		document
 			.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
@@ -782,7 +808,8 @@
 					(item) =>
 						Number.isFinite(item.quantity) &&
 						item.quantity > 0 &&
-						expiryStatus(item.expires) !== 'expired'
+						expiryStatus(item.expires) !== 'expired' &&
+						!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown')
 				)
 				.map((item) => normalizeName(item.name))
 				.filter(Boolean)
@@ -868,6 +895,34 @@
 		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
 		notify(`${item.name} removed.`, () => {
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
+		});
+	}
+	function consumeLeftoverServing(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		const next = Math.max(0, Math.round((previous - 1) * 100) / 100);
+		meal.leftoverServings = next;
+		notify(
+			next > 0
+				? `1 leftover serving used · ${next} remaining.`
+				: 'Last leftover serving marked used.',
+			() => {
+				const target = kitchen.meals.find((entry) => entry.id === mealId);
+				if (target && target.leftoverServings === next) target.leftoverServings = previous;
+				else notify('Leftovers changed again. Review the current count before editing.');
+			}
+		);
+	}
+	function clearMealLeftovers(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		meal.leftoverServings = 0;
+		notify('Leftovers marked used.', () => {
+			const target = kitchen.meals.find((entry) => entry.id === mealId);
+			if (target && target.leftoverServings === 0) target.leftoverServings = previous;
+			else notify('Leftovers changed again. Review the current count before editing.');
 		});
 	}
 	function removePlannedMeal(meal: Meal) {
@@ -2285,6 +2340,7 @@
 			selectedMealServings = undefined;
 			selected = kitchen.recipes.find((item) => item.id === saved.id) ?? saved;
 			page = 'saved';
+			priorityPantryIds = [];
 			query = '';
 			filter = 'For you';
 			notify('Recipe saved to your collection.');
@@ -2442,7 +2498,7 @@
 		}
 	}
 	function commitInlineEdits() {
-		if (pantryDraft) void savePantryEdit();
+		if (pantryDraft) void savePantryEdit(false);
 		if (editingShoppingId) {
 			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
 			if (item) normalizeShoppingItem(item);
@@ -2666,15 +2722,79 @@
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
-	async function useFirstIngredients(items: AppState['pantry']) {
-		const names = items
-			.filter((item) => expiryStatus(item.expires) === 'soon' && item.quantity > 0)
-			.map((item) => item.name.trim())
-			.filter(Boolean);
-		if (!names.length) return;
+	function restockPantryItems(selectedIds?: string[]) {
+		commitInlineEdits();
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const result = restockDepletedPantryItems(kitchen.pantry, kitchen.shopping, selectedIds);
+		if (!result.restockedCount) return;
+		kitchen.pantry = result.pantry;
+		kitchen.shopping = result.shopping;
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
+		const singleName =
+			selectedIds?.length === 1
+				? previousPantry.find((item) => item.id === selectedIds[0])?.name
+				: undefined;
+		const message = singleName
+			? result.addedCount
+				? `${singleName} added to your shopping list.`
+				: `${singleName} is already on your shopping list.`
+			: result.addedCount
+				? `${result.addedCount} depleted item${result.addedCount === 1 ? '' : 's'} added to your shopping list.`
+				: 'Depleted items are already on your shopping list.';
+		notify(message, () => {
+			if (
+				JSON.stringify(kitchen.pantry) === appliedPantry &&
+				JSON.stringify(kitchen.shopping) === appliedShopping
+			) {
+				kitchen.pantry = previousPantry;
+				kitchen.shopping = previousShopping;
+			} else {
+				notify('Your kitchen changed again. Review the current items before editing.');
+			}
+		});
+	}
+	function useFirstIngredients(items: AppState['pantry']) {
+		commitInlineEdits();
+		const targetIds = new Set(items.map((item) => item.id));
+		const targets = kitchen.pantry.filter(
+			(item) =>
+				targetIds.has(item.id) &&
+				expiryStatus(item.expires) === 'soon' &&
+				Number.isFinite(item.quantity) &&
+				item.quantity > 0 &&
+				item.name.trim()
+		);
+		if (!targets.length) return;
+		const names = targets.map((item) => item.name.trim());
 		prompt = `Use these ingredients first, prioritizing them because they are expiring: ${names.join(', ')}. Build a practical recipe that uses as much of them as possible while following my preferences.`;
-		openGenerate();
-		await generate();
+		priorityPantryIds = targets.map((item) => item.id);
+		query = '';
+		lastActivePill = 'filter';
+		filter = PANTRY_FILTER;
+		navigate('discover');
+	}
+	function cookFromPantry() {
+		commitInlineEdits();
+		const stockedNames = kitchen.pantry
+			.filter(
+				(item) =>
+					Number.isFinite(item.quantity) &&
+					item.quantity > 0 &&
+					expiryStatus(item.expires) !== 'expired' &&
+					!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown') &&
+					item.name.trim()
+			)
+			.map((item) => item.name.trim());
+		prompt = stockedNames.length
+			? `Build practical recipes around what is currently in my pantry: ${stockedNames.slice(0, 12).join(', ')}.`
+			: '';
+		priorityPantryIds = [];
+		query = '';
+		lastActivePill = 'filter';
+		filter = PANTRY_FILTER;
+		navigate('discover');
 	}
 	function addMeal(event?: SubmitEvent) {
 		event?.preventDefault();
@@ -3399,16 +3519,19 @@
 							class:can-scroll-right={filterOverflow.right}
 						>
 							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
-								{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
+								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
 										type="button"
 										data-filter={item}
 										class:active={filter === item}
 										aria-pressed={filter === item}
 										onclick={() => {
 											lastActivePill = 'filter';
+											priorityPantryIds = [];
 											filter = item;
 										}}
-										>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
+										>{#if item === 'For you'}<Sparkles
+												size={14}
+											/>{:else if item === PANTRY_FILTER}<Carrot size={14} />{/if}{item}</button
 									>{/each}
 								<button
 									type="button"
@@ -3436,6 +3559,28 @@
 								>{/if}
 						</div>
 					</div>
+					{#if filter === PANTRY_FILTER}
+						<div class="discover-pantry-bar">
+							<span>
+								{#if activePriorityPantry.length}
+									Prioritizing expiring ingredients: <b
+										>{activePriorityPantry.map((item) => item.name).join(', ')}</b
+									>
+								{:else}
+									Showing local recipes matching your stocked pantry ingredients.
+								{/if}
+							</span>
+							<div class="discover-pantry-actions">
+								{#if activePriorityPantry.length}<button
+										class="text-button"
+										onclick={() => (priorityPantryIds = [])}>All pantry matches</button
+									>{/if}
+								<button class="secondary" onclick={openGenerate}
+									><Sparkles size={16} /> Generate with AI</button
+								>
+							</div>
+						</div>
+					{/if}
 					<div class="recipe-grid">
 						{#each recipes as recipe, i (recipe.id)}{@const conflict = evaluateRecipeConflicts(
 								recipe,
@@ -3517,7 +3662,9 @@
 								<p>
 									{page === 'saved'
 										? 'Your current search or filters hid your saved recipes.'
-										: 'No recipes match your current search or filters.'}
+										: filter === PANTRY_FILTER
+											? 'No local recipes match those pantry ingredients yet. Reset filters or generate with AI.'
+											: 'No recipes match your current search or filters.'}
 								</p>
 								<button type="button" class="secondary" onclick={resetRecipeFilters}
 									>Reset filters</button
@@ -3549,11 +3696,19 @@
 				</section>
 				<div class="pantry-summary">
 					<span><b>{kitchen.pantry.length}</b> ingredients</span>
-					{#if kitchen.pantry.some((item) => item.quantity === 0)}<button
-							class="text-button"
-							onclick={() => {
-								kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
-							}}>Clear depleted items</button
+					{#if kitchen.pantry.some((item) => Number.isFinite(item.quantity) && item.quantity <= 0)}<span
+							class="depleted-actions"
+							><button class="text-button restock-depleted" onclick={() => restockPantryItems()}
+								><ShoppingBasket size={16} />Restock depleted items</button
+							><button
+								class="text-button"
+								onclick={() => {
+									commitInlineEdits();
+									kitchen.pantry = kitchen.pantry.filter(
+										(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
+									);
+								}}>Clear depleted items</button
+							></span
 						>{/if}
 					<div>
 						<button
@@ -3582,7 +3737,7 @@
 							/>
 						</label>
 						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
-							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
 									type="button"
 									class:active={pantryFilter === option.id}
 									aria-pressed={pantryFilter === option.id}
@@ -3621,7 +3776,9 @@
 							<span>INGREDIENT</span><span>AMOUNT</span><span>BEST BEFORE</span><span></span>
 						</div>
 						<div class="pantry-list" role="list" aria-label="Pantry ingredients">
-							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(item.expires)}
+							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
+									item.expires
+								)}{@const depleted = Number.isFinite(item.quantity) && item.quantity <= 0}
 								<div
 									class="pantry-row"
 									class:editing={pantryDraft?.id === item.id}
@@ -3697,7 +3854,13 @@
 											><span class="ingredient-meta"
 												><b class="pantry-name">{item.name}</b><span class="ingredient-tags"
 													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
-													>{#if expiry === 'soon'}<button
+													>{#if depleted}<button
+															type="button"
+															class="text-button restock-item"
+															aria-label={`Restock ${item.name}`}
+															onclick={() => restockPantryItems([item.id])}
+															><ShoppingBasket size={14} />Restock</button
+														>{:else if expiry === 'soon' && item.quantity > 0}<button
 															type="button"
 															class="text-button use-first"
 															onclick={() => useFirstIngredients([item])}
@@ -3710,8 +3873,10 @@
 										><span class="pantry-expiry"
 											><small
 												class="expiry-badge"
-												class:expired={expiry === 'expired'}
-												class:soon={expiry === 'soon'}>{expiryBadgeLabel(expiry)}</small
+												class:depleted
+												class:expired={!depleted && expiry === 'expired'}
+												class:soon={!depleted && expiry === 'soon'}
+												>{depleted ? 'Depleted' : expiryBadgeLabel(expiry)}</small
 											>{#if item.expires}<small class="pantry-date">{item.expires}</small
 												>{/if}</span
 										>
@@ -3745,7 +3910,7 @@
 						>
 					</div>{/if}
 				<div class="pantry-footer">
-					<button class="primary" onclick={openGenerate}
+					<button class="primary" onclick={cookFromPantry}
 						><Sparkles size={17} /> Cook from my pantry</button
 					>
 				</div>
@@ -3884,10 +4049,13 @@
 										<div class="cooked-history-actions">
 											{#if meal.leftoverServings}<button
 													class="text-button"
-													onclick={() => {
-														meal.leftoverServings = 0;
-														notify('Leftovers marked used.');
-													}}>Use leftovers <Check size={15} /></button
+													aria-label={`Use 1 leftover of ${recipe.title}`}
+													onclick={() => consumeLeftoverServing(meal)}>Use 1 leftover</button
+												><button
+													class="text-button"
+													aria-label={`Clear leftovers for ${recipe.title}`}
+													onclick={() => clearMealLeftovers(meal)}
+													>Clear leftovers <Check size={15} /></button
 												>{/if}<button
 												class="text-button"
 												onclick={() => {
@@ -5120,6 +5288,12 @@
 		font-size: 12px;
 		color: var(--muted);
 	}
+	.expiry-badge.depleted {
+		background: var(--wash);
+		color: var(--ink);
+		padding: 2px 6px;
+		font-weight: 600;
+	}
 	.expiry-badge.expired {
 		color: #a43f36;
 		font-weight: 600;
@@ -5128,13 +5302,47 @@
 		color: #926b17;
 		font-weight: 600;
 	}
-	.use-first {
+	.use-first,
+	.restock-item {
 		display: inline-flex;
 		align-items: center;
 		gap: 5px;
-		min-height: 34px;
-		padding: 3px 0;
+		min-height: 44px;
+		min-width: 44px;
+		padding: 6px 0;
 		font-size: 13px;
+	}
+	.depleted-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 14px;
+	}
+	.depleted-actions button {
+		min-height: 44px;
+		min-width: 44px;
+	}
+	.discover-pantry-bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 12px 14px;
+		margin-bottom: 20px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		font-size: 14px;
+	}
+	.discover-pantry-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 12px;
+	}
+	.discover-pantry-actions button {
+		min-height: 44px;
+		min-width: 44px;
 	}
 	.pantry-row-actions {
 		display: flex;
@@ -5432,8 +5640,10 @@
 			color: var(--muted);
 			font-size: 12px;
 		}
-		.use-first {
+		.use-first,
+		.restock-item {
 			min-height: 44px;
+			min-width: 44px;
 			padding: 6px 4px;
 		}
 		.pantry-row-actions {
