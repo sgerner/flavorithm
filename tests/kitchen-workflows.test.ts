@@ -17,6 +17,7 @@ import {
 	mergePantryAdditions,
 	normalizeIngredientName,
 	normalizePantryDraft,
+	normalizeStagedScanDraft,
 	parseManualPantryInput,
 	reconcileShoppingList,
 	restockDepletedPantryItems,
@@ -890,7 +891,7 @@ test('structured photo scan staging preserves clean names, valid units, and cate
 	assert.ok(chickpeas);
 	assert.equal(chickpeas.quantity, 2);
 	assert.equal(chickpeas.unit, 'can');
-	assert.equal(chickpeas.category, 'Canned goods');
+	assert.equal(chickpeas.category, 'Pantry');
 
 	const yogurt = merged.find((item) => item.name === 'Greek yogurt');
 	assert.ok(yogurt);
@@ -1065,6 +1066,16 @@ test('transferPurchasedItemsToPantry preserves categories on new lots and merges
 	assert.ok(flour);
 	assert.equal(flour.category, 'Pantry');
 	assert.equal(flour.unit, 'cup');
+
+	// Existing Pantry-categorized lots keep their existing category when purchases merge in.
+	const preservedCategory = transferPurchasedItemsToPantry(
+		[{ ...pantry('chickpeas', 1, 'can'), category: 'Pantry' }],
+		[{ ...shopping('buy-beans', 'garbanzo beans', 1, 'can', true), category: 'Canned goods' }],
+		() => 'unused'
+	);
+	assert.equal(preservedCategory.length, 1);
+	assert.equal(preservedCategory[0].quantity, 2);
+	assert.equal(preservedCategory[0].category, 'Pantry');
 });
 
 test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and guards invalid now', () => {
@@ -1315,4 +1326,189 @@ test('filterPantryItems excludes zero-quantity rows from Expiring soon while kee
 		),
 		['spinach-depleted', 'rice-stocked']
 	);
+});
+
+test('reconcileShoppingList replaces legacy pre-normalization generated rows without duplicates and deducts legacy checked purchases', () => {
+	const now = new Date('2026-11-24T12:00:00Z');
+	const scope = 'week:2026-11-23';
+	const legacyShopping: ShoppingItem[] = [
+		shopping(
+			'shopping-cannellini-beans-can-15-oz-',
+			'cannellini beans',
+			1,
+			'can (15 oz)',
+			false,
+			scope
+		),
+		shopping('generated-legacy-cilantro', 'fresh cilantro, for garnish', 2, 'tbsp', false, scope),
+		shopping('generated-legacy-stale', 'old removed ingredient', 1, 'cup', false, scope),
+		shopping('generated-legacy-checked', 'chickpeas (15 oz)', 1, 'can (15 oz)', true, scope),
+		shopping('manual-milk', 'oat milk', 1, 'qt', false)
+	];
+
+	const plannedRecipes = [
+		recipe({
+			id: 'beans-and-orzo',
+			servings: 2,
+			ingredients: [
+				{ name: 'cannellini beans', quantity: 2, unit: 'can' },
+				{ name: 'cilantro', quantity: 2, unit: 'tbsp' },
+				{ name: 'chickpeas', quantity: 2, unit: 'can' },
+				{ name: 'carrots, peeled and diced', quantity: 3, unit: 'whole' }
+			]
+		})
+	];
+	const freshAdditions = buildShoppingList(
+		plannedRecipes,
+		[pantry('carrot', 1, 'small')],
+		[{ id: 'm1', date: '2026-11-24', slot: 'Dinner', recipeId: 'beans-and-orzo', servings: 2 }],
+		now
+	);
+	const reconciled = reconcileShoppingList(legacyShopping, freshAdditions, scope);
+
+	// Stale generated row is dropped; manual row and checked row are preserved; zero duplicates exist.
+	assert.equal(new Set(reconciled.map((item) => item.id)).size, reconciled.length);
+	assert.equal(
+		reconciled.find((item) => item.name === 'old removed ingredient'),
+		undefined
+	);
+	assert.ok(reconciled.some((item) => item.id === 'manual-milk' && !item.checked));
+
+	// Legacy unchecked cannellini beans & cilantro IDs are reused in place rather than duplicated.
+	const uncheckedBeans = reconciled.filter(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'cannellini bean'
+	);
+	assert.equal(uncheckedBeans.length, 1);
+	assert.equal(uncheckedBeans[0].id, 'shopping-cannellini-beans-can-15-oz-');
+	assert.equal(uncheckedBeans[0].quantity, 2);
+	assert.equal(uncheckedBeans[0].unit, 'can');
+
+	const uncheckedCilantro = reconciled.filter(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'cilantro'
+	);
+	assert.equal(uncheckedCilantro.length, 1);
+	assert.equal(uncheckedCilantro[0].id, 'generated-legacy-cilantro');
+
+	// Legacy checked chickpeas (15 oz) deducts 1 can from the 2-can requirement, leaving 1 unchecked can + 1 checked can.
+	const uncheckedChickpeas = reconciled.filter(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'chickpea'
+	);
+	assert.equal(uncheckedChickpeas.length, 1);
+	assert.equal(uncheckedChickpeas[0].quantity, 1);
+	assert.equal(reconciled.find((item) => item.id === 'generated-legacy-checked')?.checked, true);
+
+	// Legacy 1 small carrot in pantry deducted from 3 whole carrots, leaving 2 each.
+	const carrots = reconciled.find(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'carrot'
+	);
+	assert.ok(carrots);
+	assert.equal(carrots.quantity, 2);
+	assert.equal(carrots.unit, 'each');
+});
+
+test('shared lot allocator keeps matchRecipePantry, rankPantryRecipes, and opt-in completeMeal deductions aligned', () => {
+	const now = new Date(2026, 10, 24, 12);
+	const splitRecipe = recipe({
+		id: 'split-curry',
+		servings: 2,
+		ingredients: [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'olive oil, divided', quantity: 1, unit: 'tbsp' },
+			{ name: 'chickpeas (15 oz)', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'fresh cilantro, for garnish', quantity: 2, unit: 'tbsp' }
+		]
+	});
+	const stock: Ingredient[] = [
+		{
+			id: 'oil-expired',
+			name: 'olive oil',
+			quantity: 4,
+			unit: 'tbsp',
+			category: 'Oils',
+			expires: '2026-11-20'
+		},
+		{
+			id: 'oil-soon',
+			name: 'extra virgin olive oil',
+			quantity: 1,
+			unit: 'tbsp',
+			category: 'Oils',
+			expires: '2026-11-25'
+		},
+		{ id: 'oil-unitless', name: 'olive oil', quantity: 4, unit: '   ', category: 'Oils' },
+		{ id: 'oil-grams', name: 'olive oil', quantity: 100, unit: 'g', category: 'Oils' },
+		{ id: 'beans-ok', name: 'garbanzo beans', quantity: 2, unit: 'can', category: 'Canned goods' }
+	];
+
+	const match = matchRecipePantry(splitRecipe, stock, now);
+	// First oil line consumes the sole usable 1 tbsp lot; second oil line starves; chickpeas matches; cilantro has no stock.
+	assert.equal(match.matchedCount, 2);
+	assert.equal(rankPantryRecipes([splitRecipe], stock, preferences(), undefined, now).length, 1);
+
+	const baseState = state({
+		pantry: stock,
+		recipes: [splitRecipe],
+		meals: [
+			{ id: 'cook-1', date: '2026-11-24', slot: 'Dinner', recipeId: 'split-curry', servings: 2 }
+		]
+	});
+
+	// Opt-out (#85 contract): deductPantry: false leaves pantry stock completely untouched.
+	const withoutDeduction = completeMeal(
+		baseState,
+		'cook-1',
+		{ deductPantry: false, leftoverServings: 1 },
+		now
+	);
+	assert.equal(withoutDeduction.pantry, baseState.pantry);
+	assert.equal(withoutDeduction.meals[0].leftoverServings, 1);
+
+	// Opt-in (#85 contract): deductPantry: true consumes the exact same usable lots matched by matchRecipePantry.
+	const withDeduction = completeMeal(
+		baseState,
+		'cook-1',
+		{ deductPantry: true, leftoverServings: 0 },
+		now
+	);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-expired')?.quantity, 4);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-soon')?.quantity, 0);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-unitless')?.quantity, 4);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-grams')?.quantity, 100);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'beans-ok')?.quantity, 1);
+});
+
+test('normalizeStagedScanDraft leaves empty quantities null on blur instead of clamping to 0.01', () => {
+	const clearedNumeric = normalizeStagedScanDraft({
+		id: 'scan-empty-null',
+		name: '  avocados  ',
+		quantity: null,
+		unit: '  ',
+		category: '  '
+	});
+	assert.deepEqual(clearedNumeric, {
+		id: 'scan-empty-null',
+		name: 'avocados',
+		quantity: null,
+		unit: 'each',
+		category: 'Pantry'
+	});
+
+	const clearedString = normalizeStagedScanDraft({
+		id: 'scan-empty-str',
+		name: '   ',
+		quantity: '   ',
+		unit: 'can',
+		category: 'Canned goods'
+	});
+	assert.equal(clearedString.name, '');
+	assert.equal(clearedString.quantity, null);
+
+	const boundedPositive = normalizeStagedScanDraft({
+		id: 'scan-valid',
+		name: 'pasta',
+		quantity: 2_500_000,
+		unit: 'g',
+		category: 'Grains'
+	});
+	assert.equal(boundedPositive.quantity, 1_000_000);
 });

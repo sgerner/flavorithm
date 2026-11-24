@@ -6,6 +6,7 @@ import {
 	buildShoppingList,
 	formatRecipeQuantity,
 	matchRecipePantry,
+	msUntilNextLocalMidnight,
 	normalizeName,
 	parseCalendarDate,
 	parseIngredientLine,
@@ -345,7 +346,7 @@ test('starter recipes have distinct Unsplash images, complete cooking directions
 	assert.notEqual(first.recipes[0].ingredients, second.recipes[0].ingredients);
 });
 
-test('normalizes regular plurals and prep modifiers while keeping uncountables and compound identities distinct', () => {
+test('normalizes regular plurals, parentheticals, clauses, and prep modifiers while keeping uncountables and compound identities distinct', () => {
 	const pairs: Array<[string, string]> = [
 		['shallots', 'shallot'],
 		['green bean', 'green beans'],
@@ -357,7 +358,21 @@ test('normalizes regular plurals and prep modifiers while keeping uncountables a
 		['fresh cilantro', 'cilantro'],
 		['fresh ginger', 'ginger'],
 		['baby kale', 'kale'],
-		['minced garlic', 'garlic']
+		['minced garlic', 'garlic'],
+		['chickpeas (15 oz)', 'chickpeas'],
+		['(15 oz) chickpeas', 'chickpea'],
+		['chickpeas (drained and rinsed)', 'chickpea'],
+		['(chickpeas)', 'chickpea'],
+		['kosher salt, to taste', 'kosher salt'],
+		['black pepper to taste', 'black pepper'],
+		['fresh cilantro, for garnish', 'cilantro'],
+		['scallions, thinly sliced, for garnish', 'scallion'],
+		['lime wedges, for serving', 'lime wedge'],
+		['chili flakes, optional', 'chili flake'],
+		['carrots, peeled and diced', 'carrot'],
+		['peeled and diced carrots', 'carrot'],
+		['olive oil, divided', 'olive oil'],
+		['boneless, skinless chicken thighs', 'chicken thigh']
 	];
 	for (const [left, right] of pairs) {
 		assert.equal(normalizeName(left), normalizeName(right), `${left} should match ${right}`);
@@ -366,6 +381,8 @@ test('normalizes regular plurals and prep modifiers while keeping uncountables a
 	assert.notEqual(normalizeName('rice'), normalizeName('rice vinegar'));
 	assert.notEqual(normalizeName('butter'), normalizeName('butternut squash'));
 	assert.notEqual(normalizeName('red onion'), normalizeName('yellow onion'));
+	assert.equal(normalizeName('carrots, peeled and diced'), 'carrot');
+	assert.equal(normalizeName('salt and pepper, to taste'), 'salt and pepper');
 	assert.equal(normalizeName('hummus'), 'hummus');
 	assert.equal(normalizeName('couscous'), 'couscous');
 	assert.equal(normalizeName('asparagus'), 'asparagus');
@@ -373,19 +390,15 @@ test('normalizes regular plurals and prep modifiers while keeping uncountables a
 	assert.equal(normalizeName('rolled oats'), 'rolled oats');
 });
 
-test('maps item units and parenthetical cans while separating size, head, and clove dimensions', () => {
-	assert.deepEqual(unitInfo('item'), {
-		dimension: 'count',
-		factor: 1,
-		display: 'each',
-		system: 'count'
-	});
-	assert.deepEqual(unitInfo('items'), {
-		dimension: 'count',
-		factor: 1,
-		display: 'each',
-		system: 'count'
-	});
+test('maps item and legacy size units to count while separating bunch, head, clove, and can dimensions', () => {
+	for (const alias of ['item', 'items', 'small', 'medium', 'large']) {
+		assert.deepEqual(unitInfo(alias), {
+			dimension: 'count',
+			factor: 1,
+			display: 'each',
+			system: 'count'
+		});
+	}
 	assert.deepEqual(unitInfo('can (15 oz)'), {
 		dimension: 'count:can',
 		factor: 1,
@@ -399,9 +412,91 @@ test('maps item units and parenthetical cans while separating size, head, and cl
 		system: 'count'
 	});
 
-	const distinctUnits = ['each', 'small', 'medium', 'large', 'head', 'clove', 'can', 'oz'];
+	const distinctUnits = ['each', 'bunch', 'head', 'clove', 'can', 'slice', 'pinch', 'dash', 'oz'];
 	const dimensions = distinctUnits.map((unit) => unitInfo(unit).dimension);
 	assert.equal(new Set(dimensions).size, distinctUnits.length);
+});
+
+test('legacy stored small/medium/large pantry rows and parenthetical canned lines match whole/each and pantry chickpeas', () => {
+	const parsedCan = parseIngredientLine('1 can (15 oz) chickpeas');
+	assert.deepEqual(parsedCan, {
+		name: 'chickpeas',
+		quantity: 1,
+		unit: 'can',
+		category: 'Pantry'
+	});
+	assert.deepEqual(parseIngredientLine('2 cans (14.5 oz) of diced tomatoes'), {
+		name: 'diced tomatoes',
+		quantity: 2,
+		unit: 'can',
+		category: 'Pantry'
+	});
+
+	const now = new Date(2026, 9, 22, 12);
+	const legacyPantry: Ingredient[] = [
+		pantry('red onion', 2, 'small'),
+		pantry('tomatoes', 3, 'medium'),
+		pantry('eggs', 4, 'large'),
+		pantry('chickpeas', 2, 'can')
+	];
+	const targetRecipe = recipe({
+		id: 'legacy-match',
+		servings: 2,
+		ingredients: [
+			{ name: 'red onion', quantity: 1, unit: 'whole' },
+			{ name: 'tomato', quantity: 2, unit: 'each' },
+			{ name: 'egg', quantity: 2, unit: 'whole' },
+			{ name: 'chickpeas (15 oz)', quantity: 1, unit: 'can (15 oz)' }
+		]
+	});
+
+	const match = matchRecipePantry(targetRecipe, legacyPantry, now);
+	assert.equal(match.matchedCount, 4);
+	assert.equal(match.available, 1);
+
+	const unstocked = recipe({
+		id: 'unstocked-legacy',
+		ingredients: [{ name: 'farro', quantity: 1, unit: 'cup' }]
+	});
+	const ranked = rankRecipes(
+		[unstocked, targetRecipe],
+		legacyPantry,
+		createInitialState().preferences,
+		now
+	);
+	assert.equal(ranked[0].id, 'legacy-match');
+
+	assert.deepEqual(buildShoppingList([targetRecipe], legacyPantry, undefined, now), []);
+
+	const completed = completeMeal(
+		{
+			...createInitialState(),
+			pantry: legacyPantry,
+			recipes: [targetRecipe],
+			meals: [
+				{
+					id: 'm-legacy',
+					date: '2026-10-22',
+					slot: 'Dinner',
+					recipeId: 'legacy-match',
+					servings: 2
+				}
+			]
+		},
+		'm-legacy',
+		{ deductPantry: true, leftoverServings: 0 },
+		now
+	);
+	assert.equal(completed.pantry[0].quantity, 1);
+	assert.equal(completed.pantry[1].quantity, 1);
+	assert.equal(completed.pantry[2].quantity, 2);
+	assert.equal(completed.pantry[3].quantity, 1);
+
+	const noon = new Date(2026, 9, 22, 12, 0, 0, 0);
+	const expectedMidnight = new Date(2026, 9, 23, 0, 0, 0, 50).getTime() - noon.getTime();
+	assert.equal(msUntilNextLocalMidnight(noon), expectedMidnight);
+	assert.equal(msUntilNextLocalMidnight(new Date(2026, 9, 22, 23, 59, 59, 950)), 250);
+	assert.ok(msUntilNextLocalMidnight(new Date(Number.NaN)) >= 250);
 });
 
 test('shared pantry matcher excludes zero, expired, substring-only, and incompatible stock across starter recipes', () => {

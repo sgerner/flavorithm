@@ -1,10 +1,9 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
 import {
 	buildShoppingList,
-	dateOrdinal,
+	deductRecipeFromPantry,
 	expiryStatus,
 	normalizeName,
-	parseCalendarDate,
 	parseIngredientLines,
 	resolveShoppingQuantity,
 	unitInfo,
@@ -12,9 +11,11 @@ import {
 } from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 export {
+	deductRecipeFromPantry,
 	expiryStatus,
 	indexUsablePantry,
 	matchRecipePantry,
+	msUntilNextLocalMidnight,
 	normalizeName,
 	normalizeName as normalizeIngredientName,
 	parseIngredientLine,
@@ -152,10 +153,6 @@ export function filterPantryItems(
 		}
 		return true;
 	});
-}
-function calendarDate(value: Date): { year: number; month: number; day: number } | undefined {
-	if (!Number.isFinite(value.getTime())) return undefined;
-	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
 }
 
 /**
@@ -387,17 +384,40 @@ export type RecognizedPantryItem = {
 export type StagedPantryItem = {
 	id: string;
 	name: string;
-	quantity: number;
+	quantity: number | string | null;
 	unit: string;
 	category: string;
 };
 
 export type PantryAddition = {
 	name: string;
-	quantity: number;
+	quantity: number | string | null;
 	unit: string;
 	category?: string;
 };
+
+/** Normalize a staged scan row on blur without clamping empty quantities to 0.01. */
+export function normalizeStagedScanDraft(item: StagedPantryItem): StagedPantryItem {
+	item.name = (item.name ?? '').trim().slice(0, 100);
+	item.unit = (item.unit ?? '').trim().slice(0, 40) || 'each';
+	item.category = (item.category ?? '').trim().slice(0, 60) || 'Pantry';
+	if (
+		item.quantity === null ||
+		item.quantity === undefined ||
+		(typeof item.quantity === 'string' && item.quantity.trim() === '')
+	) {
+		item.quantity = null;
+		return item;
+	}
+	const parsed = Number(item.quantity);
+	item.quantity =
+		Number.isFinite(parsed) && parsed > 0
+			? roundPantryQuantity(Math.min(parsed, 1_000_000))
+			: parsed === 0
+				? 0
+				: null;
+	return item;
+}
 
 /** Stage recognized AI vision ingredients for review with clean names, units, and categories. */
 export function stageScannedIngredients(
@@ -483,11 +503,8 @@ export function mergePantryAdditions(
 				1_000_000,
 				roundPantryQuantity(baseline + bucket.quantityBase / unitInfo(destination.unit).factor)
 			);
-			if (
-				(!destination.category.trim() || destination.category === 'Pantry') &&
-				bucket.category !== 'Pantry'
-			) {
-				destination.category = bucket.category;
+			if (!destination.category?.trim()) {
+				destination.category = bucket.category || 'Pantry';
 			}
 			continue;
 		}
@@ -599,65 +616,13 @@ function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
 	return state.recipes.find((recipe) => recipe.id === meal.recipeId);
 }
 
-function expiryPriority(expires: string | undefined, now: Date): number {
-	const expiry = expires ? parseCalendarDate(expires) : undefined;
-	const today = calendarDate(now);
-	if (!expiry || !today) return Number.MAX_SAFE_INTEGER;
-	return dateOrdinal(expiry) - dateOrdinal(today);
-}
-
 function consumePantry(
 	pantry: Ingredient[],
 	recipe: Recipe,
 	servings: number,
 	now: Date
 ): Ingredient[] {
-	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
-	const remaining = pantry.map((item) => ({ ...item }));
-	const scale = recipe.servings > 0 && servings > 0 ? servings / recipe.servings : 1;
-
-	for (const ingredient of recipe.ingredients) {
-		if (
-			!Number.isFinite(ingredient.quantity) ||
-			ingredient.quantity <= 0 ||
-			!ingredient.unit.trim()
-		)
-			continue;
-		let need = ingredient.quantity * scale;
-		const candidates = remaining
-			.map((item, index) => ({ item, index }))
-			.filter(({ item }) => normalizeName(item.name) === normalizeName(ingredient.name))
-			.filter(({ item }) => {
-				const status = expiryStatus(item.expires, safeNow);
-				return status !== 'expired' && (!item.expires?.trim() || status !== 'unknown');
-			})
-			.sort(
-				(a, b) =>
-					expiryPriority(a.item.expires, safeNow) - expiryPriority(b.item.expires, safeNow) ||
-					a.index - b.index
-			);
-
-		for (const { item, index } of candidates) {
-			if (need <= 0) break;
-			const available = convertCompatibleQuantity(item.quantity, item.unit, ingredient.unit);
-			if (available === undefined || !(available > 0)) continue;
-			const used = Math.min(need, available);
-			const remainingInRecipeUnit = available - used;
-			const remainingInPantryUnit = convertCompatibleQuantity(
-				remainingInRecipeUnit,
-				ingredient.unit,
-				item.unit
-			);
-			if (remainingInPantryUnit !== undefined)
-				remaining[index] = {
-					...item,
-					quantity: roundPantryQuantity(Math.max(0, remainingInPantryUnit))
-				};
-			need = Math.max(0, need - used);
-		}
-	}
-
-	return remaining;
+	return deductRecipeFromPantry(pantry, recipe, servings, now);
 }
 
 /** Mark a planned meal complete and optionally deduct its ingredient quantities from pantry. */

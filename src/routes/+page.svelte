@@ -91,8 +91,10 @@
 		listPantryCategories,
 		matchRecipePantry,
 		mergePantryAdditions,
+		msUntilNextLocalMidnight,
 		normalizeIngredientName,
 		normalizePantryDraft,
+		normalizeStagedScanDraft,
 		reconcileShoppingList,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
@@ -451,6 +453,8 @@
 		stagedScanItems.some(
 			(item) =>
 				Boolean(item.name.trim()) &&
+				item.quantity !== null &&
+				item.quantity !== '' &&
 				Number.isFinite(Number(item.quantity)) &&
 				Number(item.quantity) > 0
 		)
@@ -715,19 +719,27 @@
 		'vox',
 		'wintry'
 	];
-	let activePriorityPantry = $derived(
-		priorityPantryIds.length
-			? kitchen.pantry.filter(
-					(item) =>
-						priorityPantryIds.includes(item.id) &&
-						Number.isFinite(item.quantity) &&
-						item.quantity > 0 &&
-						expiryStatus(item.expires) !== 'expired' &&
-						!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown')
-				)
-			: []
-	);
+	let calendarDayTick = $state(0);
+	function currentCalendarNow(tick = calendarDayTick): Date {
+		void tick;
+		return new Date();
+	}
+	let activePriorityPantry = $derived.by(() => {
+		const now = currentCalendarNow();
+		if (!priorityPantryIds.length) return [];
+		return kitchen.pantry.filter((item) => {
+			if (
+				!priorityPantryIds.includes(item.id) ||
+				!Number.isFinite(item.quantity) ||
+				!(item.quantity > 0)
+			)
+				return false;
+			const status = expiryStatus(item.expires, now);
+			return status !== 'expired' && !(Boolean(item.expires?.trim()) && status === 'unknown');
+		});
+	});
 	let recipes = $derived.by(() => {
+		const now = currentCalendarNow();
 		const matches = kitchen.recipes.filter(
 			(r) =>
 				(page !== 'saved' || r.saved) &&
@@ -746,20 +758,25 @@
 				matches,
 				kitchen.pantry,
 				kitchen.preferences,
-				activePriorityPantry.length ? activePriorityPantry : undefined
+				activePriorityPantry.length ? activePriorityPantry : undefined,
+				now
 			);
 		}
 		return filter === 'For you'
-			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
+			? rankRecipes(matches, kitchen.pantry, kitchen.preferences, now)
 			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
 	});
-	let usablePantryIndex = $derived(indexUsablePantry(kitchen.pantry));
+	let usablePantryIndex = $derived(indexUsablePantry(kitchen.pantry, currentCalendarNow()));
 	let visiblePantry = $derived(
-		filterPantryItems(kitchen.pantry, {
-			query: pantryQuery,
-			category: pantryCategory,
-			expiry: pantryFilter
-		})
+		filterPantryItems(
+			kitchen.pantry,
+			{
+				query: pantryQuery,
+				category: pantryCategory,
+				expiry: pantryFilter
+			},
+			currentCalendarNow()
+		)
 	);
 	let pantryCategories = $derived(listPantryCategories(kitchen.pantry, pantryCategory));
 	let pantryCategorySuggestions = $derived(
@@ -1292,6 +1309,26 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
+		let activeDateKey = dateKey(new Date());
+		let midnightTimer: ReturnType<typeof setTimeout> | undefined;
+		const scheduleMidnightRefresh = () => {
+			clearTimeout(midnightTimer);
+			midnightTimer = setTimeout(() => {
+				refreshCalendarDay();
+			}, msUntilNextLocalMidnight(new Date()));
+		};
+		const refreshCalendarDay = () => {
+			const nextDateKey = dateKey(new Date());
+			if (nextDateKey !== activeDateKey) {
+				activeDateKey = nextDateKey;
+				calendarDayTick += 1;
+			}
+			scheduleMidnightRefresh();
+		};
+		const visibilityChanged = () => {
+			if (!document.hidden) refreshCalendarDay();
+		};
+		scheduleMidnightRefresh();
 		const calendarMedia =
 			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
 		const calendarMediaChanged = () => {
@@ -1302,11 +1339,16 @@
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
+		window.addEventListener('focus', refreshCalendarDay);
+		document.addEventListener('visibilitychange', visibilityChanged);
 		return () => {
 			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
+			window.removeEventListener('focus', refreshCalendarDay);
+			document.removeEventListener('visibilitychange', visibilityChanged);
+			clearTimeout(midnightTimer);
 			clearTimeout(saveTimer);
 			connectionPoll?.stop();
 			connectionPopup?.close();
@@ -1414,11 +1456,7 @@
 		mobileNav = false;
 	}
 	function normalizeStagedScanItem(item: StagedPantryItem) {
-		item.name = item.name.trim().slice(0, 100) || 'Ingredient';
-		item.unit = item.unit.trim().slice(0, 40) || 'each';
-		item.category = item.category.trim().slice(0, 60) || 'Pantry';
-		const quantity = Number(item.quantity);
-		item.quantity = Number.isFinite(quantity) ? Math.max(0.01, Math.min(quantity, 1000000)) : 1;
+		normalizeStagedScanDraft(item);
 	}
 	function removeStagedScanItem(id: string) {
 		stagedScanItems = stagedScanItems.filter((item) => item.id !== id);
@@ -1433,7 +1471,12 @@
 		const parsedManual = parseIngredientLines(boundedInput);
 		const scannedRaw = stagedScanItems.map((item) => ({
 			name: item.name.trim().slice(0, 200),
-			quantity: Number(item.quantity),
+			quantity:
+				item.quantity === null ||
+				item.quantity === undefined ||
+				(typeof item.quantity === 'string' && item.quantity.trim() === '')
+					? Number.NaN
+					: Number(item.quantity),
 			unit: item.unit.trim().slice(0, 40) || 'each',
 			category: item.category.trim().slice(0, 100) || 'Pantry'
 		}));
@@ -3924,6 +3967,7 @@
 						>{/if}
 				</section>
 			{:else if page === 'pantry'}
+				{@const pantryNow = currentCalendarNow()}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
 						<h1>Your pantry<span class="heading-spark" aria-hidden="true">✳</span></h1>
@@ -3976,7 +4020,7 @@
 							/>
 						</label>
 						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
-							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires, pantryNow) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires, pantryNow) === 'expired').length }] as option}<button
 									type="button"
 									class:active={pantryFilter === option.id}
 									aria-pressed={pantryFilter === option.id}
@@ -4016,7 +4060,8 @@
 						</div>
 						<div class="pantry-list" role="list" aria-label="Pantry ingredients">
 							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
-									item.expires
+									item.expires,
+									pantryNow
 								)}{@const depleted = Number.isFinite(item.quantity) && item.quantity <= 0}
 								<div
 									class="pantry-row"
@@ -4709,7 +4754,7 @@
 											type="number"
 											min="0.01"
 											max="1000000"
-											step="0.25"
+											step="any"
 											bind:value={item.quantity}
 											onblur={() => normalizeStagedScanItem(item)}
 										/><input

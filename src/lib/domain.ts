@@ -53,11 +53,11 @@ addUnits('count', 'count', 1, 'each', [
 	'pieces',
 	'whole',
 	'egg',
-	'eggs'
+	'eggs',
+	'small',
+	'medium',
+	'large'
 ]);
-addUnits('count:small', 'count', 1, 'small', ['small']);
-addUnits('count:medium', 'count', 1, 'medium', ['medium']);
-addUnits('count:large', 'count', 1, 'large', ['large']);
 addUnits('count:bunch', 'count', 1, 'bunch', ['bunch', 'bunches']);
 addUnits('count:clove', 'count', 1, 'clove', ['clove', 'cloves']);
 addUnits('count:head', 'count', 1, 'head', [
@@ -153,6 +153,7 @@ const nonIdentityModifiers = new Set([
 	'quartered',
 	'drained',
 	'rinsed',
+	'divided',
 	'finely',
 	'roughly',
 	'coarsely',
@@ -161,6 +162,18 @@ const nonIdentityModifiers = new Set([
 	'ripe',
 	'organic'
 ]);
+
+const modifierConjunctions = new Set(['and', 'or', '&']);
+
+const trailingUsageClauses = [
+	', to taste',
+	' to taste',
+	', for garnish',
+	' for garnish',
+	', for serving',
+	' for serving',
+	', optional'
+];
 
 const uncountableWords = new Set([
 	'asparagus',
@@ -208,13 +221,68 @@ function cleanText(value: string): string {
 		.replace(/[.,;:]$/, '');
 }
 
+function stripParentheticals(cleaned: string): string {
+	if (!cleaned.includes('(') && !cleaned.includes(')')) return cleaned;
+	const withoutParens = cleanText(cleaned.replace(/\([^)]*\)/g, ' '));
+	if (withoutParens) return withoutParens;
+	return cleanText(cleaned.replace(/[()]/g, ' '));
+}
+
+function stripTrailingClauses(cleaned: string): string {
+	let current = cleaned;
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const clause of trailingUsageClauses) {
+			if (current.endsWith(clause)) {
+				const candidate = cleanText(current.slice(0, -clause.length));
+				if (candidate) {
+					current = candidate;
+					changed = true;
+					break;
+				}
+			}
+		}
+	}
+	return current;
+}
+
 function stripModifiers(cleaned: string): string {
-	const tokens = cleaned
-		.split(' ')
-		.map((token) => token.replace(/^,+|,+$/g, ''))
-		.filter(Boolean);
-	const remaining = tokens.filter((token) => !nonIdentityModifiers.has(token));
-	return remaining.length > 0 ? remaining.join(' ') : tokens.join(' ');
+	const clauses = cleaned.split(',');
+	const allTokens: string[] = [];
+	const keptTokens: string[] = [];
+	for (const rawClause of clauses) {
+		const clauseTokens = rawClause
+			.trim()
+			.split(' ')
+			.map((token) => token.replace(/^,+|,+$/g, ''))
+			.filter(Boolean);
+		allTokens.push(...clauseTokens);
+		const filtered = clauseTokens.filter((token) => !nonIdentityModifiers.has(token));
+		while (filtered.length > 0 && modifierConjunctions.has(filtered[0])) {
+			filtered.shift();
+		}
+		while (filtered.length > 0 && modifierConjunctions.has(filtered[filtered.length - 1])) {
+			filtered.pop();
+		}
+		for (const token of filtered) {
+			if (
+				modifierConjunctions.has(token) &&
+				keptTokens.length > 0 &&
+				modifierConjunctions.has(keptTokens[keptTokens.length - 1])
+			) {
+				continue;
+			}
+			keptTokens.push(token);
+		}
+	}
+	while (keptTokens.length > 0 && modifierConjunctions.has(keptTokens[0])) {
+		keptTokens.shift();
+	}
+	while (keptTokens.length > 0 && modifierConjunctions.has(keptTokens[keptTokens.length - 1])) {
+		keptTokens.pop();
+	}
+	return keptTokens.length > 0 ? keptTokens.join(' ') : allTokens.join(' ');
 }
 
 function singularizeWord(word: string): string {
@@ -245,7 +313,10 @@ export function normalizeName(name: string): string {
 	const cleaned = cleanText(name);
 	if (!cleaned) return '';
 	if (ingredientAliases[cleaned]) return ingredientAliases[cleaned];
-	const stripped = stripModifiers(cleaned);
+	const deannotated = stripTrailingClauses(stripParentheticals(cleaned));
+	if (!deannotated) return '';
+	if (ingredientAliases[deannotated]) return ingredientAliases[deannotated];
+	const stripped = stripModifiers(deannotated);
 	if (ingredientAliases[stripped]) return ingredientAliases[stripped];
 	const singular = singularizePhrase(stripped);
 	return ingredientAliases[singular] ?? singular;
@@ -363,6 +434,13 @@ export function parseIngredientLine(raw: string): ParsedIngredient | undefined {
 		const afterAlias = rest.slice(alias.length);
 		if (!/^\.?\s+/.test(afterAlias)) continue;
 		let candidateName = afterAlias.replace(/^\.?\s+/, '').trim();
+		if (candidateName.startsWith('(')) {
+			const closeIndex = candidateName.indexOf(')');
+			if (closeIndex !== -1) {
+				const afterParen = candidateName.slice(closeIndex + 1).trim();
+				if (afterParen) candidateName = afterParen;
+			}
+		}
 		if (/^of$/i.test(candidateName)) candidateName = '';
 		else candidateName = candidateName.replace(/^of\s+/i, '').trim();
 		candidateName = candidateName
@@ -501,6 +579,21 @@ function localCalendarDate(value: Date): CalendarDate {
 	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
 }
 
+/** Return milliseconds until the next local calendar midnight (at least 250ms). */
+export function msUntilNextLocalMidnight(now: Date = new Date()): number {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const nextMidnight = new Date(
+		safeNow.getFullYear(),
+		safeNow.getMonth(),
+		safeNow.getDate() + 1,
+		0,
+		0,
+		0,
+		50
+	);
+	return Math.max(250, nextMidnight.getTime() - safeNow.getTime());
+}
+
 export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
 
 /** Classify an expiry by local calendar day; date-only and ISO strings never shift by timezone. */
@@ -516,6 +609,8 @@ export function expiryStatus(expires?: string, now: Date = new Date()): ExpirySt
 }
 
 export type IndexedPantryLot = {
+	pantryIndex: number;
+	unitFactor: number;
 	quantityBase: number;
 	expiry: Exclude<ExpiryStatus, 'expired'>;
 	priority: number;
@@ -530,11 +625,17 @@ export type RecipePantryMatch = {
 	expiring: number;
 };
 
+function roundLotQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
+	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
 /** Index positive, non-expired pantry stock by normalized name and unit dimension. */
 export function indexUsablePantry(pantry: Ingredient[], now: Date = new Date()): PantryLotIndex {
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const index: PantryLotIndex = new Map();
-	for (const item of pantry) {
+	for (let pantryIndex = 0; pantryIndex < pantry.length; pantryIndex++) {
+		const item = pantry[pantryIndex];
 		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
 		const expiry = expiryStatus(item.expires, safeNow);
 		if (expiry === 'expired' || (Boolean(item.expires?.trim()) && expiry === 'unknown')) continue;
@@ -546,6 +647,8 @@ export function indexUsablePantry(pantry: Ingredient[], now: Date = new Date()):
 		const priority = parsedExpiry ? dateOrdinal(parsedExpiry) : Number.MAX_SAFE_INTEGER;
 		const lots = index.get(key) ?? [];
 		lots.push({
+			pantryIndex,
+			unitFactor: unit.factor,
 			quantityBase: item.quantity * unit.factor,
 			expiry,
 			priority,
@@ -554,33 +657,45 @@ export function indexUsablePantry(pantry: Ingredient[], now: Date = new Date()):
 		index.set(key, lots);
 	}
 	for (const lots of index.values()) {
-		lots.sort((a, b) => a.priority - b.priority || a.index - b.index);
+		lots.sort((a, b) => a.priority - b.priority || a.pantryIndex - b.pantryIndex);
 	}
 	return index;
 }
 
-/**
- * Allocate usable compatible pantry stock across a recipe's ingredients, deducting consumed
- * lot balances so split ingredient lines never count shared stock twice.
- */
-export function matchRecipePantry(
+type WorkingLot = {
+	pantryIndex: number;
+	unitFactor: number;
+	initialBase: number;
+	remainingBase: number;
+	expiry: Exclude<ExpiryStatus, 'expired'>;
+};
+
+function allocateRecipePantry(
 	recipe: Recipe,
 	pantryOrIndex: Ingredient[] | PantryLotIndex,
-	now: Date = new Date()
-): RecipePantryMatch {
+	options: { servings?: number; now?: Date } = {}
+): RecipePantryMatch & { consumedLots: WorkingLot[] } {
 	const ingredients = recipe.ingredients.filter(
 		(item) => Number.isFinite(item.quantity) && item.quantity > 0 && item.unit.trim()
 	);
-	if (!ingredients.length) return { matchedCount: 0, available: 0, expiring: 0 };
+	if (!ingredients.length) {
+		return { matchedCount: 0, available: 0, expiring: 0, consumedLots: [] };
+	}
 
-	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const rawNow = options.now ?? new Date();
+	const safeNow = Number.isFinite(rawNow.getTime()) ? rawNow : new Date();
 	const index = Array.isArray(pantryOrIndex)
 		? indexUsablePantry(pantryOrIndex, safeNow)
 		: pantryOrIndex;
-	const remainingByBucket = new Map<
-		string,
-		Array<{ remainingBase: number; expiry: Exclude<ExpiryStatus, 'expired'> }>
-	>();
+	const scale =
+		options.servings !== undefined &&
+		Number.isFinite(recipe.servings) &&
+		recipe.servings > 0 &&
+		Number.isFinite(options.servings) &&
+		options.servings > 0
+			? options.servings / recipe.servings
+			: 1;
+	const remainingByBucket = new Map<string, WorkingLot[]>();
 	const buckets = new Map<
 		string,
 		{ requiredBase: number; allocatedBase: number; expiringBase: number }
@@ -589,12 +704,16 @@ export function matchRecipePantry(
 
 	for (const ingredient of ingredients) {
 		const normalizedName = normalizeName(ingredient.name);
+		if (!normalizedName) continue;
 		const unit = unitInfo(ingredient.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		const requiredBase = ingredient.quantity * unit.factor;
+		const requiredBase = ingredient.quantity * scale * unit.factor;
 		let lots = remainingByBucket.get(key);
 		if (!lots) {
 			lots = (index.get(key) ?? []).map((lot) => ({
+				pantryIndex: lot.pantryIndex,
+				unitFactor: lot.unitFactor,
+				initialBase: lot.quantityBase,
 				remainingBase: lot.quantityBase,
 				expiry: lot.expiry
 			}));
@@ -607,11 +726,19 @@ export function matchRecipePantry(
 		for (const lot of lots) {
 			if (need <= 0) break;
 			if (!(lot.remainingBase > 0)) continue;
-			const used = Math.min(need, lot.remainingBase);
-			lot.remainingBase -= used;
-			need -= used;
-			allocatedBase += used;
-			if (lot.expiry === 'soon') expiringBase += used;
+			if (need >= lot.remainingBase) {
+				const used = lot.remainingBase;
+				lot.remainingBase = 0;
+				need = Math.max(0, need - used);
+				allocatedBase += used;
+				if (lot.expiry === 'soon') expiringBase += used;
+			} else {
+				const used = need;
+				lot.remainingBase -= used;
+				need = 0;
+				allocatedBase += used;
+				if (lot.expiry === 'soon') expiringBase += used;
+			}
 		}
 		if (allocatedBase > 0) matchedCount++;
 
@@ -622,7 +749,14 @@ export function matchRecipePantry(
 		buckets.set(key, bucket);
 	}
 
-	if (!buckets.size) return { matchedCount, available: 0, expiring: 0 };
+	const consumedLots: WorkingLot[] = [];
+	for (const lots of remainingByBucket.values()) {
+		for (const lot of lots) {
+			if (lot.remainingBase < lot.initialBase) consumedLots.push(lot);
+		}
+	}
+
+	if (!buckets.size) return { matchedCount, available: 0, expiring: 0, consumedLots };
 	let availabilitySum = 0;
 	let expiringSum = 0;
 	for (const bucket of buckets.values()) {
@@ -632,8 +766,47 @@ export function matchRecipePantry(
 	return {
 		matchedCount,
 		available: availabilitySum / buckets.size,
-		expiring: expiringSum / buckets.size
+		expiring: expiringSum / buckets.size,
+		consumedLots
 	};
+}
+
+/**
+ * Allocate usable compatible pantry stock across a recipe's ingredients, deducting consumed
+ * lot balances so split ingredient lines never count shared stock twice.
+ */
+export function matchRecipePantry(
+	recipe: Recipe,
+	pantryOrIndex: Ingredient[] | PantryLotIndex,
+	now: Date = new Date()
+): RecipePantryMatch {
+	const { matchedCount, available, expiring } = allocateRecipePantry(recipe, pantryOrIndex, {
+		now
+	});
+	return { matchedCount, available, expiring };
+}
+
+/**
+ * Deduct a recipe's scaled ingredient quantities from usable compatible pantry lots using the
+ * shared lot allocator, consuming soonest-expiring lots first and never going below zero.
+ */
+export function deductRecipeFromPantry(
+	pantry: Ingredient[],
+	recipe: Recipe,
+	servings: number,
+	now: Date = new Date()
+): Ingredient[] {
+	const remaining = pantry.map((item) => ({ ...item }));
+	const { consumedLots } = allocateRecipePantry(recipe, pantry, { servings, now });
+	for (const lot of consumedLots) {
+		const item = remaining[lot.pantryIndex];
+		if (!item || !(lot.unitFactor > 0)) continue;
+		remaining[lot.pantryIndex] = {
+			...item,
+			quantity: roundLotQuantity(Math.max(0, lot.remainingBase / lot.unitFactor))
+		};
+	}
+	return remaining;
 }
 
 type ShoppingRequirement = {

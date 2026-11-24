@@ -69,6 +69,10 @@ function injectPlannerHook(svelteSource: string): string {
 		get completedMeals() { return completedMeals; },
 		get renderableCompletedMeals() { return renderableCompletedMeals; },
 		get visibleCompletedMeals() { return visibleCompletedMeals; },
+		get usablePantryIndex() { return usablePantryIndex; },
+		get visiblePantry() { return visiblePantry; },
+		set pantryFilter(value: string) { pantryFilter = value; },
+		advanceCalendarDay: () => { calendarDayTick += 1; },
 		dateKey,
 		mealSlotKey,
 		formatCompletedDate,
@@ -129,6 +133,10 @@ type PlannerHarnessApi = {
 	readonly completedMeals: Meal[];
 	readonly renderableCompletedMeals: Meal[];
 	readonly visibleCompletedMeals: Meal[];
+	readonly usablePantryIndex: ReturnType<typeof domainMod.indexUsablePantry>;
+	readonly visiblePantry: AppState['pantry'];
+	pantryFilter: string;
+	advanceCalendarDay: () => void;
 	dateKey: (date: Date) => string;
 	mealSlotKey: (date: string, slot: string) => string;
 	formatCompletedDate: (
@@ -308,7 +316,7 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 	return { html: rendered.body, api: captured };
 }
 
-function createReactivePlanner() {
+function createReactivePlanner(customDate?: unknown) {
 	const modMap = createModuleMap();
 	const exports: { default?: any } = {};
 	let api!: PlannerHarnessApi;
@@ -320,7 +328,7 @@ function createReactivePlanner() {
 			if (id in modMap) return modMap[id];
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
-		Date,
+		Date: customDate ?? Date,
 		Intl,
 		Map,
 		Set,
@@ -899,4 +907,56 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('usablePantryIndex and visiblePantry refresh across local midnight rollover when calendarDayTick advances', () => {
+	let fakeNowMs = new Date(2026, 10, 24, 23, 59, 30).getTime();
+	class ControllableDate extends Date {
+		constructor(...args: unknown[]) {
+			if (args.length === 0) {
+				super(fakeNowMs);
+			} else {
+				// @ts-expect-error forwarding variable constructor arguments
+				super(...args);
+			}
+		}
+		static override now(): number {
+			return fakeNowMs;
+		}
+	}
+
+	const { api, dispose } = createReactivePlanner(ControllableDate);
+	try {
+		const spinachRecipe = makeRecipe('spinach-bowl', 'Spinach bowl');
+		spinachRecipe.ingredients = [{ name: 'baby spinach', quantity: 2, unit: 'cups' }];
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [spinachRecipe],
+			pantry: [
+				{
+					id: 'lot-tonight',
+					name: 'spinach',
+					quantity: 2,
+					unit: 'cup',
+					category: 'Produce',
+					expires: '2026-11-24'
+				}
+			]
+		};
+		api.pantryFilter = 'soon';
+		svelte.flushSync();
+
+		assert.equal(domainMod.matchRecipePantry(spinachRecipe, api.usablePantryIndex).matchedCount, 1);
+		assert.equal(api.visiblePantry.length, 1);
+
+		// Advance clock past local midnight into 2026-11-25 and trigger calendarDayTick rollover.
+		fakeNowMs = new Date(2026, 10, 25, 0, 0, 5).getTime();
+		api.advanceCalendarDay();
+		svelte.flushSync();
+
+		assert.equal(domainMod.matchRecipePantry(spinachRecipe, api.usablePantryIndex).matchedCount, 0);
+		assert.equal(api.visiblePantry.length, 0);
+	} finally {
+		dispose();
+	}
 });
