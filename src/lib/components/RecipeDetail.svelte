@@ -1,10 +1,29 @@
 <script lang="ts">
-	import { formatRecipeQuantity } from '#lib/domain.ts';
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
-	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
+	import { MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
+	import {
+		RATING_STARS,
+		bookmarkLabel,
+		formatScaledIngredientQuantity,
+		isValidServings,
+		nextRatingStarForKey,
+		nextRecipeTabForKey,
+		nutritionAmountHeading,
+		nutritionMultiplierFor,
+		nutritionServingSizeLabel,
+		ratingTabIndex,
+		resolveActiveServings,
+		resolveServingsFallback,
+		scaleNutritionValue,
+		starRatingLabel,
+		stepServings,
+		toggleRecipeRating,
+		type NutritionMode,
+		type RecipeTab
+	} from '#lib/recipe-detail.ts';
 	import type { Recipe } from '#lib/types.ts';
 	import {
 		X,
@@ -38,7 +57,7 @@
 		save: () => void;
 		shop: (servings: number) => void;
 		plan: (servings: number) => void;
-		rate: (n: number) => void;
+		rate: (n: number | undefined) => void;
 		nutrition: () => void;
 		edit: () => void;
 		remove: () => void;
@@ -47,15 +66,18 @@
 		initialServings?: number;
 		completedSteps?: number[];
 	} = $props();
-	let nutritionMode = $state('serving');
-	let nutritionMultiplier = $derived(nutritionMode === 'recipe' ? recipe.servings : 1);
-	let tab = $state('recipe');
+	let nutritionMode = $state<NutritionMode>('serving');
+	let tab = $state<RecipeTab>('recipe');
 	let completed = $derived(
 		completedSteps.filter(
 			(step) => Number.isInteger(step) && step >= 0 && step < recipe.steps.length
 		)
 	);
-	let servingCount = $state<number | undefined>(untrack(() => initialServings ?? recipe.servings));
+	const initialCount = untrack(() => initialServings ?? recipe.servings);
+	let servingCount = $state<number | null | undefined>(initialCount);
+	let lastValidServings = $state<number>(
+		untrack(() => resolveServingsFallback(initialCount, recipe.servings))
+	);
 	let previousRecipeId = untrack(() => recipe.id);
 	let previousRecipeServings = untrack(() => recipe.servings);
 	let previousInitialServings = untrack(() => initialServings);
@@ -68,10 +90,43 @@
 			previousRecipeId = recipe.id;
 			previousRecipeServings = recipe.servings;
 			previousInitialServings = initialServings;
-			servingCount = initialServings ?? recipe.servings;
+			const nextServings = initialServings ?? recipe.servings;
+			servingCount = nextServings;
+			lastValidServings = resolveServingsFallback(nextServings, recipe.servings);
+		} else if (isValidServings(servingCount)) {
+			lastValidServings = servingCount;
 		}
 	});
 	let validServings = $derived(isValidServings(servingCount));
+	let activeServings = $derived(resolveActiveServings(servingCount, lastValidServings));
+	let nutritionMultiplier = $derived(
+		nutritionMultiplierFor(nutritionMode, recipe.servings, activeServings)
+	);
+	let recipeTabButton = $state<HTMLButtonElement | null>(null);
+	let nutritionTabButton = $state<HTMLButtonElement | null>(null);
+	let starButtons = $state<Array<HTMLButtonElement | null>>([]);
+
+	function adjustServings(delta: -1 | 1) {
+		const next = stepServings(servingCount, delta, lastValidServings);
+		servingCount = next;
+		lastValidServings = next;
+	}
+
+	function handleTabKeydown(event: KeyboardEvent) {
+		const nextTab = nextRecipeTabForKey(tab, event.key);
+		if (!nextTab) return;
+		event.preventDefault();
+		tab = nextTab;
+		(nextTab === 'recipe' ? recipeTabButton : nutritionTabButton)?.focus();
+	}
+
+	function handleRatingKeydown(event: KeyboardEvent, currentStar: number) {
+		const nextStar = nextRatingStarForKey(currentStar, event.key);
+		if (nextStar === undefined) return;
+		event.preventDefault();
+		rate(nextStar);
+		starButtons[nextStar - 1]?.focus();
+	}
 </script>
 
 <div class="modal-backdrop" transition:backdropMotion|global>
@@ -109,26 +164,31 @@
 					><Users size={16} />{recipe.servings} servings</span
 				>{#if recipe.difficulty}<span><ChefHat size={16} />{recipe.difficulty}</span>{/if}
 			</div>
+			{#if recipe.hidden || recipe.tags.length}<ul class="recipe-tags">
+					{#if recipe.hidden}<li class="recipe-badge">Hidden</li>{/if}
+					{#each recipe.tags as tag}<li class="recipe-badge">{tag}</li>{/each}
+				</ul>{/if}
 			<div class="detail-actions">
 				<button
 					class="primary"
 					disabled={!validServings}
 					aria-describedby={!validServings ? 'servings-help' : undefined}
 					onclick={() => {
-						if (validServings && servingCount !== undefined) plan(servingCount);
+						if (isValidServings(servingCount)) plan(servingCount);
 					}}><CalendarPlus size={17} /> Plan a meal</button
 				><button
 					class="secondary"
 					disabled={!validServings}
 					aria-describedby={!validServings ? 'servings-help' : undefined}
 					onclick={() => {
-						if (validServings && servingCount !== undefined) shop(servingCount);
+						if (isValidServings(servingCount)) shop(servingCount);
 					}}><ShoppingBasket size={17} /> Shopping list</button
 				><button
 					class:active={recipe.saved}
 					class="icon-button"
 					onclick={save}
-					aria-label="Save recipe"
+					aria-pressed={Boolean(recipe.saved)}
+					aria-label={bookmarkLabel(recipe.saved)}
 					><Bookmark size={19} fill={recipe.saved ? 'currentColor' : 'none'} /></button
 				>
 				<button class="secondary recipe-manage-button" onclick={toggleHidden}
@@ -137,37 +197,74 @@
 				{#if recipe.saved}<button class="secondary recipe-manage-button" onclick={edit}>Edit</button
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
-			{#if !validServings}<p class="field-help" id="servings-help">
-					Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.
-				</p>{/if}
-			<div class="tabs">
-				<button class:active={tab === 'recipe'} onclick={() => (tab = 'recipe')}>The recipe</button
-				><button class:active={tab === 'nutrition'} onclick={() => (tab = 'nutrition')}
-					>Nutrition facts</button
+			<div class="tabs" role="tablist" aria-label="Recipe details">
+				<button
+					bind:this={recipeTabButton}
+					type="button"
+					id="recipe-tab-recipe"
+					role="tab"
+					aria-selected={tab === 'recipe'}
+					aria-controls="recipe-panel-recipe"
+					tabindex={tab === 'recipe' ? 0 : -1}
+					class:active={tab === 'recipe'}
+					onclick={() => (tab = 'recipe')}
+					onkeydown={handleTabKeydown}>The recipe</button
+				><button
+					bind:this={nutritionTabButton}
+					type="button"
+					id="recipe-tab-nutrition"
+					role="tab"
+					aria-selected={tab === 'nutrition'}
+					aria-controls="recipe-panel-nutrition"
+					tabindex={tab === 'nutrition' ? 0 : -1}
+					class:active={tab === 'nutrition'}
+					onclick={() => (tab = 'nutrition')}
+					onkeydown={handleTabKeydown}>Nutrition facts</button
 				>
 			</div>
-			{#if tab === 'recipe'}<div class="recipe-columns" transition:revealMotion|global>
+			{#if tab === 'recipe'}<div
+					id="recipe-panel-recipe"
+					role="tabpanel"
+					aria-labelledby="recipe-tab-recipe"
+					class="recipe-columns"
+					in:revealMotion|global
+				>
 					<div>
 						<div class="section-line">
 							<h3>Ingredients</h3>
-							<label class="servings"
+							<div class="servings" role="group" aria-label="Adjust servings">
+								<label for="recipe-servings">Servings</label><button
+									type="button"
+									aria-label="Decrease servings"
+									onclick={() => adjustServings(-1)}>-</button
 								><input
-									aria-label="Servings"
+									id="recipe-servings"
 									type="number"
+									inputmode="numeric"
 									min="1"
 									max={MAX_SERVINGS}
 									step="1"
 									aria-invalid={!validServings}
+									aria-describedby={!validServings ? 'servings-help' : undefined}
 									bind:value={servingCount}
-								/> servings</label
-							>
+								/><button
+									type="button"
+									aria-label="Increase servings"
+									onclick={() => adjustServings(1)}>+</button
+								>
+							</div>
 						</div>
+						<p class="servings-help" id="servings-help" aria-live="polite">
+							{#if !validServings}Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.{/if}
+						</p>
 						<ul class="ingredients-list">
 							{#each recipe.ingredients as item}<li>
 									<span
-										>{validServings && servingCount !== undefined
-											? formatRecipeQuantity((item.quantity * servingCount) / recipe.servings)
-											: '—'}
+										>{formatScaledIngredientQuantity(
+											item.quantity,
+											recipe.servings,
+											activeServings
+										)}
 										{item.unit}</span
 									>{item.name}
 								</li>{/each}
@@ -185,10 +282,9 @@
 											(completedSteps = completed.includes(i)
 												? completed.filter((n) => n !== i)
 												: [...completed, i])}
-										>{#if completed.includes(i)}<span transition:fadeMotion|global
+										>{#if completed.includes(i)}<span transition:fadeMotion
 												><Check size={16} /></span
-											>{:else}<span transition:fadeMotion|global
-												>{String(i + 1).padStart(2, '0')}</span
+											>{:else}<span transition:fadeMotion>{String(i + 1).padStart(2, '0')}</span
 											>{/if}</button
 									>
 									<p class:muted={completed.includes(i)}>{step}</p>
@@ -196,7 +292,16 @@
 						</ol>
 					</div>
 				</div>
-			{:else}<div class="nutrition-panel" transition:revealMotion|global>
+			{:else}<div
+					id="recipe-panel-nutrition"
+					role="tabpanel"
+					aria-labelledby="recipe-tab-nutrition"
+					class="nutrition-panel"
+					in:revealMotion|global
+				>
+					<p class="visually-hidden" id="servings-help">
+						Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.
+					</p>
 					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
 							{Object.values(recipe.nutrition).every((value) => value === 0)
 								? 'Nutrition values have not been entered yet. Edit the recipe or refresh this estimate before relying on it.'
@@ -204,53 +309,56 @@
 						</p>{/if}
 					<label class="servings nutrition-selector"
 						>Show nutrition for<select bind:value={nutritionMode}
-							><option value="serving">One serving</option><option value="recipe"
-								>Whole recipe</option
-							></select
+							><option value="serving">One serving</option><option value="scaled"
+								>Scaled servings</option
+							><option value="recipe">Whole recipe</option></select
 						></label
 					>
 					<div class="nutrition-label">
 						<h3>Nutrition Facts</h3>
 						<div>{recipe.servings} servings per recipe</div>
 						<div class="nutrition-row thick">
-							<b>Serving size</b><b>{nutritionMode === 'recipe' ? 'Whole recipe' : '1 serving'}</b>
+							<b>Serving size</b><b>{nutritionServingSizeLabel(nutritionMode, activeServings)}</b>
 						</div>
-						<b class="small">Amount per {nutritionMode === 'recipe' ? 'recipe' : 'serving'}</b>
+						<b class="small">{nutritionAmountHeading(nutritionMode, activeServings)}</b>
 						<div class="calories">
 							<b>Calories</b><strong
-								>{Math.round(recipe.nutrition.calories * nutritionMultiplier)}</strong
+								>{scaleNutritionValue(recipe.nutrition.calories, nutritionMultiplier)}</strong
 							>
 						</div>
 						<div class="nutrition-row">
-							<b>Total Fat</b><span>{Math.round(recipe.nutrition.fat * nutritionMultiplier)}g</span>
+							<b>Total Fat</b><span
+								>{scaleNutritionValue(recipe.nutrition.fat, nutritionMultiplier)}g</span
+							>
 						</div>
 						<div class="nutrition-row">
 							<span>Saturated Fat</span><span
-								>{Math.round(recipe.nutrition.saturatedFat * nutritionMultiplier)}g</span
+								>{scaleNutritionValue(recipe.nutrition.saturatedFat, nutritionMultiplier)}g</span
 							>
 						</div>
 						<div class="nutrition-row">
-							<b>Sodium</b><span>{Math.round(recipe.nutrition.sodium * nutritionMultiplier)}mg</span
+							<b>Sodium</b><span
+								>{scaleNutritionValue(recipe.nutrition.sodium, nutritionMultiplier)}mg</span
 							>
 						</div>
 						<div class="nutrition-row">
 							<b>Total Carbohydrate</b><span
-								>{Math.round(recipe.nutrition.carbs * nutritionMultiplier)}g</span
+								>{scaleNutritionValue(recipe.nutrition.carbs, nutritionMultiplier)}g</span
 							>
 						</div>
 						<div class="nutrition-row">
 							<span>Dietary Fiber</span><span
-								>{Math.round(recipe.nutrition.fiber * nutritionMultiplier)}g</span
+								>{scaleNutritionValue(recipe.nutrition.fiber, nutritionMultiplier)}g</span
 							>
 						</div>
 						<div class="nutrition-row">
 							<span>Total Sugars</span><span
-								>{Math.round(recipe.nutrition.sugar * nutritionMultiplier)}g</span
+								>{scaleNutritionValue(recipe.nutrition.sugar, nutritionMultiplier)}g</span
 							>
 						</div>
 						<div class="nutrition-row thick">
 							<b>Protein</b><span
-								>{Math.round(recipe.nutrition.protein * nutritionMultiplier)}g</span
+								>{scaleNutritionValue(recipe.nutrition.protein, nutritionMultiplier)}g</span
 							>
 						</div>
 						<p>
@@ -264,16 +372,34 @@
 				</div>{/if}
 			<div class="rating-box">
 				<div>
-					<h3>Rate this recipe</h3>
+					<h3 id="recipe-rating-heading">Rate this recipe</h3>
 					<p class="muted">Ratings personalize future recipes.</p>
 				</div>
-				<div class="stars">
-					{#each [1, 2, 3, 4, 5] as n}<button
-							onclick={() => rate(n)}
-							aria-label={`Rate ${n} stars`}
-							aria-pressed={recipe.rating === n}
-							><Star size={25} fill={(recipe.rating ?? 0) >= n ? 'currentColor' : 'none'} /></button
-						>{/each}
+				<div class="rating-controls">
+					<div class="stars" role="radiogroup" aria-labelledby="recipe-rating-heading">
+						{#each RATING_STARS as n, index}<button
+								bind:this={starButtons[index]}
+								type="button"
+								role="radio"
+								tabindex={ratingTabIndex(recipe.rating, n)}
+								aria-checked={recipe.rating === n}
+								aria-label={starRatingLabel(n)}
+								onclick={() => rate(toggleRecipeRating(recipe.rating, n))}
+								onkeydown={(event) => handleRatingKeydown(event, n)}
+								><Star
+									size={25}
+									fill={(recipe.rating ?? 0) >= n ? 'currentColor' : 'none'}
+								/></button
+							>{/each}
+					</div>
+					{#if recipe.rating !== undefined}<button
+							type="button"
+							class="text-button clear-rating"
+							onclick={() => {
+								rate(undefined);
+								starButtons[0]?.focus();
+							}}>Clear rating</button
+						>{/if}
 				</div>
 			</div>
 			{#if recipe.source}<a
