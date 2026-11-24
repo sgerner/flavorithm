@@ -38,8 +38,10 @@
 {#if modal}<button
 		type="button"
 		class="nav-backdrop"
+		data-focus-backdrop=""
 		tabindex="-1"
 		aria-label="Dismiss navigation"
+		onpointerdown={(event) => event.preventDefault()}
 		onclick={onclose}
 		transition:backdropMotion|global
 	></button>{/if}
@@ -51,7 +53,7 @@
 	aria-modal={modal ? 'true' : undefined}
 	aria-label={label}
 	tabindex="-1"
-	inert={hidden ? true : undefined}
+	inert={hidden}
 	use:focusTrap={{ enabled: modal, returnFocus: () => trigger }}
 	onkeydown={handleKeydown}
 >

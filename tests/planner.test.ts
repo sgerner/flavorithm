@@ -90,7 +90,36 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.recipes = [...kitchen.recipes];
 		},
 		logout,
-		deleteAccount
+		deleteAccount,
+		get selected() { return selected; },
+		set selected(value: Recipe | null) { selected = value; },
+		get selectedMealServings() { return selectedMealServings; },
+		set selectedMealServings(value: number | undefined) { selectedMealServings = value; },
+		get editingRecipe() { return editingRecipe; },
+		set editingRecipe(value: Recipe | null) { editingRecipe = value; },
+		get editingRecipeMode() { return editingRecipeMode; },
+		set editingRecipeMode(value: 'create' | 'edit') { editingRecipeMode = value; },
+		get modal() { return modal; },
+		set modal(value: string) { modal = value; },
+		get resumeDialog() { return resumeDialog; },
+		set resumeDialog(value: string) { resumeDialog = value; },
+		get recipeToDelete() { return recipeToDelete; },
+		set recipeToDelete(value: Recipe | null) { recipeToDelete = value; },
+		get butlerOpen() { return butlerOpen; },
+		set butlerOpen(value: boolean) { butlerOpen = value; },
+		setButlerChat: (value: { close: () => void | Promise<void> } | undefined) => {
+			butlerChat = value as any;
+		},
+		get mobileNav() { return mobileNav; },
+		set mobileNav(value: boolean) { mobileNav = value; },
+		get pantryDraft() { return pantryDraft; },
+		set pantryDraft(value: PantryDraft | null) { pantryDraft = value; },
+		closeRecipeDetail,
+		closeRecipeEditor,
+		closeDialog,
+		handleWindowKeydown,
+		planRecipe,
+		askDeleteRecipe
 	});
 `;
 	return svelteSource.slice(0, instanceEnd) + hook + svelteSource.slice(instanceEnd);
@@ -147,6 +176,23 @@ type PlannerHarnessApi = {
 	rateRecipe: (recipe: Recipe, rating: number) => void;
 	logout: () => Promise<void>;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	selected: Recipe | null;
+	selectedMealServings: number | undefined;
+	editingRecipe: Recipe | null;
+	editingRecipeMode: 'create' | 'edit';
+	modal: string;
+	resumeDialog: string;
+	recipeToDelete: Recipe | null;
+	butlerOpen: boolean;
+	setButlerChat: (value: { close: () => void | Promise<void> } | undefined) => void;
+	mobileNav: boolean;
+	pantryDraft: workflowsMod.PantryDraft | null;
+	closeRecipeDetail: () => void;
+	closeRecipeEditor: () => void;
+	closeDialog: () => void;
+	handleWindowKeydown: (event: KeyboardEvent) => void;
+	planRecipe: (recipe: Recipe, servings?: number) => void;
+	askDeleteRecipe: (recipe: Recipe) => void;
 };
 
 const noopComponent = () => {};
@@ -352,6 +398,11 @@ function createReactivePlanner() {
 		clearInterval,
 		localStorage: storage,
 		navigator: { onLine: true },
+		CSS: { escape: (value: string) => value },
+		document: {
+			querySelector: () => null,
+			getElementById: () => null
+		},
 		window: {
 			location: {
 				assign: (url: string) => assignedUrls.push(url),
@@ -905,4 +956,181 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('closeRecipeDetail and closeRecipeEditor isolate state from modal closeDialog branches', () => {
+	assert.match(rawPageSource, /<RecipeDetail[\s\S]*?\bclose=\{closeRecipeDetail\}/);
+	assert.match(rawPageSource, /<RecipeEditor[\s\S]*?\bcancel=\{closeRecipeEditor\}/);
+
+	const { api, dispose } = createReactivePlanner();
+	try {
+		const detailRecipe = makeRecipe('detail-1', 'Lemon Orzo');
+		const draftRecipe = makeRecipe('draft-1', 'Draft Focaccia');
+		const deleteTarget = { ...makeRecipe('delete-1', 'Saved Tart'), saved: true };
+
+		// Closing RecipeDetail clears only selected/selectedMealServings even if a modal or editor is open
+		api.selected = detailRecipe;
+		api.selectedMealServings = 6;
+		api.modal = 'plan';
+		api.resumeDialog = 'settings';
+		api.editingRecipe = draftRecipe;
+		api.editingRecipeMode = 'create';
+
+		api.closeRecipeDetail();
+		assert.equal(api.selected, null);
+		assert.equal(api.selectedMealServings, undefined);
+		assert.equal(api.modal, 'plan');
+		assert.equal(api.resumeDialog, 'settings');
+		assert.equal(api.editingRecipe?.id, draftRecipe.id);
+		assert.equal(api.editingRecipeMode, 'create');
+
+		// Closing RecipeEditor clears only editingRecipe/editingRecipeMode without touching modal or selected
+		api.selected = detailRecipe;
+		api.selectedMealServings = 4;
+		api.closeRecipeEditor();
+		assert.equal(api.editingRecipe, null);
+		assert.equal(api.editingRecipeMode, 'edit');
+		assert.equal(api.modal, 'plan');
+		assert.equal(api.selected?.id, detailRecipe.id);
+		assert.equal(api.selectedMealServings, 4);
+
+		// closeDialog on modal === 'plan' clears both modal and selected (matching main)
+		api.resumeDialog = '';
+		api.closeDialog();
+		assert.equal(api.modal, '');
+		assert.equal(api.selected, null);
+		assert.equal(api.selectedMealServings, undefined);
+
+		// closeDialog on non-plan modals (e.g. deleteRecipe) clears modal/recipeToDelete without clearing selected
+		api.selected = detailRecipe;
+		api.selectedMealServings = 5;
+		api.recipeToDelete = deleteTarget;
+		api.modal = 'deleteRecipe';
+		api.closeDialog();
+		assert.equal(api.modal, '');
+		assert.equal(api.recipeToDelete, null);
+		assert.equal(api.selected?.id, detailRecipe.id);
+		assert.equal(api.selectedMealServings, 5);
+	} finally {
+		dispose();
+	}
+});
+
+test('handleWindowKeydown dismisses one Escape layer at a time in strict precedence order', async () => {
+	const { api, dispose } = createReactivePlanner();
+	try {
+		const detailRecipe = makeRecipe('esc-detail', 'Herbed Polenta');
+		const draftRecipe = makeRecipe('esc-draft', 'Draft Gnocchi');
+		const lot = api.kitchen.pantry[0];
+		assert.ok(lot);
+
+		let butlerCloseCalls = 0;
+		api.setButlerChat({
+			close: () => {
+				butlerCloseCalls += 1;
+				api.butlerOpen = false;
+			}
+		});
+
+		api.editingRecipe = draftRecipe;
+		api.editingRecipeMode = 'create';
+		api.modal = 'auth';
+		api.resumeDialog = 'settings';
+		api.selected = detailRecipe;
+		api.selectedMealServings = 3;
+		api.butlerOpen = true;
+		api.mobileNav = true;
+		api.pantryDraft = {
+			id: lot.id,
+			quantity: String(lot.quantity),
+			unit: lot.unit,
+			category: lot.category ?? 'Pantry',
+			expires: lot.expires ?? ''
+		};
+
+		const makeKeyEvent = (key: string, prePrevented = false) => {
+			let prevented = prePrevented;
+			return {
+				key,
+				get defaultPrevented() {
+					return prevented;
+				},
+				preventDefault() {
+					prevented = true;
+				}
+			} as unknown as KeyboardEvent;
+		};
+
+		// Already-handled Escape (e.g. open SearchPicker or inner dialog stop/preventDefault) is ignored
+		api.handleWindowKeydown(makeKeyEvent('Escape', true));
+		assert.equal(api.editingRecipe?.id, draftRecipe.id);
+		assert.equal(api.modal, 'auth');
+
+		// Non-Escape key is ignored
+		api.handleWindowKeydown(makeKeyEvent('Enter'));
+		assert.equal(api.editingRecipe?.id, draftRecipe.id);
+
+		// 1. Dismisses editingRecipe first
+		const esc1 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc1);
+		assert.equal(esc1.defaultPrevented, true);
+		assert.equal(api.editingRecipe, null);
+		assert.equal(api.editingRecipeMode, 'edit');
+		assert.equal(api.modal, 'auth');
+		assert.equal(api.selected?.id, detailRecipe.id);
+		assert.equal(api.butlerOpen, true);
+		assert.equal(api.mobileNav, true);
+		assert.ok(api.pantryDraft);
+
+		// 2. Steps modal from auth back to resumeDialog ('settings')
+		const esc2 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc2);
+		assert.equal(esc2.defaultPrevented, true);
+		assert.equal(api.modal, 'settings');
+		assert.equal(api.resumeDialog, '');
+		assert.equal(api.selected?.id, detailRecipe.id);
+
+		// 3. Dismisses modal ('settings' -> '')
+		const esc3 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc3);
+		assert.equal(esc3.defaultPrevented, true);
+		assert.equal(api.modal, '');
+		assert.equal(api.selected?.id, detailRecipe.id);
+		assert.equal(api.butlerOpen, true);
+
+		// 4. Dismisses selected RecipeDetail
+		const esc4 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc4);
+		assert.equal(esc4.defaultPrevented, true);
+		assert.equal(api.selected, null);
+		assert.equal(api.selectedMealServings, undefined);
+		assert.equal(api.butlerOpen, true);
+		assert.equal(api.mobileNav, true);
+
+		// 5. Closes ButlerChat
+		const esc5 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc5);
+		assert.equal(esc5.defaultPrevented, true);
+		assert.equal(butlerCloseCalls, 1);
+		assert.equal(api.butlerOpen, false);
+		assert.equal(api.mobileNav, true);
+		assert.ok(api.pantryDraft);
+
+		// 6. Closes mobileNav drawer
+		const esc6 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc6);
+		assert.equal(esc6.defaultPrevented, true);
+		assert.equal(api.mobileNav, false);
+		assert.ok(api.pantryDraft);
+
+		// 7. Cancels inline pantryDraft edit last
+		const esc7 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc7);
+		assert.equal(esc7.defaultPrevented, true);
+		assert.equal(api.pantryDraft, null);
+		await Promise.resolve();
+		await Promise.resolve();
+	} finally {
+		dispose();
+	}
 });

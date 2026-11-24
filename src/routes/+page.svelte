@@ -3211,13 +3211,16 @@
 			busy = false;
 		}
 	}
+	function closeRecipeDetail() {
+		selected = null;
+		selectedMealServings = undefined;
+	}
+	function closeRecipeEditor() {
+		editingRecipe = null;
+		editingRecipeMode = 'edit';
+		error = '';
+	}
 	function closeDialog() {
-		if (editingRecipe) {
-			editingRecipe = null;
-			editingRecipeMode = 'edit';
-			error = '';
-			return;
-		}
 		if (
 			modal === 'settings' &&
 			(connectionActive ||
@@ -3251,11 +3254,30 @@
 			const next = resolveClosedDialog(modal, resumeDialog);
 			resumeDialog = next.resumeDialog;
 			modal = next.modal;
-		} else if (selected) {
-			selected = null;
-			selectedMealServings = undefined;
 		}
 		error = '';
+	}
+	function handleWindowKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape' || e.defaultPrevented) return;
+		if (editingRecipe) {
+			e.preventDefault();
+			closeRecipeEditor();
+		} else if (modal) {
+			e.preventDefault();
+			closeDialog();
+		} else if (selected) {
+			e.preventDefault();
+			closeRecipeDetail();
+		} else if (butlerOpen) {
+			e.preventDefault();
+			void butlerChat?.close();
+		} else if (mobileNav) {
+			e.preventDefault();
+			mobileNav = false;
+		} else if (pantryDraft) {
+			e.preventDefault();
+			void cancelPantryEdit();
+		}
 	}
 	function openImport(text?: string) {
 		resumeDialog = '';
@@ -3526,24 +3548,7 @@
 	><title>{nav.find((item) => item.id === page)?.name || 'Discover'} · Flavorithm</title
 	></svelte:head
 >
-<svelte:window
-	onkeydown={(e) => {
-		if (e.key !== 'Escape' || e.defaultPrevented) return;
-		if (editingRecipe || modal || selected) {
-			e.preventDefault();
-			closeDialog();
-		} else if (butlerOpen) {
-			e.preventDefault();
-			void butlerChat?.close();
-		} else if (mobileNav) {
-			e.preventDefault();
-			mobileNav = false;
-		} else if (pantryDraft) {
-			e.preventDefault();
-			void cancelPantryEdit();
-		}
-	}}
-/>
+<svelte:window onkeydown={handleWindowKeydown} />
 <input
 	class="visually-hidden"
 	tabindex="-1"
@@ -4503,7 +4508,7 @@
 				cookingSteps[cookingSessionKey] = steps;
 			}
 		}
-		close={closeDialog}
+		close={closeRecipeDetail}
 		save={() => saveRecipe(selected!)}
 		shop={(servings) =>
 			shoppingFor(
@@ -4533,7 +4538,7 @@
 			recipe={editingRecipe}
 			mode={editingRecipeMode}
 			canUploadCover={Boolean(user) && online}
-			cancel={closeDialog}
+			cancel={closeRecipeEditor}
 			save={saveEditedRecipe}
 		/>{/key}{/if}
 {#if modal}<ModalDialog
