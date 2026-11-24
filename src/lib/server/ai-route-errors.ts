@@ -79,7 +79,8 @@ export function mapSignedInAIRouteError(
 				clearTerminalChatGPTCredentials(
 					context.hostTarget.userId,
 					context.hostTarget.accountId,
-					terminalRefreshCode
+					terminalRefreshCode,
+					error instanceof ChatGPTOAuthError ? error.credentialEnvelope : undefined
 				);
 			}
 			return hostUnavailableResponse();
@@ -92,7 +93,15 @@ export function mapSignedInAIRouteError(
 				error instanceof ChatGPTInferenceError ||
 				code === 'subscription_sharing_invalid_user';
 			if (context.personalAccountId && code === 'subscription_sharing_invalid_user') {
-				clearUnusableChatGPTCredentials(context.userId, context.personalAccountId);
+				const rejectedAccessToken =
+					'rejectedAccessToken' in error && typeof error.rejectedAccessToken === 'string'
+						? error.rejectedAccessToken
+						: undefined;
+				clearUnusableChatGPTCredentials(
+					context.userId,
+					context.personalAccountId,
+					rejectedAccessToken
+				);
 			}
 			return Response.json(
 				{

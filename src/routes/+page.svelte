@@ -1093,7 +1093,11 @@
 			throw error;
 		}
 		if (!response.ok) {
-			if (response.status === 401 && managedAuth) {
+			if (
+				response.status === 401 &&
+				managedAuth &&
+				(data?.code === 'session_expired' || data?.error === 'Authentication required')
+			) {
 				clearManagedIdentity();
 				renewManagedSession({ status: 401 });
 			}

@@ -59,17 +59,20 @@ export const REFRESH_FAILURE_COOLDOWN_MS = 10_000;
 export class ChatGPTOAuthError extends ApiError {
 	readonly code: string;
 	readonly providerErrorCode?: string;
+	readonly credentialEnvelope?: string;
 
 	constructor(
 		status: number,
 		message: string,
 		code = 'chatgpt_oauth_error',
-		providerErrorCode?: string
+		providerErrorCode?: string,
+		credentialEnvelope?: string
 	) {
 		super(status, message);
 		this.name = 'ChatGPTOAuthError';
 		this.code = code;
 		if (providerErrorCode) this.providerErrorCode = providerErrorCode;
+		if (credentialEnvelope) this.credentialEnvelope = credentialEnvelope;
 	}
 }
 
@@ -122,6 +125,10 @@ type InFlightRefresh = {
 // encrypted in SQLite so callbacks can land on another process or survive a restart.
 const pendingTransactions = new Map<string, LocalPendingTransaction>();
 const refreshPromises = new Map<string, InFlightRefresh>();
+const forcedRefreshCooldowns = new Map<
+	string,
+	{ until: number; credentialEnvelope: string | null }
+>();
 let remoteJwks: ReturnType<typeof createRemoteJWKSet> | undefined;
 
 function randomValue(bytes = 32): string {
@@ -1343,6 +1350,8 @@ async function refreshAccountAccessToken(
 ): Promise<string> {
 	const force = Boolean(options?.force);
 	const rejectedAccessToken = options?.rejectedAccessToken;
+	let baselineAccessToken: string | undefined;
+	let baselineRefreshToken: string | null | undefined;
 	const deadline = Date.now() + 20_000;
 	while (Date.now() < deadline) {
 		const preLeaseAccount = getChatGPTAccount(userId, accountId);
@@ -1385,11 +1394,23 @@ async function refreshAccountAccessToken(
 			);
 		}
 		const now = Date.now();
+		const cooldownKey = `${userId}:${preLeaseAccount.id}`;
+		const activeCooldown = forcedRefreshCooldowns.get(cooldownKey);
+		const inForcedCooldown =
+			activeCooldown !== undefined &&
+			activeCooldown.until > now &&
+			preLeaseAccount.credentialEnvelope === activeCooldown.credentialEnvelope;
+		if (activeCooldown && !inForcedCooldown) {
+			forcedRefreshCooldowns.delete(cooldownKey);
+		}
 		if (force) {
 			if (
-				rejectedAccessToken &&
-				preLeaseCredentials.accessToken !== rejectedAccessToken &&
-				preLeaseAccount.expiresAt > now
+				preLeaseAccount.expiresAt > now &&
+				((rejectedAccessToken && preLeaseCredentials.accessToken !== rejectedAccessToken) ||
+					(baselineAccessToken !== undefined &&
+						preLeaseCredentials.accessToken !== baselineAccessToken) ||
+					(baselineRefreshToken !== undefined &&
+						preLeaseCredentials.refreshToken !== baselineRefreshToken))
 			) {
 				return preLeaseCredentials.accessToken;
 			}
@@ -1399,9 +1420,13 @@ async function refreshAccountAccessToken(
 			if (preLeaseAccount.expiresAt > now && preLeaseAccount.earliestRefreshAt > now)
 				return preLeaseCredentials.accessToken;
 		}
+		baselineAccessToken ??= preLeaseCredentials.accessToken;
+		if (baselineRefreshToken === undefined) {
+			baselineRefreshToken = preLeaseCredentials.refreshToken;
+		}
 		if (
 			preLeaseCredentials.refreshToken &&
-			preLeaseAccount.earliestRefreshAt > now &&
+			(preLeaseAccount.earliestRefreshAt > now || (force && inForcedCooldown)) &&
 			(preLeaseAccount.refreshLockUntil ?? 0) <= now
 		) {
 			throw new ChatGPTOAuthError(
@@ -1467,11 +1492,17 @@ async function refreshAccountAccessToken(
 				);
 			}
 			const leasedNow = Date.now();
+			const leasedCooldown = forcedRefreshCooldowns.get(cooldownKey);
+			const leasedInForcedCooldown =
+				leasedCooldown !== undefined &&
+				leasedCooldown.until > leasedNow &&
+				account.credentialEnvelope === leasedCooldown.credentialEnvelope;
 			if (force) {
 				if (
 					account.expiresAt > leasedNow &&
 					((rejectedAccessToken && credentials.accessToken !== rejectedAccessToken) ||
-						credentials.accessToken !== preLeaseCredentials.accessToken)
+						credentials.accessToken !== baselineAccessToken ||
+						credentials.refreshToken !== baselineRefreshToken)
 				) {
 					return credentials.accessToken;
 				}
@@ -1483,13 +1514,14 @@ async function refreshAccountAccessToken(
 			}
 			if (!credentials.refreshToken) {
 				clearChatGPTCredentials(userId, account.id, leaseToken);
+				forcedRefreshCooldowns.delete(cooldownKey);
 				throw new ChatGPTOAuthError(
 					401,
 					'Reconnect this ChatGPT account to continue.',
 					'chatgpt_account_reauth_required'
 				);
 			}
-			if (account.earliestRefreshAt > leasedNow) {
+			if (account.earliestRefreshAt > leasedNow || (force && leasedInForcedCooldown)) {
 				throw new ChatGPTOAuthError(
 					503,
 					'ChatGPT access is temporarily waiting to refresh. Please retry shortly.',
@@ -1497,13 +1529,22 @@ async function refreshAccountAccessToken(
 				);
 			}
 
+			const recordRefreshCooldown = (cooldownMs = REFRESH_FAILURE_COOLDOWN_MS) => {
+				const until = Date.now() + cooldownMs;
+				deferChatGPTRefresh(userId, account.id, leaseToken, until);
+				forcedRefreshCooldowns.set(cooldownKey, {
+					until,
+					credentialEnvelope: account.credentialEnvelope
+				});
+			};
+
 			const failTransientRefresh = (retryAfterHeader?: string | null): never => {
 				const retryAfterMs = parseRetryAfterMs(retryAfterHeader);
 				const cooldownMs =
 					retryAfterMs !== null
 						? Math.min(60_000, Math.max(REFRESH_FAILURE_COOLDOWN_MS, retryAfterMs))
 						: REFRESH_FAILURE_COOLDOWN_MS;
-				deferChatGPTRefresh(userId, account.id, leaseToken, Date.now() + cooldownMs);
+				recordRefreshCooldown(cooldownMs);
 				throw new ChatGPTOAuthError(
 					502,
 					'ChatGPT access could not be refreshed. Please retry.',
@@ -1516,11 +1557,18 @@ async function refreshAccountAccessToken(
 				refresh_token: credentials.refreshToken,
 				...(account.clientId === CODEX_CLIENT_ID ? {} : { resource: OPENAI_RESOURCE })
 			});
-			const { headers, body: authenticatedBody } = hostedAuthHeadersAndBody(
-				account.mode,
-				account.clientId,
-				body
-			);
+			let headers: Headers;
+			let authenticatedBody: URLSearchParams;
+			try {
+				({ headers, body: authenticatedBody } = hostedAuthHeadersAndBody(
+					account.mode,
+					account.clientId,
+					body
+				));
+			} catch (error) {
+				recordRefreshCooldown();
+				throw error;
+			}
 			let response: Response;
 			try {
 				response = await fetch(
@@ -1554,12 +1602,35 @@ async function refreshAccountAccessToken(
 							? providerError.code
 							: null;
 				if (typeof errorCode === 'string' && TERMINAL_REFRESH_ERROR_CODES.has(errorCode)) {
-					clearChatGPTCredentials(userId, account.id, leaseToken);
+					const failedEnvelope = account.credentialEnvelope;
+					const cleared = clearChatGPTCredentials(userId, account.id, leaseToken);
+					forcedRefreshCooldowns.delete(cooldownKey);
+					if (!cleared) {
+						const latest = getChatGPTAccount(userId, account.id);
+						if (
+							latest?.credentialEnvelope &&
+							latest.credentialEnvelope !== failedEnvelope &&
+							latest.expiresAt > Date.now()
+						) {
+							try {
+								const rotated = decryptChatGPTCredentials(
+									userId,
+									latest.id,
+									latest.mode,
+									latest.credentialEnvelope
+								);
+								return rotated.accessToken;
+							} catch {
+								// Fall through if the replacement envelope cannot be decrypted.
+							}
+						}
+					}
 					throw new ChatGPTOAuthError(
 						401,
 						'Reconnect this ChatGPT account to continue.',
 						'chatgpt_account_reauth_required',
-						errorCode
+						errorCode,
+						failedEnvelope
 					);
 				}
 				return failTransientRefresh(response.headers.get('retry-after'));
@@ -1608,12 +1679,15 @@ async function refreshAccountAccessToken(
 				earliestRefreshAt: parseEarliestRefreshAt(refreshResult.earliest_refresh_at),
 				scopes
 			});
-			if (!saved)
+			if (!saved) {
+				recordRefreshCooldown();
 				throw new ChatGPTOAuthError(
 					503,
 					'ChatGPT access could not be saved securely.',
 					'chatgpt_credentials_unavailable'
 				);
+			}
+			forcedRefreshCooldowns.delete(cooldownKey);
 			if (!scopes.includes('chatgpt.tokens.use.direct') && account.clientId !== CODEX_CLIENT_ID) {
 				throw new ChatGPTOAuthError(
 					403,
@@ -1656,7 +1730,10 @@ export async function forceRefreshChatGPTAccessToken(
 ): Promise<string> {
 	const key = `${userId}:${accountId}`;
 	const matchesForcedTarget = (entry: InFlightRefresh) =>
-		entry.forced && (!rejectedAccessToken || entry.rejectedAccessToken === rejectedAccessToken);
+		entry.forced &&
+		(!rejectedAccessToken ||
+			!entry.rejectedAccessToken ||
+			entry.rejectedAccessToken === rejectedAccessToken);
 
 	const existing = refreshPromises.get(key);
 	if (existing) {
@@ -1746,11 +1823,18 @@ function clearMissingCodexAccountCredentials(userId: string, accountId: string):
 export function clearTerminalChatGPTCredentials(
 	userId: string,
 	accountId: string,
-	errorCode: string | undefined
+	errorCode: string | undefined,
+	expectedCredentialEnvelope?: string
 ): boolean {
 	if (!isTerminalChatGPTRefreshCode(errorCode)) return false;
 	const account = getChatGPTAccount(userId, accountId);
 	if (!account?.credentialEnvelope) return false;
+	if (
+		expectedCredentialEnvelope !== undefined &&
+		account.credentialEnvelope !== expectedCredentialEnvelope
+	) {
+		return false;
+	}
 	const leaseToken = randomUUID();
 	if (!claimChatGPTRefreshLease(userId, accountId, leaseToken, Date.now() + REFRESH_LEASE_MS)) {
 		return false;
@@ -1758,13 +1842,23 @@ export function clearTerminalChatGPTCredentials(
 	try {
 		const latest = getChatGPTAccount(userId, accountId);
 		if (!latest?.credentialEnvelope) return false;
+		if (
+			expectedCredentialEnvelope !== undefined &&
+			latest.credentialEnvelope !== expectedCredentialEnvelope
+		) {
+			return false;
+		}
 		return clearChatGPTCredentials(userId, accountId, leaseToken);
 	} finally {
 		releaseChatGPTRefreshLease(userId, accountId, leaseToken);
 	}
 }
 
-export function clearUnusableChatGPTCredentials(userId: string, accountId: string): void {
+export function clearUnusableChatGPTCredentials(
+	userId: string,
+	accountId: string,
+	expectedAccessToken?: string
+): void {
 	const account = getChatGPTAccount(userId, accountId);
 	if (!account?.credentialEnvelope) return;
 	const leaseToken = randomUUID();
@@ -1774,7 +1868,18 @@ export function clearUnusableChatGPTCredentials(userId: string, accountId: strin
 	try {
 		const latest = getChatGPTAccount(userId, accountId);
 		if (!latest?.credentialEnvelope) return;
+		if (expectedAccessToken !== undefined) {
+			const stored = decryptChatGPTCredentials(
+				userId,
+				latest.id,
+				latest.mode,
+				latest.credentialEnvelope
+			);
+			if (stored.accessToken !== expectedAccessToken) return;
+		}
 		clearChatGPTCredentials(userId, accountId, leaseToken);
+	} catch {
+		// Retain stored credentials on transient decryption errors.
 	} finally {
 		releaseChatGPTRefreshLease(userId, accountId, leaseToken);
 	}
@@ -1850,6 +1955,12 @@ export async function withChatGPTConnection<T>(
 		return await operation(connection);
 	} catch (error) {
 		if (!(error instanceof ChatGPTInferenceError) || error.status !== 401) {
+			if (
+				error instanceof ChatGPTInferenceError &&
+				error.code === 'subscription_sharing_invalid_user'
+			) {
+				Object.assign(error, { rejectedAccessToken: connection.accessToken });
+			}
 			throw error;
 		}
 		const refreshedToken = await forceRefreshChatGPTAccessToken(
@@ -1861,12 +1972,12 @@ export async function withChatGPTConnection<T>(
 		try {
 			return await operation(connection);
 		} catch (retryError) {
-			if (
-				retryError instanceof ChatGPTInferenceError &&
-				retryError.status === 401 &&
-				!options?.sharedHost
-			) {
-				clearRejectedChatGPTAccessToken(userId, accountId, refreshedToken);
+			if (retryError instanceof ChatGPTInferenceError) {
+				if (retryError.status === 401 && !options?.sharedHost) {
+					clearRejectedChatGPTAccessToken(userId, accountId, refreshedToken);
+				} else if (retryError.code === 'subscription_sharing_invalid_user') {
+					Object.assign(retryError, { rejectedAccessToken: refreshedToken });
+				}
 			}
 			throw retryError;
 		}
