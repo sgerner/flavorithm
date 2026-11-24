@@ -136,7 +136,7 @@ test('RecipeDetail renders Hidden visibility badge and dietary recipe.tags besid
 	const ast = parse(detailSource, { modern: true });
 	assert.ok(ast.fragment);
 
-	const bodyMatch = detailSource.match(/<div class="detail-body">([\s\S]*?)<div class="tabs">/);
+	const bodyMatch = detailSource.match(/<div class="detail-body">([\s\S]*?)<div class="tabs"[\s>]/);
 	assert.ok(bodyMatch);
 	const bodyMarkup = bodyMatch[1];
 
