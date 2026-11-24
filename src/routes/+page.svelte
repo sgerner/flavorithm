@@ -29,8 +29,9 @@
 </script>
 
 <script lang="ts">
+	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
 	import { focusTrap } from '#lib/focus.ts';
 	import {
@@ -41,6 +42,7 @@
 		motionDuration,
 		prefersReducedMotion
 	} from '#lib/motion.ts';
+	import { calendarDayScrollLeft, weekOffsetFromStarts } from '#lib/planner.ts';
 	import { flip } from 'svelte/animate';
 	import {
 		ArrowRight,
@@ -89,13 +91,23 @@
 		completeMeal,
 		deleteShoppingItem,
 		expiryStatus,
+		filterPantryItems,
+		listPantryCategories,
 		normalizeIngredientName,
+		normalizePantryDraft,
+		normalizeShoppingItem,
 		reconcileShoppingList,
+		restockDepletedPantryItems,
 		restoreShoppingItem,
+		revertShoppingItem,
+		snapshotShoppingItem,
 		transferPurchasedItemsToPantry,
-		unitInfo
+		unitInfo,
+		type PantryDraft,
+		type ShoppingItemDraft,
+		type ShoppingItemSnapshot
 	} from '#lib/kitchen-workflows.ts';
-	import { rankRecipes } from '#lib/discovery.ts';
+	import { rankPantryRecipes, rankRecipes } from '#lib/discovery.ts';
 	import {
 		createBlankRecipe,
 		DEFAULT_RECIPE_FILTER,
@@ -107,6 +119,7 @@
 		insertRecipes,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
+	import { applyRecipeRating } from '#lib/recipe-detail.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -115,7 +128,7 @@
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
 	import {
-		appendVoiceTranscript,
+		appendDictatedText,
 		isVoiceTargetActive,
 		parseQuickShoppingItems,
 		planVoiceRetry,
@@ -127,7 +140,14 @@
 		type VoiceTarget
 	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
-	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import {
+		CHATGPT_OAUTH_POLL_INTERVAL_MS,
+		CHATGPT_OAUTH_TTL_MS,
+		startConnectionPoll,
+		type ConnectionModel,
+		type ConnectionPollHandle,
+		type ConnectionProvider
+	} from '#lib/ai-connections.ts';
 	import {
 		entitledChatGPTAccountId,
 		reconcileChatGPTPreferences,
@@ -138,7 +158,8 @@
 		runSignedInHydration
 	} from '#lib/client-workflows.ts';
 	import {
-		migrateGuestKitchenOnSignup,
+		clearGuestData,
+		clearGuestKitchen,
 		quarantineLegacyKitchen,
 		sanitizeKitchenState
 	} from '#lib/guest-storage.ts';
@@ -148,7 +169,14 @@
 		emptyImportSession,
 		type ImportSession
 	} from '#lib/components/RecipeImport.svelte';
-	import { isDraftNutritionStale, isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
+	import {
+		applyImportedRecipeSave,
+		canAppendImportTranscript,
+		cloneImportSession,
+		isReviewingImportDraft,
+		replaceImportSessionWithUrl
+	} from '#lib/import-session.ts';
+	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
@@ -165,14 +193,17 @@
 	let providerLoginUrl = $derived(authMetadataLoaded ? runtimeLoginUrl : data.loginUrl);
 	let providerLogoutUrl = $derived(authMetadataLoaded ? runtimeLogoutUrl : data.logoutUrl);
 	let online = $state(true);
+	let syncReady = $state(false);
 	let pendingSync = $state(false);
 	let sendingSync = $state(false);
 	let syncErrors = $state('');
 	let conflicts = $state<SyncConflict[]>([]);
 	let reviewedEtag = $state<string | null>(null);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
+	const PANTRY_FILTER = 'From my pantry';
 	let page = $state('discover');
 	let filter = $state(DEFAULT_RECIPE_FILTER);
+	let priorityPantryIds = $state<string[]>([]);
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
 	let lastActivePill = $state<'filter' | 'hidden'>('filter');
@@ -193,6 +224,7 @@
 	function resetRecipeFilters() {
 		const next = resetRecipeFilterState();
 		lastActivePill = 'filter';
+		priorityPantryIds = [];
 		filter = next.filter;
 		query = next.query;
 		showHiddenRecipes = next.showHiddenRecipes;
@@ -339,12 +371,32 @@
 		}
 		modal = 'auth';
 	}
+	function clearHouseholdViewState() {
+		selected = null;
+		selectedMealServings = undefined;
+		editingRecipe = null;
+		editingRecipeMode = 'edit';
+		recipeToDelete = null;
+		resetMealDialogState();
+		pantryDraft = null;
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+		shoppingFilter = 'all';
+		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+	}
+	function saveLastAccount(account: User) {
+		if (managedAuth) return;
+		try {
+			localStorage.setItem('flavorithm-last-account', JSON.stringify(account));
+		} catch {}
+	}
 	function clearManagedIdentity() {
 		cancelScan(true);
 		clearVoiceSession();
 		pantryInput = '';
 		resumeDialog = '';
 		clearAIConnectionState();
+		clearHouseholdViewState();
 		kitchenSync?.clearContext();
 		user = null;
 		editingRecipe = null;
@@ -355,6 +407,7 @@
 		showStarter = false;
 		stateEtag = null;
 		localStorage.removeItem('flavorithm-last-account');
+		clearGuestData(localStorage);
 		quarantineLegacyKitchen(localStorage);
 		members = [];
 		householdInvites = [];
@@ -362,6 +415,8 @@
 		inviteCode = '';
 		currentInviteId = '';
 		joinCode = '';
+		pantryDraft = null;
+		resetPantryFilters();
 	}
 	function renewManagedSession(error: unknown) {
 		if (!navigator.onLine || (error as { status?: number })?.status !== 401) return;
@@ -420,17 +475,27 @@
 	let voiceError = $state('');
 	let voiceBusy = $derived(voiceStarting || voiceState !== 'idle');
 	let voiceTarget = $state<VoiceTarget | ''>('');
+	let shoppingVoiceInput = $state(false);
+	let shoppingMicButton = $state<HTMLButtonElement>();
+	let voiceSessionEl = $state<HTMLDivElement>();
+	let voiceStopButton = $state<HTMLButtonElement>();
+	let voiceCancelButton = $state<HTMLButtonElement>();
+	let voiceRetryButton = $state<HTMLButtonElement>();
+	let voiceReturnFocus: HTMLElement | null = null;
 	let voiceCapture: VoiceCapture | undefined;
 	let activeVoiceImportSession: ImportSession | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
 		const owner = voiceOwner;
 		if (typeof window === 'undefined') return;
-		clearVoiceSession();
-		voiceApiKey = '';
-		voiceProvider = 'auto';
-		voiceModel = '';
-		localVoiceAvailable = false;
+		untrack(() => {
+			clearVoiceSession(false);
+			shoppingVoiceInput = false;
+			voiceApiKey = '';
+			voiceProvider = 'auto';
+			voiceModel = '';
+			localVoiceAvailable = false;
+		});
 		if (owner) {
 			try {
 				const saved = JSON.parse(localStorage.getItem(`flavorithm-voice:${owner}`) || '{}');
@@ -452,7 +517,7 @@
 				})
 				.catch(() => {});
 		}
-		return () => clearVoiceSession();
+		return () => untrack(() => clearVoiceSession(false));
 	});
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
@@ -475,6 +540,7 @@
 		accounts: ChatGPTAccount[];
 	}>({ configured: false, mode: 'unavailable', accounts: [] });
 	let connectionBusy = $state(false);
+	let connectionActive = $state(false);
 	let chatGPTAuthorizationUrl = $state('');
 	let chatGPTDevice = $state<{
 		loginId: string;
@@ -483,13 +549,17 @@
 		expiresAt: number;
 		interval: number;
 	} | null>(null);
-	let connectionPoll: ReturnType<typeof setInterval> | undefined;
+	let connectionPoll: ConnectionPollHandle | undefined;
 	let connectionPopup: Window | null = null;
-	let connectionPollCount = 0;
 	let connectionAttempt = 0;
 	let activeChatGPTAccount = $derived(
 		chatGPT.accounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
 	);
+	$effect(() => {
+		if (modal !== 'settings' && (connectionActive || chatGPTDevice || chatGPTAuthorizationUrl)) {
+			void cancelChatGPTDevice();
+		}
+	});
 
 	let providers = $state<ConnectionProvider[]>([]);
 	let accountModels = $state<ConnectionModel[]>([]);
@@ -511,6 +581,10 @@
 	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
+	let calendarGrid = $state<HTMLDivElement | undefined>();
+	let previousPage = '';
+	let pendingPlannerScrollDate = '';
+	let calendarScrollToken = 0;
 	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
@@ -521,16 +595,14 @@
 	let deductPantry = $state(false);
 	let leftoverServings = $state(0);
 	let pantryFilter = $state('all');
-	let pantryDrafts = $state<Record<string, { quantity: number | null; unit: string }>>({});
+	let pantryQuery = $state('');
+	let pantryCategory = $state('all');
+	let pantryDraft = $state<PantryDraft | null>(null);
 	let shoppingFilter = $state<'all' | 'unpurchased'>('all');
 	let shoppingText = $state('');
 	let editingShoppingId = $state('');
-	let editingShoppingDraft = $state<{
-		id: string;
-		name: string;
-		quantity: number | null;
-		unit: string;
-	} | null>(null);
+	let editingShoppingDraft = $state<(ShoppingItemDraft & { id: string }) | null>(null);
+	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let showStarter = $state(true);
@@ -541,20 +613,31 @@
 		const previousMode = installationAuthMode;
 		const previousUser = user;
 		updateAuthMetadata(data);
+		capabilities = {
+			emailDelivery: Boolean(data.capabilities?.emailDelivery),
+			recipeSearch: Boolean(data.capabilities?.recipeSearch)
+		};
+		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
+		const nextUser: User | null = data.user ?? null;
 		const modeChanged = previousMode !== installationAuthMode;
-		const changedIdentity = Boolean(
-			(previousUser &&
-				(previousUser.id !== data.user?.id ||
-					previousUser.householdId !== data.user?.householdId)) ||
-			(modeChanged && managedAuth && data.user)
-		);
+		const changedIdentity =
+			Boolean(previousUser) !== Boolean(nextUser) ||
+			Boolean(
+				previousUser &&
+				nextUser &&
+				(previousUser.id !== nextUser.id || previousUser.householdId !== nextUser.householdId)
+			) ||
+			Boolean(modeChanged && managedAuth && nextUser);
 		if (modeChanged && managedAuth) clearManagedIdentity();
 		if (changedIdentity) {
 			cancelScan(true);
 			kitchenSync?.clearContext();
 			clearAIConnectionState();
+			clearHouseholdViewState();
+			stateEtag = null;
+			if (nextUser) kitchen = createNewUserState();
 		}
-		user = data.user ?? null;
+		user = nextUser;
 		if (managedAuth && !user) {
 			clearManagedIdentity();
 			renewManagedSession({ status: 401 });
@@ -562,10 +645,21 @@
 		let stateLoaded = false;
 		if (changedIdentity) {
 			if (user) {
-				const latest = await request('/api/state');
-				adoptKitchen(latest.state || createNewUserState());
+				const snapshotUser = $state.snapshot(user);
+				showStarter = false;
+				kitchenSync?.prepare(snapshotUser);
 				kitchenLoaded = true;
-				stateLoaded = true;
+				saveLastAccount(snapshotUser);
+				try {
+					const latest = await request('/api/state');
+					adoptKitchen(latest.state || createNewUserState());
+					kitchenLoaded = true;
+					stateLoaded = true;
+					if (online && kitchenSync?.snapshot()) await retrySync();
+				} catch (e) {
+					kitchenSync?.failLoad((e as Error).message);
+					throw e;
+				}
 			} else if (managedAuth) {
 				clearManagedIdentity();
 			} else {
@@ -573,12 +667,23 @@
 				localStorage.removeItem('flavorithm-last-account');
 				kitchenLoaded = true;
 			}
+		} else if (user && !syncReady) {
+			const snapshotUser = $state.snapshot(user);
+			showStarter = false;
+			kitchenSync?.prepare(snapshotUser);
+			kitchenLoaded = true;
+			saveLastAccount(snapshotUser);
+			try {
+				const latest = await request('/api/state');
+				adoptKitchen(latest.state || createNewUserState());
+				kitchenLoaded = true;
+				stateLoaded = true;
+				if (online && kitchenSync?.snapshot()) await retrySync();
+			} catch (e) {
+				kitchenSync?.failLoad((e as Error).message);
+				throw e;
+			}
 		}
-		capabilities = {
-			emailDelivery: Boolean(data.capabilities?.emailDelivery),
-			recipeSearch: Boolean(data.capabilities?.recipeSearch)
-		};
-		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
 		return { ...data, stateLoaded };
 	}
 	const nav = [
@@ -614,6 +719,18 @@
 		'vox',
 		'wintry'
 	];
+	let activePriorityPantry = $derived(
+		priorityPantryIds.length
+			? kitchen.pantry.filter(
+					(item) =>
+						priorityPantryIds.includes(item.id) &&
+						Number.isFinite(item.quantity) &&
+						item.quantity > 0 &&
+						expiryStatus(item.expires) !== 'expired' &&
+						!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown')
+				)
+			: []
+	);
 	let recipes = $derived.by(() => {
 		const matches = kitchen.recipes.filter(
 			(r) =>
@@ -628,15 +745,119 @@
 				(filter !== 'Comfort food' || r.tags.some((t) => /comfort/i.test(t))) &&
 				(filter !== 'High protein' || (!r.nutritionStale && r.nutrition.protein >= 25))
 		);
+		if (filter === PANTRY_FILTER) {
+			return rankPantryRecipes(
+				matches,
+				kitchen.pantry,
+				kitchen.preferences,
+				activePriorityPantry.length ? activePriorityPantry : undefined
+			);
+		}
 		return filter === 'For you'
 			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
 			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
 	});
 	let visiblePantry = $derived(
-		kitchen.pantry.filter(
-			(item) => pantryFilter === 'all' || expiryStatus(item.expires) === pantryFilter
+		filterPantryItems(kitchen.pantry, {
+			query: pantryQuery,
+			category: pantryCategory,
+			expiry: pantryFilter
+		})
+	);
+	let pantryCategories = $derived(listPantryCategories(kitchen.pantry, pantryCategory));
+	let pantryCategorySuggestions = $derived(
+		[
+			'Produce',
+			'Grains',
+			'Oils & condiments',
+			'Canned goods',
+			'Dairy & eggs',
+			'Spices',
+			'Pantry',
+			...pantryCategories.map((entry) => entry.label)
+		].filter(
+			(label, index, all) =>
+				all.findIndex((candidate) => candidate.toLowerCase() === label.toLowerCase()) === index
 		)
 	);
+	$effect(() => {
+		if (pantryDraft && !kitchen.pantry.some((item) => item.id === pantryDraft?.id)) {
+			pantryDraft = null;
+		}
+	});
+	async function startPantryEdit(item: AppState['pantry'][number]) {
+		pantryDraft = {
+			id: item.id,
+			quantity: item.quantity,
+			unit: item.unit,
+			category: item.category.trim() || 'Pantry',
+			expires: item.expires ?? ''
+		};
+		await tick();
+		document.querySelector<HTMLInputElement>('.pantry-row.editing input[type="number"]')?.focus();
+	}
+	async function savePantryEdit(restoreFocus = true) {
+		const draft = pantryDraft;
+		if (!draft) return;
+		const normalized = normalizePantryDraft(draft);
+		kitchen.pantry = kitchen.pantry.map((item) => {
+			if (item.id !== draft.id) return item;
+			const updated: AppState['pantry'][number] = {
+				id: item.id,
+				name: item.name,
+				quantity: normalized.quantity,
+				unit: normalized.unit,
+				category: normalized.category
+			};
+			if (normalized.expires) updated.expires = normalized.expires;
+			return updated;
+		});
+		const editedId = draft.id;
+		pantryDraft = null;
+		if (!restoreFocus) return;
+		await tick();
+		document
+			.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
+			?.focus();
+	}
+	async function cancelPantryEdit() {
+		const editedId = pantryDraft?.id;
+		pantryDraft = null;
+		if (editedId) {
+			await tick();
+			document
+				.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
+				?.focus();
+		}
+	}
+	function handlePantryInputKeydown(event: KeyboardEvent) {
+		if (event.key === 'Escape') {
+			event.preventDefault();
+			event.stopPropagation();
+			void cancelPantryEdit();
+		} else if (event.key === 'Enter') {
+			event.preventDefault();
+			void savePantryEdit();
+		}
+	}
+	function removePantryItem(item: AppState['pantry'][number]) {
+		if (pantryDraft?.id === item.id) pantryDraft = null;
+		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
+	}
+	function resetPantryFilters() {
+		pantryQuery = '';
+		pantryCategory = 'all';
+		pantryFilter = 'all';
+	}
+	function expiryBadgeLabel(status: ReturnType<typeof expiryStatus>) {
+		return status === 'expired'
+			? 'Expired'
+			: status === 'soon'
+				? 'Use soon'
+				: status === 'fresh'
+					? 'In date'
+					: 'No date';
+	}
 	let availablePantryNames = $derived(
 		new Set(
 			kitchen.pantry
@@ -644,7 +865,8 @@
 					(item) =>
 						Number.isFinite(item.quantity) &&
 						item.quantity > 0 &&
-						expiryStatus(item.expires) !== 'expired'
+						expiryStatus(item.expires) !== 'expired' &&
+						!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown')
 				)
 				.map((item) => normalizeName(item.name))
 				.filter(Boolean)
@@ -721,15 +943,87 @@
 			undo ? 10000 : 4200
 		);
 	}
-	function removeShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId === item.id) {
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+	function applyShoppingEdit(item: AppState['shopping'][number]) {
+		normalizeShoppingItem(item, editingShoppingDraft?.id === item.id ? editingShoppingDraft : null);
+	}
+	function clearEditingShoppingState() {
+		editingShoppingId = '';
+		editingShoppingDraft = null;
+		editingShoppingSnapshot = null;
+	}
+	async function startEditingShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId && editingShoppingId !== item.id) {
+			const active = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
+			if (active) applyShoppingEdit(active);
 		}
+		editingShoppingSnapshot = snapshotShoppingItem(item);
+		editingShoppingId = item.id;
+		editingShoppingDraft = {
+			id: item.id,
+			name: item.name,
+			quantity: item.quantity,
+			unit: item.unit
+		};
+		await tick();
+		document
+			.querySelector<HTMLInputElement>(`[data-shopping-name="${CSS.escape(item.id)}"]`)
+			?.focus();
+	}
+	async function finishEditingShoppingItem(item: AppState['shopping'][number]) {
+		const id = item.id;
+		applyShoppingEdit(item);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	async function cancelEditingShoppingItem() {
+		const id = editingShoppingId;
+		if (!id) return;
+		const active = kitchen.shopping.find((entry) => entry.id === id);
+		if (active && editingShoppingSnapshot) revertShoppingItem(active, editingShoppingSnapshot);
+		clearEditingShoppingState();
+		await tick();
+		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
+	}
+	function removeShoppingItem(item: AppState['shopping'][number]) {
+		if (editingShoppingId === item.id) clearEditingShoppingState();
 		const removed = structuredClone($state.snapshot(item));
 		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		notify(`${item.name} removed.`, () => {
+			if (editingShoppingId === removed.id) clearEditingShoppingState();
 			kitchen.shopping = restoreShoppingItem(kitchen, removed);
+			if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+				clearEditingShoppingState();
+		});
+	}
+	function consumeLeftoverServing(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		const next = Math.max(0, Math.round((previous - 1) * 100) / 100);
+		meal.leftoverServings = next;
+		notify(
+			next > 0
+				? `1 leftover serving used · ${next} remaining.`
+				: 'Last leftover serving marked used.',
+			() => {
+				const target = kitchen.meals.find((entry) => entry.id === mealId);
+				if (target && target.leftoverServings === next) target.leftoverServings = previous;
+				else notify('Leftovers changed again. Review the current count before editing.');
+			}
+		);
+	}
+	function clearMealLeftovers(meal: Meal) {
+		const previous = meal.leftoverServings ?? 0;
+		if (!(previous > 0)) return;
+		const mealId = meal.id;
+		meal.leftoverServings = 0;
+		notify('Leftovers marked used.', () => {
+			const target = kitchen.meals.find((entry) => entry.id === mealId);
+			if (target && target.leftoverServings === 0) target.leftoverServings = previous;
+			else notify('Leftovers changed again. Review the current count before editing.');
 		});
 	}
 	function removePlannedMeal(meal: Meal) {
@@ -798,6 +1092,19 @@
 		page;
 		if (ready) window.scrollTo({ top: 0, behavior: 'instant' });
 	});
+	$effect(() => {
+		const currentPage = page;
+		const enteringPlanner = currentPage === 'planner' && previousPage !== 'planner';
+		previousPage = currentPage;
+		if (!enteringPlanner) return;
+		if (pendingPlannerScrollDate) {
+			pendingPlannerScrollDate = '';
+			return;
+		}
+		if (untrack(() => weekOffset === 0)) {
+			void scrollCalendarToDate(dateKey(new Date()), true);
+		}
+	});
 	let stateEtag: string | null = null;
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
@@ -817,7 +1124,7 @@
 		}
 		if (user) kitchenSync?.stage(sanitized);
 		clearTimeout(saveTimer);
-		if (user && !syncing && online)
+		if (user && pendingSync && !syncing && !syncErrors && online)
 			saveTimer = setTimeout(() => {
 				void retrySync();
 			}, 500);
@@ -832,6 +1139,7 @@
 				kitchen = sanitizeKitchenState(state);
 			},
 			onStatus: (status) => {
+				syncReady = status.ready;
 				pendingSync = status.pending;
 				sendingSync = status.syncing;
 				conflicts = status.conflicts;
@@ -878,6 +1186,7 @@
 		});
 		if (managedAuth) {
 			localStorage.removeItem('flavorithm-last-account');
+			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
 			showStarter = false;
@@ -918,6 +1227,7 @@
 				updateAuthMetadata(data);
 				if (managedAuth) {
 					localStorage.removeItem('flavorithm-last-account');
+					clearGuestData(localStorage);
 					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
 					kitchenLoaded = false;
@@ -928,8 +1238,9 @@
 					recipeSearch: Boolean(data.capabilities?.recipeSearch)
 				};
 				syncing = true;
-				user = data.user ?? null;
-				if (!user) {
+				const nextUser: User | null = data.user ?? null;
+				if (!nextUser) {
+					user = null;
 					kitchenSync?.clearContext();
 					localStorage.removeItem('flavorithm-last-account');
 					if (managedAuth) {
@@ -938,30 +1249,51 @@
 					}
 					syncing = false;
 				} else {
-					const owner = data.user.id;
+					clearHouseholdViewState();
+					kitchen = createNewUserState();
+					user = nextUser;
+					showStarter = false;
+					kitchenSync?.prepare(nextUser);
+					kitchenLoaded = true;
+					saveLastAccount(nextUser);
+					const owner = nextUser.id;
 					const attempt = connectionAttempt;
-					await runSignedInHydration({
-						returnFromChatGPT,
-						fetchState: () => request('/api/state'),
-						fetchConnections: () => request('/api/connections/chatgpt'),
-						adoptState: (saved) => {
-							adoptKitchen(saved.state || createNewUserState());
-							kitchenLoaded = true;
-							user = data.user ?? null;
-							if (user) showStarter = false;
-							syncing = false;
-						},
-						openSettings: () => openSettings(),
-						onConnections: (result) => {
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							chatGPT = result;
-							reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
-						},
-						onConnectionsError: () => {
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.');
+					try {
+						await runSignedInHydration({
+							returnFromChatGPT,
+							fetchState: () => request('/api/state'),
+							fetchConnections: () => request('/api/connections/chatgpt'),
+							adoptState: (saved) => {
+								adoptKitchen(saved.state || createNewUserState());
+								kitchenLoaded = true;
+								showStarter = false;
+								syncing = false;
+							},
+							openSettings: async () => {
+								if (online && kitchenSync?.snapshot()) await retrySync();
+								await openSettings();
+							},
+							onConnections: (result) => {
+								if (attempt !== connectionAttempt || user?.id !== owner) return;
+								chatGPT = result;
+								reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+							},
+							onConnectionsError: () => {
+								if (attempt !== connectionAttempt || user?.id !== owner) return;
+								notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.');
+							}
+						});
+						if (!returnFromChatGPT && online && kitchenSync?.snapshot()) {
+							await retrySync();
 						}
-					});
+					} catch (stateError) {
+						syncing = false;
+						kitchenSync?.failLoad((stateError as Error).message);
+						if (managedAuth) renewManagedSession(stateError);
+						notify(
+							'Could not load your kitchen. New edits will stay on this device until sync succeeds.'
+						);
+					}
 				}
 				if (verificationToken && !managedAuth) {
 					try {
@@ -988,8 +1320,13 @@
 					try {
 						const cached = JSON.parse(localStorage.getItem('flavorithm-last-account') || 'null');
 						if (cached?.id && cached?.householdId) {
+							clearHouseholdViewState();
+							kitchen = createNewUserState();
 							user = cached;
+							showStarter = false;
+							kitchenLoaded = true;
 							kitchenSync?.restore(cached);
+							if (online) kitchenSync?.failLoad((error as Error).message);
 						}
 					} catch {}
 				}
@@ -1032,7 +1369,8 @@
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
-			clearInterval(connectionPoll);
+			connectionPoll?.stop();
+			connectionPopup?.close();
 			cancelScan(true);
 			voiceCapture?.cancel();
 		};
@@ -1040,12 +1378,9 @@
 	function adoptKitchen(state: AppState) {
 		const sanitized = sanitizeKitchenState(state);
 		if (user && kitchenSync) {
-			kitchenSync.initialize(JSON.parse(JSON.stringify(user)), sanitized, stateEtag || '');
-			if (!managedAuth) {
-				try {
-					localStorage.setItem('flavorithm-last-account', JSON.stringify(user));
-				} catch {}
-			}
+			const snapshotUser = $state.snapshot(user);
+			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
+			saveLastAccount(snapshotUser);
 		} else kitchen = sanitized;
 	}
 	async function retrySync(prefer?: 'local' | 'remote', expectedEtag?: string | null) {
@@ -1086,6 +1421,7 @@
 				retrySync: () => retrySync()
 			});
 		} catch (e) {
+			kitchenSync?.failLoad((e as Error).message);
 			syncErrors = (e as Error).message;
 			if (managedAuth) {
 				clearManagedIdentity();
@@ -1117,13 +1453,13 @@
 	}
 
 	function freshKitchen() {
-		pantryDrafts = {};
-		editingShoppingId = '';
-		editingShoppingDraft = null;
+		clearEditingShoppingState();
 		kitchen.pantry = [];
 		kitchen.meals = [];
 		kitchen.shopping = [];
 		kitchen.recipes = kitchen.recipes.map((r) => ({ ...r, rating: undefined, saved: false }));
+		pantryDraft = null;
+		resetPantryFilters();
 		showStarter = false;
 		localStorage.setItem('flavorithm-started', 'yes');
 		page = 'pantry';
@@ -1217,67 +1553,75 @@
 			syncing = true;
 			commitInlineEdits();
 			clearTimeout(saveTimer);
-			const guestKitchen =
-				authMode === 'register' ? sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))) : null;
+			const isRegister = authMode === 'register';
+			const guestKitchen = isRegister
+				? sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)))
+				: null;
 			const result = await request('/api/auth', { action: authMode, name, email, password });
-			user = result.user;
-			let migratedSynced = true;
-			if (guestKitchen) {
-				const migrated = await migrateGuestKitchenOnSignup({
-					guestState: guestKitchen,
-					loadInitialState: async () => {
-						const saved = await request('/api/state');
-						return { state: saved.state || null, etag: stateEtag || '' };
-					},
-					adoptBaseline: (baseline, etag) => {
-						stateEtag = etag || null;
-						adoptKitchen(baseline);
-					},
-					stage: (next) => {
-						kitchen = next;
-						kitchenSync?.stage(next);
-					},
-					sync: async () => {
-						await kitchenSync?.sync();
-					},
-					hasPendingFailure: () => Boolean(syncErrors || kitchenSync?.snapshot())
-				});
-				kitchen = migrated.state;
-				kitchenLoaded = true;
-				migratedSynced = migrated.synced;
-			} else {
-				const saved = await request('/api/state');
-				if (saved.state) adoptKitchen(saved.state);
-				else {
-					kitchen = createNewUserState();
-					await request('/api/state', { state: kitchen }, 'PUT');
-					adoptKitchen(kitchen);
-				}
-				kitchenLoaded = true;
-			}
-			user = result.user;
-			showStarter = false;
-			syncing = false;
-			await refreshConnections().catch(() =>
-				notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
-			);
+			const authenticatedUser: User = result.user;
 			password = '';
+			showStarter = false;
+			clearHouseholdViewState();
+			stateEtag = null;
+			kitchen = guestKitchen ?? createNewUserState();
+			user = authenticatedUser;
+			kitchenSync?.prepare(authenticatedUser);
+			kitchenLoaded = true;
+			saveLastAccount(authenticatedUser);
+			if (guestKitchen) {
+				kitchen = guestKitchen;
+				kitchenSync?.stage(guestKitchen);
+				if (!syncErrors) {
+					clearGuestKitchen(localStorage);
+					clearGuestData(localStorage);
+				}
+			}
+			let stateLoaded = false;
+			try {
+				const saved = await request('/api/state');
+				if (guestKitchen) {
+					adoptKitchen(saved.state || createNewUserState());
+					if (!saved.state && !kitchenSync?.snapshot()) {
+						const created = await request('/api/state', { state: guestKitchen }, 'PUT');
+						adoptKitchen(created.state || guestKitchen);
+					} else {
+						await kitchenSync?.sync();
+					}
+				} else if (saved.state) {
+					adoptKitchen(saved.state);
+					if (online && kitchenSync?.snapshot()) await retrySync();
+				} else {
+					const initial = createNewUserState();
+					const created = await request('/api/state', { state: initial }, 'PUT');
+					adoptKitchen(created.state || initial);
+					if (online && kitchenSync?.snapshot()) await retrySync();
+				}
+				stateLoaded = true;
+			} catch (stateError) {
+				kitchenSync?.failLoad((stateError as Error).message);
+			}
+			syncing = false;
+			if (stateLoaded) {
+				await refreshConnections().catch(() =>
+					notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
+				);
+			}
 			if (resumeDialog) {
 				const target = resumeDialog;
 				resumeDialog = '';
 				modal = target;
 			} else {
 				modal = '';
-				if (authMode === 'register' && !kitchen.preferences.onboardingStatus) openOnboarding();
+				if (isRegister && stateLoaded && !kitchen.preferences.onboardingStatus) openOnboarding();
 			}
-			const firstName = user?.name.split(' ')[0] || 'chef';
-			if (guestKitchen && !migratedSynced) {
-				notify(
-					`Welcome, ${firstName}. Your kitchen is saved on this device and will sync when you reconnect.`
-				);
-			} else {
-				notify(`Welcome to your kitchen, ${firstName}.`);
-			}
+			const syncedCleanly =
+				stateLoaded && !(guestKitchen && (syncErrors || kitchenSync?.snapshot()));
+			const firstName = authenticatedUser.name.split(' ')[0] || 'chef';
+			notify(
+				syncedCleanly
+					? `Welcome to your kitchen, ${firstName}.`
+					: 'Account ready. Kitchen sync failed—your items are saved on this device.'
+			);
 		} catch (e) {
 			error = (e as Error).message;
 		} finally {
@@ -1304,6 +1648,7 @@
 			await flushKitchen();
 			await request('/api/auth', { action: 'logout' });
 			kitchenSync?.clearContext();
+			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
 			editingRecipe = null;
@@ -1318,15 +1663,13 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
+			pantryDraft = null;
+			resetPantryFilters();
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
-			clearInterval(connectionPoll);
-			connectionBusy = false;
-			chatGPTAuthorizationUrl = '';
-			chatGPTDevice = null;
-			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 			stateEtag = null;
 			syncing = false;
 			modal = '';
@@ -1338,14 +1681,17 @@
 
 	function clearAIConnectionState() {
 		connectionAttempt++;
+		connectionActive = false;
 		apiKey = '';
 		providers = [];
 		accountModels = [];
 		catalogVersion++;
 		catalogLoading = false;
 		catalogError = '';
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
@@ -1422,23 +1768,36 @@
 						document.getElementById(headingId)?.focus();
 					}
 				: undefined,
+			onAuthError: (e) => {
+				if (online || syncErrors) error = (e as Error).message;
+			},
 			onError: (e) => {
-				error = (e as Error).message;
+				error ||= (e as Error).message;
 			}
 		});
 	}
 	async function changeConnection(providerId?: string) {
 		if (providerId === kitchen.preferences.provider) return;
+		const currentDevice = chatGPTDevice;
 		connectionAttempt++;
+		connectionActive = false;
 		if (providerId && providerId !== kitchen.preferences.provider) {
 			apiKey = '';
 			kitchen.preferences.provider = providerId;
 		}
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
+		if (currentDevice && user) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
 		kitchen.preferences.model = '';
 		kitchen.preferences.reasoning = undefined;
 		accountModels = [];
@@ -1454,16 +1813,31 @@
 			openAuthentication();
 			return;
 		}
+		const currentDevice = chatGPTDevice;
 		const attempt = ++connectionAttempt;
 		const owner = user.id;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
+		if (currentDevice) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
+		connectionActive = true;
 		connectionBusy = true;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
 		error = '';
-		connectionPopup =
+		const popup =
 			chatGPT.mode === 'device'
 				? null
 				: window.open('about:blank', 'flavorithm-chatgpt-connect', 'popup,width=620,height=780');
+		connectionPopup = popup;
+		const isCurrentInSettings = () =>
+			attempt === connectionAttempt && user?.id === owner && modal === 'settings';
 		try {
 			const previousAccounts = new Map(chatGPT.accounts.map((a) => [a.id, a.updatedAt]));
 			const previous = JSON.stringify(chatGPT.accounts);
@@ -1472,51 +1846,83 @@
 				accountId,
 				reconsent
 			});
-			if (attempt !== connectionAttempt || user?.id !== owner) return;
+			if (!isCurrentInSettings()) {
+				popup?.close();
+				if (connectionPopup === popup) connectionPopup = null;
+				if (result?.kind === 'device' && user?.id === owner) {
+					void request('/api/connections/chatgpt', {
+						action: 'cancel',
+						loginId: result.loginId
+					}).catch(() => {});
+				}
+				return;
+			}
 			if (result.kind === 'device') {
 				chatGPTDevice = result;
-				clearInterval(connectionPoll);
-				let polling = false;
-				connectionPoll = setInterval(async () => {
-					if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-					polling = true;
-					try {
-						const connected = await request('/api/connections/chatgpt', {
-							action: 'poll',
-							loginId: result.loginId
-						});
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						if (connected.connected) {
-							clearInterval(connectionPoll);
+				connectionPoll = startConnectionPoll({
+					intervalMs: result.interval * 1000,
+					expiresAt: result.expiresAt,
+					attempt,
+					getAttempt: () => connectionAttempt,
+					owner,
+					getOwner: () => user?.id,
+					isOpen: () => modal === 'settings',
+					poll: async ({ expired, stop }) => {
+						try {
+							const connected = await request('/api/connections/chatgpt', {
+								action: 'poll',
+								loginId: result.loginId
+							});
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							if (connected.connected) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								await refreshConnections();
+								if (attempt !== connectionAttempt || user?.id !== owner) return false;
+								kitchen.preferences.chatgptAccountId = connected.accountId;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify('ChatGPT connected. Choose a model.');
+								return false;
+							}
+							if (expired) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								error = 'ChatGPT authorization expired. Start again.';
+								return false;
+							}
+						} catch (e) {
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							const status = (e as { status?: number }).status;
+							// Keep the original login alive through brief deployment/network outages.
+							if (
+								chatGPTDevice &&
+								!expired &&
+								Date.now() < result.expiresAt &&
+								(status === undefined || status === 429 || status >= 500)
+							)
+								return;
+							stop();
+							connectionActive = false;
 							connectionBusy = false;
 							chatGPTDevice = null;
-							await refreshConnections();
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							kitchen.preferences.chatgptAccountId = connected.accountId;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							notify('ChatGPT connected. Choose a model.');
+							error = (e as Error).message;
+							return false;
 						}
-					} catch (e) {
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						const status = (e as { status?: number }).status;
-						// Keep the original login alive through brief deployment/network outages.
-						if (
-							chatGPTDevice &&
-							Date.now() < result.expiresAt &&
-							(status === undefined || status === 429 || status >= 500)
-						)
-							return;
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTDevice = null;
-						error = (e as Error).message;
-					} finally {
-						polling = false;
 					}
-				}, result.interval * 1000);
+				});
 				return;
 			}
 
@@ -1530,67 +1936,90 @@
 			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
+				connectionActive = false;
 				window.location.assign(result.authorizationUrl);
 				return;
 			}
-			clearInterval(connectionPoll);
-			connectionPollCount = 0;
-			let polling = false;
-			connectionPoll = setInterval(async () => {
-				if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-				polling = true;
-				try {
-					await refreshConnections();
-					if (attempt !== connectionAttempt || user?.id !== owner) return;
-					connectionPollCount++;
-					const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
-					if (connectionChanged || connectionPopup?.closed) {
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTAuthorizationUrl = '';
-						chatGPTDevice = null;
-						const account = chatGPT.accounts.find(
-							(a) =>
-								a.connected &&
-								(accountId
-									? a.id === accountId
-									: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
-						);
-						if (account && connectionChanged) {
-							kitchen.preferences.chatgptAccountId = account.id;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							connectionPopup?.close();
-							notify(
-								account.planEnabled
-									? 'ChatGPT connected. Choose a model to cook with your plan.'
-									: 'ChatGPT signed in. Enable plan usage to generate recipes.'
-							);
-						} else if (!connectionChanged) {
-							notify('The authorization window closed. Your previous connection is unchanged.');
+			const expiresAt =
+				typeof result.expiresAt === 'number' ? result.expiresAt : Date.now() + CHATGPT_OAUTH_TTL_MS;
+			connectionPoll = startConnectionPoll({
+				intervalMs: CHATGPT_OAUTH_POLL_INTERVAL_MS,
+				expiresAt,
+				attempt,
+				getAttempt: () => connectionAttempt,
+				owner,
+				getOwner: () => user?.id,
+				isOpen: () => modal === 'settings',
+				poll: async ({ expired, stop }) => {
+					try {
+						await refreshConnections();
+						if (!isCurrentInSettings()) {
+							stop();
+							return false;
 						}
-					}
-					if (connectionPollCount >= 400) {
-						clearInterval(connectionPoll);
+						const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
+						if (connectionChanged || connectionPopup?.closed) {
+							stop();
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							const account = chatGPT.accounts.find(
+								(a) =>
+									a.connected &&
+									(accountId
+										? a.id === accountId
+										: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
+							);
+							if (account && connectionChanged) {
+								connectionPopup?.close();
+								connectionPopup = null;
+								kitchen.preferences.chatgptAccountId = account.id;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify(
+									account.planEnabled
+										? 'ChatGPT connected. Choose a model to cook with your plan.'
+										: 'ChatGPT signed in. Enable plan usage to generate recipes.'
+								);
+							} else if (!connectionChanged) {
+								connectionPopup = null;
+								notify('The authorization window closed. Your previous connection is unchanged.');
+							}
+							return false;
+						}
+						if (expired) {
+							stop();
+							connectionPopup?.close();
+							connectionPopup = null;
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							error = 'The connection window timed out. Try connecting again.';
+							return false;
+						}
+					} catch (e) {
+						stop();
+						if (!isCurrentInSettings()) return false;
+						connectionPopup?.close();
+						connectionPopup = null;
+						connectionActive = false;
 						connectionBusy = false;
 						chatGPTAuthorizationUrl = '';
 						chatGPTDevice = null;
-						error = 'The connection window timed out. Try connecting again.';
+						error = (e as Error).message;
+						return false;
 					}
-				} catch (e) {
-					clearInterval(connectionPoll);
-					connectionBusy = false;
-					chatGPTAuthorizationUrl = '';
-					chatGPTDevice = null;
-					error = (e as Error).message;
-				} finally {
-					polling = false;
 				}
-			}, 1500);
+			});
 		} catch (e) {
-			connectionPopup?.close();
+			popup?.close();
+			if (connectionPopup === popup) connectionPopup = null;
+			if (!isCurrentInSettings()) return;
+			connectionActive = false;
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
 			chatGPTDevice = null;
@@ -1600,10 +2029,15 @@
 	async function cancelChatGPTDevice() {
 		const current = chatGPTDevice;
 		connectionAttempt++;
-		clearInterval(connectionPoll);
+		connectionActive = false;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
+		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
-		if (current) {
+		if (current && user) {
 			try {
 				await request('/api/connections/chatgpt', { action: 'cancel', loginId: current.loginId });
 			} catch {
@@ -1686,7 +2120,9 @@
 				...(action === 'capture' || action === 'chat'
 					? {}
 					: {
-							pantry: kitchen.pantry.filter((item) => expiryStatus(item.expires) !== 'expired'),
+							pantry: kitchen.pantry.filter(
+								(item) => item.quantity > 0 && expiryStatus(item.expires) !== 'expired'
+							),
 							preferences: kitchen.preferences,
 							recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
 							prompt
@@ -1704,7 +2140,15 @@
 	);
 	$effect(() => {
 		if (!voiceTarget) return;
-		if (voiceBusy && !isVoiceTargetActive(voiceTarget, { modal, page, overlay: voiceOverlay })) {
+		if (
+			voiceBusy &&
+			!isVoiceTargetActive(voiceTarget, {
+				modal,
+				page,
+				overlay: voiceOverlay,
+				reviewingDraft: isReviewingImportDraft(importSession)
+			})
+		) {
 			clearVoiceSession();
 		} else if (voiceTarget === 'shopping' && page !== 'shopping') {
 			clearVoiceSession();
@@ -1845,7 +2289,7 @@
 				void openLeaveHousehold();
 				break;
 			case 'scan':
-				if (!scanBusy) imageInput?.click();
+				if (!scanBusy && !busy && !voiceBusy) imageInput?.click();
 				break;
 			case 'dictate':
 				dictateRecipe();
@@ -1891,37 +2335,13 @@
 		if (input) input.value = '';
 		if (imageInput) imageInput.value = '';
 		if (!file || scanBusy || busy || voiceBusy || !needAI()) return;
-		if (file.size > 5 * 1024 * 1024) {
-			notify('Choose a photo under 5 MB.');
-			return;
-		}
 		const generation = ++scanGeneration;
 		const currentController = new AbortController();
 		scanController = currentController;
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
 		scanBusy = true;
 		try {
-			const image = await new Promise<string>((resolve, reject) => {
-				const reader = new FileReader();
-				const onAbort = () => {
-					reader.abort();
-					reject(new DOMException('Scan aborted.', 'AbortError'));
-				};
-				if (currentController.signal.aborted) {
-					onAbort();
-					return;
-				}
-				currentController.signal.addEventListener('abort', onAbort, { once: true });
-				reader.onload = () => {
-					currentController.signal.removeEventListener('abort', onAbort);
-					resolve(String(reader.result));
-				};
-				reader.onerror = () => {
-					currentController.signal.removeEventListener('abort', onAbort);
-					reject(new Error('Could not read that photo. Try another file.'));
-				};
-				reader.readAsDataURL(file);
-			});
+			const image = await prepareAIPhoto(file, { signal: currentController.signal });
 			const result = await ai('vision', { image }, currentController.signal);
 			if (
 				generation !== scanGeneration ||
@@ -1958,7 +2378,7 @@
 				notify(
 					currentController.signal.aborted
 						? 'Photo scan cancelled.'
-						: e instanceof Error
+						: e instanceof Error && e.message
 							? e.message
 							: 'Could not recognize ingredients from that photo.'
 				);
@@ -1968,18 +2388,63 @@
 				scanBusy = false;
 				scanController = undefined;
 			}
+			if (input) input.value = '';
 			if (imageInput) imageInput.value = '';
 		}
 	}
-	function clearVoiceSession() {
-		voiceCapture?.cancel();
+	function isFocusManagedByVoice(): boolean {
+		if (typeof document === 'undefined') return false;
+		const active = document.activeElement;
+		return (
+			!active ||
+			active === document.body ||
+			active === voiceReturnFocus ||
+			active === shoppingMicButton ||
+			Boolean(voiceSessionEl?.contains(active))
+		);
+	}
+	function scheduleVoiceIdleFocus(endedTarget: VoiceTarget | '', restoreEl: HTMLElement | null) {
+		if (!endedTarget || !restoreEl) return;
+		void tick().then(() => {
+			if (
+				!voiceBusy &&
+				!voiceRetained &&
+				isVoiceTargetActive(endedTarget, {
+					modal,
+					page,
+					overlay: voiceOverlay,
+					reviewingDraft: isReviewingImportDraft(importSession)
+				}) &&
+				restoreEl.isConnected &&
+				!(restoreEl as HTMLButtonElement).disabled
+			) {
+				restoreEl.focus();
+			}
+		});
+	}
+	function clearVoiceSession(restoreFocus = true) {
+		const { endedTarget, restoreEl, shouldRestore } = untrack(() => {
+			const target = voiceTarget;
+			const el = target === 'shopping' ? (shoppingMicButton ?? voiceReturnFocus) : voiceReturnFocus;
+			return {
+				endedTarget: target,
+				restoreEl: el,
+				shouldRestore: restoreFocus && Boolean(target) && isFocusManagedByVoice()
+			};
+		});
+		const current = voiceCapture;
 		voiceCapture = undefined;
+		current?.cancel();
 		voiceStarting = false;
 		voiceState = 'idle';
 		voiceRetained = false;
 		voiceError = '';
 		voiceTarget = '';
+		voiceReturnFocus = null;
 		activeVoiceImportSession = undefined;
+		if (shouldRestore) {
+			scheduleVoiceIdleFocus(endedTarget, restoreEl);
+		}
 	}
 	function openVoiceSettings() {
 		if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
@@ -2019,7 +2484,10 @@
 			return;
 		}
 		voiceError = '';
-		if (voiceTarget === 'import') activeVoiceImportSession = importSession;
+		if (voiceTarget === 'import') {
+			importSession.reviewingDraft = false;
+			activeVoiceImportSession = importSession;
+		}
 		await voiceCapture.retry({
 			provider: plan.provider,
 			model: voiceModel,
@@ -2027,19 +2495,19 @@
 		});
 	}
 	function dictate() {
+		if (voiceBusy) return;
 		void startDictation('pantry');
 	}
 	function dictateRecipe() {
+		if (voiceBusy) return;
 		void startDictation('import');
 	}
 	function dictateShopping() {
+		if (voiceBusy) return;
 		void startDictation('shopping');
 	}
 	async function startDictation(target: VoiceTarget) {
 		if (voiceBusy) return;
-		if (target === 'import' && modal !== 'import') {
-			openImport(importSession.draft ? '' : undefined);
-		}
 		const plan = planVoiceStart({
 			target,
 			modal,
@@ -2060,10 +2528,16 @@
 			notify(plan.message);
 			return;
 		}
-		clearVoiceSession();
+		const activeEl =
+			typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+				? document.activeElement
+				: null;
+		clearVoiceSession(false);
 		resumeDialog = '';
+		voiceReturnFocus = target === 'shopping' ? (shoppingMicButton ?? activeEl) : activeEl;
 		if (target === 'import') {
-			if (modal !== 'import') openImport(importSession.draft ? '' : undefined);
+			importSession.reviewingDraft = false;
+			if (modal !== 'import') openImport();
 		} else if (target === 'pantry') {
 			mobileNav = false;
 			error = '';
@@ -2081,10 +2555,46 @@
 		const capture = new VoiceCapture({
 			state: (value) => {
 				if (voiceCapture !== capture) return;
+				const focusInVoiceUi = isFocusManagedByVoice();
 				voiceState = value;
-				if (value === 'idle') {
+				if (value === 'recording') {
+					if (focusInVoiceUi) {
+						void tick().then(() => {
+							if (voiceCapture === capture && voiceState === 'recording') {
+								voiceStopButton?.focus();
+							}
+						});
+					}
+				} else if (value === 'transcribing') {
+					if (focusInVoiceUi) {
+						void tick().then(() => {
+							if (voiceCapture === capture && voiceState === 'transcribing') {
+								voiceCancelButton?.focus();
+							}
+						});
+					}
+				} else if (value === 'idle') {
 					voiceStarting = false;
-					if (!capture.hasRetainedAudio) voiceTarget = '';
+					if (capture.hasRetainedAudio) {
+						if (focusInVoiceUi) {
+							void tick().then(() => {
+								if (voiceCapture === capture && voiceRetained) {
+									voiceRetryButton?.focus();
+								}
+							});
+						}
+					} else {
+						const endedTarget = voiceTarget;
+						const restoreEl =
+							endedTarget === 'shopping'
+								? (shoppingMicButton ?? voiceReturnFocus)
+								: voiceReturnFocus;
+						voiceTarget = '';
+						voiceReturnFocus = null;
+						if (focusInVoiceUi) {
+							scheduleVoiceIdleFocus(endedTarget, restoreEl);
+						}
+					}
 				}
 			},
 			retained: (value) => {
@@ -2093,20 +2603,39 @@
 			text: (text) => {
 				if (
 					voiceCapture !== capture ||
-					user?.id !== owner ||
 					voiceTarget !== target ||
-					!isVoiceTargetActive(target, { modal, page, overlay: voiceOverlay })
+					!isVoiceTargetActive(target, {
+						modal,
+						page,
+						overlay: voiceOverlay,
+						reviewingDraft: isReviewingImportDraft(importSession)
+					})
 				)
 					return;
-				voiceError = '';
 				if (target === 'import') {
-					if (importSession !== activeVoiceImportSession || importSession.draft) return;
-					importSession.text = appendVoiceTranscript(importSession.text, text, '\n', 20000);
+					if (
+						!activeVoiceImportSession ||
+						!canAppendImportTranscript({
+							modal,
+							currentSession: importSession,
+							startedSession: activeVoiceImportSession,
+							currentUserId: user?.id,
+							startedUserId: owner
+						})
+					)
+						return;
+					voiceError = '';
+					importSession.text = appendDictatedText('import', importSession.text, text);
 				} else if (target === 'pantry') {
-					pantryInput = appendVoiceTranscript(pantryInput, text, ', ', 20000);
+					if (user?.id !== owner) return;
+					voiceError = '';
+					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
 				} else {
-					shoppingText = appendVoiceTranscript(shoppingText, text, ', ', 2000);
+					if (user?.id !== owner) return;
+					voiceError = '';
+					shoppingText = appendDictatedText('shopping', shoppingText, text);
+					shoppingVoiceInput = true;
 					notify('Review your items, then add them.');
 				}
 			},
@@ -2118,12 +2647,28 @@
 			}
 		});
 		voiceCapture = capture;
+		void tick().then(() => {
+			if (voiceCapture === capture && isFocusManagedByVoice()) {
+				if (voiceState === 'recording') voiceStopButton?.focus();
+				else if (voiceStarting) voiceCancelButton?.focus();
+			}
+		});
 		try {
 			await capture.start({ provider: plan.provider, model: voiceModel, apiKey: voiceApiKey });
 		} finally {
 			if (voiceCapture === capture) {
+				const focusInVoiceUi = isFocusManagedByVoice();
 				voiceStarting = false;
-				if (voiceState === 'idle' && !capture.hasRetainedAudio) voiceTarget = '';
+				if (voiceState === 'idle' && !capture.hasRetainedAudio) {
+					const endedTarget = voiceTarget;
+					const restoreEl =
+						endedTarget === 'shopping' ? (shoppingMicButton ?? voiceReturnFocus) : voiceReturnFocus;
+					voiceTarget = '';
+					voiceReturnFocus = null;
+					if (focusInVoiceUi) {
+						scheduleVoiceIdleFocus(endedTarget, restoreEl);
+					}
+				}
 			}
 		}
 	}
@@ -2178,6 +2723,7 @@
 			selectedMealServings = undefined;
 			selected = kitchen.recipes.find((item) => item.id === saved.id) ?? saved;
 			page = 'saved';
+			priorityPantryIds = [];
 			query = '';
 			filter = 'For you';
 			notify('Recipe saved to your collection.');
@@ -2223,20 +2769,57 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
-	function weekOffsetForDate(value: string) {
-		const target = new Date(`${value}T12:00:00`);
-		if (Number.isNaN(target.getTime())) return weekOffset;
-		target.setDate(target.getDate() - ((target.getDay() + 6) % 7));
-		const currentMonday = new Date();
-		currentMonday.setHours(12, 0, 0, 0);
-		currentMonday.setDate(currentMonday.getDate() - ((currentMonday.getDay() + 6) % 7));
-		const utcTarget = Date.UTC(target.getFullYear(), target.getMonth(), target.getDate());
-		const utcCurrent = Date.UTC(
-			currentMonday.getFullYear(),
-			currentMonday.getMonth(),
-			currentMonday.getDate()
-		);
-		return Math.round((utcTarget - utcCurrent) / (7 * 86_400_000));
+	function weekOffsetForDate(value: string, today = new Date()) {
+		const start = weekStartForDate(value);
+		if (start === value && Number.isNaN(new Date(`${value}T12:00:00`).getTime())) return weekOffset;
+		return weekOffsetFromStarts(start, weekStartForDate(dateKey(today)));
+	}
+	async function scrollCalendarToDate(targetDate: string, instant = false) {
+		const token = ++calendarScrollToken;
+		await tick();
+		if (
+			token !== calendarScrollToken ||
+			page !== 'planner' ||
+			!calendarGrid?.isConnected ||
+			typeof window === 'undefined' ||
+			typeof window.matchMedia !== 'function' ||
+			!window.matchMedia('(max-width: 900px)').matches ||
+			calendarGrid.scrollWidth <= calendarGrid.clientWidth
+		) {
+			return;
+		}
+		const dayCard =
+			Array.from(calendarGrid.querySelectorAll<HTMLElement>('.calendar-day')).find(
+				(day) => day.dataset.date === targetDate
+			) ??
+			(targetDate === dateKey(new Date())
+				? calendarGrid.querySelector<HTMLElement>('.calendar-day.today')
+				: null);
+		if (!dayCard) return;
+		const gridRect = calendarGrid.getBoundingClientRect();
+		const dayRect = dayCard.getBoundingClientRect();
+		const styles = window.getComputedStyle(calendarGrid);
+		const scrollPaddingStart =
+			Number.parseFloat(styles.scrollPaddingInlineStart) ||
+			Number.parseFloat(styles.scrollPaddingLeft) ||
+			0;
+		const left = calendarDayScrollLeft({
+			dayLeft: dayRect.left,
+			gridLeft: gridRect.left,
+			clientLeft: calendarGrid.clientLeft,
+			scrollLeft: calendarGrid.scrollLeft,
+			scrollPaddingStart,
+			scrollWidth: calendarGrid.scrollWidth,
+			clientWidth: calendarGrid.clientWidth
+		});
+		calendarGrid.scrollTo({
+			left,
+			behavior: instant || prefersReducedMotion() ? 'instant' : 'smooth'
+		});
+	}
+	function showCurrentWeek() {
+		weekOffset = 0;
+		void scrollCalendarToDate(dateKey(new Date()));
 	}
 	function resetMealDialogState() {
 		pickingForSlot = false;
@@ -2262,6 +2845,8 @@
 		);
 		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -2273,6 +2858,8 @@
 		kitchen.shopping = kitchen.shopping.filter(
 			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
 		);
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		if (kitchen.preferences.ratings) {
 			const ratings = { ...kitchen.preferences.ratings };
 			delete ratings[recipe.id];
@@ -2290,101 +2877,23 @@
 		if (sourceKey?.startsWith('week:')) return 'Meal plan';
 		return 'Added by you';
 	}
-	function normalizePantryItem(item: AppState['pantry'][number]) {
-		const draft = pantryDrafts[item.id];
-		delete pantryDrafts[item.id];
-		if (!kitchen.pantry.some((entry) => entry.id === item.id)) return;
-		const rawQuantity = draft ? draft.quantity : item.quantity;
-		const parsed =
-			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
-				? 0
-				: Number(rawQuantity);
-		const clamped = Number.isFinite(parsed) ? Math.min(1_000_000, Math.max(0, parsed)) : 0;
-		item.quantity = Object.is(clamped, -0) ? 0 : clamped;
-		const rawUnit = draft ? draft.unit : item.unit;
-		item.unit =
-			String(rawUnit ?? '')
-				.trim()
-				.slice(0, 40) || 'piece';
-		item.expires = item.expires?.trim().slice(0, 50) || undefined;
-	}
-	function startEditingShoppingItem(item: AppState['shopping'][number]) {
-		if (editingShoppingId && editingShoppingId !== item.id) {
-			const previous = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (previous) normalizeShoppingItem(previous);
-		}
-		editingShoppingId = item.id;
-		editingShoppingDraft = {
-			id: item.id,
-			name: item.name,
-			quantity: item.quantity,
-			unit: item.unit
-		};
-	}
-	function finishEditingShoppingItem(item: AppState['shopping'][number]) {
-		normalizeShoppingItem(item);
-		editingShoppingId = '';
-		editingShoppingDraft = null;
-	}
-	function normalizeShoppingItem(item: AppState['shopping'][number]) {
-		const draft = editingShoppingDraft?.id === item.id ? editingShoppingDraft : null;
-		const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
-		const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
-		const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
-		const rawQuantity = draft ? draft.quantity : item.quantity;
-		const parsed =
-			rawQuantity === null || rawQuantity === undefined || String(rawQuantity).trim() === ''
-				? Number.NaN
-				: Number(rawQuantity);
-		const fallbackQuantity =
-			Number.isFinite(item.quantity) && item.quantity >= 0.01 && item.quantity <= 1_000_000
-				? item.quantity
-				: 1;
-		const quantity = Number.isFinite(parsed)
-			? Math.max(0.01, Math.min(parsed, 1_000_000))
-			: fallbackQuantity;
-		item.name = name;
-		item.unit = unit;
-		item.quantity = quantity;
-		if (draft) {
-			draft.name = name;
-			draft.unit = unit;
-			draft.quantity = quantity;
-		}
-	}
 	function commitInlineEdits() {
-		for (const id of Object.keys(pantryDrafts)) {
-			const item = kitchen.pantry.find((entry) => entry.id === id);
-			if (item) normalizePantryItem(item);
-			else delete pantryDrafts[id];
-		}
+		if (pantryDraft) void savePantryEdit(false);
 		if (editingShoppingId) {
 			const item = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
-			if (item) normalizeShoppingItem(item);
-			editingShoppingId = '';
-			editingShoppingDraft = null;
+			if (item) applyShoppingEdit(item);
+			clearEditingShoppingState();
 		}
 	}
 	function addShoppingQuickItem() {
 		const raw = shoppingText.trim();
 		if (!raw) return;
-		const segments = raw
-			.split(/[,\n;]/)
-			.map((segment) => segment.trim().replace(/\.+$/, '').trim())
-			.filter(Boolean);
-		if (
-			segments.some((segment, index) => {
-				const cleaned =
-					segments.length > 1 && index > 0 ? segment.replace(/^and\s+/i, '').trim() : segment;
-				return /^0+(?:\.0+)?(?:\s*(?:g|grams?|kg|kilograms?|mg|oz|ounces?|lbs?|pounds?|ml|milliliters?|millilitres?|l|liters?|litres?|cups?|tbsp|tablespoons?|tsp|teaspoons?|pt|pints?|qt|quarts?|gal|gallons?|pieces?|whole|each|cans?|cloves?|bunch(?:es)?|heads?|slices?|loaf|loaves|bottles?|packs?|packages?|bags?|boxes?|jars?)\s+|\s+).+/i.test(
-					cleaned
-				);
-			})
-		) {
-			notify('Enter a quantity above zero.');
+		const parsed = parseQuickShoppingItems(raw, { split: shoppingVoiceInput });
+		if (parsed.error) {
+			notify(parsed.error);
 			return;
 		}
-		const additions = parseQuickShoppingItems(raw);
+		const additions = parsed.items;
 		if (!additions.length) return;
 		if (kitchen.shopping.length >= 1_000) {
 			notify('Your shopping list can hold up to 1,000 items.');
@@ -2399,6 +2908,7 @@
 			kitchen.shopping.splice(firstCheckedIndex, 0, ...accepted);
 		}
 		shoppingText = '';
+		shoppingVoiceInput = false;
 		if (accepted.length < additions.length) {
 			notify('Your shopping list can hold up to 1,000 items.');
 		}
@@ -2457,6 +2967,7 @@
 			notify('Enter a valid serving count before making a shopping list.');
 			return;
 		}
+		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
 		selected = null;
@@ -2497,11 +3008,13 @@
 			kitchen.meals.push(created);
 			refreshWeekShopping(scheduledWeek);
 			weekOffset = weekOffsetForDate(scheduledDate);
+			if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 			selectedMealServings = undefined;
 			selected = null;
 			resetMealDialogState();
 			modal = '';
 			page = 'planner';
+			void scrollCalendarToDate(scheduledDate);
 			notify(`${recipe.title} scheduled.`, () => {
 				const existing = kitchen.meals.find((entry) => entry.id === created.id);
 				if (!existing) return;
@@ -2549,6 +3062,7 @@
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
 		modal = '';
+		void scrollCalendarToDate(updatedDate);
 		notify('Meal plan updated.');
 	}
 	function openCookDialog(meal: Meal) {
@@ -2586,15 +3100,81 @@
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
-	async function useFirstIngredients(items: AppState['pantry']) {
-		const names = items
-			.filter((item) => expiryStatus(item.expires) === 'soon' && item.quantity > 0)
-			.map((item) => item.name.trim())
-			.filter(Boolean);
-		if (!names.length) return;
+	function restockPantryItems(selectedIds?: string[]) {
+		commitInlineEdits();
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const result = restockDepletedPantryItems(kitchen.pantry, kitchen.shopping, selectedIds);
+		if (!result.restockedCount) return;
+		kitchen.pantry = result.pantry;
+		kitchen.shopping = result.shopping;
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
+		const singleName =
+			selectedIds?.length === 1
+				? previousPantry.find((item) => item.id === selectedIds[0])?.name
+				: undefined;
+		const message = singleName
+			? result.addedCount
+				? `${singleName} added to your shopping list.`
+				: `${singleName} is already on your shopping list.`
+			: result.addedCount
+				? `${result.addedCount} depleted item${result.addedCount === 1 ? '' : 's'} added to your shopping list.`
+				: 'Depleted items are already on your shopping list.';
+		notify(message, () => {
+			if (
+				JSON.stringify(kitchen.pantry) === appliedPantry &&
+				JSON.stringify(kitchen.shopping) === appliedShopping
+			) {
+				kitchen.pantry = previousPantry;
+				kitchen.shopping = previousShopping;
+				if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+					clearEditingShoppingState();
+			} else {
+				notify('Your kitchen changed again. Review the current items before editing.');
+			}
+		});
+	}
+	function useFirstIngredients(items: AppState['pantry']) {
+		commitInlineEdits();
+		const targetIds = new Set(items.map((item) => item.id));
+		const targets = kitchen.pantry.filter(
+			(item) =>
+				targetIds.has(item.id) &&
+				expiryStatus(item.expires) === 'soon' &&
+				Number.isFinite(item.quantity) &&
+				item.quantity > 0 &&
+				item.name.trim()
+		);
+		if (!targets.length) return;
+		const names = targets.map((item) => item.name.trim());
 		prompt = `Use these ingredients first, prioritizing them because they are expiring: ${names.join(', ')}. Build a practical recipe that uses as much of them as possible while following my preferences.`;
-		modal = 'generate';
-		await generate();
+		priorityPantryIds = targets.map((item) => item.id);
+		query = '';
+		lastActivePill = 'filter';
+		filter = PANTRY_FILTER;
+		navigate('discover');
+	}
+	function cookFromPantry() {
+		commitInlineEdits();
+		const stockedNames = kitchen.pantry
+			.filter(
+				(item) =>
+					Number.isFinite(item.quantity) &&
+					item.quantity > 0 &&
+					expiryStatus(item.expires) !== 'expired' &&
+					!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown') &&
+					item.name.trim()
+			)
+			.map((item) => item.name.trim());
+		prompt = stockedNames.length
+			? `Build practical recipes around what is currently in my pantry: ${stockedNames.slice(0, 12).join(', ')}.`
+			: '';
+		priorityPantryIds = [];
+		query = '';
+		lastActivePill = 'filter';
+		filter = PANTRY_FILTER;
+		navigate('discover');
 	}
 	function addMeal(event?: SubmitEvent) {
 		event?.preventDefault();
@@ -2613,11 +3193,13 @@
 		});
 		refreshWeekShopping(weekStartForDate(scheduledDate));
 		weekOffset = weekOffsetForDate(scheduledDate);
+		if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 		selectedMealServings = undefined;
 		selected = null;
 		resetMealDialogState();
 		modal = '';
 		page = 'planner';
+		void scrollCalendarToDate(scheduledDate);
 		notify('Meal scheduled.');
 	}
 	function applyHouseholdRoster(data: {
@@ -2744,6 +3326,7 @@
 		const confirmed = confirmReplace === true;
 		householdBusy = true;
 		error = '';
+		let joinedHousehold = false;
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -2756,6 +3339,12 @@
 						...(confirmed ? { confirmReplace: true } : {})
 					}),
 				onMutated: () => {
+					joinedHousehold = true;
+					kitchenSync?.clearContext();
+					clearAIConnectionState();
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = createNewUserState();
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -2776,6 +3365,7 @@
 				modal = 'confirmJoin';
 				return;
 			}
+			if (joinedHousehold) modal = 'household';
 			error = err.message;
 		} finally {
 			syncing = false;
@@ -2798,6 +3388,16 @@
 		}
 	}
 	function closeDialog() {
+		if (
+			modal === 'settings' &&
+			(connectionActive ||
+				connectionPoll?.active ||
+				connectionPopup ||
+				chatGPTDevice ||
+				chatGPTAuthorizationUrl)
+		) {
+			void cancelChatGPTDevice();
+		}
 		if (modal === 'plan') {
 			selected = null;
 			selectedMealServings = undefined;
@@ -2839,8 +3439,18 @@
 	}
 	function importRecipe(url: string) {
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = { ...emptyImportSession(), url };
+		const { session, previous } = replaceImportSessionWithUrl($state.snapshot(importSession), url);
+		importSession = session;
 		openImport();
+		if (previous) {
+			notify('Recipe link loaded. Undo to restore your previous import.', () => {
+				if (voiceTarget === 'import') clearVoiceSession();
+				importSession = cloneImportSession(previous);
+				resumeDialog = '';
+				error = '';
+				modal = 'import';
+			});
+		}
 	}
 	async function captureImport(
 		input: { url?: string; prompt: string; image?: string },
@@ -2853,22 +3463,51 @@
 		return ai('capture', input, signal);
 	}
 	function saveImportedRecipe(recipe: Recipe) {
-		const nutritionStale =
-			recipe.nutritionStale ?? isDraftNutritionStale(recipe, importSession.baseline);
-		const saved = { ...recipe, saved: true, nutritionStale };
-		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+		const previousPage = page;
+		const previousQuery = query;
+		const previousFilter = filter;
+		const applied = applyImportedRecipeSave(
+			$state.snapshot(kitchen),
+			$state.snapshot(importSession),
+			recipe
+		);
+		kitchen.recipes = applied.nextRecipes;
 		if (voiceTarget === 'import') clearVoiceSession();
-		importSession = emptyImportSession();
+		importSession = applied.nextSession;
 		resumeDialog = '';
 		modal = '';
-		selected = saved;
+		selected = applied.saved;
 		page = 'saved';
 		query = '';
 		filter = 'For you';
 		notify(
-			nutritionStale
+			applied.saved.nutritionStale
 				? 'Recipe saved to your collection. Refresh its nutrition estimate.'
-				: 'Recipe saved to your collection.'
+				: 'Recipe saved to your collection.',
+			() => {
+				const rolledBack = applied.rollback($state.snapshot(kitchen));
+				if (!rolledBack.ok) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				if (voiceTarget === 'import') clearVoiceSession();
+				kitchen = rolledBack.kitchen;
+				if (selected?.id === applied.saved.id) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				if (editingRecipeMode === 'edit' && editingRecipe?.id === applied.saved.id) {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}
+				importSession = rolledBack.session;
+				resumeDialog = '';
+				error = '';
+				page = previousPage;
+				query = previousQuery;
+				filter = previousFilter;
+				modal = 'import';
+			}
 		);
 	}
 	async function exportKitchen() {
@@ -2905,6 +3544,7 @@
 				}
 			}
 			kitchenSync?.clearContext();
+			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
 			editingRecipe = null;
@@ -2919,11 +3559,12 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
-			apiKey = '';
+			clearAIConnectionState();
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
 			modal = '';
@@ -2986,6 +3627,7 @@
 		busy = true;
 		householdBusy = true;
 		error = '';
+		let leftHousehold = false;
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -2993,6 +3635,12 @@
 			await runHouseholdTransition({
 				mutateHousehold: () => request('/api/household', { action: 'leave' }),
 				onMutated: () => {
+					leftHousehold = true;
+					kitchenSync?.clearContext();
+					clearAIConnectionState();
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = createNewUserState();
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -3008,6 +3656,7 @@
 			notify('You now have your own kitchen.');
 		} catch (e) {
 			syncing = false;
+			if (leftHousehold) modal = 'household';
 			error = (e as Error).message;
 		} finally {
 			syncing = false;
@@ -3067,7 +3716,7 @@
 </script>
 
 {#snippet voiceSession()}
-	{#if voiceBusy}<div class="voice-session" in:revealMotion>
+	{#if voiceBusy}<div class="voice-session" bind:this={voiceSessionEl} in:revealMotion>
 			<p role="status" aria-live="polite">
 				{voiceStarting
 					? 'Opening microphone…'
@@ -3077,14 +3726,22 @@
 			</p>
 			<div class="dialog-actions">
 				{#if voiceState === 'recording'}<button
+						bind:this={voiceStopButton}
 						type="button"
 						class="primary"
 						onclick={() => voiceCapture?.stop()}>Stop recording</button
-					>{/if}<button type="button" class="secondary" onclick={clearVoiceSession}
-					>Cancel voice</button
+					>{/if}<button
+					bind:this={voiceCancelButton}
+					type="button"
+					class="secondary"
+					onclick={() => clearVoiceSession()}>Cancel voice</button
 				>
 			</div>
-		</div>{:else if voiceRetained}<div class="voice-session voice-recovery" in:revealMotion>
+		</div>{:else if voiceRetained}<div
+			class="voice-session voice-recovery"
+			bind:this={voiceSessionEl}
+			in:revealMotion
+		>
 			<p class="voice-error-copy" role="alert">
 				{voiceError || 'Voice transcription failed. Your recording is ready to retry.'}
 			</p>
@@ -3093,6 +3750,7 @@
 			</p>
 			<div class="dialog-actions voice-recovery-actions">
 				<button
+					bind:this={voiceRetryButton}
 					class="primary"
 					type="button"
 					onclick={() => {
@@ -3130,11 +3788,19 @@
 <svelte:window
 	onkeydown={(e) => {
 		if (e.key === 'Escape') {
+			const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
+			if (!overlayOpen && pantryDraft) {
+				void cancelPantryEdit();
+			}
 			mobileNav = false;
 			closeDialog();
 			selected = null;
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
+			if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
+				e.preventDefault();
+				void cancelEditingShoppingItem();
+			}
 		}
 	}}
 />
@@ -3235,6 +3901,7 @@
 			{#if user}<SyncStatus
 					{kitchen}
 					{online}
+					ready={syncReady}
 					pending={pendingSync}
 					syncing={sendingSync}
 					{conflicts}
@@ -3338,8 +4005,9 @@
 					<div class="section-heading">
 						<div>
 							<h2>
-								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span class="small-spark"
-									>✷</span
+								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span
+									class="small-spark"
+									aria-hidden="true">✷</span
 								>
 							</h2>
 						</div>
@@ -3365,16 +4033,19 @@
 							class:can-scroll-right={filterOverflow.right}
 						>
 							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
-								{#each ['For you', 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
+								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
 										type="button"
 										data-filter={item}
 										class:active={filter === item}
 										aria-pressed={filter === item}
 										onclick={() => {
 											lastActivePill = 'filter';
+											priorityPantryIds = [];
 											filter = item;
 										}}
-										>{#if item === 'For you'}<Sparkles size={14} />{/if}{item}</button
+										>{#if item === 'For you'}<Sparkles
+												size={14}
+											/>{:else if item === PANTRY_FILTER}<Carrot size={14} />{/if}{item}</button
 									>{/each}
 								<button
 									type="button"
@@ -3402,6 +4073,32 @@
 								>{/if}
 						</div>
 					</div>
+					{#if filter === PANTRY_FILTER}
+						<div class="discover-pantry-bar">
+							<span>
+								{#if activePriorityPantry.length}
+									Prioritizing expiring ingredients: <b
+										>{activePriorityPantry.map((item) => item.name).join(', ')}</b
+									>
+								{:else}
+									Showing local recipes matching your stocked pantry ingredients.
+								{/if}
+							</span>
+							<div class="discover-pantry-actions">
+								{#if activePriorityPantry.length}<button
+										class="text-button"
+										onclick={() => (priorityPantryIds = [])}>All pantry matches</button
+									>{/if}
+								<button
+									class="secondary"
+									onclick={() => {
+										modal = 'generate';
+										error = '';
+									}}><Sparkles size={16} /> Generate with AI</button
+								>
+							</div>
+						</div>
+					{/if}
 					<div class="recipe-grid">
 						{#each recipes as recipe, i (recipe.id)}<article
 								class="recipe-card"
@@ -3422,9 +4119,7 @@
 											alt={recipe.title}
 											loading={i > 2 ? 'lazy' : 'eager'}
 										/></button
-									>{#if recipe.hidden || recipe.tags[0] || recipe.cuisine}<span class="recipe-badge"
-											>{recipe.hidden ? 'Hidden' : recipe.tags[0] || recipe.cuisine}</span
-										>{/if}<button
+									><button
 										class:saved={recipe.saved}
 										class="save-recipe"
 										onclick={() => saveRecipe(recipe)}
@@ -3446,6 +4141,10 @@
 										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
 									<p>{recipe.description}</p>
+									{#if recipe.hidden || recipe.tags.length}<ul class="recipe-tags">
+											{#if recipe.hidden}<li class="recipe-badge">Hidden</li>{/if}
+											{#each recipe.tags as tag}<li class="recipe-badge">{tag}</li>{/each}
+										</ul>{/if}
 									<div class="recipe-meta">
 										<span><Clock size={14} />{recipe.time} min</span>{#if recipe.difficulty}<span
 												><ChefHat size={14} />{recipe.difficulty}</span
@@ -3475,7 +4174,9 @@
 								<p>
 									{page === 'saved'
 										? 'Your current search or filters hid your saved recipes.'
-										: 'No recipes match your current search or filters.'}
+										: filter === PANTRY_FILTER
+											? 'No local recipes match those pantry ingredients yet. Reset filters or generate with AI.'
+											: 'No recipes match your current search or filters.'}
 								</p>
 								<button type="button" class="secondary" onclick={resetRecipeFilters}
 									>Reset filters</button
@@ -3507,11 +4208,19 @@
 				</section>
 				<div class="pantry-summary">
 					<span><b>{kitchen.pantry.length}</b> ingredients</span>
-					{#if kitchen.pantry.some((item) => item.quantity === 0)}<button
-							class="text-button"
-							onclick={() => {
-								kitchen.pantry = kitchen.pantry.filter((item) => item.quantity !== 0);
-							}}>Clear depleted items</button
+					{#if kitchen.pantry.some((item) => Number.isFinite(item.quantity) && item.quantity <= 0)}<span
+							class="depleted-actions"
+							><button class="text-button restock-depleted" onclick={() => restockPantryItems()}
+								><ShoppingBasket size={16} />Restock depleted items</button
+							><button
+								class="text-button"
+								onclick={() => {
+									commitInlineEdits();
+									kitchen.pantry = kitchen.pantry.filter(
+										(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
+									);
+								}}>Clear depleted items</button
+							></span
 						>{/if}
 					<div>
 						<button
@@ -3530,103 +4239,175 @@
 						<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
 						<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 					</div>{/if}
-				<div class="expiry-filters" aria-label="Filter pantry by expiry">
-					{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
-							class:active={pantryFilter === option.id}
-							aria-pressed={pantryFilter === option.id}
-							onclick={() => (pantryFilter = option.id)}
-							>{option.label}<span>{option.count}</span></button
-						>{/each}
+				<div class="pantry-controls">
+					<div class="pantry-filter-bar">
+						<label class="search-box pantry-search">
+							<Search size={17} /><span class="visually-hidden">Search pantry</span><input
+								type="search"
+								placeholder="Search pantry"
+								bind:value={pantryQuery}
+							/>
+						</label>
+						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
+									type="button"
+									class:active={pantryFilter === option.id}
+									aria-pressed={pantryFilter === option.id}
+									onclick={() => (pantryFilter = option.id)}
+									>{option.label}<span>{option.count}</span></button
+								>{/each}
+						</div>
+					</div>
+					{#if pantryCategories.length}<div
+							class="filter-tabs pantry-categories"
+							role="group"
+							aria-label="Filter pantry by category"
+						>
+							<button
+								type="button"
+								class:active={pantryCategory === 'all'}
+								aria-pressed={pantryCategory === 'all'}
+								onclick={() => (pantryCategory = 'all')}>All categories</button
+							>{#each pantryCategories as category (category.key)}<button
+									type="button"
+									class:active={pantryCategory.toLowerCase() === category.key}
+									aria-pressed={pantryCategory.toLowerCase() === category.key}
+									onclick={() =>
+										(pantryCategory =
+											pantryCategory.toLowerCase() === category.key ? 'all' : category.label)}
+									>{category.label}</button
+								>{/each}
+						</div>{/if}
 				</div>
 				<div class="pantry-table">
-					<div class="table-head">
-						<span>INGREDIENT</span><span>AMOUNT</span><span>BEST BEFORE</span><span></span>
-					</div>
-					{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(item.expires)}
-						<div
-							class="pantry-row"
-							animate:flip={{ duration: motionDuration(200) }}
-							in:revealMotion|global={{ y: 8, duration: 200 }}
-							out:fadeMotion={{ duration: 120 }}
-						>
-							<span class="pantry-ingredient">
-								<span class="ingredient-symbol">{ingredientEmoji(item.name)}</span><span
-									class="ingredient-meta"
-									><b>{item.name}</b><small
-										class="expiry-badge"
-										class:expired={expiry === 'expired'}
-										class:soon={expiry === 'soon'}
-										>{expiry === 'expired'
-											? 'Expired'
-											: expiry === 'soon'
-												? 'Use soon'
-												: expiry === 'fresh'
-													? 'In date'
-													: 'No date'}</small
-									>{#if expiry === 'soon'}<button
-											class="text-button use-first"
-											onclick={() => useFirstIngredients([item])}
-											><Sparkles size={14} />Use first</button
-										>{/if}</span
+					{#if pantryDraft}<datalist id="pantry-category-suggestions">
+							{#each pantryCategorySuggestions as suggestion}<option value={suggestion}
+								></option>{/each}
+						</datalist>{/if}
+					{#if visiblePantry.length}<div class="table-head" aria-hidden="true">
+							<span>INGREDIENT</span><span>AMOUNT</span><span>BEST BEFORE</span><span></span>
+						</div>
+						<div class="pantry-list" role="list" aria-label="Pantry ingredients">
+							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
+									item.expires
+								)}{@const depleted = Number.isFinite(item.quantity) && item.quantity <= 0}
+								<div
+									class="pantry-row"
+									class:editing={pantryDraft?.id === item.id}
+									role="listitem"
+									animate:flip={{ duration: motionDuration(200) }}
+									in:revealMotion|global={{ y: 8, duration: 200 }}
+									out:fadeMotion={{ duration: 120 }}
 								>
-							</span><label
-								><input
-									aria-label={`Quantity of ${item.name}`}
-									type="number"
-									min="0"
-									max="1000000"
-									step="0.25"
-									bind:value={
-										() =>
-											item.id in pantryDrafts ? pantryDrafts[item.id].quantity : item.quantity,
-										(value) => {
-											pantryDrafts[item.id] = {
-												quantity: value,
-												unit: pantryDrafts[item.id]?.unit ?? item.unit
-											};
-										}
-									}
-									onblur={() => normalizePantryItem(item)}
-									onkeydown={(e) => {
-										if (e.key === 'Enter') e.currentTarget.blur();
-									}}
-								/><input
-									class="unit-input"
-									aria-label={`Unit for ${item.name}`}
-									maxlength="40"
-									bind:value={
-										() => (item.id in pantryDrafts ? pantryDrafts[item.id].unit : item.unit),
-										(value) => {
-											pantryDrafts[item.id] = {
-												quantity:
-													item.id in pantryDrafts ? pantryDrafts[item.id].quantity : item.quantity,
-												unit: value
-											};
-										}
-									}
-									onblur={() => normalizePantryItem(item)}
-									onkeydown={(e) => {
-										if (e.key === 'Enter') e.currentTarget.blur();
-									}}
-								/></label
-							><input
-								aria-label={`Expiry for ${item.name}`}
-								type="date"
-								bind:value={
-									() => item.expires ?? '',
-									(value) => {
-										item.expires = value ? value.trim().slice(0, 50) : undefined;
-									}
-								}
-							/><button
-								class="icon-button"
-								aria-label={`Remove ${item.name}`}
-								onclick={() => {
-									delete pantryDrafts[item.id];
-									kitchen.pantry = kitchen.pantry.filter((p) => p.id !== item.id);
-								}}><X size={16} /></button
-							>
-						</div>{/each}
+									{#if pantryDraft?.id === item.id}<form
+											class="pantry-edit-form"
+											novalidate
+											onsubmit={(event) => {
+												event.preventDefault();
+												void savePantryEdit();
+											}}
+										>
+											<div class="pantry-edit-header">
+												<span class="pantry-ingredient">
+													<span class="ingredient-symbol" aria-hidden="true"
+														>{ingredientEmoji(item.name)}</span
+													><b class="pantry-name">{item.name}</b>
+												</span>
+												<div class="pantry-edit-actions">
+													<button type="submit" class="primary pantry-done-button">Done</button
+													><button
+														type="button"
+														class="secondary pantry-cancel-button"
+														onclick={() => cancelPantryEdit()}>Cancel</button
+													><button
+														type="button"
+														class="icon-button pantry-remove-button"
+														aria-label={`Remove ${item.name}`}
+														onclick={() => removePantryItem(item)}><X size={16} /></button
+													>
+												</div>
+											</div>
+											<div class="pantry-edit-fields">
+												<label class="pantry-field"
+													><span>Quantity</span><input
+														type="number"
+														min="0"
+														max="1000000"
+														step="any"
+														bind:value={pantryDraft.quantity}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												><label class="pantry-field"
+													><span>Unit</span><input
+														type="text"
+														maxlength="40"
+														bind:value={pantryDraft.unit}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												><label class="pantry-field"
+													><span>Category</span><input
+														type="text"
+														maxlength="100"
+														list="pantry-category-suggestions"
+														bind:value={pantryDraft.category}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												><label class="pantry-field"
+													><span>Best before</span><input
+														type="date"
+														bind:value={pantryDraft.expires}
+														onkeydown={handlePantryInputKeydown}
+													/></label
+												>
+											</div>
+										</form>{:else}<span class="pantry-ingredient">
+											<span class="ingredient-symbol" aria-hidden="true"
+												>{ingredientEmoji(item.name)}</span
+											><span class="ingredient-meta"
+												><b class="pantry-name">{item.name}</b><span class="ingredient-tags"
+													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
+													>{#if depleted}<button
+															type="button"
+															class="text-button restock-item"
+															aria-label={`Restock ${item.name}`}
+															onclick={() => restockPantryItems([item.id])}
+															><ShoppingBasket size={14} />Restock</button
+														>{:else if expiry === 'soon' && item.quantity > 0}<button
+															type="button"
+															class="text-button use-first"
+															onclick={() => useFirstIngredients([item])}
+															><Sparkles size={14} />Use first</button
+														>{/if}</span
+												></span
+											>
+										</span><span class="pantry-amount"
+											>{item.quantity}{item.unit ? ` ${item.unit}` : ''}</span
+										><span class="pantry-expiry"
+											><small
+												class="expiry-badge"
+												class:depleted
+												class:expired={!depleted && expiry === 'expired'}
+												class:soon={!depleted && expiry === 'soon'}
+												>{depleted ? 'Depleted' : expiryBadgeLabel(expiry)}</small
+											>{#if item.expires}<small class="pantry-date">{item.expires}</small
+												>{/if}</span
+										>
+										<div class="pantry-row-actions">
+											<button
+												type="button"
+												class="text-button pantry-edit-button"
+												data-pantry-edit={item.id}
+												aria-label={`Edit ${item.name}`}
+												onclick={() => startPantryEdit(item)}>Edit</button
+											><button
+												type="button"
+												class="icon-button pantry-remove-button"
+												aria-label={`Remove ${item.name}`}
+												onclick={() => removePantryItem(item)}><X size={16} /></button
+											>
+										</div>{/if}
+								</div>{/each}
+						</div>{/if}
 				</div>
 				{#if !kitchen.pantry.length}<div class="empty-state">
 						<Carrot size={40} />
@@ -3635,10 +4416,13 @@
 					</div>{:else if !visiblePantry.length}<div class="empty-state filtered-pantry-empty">
 						<Carrot size={34} />
 						<h2>No matching ingredients</h2>
-						<p>Try another expiry filter or update a best-before date.</p>
+						<p>Try another search, category, or expiry filter.</p>
+						<button type="button" class="secondary" onclick={resetPantryFilters}
+							>Reset filters</button
+						>
 					</div>{/if}
 				<div class="pantry-footer">
-					<button class="primary" onclick={() => (modal = 'generate')}
+					<button class="primary" onclick={cookFromPantry}
 						><Sparkles size={17} /> Cook from my pantry</button
 					>
 				</div>
@@ -3669,7 +4453,7 @@
 						</h2>
 						<button class="icon-button" onclick={() => weekOffset++} aria-label="Next week"
 							><ChevronRight size={20} /></button
-						><button class="text-button" onclick={() => (weekOffset = 0)}>This week</button>
+						><button class="text-button" onclick={showCurrentWeek}>This week</button>
 					</div>
 					<button
 						class="secondary"
@@ -3690,11 +4474,12 @@
 					>
 				</div>
 				{#key weekOffset}<div
+						bind:this={calendarGrid}
 						class="calendar-grid"
 						in:revealMotion|global={{ y: 8, duration: 220 }}
 					>
 						{#each week as day}{@const dayKey = dateKey(day)}
-							<div class:today={dayKey === todayKey} class="calendar-day">
+							<div data-date={dayKey} class:today={dayKey === todayKey} class="calendar-day">
 								<div class="day-heading">
 									<span>{weekdayFormatter.format(day)}</span><b>{day.getDate()}</b>
 								</div>
@@ -3777,10 +4562,13 @@
 										<div class="cooked-history-actions">
 											{#if meal.leftoverServings}<button
 													class="text-button"
-													onclick={() => {
-														meal.leftoverServings = 0;
-														notify('Leftovers marked used.');
-													}}>Use leftovers <Check size={15} /></button
+													aria-label={`Use 1 leftover of ${recipe.title}`}
+													onclick={() => consumeLeftoverServing(meal)}>Use 1 leftover</button
+												><button
+													class="text-button"
+													aria-label={`Clear leftovers for ${recipe.title}`}
+													onclick={() => clearMealLeftovers(meal)}
+													>Clear leftovers <Check size={15} /></button
 												>{/if}<button
 												class="text-button"
 												onclick={() => {
@@ -3837,8 +4625,18 @@
 									type="button"
 									class:active={shoppingFilter === option.id}
 									aria-pressed={shoppingFilter === option.id}
-									onclick={() => (shoppingFilter = option.id)}
-									>{option.label}<span>{option.count}</span></button
+									onclick={() => {
+										if (option.id === 'unpurchased' && editingShoppingId) {
+											const active = kitchen.shopping.find(
+												(entry) => entry.id === editingShoppingId
+											);
+											if (active?.checked) {
+												applyShoppingEdit(active);
+												clearEditingShoppingState();
+											}
+										}
+										shoppingFilter = option.id;
+									}}>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
 						{#if voiceTarget === 'shopping' && !modal && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
@@ -3854,11 +4652,15 @@
 								placeholder="Anything else for the basket?"
 								maxlength="2000"
 								bind:value={shoppingText}
+								oninput={() => {
+									if (!shoppingText.trim()) shoppingVoiceInput = false;
+								}}
 							/><button
+								bind:this={shoppingMicButton}
 								type="button"
 								class="icon-button"
 								aria-label="Dictate shopping items"
-								disabled={voiceBusy}
+								aria-disabled={voiceBusy || undefined}
 								onclick={dictateShopping}><Mic size={18} /></button
 							><button type="submit" class="text-button">Add</button>
 						</form>
@@ -3870,67 +4672,89 @@
 								out:fadeMotion={{ duration: 120 }}
 							>
 								<button
+									type="button"
+									role="checkbox"
+									aria-checked={item.checked}
 									class="check-box"
 									class:checked={item.checked}
 									aria-label={`Mark ${item.name} ${item.checked ? 'needed' : 'purchased'}`}
-									onclick={() => (item.checked = !item.checked)}
+									onclick={() => {
+										item.checked = !item.checked;
+										if (
+											shoppingFilter === 'unpurchased' &&
+											item.checked &&
+											editingShoppingId === item.id
+										) {
+											applyShoppingEdit(item);
+											clearEditingShoppingState();
+										}
+									}}
 									>{#if item.checked}<Check size={16} />{/if}</button
 								>
-								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<div
-										class="shopping-item-edit"
+								{#if editingShoppingId === item.id && editingShoppingDraft?.id === item.id}<form
+										class="shopping-edit-form"
+										novalidate
+										onsubmit={(e) => {
+											e.preventDefault();
+											void finishEditingShoppingItem(item);
+										}}
 									>
-										<input
-											class="shopping-name"
-											aria-label="Shopping item name"
-											bind:value={editingShoppingDraft.name}
-											maxlength="200"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
-									</div>
-									<span class="shopping-quantity"
-										><input
-											aria-label={`Quantity of ${item.name}`}
-											type="number"
-											min="0.01"
-											max="1000000"
-											step="0.01"
-											bind:value={editingShoppingDraft.quantity}
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/><input
-											aria-label={`Unit for ${item.name}`}
-											bind:value={editingShoppingDraft.unit}
-											maxlength="40"
-											onblur={() => normalizeShoppingItem(item)}
-											onkeydown={(e) => {
-												if (e.key === 'Enter') finishEditingShoppingItem(item);
-											}}
-										/></span
-									>
-									<button class="text-button" onclick={() => finishEditingShoppingItem(item)}
-										>Done</button
-									>
+										<div class="shopping-item-edit">
+											<input
+												class="shopping-name"
+												data-shopping-name={item.id}
+												aria-label="Shopping item name"
+												bind:value={editingShoppingDraft.name}
+												maxlength="200"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
+										</div>
+										<span class="shopping-quantity"
+											><input
+												aria-label={`Quantity of ${item.name}`}
+												type="number"
+												min="0.01"
+												max="1000000"
+												step="0.01"
+												bind:value={editingShoppingDraft.quantity}
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/><input
+												aria-label={`Unit for ${item.name}`}
+												bind:value={editingShoppingDraft.unit}
+												maxlength="40"
+												onblur={() => {
+													if (editingShoppingId === item.id) applyShoppingEdit(item);
+												}}
+											/></span
+										>
+										<button type="submit" class="text-button">Done</button>
+									</form>
 								{:else}
 									<div class="shopping-item-edit">
-										<b class="shopping-name">{item.name}</b><small class="shopping-source"
-											>{shoppingSourceLabel(item.sourceKey)}</small
-										>
+										<button
+											type="button"
+											tabindex="-1"
+											class="shopping-name"
+											onclick={() => (item.checked = !item.checked)}>{item.name}</button
+										><small class="shopping-source">{shoppingSourceLabel(item.sourceKey)}</small>
 									</div>
 									<span class="shopping-quantity"
 										>{item.quantity}
 										{item.unit}<button
+											type="button"
 											class="text-button"
+											data-shopping-edit={item.id}
 											aria-label={`Edit ${item.name}`}
-											onclick={() => startEditingShoppingItem(item)}>Edit</button
+											onclick={() => void startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
 								{/if}
 								<button
+									type="button"
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
 									onclick={() => removeShoppingItem(item)}><X size={15} /></button
@@ -3966,8 +4790,12 @@
 	{scanBusy ? 'Scanning photo for ingredients…' : toast}
 </div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button onclick={toastUndo}>Undo</button>{/if}<button
-			onclick={() => (toast = '')}
+		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}>Undo</button
+			>{/if}<button
+			onclick={() => {
+				toast = '';
+				toastUndo = null;
+			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
@@ -3998,10 +4826,15 @@
 		toggleHidden={() => toggleRecipeHidden(selected!)}
 		{busy}
 		rate={(n) => {
-			selected!.rating = n;
-			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
+			kitchen.preferences.ratings = applyRecipeRating(selected!, kitchen.preferences.ratings, n);
+			const stored = kitchen.recipes.find((item) => item.id === selected!.id);
+			if (stored && stored !== selected!) {
+				applyRecipeRating(stored, undefined, n);
+			}
 			kitchen.recipes = [...kitchen.recipes];
-			notify('Rating saved. Future recipes will use your feedback.');
+			notify(
+				n === undefined ? 'Rating cleared.' : 'Rating saved. Future recipes will use your feedback.'
+			);
 		}}
 	/>{/if}
 {#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
@@ -4033,7 +4866,7 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if modal === voiceTarget && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
+				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
 
 				<button
 					class="icon-button dialog-close"
@@ -4851,11 +5684,38 @@
 		}
 	}
 
+	.pantry-controls {
+		display: flex;
+		flex-direction: column;
+		gap: 10px;
+		margin: 18px 0 10px;
+	}
+	.pantry-filter-bar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		flex-wrap: wrap;
+	}
+	.pantry-search {
+		flex: 1 1 220px;
+		max-width: 320px;
+		min-height: 44px;
+	}
+	.pantry-search input {
+		width: 100%;
+		min-width: 0;
+		font-size: 14px;
+		padding: 9px 10px;
+	}
+	.pantry-categories {
+		padding-bottom: 4px;
+	}
 	.expiry-filters {
 		display: flex;
 		gap: 8px;
 		flex-wrap: wrap;
-		margin: 20px 0 10px;
+		margin: 0;
 	}
 	.expiry-filters button {
 		min-height: 44px;
@@ -4863,14 +5723,16 @@
 		align-items: center;
 		gap: 9px;
 		padding: 8px 12px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		font-size: 14px;
 	}
 	.expiry-filters button.active {
-		background: var(--green);
-		color: var(--paper);
-		border-color: var(--green);
+		padding: 7px 11px;
+		background: var(--chip-active-bg);
+		color: var(--ink);
+		border: 2px solid var(--chip-active-border);
+		font-weight: 700;
 	}
 	.expiry-filters button span {
 		min-width: 22px;
@@ -4888,9 +5750,48 @@
 		align-items: flex-start;
 		gap: 4px;
 	}
+	.pantry-name {
+		overflow-wrap: anywhere;
+	}
+	.ingredient-tags {
+		display: flex;
+		align-items: center;
+		flex-wrap: wrap;
+		gap: 6px 8px;
+	}
+	.category-badge {
+		display: inline-flex;
+		align-items: center;
+		padding: 2px 7px;
+		background: var(--wash);
+		color: var(--muted);
+		font-size: 12px;
+		line-height: 1.35;
+	}
+	.pantry-amount {
+		font-weight: 500;
+		overflow-wrap: anywhere;
+	}
+	.pantry-expiry {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 2px;
+		min-width: 0;
+	}
+	.pantry-date {
+		font-size: 12px;
+		color: var(--muted);
+	}
 	.expiry-badge {
 		font-size: 12px;
 		color: var(--muted);
+	}
+	.expiry-badge.depleted {
+		background: var(--wash);
+		color: var(--ink);
+		padding: 2px 6px;
+		font-weight: 600;
 	}
 	.expiry-badge.expired {
 		color: #a43f36;
@@ -4900,16 +5801,128 @@
 		color: #926b17;
 		font-weight: 600;
 	}
-	.use-first {
+	.use-first,
+	.restock-item {
 		display: inline-flex;
 		align-items: center;
 		gap: 5px;
-		min-height: 34px;
-		padding: 3px 0;
+		min-height: 44px;
+		min-width: 44px;
+		padding: 6px 0;
 		font-size: 13px;
+	}
+	.depleted-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 14px;
+	}
+	.depleted-actions button {
+		min-height: 44px;
+		min-width: 44px;
+	}
+	.discover-pantry-bar {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		padding: 12px 14px;
+		margin-bottom: 20px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		font-size: 14px;
+	}
+	.discover-pantry-actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 12px;
+	}
+	.discover-pantry-actions button {
+		min-height: 44px;
+		min-width: 44px;
+	}
+	.pantry-row-actions {
+		display: flex;
+		align-items: center;
+		justify-content: flex-end;
+		gap: 4px;
+	}
+	.pantry-edit-button {
+		padding: 6px 8px;
+		font-size: 14px;
+	}
+	.pantry-remove-button {
+		display: grid;
+		place-items: center;
+		width: 36px;
+		height: 36px;
+	}
+	.pantry-edit-form {
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+		width: 100%;
+	}
+	.pantry-edit-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 10px;
+		flex-wrap: wrap;
+	}
+	.pantry-edit-actions {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		margin-left: auto;
+	}
+	.pantry-done-button,
+	.pantry-cancel-button {
+		min-height: 38px;
+		padding: 7px 12px;
+		font-size: 14px;
+	}
+	.pantry-edit-fields {
+		display: grid;
+		grid-template-columns: minmax(90px, 0.8fr) minmax(100px, 1fr) minmax(130px, 1.2fr) minmax(
+				140px,
+				1.2fr
+			);
+		gap: 10px;
+	}
+	.pantry-field {
+		display: flex;
+		flex-direction: column;
+		align-items: stretch;
+		gap: 4px;
+		min-width: 0;
+		font-size: 12px;
+		font-weight: 500;
+		color: var(--muted);
+	}
+	.pantry-field input {
+		width: 100%;
+		max-width: none;
+		min-width: 0;
+		min-height: 40px;
+		padding: 7px 9px;
+		font-size: 14px;
+		font-weight: 400;
+		color: var(--ink);
+		background: var(--surface);
+		border: 1px solid var(--control-border);
 	}
 	.filtered-pantry-empty {
 		padding: 32px 12px;
+	}
+	.filtered-pantry-empty button {
+		min-height: 44px;
+		padding: 8px 14px;
+	}
+	.shopping-edit-form {
+		display: contents;
 	}
 	.shopping-item-edit {
 		min-width: 100px;
@@ -4918,16 +5931,29 @@
 		flex-direction: column;
 		gap: 3px;
 	}
-	.shopping-name {
+	button.shopping-name {
 		width: 100%;
 		min-width: 0;
+		min-height: 44px;
 		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		display: flex;
+		align-items: center;
+		text-align: left;
 		font-weight: 500;
+		overflow-wrap: anywhere;
 	}
-	.shopping-name:focus {
-		border-color: var(--line);
+	.shopping-row.checked button.shopping-name {
+		color: var(--muted);
+	}
+	input.shopping-name {
+		width: 100%;
+		min-width: 0;
+		min-height: 44px;
+		padding: 7px 5px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
+		font-size: 16px;
+		font-weight: 500;
 	}
 	.shopping-source {
 		padding-left: 5px;
@@ -4943,19 +5969,17 @@
 	}
 	.shopping-quantity input {
 		min-width: 0;
+		min-height: 44px;
 		width: 72px;
-		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		padding: 7px 5px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
 		text-align: right;
-		font-size: 14px;
+		font-size: 16px;
 	}
 	.shopping-quantity input:last-child {
 		width: 70px;
 		text-align: left;
-	}
-	.shopping-quantity input:focus {
-		border-color: var(--line);
 	}
 	.calendar-meal-actions {
 		min-height: 34px;
@@ -5050,7 +6074,7 @@
 		min-height: 44px;
 		padding: 12px 14px;
 		margin: 22px 0;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		cursor: pointer;
 		font-size: 14px;
@@ -5060,7 +6084,7 @@
 		height: 24px;
 		flex: 0 0 24px;
 		margin-top: 1px;
-		accent-color: var(--green);
+		accent-color: var(--ink);
 	}
 	.cook-option span {
 		display: flex;
@@ -5079,9 +6103,27 @@
 		background: #87332c;
 	}
 	@media (max-width: 650px) {
+		.pantry-controls {
+			gap: 8px;
+			margin: 12px 0 6px;
+		}
+		.pantry-filter-bar {
+			flex-direction: column;
+			align-items: stretch;
+			gap: 8px;
+		}
+		.pantry-search {
+			flex: 0 0 auto;
+			max-width: none;
+			width: 100%;
+		}
+		.pantry-search input {
+			font-size: 16px;
+		}
 		.expiry-filters {
 			display: grid;
 			grid-template-columns: repeat(3, minmax(0, 1fr));
+			width: 100%;
 		}
 		.expiry-filters button {
 			justify-content: center;
@@ -5089,21 +6131,72 @@
 			padding-inline: 6px;
 			font-size: 12px;
 		}
+		.expiry-filters button.active {
+			padding-inline: 5px;
+		}
+		.ingredient-meta {
+			flex-direction: row;
+			flex-wrap: wrap;
+			align-items: center;
+			gap: 3px 7px;
+		}
+		.pantry-amount {
+			font-size: 13px;
+			color: var(--ink);
+			white-space: nowrap;
+		}
+		.pantry-expiry {
+			flex-direction: row;
+			align-items: center;
+			flex-wrap: wrap;
+			gap: 5px;
+		}
+		.pantry-expiry::before {
+			content: '·';
+			color: var(--muted);
+			font-size: 12px;
+		}
+		.use-first,
+		.restock-item {
+			min-height: 44px;
+			min-width: 44px;
+			padding: 6px 4px;
+		}
+		.pantry-row-actions {
+			gap: 2px;
+		}
+		.pantry-edit-button,
+		.pantry-done-button,
+		.pantry-cancel-button {
+			min-width: 44px;
+			min-height: 44px;
+			padding: 8px 10px;
+		}
+		.pantry-remove-button {
+			width: 44px;
+			min-width: 44px;
+			height: 44px;
+			min-height: 44px;
+		}
+		.pantry-edit-fields {
+			grid-template-columns: repeat(2, minmax(0, 1fr));
+			gap: 8px 10px;
+		}
+		.pantry-field input {
+			min-height: 44px;
+			padding: 8px;
+			font-size: 16px;
+		}
 		.shopping-row {
 			flex-wrap: wrap;
 			align-items: center;
 		}
 		.shopping-item-edit {
 			flex-basis: calc(100% - 66px);
-			order: 2;
 		}
 		.shopping-quantity {
-			order: 3;
 			flex: 1 1 auto;
 			margin-left: 44px !important;
-		}
-		.shopping-row > .icon-button {
-			order: 4;
 		}
 		.cooked-history-row {
 			grid-template-columns: 46px minmax(0, 1fr);

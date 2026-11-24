@@ -21,10 +21,12 @@ export function isVoiceTargetActive(
 		modal: string;
 		page: string;
 		overlay?: boolean;
+		reviewingDraft?: boolean;
 	}
 ): boolean {
 	if (!target || view.overlay) return false;
 	if (target === 'shopping') return view.page === 'shopping' && !view.modal;
+	if (target === 'import' && view.reviewingDraft) return false;
 	return view.modal === target;
 }
 
@@ -42,37 +44,65 @@ export function appendVoiceTranscript(
 	return maxLength !== undefined ? merged.slice(0, maxLength) : merged;
 }
 
+export type QuickShoppingParseOptions = {
+	createId?: () => string;
+	split?: boolean;
+};
+
+export type QuickShoppingParseResult = {
+	items: ShoppingItem[];
+	error?: string;
+};
+
 export function parseQuickShoppingItems(
 	input: string,
-	createId: () => string = () => globalThis.crypto.randomUUID()
-): ShoppingItem[] {
-	const segments = input
-		.split(/[,\n;]/)
+	options?: (() => string) | QuickShoppingParseOptions
+): QuickShoppingParseResult {
+	const resolvedOptions: QuickShoppingParseOptions =
+		typeof options === 'function' ? { createId: options } : (options ?? {});
+	const createId = resolvedOptions.createId ?? (() => globalThis.crypto.randomUUID());
+	const split = resolvedOptions.split ?? true;
+	const segments = (split ? input.split(/[,\n;]/) : [input])
 		.map((segment) => segment.trim())
 		.filter(Boolean);
 	const items: ShoppingItem[] = [];
 	for (let i = 0; i < segments.length; i++) {
-		let value = segments[i].replace(/\.+$/, '').trim();
-		if (segments.length > 1 && i > 0) value = value.replace(/^and\s+/i, '').trim();
+		let value = split ? segments[i].replace(/\.+$/, '').trim() : segments[i];
+		if (split && segments.length > 1 && i > 0) value = value.replace(/^and\s+/i, '').trim();
 		if (!value) continue;
 		const match = value.match(QUICK_SHOPPING_ITEM_PATTERN);
-		const parsedQuantity = match ? Number(match[1]) : NaN;
-		const validQuantity = Number.isFinite(parsedQuantity) && parsedQuantity > 0;
-		const rawName = (validQuantity && match ? match[3] : value).trim().slice(0, 200);
-		if (!rawName) continue;
-		const quantity = validQuantity
-			? Math.min(1_000_000, Math.round(parsedQuantity * 100) / 100 || parsedQuantity)
-			: 1;
-		const unit = (validQuantity && match?.[2] ? match[2].toLowerCase() : 'piece').slice(0, 40);
-		items.push({
-			id: createId(),
-			name: rawName,
-			quantity,
-			unit,
-			checked: false
-		});
+		if (match) {
+			const parsedQuantity = Number(match[1]);
+			if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
+				return { items: [], error: 'Enter a quantity above zero.' };
+			}
+			const rawName = match[3].trim().slice(0, 200);
+			if (!rawName) continue;
+			const quantity = Math.min(
+				1_000_000,
+				Math.round(parsedQuantity * 100) / 100 || parsedQuantity
+			);
+			const unit = (match[2] ? match[2].toLowerCase() : 'piece').slice(0, 40);
+			items.push({
+				id: createId(),
+				name: rawName,
+				quantity,
+				unit,
+				checked: false
+			});
+		} else {
+			const rawName = value.slice(0, 200);
+			if (!rawName) continue;
+			items.push({
+				id: createId(),
+				name: rawName,
+				quantity: 1,
+				unit: 'piece',
+				checked: false
+			});
+		}
 	}
-	return items;
+	return { items };
 }
 
 export function resolveVoiceProvider(
@@ -237,8 +267,17 @@ export function resolveClosedDialog(
 }
 
 export function appendDictatedText(target: VoiceTarget, current: string, incoming: string): string {
-	if (target === 'import') return appendVoiceTranscript(current, incoming, '\n', 20000);
-	return appendVoiceTranscript(current, incoming);
+	const text = incoming.trim();
+	if (!text) return target === 'import' ? current.slice(0, 20000) : current;
+	if (target === 'import') {
+		const base = current.replace(/\s+$/, '');
+		return [base, text].filter(Boolean).join('\n').slice(0, 20000);
+	}
+	if (target === 'shopping') {
+		return appendVoiceTranscript(current, text, ', ', 2000);
+	}
+	const base = current.trim().replace(/,+\s*$/, '');
+	return [base, text].filter(Boolean).join(', ');
 }
 
 function statusFallbackMessage(status: number): string {

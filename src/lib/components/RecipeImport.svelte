@@ -1,37 +1,26 @@
 <script module lang="ts">
-	import {
-		createDraftBaseline,
-		isValidNutrition,
-		MAX_SERVINGS,
-		NUTRITION_FIELDS,
-		validateRecipeDraft,
-		type RecipeDraftBaseline
-	} from '#lib/recipe-draft.ts';
-	import type { Recipe } from '#lib/types.ts';
-	export type ImportSession = {
-		url: string;
-		text: string;
-		photo: string;
-		photoName: string;
-		draft: Recipe | null;
-		baseline: RecipeDraftBaseline | null;
-		assumptions: string[];
-	};
-	export const emptyImportSession = (): ImportSession => ({
-		url: '',
-		text: '',
-		photo: '',
-		photoName: '',
-		draft: null,
-		baseline: null,
-		assumptions: []
-	});
+	export { emptyImportSession, type ImportSession } from '#lib/import-session.ts';
 </script>
 
 <script lang="ts">
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
+	import { prepareAIPhoto } from '#lib/cover-upload.ts';
+	import {
+		clearImportSourceInPlace,
+		emptyImportSession,
+		isReviewingImportDraft,
+		type ImportSession
+	} from '#lib/import-session.ts';
 	import { revealMotion } from '#lib/motion.ts';
+	import {
+		createDraftBaseline,
+		isValidNutrition,
+		MAX_SERVINGS,
+		NUTRITION_FIELDS,
+		validateRecipeDraft
+	} from '#lib/recipe-draft.ts';
+	import type { Recipe } from '#lib/types.ts';
 	let {
 		session = $bindable(),
 		capture,
@@ -50,7 +39,6 @@
 	} = $props();
 	let busy = $state(false);
 	let reading = $state(false);
-	let reviewingDraft = $state(untrack(() => session.draft !== null));
 	let nutritionOpen = $state(
 		untrack(() => (session.draft ? !isValidNutrition(session.draft.nutrition) : false))
 	);
@@ -65,6 +53,22 @@
 	let controller: AbortController | undefined;
 	let captureGeneration = 0;
 	let alive = true;
+	let observedSession = untrack(() => session);
+	$effect(() => {
+		if (session !== observedSession) {
+			observedSession = session;
+			captureGeneration++;
+			controller?.abort();
+			controller = undefined;
+			busy = false;
+			nutritionOpen = session.draft ? !isValidNutrition(session.draft.nutrition) : false;
+			error = '';
+			retryAvailable = false;
+		}
+		if (session.draft !== null && session.baseline === null) {
+			session.baseline = createDraftBaseline(session.draft);
+		}
+	});
 	onDestroy(() => {
 		alive = false;
 		captureGeneration++;
@@ -72,30 +76,26 @@
 	});
 
 	async function attachPhoto(file?: File) {
-		if (!file || busy || reading || voiceBusy) return;
-		if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
-			error = 'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.';
-			return;
-		}
-		if (file.size > 5 * 1024 * 1024) {
-			error = 'Choose a photo under 5 MB.';
+		if (!file || busy || reading || voiceBusy) {
+			if (photoInput) photoInput.value = '';
 			return;
 		}
 		reading = true;
 		error = '';
+		const targetSession = session;
 		try {
-			const photo = await new Promise<string>((resolve, reject) => {
-				const reader = new FileReader();
-				reader.onload = () => resolve(String(reader.result));
-				reader.onerror = () => reject(new Error('Could not read that photo. Try another file.'));
-				reader.readAsDataURL(file);
+			const photo = await prepareAIPhoto(file, {
+				unsupportedMessage:
+					'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.'
 			});
-			if (alive) {
-				session.photo = photo;
-				session.photoName = file.name;
+			if (alive && session === targetSession) {
+				targetSession.photo = photo;
+				targetSession.photoName = file.name || 'recipe-photo.jpg';
 			}
 		} catch (e) {
-			if (alive) error = (e as Error).message;
+			if (alive && session === targetSession) {
+				error = e instanceof Error ? e.message : 'Could not read that photo. Try another file.';
+			}
 		} finally {
 			if (alive) reading = false;
 			if (photoInput) photoInput.value = '';
@@ -151,28 +151,30 @@
 		retryAvailable = false;
 		busy = true;
 		const generation = ++captureGeneration;
+		const targetSession = session;
 		const currentController = new AbortController();
 		controller = currentController;
 		try {
 			const result = await capture(
 				{
 					...(url ? { url } : {}),
-					prompt: session.text,
-					...(session.photo ? { image: session.photo } : {})
+					prompt: targetSession.text,
+					...(targetSession.photo ? { image: targetSession.photo } : {})
 				},
 				currentController.signal
 			);
-			if (alive && generation === captureGeneration && result) {
-				session.draft = result.recipe;
-				session.baseline = createDraftBaseline(result.recipe);
-				session.assumptions = result.assumptions;
+			if (alive && generation === captureGeneration && session === targetSession && result) {
+				targetSession.draft = result.recipe;
+				targetSession.baseline = createDraftBaseline(result.recipe);
+				targetSession.assumptions = result.assumptions;
+				targetSession.reviewingDraft = true;
 				nutritionOpen = !isValidNutrition(result.recipe.nutrition);
-				reviewingDraft = true;
 				await tick();
-				if (alive && generation === captureGeneration) heading?.focus();
+				if (alive && generation === captureGeneration && session === targetSession)
+					heading?.focus();
 			}
 		} catch (e) {
-			if (alive && generation === captureGeneration) {
+			if (alive && generation === captureGeneration && session === targetSession) {
 				error = currentController.signal.aborted
 					? 'Request cancelled. Your input is still here; try again when you’re ready.'
 					: e instanceof Error
@@ -203,7 +205,7 @@
 		if (!draft) return;
 		const validation = validateRecipeDraft(draft, {
 			baseline: session.baseline,
-			assumptions: session.assumptions
+			assumptions: session.assumptions.map((note) => note.trim()).filter(Boolean)
 		});
 		if (!validation.ok) {
 			if (validation.nutritionInvalid) nutritionOpen = true;
@@ -219,7 +221,7 @@
 	}
 </script>
 
-{#if !reviewingDraft || !session.draft}
+{#if !isReviewingImportDraft(session)}
 	<h2 id="recipe-import-title" bind:this={heading} tabindex="-1">Import a recipe</h2>
 	<p class="muted capture-help">
 		Add an optional recipe link to fetch, or paste a recipe and notes.
@@ -284,10 +286,11 @@
 						class="text-button"
 						disabled={busy || reading || voiceBusy}
 						onclick={() => {
-							session = emptyImportSession();
+							clearImportSourceInPlace(session);
 							error = '';
-							nutritionOpen = false;
+							nutritionOpen = session.draft ? !isValidNutrition(session.draft.nutrition) : false;
 							retryAvailable = false;
+							if (photoInput) photoInput.value = '';
 						}}>Clear</button
 					>{/if}
 			</div>
@@ -331,7 +334,7 @@
 				disabled={voiceBusy}
 				onclick={() => {
 					error = '';
-					reviewingDraft = true;
+					session.reviewingDraft = true;
 				}}>Return to reviewed draft</button
 			>{/if}
 		<p class="field-help">
@@ -485,7 +488,6 @@
 				session = emptyImportSession();
 				error = '';
 				nutritionOpen = false;
-				reviewingDraft = false;
 				retryAvailable = false;
 			}}>Discard draft</button
 		>
@@ -502,7 +504,7 @@
 				class="secondary"
 				type="button"
 				onclick={() => {
-					reviewingDraft = false;
+					session.reviewingDraft = false;
 					error = '';
 				}}><ChevronLeft size={18} />Back</button
 			><button class="primary" type="submit" disabled={voiceBusy}
