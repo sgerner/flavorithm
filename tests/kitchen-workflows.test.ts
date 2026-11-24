@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { rankRecipes } from '../src/lib/discovery.ts';
+import { rankPantryRecipes, rankRecipes } from '../src/lib/discovery.ts';
 import {
 	buildShoppingList,
 	normalizeName as normalizeDomainName,
@@ -11,8 +11,12 @@ import {
 	convertCompatibleQuantity,
 	deleteShoppingItem,
 	expiryStatus,
+	filterPantryItems,
+	listPantryCategories,
 	normalizeIngredientName,
+	normalizePantryDraft,
 	reconcileShoppingList,
+	restockDepletedPantryItems,
 	restoreShoppingItem,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
@@ -723,6 +727,127 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 });
 
+test('normalizePantryDraft clamps quantities, trims unit to 40 chars, and normalizes optional expiry', () => {
+	assert.deepEqual(
+		normalizePantryDraft({
+			quantity: null,
+			unit: '  cups  ',
+			category: '  Grains  ',
+			expires: '   '
+		}),
+		{
+			quantity: 0,
+			unit: 'cups',
+			category: 'Grains'
+		}
+	);
+	assert.deepEqual(
+		normalizePantryDraft({
+			quantity: '',
+			unit: '',
+			category: '',
+			expires: ' 2026-12-01 '
+		}),
+		{
+			quantity: 0,
+			unit: 'piece',
+			category: 'Pantry',
+			expires: '2026-12-01'
+		}
+	);
+	assert.equal(
+		normalizePantryDraft({
+			quantity: -12.5,
+			unit: 'g',
+			category: 'Spices',
+			expires: ''
+		}).quantity,
+		0
+	);
+	assert.equal(
+		normalizePantryDraft({
+			quantity: 2_500_000,
+			unit: 'g',
+			category: 'Spices',
+			expires: ''
+		}).quantity,
+		1_000_000
+	);
+	const longUnit = normalizePantryDraft({
+		quantity: 1.5,
+		unit: `  ${'u'.repeat(55)}  `,
+		category: `  ${'c'.repeat(120)}  `,
+		expires: ''
+	});
+	assert.equal(longUnit.quantity, 1.5);
+	assert.equal(longUnit.unit.length, 40);
+	assert.equal(longUnit.category.length, 100);
+});
+
+test('filterPantryItems and listPantryCategories combine search text, category, and expiry filters', () => {
+	const now = new Date(2026, 10, 21, 12, 0);
+	const items: Ingredient[] = [
+		{
+			id: 'oil',
+			name: 'olive oil',
+			quantity: 0.5,
+			unit: 'cup',
+			category: 'Oils & condiments'
+		},
+		{
+			id: 'spinach',
+			name: 'baby spinach',
+			quantity: 2,
+			unit: 'cups',
+			category: 'Produce',
+			expires: '2026-11-23'
+		},
+		{
+			id: 'milk',
+			name: 'whole milk',
+			quantity: 1,
+			unit: 'qt',
+			category: 'Dairy & eggs',
+			expires: '2026-11-18'
+		},
+		{
+			id: 'rice',
+			name: 'jasmine rice',
+			quantity: 2,
+			unit: 'cups',
+			category: 'Grains',
+			expires: '2027-06-01'
+		}
+	];
+
+	const categories = listPantryCategories(items);
+	assert.deepEqual(
+		categories.map((entry) => entry.label),
+		['Dairy & eggs', 'Grains', 'Oils & condiments', 'Produce']
+	);
+	assert.equal(
+		listPantryCategories(items, 'Spices').find((entry) => entry.key === 'spices')?.count,
+		0
+	);
+
+	assert.deepEqual(
+		filterPantryItems(items, { query: 'condiment', category: 'all', expiry: 'all' }, now).map(
+			(item) => item.id
+		),
+		['oil']
+	);
+	assert.deepEqual(
+		filterPantryItems(items, { query: '', category: 'Produce', expiry: 'soon' }, now).map(
+			(item) => item.id
+		),
+		['spinach']
+	);
+	assert.deepEqual(
+		filterPantryItems(items, { query: 'rice', category: 'Grains', expiry: 'expired' }, now),
+		[]
+	);
+});
+
 test('transferPurchasedItemsToPantry preserves categories on new lots and merges item/bunch aliases into unexpired stock', () => {
 	const existing = [
 		{ ...pantry('avocado', 1, 'whole', '2026-10-24'), category: 'Produce' },
@@ -803,5 +928,214 @@ test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and 
 	assert.deepEqual(
 		fallbackRanked.map((item) => item.id),
 		['blank-lot', 'invalid-lot']
+	);
+});
+
+test('restockDepletedPantryItems moves selected or all zero-quantity rows while keeping stored name and unit', () => {
+	const initialPantry = [
+		pantry('chickpeas', 0, 'can (15 oz)'),
+		pantry('baby spinach', 0, 'cups', '2026-10-23'),
+		pantry('olive oil', 0.5, 'cup')
+	];
+	let nextId = 0;
+	const createId = () => `restock-${++nextId}`;
+
+	const single = restockDepletedPantryItems(initialPantry, [], ['chickpeas-can (15 oz)'], createId);
+	assert.equal(single.restockedCount, 1);
+	assert.equal(single.addedCount, 1);
+	assert.deepEqual(
+		single.pantry.map((item) => item.name),
+		['baby spinach', 'olive oil']
+	);
+	assert.deepEqual(single.shopping, [
+		{
+			id: 'restock-1',
+			name: 'chickpeas',
+			quantity: 1,
+			unit: 'can (15 oz)',
+			checked: false
+		}
+	]);
+	assert.equal('sourceKey' in single.shopping[0], false);
+	assert.equal(initialPantry.length, 3);
+
+	const bulk = restockDepletedPantryItems(initialPantry, [], undefined, createId);
+	assert.equal(bulk.restockedCount, 2);
+	assert.equal(bulk.addedCount, 2);
+	assert.deepEqual(
+		bulk.pantry.map((item) => item.name),
+		['olive oil']
+	);
+	assert.deepEqual(
+		bulk.shopping.map(({ name, quantity, unit, checked }) => ({ name, quantity, unit, checked })),
+		[
+			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)', checked: false },
+			{ name: 'baby spinach', quantity: 1, unit: 'cups', checked: false }
+		]
+	);
+});
+
+test('restockDepletedPantryItems deduplicates compatible unchecked entries and survives scoped refreshes', () => {
+	const existingShopping: ShoppingItem[] = [
+		shopping('week-beans', 'garbanzo beans', 2, 'can (15 oz)', false, 'week:2026-10-19'),
+		shopping('bought-oil', 'extra virgin olive oil', 1, 'tbsp', true, 'recipe:pasta'),
+		shopping('oil-pack', 'olive oil', 1, 'package', false)
+	];
+	const depletedPantry = [
+		pantry('chickpeas', 0, 'can (15 oz)'),
+		pantry('olive oil', 0, 'cup'),
+		pantry('tomato', 0, 'g', '2026-10-22'),
+		pantry('tomatoes', 0, 'oz', '2026-10-25')
+	];
+	let nextId = 0;
+	const result = restockDepletedPantryItems(
+		depletedPantry,
+		existingShopping,
+		undefined,
+		() => `restock-${++nextId}`
+	);
+
+	assert.equal(result.pantry.length, 0);
+	assert.equal(result.restockedCount, 4);
+	assert.equal(result.addedCount, 2);
+	assert.equal(result.shopping.length, 5);
+	assert.deepEqual(result.shopping[0], existingShopping[0]);
+	assert.equal(result.shopping.at(-1)?.id, 'bought-oil');
+	const addedOil = result.shopping.find((item) => item.id === 'restock-1');
+	assert.deepEqual(addedOil, {
+		id: 'restock-1',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'cup',
+		checked: false
+	});
+	const addedTomato = result.shopping.find((item) => item.id === 'restock-2');
+	assert.deepEqual(addedTomato, {
+		id: 'restock-2',
+		name: 'tomato',
+		quantity: 1,
+		unit: 'g',
+		checked: false
+	});
+
+	const refreshedWeek = reconcileShoppingList(
+		result.shopping,
+		[shopping('next-rice', 'jasmine rice', 1, 'cup', false)],
+		'week:2026-10-19'
+	);
+	assert.ok(refreshedWeek.some((item) => item.id === 'restock-1' && item.sourceKey === undefined));
+	assert.ok(refreshedWeek.some((item) => item.id === 'restock-2' && item.sourceKey === undefined));
+});
+
+test('rankPantryRecipes filters to positive pantry matches and supports targeted expiring ingredients', () => {
+	const now = new Date(2026, 9, 22);
+	const chickpeaOrzo = recipe({
+		id: 'orzo',
+		title: 'Chickpea spinach orzo',
+		ingredients: [
+			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'baby spinach', quantity: 2, unit: 'cups' }
+		]
+	});
+	const hummus = recipe({
+		id: 'hummus',
+		title: 'Quick hummus',
+		ingredients: [
+			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'tahini', quantity: 2, unit: 'tbsp' }
+		]
+	});
+	const wiltedGreens = recipe({
+		id: 'greens',
+		title: 'Wilted spinach',
+		ingredients: [{ name: 'spinach', quantity: 2, unit: 'cups' }]
+	});
+	const lentilSoup = recipe({
+		id: 'lentils',
+		title: 'Red lentil soup',
+		ingredients: [{ name: 'lentils', quantity: 1, unit: 'cup' }]
+	});
+	const custard = recipe({
+		id: 'custard',
+		title: 'Baked custard',
+		ingredients: [{ name: 'milk', quantity: 1, unit: 'cup' }]
+	});
+
+	const expiringSpinach = pantry('baby spinach', 2, 'cups', '2026-10-24');
+	const stockedChickpeas = pantry('chickpeas', 1, 'can (15 oz)');
+	const depletedLentils = pantry('lentils', 0, 'cup');
+	const expiredMilk = pantry('milk', 1, 'cup', '2026-10-20');
+	const malformedSpinach = pantry('spinach', 2, 'cups', '2026-02-30');
+	const pantryItems = [
+		expiringSpinach,
+		stockedChickpeas,
+		depletedLentils,
+		expiredMilk,
+		malformedSpinach
+	];
+	const allRecipes = [lentilSoup, custard, hummus, wiltedGreens, chickpeaOrzo];
+
+	const fromPantry = rankPantryRecipes(allRecipes, pantryItems, preferences(), undefined, now);
+	assert.deepEqual(
+		fromPantry.map((item) => item.id),
+		['greens', 'orzo', 'hummus']
+	);
+
+	const useSpinachFirst = rankPantryRecipes(
+		allRecipes,
+		pantryItems,
+		preferences(),
+		[expiringSpinach],
+		now
+	);
+	assert.deepEqual(
+		useSpinachFirst.map((item) => item.id),
+		['greens', 'orzo']
+	);
+
+	assert.deepEqual(
+		rankPantryRecipes(
+			allRecipes,
+			[depletedLentils, expiredMilk, malformedSpinach],
+			preferences(),
+			undefined,
+			now
+		),
+		[]
+	);
+});
+
+test('filterPantryItems excludes zero-quantity rows from Expiring soon while keeping them in All ingredients', () => {
+	const now = new Date(2026, 10, 21, 12, 0);
+	const items: Ingredient[] = [
+		{
+			id: 'spinach-depleted',
+			name: 'baby spinach',
+			quantity: 0,
+			unit: 'cups',
+			category: 'Produce',
+			expires: '2026-11-22'
+		},
+		{
+			id: 'rice-stocked',
+			name: 'jasmine rice',
+			quantity: 2,
+			unit: 'cups',
+			category: 'Grains',
+			expires: '2026-11-22'
+		}
+	];
+
+	assert.deepEqual(
+		filterPantryItems(items, { query: '', category: 'all', expiry: 'soon' }, now).map(
+			(item) => item.id
+		),
+		['rice-stocked']
+	);
+	assert.deepEqual(
+		filterPantryItems(items, { query: '', category: 'all', expiry: 'all' }, now).map(
+			(item) => item.id
+		),
+		['spinach-depleted', 'rice-stocked']
 	);
 });
