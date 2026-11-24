@@ -6,8 +6,10 @@ import {
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
+	readdirSync,
 	readFileSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync
 } from 'node:fs';
@@ -26,6 +28,12 @@ interface CheckRunFixture {
 	conclusion: string | null;
 	app?: { slug?: string } | null;
 	head_sha?: string;
+	details_url?: string | null;
+	html_url?: string | null;
+	workflow_path?: string;
+	workflow_status?: string;
+	workflow_conclusion?: string | null;
+	workflow_status_code?: number;
 }
 
 interface RecordedRequest {
@@ -34,12 +42,18 @@ interface RecordedRequest {
 	authorization: string | undefined;
 }
 
+interface DeployedState {
+	sha: string;
+	image: string;
+}
+
 interface Harness {
 	rootDir: string;
 	bareRepoDir: string;
 	workRepoDir: string;
 	appDir: string;
 	stateDir: string;
+	tmpRuntimeBaseDir: string;
 	runtimeScriptPath: string;
 	binDir: string;
 	dockerStateFile: string;
@@ -47,6 +61,8 @@ interface Harness {
 	requests: RecordedRequest[];
 	setCheckRuns: (sha: string, runs: CheckRunFixture[], statusCode?: number) => void;
 	commitAndPush: (files: Record<string, string>, message: string) => string;
+	readDeployedState: () => DeployedState;
+	writeDeployedState: (sha: string, image: string) => void;
 	readDockerState: () => DockerSimState;
 	writeDockerState: (patch: Partial<DockerSimState>) => void;
 	readDockerLog: () => string[];
@@ -54,6 +70,7 @@ interface Harness {
 	runUpdater: (options?: {
 		env?: Record<string, string | undefined>;
 		useIsolatedTools?: boolean;
+		omitRuntimeScriptEnv?: boolean;
 	}) => Promise<{ code: number | null; stdout: string; stderr: string }>;
 	cleanup: () => Promise<void>;
 }
@@ -67,6 +84,7 @@ interface DockerSimState {
 	failBuild: boolean;
 	failUpCount: number;
 	failRollbackHealthCount: number;
+	failRollbackTag: boolean;
 }
 
 function git(cwd: string, args: string[]) {
@@ -97,7 +115,8 @@ async function createHarness(): Promise<Harness> {
 	const workRepoDir = join(rootDir, 'work');
 	const appDir = join(rootDir, 'app');
 	const stateDir = join(rootDir, 'state');
-	const runtimeScriptPath = join(rootDir, 'tmp', 'flavorithm-update.sh');
+	const tmpRuntimeBaseDir = join(rootDir, 'tmp-base');
+	const runtimeScriptPath = join(rootDir, 'runtime-dir', 'update.sh');
 	const binDir = join(rootDir, 'bin');
 	const dockerStateFile = join(rootDir, 'docker-state.json');
 	const dockerLogFile = join(rootDir, 'docker-commands.log');
@@ -105,6 +124,8 @@ async function createHarness(): Promise<Harness> {
 	mkdirSync(bareRepoDir, { recursive: true });
 	mkdirSync(workRepoDir, { recursive: true });
 	mkdirSync(stateDir, { recursive: true });
+	mkdirSync(tmpRuntimeBaseDir, { recursive: true });
+	chmodSync(tmpRuntimeBaseDir, 0o777);
 	mkdirSync(binDir, { recursive: true });
 
 	git(bareRepoDir, ['init', '--bare', '--initial-branch=main']);
@@ -126,8 +147,7 @@ async function createHarness(): Promise<Harness> {
 	writeFileSync(join(appDir, '.env'), 'ORIGIN=https://eat.flavorithm.test\n');
 
 	const initialImage = 'sha256:1111111111111111111111111111111111111111111111111111111111111111';
-	writeFileSync(join(stateDir, 'deployed-sha'), `${initialSha}\n`);
-	writeFileSync(join(stateDir, 'deployed-image'), `${initialImage}\n`);
+	writeFileSync(join(stateDir, 'deployed-state'), `${initialSha}\n${initialImage}\n`);
 
 	const initialDockerState: DockerSimState = {
 		containerImage: initialImage,
@@ -142,7 +162,8 @@ async function createHarness(): Promise<Harness> {
 		nextBuildImage: 'sha256:2222222222222222222222222222222222222222222222222222222222222222',
 		failBuild: false,
 		failUpCount: 0,
-		failRollbackHealthCount: 0
+		failRollbackHealthCount: 0,
+		failRollbackTag: false
 	};
 	writeFileSync(dockerStateFile, JSON.stringify(initialDockerState, null, 2));
 	writeFileSync(dockerLogFile, '');
@@ -215,6 +236,10 @@ if (args[0] === 'inspect') {
 
 if (args[0] === 'tag') {
 	const [, src, dst] = args;
+	if (dst === 'flavorithm:rollback' && state.failRollbackTag) {
+		process.stderr.write('simulated rollback tag failure\\n');
+		process.exit(1);
+	}
 	const resolved = state.tags[src] || src;
 	if (!resolved || (!resolved.startsWith('sha256:') && !state.tags[src])) {
 		process.stderr.write('No such image: ' + src + '\\n');
@@ -278,7 +303,12 @@ process.exit(1);
 	chmodSync(mockDockerSh, 0o755);
 
 	const requests: RecordedRequest[] = [];
-	const checkResponses = new Map<string, { statusCode: number; runs: CheckRunFixture[] }>();
+	let nextWorkflowRunId = 10000;
+	const checkResponses = new Map<string, { statusCode: number; runs: Record<string, unknown>[] }>();
+	const workflowRunResponses = new Map<
+		string,
+		{ statusCode: number; payload: Record<string, unknown> }
+	>();
 
 	const server = createServer((req: IncomingMessage, res: ServerResponse) => {
 		const url = req.url ?? '';
@@ -289,28 +319,43 @@ process.exit(1);
 				typeof req.headers.authorization === 'string' ? req.headers.authorization : undefined
 		});
 
-		const match = url.match(
+		const checkMatch = url.match(
 			/^\/repos\/([^/]+)\/([^/]+)\/commits\/([0-9a-fA-F]{40})\/check-runs\?check_name=verify&filter=latest$/
 		);
-		if (!match) {
-			res.writeHead(404, { 'content-type': 'application/json' });
-			res.end(JSON.stringify({ message: 'Not Found' }));
+		if (checkMatch) {
+			const sha = checkMatch[3].toLowerCase();
+			const configured = checkResponses.get(sha);
+			if (!configured) {
+				res.writeHead(200, { 'content-type': 'application/json' });
+				res.end(JSON.stringify({ total_count: 0, check_runs: [] }));
+				return;
+			}
+			res.writeHead(configured.statusCode, { 'content-type': 'application/json' });
+			res.end(
+				JSON.stringify({
+					total_count: configured.runs.length,
+					check_runs: configured.runs
+				})
+			);
 			return;
 		}
-		const sha = match[3].toLowerCase();
-		const configured = checkResponses.get(sha);
-		if (!configured) {
-			res.writeHead(200, { 'content-type': 'application/json' });
-			res.end(JSON.stringify({ total_count: 0, check_runs: [] }));
+
+		const runMatch = url.match(/^\/repos\/([^/]+)\/([^/]+)\/actions\/runs\/([0-9]+)$/);
+		if (runMatch) {
+			const runId = runMatch[3];
+			const configuredRun = workflowRunResponses.get(runId);
+			if (!configuredRun) {
+				res.writeHead(404, { 'content-type': 'application/json' });
+				res.end(JSON.stringify({ message: 'Not Found' }));
+				return;
+			}
+			res.writeHead(configuredRun.statusCode, { 'content-type': 'application/json' });
+			res.end(JSON.stringify(configuredRun.payload));
 			return;
 		}
-		res.writeHead(configured.statusCode, { 'content-type': 'application/json' });
-		res.end(
-			JSON.stringify({
-				total_count: configured.runs.length,
-				check_runs: configured.runs
-			})
-		);
+
+		res.writeHead(404, { 'content-type': 'application/json' });
+		res.end(JSON.stringify({ message: 'Not Found' }));
 	});
 
 	await new Promise<void>((resolveListen) => {
@@ -321,7 +366,40 @@ process.exit(1);
 	const apiBaseUrl = `http://127.0.0.1:${address.port}`;
 
 	function setCheckRuns(sha: string, runs: CheckRunFixture[], statusCode = 200) {
-		checkResponses.set(sha.toLowerCase(), { statusCode, runs });
+		const normalizedSha = sha.toLowerCase();
+		const serializedRuns = runs.map((run, index) => {
+			nextWorkflowRunId += 1;
+			const runId = String(nextWorkflowRunId);
+			const defaultUrl =
+				run.app?.slug === 'github-actions'
+					? `https://github.com/sgerner/flavorithm/actions/runs/${runId}/job/${index + 1}`
+					: undefined;
+			const detailsUrl = run.details_url === undefined ? defaultUrl : run.details_url;
+			const htmlUrl = run.html_url === undefined ? detailsUrl : run.html_url;
+
+			workflowRunResponses.set(runId, {
+				statusCode: run.workflow_status_code ?? 200,
+				payload: {
+					id: Number(runId),
+					path: run.workflow_path ?? '.github/workflows/ci.yml',
+					head_sha: run.head_sha ?? normalizedSha,
+					status: run.workflow_status ?? run.status,
+					conclusion:
+						run.workflow_conclusion === undefined ? run.conclusion : run.workflow_conclusion
+				}
+			});
+
+			return {
+				name: run.name,
+				status: run.status,
+				conclusion: run.conclusion,
+				app: run.app,
+				head_sha: run.head_sha ?? normalizedSha,
+				details_url: detailsUrl,
+				html_url: htmlUrl
+			};
+		});
+		checkResponses.set(normalizedSha, { statusCode, runs: serializedRuns });
 	}
 
 	function commitAndPush(files: Record<string, string>, message: string): string {
@@ -335,6 +413,18 @@ process.exit(1);
 		const sha = git(workRepoDir, ['rev-parse', 'HEAD']);
 		git(workRepoDir, ['push', bareRepoDir, 'HEAD:refs/heads/main']);
 		return sha;
+	}
+
+	function readDeployedState(): DeployedState {
+		const raw = readFileSync(join(stateDir, 'deployed-state'), 'utf8').split(/\r?\n/);
+		return {
+			sha: (raw[0] ?? '').trim(),
+			image: (raw[1] ?? '').trim()
+		};
+	}
+
+	function writeDeployedState(sha: string, image: string) {
+		writeFileSync(join(stateDir, 'deployed-state'), `${sha}\n${image}\n`);
 	}
 
 	function readDockerState(): DockerSimState {
@@ -359,6 +449,7 @@ process.exit(1);
 	async function runUpdater(options?: {
 		env?: Record<string, string | undefined>;
 		useIsolatedTools?: boolean;
+		omitRuntimeScriptEnv?: boolean;
 	}) {
 		let pathEnv = `${binDir}:${process.env.PATH ?? ''}`;
 		let isolatedDir: string | undefined;
@@ -367,6 +458,7 @@ process.exit(1);
 			for (const cmd of [
 				'sh',
 				'mkdir',
+				'mktemp',
 				'dirname',
 				'cp',
 				'ln',
@@ -407,6 +499,7 @@ ln -sf "${realJq}" "${join(isolatedDir, 'jq')}"
 		const mergedEnv: NodeJS.ProcessEnv = {
 			...process.env,
 			PATH: pathEnv,
+			TMPDIR: tmpRuntimeBaseDir,
 			MOCK_DOCKER_STATE_FILE: dockerStateFile,
 			MOCK_DOCKER_LOG_FILE: dockerLogFile,
 			FLAVORITHM_UPDATE_INTERVAL_SECONDS: '0',
@@ -427,6 +520,9 @@ ln -sf "${realJq}" "${join(isolatedDir, 'jq')}"
 			GIT_CONFIG_VALUE_1: 'git@github.com:sgerner/flavorithm.git',
 			...options?.env
 		};
+		if (options?.omitRuntimeScriptEnv) {
+			delete mergedEnv.FLAVORITHM_UPDATER_RUNTIME_SCRIPT;
+		}
 
 		return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveRun) => {
 			const child = spawn('/bin/sh', [join(appDir, 'deploy', 'skynet', 'update.sh')], {
@@ -461,6 +557,7 @@ ln -sf "${realJq}" "${join(isolatedDir, 'jq')}"
 		workRepoDir,
 		appDir,
 		stateDir,
+		tmpRuntimeBaseDir,
 		runtimeScriptPath,
 		binDir,
 		dockerStateFile,
@@ -468,6 +565,8 @@ ln -sf "${realJq}" "${join(isolatedDir, 'jq')}"
 		requests,
 		setCheckRuns,
 		commitAndPush,
+		readDeployedState,
+		writeDeployedState,
 		readDockerState,
 		writeDockerState,
 		readDockerLog,
@@ -477,12 +576,35 @@ ln -sf "${realJq}" "${join(isolatedDir, 'jq')}"
 	};
 }
 
-test('copies updater to /tmp, installs missing apk tools, and skips GitHub API when SHA matches deployed or failed state', async () => {
+test('creates 0700 mktemp -d runtime copy by default, installs missing apk tools, skips GitHub API on deployed/failed SHA, and migrates legacy deployed-sha', async () => {
 	const h = await createHarness();
 	try {
-		const upToDate = await h.runUpdater({ useIsolatedTools: true });
+		const upToDate = await h.runUpdater({ useIsolatedTools: true, omitRuntimeScriptEnv: true });
 		assert.equal(upToDate.code, 0, upToDate.stderr);
-		assert.ok(existsSync(h.runtimeScriptPath), 'Expected updater copy in /tmp');
+
+		const tmpEntries = readdirSync(h.tmpRuntimeBaseDir);
+		assert.equal(
+			tmpEntries.includes('flavorithm-update.sh'),
+			false,
+			'Must not create predictable /tmp/flavorithm-update.sh'
+		);
+		const runtimeDirs = tmpEntries.filter((name) => name.startsWith('flavorithm-updater.'));
+		assert.equal(runtimeDirs.length, 1, 'Expected one mktemp -d runtime directory');
+		const createdRuntimeDir = join(h.tmpRuntimeBaseDir, runtimeDirs[0]);
+		assert.equal(
+			statSync(createdRuntimeDir).mode & 0o777,
+			0o700,
+			'Runtime directory must have mode 0700'
+		);
+		const createdScript = join(createdRuntimeDir, 'update.sh');
+		assert.ok(existsSync(createdScript), 'Expected update.sh inside mktemp -d directory');
+		assert.equal(statSync(createdScript).mode & 0o777, 0o700, 'Runtime script must have mode 0700');
+		assert.deepEqual(
+			readdirSync(createdRuntimeDir),
+			['update.sh'],
+			'Must not leave temporary staging files behind'
+		);
+
 		assert.equal(
 			readFileSync(join(h.rootDir, 'apk.log'), 'utf8').trim(),
 			'add --no-cache git curl jq'
@@ -501,8 +623,8 @@ test('copies updater to /tmp, installs missing apk tools, and skips GitHub API w
 		assert.match(skippedFailed.stdout, /Skipping previously failed commit/);
 		assert.equal(h.requests.length, 0, 'Should not call GitHub API when remote_sha == failed-sha');
 
-		// Existing deployment upgrade: seeds missing deployed-image only when container is healthy
-		rmSync(join(h.stateDir, 'deployed-image'), { force: true });
+		// Legacy deployment upgrade: seeds atomic deployed-state from legacy deployed-sha only when container is healthy
+		rmSync(join(h.stateDir, 'deployed-state'), { force: true });
 		rmSync(join(h.stateDir, 'failed-sha'), { force: true });
 		writeFileSync(join(h.stateDir, 'deployed-sha'), `${failedSha}\n`);
 		git(h.appDir, ['fetch', '--no-tags', h.bareRepoDir, failedSha]);
@@ -510,17 +632,18 @@ test('copies updater to /tmp, installs missing apk tools, and skips GitHub API w
 		h.writeDockerState({ containerHealth: 'unhealthy' });
 		await h.runUpdater();
 		assert.equal(
-			existsSync(join(h.stateDir, 'deployed-image')),
+			existsSync(join(h.stateDir, 'deployed-state')),
 			false,
-			'Must never seed deployed-image from an unhealthy container'
+			'Must never seed deployed-state image from an unhealthy container'
 		);
 
 		h.writeDockerState({ containerHealth: 'healthy' });
 		await h.runUpdater();
-		assert.equal(
-			readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim(),
-			h.readDockerState().containerImage
-		);
+		assert.deepEqual(h.readDeployedState(), {
+			sha: failedSha,
+			image: h.readDockerState().containerImage
+		});
+		assert.equal(existsSync(join(h.stateDir, 'deployed-sha')), false);
 	} finally {
 		await h.cleanup();
 	}
@@ -571,21 +694,23 @@ test('validates GitHub repo URLs and 40-char SHAs and supports optional FLAVORIT
 		assert.equal(sshDeploy.code, 0, sshDeploy.stderr);
 		assert.match(sshDeploy.stdout, /Flavorithm updated successfully/);
 		assert.doesNotMatch(sshDeploy.stdout + sshDeploy.stderr, /ghp_secretTestToken123/);
-		assert.equal(h.requests.length, 1);
+		assert.equal(h.requests.length, 2);
 		assert.equal(
 			h.requests[0].url,
 			`/repos/sgerner/flavorithm/commits/${nextSha}/check-runs?check_name=verify&filter=latest`
 		);
+		assert.match(h.requests[1].url, /^\/repos\/sgerner\/flavorithm\/actions\/runs\/[0-9]+$/);
 		assert.equal(h.requests[0].authorization, 'Bearer ghp_secretTestToken123');
+		assert.equal(h.requests[1].authorization, 'Bearer ghp_secretTestToken123');
 	} finally {
 		await h.cleanup();
 	}
 });
 
-test('gates deployment on github-actions verify check-run success and deploys once verified', async () => {
+test('gates deployment on .github/workflows/ci.yml verify check-run success and deploys once verified', async () => {
 	const h = await createHarness();
 	try {
-		const initialSha = readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim();
+		const initialState = h.readDeployedState();
 		const nextImage = 'sha256:3333333333333333333333333333333333333333333333333333333333333333';
 		h.writeDockerState({
 			nextBuildImage: nextImage,
@@ -636,6 +761,37 @@ test('gates deployment on github-actions verify check-run success and deploys on
 					conclusion: 'cancelled',
 					app: { slug: 'github-actions' }
 				}
+			],
+			[
+				// Passing github-actions verify job from a different workflow file
+				{
+					name: 'verify',
+					status: 'completed',
+					conclusion: 'success',
+					app: { slug: 'github-actions' },
+					workflow_path: '.github/workflows/other.yml'
+				}
+			],
+			[
+				// Missing workflow run link on check-run (fail-closed)
+				{
+					name: 'verify',
+					status: 'completed',
+					conclusion: 'success',
+					app: { slug: 'github-actions' },
+					details_url: null,
+					html_url: null
+				}
+			],
+			[
+				// Workflow run endpoint fails (fail-closed)
+				{
+					name: 'verify',
+					status: 'completed',
+					conclusion: 'success',
+					app: { slug: 'github-actions' },
+					workflow_status_code: 500
+				}
 			]
 		];
 
@@ -644,27 +800,27 @@ test('gates deployment on github-actions verify check-run success and deploys on
 			const skipped = await h.runUpdater();
 			assert.equal(skipped.code, 0, skipped.stderr);
 			assert.match(skipped.stdout, /verify check-run has not completed with success/);
-			assert.equal(git(h.appDir, ['rev-parse', 'HEAD']), initialSha);
-			assert.equal(readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim(), initialSha);
+			assert.equal(git(h.appDir, ['rev-parse', 'HEAD']), initialState.sha);
+			assert.deepEqual(h.readDeployedState(), initialState);
 			assert.equal(existsSync(join(h.stateDir, 'failed-sha')), false);
 		}
 
-		// Once GitHub Actions verify finishes with success, the next poll deploys it
+		// Once GitHub Actions .github/workflows/ci.yml verify finishes with success, the next poll deploys it
 		h.setCheckRuns(candidateSha, [
 			{
 				name: 'verify',
 				status: 'completed',
 				conclusion: 'success',
 				app: { slug: 'github-actions' },
-				head_sha: candidateSha
+				head_sha: candidateSha,
+				workflow_path: '.github/workflows/ci.yml'
 			}
 		]);
 		const deployed = await h.runUpdater();
 		assert.equal(deployed.code, 0, deployed.stderr);
 		assert.match(deployed.stdout, /Flavorithm updated successfully/);
 		assert.equal(git(h.appDir, ['rev-parse', 'HEAD']), candidateSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim(), candidateSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim(), nextImage);
+		assert.deepEqual(h.readDeployedState(), { sha: candidateSha, image: nextImage });
 		assert.equal(h.readDockerState().tags['flavorithm:rollback'], nextImage);
 		assert.equal(h.readDockerState().tags['flavorithm:local'], nextImage);
 	} finally {
@@ -675,8 +831,7 @@ test('gates deployment on github-actions verify check-run success and deploys on
 test('resets /app to deployed_sha before rollback when compose.override.yml is invalid', async () => {
 	const h = await createHarness();
 	try {
-		const initialSha = readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim();
-		const initialImage = readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim();
+		const { sha: initialSha, image: initialImage } = h.readDeployedState();
 
 		const brokenComposeSha = h.commitAndPush(
 			{
@@ -700,8 +855,7 @@ test('resets /app to deployed_sha before rollback when compose.override.yml is i
 		assert.match(res.stdout, /Rollback to .* succeeded/);
 
 		assert.equal(git(h.appDir, ['rev-parse', 'HEAD']), initialSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim(), initialSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim(), initialImage);
+		assert.deepEqual(h.readDeployedState(), { sha: initialSha, image: initialImage });
 		assert.equal(readFileSync(join(h.stateDir, 'failed-sha'), 'utf8').trim(), brokenComposeSha);
 
 		const entries = h
@@ -733,8 +887,7 @@ test('resets /app to deployed_sha before rollback when compose.override.yml is i
 test('rolls back container image and checkout when new container fails health check', async () => {
 	const h = await createHarness();
 	try {
-		const initialSha = readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim();
-		const initialImage = readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim();
+		const { sha: initialSha, image: initialImage } = h.readDeployedState();
 		const unhealthyImage =
 			'sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
@@ -762,8 +915,7 @@ test('rolls back container image and checkout when new container fails health ch
 		assert.match(res.stdout, /Rollback to .* succeeded/);
 
 		assert.equal(git(h.appDir, ['rev-parse', 'HEAD']), initialSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim(), initialSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim(), initialImage);
+		assert.deepEqual(h.readDeployedState(), { sha: initialSha, image: initialImage });
 		assert.equal(readFileSync(join(h.stateDir, 'failed-sha'), 'utf8').trim(), brokenAppSha);
 
 		const finalDocker = h.readDockerState();
@@ -776,11 +928,10 @@ test('rolls back container image and checkout when new container fails health ch
 	}
 });
 
-test('preserves deployed-image when Poll 1 rollback fails and retries recovery on Poll 2 without rebuilding', async () => {
+test('preserves deployed-state image when Poll 1 rollback fails and retries recovery on Poll 2 without rebuilding', async () => {
 	const h = await createHarness();
 	try {
-		const initialSha = readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim();
-		const initialImage = readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim();
+		const { sha: initialSha, image: initialImage } = h.readDeployedState();
 		const brokenImage = 'sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
 
 		h.writeDockerState({
@@ -807,7 +958,7 @@ test('preserves deployed-image when Poll 1 rollback fails and retries recovery o
 		const poll1 = await h.runUpdater();
 		assert.equal(poll1.code, 0, poll1.stderr);
 		assert.match(poll1.stdout, /Rollback failed; retrying recovery/);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim(), initialImage);
+		assert.deepEqual(h.readDeployedState(), { sha: initialSha, image: initialImage });
 		assert.equal(h.readDockerState().tags['flavorithm:rollback'], initialImage);
 		assert.equal(
 			existsSync(join(h.stateDir, 'failed-sha')),
@@ -839,8 +990,7 @@ test('preserves deployed-image when Poll 1 rollback fails and retries recovery o
 		);
 
 		assert.equal(git(h.appDir, ['rev-parse', 'HEAD']), initialSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim(), initialSha);
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-image'), 'utf8').trim(), initialImage);
+		assert.deepEqual(h.readDeployedState(), { sha: initialSha, image: initialImage });
 		assert.equal(readFileSync(join(h.stateDir, 'failed-sha'), 'utf8').trim(), brokenSha);
 		assert.equal(existsSync(join(h.stateDir, 'rollback-pending')), false);
 		assert.equal(h.readDockerState().tags['flavorithm:local'], initialImage);
@@ -851,10 +1001,268 @@ test('preserves deployed-image when Poll 1 rollback fails and retries recovery o
 	}
 });
 
-test('isolates active /tmp script from corrupted update.sh during rollback and re-executes healthy script updates', async () => {
+test('writes deployed SHA and image atomically, treats rollback docker tag as non-fatal, and converges cleanly across crash windows', async () => {
 	const h = await createHarness();
 	try {
-		const initialSha = readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim();
+		// Part A: Non-fatal docker tag failure during healthy deploy still commits atomic deployed-state and clears rollback-pending
+		const sha2 = h.commitAndPush({ 'version.txt': 'v2-nonfatal-tag\n' }, 'Non-fatal tag release');
+		const image2 = 'sha256:2222222222222222222222222222222222222222222222222222222222222222';
+		h.writeDockerState({
+			nextBuildImage: image2,
+			imageHealthMap: {
+				...h.readDockerState().imageHealthMap,
+				[image2]: 'healthy'
+			},
+			failRollbackTag: true
+		});
+		h.setCheckRuns(sha2, [
+			{
+				name: 'verify',
+				status: 'completed',
+				conclusion: 'success',
+				app: { slug: 'github-actions' }
+			}
+		]);
+
+		const deployNonFatalTag = await h.runUpdater();
+		assert.equal(deployNonFatalTag.code, 0, deployNonFatalTag.stderr);
+		assert.match(deployNonFatalTag.stdout, /Flavorithm updated successfully/);
+		assert.deepEqual(h.readDeployedState(), { sha: sha2, image: image2 });
+		assert.equal(existsSync(join(h.stateDir, 'rollback-pending')), false);
+		assert.equal(existsSync(join(h.stateDir, 'failed-sha')), false);
+
+		// Restore working docker tag so next poll repairs flavorithm:rollback from deployed-state
+		h.writeDockerState({ failRollbackTag: false });
+
+		// Part B: Crash BEFORE atomic deployed-state write (checkout & running container are at sha3/image3, but deployed-state is still sha2/image2 and rollback-pending is set)
+		const sha3 = h.commitAndPush({ 'version.txt': 'v3-crash-before\n' }, 'Crash before commit');
+		const image3 = 'sha256:3434343434343434343434343434343434343434343434343434343434343434';
+		git(h.appDir, ['fetch', '--no-tags', h.bareRepoDir, sha3]);
+		git(h.appDir, ['checkout', '--force', sha3]);
+		h.writeDockerState({
+			containerImage: image3,
+			containerHealth: 'healthy',
+			nextBuildImage: image3,
+			tags: {
+				'flavorithm:local': image3,
+				'flavorithm:rollback': image2
+			},
+			imageHealthMap: {
+				...h.readDockerState().imageHealthMap,
+				[image2]: 'healthy',
+				[image3]: 'healthy'
+			}
+		});
+		writeFileSync(join(h.stateDir, 'rollback-pending'), 'recover\n');
+		h.setCheckRuns(sha3, [
+			{
+				name: 'verify',
+				status: 'completed',
+				conclusion: 'success',
+				app: { slug: 'github-actions' }
+			}
+		]);
+
+		const recoverBeforeWrite = await h.runUpdater();
+		assert.equal(recoverBeforeWrite.code, 0, recoverBeforeWrite.stderr);
+		assert.match(recoverBeforeWrite.stdout, new RegExp(`Rollback to ${sha2} succeeded`));
+		assert.equal(
+			git(h.appDir, ['rev-parse', 'HEAD']),
+			sha2,
+			'Must restore checkout to sha2 matching image2'
+		);
+		assert.equal(
+			h.readDockerState().containerImage,
+			image2,
+			'Must restore container image to image2 matching sha2 (never pairing image3 with sha2)'
+		);
+		assert.deepEqual(h.readDeployedState(), { sha: sha2, image: image2 });
+		assert.equal(existsSync(join(h.stateDir, 'rollback-pending')), false);
+		assert.equal(
+			existsSync(join(h.stateDir, 'failed-sha')),
+			false,
+			'Interrupted healthy commit must not be marked failed-sha'
+		);
+
+		// Next poll cleanly deploys sha3/image3
+		const redeployAfterRecover = await h.runUpdater();
+		assert.equal(redeployAfterRecover.code, 0, redeployAfterRecover.stderr);
+		assert.match(redeployAfterRecover.stdout, /Flavorithm updated successfully/);
+		assert.deepEqual(h.readDeployedState(), { sha: sha3, image: image3 });
+
+		// Part C: Crash IMMEDIATELY AFTER atomic deployed-state write (deployed-state is sha4/image4, but rollback-pending still exists and flavorithm:rollback still points to image3)
+		const sha4 = h.commitAndPush({ 'version.txt': 'v4-crash-after\n' }, 'Crash after commit');
+		const image4 = 'sha256:4545454545454545454545454545454545454545454545454545454545454545';
+		git(h.appDir, ['fetch', '--no-tags', h.bareRepoDir, sha4]);
+		git(h.appDir, ['checkout', '--force', sha4]);
+		h.writeDeployedState(sha4, image4);
+		writeFileSync(join(h.stateDir, 'rollback-pending'), 'recover\n');
+		h.writeDockerState({
+			containerImage: image4,
+			containerHealth: 'healthy',
+			tags: {
+				'flavorithm:local': image4,
+				'flavorithm:rollback': image3
+			},
+			imageHealthMap: {
+				...h.readDockerState().imageHealthMap,
+				[image4]: 'healthy'
+			}
+		});
+
+		const recoverAfterWrite = await h.runUpdater();
+		assert.equal(recoverAfterWrite.code, 0, recoverAfterWrite.stderr);
+		assert.match(recoverAfterWrite.stdout, new RegExp(`Rollback to ${sha4} succeeded`));
+		assert.equal(
+			git(h.appDir, ['rev-parse', 'HEAD']),
+			sha4,
+			'Checkout must converge to sha4 matching image4'
+		);
+		assert.equal(
+			h.readDockerState().containerImage,
+			image4,
+			'Container image must converge to image4 matching sha4'
+		);
+		assert.equal(h.readDockerState().tags['flavorithm:rollback'], image4);
+		assert.deepEqual(h.readDeployedState(), { sha: sha4, image: image4 });
+		assert.equal(existsSync(join(h.stateDir, 'rollback-pending')), false);
+		assert.equal(existsSync(join(h.stateDir, 'failed-sha')), false);
+	} finally {
+		await h.cleanup();
+	}
+});
+
+test('treats missing or invalid deployed SHA as no rollback target, clears pending marker, and continues deploying', async () => {
+	const h = await createHarness();
+	try {
+		// Part A: Empty state directory + pre-existing rollback-pending marker
+		rmSync(join(h.stateDir, 'deployed-state'), { force: true });
+		writeFileSync(join(h.stateDir, 'rollback-pending'), 'recover\n');
+
+		const sha2 = h.commitAndPush({ 'version.txt': 'v2-from-empty\n' }, 'Deploy from empty state');
+		const image2 = 'sha256:5656565656565656565656565656565656565656565656565656565656565656';
+		h.writeDockerState({
+			nextBuildImage: image2,
+			imageHealthMap: {
+				...h.readDockerState().imageHealthMap,
+				[image2]: 'healthy'
+			}
+		});
+		h.setCheckRuns(sha2, [
+			{
+				name: 'verify',
+				status: 'completed',
+				conclusion: 'success',
+				app: { slug: 'github-actions' }
+			}
+		]);
+
+		const emptyStateDeploy = await h.runUpdater();
+		assert.equal(emptyStateDeploy.code, 0, emptyStateDeploy.stderr);
+		assert.match(emptyStateDeploy.stdout, /No rollback target.*clearing pending rollback marker/);
+		assert.match(emptyStateDeploy.stdout, /Flavorithm updated successfully/);
+		assert.equal(existsSync(join(h.stateDir, 'rollback-pending')), false);
+		assert.deepEqual(h.readDeployedState(), { sha: sha2, image: image2 });
+
+		// Part B: Invalid deployed SHA in deployed-state + pre-existing rollback-pending marker
+		h.writeDeployedState('not-a-valid-40-char-sha', image2);
+		writeFileSync(join(h.stateDir, 'rollback-pending'), `${sha2}\n`);
+
+		const sha3 = h.commitAndPush(
+			{ 'version.txt': 'v3-from-invalid\n' },
+			'Deploy from invalid state'
+		);
+		const image3 = 'sha256:6767676767676767676767676767676767676767676767676767676767676767';
+		h.writeDockerState({
+			nextBuildImage: image3,
+			imageHealthMap: {
+				...h.readDockerState().imageHealthMap,
+				[image3]: 'healthy'
+			}
+		});
+		h.setCheckRuns(sha3, [
+			{
+				name: 'verify',
+				status: 'completed',
+				conclusion: 'success',
+				app: { slug: 'github-actions' }
+			}
+		]);
+
+		const invalidStateDeploy = await h.runUpdater();
+		assert.equal(invalidStateDeploy.code, 0, invalidStateDeploy.stderr);
+		assert.match(invalidStateDeploy.stdout, /No rollback target.*clearing pending rollback marker/);
+		assert.match(invalidStateDeploy.stdout, /Flavorithm updated successfully/);
+		assert.equal(existsSync(join(h.stateDir, 'rollback-pending')), false);
+		assert.deepEqual(h.readDeployedState(), { sha: sha3, image: image3 });
+
+		// Part C: Initial deploy fails when no deployed-state exists yet, then subsequent healthy commit deploys without wedging
+		rmSync(join(h.stateDir, 'deployed-state'), { force: true });
+		const brokenSha = h.commitAndPush(
+			{ 'version.txt': 'v4-initial-fail\n' },
+			'Broken initial deploy'
+		);
+		const brokenImage = 'sha256:7878787878787878787878787878787878787878787878787878787878787878';
+		h.writeDockerState({
+			nextBuildImage: brokenImage,
+			imageHealthMap: {
+				...h.readDockerState().imageHealthMap,
+				[brokenImage]: 'unhealthy'
+			}
+		});
+		h.setCheckRuns(brokenSha, [
+			{
+				name: 'verify',
+				status: 'completed',
+				conclusion: 'success',
+				app: { slug: 'github-actions' }
+			}
+		]);
+
+		const failedInitialPoll = await h.runUpdater();
+		assert.equal(failedInitialPoll.code, 0, failedInitialPoll.stderr);
+		assert.match(
+			failedInitialPoll.stdout,
+			/No rollback target: no valid deployed SHA recorded; clearing pending rollback marker/
+		);
+		assert.equal(
+			existsSync(join(h.stateDir, 'rollback-pending')),
+			false,
+			'Must clear rollback-pending when no rollback target exists'
+		);
+		assert.equal(readFileSync(join(h.stateDir, 'failed-sha'), 'utf8').trim(), brokenSha);
+
+		const fixedSha = h.commitAndPush({ 'version.txt': 'v5-recovered\n' }, 'Healthy follow-up');
+		const fixedImage = 'sha256:8989898989898989898989898989898989898989898989898989898989898989';
+		h.writeDockerState({
+			nextBuildImage: fixedImage,
+			imageHealthMap: {
+				...h.readDockerState().imageHealthMap,
+				[fixedImage]: 'healthy'
+			}
+		});
+		h.setCheckRuns(fixedSha, [
+			{
+				name: 'verify',
+				status: 'completed',
+				conclusion: 'success',
+				app: { slug: 'github-actions' }
+			}
+		]);
+
+		const recoveredPoll = await h.runUpdater();
+		assert.equal(recoveredPoll.code, 0, recoveredPoll.stderr);
+		assert.match(recoveredPoll.stdout, /Flavorithm updated successfully/);
+		assert.deepEqual(h.readDeployedState(), { sha: fixedSha, image: fixedImage });
+	} finally {
+		await h.cleanup();
+	}
+});
+
+test('isolates active mktemp -d runtime script from corrupted update.sh during rollback and re-executes healthy script updates', async () => {
+	const h = await createHarness();
+	try {
+		const { sha: initialSha } = h.readDeployedState();
 
 		// Part A: Commit corrupts deploy/skynet/update.sh AND breaks compose.override.yml
 		const corruptUpdaterSha = h.commitAndPush(
@@ -873,10 +1281,15 @@ test('isolates active /tmp script from corrupted update.sh during rollback and r
 			}
 		]);
 
-		const rollbackRes = await h.runUpdater();
+		const rollbackRes = await h.runUpdater({ omitRuntimeScriptEnv: true });
 		assert.equal(rollbackRes.code, 0, rollbackRes.stderr);
 		assert.match(rollbackRes.stdout, /Rollback to .* succeeded/);
 		assert.equal(git(h.appDir, ['rev-parse', 'HEAD']), initialSha);
+
+		// Clear previous mktemp -d directory before testing self-update re-execution
+		for (const entry of readdirSync(h.tmpRuntimeBaseDir)) {
+			rmSync(join(h.tmpRuntimeBaseDir, entry), { recursive: true, force: true });
+		}
 
 		// Part B: Healthy commit updates deploy/skynet/update.sh itself
 		git(h.workRepoDir, ['reset', '--hard', initialSha]);
@@ -908,14 +1321,25 @@ test('isolates active /tmp script from corrupted update.sh during rollback and r
 			}
 		]);
 
-		const selfUpdateRes = await h.runUpdater();
+		const selfUpdateRes = await h.runUpdater({ omitRuntimeScriptEnv: true });
 		assert.equal(selfUpdateRes.code, 0, selfUpdateRes.stderr);
 		assert.match(selfUpdateRes.stdout, /Flavorithm updated successfully/);
 		assert.match(selfUpdateRes.stdout, /Updater script changed; re-executing/);
 		assert.match(selfUpdateRes.stdout, /re-executed-updated-script-v2/);
 		assert.match(selfUpdateRes.stdout, new RegExp(`No update detected \\(${selfUpdateSha}\\)`));
-		assert.equal(readFileSync(join(h.stateDir, 'deployed-sha'), 'utf8').trim(), selfUpdateSha);
-		assert.equal(readFileSync(h.runtimeScriptPath, 'utf8'), updatedScript);
+		assert.deepEqual(h.readDeployedState(), { sha: selfUpdateSha, image: nextImage });
+
+		const runtimeDirs = readdirSync(h.tmpRuntimeBaseDir).filter((name) =>
+			name.startsWith('flavorithm-updater.')
+		);
+		assert.equal(
+			runtimeDirs.length,
+			1,
+			'Self-update exec must reuse the same 0700 mktemp -d runtime directory'
+		);
+		const runtimeDir = join(h.tmpRuntimeBaseDir, runtimeDirs[0]);
+		assert.equal(statSync(runtimeDir).mode & 0o777, 0o700);
+		assert.equal(readFileSync(join(runtimeDir, 'update.sh'), 'utf8'), updatedScript);
 	} finally {
 		await h.cleanup();
 	}

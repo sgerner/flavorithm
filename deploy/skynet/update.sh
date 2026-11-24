@@ -1,12 +1,31 @@
 #!/bin/sh
 set -eu
 
-runtime_script="${FLAVORITHM_UPDATER_RUNTIME_SCRIPT:-/tmp/flavorithm-update.sh}"
+if [ -z "${FLAVORITHM_UPDATER_RUNTIME_SCRIPT:-}" ]; then
+	umask_prev="$(umask)"
+	umask 077
+	runtime_dir="$(mktemp -d "${TMPDIR:-/tmp}/flavorithm-updater.XXXXXX")"
+	umask "$umask_prev"
+	chmod 0700 "$runtime_dir"
+	FLAVORITHM_UPDATER_RUNTIME_SCRIPT="$runtime_dir/update.sh"
+	export FLAVORITHM_UPDATER_RUNTIME_SCRIPT
+fi
+runtime_script="$FLAVORITHM_UPDATER_RUNTIME_SCRIPT"
 if [ "$0" != "$runtime_script" ]; then
-	mkdir -p "$(dirname "$runtime_script")"
-	cp "$0" "${runtime_script}.tmp"
-	chmod 0700 "${runtime_script}.tmp"
-	mv -f "${runtime_script}.tmp" "$runtime_script"
+	runtime_dir="$(dirname "$runtime_script")"
+	mkdir -p "$runtime_dir"
+	if [ -L "$runtime_dir" ]; then
+		printf '%s\n' "[flavorithm-updater] Refusing symlinked runtime directory: $runtime_dir" >&2
+		exit 1
+	fi
+	chmod 0700 "$runtime_dir"
+	umask_prev="$(umask)"
+	umask 077
+	tmp_runtime="$(mktemp "$runtime_dir/update.sh.XXXXXX")"
+	umask "$umask_prev"
+	cp "$0" "$tmp_runtime"
+	chmod 0700 "$tmp_runtime"
+	mv -f "$tmp_runtime" "$runtime_script"
 	exec /bin/sh "$runtime_script" "$@"
 fi
 
@@ -19,11 +38,13 @@ timeout_seconds="${FLAVORITHM_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}"
 branch="${FLAVORITHM_UPDATE_BRANCH:-main}"
 repo_url="${FLAVORITHM_UPDATE_REPO_URL:-https://github.com/sgerner/flavorithm.git}"
 github_api_url="${FLAVORITHM_GITHUB_API_URL:-https://api.github.com}"
+ci_workflow_path="${FLAVORITHM_CI_WORKFLOW_PATH:-.github/workflows/ci.yml}"
 app_dir="${FLAVORITHM_UPDATE_APP_DIR:-/app}"
 source_script="${FLAVORITHM_UPDATER_SOURCE_SCRIPT:-$app_dir/deploy/skynet/update.sh}"
 state_dir="${FLAVORITHM_UPDATE_STATE_DIR:-/state}"
-state_file="$state_dir/deployed-sha"
-deployed_image_file="$state_dir/deployed-image"
+deployed_state_file="$state_dir/deployed-state"
+legacy_sha_file="$state_dir/deployed-sha"
+legacy_image_file="$state_dir/deployed-image"
 failed_sha_file="$state_dir/failed-sha"
 rollback_pending_file="$state_dir/rollback-pending"
 health_max_attempts="${FLAVORITHM_HEALTH_MAX_ATTEMPTS:-36}"
@@ -101,13 +122,46 @@ fi
 
 write_state_file() {
 	mkdir -p "$state_dir"
-	printf '%s\n' "$2" > "${1}.tmp"
-	mv -f "${1}.tmp" "$1"
+	umask_prev="$(umask)"
+	umask 077
+	tmp_state="$(mktemp "$state_dir/.state.XXXXXX")"
+	umask "$umask_prev"
+	printf '%s\n' "$2" > "$tmp_state"
+	mv -f "$tmp_state" "$1"
 }
 
 read_state_file() {
 	[ -f "$1" ] || return 0
 	tr -d '[:space:]' < "$1" 2>/dev/null || true
+}
+
+write_deployed_state() {
+	mkdir -p "$state_dir"
+	umask_prev="$(umask)"
+	umask 077
+	tmp_state="$(mktemp "$state_dir/.state.XXXXXX")"
+	umask "$umask_prev"
+	printf '%s\n%s\n' "$1" "${2:-}" > "$tmp_state"
+	mv -f "$tmp_state" "$deployed_state_file"
+	rm -f "$legacy_sha_file" "$legacy_image_file"
+}
+
+load_deployed_state() {
+	deployed_sha=""
+	deployed_image=""
+	if [ -f "$deployed_state_file" ]; then
+		line1=""
+		line2=""
+		{
+			IFS= read -r line1 || true
+			IFS= read -r line2 || true
+		} < "$deployed_state_file"
+		deployed_sha="$(printf '%s' "$line1" | tr -d '[:space:]')"
+		deployed_image="$(printf '%s' "$line2" | tr -d '[:space:]')"
+	else
+		deployed_sha="$(read_state_file "$legacy_sha_file")"
+		deployed_image="$(read_state_file "$legacy_image_file")"
+	fi
 }
 
 run_compose() {
@@ -138,33 +192,35 @@ wait_until_healthy() {
 }
 
 ensure_rollback_image() {
-	deployed_image="$(read_state_file "$deployed_image_file")"
 	if [ -n "$deployed_image" ]; then
+		if [ ! -f "$deployed_state_file" ] && [ ! -f "$rollback_pending_file" ] && is_valid_sha "$deployed_sha"; then
+			write_deployed_state "$deployed_sha" "$deployed_image"
+		fi
 		docker tag "$deployed_image" flavorithm:rollback 2>/dev/null || true
 		return 0
 	fi
 
-	if [ -f "$rollback_pending_file" ]; then
+	if [ -f "$rollback_pending_file" ] || ! is_valid_sha "$deployed_sha"; then
 		return 0
 	fi
 
 	current_local_sha="$(git -C "$app_dir" -c safe.directory="$app_dir" rev-parse HEAD 2>/dev/null || true)"
-	if [ -n "$deployed_sha" ] && [ "$current_local_sha" != "$deployed_sha" ]; then
+	if [ "$current_local_sha" != "$deployed_sha" ]; then
 		return 0
 	fi
 
 	if [ "$(inspect_container_health)" = healthy ]; then
 		current_image="$(inspect_container_image)"
 		if [ -n "$current_image" ]; then
-			write_state_file "$deployed_image_file" "$current_image"
+			write_deployed_state "$deployed_sha" "$current_image"
 			deployed_image="$current_image"
 			docker tag "$deployed_image" flavorithm:rollback 2>/dev/null || true
 		fi
 	fi
 }
 
-verify_ci_check_run() {
-	check_url="${github_api_url%/}/repos/${repo_owner}/${repo_name}/commits/${1}/check-runs?check_name=verify&filter=latest"
+github_api_get() {
+	api_url="$1"
 	api_timeout=60
 	if [ "$timeout_seconds" -lt "$api_timeout" ] 2>/dev/null; then
 		api_timeout="$timeout_seconds"
@@ -172,50 +228,90 @@ verify_ci_check_run() {
 
 	if [ -n "${FLAVORITHM_GITHUB_TOKEN:-}" ]; then
 		clean_token="$(printf '%s' "$FLAVORITHM_GITHUB_TOKEN" | tr -d '\r\n"\\')"
-		response="$(
-			printf 'header = "Authorization: Bearer %s"\n' "$clean_token" |
-				curl --fail --silent --show-error --location \
-					--connect-timeout 15 \
-					--max-time "$api_timeout" \
-					--config - \
-					-H 'Accept: application/vnd.github+json' \
-					-H 'X-GitHub-Api-Version: 2022-11-28' \
-					-H 'User-Agent: flavorithm-updater' \
-					"$check_url"
-		)" || return 1
-	else
-		response="$(
+		printf 'header = "Authorization: Bearer %s"\n' "$clean_token" |
 			curl --fail --silent --show-error --location \
 				--connect-timeout 15 \
 				--max-time "$api_timeout" \
+				--config - \
 				-H 'Accept: application/vnd.github+json' \
 				-H 'X-GitHub-Api-Version: 2022-11-28' \
 				-H 'User-Agent: flavorithm-updater' \
-				"$check_url"
-		)" || return 1
+				"$api_url"
+	else
+		curl --fail --silent --show-error --location \
+			--connect-timeout 15 \
+			--max-time "$api_timeout" \
+			-H 'Accept: application/vnd.github+json' \
+			-H 'X-GitHub-Api-Version: 2022-11-28' \
+			-H 'User-Agent: flavorithm-updater' \
+			"$api_url"
 	fi
+}
 
-	printf '%s\n' "$response" | jq -e --arg sha "$1" '
-		(.check_runs | type == "array") and
-		(
-			[
-				.check_runs[]
-				| select(
-					.name == "verify" and
-					(.app.slug? == "github-actions") and
-					(((.head_sha? // $sha) | tostring | ascii_downcase) == ($sha | ascii_downcase))
-				)
-			]
-			| length > 0 and all(.[]; .status == "completed" and .conclusion == "success")
-		)
-	' >/dev/null 2>&1
+verify_ci_check_run() {
+	target_sha="$1"
+	check_url="${github_api_url%/}/repos/${repo_owner}/${repo_name}/commits/${target_sha}/check-runs?check_name=verify&filter=latest"
+	response="$(github_api_get "$check_url")" || return 1
+
+	run_ids="$(
+		printf '%s\n' "$response" | jq -er --arg sha "$target_sha" '
+			if (.check_runs | type) != "array" then
+				error("invalid check_runs")
+			else
+				[
+					.check_runs[]
+					| select(
+						.name == "verify" and
+						(.app.slug? == "github-actions") and
+						(((.head_sha? // $sha) | tostring | ascii_downcase) == ($sha | ascii_downcase))
+					)
+				] as $runs
+				| if ($runs | length) == 0 or (all($runs[]; .status == "completed" and .conclusion == "success") | not) then
+					error("verify not green")
+				else
+					[
+						$runs[]
+						| ((.details_url? // .html_url? // "") | tostring)
+						| capture("/actions/runs/(?<id>[0-9]+)(?:/|$)")
+						| .id
+					]
+					| unique
+					| if length == 0 then error("missing workflow run id") else .[] end
+				end
+			end
+		' 2>/dev/null
+	)" || return 1
+
+	matched_ci_workflow=0
+	for run_id in $run_ids; do
+		case "$run_id" in
+			'' | *[!0-9]*) return 1 ;;
+		esac
+		run_url="${github_api_url%/}/repos/${repo_owner}/${repo_name}/actions/runs/${run_id}"
+		run_response="$(github_api_get "$run_url")" || return 1
+		if printf '%s\n' "$run_response" | jq -e --arg sha "$target_sha" --arg wf "$ci_workflow_path" '
+			(.path? == $wf) and
+			(((.head_sha? // "") | tostring | ascii_downcase) == ($sha | ascii_downcase)) and
+			(.status == "completed") and
+			(.conclusion == "success")
+		' >/dev/null 2>&1; then
+			matched_ci_workflow=1
+		fi
+	done
+
+	[ "$matched_ci_workflow" -eq 1 ]
 }
 
 rollback_to_deployed() {
 	failed_candidate="$1"
+	load_deployed_state
 	if ! is_valid_sha "$deployed_sha"; then
-		log "Cannot roll back: no valid deployed SHA recorded in $state_file."
-		return 1
+		log "No rollback target: no valid deployed SHA recorded; clearing pending rollback marker."
+		if is_valid_sha "$failed_candidate"; then
+			write_state_file "$failed_sha_file" "$failed_candidate"
+		fi
+		rm -f "$rollback_pending_file"
+		return 0
 	fi
 
 	log "Rolling back /app and container to $deployed_sha."
@@ -229,7 +325,6 @@ rollback_to_deployed() {
 		return 1
 	fi
 
-	deployed_image="$(read_state_file "$deployed_image_file")"
 	if [ -n "$deployed_image" ]; then
 		docker tag "$deployed_image" flavorithm:rollback 2>/dev/null || true
 	fi
@@ -248,10 +343,14 @@ rollback_to_deployed() {
 		return 1
 	fi
 
-	if is_valid_sha "$failed_candidate"; then
+	if is_valid_sha "$failed_candidate" && [ "$failed_candidate" != "$deployed_sha" ]; then
 		write_state_file "$failed_sha_file" "$failed_candidate"
 		log "Rollback to $deployed_sha succeeded; skipping broken commit $failed_candidate."
 	else
+		existing_failed="$(read_state_file "$failed_sha_file")"
+		if [ "$existing_failed" = "$deployed_sha" ]; then
+			rm -f "$failed_sha_file"
+		fi
 		log "Rollback to $deployed_sha succeeded."
 	fi
 	rm -f "$rollback_pending_file"
@@ -259,18 +358,24 @@ rollback_to_deployed() {
 }
 
 poll_once() {
-	deployed_sha="$(read_state_file "$state_file")"
-	failed_sha="$(read_state_file "$failed_sha_file")"
+	load_deployed_state
+	if [ -f "$rollback_pending_file" ] && ! is_valid_sha "$deployed_sha"; then
+		log "No rollback target: deployed SHA is missing or invalid; clearing pending rollback marker."
+		rm -f "$rollback_pending_file"
+	fi
+
 	ensure_rollback_image
 
 	if [ -f "$rollback_pending_file" ]; then
 		pending_failed_sha="$(read_state_file "$rollback_pending_file")"
-		log "Retrying pending rollback to ${deployed_sha:-none}."
+		log "Retrying pending rollback to $deployed_sha."
 		if ! rollback_to_deployed "$pending_failed_sha"; then
 			log "Recovery retry failed; retrying in ${interval}s."
 		fi
 		return 0
 	fi
+
+	failed_sha="$(read_state_file "$failed_sha_file")"
 
 	if ! parse_github_repo "$repo_url"; then
 		log "Invalid GitHub repository URL ($repo_url); retrying in ${interval}s."
@@ -328,18 +433,27 @@ poll_once() {
 		run_compose up -d --no-deps flavorithm && \
 		wait_until_healthy; then
 		healthy_image="$(inspect_container_image)"
+		write_deployed_state "$build_sha" "$healthy_image"
+		rm -f "$rollback_pending_file" "$failed_sha_file"
 		if [ -n "$healthy_image" ]; then
-			write_state_file "$deployed_image_file" "$healthy_image"
-			docker tag "$healthy_image" flavorithm:rollback
+			docker tag "$healthy_image" flavorithm:rollback 2>/dev/null || true
 		fi
-		write_state_file "$state_file" "$build_sha"
-		rm -f "$failed_sha_file" "$rollback_pending_file"
 		log "Flavorithm updated successfully ($build_sha)."
 
 		if [ -f "$source_script" ] && ! cmp -s "$source_script" "$runtime_script"; then
-			cp "$source_script" "${runtime_script}.tmp"
-			chmod 0700 "${runtime_script}.tmp"
-			mv -f "${runtime_script}.tmp" "$runtime_script"
+			runtime_dir="$(dirname "$runtime_script")"
+			if [ -L "$runtime_dir" ]; then
+				log "Refusing symlinked runtime directory: $runtime_dir"
+				exit 1
+			fi
+			chmod 0700 "$runtime_dir"
+			umask_prev="$(umask)"
+			umask 077
+			tmp_runtime="$(mktemp "$runtime_dir/update.sh.XXXXXX")"
+			umask "$umask_prev"
+			cp "$source_script" "$tmp_runtime"
+			chmod 0700 "$tmp_runtime"
+			mv -f "$tmp_runtime" "$runtime_script"
 			log "Updater script changed; re-executing $runtime_script."
 			exec /bin/sh "$runtime_script" "$@"
 		fi

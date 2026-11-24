@@ -61,6 +61,7 @@ services:
       FLAVORITHM_UPDATE_COMMAND_TIMEOUT_SECONDS: ${FLAVORITHM_UPDATE_COMMAND_TIMEOUT_SECONDS:-1800}
       FLAVORITHM_UPDATE_BRANCH: ${FLAVORITHM_UPDATE_BRANCH:-main}
       FLAVORITHM_UPDATE_REPO_URL: ${FLAVORITHM_UPDATE_REPO_URL:-https://github.com/sgerner/flavorithm.git}
+      # Optional fine-grained token: read-only Checks and Actions permissions (plus Contents for private HTTPS forks).
       FLAVORITHM_GITHUB_TOKEN: ${FLAVORITHM_GITHUB_TOKEN:-}
     volumes:
       - .:/app
