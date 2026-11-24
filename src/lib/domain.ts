@@ -1,34 +1,50 @@
 import type { Ingredient, Meal, Recipe, ShoppingItem } from './types';
 
-export type UnitInfo = { dimension: string; factor: number; display: string };
+export type UnitSystem = 'metric' | 'customary' | 'count' | 'custom';
+export type UnitInfo = { dimension: string; factor: number; display: string; system: UnitSystem };
 
 const unitAliases: Record<string, UnitInfo> = {};
+const canonicalUnits: UnitInfo[] = [];
 
-function addUnits(dimension: string, factor: number, display: string, aliases: string[]) {
-	for (const alias of aliases) unitAliases[alias] = { dimension, factor, display };
+function addUnits(
+	dimension: string,
+	system: UnitSystem,
+	factor: number,
+	display: string,
+	aliases: string[]
+) {
+	const info: UnitInfo = { dimension, factor, display, system };
+	canonicalUnits.push(info);
+	for (const alias of aliases) unitAliases[alias] = info;
 }
 
-addUnits('mass', 1, 'g', ['g', 'gram', 'grams']);
-addUnits('mass', 1000, 'kg', ['kg', 'kilogram', 'kilograms']);
-addUnits('mass', 0.001, 'mg', ['mg', 'milligram', 'milligrams']);
-addUnits('mass', 28.349523125, 'oz', ['oz', 'ounce', 'ounces']);
-addUnits('mass', 453.59237, 'lb', ['lb', 'lbs', 'pound', 'pounds']);
-addUnits('volume', 1, 'ml', ['ml', 'milliliter', 'milliliters', 'millilitre', 'millilitres']);
-addUnits('volume', 1000, 'l', ['l', 'liter', 'liters', 'litre', 'litres']);
-addUnits('volume', 4.928921594, 'tsp', ['tsp', 'teaspoon', 'teaspoons']);
-addUnits('volume', 14.78676478, 'tbsp', ['tbsp', 'tablespoon', 'tablespoons']);
-addUnits('volume', 236.5882365, 'cup', ['cup', 'cups']);
-addUnits('volume', 29.5735295625, 'fl oz', [
+addUnits('mass', 'metric', 1, 'g', ['g', 'gram', 'grams']);
+addUnits('mass', 'metric', 1000, 'kg', ['kg', 'kilogram', 'kilograms']);
+addUnits('mass', 'metric', 0.001, 'mg', ['mg', 'milligram', 'milligrams']);
+addUnits('mass', 'customary', 28.349523125, 'oz', ['oz', 'ounce', 'ounces']);
+addUnits('mass', 'customary', 453.59237, 'lb', ['lb', 'lbs', 'pound', 'pounds']);
+addUnits('volume', 'metric', 1, 'ml', [
+	'ml',
+	'milliliter',
+	'milliliters',
+	'millilitre',
+	'millilitres'
+]);
+addUnits('volume', 'metric', 1000, 'l', ['l', 'liter', 'liters', 'litre', 'litres']);
+addUnits('volume', 'customary', 4.928921594, 'tsp', ['tsp', 'teaspoon', 'teaspoons']);
+addUnits('volume', 'customary', 14.78676478, 'tbsp', ['tbsp', 'tablespoon', 'tablespoons']);
+addUnits('volume', 'customary', 236.5882365, 'cup', ['cup', 'cups']);
+addUnits('volume', 'customary', 29.5735295625, 'fl oz', [
 	'fl oz',
 	'fl. oz',
 	'fluid oz',
 	'fluid ounce',
 	'fluid ounces'
 ]);
-addUnits('volume', 473.176473, 'pt', ['pt', 'pint', 'pints']);
-addUnits('volume', 946.352946, 'qt', ['qt', 'quart', 'quarts']);
-addUnits('volume', 3785.411784, 'gal', ['gal', 'gallon', 'gallons']);
-addUnits('count', 1, 'each', [
+addUnits('volume', 'customary', 473.176473, 'pt', ['pt', 'pint', 'pints']);
+addUnits('volume', 'customary', 946.352946, 'qt', ['qt', 'quart', 'quarts']);
+addUnits('volume', 'customary', 3785.411784, 'gal', ['gal', 'gallon', 'gallons']);
+addUnits('count', 'count', 1, 'each', [
 	'ea',
 	'each',
 	'item',
@@ -42,13 +58,19 @@ addUnits('count', 1, 'each', [
 	'medium',
 	'large'
 ]);
-addUnits('count:bunch', 1, 'bunch', ['bunch', 'bunches']);
-addUnits('count:clove', 1, 'clove', ['clove', 'cloves']);
-addUnits('count:head', 1, 'head', ['head', 'heads', 'small head', 'medium head', 'large head']);
-addUnits('count:slice', 1, 'slice', ['slice', 'slices']);
-addUnits('count:can', 1, 'can', ['can', 'cans']);
-addUnits('count:pinch', 1, 'pinch', ['pinch', 'pinches']);
-addUnits('count:dash', 1, 'dash', ['dash', 'dashes']);
+addUnits('count:bunch', 'count', 1, 'bunch', ['bunch', 'bunches']);
+addUnits('count:clove', 'count', 1, 'clove', ['clove', 'cloves']);
+addUnits('count:head', 'count', 1, 'head', [
+	'head',
+	'heads',
+	'small head',
+	'medium head',
+	'large head'
+]);
+addUnits('count:slice', 'count', 1, 'slice', ['slice', 'slices']);
+addUnits('count:can', 'count', 1, 'can', ['can', 'cans']);
+addUnits('count:pinch', 'count', 1, 'pinch', ['pinch', 'pinches']);
+addUnits('count:dash', 'count', 1, 'dash', ['dash', 'dashes']);
 
 const sortedUnitAliases = Object.keys(unitAliases).sort((a, b) => b.length - a.length);
 
@@ -141,9 +163,17 @@ export function normalizeName(name: string): string {
 export function unitInfo(unit: string): UnitInfo {
 	const cleaned = cleanText(unit);
 	return (
-		unitAliases[cleaned] ?? { dimension: `unit:${cleaned}`, factor: 1, display: cleaned || 'each' }
+		unitAliases[cleaned] ?? {
+			dimension: `unit:${cleaned}`,
+			factor: 1,
+			display: cleaned || 'each',
+			system: 'custom'
+		}
 	);
 }
+
+const MIN_READABLE_SHOPPING_QUANTITY = 0.05;
+const BASE_REMAINDER_EPSILON = 0.00001;
 
 function roundParsedQuantity(value: number): number {
 	const rounded = Math.round(value * 1_000_000) / 1_000_000;
@@ -265,9 +295,75 @@ export function parseIngredientLines(input: string): ParsedIngredient[] {
 		.filter((item): item is ParsedIngredient => item !== undefined);
 }
 
-function roundQuantity(value: number): number {
-	const rounded = Math.round(value * 100) / 100;
+export function roundShoppingQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
 	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function selectShoppingUnit(
+	remainingBase: number,
+	seenUnits: Iterable<UnitInfo>
+): UnitInfo | undefined {
+	const seenByDisplay = new Map<string, UnitInfo>();
+	for (const unit of seenUnits) seenByDisplay.set(unit.display, unit);
+	const sortedSeen = [...seenByDisplay.values()].sort((a, b) => b.factor - a.factor);
+	if (sortedSeen.length === 0) return undefined;
+
+	const readableSeen = sortedSeen.find(
+		(unit) => roundShoppingQuantity(remainingBase / unit.factor) >= MIN_READABLE_SHOPPING_QUANTITY
+	);
+	if (readableSeen) return readableSeen;
+
+	const anchor = sortedSeen[sortedSeen.length - 1];
+	const smallerUnits = canonicalUnits
+		.filter(
+			(unit) =>
+				unit.dimension === anchor.dimension &&
+				unit.system === anchor.system &&
+				unit.factor < anchor.factor
+		)
+		.sort((a, b) => b.factor - a.factor);
+	return (
+		smallerUnits.find(
+			(unit) => roundShoppingQuantity(remainingBase / unit.factor) >= MIN_READABLE_SHOPPING_QUANTITY
+		) ??
+		smallerUnits[smallerUnits.length - 1] ??
+		anchor
+	);
+}
+
+/**
+ * Clamp negligible base remainders up to 0.00001 to zero, pick a readable unit
+ * from the seen units or downscale within its unit system, and round to 0.000001.
+ */
+export function resolveShoppingQuantity(
+	rawRemainingBase: number,
+	seenUnits: Iterable<UnitInfo>
+): { quantity: number; unit: UnitInfo } | undefined {
+	if (!Number.isFinite(rawRemainingBase) || rawRemainingBase <= BASE_REMAINDER_EPSILON)
+		return undefined;
+	const unit = selectShoppingUnit(rawRemainingBase, seenUnits);
+	if (!unit) return undefined;
+	const quantity = roundShoppingQuantity(rawRemainingBase / unit.factor);
+	if (quantity <= 0) return undefined;
+	return { quantity, unit };
+}
+
+/**
+ * Format scaled recipe ingredient quantities: at most two decimal places from 0.1 upward,
+ * and two significant digits in plain decimal form for positive values below 0.1.
+ */
+export function formatRecipeQuantity(value: number): string {
+	if (!Number.isFinite(value)) return '—';
+	if (value <= 0) return '0';
+	if (value >= 0.1) return String(Number(value.toFixed(2)));
+	const precise = value.toPrecision(2);
+	const exponential = /^(\d)(?:\.(\d+))?e-(\d+)$/i.exec(precise);
+	if (exponential) {
+		const digits = `${exponential[1]}${exponential[2] ?? ''}`.replace(/0+$/, '');
+		return `0.${'0'.repeat(Number(exponential[3]) - 1)}${digits}`;
+	}
+	return String(Number(precise));
 }
 
 export type CalendarDate = { year: number; month: number; day: number };
@@ -355,7 +451,7 @@ export function buildShoppingList(
 			name: string;
 			normalizedName: string;
 			dimension: string;
-			unit: UnitInfo;
+			units: UnitInfo[];
 			quantityBase: number;
 			pantryBase: number;
 			requirements: ShoppingRequirement[];
@@ -379,11 +475,12 @@ export function buildShoppingList(
 				name: ingredient.name.trim(),
 				normalizedName,
 				dimension: unit.dimension,
-				unit,
+				units: [],
 				quantityBase: 0,
 				pantryBase: 0,
 				requirements: []
 			};
+			bucket.units.push(unit);
 			const quantityBase = ingredient.quantity * scale * unit.factor;
 			bucket.quantityBase += quantityBase;
 			bucket.requirements.push({
@@ -412,7 +509,9 @@ export function buildShoppingList(
 		const normalizedName = normalizeName(item.name);
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
-		if (!buckets.has(key)) continue;
+		const bucket = buckets.get(key);
+		if (!bucket) continue;
+		bucket.units.push(unit);
 		const lots = pantryByBucket.get(key) ?? [];
 		lots.push({
 			quantityBase: item.quantity * unit.factor,
@@ -452,17 +551,22 @@ export function buildShoppingList(
 	}
 
 	return [...buckets.values()]
-		.map((bucket) => {
-			const remainingBase = Math.max(0, bucket.quantityBase - bucket.pantryBase);
-			return {
-				id: `shopping-${bucket.normalizedName.replace(/[^a-z0-9]+/g, '-')}-${bucket.unit.display.replace(/[^a-z0-9]+/g, '-')}`,
-				name: bucket.name,
-				quantity: roundQuantity(remainingBase / bucket.unit.factor),
-				unit: bucket.unit.display,
-				checked: false
-			};
+		.flatMap((bucket) => {
+			const resolved = resolveShoppingQuantity(
+				bucket.quantityBase - bucket.pantryBase,
+				bucket.units
+			);
+			if (!resolved) return [];
+			return [
+				{
+					id: `shopping-${bucket.normalizedName.replace(/[^a-z0-9]+/g, '-')}-${resolved.unit.display.replace(/[^a-z0-9]+/g, '-')}`,
+					name: bucket.name,
+					quantity: resolved.quantity,
+					unit: resolved.unit.display,
+					checked: false
+				}
+			];
 		})
-		.filter((item) => item.quantity > 0)
 		.sort((a, b) => a.name.localeCompare(b.name));
 }
 
