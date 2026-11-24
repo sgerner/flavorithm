@@ -82,7 +82,7 @@ test('butler chat receives the supplied display name as untrusted kitchen contex
 	);
 });
 
-test('butler chat isolates invalid commands and drops dependent items while rejecting malformed envelopes', async () => {
+test('butler chat preserves a valid command when an invalid sibling is dropped and rejects malformed envelopes', async () => {
 	const { createInitialState } = await import('../src/lib/data.ts');
 	const { applyButlerCommands } = await import('../src/lib/butler.ts');
 	const kitchen = createInitialState();
@@ -101,7 +101,47 @@ test('butler chat isolates invalid commands and drops dependent items while reje
 		type: 'pantry.upsert',
 		item: { id: 'garlic-1', name: 'Garlic', quantity: 4, unit: 'cloves', category: 'Produce' }
 	};
-	const mixed = (await runAIRequest(
+	const siblingIsolated = (await runAIRequest(
+		request,
+		provider({
+			reply: 'I added the garlic; the malformed recipe card was omitted.',
+			commands: [
+				validPantryCommand,
+				{
+					type: 'recipe.upsert',
+					recipe: { id: 'broken-stew', title: 'Broken Stew', servings: 0 }
+				}
+			]
+		})
+	)) as { reply: string; commands: unknown[]; droppedCommands?: number };
+	assert.equal(siblingIsolated.reply, 'I added the garlic; the malformed recipe card was omitted.');
+	assert.deepEqual(siblingIsolated.commands, [validPantryCommand]);
+	assert.equal(siblingIsolated.droppedCommands, 1);
+	const applied = applyButlerCommands(kitchen, siblingIsolated.commands);
+	assert.ok(applied.state.pantry.some((item) => item.id === 'garlic-1'));
+
+	for (const malformed of [
+		{ reply: 'Done.' },
+		{ reply: '   ', commands: [] },
+		{ reply: 'Done.', commands: 'not-an-array' }
+	]) {
+		await assert.rejects(
+			runAIRequest(request, provider(malformed)),
+			(error: unknown) => error instanceof AIRequestError && error.status === 502
+		);
+	}
+});
+
+test('butler chat cascade-drops dependent commands while counting only per-command validation failures', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const { applyButlerCommands } = await import('../src/lib/butler.ts');
+	const kitchen = createInitialState();
+	const validPantryCommand = {
+		type: 'pantry.upsert',
+		item: { id: 'garlic-1', name: 'Garlic', quantity: 4, unit: 'cloves', category: 'Produce' }
+	};
+
+	const cascaded = (await runAIRequest(
 		request,
 		provider({
 			reply: 'I have added the garlic; the soup card needed another pass.',
@@ -121,27 +161,40 @@ test('butler chat isolates invalid commands and drops dependent items while reje
 					recipe: { id: 'broken-soup', title: 'Broken Soup', servings: 0 }
 				},
 				{ type: 'recipe.open', id: 'broken-soup', mode: 'detail' },
+				{ type: 'recipe.delete', id: 'broken-soup' },
 				{ type: 'meal.complete', id: 'dinner-1', deductPantry: true },
 				validPantryCommand
 			]
 		})
 	)) as { reply: string; commands: unknown[]; droppedCommands?: number };
-	assert.equal(mixed.reply, 'I have added the garlic; the soup card needed another pass.');
-	assert.deepEqual(mixed.commands, [validPantryCommand]);
-	assert.equal(mixed.droppedCommands, 4);
-	const applied = applyButlerCommands(kitchen, mixed.commands);
+	assert.equal(cascaded.reply, 'I have added the garlic; the soup card needed another pass.');
+	assert.deepEqual(cascaded.commands, [validPantryCommand]);
+	// 1 invalid command (`recipe.upsert`) + 4 cascade-dropped dependents -> droppedCommands counts only the 1 validation failure
+	assert.equal(cascaded.droppedCommands, 1);
+	const applied = applyButlerCommands(kitchen, cascaded.commands);
 	assert.ok(applied.state.pantry.some((item) => item.id === 'garlic-1'));
 
-	for (const malformed of [
-		{ reply: 'Done.' },
-		{ reply: '   ', commands: [] },
-		{ reply: 'Done.', commands: 'not-an-array' }
-	]) {
-		await assert.rejects(
-			runAIRequest(request, provider(malformed)),
-			(error: unknown) => error instanceof AIRequestError && error.status === 502
-		);
-	}
+	const multiInvalidCascaded = (await runAIRequest(
+		request,
+		provider({
+			reply: 'I added the garlic; two invalid items and their follow-ups were skipped.',
+			commands: [
+				{
+					type: 'recipe.upsert',
+					recipe: { id: 'broken-soup', title: 'Broken Soup', servings: 0 }
+				},
+				{ type: 'recipe.open', id: 'broken-soup', mode: 'detail' },
+				{
+					type: 'shopping.upsert',
+					item: { id: 'bad-milk', name: 'Milk', quantity: -1, unit: 'cup', checked: false }
+				},
+				{ type: 'shopping.delete', id: 'bad-milk' },
+				validPantryCommand
+			]
+		})
+	)) as { reply: string; commands: unknown[]; droppedCommands?: number };
+	assert.deepEqual(multiInvalidCascaded.commands, [validPantryCommand]);
+	assert.equal(multiInvalidCascaded.droppedCommands, 2);
 });
 
 test('butler chat requires bounded conversation and kitchen context before inference', async () => {

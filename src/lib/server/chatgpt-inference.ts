@@ -176,6 +176,16 @@ function emptyOutputMessage(action?: ChatGPTResponseAction): string {
 	return 'ChatGPT completed without a nutrition estimate. Try a different request.';
 }
 
+function isCallerAbort(
+	error: unknown,
+	timeoutSignal: AbortSignal,
+	callerSignal?: AbortSignal
+): boolean {
+	if (callerSignal?.aborted) return true;
+	if (timeoutSignal.aborted) return false;
+	return error instanceof Error && error.name === 'AbortError';
+}
+
 function isTimeoutFailure(error: unknown, signal: AbortSignal): boolean {
 	if (error instanceof Error && error.name === 'TimeoutError') return true;
 	const reason = signal.aborted ? signal.reason : undefined;
@@ -191,11 +201,16 @@ export async function chatGPTResponse(
 		action?: ChatGPTResponseAction;
 		image?: string;
 		reasoning?: ReasoningSettings;
+		signal?: AbortSignal;
 		timeoutMs?: number;
 	},
 	fetcher: typeof fetch = fetch
 ): Promise<string> {
+	if (options.signal?.aborted) {
+		throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+	}
 	const controller = AbortSignal.timeout(options.timeoutMs ?? TIMEOUT_MS);
+	const requestSignal = options.signal ? AbortSignal.any([controller, options.signal]) : controller;
 	const content = options.image
 		? [
 				{ type: 'input_text', text: options.prompt },
@@ -213,7 +228,7 @@ export async function chatGPTResponse(
 				'User-Agent': 'Flavorithm/1.0'
 			},
 			redirect: 'error',
-			signal: controller,
+			signal: requestSignal,
 			body: JSON.stringify({
 				model: options.model,
 				...(options.reasoning?.effort ? { reasoning: { effort: options.reasoning.effort } } : {}),
@@ -224,8 +239,16 @@ export async function chatGPTResponse(
 			})
 		});
 	} catch (error) {
-		if (isTimeoutFailure(error, controller))
-			throw new ChatGPTInferenceError('ChatGPT took too long to respond. Please try again.', 504);
+		if (isCallerAbort(error, controller, options.signal)) {
+			throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+		}
+		if (controller.aborted || isTimeoutFailure(error, controller)) {
+			throw new ChatGPTInferenceError(
+				'ChatGPT took too long to respond. Please try again.',
+				504,
+				'timeout'
+			);
+		}
 		throw new ChatGPTInferenceError(
 			'Could not reach ChatGPT. Check your connection and try again.'
 		);
@@ -249,13 +272,13 @@ export async function chatGPTResponse(
 	let onAbort: (() => void) | undefined;
 	const streamTimeout = new Promise<never>((_, reject) => {
 		const abort = () =>
-			reject(controller.reason ?? new DOMException('The operation timed out.', 'TimeoutError'));
-		if (controller.aborted) {
+			reject(requestSignal.reason ?? new DOMException('The operation timed out.', 'TimeoutError'));
+		if (requestSignal.aborted) {
 			abort();
 			return;
 		}
 		onAbort = abort;
-		controller.addEventListener('abort', onAbort, { once: true });
+		requestSignal.addEventListener('abort', onAbort, { once: true });
 	});
 	streamTimeout.catch(() => {});
 
@@ -359,13 +382,21 @@ export async function chatGPTResponse(
 	} catch (error) {
 		void reader.cancel().catch(() => {});
 		if (error instanceof ChatGPTInferenceError) throw error;
-		if (isTimeoutFailure(error, controller))
-			throw new ChatGPTInferenceError('ChatGPT took too long to respond. Please try again.', 504);
+		if (isCallerAbort(error, controller, options.signal)) {
+			throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+		}
+		if (controller.aborted || isTimeoutFailure(error, controller)) {
+			throw new ChatGPTInferenceError(
+				'ChatGPT took too long to respond. Please try again.',
+				504,
+				'timeout'
+			);
+		}
 		throw new ChatGPTInferenceError(
 			'The ChatGPT connection was interrupted before completion. Please try again.'
 		);
 	} finally {
-		if (onAbort) controller.removeEventListener('abort', onAbort);
+		if (onAbort) requestSignal.removeEventListener('abort', onAbort);
 		try {
 			reader.releaseLock();
 		} catch {}

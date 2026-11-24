@@ -206,6 +206,7 @@ test('ChatGPT uses action-aware stream error messages for Basil chat and non-rec
 		(error: unknown) =>
 			error instanceof ChatGPTInferenceError &&
 			error.status === 504 &&
+			error.code === 'timeout' &&
 			/took too long to respond/.test(error.message)
 	);
 
@@ -232,9 +233,26 @@ test('ChatGPT uses action-aware stream error messages for Basil chat and non-rec
 		(error: unknown) =>
 			error instanceof ChatGPTInferenceError &&
 			error.status === 504 &&
+			error.code === 'timeout' &&
 			/took too long to respond/.test(error.message)
 	);
 	clearTimeout(streamTimer);
+
+	const abortController = new AbortController();
+	await assert.rejects(
+		() =>
+			chatGPTResponse(
+				{ ...options, action: 'chat', signal: abortController.signal },
+				async (_input, init) => {
+					abortController.abort();
+					throw init?.signal?.reason ?? new DOMException('Aborted', 'AbortError');
+				}
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 499 &&
+			error.code === 'request_cancelled'
+	);
 });
 test('ChatGPT usage-limit failures surface without a fallback API call', async () => {
 	let calls = 0;

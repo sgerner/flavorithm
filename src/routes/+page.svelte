@@ -127,7 +127,11 @@
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
-	import { pairButlerHistory, type ButlerChatResult } from '#lib/butler-chat.ts';
+	import {
+		BUTLER_HISTORY_LIMIT,
+		pairButlerHistory,
+		type ButlerChatResult
+	} from '#lib/butler-chat.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
@@ -2268,7 +2272,11 @@
 			{
 				prompt: message,
 				messages: [
-					...pairButlerHistory(history, (turn) => turn.content.slice(0, 8000), 38),
+					...pairButlerHistory(
+						history,
+						(turn) => turn.content.slice(0, 8000),
+						BUTLER_HISTORY_LIMIT
+					),
 					{ role: 'user', content: message }
 				],
 				context

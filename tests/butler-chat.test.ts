@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createInitialState } from '../src/lib/data.ts';
 import {
+	BUTLER_HISTORY_LIMIT,
 	BUTLER_TIMEOUT_MESSAGE,
 	butlerRequestError,
 	createButlerChat,
 	formatButlerMessage,
 	pairButlerHistory,
+	shouldRestoreDraft,
 	type ButlerChatMessage,
 	type ButlerChatResult,
 	type ButlerTurn
@@ -166,6 +168,55 @@ test('stop removes the unanswered turn, restores draft, and preserves prior pend
 	assert.equal(harness.messages[1].actions?.[0]?.status, 'pending');
 });
 
+test('stop and request failures preserve text typed while a request is in flight', async () => {
+	assert.equal(shouldRestoreDraft('', 'Plan pasta'), true);
+	assert.equal(shouldRestoreDraft('   ', 'Plan pasta'), true);
+	assert.equal(shouldRestoreDraft('Plan pasta', 'Plan pasta'), true);
+	assert.equal(shouldRestoreDraft('  Plan pasta  ', 'Plan pasta'), true);
+	assert.equal(shouldRestoreDraft('Actually make risotto', 'Plan pasta'), false);
+
+	let inFlight = deferred<ButlerChatResult>();
+	const harness = createHarness({
+		request: () => inFlight.promise
+	});
+
+	// 1. Typing while in flight + stop() keeps the newly typed draft
+	harness.draft = 'Plan pasta tonight';
+	const stoppedTurn = harness.chat.send();
+	assert.equal(harness.draft, '');
+	harness.draft = 'Actually make mushroom risotto';
+	harness.chat.stop();
+	inFlight.reject(new DOMException('Aborted', 'AbortError'));
+	await stoppedTurn;
+	assert.equal(harness.messages.length, 0);
+	assert.equal(harness.draft, 'Actually make mushroom risotto');
+	assert.equal(harness.error, '');
+	assert.equal(harness.failedPrompt, '');
+
+	// 2. Typing while in flight + request failure keeps the newly typed draft while recording failedPrompt
+	inFlight = deferred<ButlerChatResult>();
+	harness.draft = 'Plan soup tonight';
+	const failedTurn = harness.chat.send();
+	assert.equal(harness.draft, '');
+	harness.draft = 'Hold the garlic in tomorrow’s soup';
+	inFlight.reject(new Error('Provider temporarily unavailable.'));
+	await failedTurn;
+	assert.equal(harness.messages.length, 0);
+	assert.equal(harness.draft, 'Hold the garlic in tomorrow’s soup');
+	assert.equal(harness.failedPrompt, 'Plan soup tonight');
+	assert.equal(harness.error, 'Provider temporarily unavailable.');
+
+	// 3. Clicking a starter prompt while unsent text is in draft preserves the unsent draft
+	inFlight = deferred<ButlerChatResult>();
+	harness.draft = 'My half-finished note';
+	const starterTurn = harness.chat.send('Plan dinners for the week using my pantry.');
+	assert.equal(harness.draft, 'My half-finished note');
+	harness.chat.stop();
+	inFlight.reject(new DOMException('Aborted', 'AbortError'));
+	await starterTurn;
+	assert.equal(harness.draft, 'My half-finished note');
+});
+
 test('90-second request timeout surfaces reason.message, rolls back the unanswered turn, and restores draft', async () => {
 	const harness = createHarness({
 		timeoutMs: 20,
@@ -301,8 +352,9 @@ test('pairButlerHistory keeps only completed user and assistant pairs and preser
 		content: `turn-${index}`
 	}));
 	manyTurns.push({ role: 'user', content: 'unanswered-tail' });
-	const window = pairButlerHistory(manyTurns, (turn) => turn.content.slice(0, 8000), 20);
-	assert.equal(window.length, 20);
+	assert.equal(BUTLER_HISTORY_LIMIT, 20);
+	const window = pairButlerHistory(manyTurns, (turn) => turn.content.slice(0, 8000));
+	assert.equal(window.length, BUTLER_HISTORY_LIMIT);
 	assert.equal(window[0].role, 'user');
 	assert.equal(window[0].content, 'turn-4');
 	assert.equal(window.at(-1)?.role, 'assistant');

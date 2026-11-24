@@ -441,7 +441,7 @@
 		<form
 			onsubmit={(event) => {
 				event.preventDefault();
-				void send();
+				if (!working) void send();
 			}}
 		>
 			<label class="sr-only" for="butler-message">Message Basil</label>
@@ -452,11 +452,11 @@
 				placeholder="Your instructions…"
 				rows="2"
 				maxlength="2000"
-				disabled={working || !owner}
+				disabled={!owner}
 				onkeydown={(event) => {
 					if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
 						event.preventDefault();
-						void send();
+						if (!working) void send();
 					}
 				}}></textarea>
 			{#if busy}<button

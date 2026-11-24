@@ -17,6 +17,14 @@ export type ButlerChatResult = {
 
 export const BUTLER_TIMEOUT_MS = 90_000;
 export const BUTLER_TIMEOUT_MESSAGE = 'Basil took too long to respond. Please try again.';
+/**
+ * Cap history at 20 turns (10 completed user -> assistant pairs). Every chat request
+ * already supplies the current kitchen state and recipeDrafts in `context` alongside
+ * `[User applied: ...]` annotations, so 10 exchanges preserve iterative refinement
+ * continuity while keeping token cost and latency bounded well inside `/api/ai`'s
+ * 40-message schema limit.
+ */
+export const BUTLER_HISTORY_LIMIT = 20;
 
 export function formatButlerMessage(
 	message: Pick<ButlerChatMessage, 'content' | 'actions'>
@@ -33,7 +41,7 @@ export function formatButlerMessage(
 export function pairButlerHistory<T extends ButlerTurn>(
 	turns: readonly T[],
 	format?: (turn: T) => string,
-	maxTurns = 20
+	maxTurns = BUTLER_HISTORY_LIMIT
 ): ButlerTurn[] {
 	const paired: ButlerTurn[] = [];
 	for (let index = 0; index < turns.length - 1; index += 1) {
@@ -76,6 +84,11 @@ export function droppedCommandsWarning(droppedCommands?: number): string | undef
 	return droppedCommands === 1
 		? '1 invalid action was omitted from this reply.'
 		: `${droppedCommands} invalid actions were omitted from this reply.`;
+}
+
+export function shouldRestoreDraft(currentDraft: string, pendingPrompt: string): boolean {
+	const trimmed = currentDraft.trim();
+	return trimmed.length === 0 || trimmed === pendingPrompt;
 }
 
 export function createButlerChat(options: {
@@ -125,11 +138,13 @@ export function createButlerChat(options: {
 		options.onResetReaction?.();
 		const token = ++generation;
 		const currentMessages = options.getMessages();
-		const history = pairButlerHistory(currentMessages, formatButlerMessage, 20);
+		const history = pairButlerHistory(currentMessages, formatButlerMessage, BUTLER_HISTORY_LIMIT);
 		const turnId = ++sequence;
 		pendingTurn = { id: turnId, prompt };
 		options.setMessages([...currentMessages, { id: turnId, role: 'user', content: prompt }]);
-		options.setDraft('');
+		if (shouldRestoreDraft(options.getDraft(), prompt)) {
+			options.setDraft('');
+		}
 		options.setError('');
 		options.setFailedPrompt('');
 		options.setBusy(true);
@@ -184,7 +199,9 @@ export function createButlerChat(options: {
 			if (!alive || token !== generation) return;
 			pendingTurn = undefined;
 			options.setMessages(options.getMessages().filter((message) => message.id !== turnId));
-			options.setDraft(prompt);
+			if (shouldRestoreDraft(options.getDraft(), prompt)) {
+				options.setDraft(prompt);
+			}
 			options.setError(butlerRequestError(error, currentController.signal));
 			options.setFailedPrompt(prompt);
 		} finally {
@@ -202,7 +219,9 @@ export function createButlerChat(options: {
 		cancelRequest();
 		if (pending) {
 			options.setMessages(options.getMessages().filter((message) => message.id !== pending.id));
-			options.setDraft(pending.prompt);
+			if (shouldRestoreDraft(options.getDraft(), pending.prompt)) {
+				options.setDraft(pending.prompt);
+			}
 		}
 		options.setError('');
 		options.setFailedPrompt('');

@@ -957,6 +957,7 @@ function isolateButlerChatResult(value: unknown) {
 	const droppedMealIds = new Set<string>();
 	const droppedPantryIds = new Set<string>();
 	const droppedShoppingIds = new Set<string>();
+	let invalidCommands = 0;
 
 	for (const rawCommand of envelope.data.commands) {
 		const parsed = ButlerCommandSchema.safeParse(rawCommand);
@@ -968,6 +969,7 @@ function isolateButlerChatResult(value: unknown) {
 			else if (parsed.data.type === 'shopping.upsert') validShoppingIds.add(parsed.data.item.id);
 			continue;
 		}
+		invalidCommands += 1;
 		if (rawCommand && typeof rawCommand === 'object') {
 			const candidate = rawCommand as Record<string, any>;
 			if (candidate.type === 'recipe.upsert') {
@@ -1021,7 +1023,7 @@ function isolateButlerChatResult(value: unknown) {
 		return true;
 	});
 
-	const droppedCommands = envelope.data.commands.length - commands.length;
+	const droppedCommands = invalidCommands;
 	return droppedCommands > 0
 		? { reply: envelope.data.reply, commands, droppedCommands }
 		: { reply: envelope.data.reply, commands };
