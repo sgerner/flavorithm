@@ -3,10 +3,17 @@ import assert from 'node:assert/strict';
 import { createKitchenSync } from '../src/lib/client-sync.ts';
 import { createInitialState, createNewUserState } from '../src/lib/data.ts';
 import {
+	clearGuestData,
+	clearGuestKitchen,
 	migrateGuestKitchenOnSignup,
 	quarantineLegacyKitchen,
 	sanitizeKitchenState
 } from '../src/lib/guest-storage.ts';
+import {
+	clearSampleData,
+	hasSampleData,
+	promoteSampleIngredient
+} from '../src/lib/kitchen-workflows.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 
 process.env.FLAVORITHM_DB_PATH = ':memory:';
@@ -50,6 +57,33 @@ test('quota errors and an older distinct backup never destroy the only legacy co
 	quarantineLegacyKitchen(memoryStorage(values));
 	assert.equal(values.get('flavorithm-kitchen'), 'new legacy snapshot');
 	assert.equal(values.get('flavorithm-legacy-kitchen-backup'), 'older snapshot');
+});
+
+test('clearGuestKitchen and clearGuestData remove only guest keys and tolerate storage errors', () => {
+	const values = new Map([
+		['flavorithm-guest-kitchen', '{"pantry":["eggs"]}'],
+		['flavorithm-started', 'yes'],
+		['flavorithm-last-account', '{"id":"user-1"}'],
+		['flavorithm-legacy-kitchen-backup', '{"legacy":true}']
+	]);
+	clearGuestKitchen(memoryStorage(values));
+	assert.equal(values.has('flavorithm-guest-kitchen'), false);
+	assert.equal(values.get('flavorithm-started'), 'yes');
+
+	values.set('flavorithm-guest-kitchen', '{"pantry":["milk"]}');
+	clearGuestData(memoryStorage(values));
+	assert.equal(values.has('flavorithm-guest-kitchen'), false);
+	assert.equal(values.has('flavorithm-started'), false);
+	assert.equal(values.get('flavorithm-last-account'), '{"id":"user-1"}');
+	assert.equal(values.get('flavorithm-legacy-kitchen-backup'), '{"legacy":true}');
+
+	assert.doesNotThrow(() =>
+		clearGuestData({
+			removeItem: () => {
+				throw new Error('Storage restricted');
+			}
+		})
+	);
 });
 
 test('sanitizeKitchenState preserves valid states and clamps corrupt guest fields to server bounds', () => {
@@ -377,4 +411,47 @@ test('signup migration sanitizes guest state for immediate sync and retains jour
 		onlineServerState.pantry.find((item) => item.id === 'oversized-sugar')?.quantity,
 		1_000_000
 	);
+});
+
+test('signup preparation sanitizes guest state while preserving sample flags for selective cleanup', async () => {
+	const guest = createInitialState();
+	guest.pantry = guest.pantry.map((item) =>
+		item.id === 'pantry-eggs' ? promoteSampleIngredient({ ...item, quantity: 6 }) : item
+	);
+	guest.pantry.push({
+		id: 'oversized-oats',
+		name: '  rolled oats  ',
+		quantity: 5_000_000,
+		unit: 'g',
+		category: 'Grains'
+	});
+
+	const sanitizedBeforeCleanup = sanitizeKitchenState(guest);
+	assert.equal(hasSampleData(sanitizedBeforeCleanup), true);
+	const prepared = clearSampleData(sanitizedBeforeCleanup);
+	assert.equal(hasSampleData(prepared), false);
+
+	let syncedState = createNewUserState();
+	const migrated = await migrateGuestKitchenOnSignup({
+		guestState: prepared,
+		loadInitialState: async () => ({ state: syncedState, etag: 'v1' }),
+		adoptBaseline: () => {},
+		stage: (next) => {
+			syncedState = next;
+		},
+		sync: async () => {},
+		hasPendingFailure: () => false
+	});
+
+	assert.equal(migrated.synced, true);
+	assert.ok(validateAppState(syncedState));
+	assert.deepEqual(
+		syncedState.pantry.map((item) => ({ id: item.id, name: item.name, quantity: item.quantity })),
+		[
+			{ id: 'pantry-eggs', name: 'eggs', quantity: 6 },
+			{ id: 'oversized-oats', name: 'rolled oats', quantity: 1_000_000 }
+		]
+	);
+	assert.deepEqual(syncedState.meals, []);
+	assert.ok(syncedState.recipes.every((recipe) => !recipe.saved && !recipe.sampleSaved));
 });

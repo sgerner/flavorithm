@@ -203,7 +203,7 @@ test('parseRecipeIngredientLine produces positive quantities, canonical units, a
 	assert.deepEqual(
 		shopping.map((item) => ({ name: item.name, quantity: item.quantity, unit: item.unit })),
 		[
-			{ name: 'canned tomatoes', quantity: 250, unit: 'g' },
+			{ name: 'canned tomatoes', quantity: 0.25, unit: 'kg' },
 			{ name: 'chickpeas', quantity: 1, unit: 'can' },
 			{ name: 'garlic', quantity: 3, unit: 'clove' },
 			{ name: 'olive oil', quantity: 1, unit: 'tbsp' }
@@ -623,6 +623,7 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 			'a strong host operator password'
 		);
 		process.env.FLAVORITHM_HOST_ADMIN_USER_ID = hostAdmin.user.id;
+		process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
 		const grant = storage.saveChatGPTAccount({
 			userId: hostAdmin.user.id,
 			mode: 'local',
@@ -706,6 +707,7 @@ test('hooks.server and POST /api/recipe-import allow local guests and keyless us
 		assert.equal((await unstructuredWithHostRes.json()).recipe.title, 'Honey Ricotta Toast');
 		host.configureHostAI(hostAdmin.user.id);
 		delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+		delete process.env.FLAVORITHM_HOST_AI_SHARED;
 
 		// 6. Cross-origin & cross-site requests rejected with 403.
 		const crossOriginRes = await recipeImportRoute.POST(

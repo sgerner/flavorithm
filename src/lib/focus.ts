@@ -8,7 +8,7 @@ export function focusTrap(node: HTMLElement) {
 	const controls = () =>
 		Array.from(
 			node.querySelectorAll<HTMLElement>(
-				'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])'
+				'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])'
 			)
 		).filter((el) => el.offsetParent !== null);
 	queueMicrotask(() => {
@@ -48,7 +48,7 @@ export function focusTrap(node: HTMLElement) {
 				const returnTarget = originalFocus;
 				queueMicrotask(() => {
 					if (activeTraps === 0 && returnTarget?.isConnected && !returnTarget.closest('[inert]'))
-						returnTarget.focus();
+						returnTarget.focus({ preventScroll: true });
 				});
 			}
 		}

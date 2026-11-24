@@ -8,7 +8,7 @@ import {
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ApiError, assertSameOrigin, clientAddress, consumeRateLimit } from '#lib/server/db.ts';
-import { getHostAI } from '#lib/server/host-ai.ts';
+import { getHostAIFor } from '#lib/server/host-ai.ts';
 import { getAuthMode } from '#lib/server/sso.ts';
 
 const MAX_IMPORT_REQUEST_BYTES = 64_000;
@@ -81,7 +81,7 @@ export const POST: RequestHandler = async (event) => {
 				resolveFallback: async (): Promise<RecipeUrlImportFallback | null> => {
 					if (!user) return null;
 
-					const host = getHostAI();
+					const host = getHostAIFor(user.id);
 					if (host) {
 						consumeRateLimit(`ai-user:${user.id}`, 30, 60 * 60 * 1000);
 						const resolved = await getChatGPTConnection(host.userId, host.accountId, event.fetch);
