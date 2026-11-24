@@ -10,6 +10,7 @@ import {
 	type UnitInfo
 } from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
+import { seedPantry, seedRecipes } from './data.ts';
 export {
 	normalizeName,
 	normalizeName as normalizeIngredientName,
@@ -496,6 +497,79 @@ export function reconcileShoppingList(
 	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
+export type ShoppingItemSnapshot = Pick<ShoppingItem, 'name' | 'quantity' | 'unit' | 'customized'>;
+
+export interface ShoppingItemDraft {
+	name: string;
+	quantity: number | null;
+	unit: string;
+}
+
+/** Clamp and trim a shopping item's editable fields so inline edits remain valid. */
+export function normalizeShoppingItem(
+	item: ShoppingItem,
+	draft?: ShoppingItemDraft | null
+): ShoppingItem {
+	const prevName = item.name;
+	const prevUnit = item.unit;
+	const prevQuantity = Number(item.quantity);
+	const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
+	const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
+	const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
+	const rawQuantity: unknown = draft ? draft.quantity : item.quantity;
+	const parsed =
+		rawQuantity === null ||
+		rawQuantity === undefined ||
+		(typeof rawQuantity === 'string' && !rawQuantity.trim())
+			? Number.NaN
+			: Number(rawQuantity);
+	const fallbackQuantity =
+		Number.isFinite(item.quantity) &&
+		item.quantity >= 0.01 &&
+		item.quantity <= MAX_SHOPPING_QUANTITY
+			? item.quantity
+			: 1;
+	const quantity = Number.isFinite(parsed)
+		? Math.max(0.01, Math.min(parsed, MAX_SHOPPING_QUANTITY))
+		: fallbackQuantity;
+	if (item.sourceKey && (name !== prevName || unit !== prevUnit || quantity !== prevQuantity)) {
+		item.customized = true;
+	}
+	item.name = name;
+	item.unit = unit;
+	item.quantity = quantity;
+	if (draft) {
+		draft.name = name;
+		draft.unit = unit;
+		draft.quantity = quantity;
+	}
+	return item;
+}
+
+/** Capture a shopping item's editable fields before inline editing begins. */
+export function snapshotShoppingItem(item: ShoppingItem): ShoppingItemSnapshot {
+	return {
+		name: item.name,
+		quantity: item.quantity,
+		unit: item.unit,
+		...(item.customized !== undefined ? { customized: item.customized } : {})
+	};
+}
+
+/** Restore a shopping item's editable fields from a pre-edit snapshot. */
+export function revertShoppingItem(
+	item: ShoppingItem,
+	snapshot: ShoppingItemSnapshot
+): ShoppingItem {
+	item.name = snapshot.name;
+	item.quantity = snapshot.quantity;
+	item.unit = snapshot.unit;
+	normalizeShoppingItem(item);
+	if (snapshot.customized !== undefined) item.customized = snapshot.customized;
+	else delete item.customized;
+	return item;
+}
+
 const MAX_SHOPPING_ITEMS = 1_000;
 
 function formatDateKey(date: Date): string {
@@ -747,6 +821,7 @@ export function transferPurchasedItemsToPantry(
 		const [normalizedName] = key.split('\u0000');
 		const destination = result.find(
 			(item) =>
+				!item.sample &&
 				normalizeName(item.name) === normalizedName &&
 				unitInfo(item.unit).dimension === bucket.unit.dimension &&
 				!item.expires?.trim()
@@ -926,13 +1001,157 @@ export function completeMeal(
 	const leftoverServings = Number.isFinite(options.leftoverServings)
 		? roundQuantity(Math.min(servingsLimit, Math.max(0, options.leftoverServings)))
 		: 0;
-	const meals = state.meals.map((meal) =>
-		meal.id === mealId ? { ...meal, completedAt: safeNow.toISOString(), leftoverServings } : meal
-	);
+	const meals = state.meals.map((meal) => {
+		if (meal.id !== mealId) return meal;
+		const { sample: _sample, ...userMeal } = meal;
+		return { ...userMeal, completedAt: safeNow.toISOString(), leftoverServings };
+	});
 	const pantry =
 		options.deductPantry && recipe
 			? consumePantry(state.pantry, recipe, target.servings, safeNow)
 			: state.pantry;
 
 	return { ...state, meals, pantry };
+}
+
+const seedPantryById = new Map(seedPantry.map((item) => [item.id, item]));
+const seedSavedRecipesById = new Map(
+	seedRecipes.filter((recipe) => recipe.saved).map((recipe) => [recipe.id, recipe])
+);
+
+/** Check whether the kitchen currently contains any untouched sample staples, meals, or bookmarks. */
+export function hasSampleData(state: Pick<AppState, 'pantry' | 'meals' | 'recipes'>): boolean {
+	return (
+		state.pantry.some((item) => Boolean(item.sample)) ||
+		state.meals.some((meal) => Boolean(meal.sample)) ||
+		state.recipes.some((recipe) => Boolean(recipe.saved && recipe.sampleSaved))
+	);
+}
+
+/** Promote an edited sample pantry ingredient to user-owned stock. */
+export function promoteSampleIngredient(item: Ingredient): Ingredient {
+	const { sample: _sample, ...promoted } = item;
+	return promoted;
+}
+
+/** Promote an edited sample meal entry to user-owned status. */
+export function promoteSampleMeal(meal: Meal): Meal {
+	const { sample: _sample, ...promoted } = meal;
+	return promoted;
+}
+
+/** Promote an edited or toggled recipe bookmark out of sample status. */
+export function promoteSampleBookmark(recipe: Recipe): Recipe {
+	const { sampleSaved: _sampleSaved, ...promoted } = recipe;
+	return promoted;
+}
+
+function stableDataSnapshot(value: unknown): string | undefined {
+	return JSON.stringify(value, (_key, entry) => {
+		if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry;
+		return Object.fromEntries(
+			Object.entries(entry)
+				.filter(([, item]) => item !== undefined)
+				.sort(([a], [b]) => a.localeCompare(b))
+		);
+	});
+}
+
+/**
+ * Backfill only exact legacy pantry and bookmark seed records. Older guest snapshots have no
+ * provenance for planned meals, so their IDs and dates cannot safely distinguish a starter from
+ * a user-rescheduled meal.
+ */
+export function backfillSampleData(state: AppState): AppState {
+	if (
+		!state ||
+		typeof state !== 'object' ||
+		!Array.isArray(state.pantry) ||
+		!Array.isArray(state.meals) ||
+		!Array.isArray(state.recipes)
+	) {
+		return state;
+	}
+	const alreadyTagged =
+		state.pantry.some((item) => item?.sample !== undefined) ||
+		state.meals.some((meal) => meal?.sample !== undefined) ||
+		state.recipes.some((recipe) => recipe?.sampleSaved !== undefined);
+	if (alreadyTagged) return state;
+
+	const pantry = state.pantry.map((item) => {
+		const seed = seedPantryById.get(item.id);
+		if (seed && stableDataSnapshot(item) === stableDataSnapshot(seed)) {
+			return { ...item, sample: true };
+		}
+		return { ...item };
+	});
+
+	const meals = state.meals.map((meal) => ({ ...meal }));
+
+	const recipes = state.recipes.map((recipe) => {
+		const seed = seedSavedRecipesById.get(recipe.id);
+		if (seed && stableDataSnapshot(recipe) === stableDataSnapshot(seed)) {
+			return { ...recipe, sampleSaved: true };
+		}
+		return { ...recipe };
+	});
+
+	return { ...state, pantry, meals, recipes };
+}
+
+function weekEndKey(startKey: string): string | undefined {
+	const parsed = parseCalendarDate(startKey);
+	if (!parsed) return undefined;
+	const end = new Date(0);
+	end.setFullYear(parsed.year, parsed.month, parsed.day + 6);
+	end.setHours(12, 0, 0, 0);
+	return `${end.getFullYear()}-${String(end.getMonth() + 1).padStart(2, '0')}-${String(end.getDate()).padStart(2, '0')}`;
+}
+
+/**
+ * Remove untouched sample staples, meals, and bookmarks while keeping all user-added or
+ * promoted kitchen data and refreshing generated weekly shopping lists.
+ */
+export function clearSampleData(state: AppState, now: Date = new Date()): AppState {
+	const pantry = state.pantry.filter((item) => !item.sample).map((item) => ({ ...item }));
+	const meals = state.meals.filter((meal) => !meal.sample).map((meal) => ({ ...meal }));
+	const recipes = state.recipes.map((recipe) => {
+		const { sampleSaved, ...rest } = recipe;
+		return sampleSaved ? { ...rest, saved: false } : { ...rest };
+	});
+
+	let shopping = state.shopping.map((item) => ({ ...item }));
+	let dismissedShopping = state.dismissedShopping;
+	const weeks = new Set(
+		shopping.flatMap((item) => item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1] ?? [])
+	);
+	for (const startKey of weeks) {
+		const endKey = weekEndKey(startKey);
+		if (!endKey) continue;
+		const scopeKey = `week:${startKey}`;
+		const weekMeals = meals.filter(
+			(meal) => !meal.completedAt && meal.date >= startKey && meal.date <= endKey
+		);
+		if (weekMeals.length === 0) {
+			dismissedShopping = clearScopeDismissals(dismissedShopping, scopeKey);
+		}
+		const additions = buildShoppingList(recipes, pantry, weekMeals, now);
+		shopping = reconcileShoppingList(
+			shopping,
+			additions,
+			scopeKey,
+			dismissedKeysForScope(dismissedShopping, scopeKey)
+		);
+	}
+
+	const { dismissedShopping: _prevDismissed, ...restState } = state;
+	return {
+		...restState,
+		pantry,
+		recipes,
+		meals,
+		shopping,
+		...(dismissedShopping ? { dismissedShopping } : {}),
+		preferences: structuredClone(state.preferences)
+	};
 }
