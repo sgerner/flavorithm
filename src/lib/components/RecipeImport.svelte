@@ -5,6 +5,7 @@
 <script lang="ts">
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
+	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import {
 		clearImportSourceInPlace,
 		emptyImportSession,
@@ -75,31 +76,26 @@
 	});
 
 	async function attachPhoto(file?: File) {
-		if (!file || busy || reading || voiceBusy) return;
-		if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
-			error = 'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.';
-			return;
-		}
-		if (file.size > 5 * 1024 * 1024) {
-			error = 'Choose a photo under 5 MB.';
+		if (!file || busy || reading || voiceBusy) {
+			if (photoInput) photoInput.value = '';
 			return;
 		}
 		reading = true;
 		error = '';
 		const targetSession = session;
 		try {
-			const photo = await new Promise<string>((resolve, reject) => {
-				const reader = new FileReader();
-				reader.onload = () => resolve(String(reader.result));
-				reader.onerror = () => reject(new Error('Could not read that photo. Try another file.'));
-				reader.readAsDataURL(file);
+			const photo = await prepareAIPhoto(file, {
+				unsupportedMessage:
+					'Choose a JPG, PNG, or WebP photo. For other files, paste their recipe text.'
 			});
 			if (alive && session === targetSession) {
 				targetSession.photo = photo;
-				targetSession.photoName = file.name;
+				targetSession.photoName = file.name || 'recipe-photo.jpg';
 			}
 		} catch (e) {
-			if (alive && session === targetSession) error = (e as Error).message;
+			if (alive && session === targetSession) {
+				error = e instanceof Error ? e.message : 'Could not read that photo. Try another file.';
+			}
 		} finally {
 			if (alive) reading = false;
 			if (photoInput) photoInput.value = '';
