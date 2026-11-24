@@ -365,8 +365,8 @@
 		'Middle Eastern',
 		'American'
 	];
-	function openModal(nextModal: string) {
-		if (nextModal && !modal) modalReturnFocus = activeFocusedElement();
+	function openModal(nextModal: string, trigger: HTMLElement | null = activeFocusedElement()) {
+		if (nextModal && !modal) modalReturnFocus = trigger;
 		else if (!nextModal) modalReturnFocus = null;
 		modal = nextModal;
 	}
@@ -394,7 +394,9 @@
 		quizAllergies = kitchen.preferences.allergies;
 		openModal('onboarding');
 	}
-	function openAuthentication() {
+	function openAuthentication(eventOrTrigger?: Event | HTMLElement | null) {
+		const trigger =
+			eventOrTrigger && 'focus' in eventOrTrigger ? eventOrTrigger : activeFocusedElement();
 		if (installationAuthMode === 'oidc') {
 			window.location.assign(providerLoginUrl ?? '/auth/login');
 			return;
@@ -407,7 +409,7 @@
 			notify('Sign-in is unavailable because authentication is misconfigured.');
 			return;
 		}
-		openModal('auth');
+		openModal('auth', trigger);
 	}
 	function resetRecipeSubflows(preserveSelected = false) {
 		const cleared = clearRecipeSubflowState();
@@ -1899,12 +1901,15 @@
 			error = (e as Error).message;
 		}
 	}
-	async function openSettings(focusTarget: boolean | 'ai' | 'voice' = false) {
+	async function openSettings(
+		focusTarget: boolean | 'ai' | 'voice' = false,
+		trigger: HTMLElement | null = activeFocusedElement()
+	) {
 		mobileNav = false;
 		if (!focusTarget && modal !== 'pantry' && modal !== 'import' && modal !== 'settings') {
 			resumeDialog = '';
 		}
-		openModal('settings');
+		openModal('settings', trigger);
 		error = '';
 		const headingId =
 			focusTarget === true || focusTarget === 'ai'
@@ -2250,8 +2255,9 @@
 		return Boolean(user) && hasPersonalAIReady();
 	}
 	async function needAI() {
+		const trigger = activeFocusedElement();
 		if (!user) {
-			openAuthentication();
+			openAuthentication(trigger);
 			notify(
 				managedAuth
 					? 'Sign in through your organization to use your AI connection.'
@@ -2266,7 +2272,7 @@
 		}
 		const isPlan = kitchen.preferences.provider === 'chatgpt';
 		if (!hasPersonalAIReady()) {
-			void openSettings(true);
+			void openSettings(true, trigger);
 			notify(
 				isPlan
 					? 'Connect your ChatGPT plan and choose an available model.'

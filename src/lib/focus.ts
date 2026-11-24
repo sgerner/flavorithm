@@ -14,6 +14,7 @@ type ResolvedOptions = {
 type TrapEntry = {
 	node: HTMLElement;
 	returnFocus: HTMLElement | null;
+	deactivate: (exiting?: boolean) => void;
 };
 
 const FOCUSABLE_SELECTOR =
@@ -91,26 +92,46 @@ export function focusableControls(node: HTMLElement): HTMLElement[] {
 }
 
 function focusFirstControl(node: HTMLElement) {
-	if (!node.isConnected || node.hidden || node.closest('[hidden], [inert]')) return;
+	if (!node.isConnected || node.hidden || node.inert || node.closest('[hidden], [inert]')) return;
 	(focusableControls(node)[0] || node).focus();
+}
+
+function hasExternalActiveFocus(closingNode: HTMLElement, target: HTMLElement | null): boolean {
+	const active = document.activeElement as HTMLElement | null;
+	if (!active || active === document.body || active === document.documentElement) return false;
+	if (active === target || closingNode.contains(active)) return false;
+	return active.isConnected && isElementVisible(active);
 }
 
 export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean) {
 	let options = resolveOptions(param);
 	let active = false;
 	let focusGeneration = 0;
+	let inertObserver: MutationObserver | null = null;
 
 	const entry: TrapEntry = {
 		node,
-		returnFocus: null
+		returnFocus: null,
+		deactivate
 	};
 
 	function scheduleInitialFocus() {
 		const token = ++focusGeneration;
+		const applyFocus = () => {
+			if (!active || token !== focusGeneration) return true;
+			if (trapStack[trapStack.length - 1] !== entry) return true;
+			if (!node.isConnected || node.hidden || node.inert || node.closest('[hidden], [inert]')) {
+				return true;
+			}
+			(focusableControls(node)[0] || node).focus();
+			return node.contains(document.activeElement);
+		};
 		queueMicrotask(() => {
-			if (!active || token !== focusGeneration) return;
-			if (trapStack[trapStack.length - 1] !== entry) return;
-			focusFirstControl(node);
+			if (!applyFocus() && typeof requestAnimationFrame === 'function') {
+				requestAnimationFrame(() => {
+					if (!node.contains(document.activeElement)) applyFocus();
+				});
+			}
 		});
 	}
 
@@ -144,6 +165,9 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 
 	function activate() {
 		if (active) return;
+		for (const stale of [...trapStack]) {
+			if (stale.node.inert) stale.deactivate(true);
+		}
 		const explicitReturn = resolveReturnElement(options.returnFocus, null);
 		const returnFocus = hasPendingReturn
 			? !explicitReturn ||
@@ -167,6 +191,12 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 
 		node.addEventListener('keydown', keydown);
 		node.addEventListener('outrostart', outrostart);
+		if (typeof MutationObserver !== 'undefined') {
+			inertObserver = new MutationObserver(() => {
+				if (node.inert) deactivate(true);
+			});
+			inertObserver.observe(node, { attributes: true, attributeFilter: ['inert'] });
+		}
 		scheduleInitialFocus();
 	}
 
@@ -179,6 +209,8 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 		focusGeneration += 1;
 		node.removeEventListener('keydown', keydown);
 		node.removeEventListener('outrostart', outrostart);
+		inertObserver?.disconnect();
+		inertObserver = null;
 		if (exiting) node.removeAttribute?.('aria-modal');
 
 		const index = trapStack.indexOf(entry);
@@ -211,8 +243,24 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 			pendingReturnFocus = null;
 			pendingClosingNode = null;
 			const top = trapStack[trapStack.length - 1];
+			if (!top && hasExternalActiveFocus(node, target)) return;
 			if (target?.isConnected && isElementVisible(target) && (!top || top.node.contains(target))) {
 				target.focus({ preventScroll: true });
+				return;
+			}
+			if (
+				!top &&
+				target?.isConnected &&
+				target.closest('[inert]') &&
+				typeof requestAnimationFrame === 'function'
+			) {
+				requestAnimationFrame(() => {
+					if (generation !== restoreGeneration || trapStack.length !== 0) return;
+					if (hasExternalActiveFocus(node, target)) return;
+					if (target.isConnected && isElementVisible(target)) {
+						target.focus({ preventScroll: true });
+					}
+				});
 				return;
 			}
 			if (top) {

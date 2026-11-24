@@ -567,3 +567,110 @@ test('supports { enabled, key } updates, closed details/summary, fixed controls,
 	dialog.remove();
 	trap.destroy();
 });
+
+test('node.inert deactivates outgoing modal, preserves stacked parent traps, guards external focus, and retries rAF when trigger un-inerts', async (t) => {
+	const doc = installDom(t);
+	const rafQueue: FrameRequestCallback[] = [];
+	const prevRaf = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame');
+	Object.defineProperty(globalThis, 'requestAnimationFrame', {
+		configurable: true,
+		value: (cb: FrameRequestCallback) => {
+			rafQueue.push(cb);
+			return rafQueue.length;
+		}
+	});
+	t.after(() => {
+		if (prevRaf) Object.defineProperty(globalThis, 'requestAnimationFrame', prevRaf);
+		else Reflect.deleteProperty(globalThis, 'requestAnimationFrame');
+	});
+
+	const mainRegion = doc.el('main', 'main-shell');
+	const menuBtn = doc.el('button', 'mobile-menu');
+	const pageInput = doc.el('input', 'page-search');
+	mainRegion.append(menuBtn, pageInput);
+
+	const detailWrapper = doc.el('div', 'detail-wrapper');
+	const detailDialog = doc.el('div', 'detail-dialog', { tabIndex: -1 });
+	detailDialog.setAttribute('aria-modal', 'true');
+	const detailClose = doc.el('button', 'detail-close');
+	const detailSettingsTrigger = doc.el('button', 'detail-settings');
+	detailDialog.append(detailClose, detailSettingsTrigger);
+	detailWrapper.append(detailDialog);
+
+	doc.body.append(mainRegion, detailWrapper);
+	menuBtn.focus();
+
+	// Open RecipeDetail; then mark its wrapper inert (NOT detailDialog.inert) and open modal1.
+	const detailTrap = focusTrap(detailDialog as unknown as HTMLElement);
+	await flushMicrotasks();
+	detailSettingsTrigger.focus();
+	const capturedDetailTrigger = activeFocusedElement();
+	detailWrapper.inert = true;
+
+	const modal1 = doc.el('div', 'settings-modal', { tabIndex: -1 });
+	modal1.setAttribute('aria-modal', 'true');
+	const modal1Close = doc.el('button', 'settings-close');
+	modal1.append(modal1Close);
+	doc.body.append(modal1);
+	const trap1 = focusTrap(modal1 as unknown as HTMLElement, {
+		returnFocus: capturedDetailTrigger
+	});
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, modal1Close);
+
+	// Svelte outro marks modal1.inert = true directly while mounting modal2: modal1 loses aria-modal and hands off returnFocus, while detailDialog stays stacked.
+	modal1.inert = true;
+	const modal2 = doc.el('div', 'delete-modal', { tabIndex: -1 });
+	modal2.setAttribute('aria-modal', 'true');
+	const modal2Close = doc.el('button', 'delete-close');
+	modal2.append(modal2Close);
+	doc.body.append(modal2);
+	const trap2 = focusTrap(modal2 as unknown as HTMLElement);
+	await flushMicrotasks();
+
+	assert.equal(modal1.getAttribute('aria-modal'), null);
+	assert.equal(modal2.getAttribute('aria-modal'), 'true');
+	assert.equal(detailDialog.getAttribute('aria-modal'), 'true');
+	assert.equal(doc.activeElement, modal2Close);
+
+	modal1.remove();
+	trap1.destroy();
+
+	// Closing modal2 restores focus to detailSettingsTrigger inside RecipeDetail.
+	detailWrapper.inert = false;
+	modal2.remove();
+	trap2.destroy();
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, detailSettingsTrigger);
+
+	// Closing RecipeDetail while <main inert> is still set at microtask time retries on requestAnimationFrame and lands on menuBtn.
+	mainRegion.inert = true;
+	detailDialog.dispatchOutroStart();
+	await flushMicrotasks();
+	assert.equal(rafQueue.length, 1);
+	mainRegion.inert = false;
+	const nextFrame = rafQueue.shift()!;
+	nextFrame(16);
+	assert.equal(doc.activeElement, menuBtn);
+
+	detailWrapper.remove();
+	detailTrap.destroy();
+
+	// Focusing an external page input before/during outro microtask is never overwritten by focus restoration.
+	const quickModal = doc.el('div', 'quick-modal', { tabIndex: -1 });
+	const quickClose = doc.el('button', 'quick-close');
+	quickModal.append(quickClose);
+	doc.body.append(quickModal);
+	const quickTrap = focusTrap(quickModal as unknown as HTMLElement, {
+		returnFocus: menuBtn as unknown as HTMLElement
+	});
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, quickClose);
+
+	quickModal.dispatchOutroStart();
+	pageInput.focus();
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, pageInput);
+	quickModal.remove();
+	quickTrap.destroy();
+});
