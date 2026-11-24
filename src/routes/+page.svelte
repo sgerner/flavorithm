@@ -29,6 +29,7 @@
 </script>
 
 <script lang="ts">
+	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick } from 'svelte';
 	import type { PageData } from './$types';
@@ -1999,7 +2000,7 @@
 				void openLeaveHousehold();
 				break;
 			case 'scan':
-				if (!scanBusy) imageInput?.click();
+				if (!scanBusy && !busy && !voiceBusy) imageInput?.click();
 				break;
 			case 'dictate':
 				dictateRecipe();
@@ -2045,37 +2046,13 @@
 		if (input) input.value = '';
 		if (imageInput) imageInput.value = '';
 		if (!file || scanBusy || busy || voiceBusy || !needAI()) return;
-		if (file.size > 5 * 1024 * 1024) {
-			notify('Choose a photo under 5 MB.');
-			return;
-		}
 		const generation = ++scanGeneration;
 		const currentController = new AbortController();
 		scanController = currentController;
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
 		scanBusy = true;
 		try {
-			const image = await new Promise<string>((resolve, reject) => {
-				const reader = new FileReader();
-				const onAbort = () => {
-					reader.abort();
-					reject(new DOMException('Scan aborted.', 'AbortError'));
-				};
-				if (currentController.signal.aborted) {
-					onAbort();
-					return;
-				}
-				currentController.signal.addEventListener('abort', onAbort, { once: true });
-				reader.onload = () => {
-					currentController.signal.removeEventListener('abort', onAbort);
-					resolve(String(reader.result));
-				};
-				reader.onerror = () => {
-					currentController.signal.removeEventListener('abort', onAbort);
-					reject(new Error('Could not read that photo. Try another file.'));
-				};
-				reader.readAsDataURL(file);
-			});
+			const image = await prepareAIPhoto(file, { signal: currentController.signal });
 			const result = await ai('vision', { image }, currentController.signal);
 			if (
 				generation !== scanGeneration ||
@@ -2112,7 +2089,7 @@
 				notify(
 					currentController.signal.aborted
 						? 'Photo scan cancelled.'
-						: e instanceof Error
+						: e instanceof Error && e.message
 							? e.message
 							: 'Could not recognize ingredients from that photo.'
 				);
@@ -2122,6 +2099,7 @@
 				scanBusy = false;
 				scanController = undefined;
 			}
+			if (input) input.value = '';
 			if (imageInput) imageInput.value = '';
 		}
 	}
