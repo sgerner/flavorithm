@@ -394,6 +394,9 @@ test('shopping provenance and edit tracking fields persist through state validat
 		requirementQuantity: 29.5735,
 		customized: true
 	});
+	state.dismissedShopping = {
+		'week:2026-10-19': { 'onion::count': true }
+	};
 	assert.ok(backend.validateAppState(state));
 	backend.saveState(account.user, state, {
 		ifMatch: backend.getStateEtag(account.user),
@@ -403,6 +406,9 @@ test('shopping provenance and edit tracking fields persist through state validat
 	assert.equal(saved.shopping[0]?.requirementKey, 'olive oil::volume');
 	assert.equal(saved.shopping[0]?.requirementQuantity, 29.5735);
 	assert.equal(saved.shopping[0]?.customized, true);
+	assert.deepEqual(saved.dismissedShopping, {
+		'week:2026-10-19': { 'onion::count': true }
+	});
 });
 
 test('household endpoint blocks solo leave and requires confirmReplace before replacing populated solo kitchens', async () => {

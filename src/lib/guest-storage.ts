@@ -12,6 +12,10 @@ import type {
 } from './types.ts';
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+type RemovableStorage = Pick<Storage, 'removeItem'>;
+
+const GUEST_KITCHEN_KEY = 'flavorithm-guest-kitchen';
+const GUEST_STARTED_KEY = 'flavorithm-started';
 
 /** Preserve ambiguous pre-isolation data without exposing it as a guest kitchen. */
 export function quarantineLegacyKitchen(storage: StorageLike): void {
@@ -24,6 +28,25 @@ export function quarantineLegacyKitchen(storage: StorageLike): void {
 		storage.removeItem('flavorithm-kitchen');
 	} catch {
 		// A failed backup must leave the original available for manual recovery.
+	}
+}
+
+/** Remove saved guest kitchen state once it has been staged into an account or discarded. */
+export function clearGuestKitchen(storage: RemovableStorage): void {
+	try {
+		storage.removeItem(GUEST_KITCHEN_KEY);
+	} catch {
+		// Restricted storage must not block account transitions.
+	}
+}
+
+/** Clear all guest-only browser keys, including the sample-kitchen dismissal flag. */
+export function clearGuestData(storage: RemovableStorage): void {
+	clearGuestKitchen(storage);
+	try {
+		storage.removeItem(GUEST_STARTED_KEY);
+	} catch {
+		// Restricted storage must not block account transitions.
 	}
 }
 
@@ -374,15 +397,38 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 	};
 }
 
+function sanitizeDismissedShopping(value: unknown): AppState['dismissedShopping'] {
+	if (!isRecord(value)) return undefined;
+	const scopes: Record<string, Record<string, boolean>> = {};
+	for (const [rawScope, rawEntries] of Object.entries(value)) {
+		if (Object.keys(scopes).length >= 200) break;
+		const scope = rawScope.trim().slice(0, 200);
+		if (!scope || !isRecord(rawEntries)) continue;
+		const entries: Record<string, boolean> = {};
+		for (const [rawKey, dismissed] of Object.entries(rawEntries)) {
+			if (Object.keys(entries).length >= 1_000) break;
+			const key = rawKey.trim().slice(0, 260);
+			if (!key || dismissed !== true) continue;
+			entries[key] = true;
+		}
+		if (Object.keys(entries).length > 0) {
+			scopes[scope] = entries;
+		}
+	}
+	return Object.keys(scopes).length > 0 ? scopes : undefined;
+}
+
 /** Clamp a guest or client kitchen snapshot to match server persistence bounds. */
 export function sanitizeKitchenState(value: unknown): AppState {
 	if (!isRecord(value)) return createInitialState();
 	const defaults = createInitialState();
+	const dismissedShopping = sanitizeDismissedShopping(value.dismissedShopping);
 	return {
 		pantry: sanitizePantry(value.pantry, defaults.pantry),
 		recipes: sanitizeRecipes(value.recipes, defaults.recipes),
 		meals: sanitizeMeals(value.meals, defaults.meals),
 		shopping: sanitizeShopping(value.shopping, defaults.shopping),
+		...(dismissedShopping !== undefined ? { dismissedShopping } : {}),
 		preferences: sanitizePreferences(value.preferences, defaultPreferences)
 	};
 }

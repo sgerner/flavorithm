@@ -80,6 +80,7 @@ export type AppState = {
 	recipes: Recipe[];
 	meals: Meal[];
 	shopping: ShoppingItem[];
+	dismissedShopping?: Record<string, Record<string, boolean>>;
 	preferences: Preferences;
 };
 export type User = {

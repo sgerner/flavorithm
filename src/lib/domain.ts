@@ -64,35 +64,13 @@ addUnits('count:head', 'count', 1, 'head', [
 	'head',
 	'heads',
 	'small head',
-	'small heads',
 	'medium head',
-	'medium heads',
-	'large head',
-	'large heads'
+	'large head'
 ]);
 addUnits('count:slice', 'count', 1, 'slice', ['slice', 'slices']);
 addUnits('count:can', 'count', 1, 'can', ['can', 'cans']);
 addUnits('count:pinch', 'count', 1, 'pinch', ['pinch', 'pinches']);
 addUnits('count:dash', 'count', 1, 'dash', ['dash', 'dashes']);
-
-const containerUnits: Record<string, string> = {
-	package: 'package',
-	packages: 'package',
-	pkg: 'package',
-	pkgs: 'package',
-	bag: 'bag',
-	bags: 'bag',
-	box: 'box',
-	boxes: 'box',
-	bottle: 'bottle',
-	bottles: 'bottle',
-	jar: 'jar',
-	jars: 'jar'
-};
-
-const parsableUnitTokens = [...Object.keys(unitAliases), ...Object.keys(containerUnits)].sort(
-	(a, b) => b.length - a.length
-);
 
 const sortedUnitAliases = Object.keys(unitAliases).sort((a, b) => b.length - a.length);
 
@@ -184,12 +162,11 @@ export function normalizeName(name: string): string {
 
 export function unitInfo(unit: string): UnitInfo {
 	const cleaned = cleanText(unit);
-	if (!cleaned) return unitAliases.each;
 	return (
 		unitAliases[cleaned] ?? {
 			dimension: `unit:${cleaned}`,
 			factor: 1,
-			display: cleaned,
+			display: cleaned || 'each',
 			system: 'custom'
 		}
 	);
@@ -251,80 +228,6 @@ function parseLeadingQuantity(text: string): { quantity: number; rest: string } 
 	}
 
 	return undefined;
-}
-
-export function parseIngredientInput(raw: string): {
-	name: string;
-	quantity: number;
-	unit: string;
-	hasExplicitQuantity: boolean;
-	hasExplicitUnit: boolean;
-} {
-	const compact = raw.trim().replace(/\s+/g, ' ');
-	if (!compact) {
-		return {
-			name: '',
-			quantity: 1,
-			unit: 'each',
-			hasExplicitQuantity: false,
-			hasExplicitUnit: false
-		};
-	}
-
-	const leading = parseLeadingQuantity(compact);
-	if (
-		leading &&
-		Number.isFinite(leading.quantity) &&
-		leading.quantity > 0 &&
-		leading.quantity <= 1_000_000
-	) {
-		const restTrimmed = leading.rest.trim();
-		if (restTrimmed) {
-			const quantity = Math.max(0.01, Math.round(leading.quantity * 1000) / 1000);
-			const lowerRest = restTrimmed.toLowerCase();
-			for (const token of parsableUnitTokens) {
-				if (!lowerRest.startsWith(token)) continue;
-				const afterToken = restTrimmed.slice(token.length);
-				const sepMatch = /^\.?\s+/.exec(afterToken);
-				if (!sepMatch) continue;
-				const rawAfter = afterToken.slice(sepMatch[0].length).trim();
-				if (/^of$/i.test(rawAfter)) continue;
-				const afterUnit = rawAfter
-					.replace(/^of\s+/i, '')
-					.replace(/[.,;:]$/, '')
-					.trim();
-				if (!afterUnit) continue;
-				const unit = containerUnits[token] ?? unitInfo(token).display;
-				return {
-					name: afterUnit,
-					quantity,
-					unit,
-					hasExplicitQuantity: true,
-					hasExplicitUnit: true
-				};
-			}
-
-			const fallbackName = restTrimmed.replace(/[.,;:]$/, '').trim();
-			if (fallbackName) {
-				return {
-					name: fallbackName,
-					quantity,
-					unit: 'each',
-					hasExplicitQuantity: true,
-					hasExplicitUnit: false
-				};
-			}
-		}
-	}
-
-	const plainName = compact.replace(/[.,;:]$/, '').trim() || compact;
-	return {
-		name: plainName,
-		quantity: 1,
-		unit: 'each',
-		hasExplicitQuantity: false,
-		hasExplicitUnit: false
-	};
 }
 
 export function parseIngredientLine(raw: string): ParsedIngredient | undefined {

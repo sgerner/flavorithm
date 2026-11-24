@@ -4,9 +4,13 @@ import { MAX_RECIPES } from './recipe-collection.ts';
 import { buildShoppingList, normalizeName } from './domain.ts';
 import {
 	activeShoppingWeeks,
+	clearScopeDismissals,
+	clearShoppingDismissal,
 	completeMeal,
 	convertCompatibleQuantity,
+	dismissedKeysForScope,
 	reconcileShoppingList,
+	recordShoppingDismissal,
 	weekStartForDate
 } from './kitchen-workflows.ts';
 
@@ -218,10 +222,12 @@ function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
 	const meals = state.meals.filter(
 		(item) => !item.completedAt && item.date >= startKey && item.date <= endKey
 	);
+	const scopeKey = `week:${startKey}`;
 	state.shopping = reconcileShoppingList(
 		state.shopping,
 		buildShoppingList(state.recipes, state.pantry, meals, now),
-		`week:${startKey}`
+		scopeKey,
+		dismissedKeysForScope(state.dismissedShopping, scopeKey)
 	);
 }
 
@@ -436,6 +442,12 @@ export function applyButlerCommands(
 				) {
 					nextItem.customized = true;
 				}
+				if (previous?.sourceKey) {
+					state.dismissedShopping = clearShoppingDismissal(state.dismissedShopping, previous);
+				}
+				if (nextItem.sourceKey) {
+					state.dismissedShopping = clearShoppingDismissal(state.dismissedShopping, nextItem);
+				}
 				state.shopping = upsert(state.shopping, nextItem);
 				break;
 			}
@@ -450,8 +462,9 @@ export function applyButlerCommands(
 				if (week) {
 					explicitDeletedShoppingIds.delete(command.id);
 					dirtyWeeks.add(week);
-				} else if (!removed?.checked) {
+				} else if (removed && !removed.checked) {
 					explicitDeletedShoppingIds.add(command.id);
+					state.dismissedShopping = recordShoppingDismissal(state.dismissedShopping, removed);
 				}
 				break;
 			}
@@ -459,7 +472,9 @@ export function applyButlerCommands(
 				explicitDeletedShoppingIds.clear();
 				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
-				dirtyWeeks.add(calendarKey(start));
+				const startKey = calendarKey(start);
+				state.dismissedShopping = clearScopeDismissals(state.dismissedShopping, `week:${startKey}`);
+				dirtyWeeks.add(startKey);
 				flushDirtyWeeks();
 				break;
 			}

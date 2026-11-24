@@ -8,19 +8,21 @@ import {
 } from '../src/lib/domain.ts';
 import {
 	activeShoppingWeeks,
+	clearScopeDismissals,
 	completeMeal,
 	convertCompatibleQuantity,
 	deleteShoppingItem,
+	deleteShoppingRow,
+	dismissedKeysForScope,
 	expiryStatus,
 	filterPantryItems,
-	isTransferablePurchase,
 	listPantryCategories,
 	normalizeIngredientName,
 	normalizePantryDraft,
-	parseIngredientInput,
 	reconcileShoppingList,
 	restockDepletedPantryItems,
 	restoreShoppingItem,
+	restoreShoppingRow,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -730,50 +732,137 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 });
 
-test('parsed manual shopping entries and blank-unit purchases merge into pantry while keeping invalid rows', () => {
-	const parsed = parseIngredientInput('2 cups jasmine rice');
-	const riceRow = shopping('manual-rice', parsed.name, parsed.quantity, parsed.unit, true);
-	const unitlessNew = shopping('basil-lemons', 'lemons', 3, '', true);
-	const unitlessMerge = shopping('basil-eggs', 'eggs', 2, '', true);
-	const invalidZero = shopping('invalid-zero', 'milk', 0, 'cup', true);
-	const invalidBlankName = shopping('invalid-name', '   ', 1, 'each', true);
-	const uncheckedItem = shopping('needed', 'butter', 1, 'tbsp', false);
+test('deleted unchecked generated rows stay tombstoned across refreshes until undone or rebuilt', () => {
+	const now = new Date('2026-10-20T12:00:00Z');
+	const scope = 'week:2026-10-19';
+	const stew = recipe({
+		id: 'stew',
+		servings: 2,
+		ingredients: [
+			{ name: 'carrot', quantity: 4, unit: 'each' },
+			{ name: 'onion', quantity: 2, unit: 'each' }
+		]
+	});
+	const baseState = state({
+		recipes: [stew],
+		meals: [{ id: 'wed', date: '2026-10-21', slot: 'Dinner', recipeId: 'stew', servings: 2 }]
+	});
+	const desired = buildShoppingList(baseState.recipes, baseState.pantry, baseState.meals, now);
+	const initial = reconcileShoppingList([], desired, scope);
+	const carrotRow = initial.find((item) => item.name === 'carrot')!;
+	const onionRow = initial.find((item) => item.name === 'onion')!;
 
-	const candidates = [
-		riceRow,
-		unitlessNew,
-		unitlessMerge,
-		invalidZero,
-		invalidBlankName,
-		uncheckedItem
-	];
-	const transferable = candidates.filter(isTransferablePurchase);
+	// Dismissing unchecked onion records a tombstone for week:2026-10-19
+	const dismissed = deleteShoppingRow({ ...baseState, shopping: initial }, onionRow.id, now);
+	assert.deepEqual(dismissed.shopping, [carrotRow]);
+	assert.deepEqual(dismissed.dismissedShopping, {
+		[scope]: { 'onion::count': true }
+	});
+
+	// Subsequent active-week refreshes (e.g. pantry/recipe/transfer edits) keep onion deleted
+	const afterRefresh = reconcileShoppingList(
+		dismissed.shopping,
+		desired,
+		scope,
+		dismissedKeysForScope(dismissed.dismissedShopping, scope)
+	);
+	assert.deepEqual(afterRefresh, [carrotRow]);
+
+	// Checking carrot and deleting it refreshes the week for carrot while keeping onion tombstoned
+	const checkedCarrot: ShoppingItem = { ...carrotRow, checked: true };
+	const afterCheckedDelete = deleteShoppingRow(
+		{
+			...baseState,
+			shopping: [checkedCarrot],
+			dismissedShopping: dismissed.dismissedShopping
+		},
+		checkedCarrot.id,
+		now
+	);
 	assert.deepEqual(
-		transferable.map((item) => item.id),
-		['manual-rice', 'basil-lemons', 'basil-eggs']
+		afterCheckedDelete.shopping.map((item) => ({
+			name: item.name,
+			quantity: item.quantity,
+			checked: item.checked
+		})),
+		[{ name: 'carrot', quantity: 4, checked: false }]
 	);
 
-	const updatedPantry = transferPurchasedItemsToPantry(
-		[pantry('jasmine rice', 2, 'cups'), pantry('egg', 4, 'whole')],
-		candidates,
-		(() => {
-			let count = 0;
-			return () => `lot-${++count}`;
-		})()
+	// Undoing onion dismissal restores onion and clears the tombstone
+	const restored = restoreShoppingRow(
+		{
+			...baseState,
+			shopping: afterCheckedDelete.shopping,
+			dismissedShopping: afterCheckedDelete.dismissedShopping
+		},
+		onionRow,
+		now
 	);
-	assert.equal(updatedPantry.find((item) => item.name === 'jasmine rice')?.quantity, 4);
-	assert.equal(updatedPantry.find((item) => item.name === 'egg')?.quantity, 6);
-	const addedLemons = updatedPantry.find((item) => item.name === 'lemons');
-	assert.ok(addedLemons);
-	assert.equal(addedLemons.unit, 'each');
-	assert.equal(addedLemons.quantity, 3);
+	assert.equal(restored.dismissedShopping, undefined);
+	assert.deepEqual(restored.shopping.map((item) => item.name).sort(), ['carrot', 'onion']);
 
-	const transferredIds = new Set(transferable.map((item) => item.id));
-	const remainingShopping = candidates.filter((item) => !transferredIds.has(item.id));
+	// Explicit scope rebuild clears tombstones so dismissed deficits regenerate
+	const reDismissed = deleteShoppingRow(
+		{ ...baseState, shopping: restored.shopping },
+		onionRow.id,
+		now
+	);
+	const clearedDismissals = clearScopeDismissals(reDismissed.dismissedShopping, scope);
+	assert.equal(clearedDismissals, undefined);
+	const rebuilt = reconcileShoppingList(
+		reDismissed.shopping,
+		desired,
+		scope,
+		dismissedKeysForScope(clearedDismissals, scope)
+	);
+	assert.deepEqual(rebuilt.map((item) => item.name).sort(), ['carrot', 'onion']);
+});
+
+test('legacy customized rows lacking requirementKey are kept verbatim while the week is active', () => {
+	const scope = 'week:2026-10-19';
+	const legacyRenamed: ShoppingItem = {
+		id: 'legacy-oil',
+		name: 'Spanish extra-virgin olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		checked: false,
+		sourceKey: scope,
+		customized: true
+	};
+	const legacyResized: ShoppingItem = {
+		id: 'legacy-rice',
+		name: 'jasmine rice',
+		quantity: 2,
+		unit: 'bag',
+		checked: false,
+		sourceKey: scope,
+		customized: true
+	};
+
+	const refreshed = reconcileShoppingList(
+		[legacyRenamed, legacyResized],
+		[
+			shopping('req-oil', 'olive oil', 2, 'tbsp', false),
+			shopping('req-rice', 'jasmine rice', 1, 'cup', false),
+			shopping('req-carrot', 'carrot', 3, 'each', false)
+		],
+		scope
+	);
+
 	assert.deepEqual(
-		remainingShopping.map((item) => item.id),
-		['invalid-zero', 'invalid-name', 'unchecked'].map((id) => (id === 'unchecked' ? 'needed' : id))
+		refreshed.find((item) => item.id === 'legacy-oil'),
+		legacyRenamed
 	);
+	assert.deepEqual(
+		refreshed.find((item) => item.id === 'legacy-rice'),
+		legacyResized
+	);
+	assert.equal(refreshed.filter((item) => item.name === 'jasmine rice').length, 1);
+	assert.ok(refreshed.some((item) => item.name === 'carrot' && item.quantity === 3));
+
+	// Once the week has no active requirements left, legacy customized rows in that scope retire
+	const afterWeekInactive = reconcileShoppingList(refreshed, [], scope);
+	assert.deepEqual(afterWeekInactive, []);
 });
 
 test('weekly refresh preserves customized unchecked rows while active and credits edited checked rows without duplicates', () => {
@@ -833,6 +922,29 @@ test('weekly refresh preserves customized unchecked rows while active and credit
 			scope
 		),
 		afterSecondMeal
+	);
+
+	// Covering the olive oil requirement via a checked row in the same scope retires the customized unchecked row.
+	const afterCheckedCoversOil = reconcileShoppingList(
+		[
+			...afterSecondMeal,
+			{
+				...shopping('bought-oil', 'olive oil', 1, 'cup', true, scope),
+				requirementKey: 'olive oil::volume'
+			}
+		],
+		[
+			shopping('req-oil-2', 'olive oil', 3, 'tbsp', false),
+			shopping('req-chickpeas-2', 'chickpeas', 15, 'oz', false),
+			shopping('req-rice', 'jasmine rice', 1, 'cup', false)
+		],
+		scope
+	);
+	assert.equal(
+		afterCheckedCoversOil.some(
+			(item) => item.sourceKey === scope && !item.checked && item.name === 'olive oil'
+		),
+		false
 	);
 
 	// Removing meals that needed olive oil drops the customized unchecked olive oil row while keeping checked items.

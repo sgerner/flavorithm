@@ -309,6 +309,13 @@ const appStateSchema = z.object({
 			})
 		)
 		.max(1_000),
+	dismissedShopping: z
+		.record(z.string().min(1).max(200), z.record(z.string().min(1).max(260), z.boolean()))
+		.refine((scopes) => Object.keys(scopes).length <= 200)
+		.refine((scopes) =>
+			Object.values(scopes).every((entries) => Object.keys(entries).length <= 1_000)
+		)
+		.optional(),
 	preferences: preferencesSchema
 });
 

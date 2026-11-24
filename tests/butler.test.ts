@@ -626,11 +626,46 @@ test('pairing meal commands with explicit shopping edits or deletions preserves 
 		paired.shopping.some((item) => item.id === garlicItem.id),
 		false
 	);
+	assert.deepEqual(paired.dismissedShopping, {
+		'week:2026-10-19': { 'garlic::count:clove': true }
+	});
 	const updatedOil = paired.shopping.find((item) => item.id === oilItem.id);
 	assert.ok(updatedOil);
 	assert.equal(updatedOil.quantity, 1);
 	assert.equal(updatedOil.unit, 'cup');
 	assert.equal(updatedOil.customized, true);
+
+	// A subsequent refresh triggered by a pantry mutation in a later proposal keeps garlic deleted
+	const afterLaterPantryEdit = applyButlerCommands(
+		paired,
+		[
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'pantry-salt',
+					name: 'kosher salt',
+					quantity: 1,
+					unit: 'box',
+					category: 'Spices'
+				}
+			}
+		],
+		now
+	).state;
+	assert.equal(
+		afterLaterPantryEdit.shopping.some((item) => item.name === 'garlic'),
+		false
+	);
+	assert.equal(afterLaterPantryEdit.shopping.find((item) => item.id === oilItem.id)?.quantity, 1);
+
+	// Explicit shopping.generate clears the week's tombstones and regenerates garlic
+	const regenerated = applyButlerCommands(
+		afterLaterPantryEdit,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.equal(regenerated.dismissedShopping, undefined);
+	assert.equal(regenerated.shopping.find((item) => item.name === 'garlic')?.quantity, 6);
 });
 
 test('ButlerResponseSchema JSON schema requires deductPantry on meal.complete and describes completion fields', () => {
@@ -987,4 +1022,8 @@ test('recipe.delete retains checked recipe purchases and shopping.delete refresh
 	assert.equal(refreshedCarrot.checked, false);
 	assert.equal(refreshedCarrot.quantity, 4);
 	assert.equal(refreshedCarrot.sourceKey, 'week:2026-10-19');
+	assert.equal(
+		afterDeleteCheckedCarrot.shopping.some((item) => item.name === 'onion'),
+		false
+	);
 });
