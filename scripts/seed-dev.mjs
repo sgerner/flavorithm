@@ -8,12 +8,14 @@ const demoName = 'Local Demo';
 const defaultDatabasePath = resolve(process.cwd(), 'data', 'flavorithm.dev.sqlite');
 const applicationDatabasePath = resolve(process.cwd(), 'data', 'flavorithm.sqlite');
 
+/** @param {string[]} args */
 function parseDatabasePath(args) {
 	if (args.length === 0) return defaultDatabasePath;
 	if (args.length === 2 && args[0] === '--db' && args[1]) return resolve(args[1]);
 	throw new Error('Usage: npm run seed:dev [-- --db /path/to/new-or-empty-dev.sqlite]');
 }
 
+/** @param {string} databasePath */
 function inspectTarget(databasePath) {
 	if (databasePath === applicationDatabasePath) {
 		throw new Error(
@@ -31,19 +33,26 @@ function inspectTarget(databasePath) {
 		const tables = db
 			.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
 			.all()
-			.map((row) => row.name)
-			.filter((name) => !name.startsWith('sqlite_'));
+			.flatMap(({ name }) =>
+				typeof name === 'string' && !name.startsWith('sqlite_') ? [name] : []
+			);
 
 		if (tables.includes('users')) {
 			const users = db.prepare('SELECT email FROM users').all();
-			if (users.length === 1 && users[0].email?.toLowerCase() === demoEmail) {
+			if (
+				users.length === 1 &&
+				typeof users[0].email === 'string' &&
+				users[0].email.toLowerCase() === demoEmail
+			) {
 				return { isSeeded: true };
 			}
 		}
 
 		for (const table of tables) {
 			const escapedTable = table.replaceAll('"', '""');
-			const count = db.prepare(`SELECT COUNT(*) AS count FROM "${escapedTable}"`).get().count;
+			const row = db.prepare(`SELECT COUNT(*) AS count FROM "${escapedTable}"`).get();
+			const count =
+				typeof row?.count === 'number' || typeof row?.count === 'bigint' ? row.count : 0;
 			if (count > 0) {
 				throw new Error(
 					`Refusing to seed ${databasePath}: table ${table} already contains data. Choose an empty dev database.`
