@@ -560,32 +560,140 @@ class MockElement extends MockNode {
 
 class MockHTMLMediaElement extends MockElement {}
 
+function isHtmlWhitespace(ch: string): boolean {
+	return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f';
+}
+
+function isTagNameChar(ch: string): boolean {
+	const code = ch.charCodeAt(0);
+	return (
+		(code >= 65 && code <= 90) ||
+		(code >= 97 && code <= 122) ||
+		(code >= 48 && code <= 57) ||
+		ch === '-'
+	);
+}
+
+function findHtmlCommentEnd(html: string, contentStart: number): { dataEnd: number; next: number } {
+	if (html.startsWith('>', contentStart)) {
+		return { dataEnd: contentStart, next: contentStart + 1 };
+	}
+	if (html.startsWith('->', contentStart)) {
+		return { dataEnd: contentStart, next: contentStart + 2 };
+	}
+	for (let i = contentStart; i < html.length; i++) {
+		if (html.startsWith('-->', i)) {
+			return { dataEnd: i, next: i + 3 };
+		}
+		if (html.startsWith('--!>', i)) {
+			return { dataEnd: i, next: i + 4 };
+		}
+	}
+	return { dataEnd: html.length, next: html.length };
+}
+
 function parseHtmlInto(doc: MockDocument, html: string, parent: MockNode) {
 	const stack: MockNode[] = [parent];
-	const tokenRe = /<!--([\s\S]*?)-->|<\/([a-zA-Z0-9-]+)\s*>|<([a-zA-Z0-9-]+)([^>]*)>|([^<]+)/g;
 	const voidTags = new Set(['INPUT', 'IMG', 'BR', 'HR', 'META', 'LINK']);
-	let match: RegExpExecArray | null;
-	while ((match = tokenRe.exec(html)) !== null) {
+	let cursor = 0;
+
+	while (cursor < html.length) {
 		const current = stack[stack.length - 1];
-		if (match[1] !== undefined) {
-			current.appendChild(new MockComment(doc, match[1]));
-		} else if (match[2] !== undefined) {
-			if (stack.length > 1) stack.pop();
-		} else if (match[3] !== undefined) {
-			const tag = match[3];
-			const rawAttrs = match[4] ?? '';
-			const selfClosing = rawAttrs.trim().endsWith('/');
-			const el = new MockElement(doc, tag);
-			const attrRe = /([a-zA-Z0-9:-]+)(?:="([^"]*)")?/g;
-			let attrMatch: RegExpExecArray | null;
-			while ((attrMatch = attrRe.exec(rawAttrs)) !== null) {
-				el.setAttribute(attrMatch[1], attrMatch[2] ?? '');
-			}
-			current.appendChild(el);
-			if (!selfClosing && !voidTags.has(el.tagName)) stack.push(el);
-		} else if (match[5] !== undefined) {
-			current.appendChild(new MockText(doc, match[5]));
+		const lt = html.indexOf('<', cursor);
+		if (lt === -1) {
+			current.appendChild(new MockText(doc, html.slice(cursor)));
+			break;
 		}
+		if (lt > cursor) {
+			current.appendChild(new MockText(doc, html.slice(cursor, lt)));
+			cursor = lt;
+		}
+
+		if (html.startsWith('<!--', cursor)) {
+			const { dataEnd, next } = findHtmlCommentEnd(html, cursor + 4);
+			current.appendChild(new MockComment(doc, html.slice(cursor + 4, dataEnd)));
+			cursor = next;
+			continue;
+		}
+
+		if (html.startsWith('</', cursor)) {
+			const gt = html.indexOf('>', cursor + 2);
+			if (gt === -1) break;
+			if (stack.length > 1) stack.pop();
+			cursor = gt + 1;
+			continue;
+		}
+
+		let pos = cursor + 1;
+		while (pos < html.length && isTagNameChar(html[pos])) pos++;
+		const tag = html.slice(cursor + 1, pos);
+		if (!tag) {
+			current.appendChild(new MockText(doc, '<'));
+			cursor += 1;
+			continue;
+		}
+
+		const el = new MockElement(doc, tag);
+		let selfClosing = false;
+		while (pos < html.length) {
+			while (pos < html.length && isHtmlWhitespace(html[pos])) pos++;
+			if (pos >= html.length) break;
+			if (html[pos] === '>') {
+				pos += 1;
+				break;
+			}
+			if (html[pos] === '/' && html[pos + 1] === '>') {
+				selfClosing = true;
+				pos += 2;
+				break;
+			}
+
+			const nameStart = pos;
+			while (
+				pos < html.length &&
+				!isHtmlWhitespace(html[pos]) &&
+				html[pos] !== '=' &&
+				html[pos] !== '>' &&
+				!(html[pos] === '/' && html[pos + 1] === '>')
+			) {
+				pos++;
+			}
+			const attrName = html.slice(nameStart, pos);
+			while (pos < html.length && isHtmlWhitespace(html[pos])) pos++;
+
+			let attrValue = '';
+			if (html[pos] === '=') {
+				pos += 1;
+				while (pos < html.length && isHtmlWhitespace(html[pos])) pos++;
+				const quote = html[pos];
+				if (quote === '"' || quote === "'") {
+					pos += 1;
+					const valStart = pos;
+					const closeQuote = html.indexOf(quote, pos);
+					if (closeQuote === -1) {
+						attrValue = html.slice(valStart);
+						pos = html.length;
+					} else {
+						attrValue = html.slice(valStart, closeQuote);
+						pos = closeQuote + 1;
+					}
+				} else {
+					const valStart = pos;
+					while (pos < html.length && !isHtmlWhitespace(html[pos]) && html[pos] !== '>') {
+						pos++;
+					}
+					attrValue = html.slice(valStart, pos);
+				}
+			}
+
+			if (attrName) el.setAttribute(attrName, attrValue);
+		}
+
+		current.appendChild(el);
+		if (!selfClosing && !voidTags.has(el.tagName)) {
+			stack.push(el);
+		}
+		cursor = pos;
 	}
 }
 
@@ -890,6 +998,7 @@ test(
 		const trap = focusTrap(dialog as unknown as HTMLElement);
 		await flushMicrotasks();
 		assert.equal(doc.activeElement, closeBtn);
+		assert.deepEqual(closeBtn.lastFocusOptions, { preventScroll: true });
 
 		saveBtn.hidden = true;
 		scrollRegion.hidden = true;
@@ -1067,7 +1176,7 @@ test(
 			viewKey: currentViewKey,
 			children: createRawSnippet(() => ({
 				render: () =>
-					`<div class="dialog-inner"><input class="combobox-input" /><button type="button" class="save-btn">Save</button></div>`,
+					`<div class="dialog-inner"><!----><!-- bang comment --!><input class="combobox-input" /><button type="button" class="save-btn">Save</button></div>`,
 				setup(node: Element) {
 					const input = (node as unknown as MockElement).querySelector('.combobox-input');
 					input?.addEventListener('keydown', (event) => {

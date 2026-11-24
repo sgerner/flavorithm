@@ -3410,13 +3410,13 @@
 	}
 	function handleWindowKeydown(e: KeyboardEvent) {
 		if (e.key !== 'Escape' || e.defaultPrevented) return;
-		if (editingRecipe) {
+		if (modal) {
+			e.preventDefault();
+			closeDialog();
+		} else if (editingRecipe) {
 			e.preventDefault();
 			if (recipeEditor) void recipeEditor.requestCancel();
 			else closeRecipeEditor();
-		} else if (modal) {
-			e.preventDefault();
-			closeDialog();
 		} else if (selected) {
 			e.preventDefault();
 			closeRecipeDetail();

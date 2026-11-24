@@ -200,7 +200,7 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 		const token = ++focusGeneration;
 		const applyFocus = () => {
 			if (!active || token !== focusGeneration || node.inert || !node.isConnected) return true;
-			(focusableControls(node)[0] || node).focus();
+			(focusableControls(node)[0] || node).focus({ preventScroll: true });
 			return node.contains(document.activeElement);
 		};
 		queueMicrotask(() => {

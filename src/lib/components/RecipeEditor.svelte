@@ -628,4 +628,9 @@
 	.full-field {
 		grid-column: 1 / -1;
 	}
+	@media (max-width: 650px) {
+		:global(.flavor-dialog.wide.recipe-editor-dialog) {
+			padding: 28px 16px 20px;
+		}
+	}
 </style>

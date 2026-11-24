@@ -1074,31 +1074,32 @@ test('handleWindowKeydown dismisses one Escape layer at a time in strict precede
 		api.handleWindowKeydown(makeKeyEvent('Enter'));
 		assert.equal(api.editingRecipe?.id, draftRecipe.id);
 
-		// 1. Dismisses editingRecipe first
+		// 1. Steps topmost modal from auth back to resumeDialog ('settings') without touching underlying editingRecipe
 		const esc1 = makeKeyEvent('Escape');
 		api.handleWindowKeydown(esc1);
 		assert.equal(esc1.defaultPrevented, true);
-		assert.equal(api.editingRecipe, null);
-		assert.equal(api.editingRecipeMode, 'edit');
-		assert.equal(api.modal, 'auth');
+		assert.equal(api.modal, 'settings');
+		assert.equal(api.resumeDialog, '');
+		assert.equal(api.editingRecipe?.id, draftRecipe.id);
 		assert.equal(api.selected?.id, detailRecipe.id);
 		assert.equal(api.butlerOpen, true);
 		assert.equal(api.mobileNav, true);
 		assert.ok(api.pantryDraft);
 
-		// 2. Steps modal from auth back to resumeDialog ('settings')
+		// 2. Dismisses modal ('settings' -> '') while keeping editingRecipe intact
 		const esc2 = makeKeyEvent('Escape');
 		api.handleWindowKeydown(esc2);
 		assert.equal(esc2.defaultPrevented, true);
-		assert.equal(api.modal, 'settings');
-		assert.equal(api.resumeDialog, '');
+		assert.equal(api.modal, '');
+		assert.equal(api.editingRecipe?.id, draftRecipe.id);
 		assert.equal(api.selected?.id, detailRecipe.id);
 
-		// 3. Dismisses modal ('settings' -> '')
+		// 3. Dismisses editingRecipe next
 		const esc3 = makeKeyEvent('Escape');
 		api.handleWindowKeydown(esc3);
 		assert.equal(esc3.defaultPrevented, true);
-		assert.equal(api.modal, '');
+		assert.equal(api.editingRecipe, null);
+		assert.equal(api.editingRecipeMode, 'edit');
 		assert.equal(api.selected?.id, detailRecipe.id);
 		assert.equal(api.butlerOpen, true);
 
