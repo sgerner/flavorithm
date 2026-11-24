@@ -113,6 +113,7 @@
 		insertRecipes,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
+	import { applyRecipeRating } from '#lib/recipe-detail.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -4437,10 +4438,15 @@
 		toggleHidden={() => toggleRecipeHidden(selected!)}
 		{busy}
 		rate={(n) => {
-			selected!.rating = n;
-			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
+			kitchen.preferences.ratings = applyRecipeRating(selected!, kitchen.preferences.ratings, n);
+			const stored = kitchen.recipes.find((item) => item.id === selected!.id);
+			if (stored && stored !== selected!) {
+				applyRecipeRating(stored, undefined, n);
+			}
 			kitchen.recipes = [...kitchen.recipes];
-			notify('Rating saved. Future recipes will use your feedback.');
+			notify(
+				n === undefined ? 'Rating cleared.' : 'Rating saved. Future recipes will use your feedback.'
+			);
 		}}
 	/>{/if}
 {#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
