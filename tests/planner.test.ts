@@ -8,6 +8,7 @@ import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
 import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
+import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
@@ -17,8 +18,11 @@ import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
+import * as plannerMod from '../src/lib/planner.ts';
+import { calendarDayScrollLeft, weekOffsetFromStarts } from '../src/lib/planner.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
+import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as recipeSubflowsMod from '../src/lib/recipe-subflows.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
@@ -30,6 +34,7 @@ const { MAX_RECIPES } = recipeCollectionMod;
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
 	effect_root: (fn: () => void) => () => void;
+	flush: (fn?: () => void) => void;
 };
 const svelteServer = nodeRequire('svelte/internal/server') as Record<string, unknown>;
 
@@ -59,9 +64,15 @@ function injectPlannerHook(svelteSource: string): string {
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
 		get modal() { return modal; },
+		get selectedId() { return selectedId; },
+		set selectedId(value: string | null) { selectedId = value; },
 		get selected() { return selected; },
-		set selected(value: Recipe | null) { selected = value; },
+		get editingRecipe() { return editingRecipe; },
+		get recipeToDelete() { return recipeToDelete; },
 		get plannedRecipe() { return plannedRecipe; },
+		get detailReturnFocus() { return detailReturnFocus; },
+		get editorReturnFocus() { return editorReturnFocus; },
+		get modalReturnFocus() { return modalReturnFocus; },
 		get deductPantry() { return deductPantry; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
@@ -73,6 +84,14 @@ function injectPlannerHook(svelteSource: string): string {
 		dateKey,
 		mealSlotKey,
 		formatCompletedDate,
+		openRecipeDetail,
+		adoptKitchen,
+		replaceKitchen,
+		editSavedRecipe,
+		closeRecipeEditor,
+		saveEditedRecipe,
+		askDeleteRecipe,
+		handleWindowKeydown,
 		openRecipePicker,
 		choosePickedRecipe,
 		planRecipe,
@@ -127,8 +146,14 @@ type PlannerHarnessApi = {
 	readonly week: Date[];
 	weekOffset: number;
 	readonly modal: string;
-	selected: Recipe | null;
+	selectedId: string | null;
+	readonly selected: Recipe | null;
+	readonly editingRecipe: Recipe | null;
+	readonly recipeToDelete: Recipe | null;
 	readonly plannedRecipe: Recipe | null;
+	readonly detailReturnFocus: HTMLElement | null;
+	readonly editorReturnFocus: HTMLElement | null;
+	readonly modalReturnFocus: HTMLElement | null;
 	readonly deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
@@ -143,6 +168,14 @@ type PlannerHarnessApi = {
 		formatter: Intl.DateTimeFormat,
 		fallback?: string
 	) => string;
+	openRecipeDetail: (id: string | null, servings?: number) => void;
+	adoptKitchen: (state: AppState) => void;
+	replaceKitchen: (state: AppState) => void;
+	editSavedRecipe: (recipe: Recipe) => void;
+	closeRecipeEditor: () => void;
+	saveEditedRecipe: (updated: Recipe) => void;
+	askDeleteRecipe: (recipe: Recipe) => void;
+	handleWindowKeydown: (event: Pick<KeyboardEvent, 'key' | 'defaultPrevented'>) => void;
 	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
 	choosePickedRecipe: (recipe: Recipe) => void;
 	planRecipe: (recipe: Recipe, servings?: number) => void;
@@ -172,7 +205,19 @@ function createModuleMap() {
 		'@lucide/svelte': iconProxy,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': {
+			activeFocusedElement: () => {
+				const doc = (
+					globalThis as {
+						document?: { activeElement?: unknown; body?: unknown; documentElement?: unknown };
+					}
+				).document;
+				const active = doc?.activeElement ?? null;
+				if (!active || active === doc?.body || active === doc?.documentElement) return null;
+				return active;
+			},
+			focusTrap: () => ({})
+		},
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -181,11 +226,13 @@ function createModuleMap() {
 			motionDuration: () => 0,
 			prefersReducedMotion: () => true
 		},
+		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
+		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/recipe-subflows.ts': recipeSubflowsMod,
 		'#lib/butler.ts': butlerMod,
@@ -199,6 +246,7 @@ function createModuleMap() {
 			}
 		},
 		'#lib/voice-config.ts': voiceConfigMod,
+		'#lib/ai-connections.ts': aiConnectionsMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
@@ -330,6 +378,22 @@ function createReactivePlanner() {
 	let api!: PlannerHarnessApi;
 	const assignedUrls: string[] = [];
 	const storage = makeMemoryStorage();
+	const mockDocument = {
+		body: { id: 'body' },
+		documentElement: { id: 'html' },
+		activeElement: null as unknown
+	};
+	mockDocument.activeElement = mockDocument.body;
+	modMap['#lib/focus.ts'] = {
+		activeFocusedElement: () => {
+			const active = mockDocument.activeElement;
+			if (!active || active === mockDocument.body || active === mockDocument.documentElement) {
+				return null;
+			}
+			return active;
+		},
+		focusTrap: () => ({})
+	};
 	const sandbox: Record<string, unknown> = {
 		exports,
 		require: (id: string) => {
@@ -361,6 +425,7 @@ function createReactivePlanner() {
 		setInterval,
 		clearInterval,
 		localStorage: storage,
+		document: mockDocument,
 		navigator: { onLine: true },
 		window: {
 			location: {
@@ -383,7 +448,7 @@ function createReactivePlanner() {
 	const dispose = svelteClient.effect_root(() => {
 		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
 	});
-	return { api, assignedUrls, storage, dispose };
+	return { api, assignedUrls, storage, mockDocument, dispose };
 }
 
 test('unmodified +page.svelte compiles cleanly and avoids linear recipe scans and per-item toLocaleDateString in planner', () => {
@@ -848,7 +913,7 @@ test('plan dialog preserves open recipe on cancel and keeps selected null when o
 		};
 
 		// Plan from an open RecipeDetail, then cancel: selected stays open and plannedRecipe clears.
-		api.selected = activeRecipe;
+		api.openRecipeDetail(activeRecipe.id);
 		api.planRecipe(activeRecipe, 6);
 		assert.equal(api.modal, 'plan');
 		assert.equal(api.selected?.id, activeRecipe.id);
@@ -860,6 +925,7 @@ test('plan dialog preserves open recipe on cancel and keeps selected null when o
 		assert.equal(api.plannedRecipe, null);
 
 		// Open recipe picker from planner without slotTarget, choose recipe, then cancel: selected stays null.
+		api.openRecipeDetail(null);
 		api.openRecipePicker();
 		assert.equal(api.modal, 'pickRecipe');
 		assert.equal(api.selected, null);
@@ -874,7 +940,7 @@ test('plan dialog preserves open recipe on cancel and keeps selected null when o
 		assert.equal(api.plannedRecipe, null);
 
 		// Confirming addMeal schedules plannedRecipe and closes open RecipeDetail.
-		api.selected = activeRecipe;
+		api.openRecipeDetail(activeRecipe.id);
 		api.planRecipe(activeRecipe, 5);
 		api.setPlannedDraft('2026-11-24', 'Dinner', 5);
 		api.addMeal();
@@ -887,4 +953,228 @@ test('plan dialog preserves open recipe on cancel and keeps selected null when o
 	} finally {
 		harness.dispose();
 	}
+});
+
+test('replacing kitchen refreshes derived selected/plannedRecipe/recipeToDelete and clears removed recipe state', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const v1 = makeRecipe('r-sync', 'Initial Lemon Pasta');
+		const keeper = makeRecipe('r-keep', 'Keeper Soup');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [v1, keeper],
+			meals: []
+		};
+
+		// Open RecipeDetail and stack Plan dialog over it.
+		api.openRecipeDetail(v1.id);
+		api.planRecipe(v1, 4);
+		const initialSelected = api.selected;
+		assert.equal(initialSelected, api.kitchen.recipes[0]);
+		assert.equal(initialSelected?.title, 'Initial Lemon Pasta');
+		assert.equal(api.plannedRecipe, api.kitchen.recipes[0]);
+		assert.equal(api.modal, 'plan');
+
+		// Simulate kitchenSync / adoptKitchen / undo replacing kitchen with a fresh Recipe instance for the same ID.
+		const v2: Recipe = { ...v1, title: 'Synced Lemon Pasta', servings: 6, rating: 5 };
+		api.adoptKitchen({
+			...dataMod.createNewUserState(),
+			recipes: [v2, keeper],
+			meals: []
+		});
+		assert.notEqual(api.selected, initialSelected);
+		assert.equal(api.selected, api.kitchen.recipes[0]);
+		assert.equal(api.selected?.title, 'Synced Lemon Pasta');
+		assert.equal(api.selected?.servings, 6);
+		assert.equal(api.selected?.rating, 5);
+		assert.equal(api.plannedRecipe, api.kitchen.recipes[0]);
+		assert.equal(api.modal, 'plan');
+
+		// Simulate kitchen replacement where the open/planned recipe was deleted remotely: clears stale state and modal immediately.
+		api.replaceKitchen({
+			...dataMod.createNewUserState(),
+			recipes: [keeper],
+			meals: []
+		});
+		assert.equal(api.selectedId, null);
+		assert.equal(api.selected, null);
+		assert.equal(api.plannedRecipe, null);
+		assert.equal(api.modal, '');
+
+		// Direct reactive assignment to kitchen also reconciles via $effect.pre when client effects flush.
+		api.openRecipeDetail(keeper.id);
+		api.askDeleteRecipe(keeper);
+		assert.equal((api.selected as Recipe | null)?.id, keeper.id);
+		assert.equal(api.recipeToDelete?.id, keeper.id);
+		assert.equal(api.modal, 'deleteRecipe');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [],
+			meals: []
+		};
+		svelteClient.flush();
+		assert.equal(api.selectedId, null);
+		assert.equal(api.selected, null);
+		assert.equal(api.recipeToDelete, null);
+		assert.equal(api.modal, '');
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('captures detailReturnFocus, editorReturnFocus, and modalReturnFocus before state mutation', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api, mockDocument } = harness;
+		const recipe = makeRecipe('r-focus', 'Focus Pasta');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [recipe],
+			meals: []
+		};
+
+		const cardButton = { id: 'recipe-card-btn' } as unknown as HTMLElement;
+		const editButton = { id: 'recipe-edit-btn' } as unknown as HTMLElement;
+		const deleteButton = { id: 'recipe-delete-btn' } as unknown as HTMLElement;
+
+		mockDocument.activeElement = cardButton;
+		api.openRecipeDetail(recipe.id);
+		mockDocument.activeElement = mockDocument.body;
+		assert.equal(api.detailReturnFocus, cardButton);
+
+		mockDocument.activeElement = editButton;
+		api.editSavedRecipe(recipe);
+		mockDocument.activeElement = mockDocument.body;
+		assert.equal(api.editorReturnFocus, editButton);
+		assert.equal(api.detailReturnFocus, cardButton);
+
+		api.closeRecipeEditor();
+		assert.equal(api.editorReturnFocus, null);
+		assert.equal(api.selected?.id, recipe.id);
+
+		mockDocument.activeElement = deleteButton;
+		api.askDeleteRecipe(recipe);
+		mockDocument.activeElement = mockDocument.body;
+		assert.equal(api.modalReturnFocus, deleteButton);
+		assert.equal(api.modal, 'deleteRecipe');
+
+		api.closeDialog();
+		assert.equal(api.modalReturnFocus, null);
+		assert.equal(api.detailReturnFocus, cardButton);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('window Escape dismisses editingRecipe before selected when both are open', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-esc', 'Escape Risotto');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [recipe],
+			meals: []
+		};
+
+		api.openRecipeDetail(recipe.id);
+		api.editSavedRecipe(recipe);
+		assert.equal(api.selected?.id, recipe.id);
+		assert.notEqual(api.editingRecipe, null);
+
+		// First Escape closes RecipeEditor while keeping RecipeDetail open.
+		api.handleWindowKeydown({ key: 'Escape', defaultPrevented: false });
+		assert.equal(api.editingRecipe, null);
+		assert.equal(api.selected?.id, recipe.id);
+
+		// Second Escape closes RecipeDetail.
+		api.handleWindowKeydown({ key: 'Escape', defaultPrevented: false });
+		assert.equal(api.selected, null);
+		assert.equal(api.selectedId, null);
+	} finally {
+		harness.dispose();
+	}
+});
+
+function dateKeyForTest(date: Date) {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function weekStartForTest(value: string) {
+	const date = new Date(`${value}T12:00:00`);
+	if (Number.isNaN(date.getTime())) return value;
+	date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+	return dateKeyForTest(date);
+}
+
+test('weekOffsetFromStarts computes Monday-relative week offsets across weekdays and DST boundaries', () => {
+	const todayMonday = weekStartForTest('2026-11-19'); // Thursday -> 2026-11-16
+	assert.equal(todayMonday, '2026-11-16');
+
+	assert.equal(weekOffsetFromStarts(weekStartForTest('2026-11-16'), todayMonday), 0);
+	assert.equal(weekOffsetFromStarts(weekStartForTest('2026-11-22'), todayMonday), 0);
+	assert.equal(weekOffsetFromStarts(weekStartForTest('2026-11-24'), todayMonday), 1);
+	assert.equal(weekOffsetFromStarts(weekStartForTest('2026-11-15'), todayMonday), -1);
+
+	// Across US fall-back DST boundary (2026-11-01) and spring-forward DST boundary (2026-03-08)
+	assert.equal(
+		weekOffsetFromStarts(weekStartForTest('2026-11-04'), weekStartForTest('2026-10-28')),
+		1
+	);
+	assert.equal(
+		weekOffsetFromStarts(weekStartForTest('2026-03-11'), weekStartForTest('2026-03-04')),
+		1
+	);
+
+	// Invalid date strings fall back safely to 0
+	assert.equal(weekOffsetFromStarts('not-a-date', todayMonday), 0);
+});
+
+test('calendarDayScrollLeft preserves phone 16px inline snap gutter and handles existing scrollLeft', () => {
+	// 390px phone viewport: grid has margin 0 -16px, padding 0 16px, scroll-padding-inline 16px,
+	// 340px cards with 8px gap -> stride 348px; scrollWidth = 16 + 7*340 + 6*8 + 16 = 2460, clientWidth = 390
+	const phoneMetrics = {
+		gridLeft: 0,
+		clientLeft: 0,
+		scrollPaddingStart: 16,
+		scrollWidth: 2460,
+		clientWidth: 390
+	};
+
+	// Monday (index 0) at scrollLeft = 0 -> left = 0
+	assert.equal(calendarDayScrollLeft({ ...phoneMetrics, scrollLeft: 0, dayLeft: 16 }), 0);
+
+	// Thursday (index 3) at scrollLeft = 0 -> dayLeft = 16 + 3*348 = 1060 -> left = 1044
+	assert.equal(calendarDayScrollLeft({ ...phoneMetrics, scrollLeft: 0, dayLeft: 1060 }), 1044);
+
+	// Returning to Thursday when currently scrolled to Sunday (scrollLeft = 2070):
+	// dayLeft in viewport is 1060 - 2070 = -1010 -> still computes exact left = 1044
+	assert.equal(calendarDayScrollLeft({ ...phoneMetrics, scrollLeft: 2070, dayLeft: -1010 }), 1044);
+
+	// Sunday (index 6) clamps cleanly to maxLeft = 2460 - 390 = 2070
+	assert.equal(
+		calendarDayScrollLeft({ ...phoneMetrics, scrollLeft: 0, dayLeft: 16 + 6 * 348 }),
+		2070
+	);
+});
+
+test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at max scroll', () => {
+	// 768px tablet viewport: 1px border-left, 0 inline padding, 164px cards, 0 gap
+	const tabletMetrics = {
+		gridLeft: 218,
+		clientLeft: 1,
+		scrollPaddingStart: 0,
+		scrollWidth: 1148,
+		clientWidth: 520
+	};
+
+	// Wednesday (index 2): dayLeft = 219 + 2*164 = 547 -> left = 328
+	assert.equal(calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 547 }), 328);
+
+	// Sunday (index 6): rawLeft = 984 -> clamped to 1148 - 520 = 628
+	assert.equal(
+		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
+		628
+	);
 });

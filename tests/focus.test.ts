@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
-import { focusTrap } from '../src/lib/focus.ts';
+import { activeFocusedElement, focusableControls, focusTrap } from '../src/lib/focus.ts';
 
-type KeyListener = (event: KeyboardEvent) => void;
+type EventListenerFn = (event: any) => void;
 
 class MockElement {
 	tagName: string;
@@ -10,19 +10,24 @@ class MockElement {
 	disabled = false;
 	href = '';
 	tabIndex = -1;
+	hasExplicitTabIndex = false;
 	inert = false;
 	hidden = false;
-	style = { overflow: '' };
+	open = false;
+	scrollTop = 0;
+	style = { overflow: '', display: '', visibility: '', position: '' };
 	parentElement: MockElement | null = null;
 	children: MockElement[] = [];
 	ownerDocument: MockDocument;
-	private listeners = new Map<string, Set<KeyListener>>();
+	lastFocusOptions: FocusOptions | undefined;
+	private attributes = new Map<string, string>();
+	private listeners = new Map<string, Set<EventListenerFn>>();
 
 	constructor(doc: MockDocument, tagName: string, id = '') {
 		this.ownerDocument = doc;
 		this.tagName = tagName.toLowerCase();
 		this.id = id;
-		if (['button', 'input', 'select', 'textarea'].includes(this.tagName)) {
+		if (['button', 'input', 'select', 'textarea', 'summary'].includes(this.tagName)) {
 			this.tabIndex = 0;
 		}
 	}
@@ -37,13 +42,26 @@ class MockElement {
 	}
 
 	get offsetParent(): MockElement | null {
-		if (!this.isConnected || this.hidden) return null;
+		if (!this.isConnected || this.hidden || this.style.display === 'none') return null;
+		if (this.style.position === 'fixed') return null;
 		let current: MockElement | null = this.parentElement;
 		while (current) {
-			if (current.hidden) return null;
+			if (current.hidden || current.style.display === 'none') return null;
 			current = current.parentElement;
 		}
 		return this.ownerDocument.body;
+	}
+
+	setAttribute(name: string, value: string) {
+		this.attributes.set(name, value);
+	}
+
+	getAttribute(name: string): string | null {
+		return this.attributes.get(name) ?? null;
+	}
+
+	removeAttribute(name: string) {
+		this.attributes.delete(name);
 	}
 
 	append(...nodes: MockElement[]) {
@@ -74,24 +92,36 @@ class MockElement {
 	}
 
 	closest(selector: string): MockElement | null {
-		if (selector !== '[inert]') return null;
+		const checkInert = selector.includes('[inert]');
+		const checkHidden = selector.includes('[hidden]');
+		if (!checkInert && !checkHidden) return null;
 		let current: MockElement | null = this;
 		while (current) {
-			if (current.inert) return current;
+			if ((checkInert && current.inert) || (checkHidden && current.hidden)) return current;
 			current = current.parentElement;
 		}
 		return null;
 	}
 
+	private isFirstSummaryOfDetails(): boolean {
+		if (this.tagName !== 'summary' || this.parentElement?.tagName !== 'details') return false;
+		const firstSummary = this.parentElement.children.find((child) => child.tagName === 'summary');
+		return firstSummary === this;
+	}
+
 	private matchesFocusable(selector: string): boolean {
+		if (this.tabIndex === -1 && selector.includes(':not([tabindex="-1"])')) return false;
 		if (this.tagName === 'button' && !this.disabled) return true;
 		if (this.tagName === 'a' && Boolean(this.href)) return true;
 		if (this.tagName === 'input' && !this.disabled) return true;
 		if (this.tagName === 'select' && !this.disabled) return true;
 		if (this.tagName === 'textarea' && !this.disabled) return true;
+		if (selector.includes('details > summary:first-of-type') && this.isFirstSummaryOfDetails()) {
+			return true;
+		}
 		if (selector.includes('[tabindex]:not([tabindex="-1"])')) {
-			if (this.tabIndex !== -1 && !this.disabled) return true;
-		} else if (this.tabIndex === 0 && !this.disabled) {
+			if (this.hasExplicitTabIndex && this.tabIndex !== -1 && !this.disabled) return true;
+		} else if (this.hasExplicitTabIndex && this.tabIndex === 0 && !this.disabled) {
 			return true;
 		}
 		return false;
@@ -109,13 +139,14 @@ class MockElement {
 		return found;
 	}
 
-	focus() {
-		if (!this.isConnected || this.closest('[inert]')) return;
+	focus(options?: FocusOptions) {
+		if (!this.isConnected || this.closest('[hidden], [inert]')) return;
+		this.lastFocusOptions = options;
 		this.ownerDocument.activeElement = this;
 		this.ownerDocument.focusHistory.push(this.id || this.tagName);
 	}
 
-	addEventListener(type: string, listener: KeyListener) {
+	addEventListener(type: string, listener: EventListenerFn) {
 		let set = this.listeners.get(type);
 		if (!set) {
 			set = new Set();
@@ -124,7 +155,7 @@ class MockElement {
 		set.add(listener);
 	}
 
-	removeEventListener(type: string, listener: KeyListener) {
+	removeEventListener(type: string, listener: EventListenerFn) {
 		this.listeners.get(type)?.delete(listener);
 	}
 
@@ -145,20 +176,31 @@ class MockElement {
 		}
 		return defaultPrevented;
 	}
+
+	dispatchOutroStart(target: MockElement = this) {
+		const event = { type: 'outrostart', target } as unknown as Event;
+		for (const listener of [...(this.listeners.get('outrostart') ?? [])]) {
+			listener(event);
+		}
+	}
 }
 
 class MockDocument {
 	body: MockElement;
+	documentElement: MockElement;
 	activeElement: MockElement | null;
 	focusHistory: string[] = [];
 
 	constructor() {
+		this.documentElement = new MockElement(this, 'html', 'html');
 		this.body = new MockElement(this, 'body', 'body');
+		this.documentElement.children.push(this.body);
 		this.activeElement = this.body;
 	}
 
 	el(tagName: string, id: string, props: Partial<MockElement> = {}) {
 		const element = new MockElement(this, tagName, id);
+		if ('tabIndex' in props) element.hasExplicitTabIndex = true;
 		Object.assign(element, props);
 		return element;
 	}
@@ -166,11 +208,24 @@ class MockDocument {
 
 function installDom(t: TestContext) {
 	const doc = new MockDocument();
-	const previous = Object.getOwnPropertyDescriptor(globalThis, 'document');
+	const mockWindow = {
+		getComputedStyle(el: MockElement) {
+			return {
+				display: el.style.display || 'block',
+				visibility: el.style.visibility || 'visible',
+				position: el.style.position || 'static'
+			};
+		}
+	};
+	const previousDoc = Object.getOwnPropertyDescriptor(globalThis, 'document');
+	const previousWin = Object.getOwnPropertyDescriptor(globalThis, 'window');
 	Object.defineProperty(globalThis, 'document', { configurable: true, value: doc });
+	Object.defineProperty(globalThis, 'window', { configurable: true, value: mockWindow });
 	t.after(() => {
-		if (previous) Object.defineProperty(globalThis, 'document', previous);
+		if (previousDoc) Object.defineProperty(globalThis, 'document', previousDoc);
 		else Reflect.deleteProperty(globalThis, 'document');
+		if (previousWin) Object.defineProperty(globalThis, 'window', previousWin);
+		else Reflect.deleteProperty(globalThis, 'window');
 	});
 	return doc;
 }
@@ -219,13 +274,14 @@ test('nested traps restrict Tab to the top trap and restore focus through each l
 	assert.equal(detailDialog.dispatchTab(false), false);
 	assert.equal(doc.activeElement, titleInput);
 
-	// Closing child trap restores focus to Edit button in RecipeDetail and keeps overflow locked.
+	// Closing child trap restores focus to Edit button in RecipeDetail with preventScroll and keeps overflow locked.
 	detailWrapper.inert = false;
 	editorDialog.remove();
 	editorTrap.destroy();
 	assert.equal(doc.body.style.overflow, 'hidden');
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, editButton);
+	assert.deepEqual(editButton.lastFocusOptions, { preventScroll: true });
 
 	// Tab trapping works in RecipeDetail again once it is back on top.
 	assert.equal(detailDialog.dispatchTab(false), true);
@@ -237,6 +293,50 @@ test('nested traps restrict Tab to the top trap and restore focus through each l
 	assert.equal(doc.body.style.overflow, 'clip');
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, cardTrigger);
+});
+
+test('pre-captured returnFocus restores focus even when ancestor inert blurs activeElement to body before mount', async (t) => {
+	const doc = installDom(t);
+
+	const detailWrapper = doc.el('div', 'detail-wrapper');
+	const detailDialog = doc.el('div', 'detail-dialog', { tabIndex: -1 });
+	const closeDetail = doc.el('button', 'close-detail');
+	const editButton = doc.el('button', 'edit-recipe');
+	detailDialog.append(closeDetail, editButton);
+	detailWrapper.append(detailDialog);
+	doc.body.append(detailWrapper);
+
+	const detailTrap = focusTrap(detailDialog as unknown as HTMLElement);
+	await flushMicrotasks();
+	editButton.focus();
+
+	// Capture return target before state update, then simulate browser blurring activeElement to body when inert=true.
+	const capturedTrigger = activeFocusedElement();
+	assert.equal(capturedTrigger, editButton);
+	detailWrapper.inert = true;
+	doc.activeElement = doc.body;
+	assert.equal(activeFocusedElement(), null);
+
+	const editorDialog = doc.el('div', 'editor-dialog', { tabIndex: -1 });
+	const cancelBtn = doc.el('button', 'cancel-edit');
+	editorDialog.append(cancelBtn);
+	doc.body.append(editorDialog);
+
+	const editorTrap = focusTrap(editorDialog as unknown as HTMLElement, {
+		returnFocus: capturedTrigger
+	});
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, cancelBtn);
+
+	// Closing RecipeEditor restores focus to Edit button rather than document.body.
+	detailWrapper.inert = false;
+	editorDialog.remove();
+	editorTrap.destroy();
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, editButton);
+
+	detailWrapper.remove();
+	detailTrap.destroy();
 });
 
 test('falls back to the first control in the active top trap when returnFocus is disconnected or inert', async (t) => {
@@ -312,12 +412,16 @@ test('reduced-motion synchronous {#key modal} handoff skips intermediate focus r
 	refreshNutrition.focus();
 
 	// Open settings modal over inert RecipeDetail.
+	const modalReturnFocus = activeFocusedElement();
 	detailWrapper.inert = true;
+	doc.activeElement = doc.body;
 	const settingsDialog = doc.el('div', 'settings-dialog', { tabIndex: -1 });
 	const editTaste = doc.el('button', 'edit-taste');
 	settingsDialog.append(editTaste);
 	doc.body.append(settingsDialog);
-	const settingsTrap = focusTrap(settingsDialog as unknown as HTMLElement);
+	const settingsTrap = focusTrap(settingsDialog as unknown as HTMLElement, {
+		returnFocus: modalReturnFocus
+	});
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, editTaste);
 
@@ -330,7 +434,9 @@ test('reduced-motion synchronous {#key modal} handoff skips intermediate focus r
 	const savePrefs = doc.el('button', 'save-prefs');
 	onboardingDialog.append(savePrefs);
 	doc.body.append(onboardingDialog);
-	const onboardingTrap = focusTrap(onboardingDialog as unknown as HTMLElement);
+	const onboardingTrap = focusTrap(onboardingDialog as unknown as HTMLElement, {
+		returnFocus: modalReturnFocus
+	});
 
 	assert.equal(doc.body.style.overflow, 'hidden');
 	await flushMicrotasks();
@@ -349,7 +455,7 @@ test('reduced-motion synchronous {#key modal} handoff skips intermediate focus r
 	assert.equal(doc.body.style.overflow, 'auto');
 });
 
-test('animated {#key modal} replacement skips focus restore when outgoing trap finishes later', async (t) => {
+test('animated {#key modal} replacement and outrostart deactivate outgoing trap cleanly without stealing focus', async (t) => {
 	const doc = installDom(t);
 	doc.body.style.overflow = 'scroll';
 
@@ -359,6 +465,7 @@ test('animated {#key modal} replacement skips focus restore when outgoing trap f
 
 	// Open pickRecipe modal.
 	const pickDialog = doc.el('div', 'pick-dialog', { tabIndex: -1 });
+	pickDialog.setAttribute('aria-modal', 'true');
 	const pickItem = doc.el('button', 'pick-pasta');
 	pickDialog.append(pickItem);
 	doc.body.append(pickDialog);
@@ -366,13 +473,15 @@ test('animated {#key modal} replacement skips focus restore when outgoing trap f
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, pickItem);
 
-	// Click recipe -> {#key modal} mounts planDialog while pickDialog is still playing outro transition.
+	// Click recipe -> {#key modal} mounts planDialog while pickDialog begins its outro transition.
 	const planDialog = doc.el('div', 'plan-dialog', { tabIndex: -1 });
 	const dateInput = doc.el('input', 'plan-date');
 	const servingsInput = doc.el('input', 'plan-servings');
 	planDialog.append(dateInput, servingsInput);
 	doc.body.append(planDialog);
 	const planTrap = focusTrap(planDialog as unknown as HTMLElement);
+	pickDialog.dispatchOutroStart();
+	assert.equal(pickDialog.getAttribute('aria-modal'), null);
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, dateInput);
 
@@ -396,27 +505,64 @@ test('animated {#key modal} replacement skips focus restore when outgoing trap f
 	assert.equal(doc.activeElement, plannerTrigger);
 });
 
-test('includes focusable scroll regions with non-negative tabindex while skipping tabindex="-1"', async (t) => {
+test('supports { enabled, key } updates, closed details/summary, fixed controls, and non-negative tabindex', async (t) => {
 	const doc = installDom(t);
 
-	const dialog = doc.el('div', 'chat-dialog', { tabIndex: -1 });
+	const opener = doc.el('button', 'opener');
+	const dialog = doc.el('div', 'chat-dialog', { tabIndex: -1, scrollTop: 120 });
 	const closeBtn = doc.el('button', 'close-chat');
 	const skippedNote = doc.el('div', 'programmatic-only', { tabIndex: -1 });
+	const skippedBtn = doc.el('button', 'skipped-btn', { tabIndex: -1 });
+	const details = doc.el('details', 'nutrition-details', { open: false });
+	const summary = doc.el('summary', 'nutrition-summary');
+	const hiddenInsideDetails = doc.el('button', 'inside-closed-details');
+	details.append(summary, hiddenInsideDetails);
+	const fixedAction = doc.el('button', 'fixed-action');
+	fixedAction.style.position = 'fixed';
 	const scrollRegion = doc.el('div', 'transcript-region', { tabIndex: 0 });
-	const customOrder = doc.el('div', 'custom-tabindex', { tabIndex: 1 });
-	dialog.append(closeBtn, skippedNote, scrollRegion, customOrder);
-	doc.body.append(dialog);
+	dialog.append(closeBtn, skippedNote, skippedBtn, details, fixedAction, scrollRegion);
+	doc.body.append(opener, dialog);
+	opener.focus();
 
-	const trap = focusTrap(dialog as unknown as HTMLElement);
+	// Start disabled: does not trap or move focus.
+	const trap = focusTrap(dialog as unknown as HTMLElement, { enabled: false, key: 'step-1' });
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, opener);
+
+	// Enable trap: moves focus to first focusable control and excludes closed <details> children + tabindex="-1".
+	trap.update({ enabled: true, key: 'step-1' });
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, closeBtn);
+	assert.deepEqual(
+		focusableControls(dialog as unknown as HTMLElement).map((el) => el.id),
+		['close-chat', 'nutrition-summary', 'fixed-action', 'transcript-region']
+	);
+
+	// Opening <details> exposes controls inside it.
+	details.open = true;
+	assert.deepEqual(
+		focusableControls(dialog as unknown as HTMLElement).map((el) => el.id),
+		[
+			'close-chat',
+			'nutrition-summary',
+			'inside-closed-details',
+			'fixed-action',
+			'transcript-region'
+		]
+	);
+
+	// Changing key resets scrollTop and re-runs initial focus.
+	scrollRegion.focus();
+	dialog.scrollTop = 180;
+	trap.update({ enabled: true, key: 'step-2' });
+	assert.equal(dialog.scrollTop, 0);
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, closeBtn);
 
-	customOrder.focus();
-	assert.equal(dialog.dispatchTab(false), true);
-	assert.equal(doc.activeElement, closeBtn);
-
-	assert.equal(dialog.dispatchTab(true), true);
-	assert.equal(doc.activeElement, customOrder);
+	// Disabling trap restores focus to opener.
+	trap.update({ enabled: false, key: 'step-2' });
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, opener);
 
 	dialog.remove();
 	trap.destroy();

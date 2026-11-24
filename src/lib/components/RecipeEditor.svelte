@@ -2,7 +2,7 @@
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
+	import { focusTrap, type FocusTrapOptions } from '#lib/focus.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
 	import { Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
@@ -10,12 +10,14 @@
 		recipe,
 		mode = 'edit',
 		canUploadCover = false,
+		returnFocus = null,
 		cancel,
 		save
 	}: {
 		recipe: Recipe;
 		mode?: 'create' | 'edit';
 		canUploadCover?: boolean;
+		returnFocus?: FocusTrapOptions['returnFocus'];
 		cancel: () => void;
 		save: (recipe: Recipe) => void;
 	} = $props();
@@ -159,7 +161,7 @@
 <div class="modal-backdrop" transition:backdropMotion|global>
 	<div
 		class="flavor-dialog wide capture-dialog recipe-editor-dialog"
-		use:focusTrap
+		use:focusTrap={{ returnFocus }}
 		role="dialog"
 		aria-modal="true"
 		aria-labelledby="recipe-editor-title"

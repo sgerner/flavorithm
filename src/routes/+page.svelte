@@ -31,9 +31,9 @@
 <script lang="ts">
 	import { prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
-	import { onMount, tick } from 'svelte';
+	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
-	import { focusTrap } from '#lib/focus.ts';
+	import { activeFocusedElement, focusTrap } from '#lib/focus.ts';
 	import {
 		backdropMotion,
 		dialogMotion,
@@ -42,6 +42,7 @@
 		motionDuration,
 		prefersReducedMotion
 	} from '#lib/motion.ts';
+	import { calendarDayScrollLeft, weekOffsetFromStarts } from '#lib/planner.ts';
 	import { flip } from 'svelte/animate';
 	import {
 		ArrowRight,
@@ -126,6 +127,7 @@
 		isRecipeDetailInert,
 		pickRecipeForPlan
 	} from '#lib/recipe-subflows.ts';
+	import { applyRecipeRating } from '#lib/recipe-detail.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
@@ -143,7 +145,14 @@
 		type VoiceState
 	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
-	import type { ConnectionProvider, ConnectionModel } from '#lib/ai-connections.ts';
+	import {
+		CHATGPT_OAUTH_POLL_INTERVAL_MS,
+		CHATGPT_OAUTH_TTL_MS,
+		startConnectionPoll,
+		type ConnectionModel,
+		type ConnectionPollHandle,
+		type ConnectionProvider
+	} from '#lib/ai-connections.ts';
 	import {
 		entitledChatGPTAccountId,
 		reconcileChatGPTPreferences,
@@ -337,13 +346,34 @@
 		'Middle Eastern',
 		'American'
 	];
+	function openModal(nextModal: string) {
+		if (nextModal && !modal) modalReturnFocus = activeFocusedElement();
+		else if (!nextModal) modalReturnFocus = null;
+		modal = nextModal;
+	}
+	function openRecipeDetail(id: string | null, servings?: number) {
+		if (id && !selected) detailReturnFocus = activeFocusedElement();
+		else if (!id) detailReturnFocus = null;
+		selectedMealServings = id ? servings : undefined;
+		selectedId = id;
+	}
+	function openRecipeEditor(draft: Recipe, mode: 'create' | 'edit') {
+		if (!editingRecipe) editorReturnFocus = activeFocusedElement();
+		editingRecipeMode = mode;
+		editingRecipe = draft;
+	}
+	function closeRecipeEditor() {
+		editorReturnFocus = null;
+		editingRecipe = null;
+		editingRecipeMode = 'edit';
+	}
 	function openOnboarding() {
 		quizTime = kitchen.preferences.maxTime;
 		quizComplexity = kitchen.preferences.complexity;
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
 		quizDiet = kitchen.preferences.diet;
 		quizAllergies = kitchen.preferences.allergies;
-		modal = 'onboarding';
+		openModal('onboarding');
 	}
 	function openAuthentication() {
 		if (installationAuthMode === 'oidc') {
@@ -358,18 +388,20 @@
 			notify('Sign-in is unavailable because authentication is misconfigured.');
 			return;
 		}
-		modal = 'auth';
+		openModal('auth');
 	}
 	function resetRecipeSubflows(preserveSelected = false) {
 		const cleared = clearRecipeSubflowState();
 		if (!preserveSelected) {
-			selected = cleared.selected;
+			detailReturnFocus = null;
+			selectedId = cleared.selectedId;
 			selectedMealServings = cleared.selectedMealServings;
 		}
+		editorReturnFocus = null;
 		editingRecipe = cleared.editingRecipe;
 		editingRecipeMode = cleared.editingRecipeMode;
-		recipeToDelete = cleared.recipeToDelete;
-		plannedRecipe = cleared.plannedRecipe;
+		recipeToDeleteId = cleared.recipeToDeleteId;
+		plannedRecipeId = cleared.plannedRecipeId;
 		resetMealDialogState();
 	}
 	function clearHouseholdViewState(preserveSelected = false) {
@@ -379,6 +411,29 @@
 		editingShoppingDraft = null;
 		shoppingFilter = 'all';
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+	}
+	function reconcileRecipeSelection(recipes: Recipe[]) {
+		const ids = new Set(recipes.map((recipe) => recipe.id));
+		if (selectedId && !ids.has(selectedId)) {
+			detailReturnFocus = null;
+			selectedId = null;
+			selectedMealServings = undefined;
+		}
+		if (recipeToDeleteId && !ids.has(recipeToDeleteId)) {
+			recipeToDeleteId = null;
+			if (modal === 'deleteRecipe') openModal('');
+		}
+		if (plannedRecipeId && !ids.has(plannedRecipeId)) {
+			plannedRecipeId = null;
+			if (modal === 'plan') {
+				resetMealDialogState();
+				openModal('');
+			}
+		}
+	}
+	function replaceKitchen(nextKitchen: AppState) {
+		kitchen = nextKitchen;
+		reconcileRecipeSelection(nextKitchen.recipes);
 	}
 	function saveLastAccount(account: User) {
 		if (managedAuth) return;
@@ -432,7 +487,7 @@
 	}
 	function dismissOnboarding() {
 		if (!kitchen.preferences.onboardingStatus) kitchen.preferences.onboardingStatus = 'skipped';
-		modal = '';
+		openModal('');
 	}
 	function finishOnboarding(event: SubmitEvent) {
 		event.preventDefault();
@@ -444,15 +499,18 @@
 			allergies: quizAllergies.trim(),
 			onboardingStatus: 'completed'
 		});
-		modal = '';
+		openModal('');
 		notify('Preferences saved.');
 	}
 
-	let selected = $state<Recipe | null>(null);
+	let detailReturnFocus = $state.raw<HTMLElement | null>(null);
+	let editorReturnFocus = $state.raw<HTMLElement | null>(null);
+	let modalReturnFocus = $state.raw<HTMLElement | null>(null);
+	let selectedId = $state<string | null>(null);
 	let editingRecipe = $state<Recipe | null>(null);
 	let editingRecipeMode = $state<'create' | 'edit'>('edit');
-	let recipeToDelete = $state<Recipe | null>(null);
-	let plannedRecipe = $state<Recipe | null>(null);
+	let recipeToDeleteId = $state<string | null>(null);
+	let plannedRecipeId = $state<string | null>(null);
 	let pantryInput = $state('');
 	let authMode = $state('register');
 	let name = $state('');
@@ -530,6 +588,7 @@
 		accounts: ChatGPTAccount[];
 	}>({ configured: false, mode: 'unavailable', accounts: [] });
 	let connectionBusy = $state(false);
+	let connectionActive = $state(false);
 	let chatGPTAuthorizationUrl = $state('');
 	let chatGPTDevice = $state<{
 		loginId: string;
@@ -538,13 +597,17 @@
 		expiresAt: number;
 		interval: number;
 	} | null>(null);
-	let connectionPoll: ReturnType<typeof setInterval> | undefined;
+	let connectionPoll: ConnectionPollHandle | undefined;
 	let connectionPopup: Window | null = null;
-	let connectionPollCount = 0;
 	let connectionAttempt = 0;
 	let activeChatGPTAccount = $derived(
 		chatGPT.accounts.find((a) => a.id === kitchen.preferences.chatgptAccountId)
 	);
+	$effect(() => {
+		if (modal !== 'settings' && (connectionActive || chatGPTDevice || chatGPTAuthorizationUrl)) {
+			void cancelChatGPTDevice();
+		}
+	});
 
 	let providers = $state<ConnectionProvider[]>([]);
 	let accountModels = $state<ConnectionModel[]>([]);
@@ -566,6 +629,10 @@
 	let currentInviteId = $state('');
 	let joinCode = $state('');
 	let weekOffset = $state(0);
+	let calendarGrid = $state<HTMLDivElement | undefined>();
+	let previousPage = '';
+	let pendingPlannerScrollDate = '';
+	let calendarScrollToken = 0;
 	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
@@ -874,6 +941,29 @@
 		});
 	});
 	let recipesById = $derived(new Map(kitchen.recipes.map((recipe) => [recipe.id, recipe])));
+	let selected = $derived(selectedId ? (recipesById.get(selectedId) ?? null) : null);
+	let recipeToDelete = $derived(
+		recipeToDeleteId ? (recipesById.get(recipeToDeleteId) ?? null) : null
+	);
+	let plannedRecipe = $derived(plannedRecipeId ? (recipesById.get(plannedRecipeId) ?? null) : null);
+	$effect.pre(() => {
+		if (selectedId && !recipesById.has(selectedId)) {
+			detailReturnFocus = null;
+			selectedId = null;
+			selectedMealServings = undefined;
+		}
+		if (recipeToDeleteId && !recipesById.has(recipeToDeleteId)) {
+			recipeToDeleteId = null;
+			if (modal === 'deleteRecipe') openModal('');
+		}
+		if (plannedRecipeId && !recipesById.has(plannedRecipeId)) {
+			plannedRecipeId = null;
+			if (modal === 'plan') {
+				resetMealDialogState();
+				openModal('');
+			}
+		}
+	});
 	let plannerMeals = $derived.by(() => {
 		const byDateSlot = new Map<string, Meal[]>();
 		const completed: Meal[] = [];
@@ -1033,6 +1123,19 @@
 		page;
 		if (ready) window.scrollTo({ top: 0, behavior: 'instant' });
 	});
+	$effect(() => {
+		const currentPage = page;
+		const enteringPlanner = currentPage === 'planner' && previousPage !== 'planner';
+		previousPage = currentPage;
+		if (!enteringPlanner) return;
+		if (pendingPlannerScrollDate) {
+			pendingPlannerScrollDate = '';
+			return;
+		}
+		if (untrack(() => weekOffset === 0)) {
+			void scrollCalendarToDate(dateKey(new Date()), true);
+		}
+	});
 	let stateEtag: string | null = null;
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
@@ -1064,7 +1167,7 @@
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				kitchen = sanitizeKitchenState(state);
+				replaceKitchen(sanitizeKitchenState(state));
 			},
 			onStatus: (status) => {
 				syncReady = status.ready;
@@ -1126,7 +1229,7 @@
 				if (local) {
 					const sanitized = sanitizeKitchenState(JSON.parse(local));
 					if (!themes.includes(sanitized.preferences.theme)) sanitized.preferences.theme = 'nosh';
-					kitchen = sanitized;
+					replaceKitchen(sanitized);
 				}
 			} catch {}
 			showStarter = localStorage.getItem('flavorithm-started') !== 'yes';
@@ -1297,7 +1400,8 @@
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
 			clearTimeout(saveTimer);
-			clearInterval(connectionPoll);
+			connectionPoll?.stop();
+			connectionPopup?.close();
 			cancelScan(true);
 			voiceCapture?.cancel();
 		};
@@ -1308,7 +1412,7 @@
 			const snapshotUser = $state.snapshot(user);
 			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
 			saveLastAccount(snapshotUser);
-		} else kitchen = sanitized;
+		} else replaceKitchen(sanitized);
 	}
 	async function retrySync(prefer?: 'local' | 'remote', expectedEtag?: string | null) {
 		if (!online || !user || !kitchenSync) return;
@@ -1392,7 +1496,7 @@
 		showStarter = false;
 		localStorage.setItem('flavorithm-started', 'yes');
 		page = 'pantry';
-		modal = 'pantry';
+		openModal('pantry');
 		notify('Sample pantry and meal plan cleared. Starter recipes kept.');
 	}
 	function navigate(id: string) {
@@ -1453,7 +1557,7 @@
 		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
 		const applied = JSON.stringify(kitchen.pantry);
 		pantryInput = '';
-		modal = '';
+		openModal('');
 		const acceptedCount = additions.length;
 		const suffix =
 			skippedCapacity > 0
@@ -1529,11 +1633,10 @@
 			} catch (stateError) {
 				kitchenSync?.failLoad((stateError as Error).message);
 			}
-			if (isRegister && selected) {
-				const openId = selected.id;
-				const preserved = kitchen.recipes.find((item) => item.id === openId) ?? null;
-				selected = preserved;
-				if (!preserved) selectedMealServings = undefined;
+			if (isRegister && selectedId && !recipesById.has(selectedId)) {
+				detailReturnFocus = null;
+				selectedId = null;
+				selectedMealServings = undefined;
 			}
 			syncing = false;
 			if (stateLoaded) {
@@ -1544,9 +1647,9 @@
 			if (resumeDialog) {
 				const target = resumeDialog;
 				resumeDialog = '';
-				modal = target;
+				openModal(target);
 			} else {
-				modal = '';
+				openModal('');
 				if (isRegister && stateLoaded && !kitchen.preferences.onboardingStatus) openOnboarding();
 			}
 			const syncedCleanly =
@@ -1603,14 +1706,9 @@
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			clearAIConnectionState();
-			clearInterval(connectionPoll);
-			connectionBusy = false;
-			chatGPTAuthorizationUrl = '';
-			chatGPTDevice = null;
-			chatGPT = { configured: false, mode: 'unavailable', accounts: [] };
 			stateEtag = null;
 			syncing = false;
-			modal = '';
+			openModal('');
 			notify('Signed out. Your household is safely saved.');
 		} catch (e) {
 			notify((e as Error).message);
@@ -1619,14 +1717,17 @@
 
 	function clearAIConnectionState() {
 		connectionAttempt++;
+		connectionActive = false;
 		apiKey = '';
 		providers = [];
 		accountModels = [];
 		catalogVersion++;
 		catalogLoading = false;
 		catalogError = '';
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
@@ -1683,7 +1784,7 @@
 		if (!focusTarget && modal !== 'pantry' && modal !== 'import' && modal !== 'settings') {
 			resumeDialog = '';
 		}
-		modal = 'settings';
+		openModal('settings');
 		error = '';
 		const headingId =
 			focusTarget === true || focusTarget === 'ai'
@@ -1713,16 +1814,26 @@
 	}
 	async function changeConnection(providerId?: string) {
 		if (providerId === kitchen.preferences.provider) return;
+		const currentDevice = chatGPTDevice;
 		connectionAttempt++;
+		connectionActive = false;
 		if (providerId && providerId !== kitchen.preferences.provider) {
 			apiKey = '';
 			kitchen.preferences.provider = providerId;
 		}
-		clearInterval(connectionPoll);
+		connectionPoll?.stop();
+		connectionPoll = undefined;
 		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
+		if (currentDevice && user) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
 		kitchen.preferences.model = '';
 		kitchen.preferences.reasoning = undefined;
 		accountModels = [];
@@ -1738,16 +1849,31 @@
 			openAuthentication();
 			return;
 		}
+		const currentDevice = chatGPTDevice;
 		const attempt = ++connectionAttempt;
 		const owner = user.id;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
+		if (currentDevice) {
+			void request('/api/connections/chatgpt', {
+				action: 'cancel',
+				loginId: currentDevice.loginId
+			}).catch(() => {});
+		}
+		connectionActive = true;
 		connectionBusy = true;
 		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
 		error = '';
-		connectionPopup =
+		const popup =
 			chatGPT.mode === 'device'
 				? null
 				: window.open('about:blank', 'flavorithm-chatgpt-connect', 'popup,width=620,height=780');
+		connectionPopup = popup;
+		const isCurrentInSettings = () =>
+			attempt === connectionAttempt && user?.id === owner && modal === 'settings';
 		try {
 			const previousAccounts = new Map(chatGPT.accounts.map((a) => [a.id, a.updatedAt]));
 			const previous = JSON.stringify(chatGPT.accounts);
@@ -1756,51 +1882,83 @@
 				accountId,
 				reconsent
 			});
-			if (attempt !== connectionAttempt || user?.id !== owner) return;
+			if (!isCurrentInSettings()) {
+				popup?.close();
+				if (connectionPopup === popup) connectionPopup = null;
+				if (result?.kind === 'device' && user?.id === owner) {
+					void request('/api/connections/chatgpt', {
+						action: 'cancel',
+						loginId: result.loginId
+					}).catch(() => {});
+				}
+				return;
+			}
 			if (result.kind === 'device') {
 				chatGPTDevice = result;
-				clearInterval(connectionPoll);
-				let polling = false;
-				connectionPoll = setInterval(async () => {
-					if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-					polling = true;
-					try {
-						const connected = await request('/api/connections/chatgpt', {
-							action: 'poll',
-							loginId: result.loginId
-						});
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						if (connected.connected) {
-							clearInterval(connectionPoll);
+				connectionPoll = startConnectionPoll({
+					intervalMs: result.interval * 1000,
+					expiresAt: result.expiresAt,
+					attempt,
+					getAttempt: () => connectionAttempt,
+					owner,
+					getOwner: () => user?.id,
+					isOpen: () => modal === 'settings',
+					poll: async ({ expired, stop }) => {
+						try {
+							const connected = await request('/api/connections/chatgpt', {
+								action: 'poll',
+								loginId: result.loginId
+							});
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							if (connected.connected) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								await refreshConnections();
+								if (attempt !== connectionAttempt || user?.id !== owner) return false;
+								kitchen.preferences.chatgptAccountId = connected.accountId;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify('ChatGPT connected. Choose a model.');
+								return false;
+							}
+							if (expired) {
+								stop();
+								connectionActive = false;
+								connectionBusy = false;
+								chatGPTDevice = null;
+								error = 'ChatGPT authorization expired. Start again.';
+								return false;
+							}
+						} catch (e) {
+							if (!isCurrentInSettings()) {
+								stop();
+								return false;
+							}
+							const status = (e as { status?: number }).status;
+							// Keep the original login alive through brief deployment/network outages.
+							if (
+								chatGPTDevice &&
+								!expired &&
+								Date.now() < result.expiresAt &&
+								(status === undefined || status === 429 || status >= 500)
+							)
+								return;
+							stop();
+							connectionActive = false;
 							connectionBusy = false;
 							chatGPTDevice = null;
-							await refreshConnections();
-							if (attempt !== connectionAttempt || user?.id !== owner) return;
-							kitchen.preferences.chatgptAccountId = connected.accountId;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							notify('ChatGPT connected. Choose a model.');
+							error = (e as Error).message;
+							return false;
 						}
-					} catch (e) {
-						if (attempt !== connectionAttempt || user?.id !== owner) return;
-						const status = (e as { status?: number }).status;
-						// Keep the original login alive through brief deployment/network outages.
-						if (
-							chatGPTDevice &&
-							Date.now() < result.expiresAt &&
-							(status === undefined || status === 429 || status >= 500)
-						)
-							return;
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTDevice = null;
-						error = (e as Error).message;
-					} finally {
-						polling = false;
 					}
-				}, result.interval * 1000);
+				});
 				return;
 			}
 
@@ -1814,67 +1972,90 @@
 			) {
 				chatGPTAuthorizationUrl = result.authorizationUrl;
 			} else {
+				connectionActive = false;
 				window.location.assign(result.authorizationUrl);
 				return;
 			}
-			clearInterval(connectionPoll);
-			connectionPollCount = 0;
-			let polling = false;
-			connectionPoll = setInterval(async () => {
-				if (polling || attempt !== connectionAttempt || user?.id !== owner) return;
-				polling = true;
-				try {
-					await refreshConnections();
-					if (attempt !== connectionAttempt || user?.id !== owner) return;
-					connectionPollCount++;
-					const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
-					if (connectionChanged || connectionPopup?.closed) {
-						clearInterval(connectionPoll);
-						connectionBusy = false;
-						chatGPTAuthorizationUrl = '';
-						chatGPTDevice = null;
-						const account = chatGPT.accounts.find(
-							(a) =>
-								a.connected &&
-								(accountId
-									? a.id === accountId
-									: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
-						);
-						if (account && connectionChanged) {
-							kitchen.preferences.chatgptAccountId = account.id;
-							kitchen.preferences.provider = 'chatgpt';
-							kitchen.preferences.model = '';
-							kitchen.preferences.reasoning = undefined;
-							await loadModelCatalog();
-							connectionPopup?.close();
-							notify(
-								account.planEnabled
-									? 'ChatGPT connected. Choose a model to cook with your plan.'
-									: 'ChatGPT signed in. Enable plan usage to generate recipes.'
-							);
-						} else if (!connectionChanged) {
-							notify('The authorization window closed. Your previous connection is unchanged.');
+			const expiresAt =
+				typeof result.expiresAt === 'number' ? result.expiresAt : Date.now() + CHATGPT_OAUTH_TTL_MS;
+			connectionPoll = startConnectionPoll({
+				intervalMs: CHATGPT_OAUTH_POLL_INTERVAL_MS,
+				expiresAt,
+				attempt,
+				getAttempt: () => connectionAttempt,
+				owner,
+				getOwner: () => user?.id,
+				isOpen: () => modal === 'settings',
+				poll: async ({ expired, stop }) => {
+					try {
+						await refreshConnections();
+						if (!isCurrentInSettings()) {
+							stop();
+							return false;
 						}
-					}
-					if (connectionPollCount >= 400) {
-						clearInterval(connectionPoll);
+						const connectionChanged = JSON.stringify(chatGPT.accounts) !== previous;
+						if (connectionChanged || connectionPopup?.closed) {
+							stop();
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							const account = chatGPT.accounts.find(
+								(a) =>
+									a.connected &&
+									(accountId
+										? a.id === accountId
+										: !previousAccounts.has(a.id) || previousAccounts.get(a.id) !== a.updatedAt)
+							);
+							if (account && connectionChanged) {
+								connectionPopup?.close();
+								connectionPopup = null;
+								kitchen.preferences.chatgptAccountId = account.id;
+								kitchen.preferences.provider = 'chatgpt';
+								kitchen.preferences.model = '';
+								kitchen.preferences.reasoning = undefined;
+								await loadModelCatalog();
+								notify(
+									account.planEnabled
+										? 'ChatGPT connected. Choose a model to cook with your plan.'
+										: 'ChatGPT signed in. Enable plan usage to generate recipes.'
+								);
+							} else if (!connectionChanged) {
+								connectionPopup = null;
+								notify('The authorization window closed. Your previous connection is unchanged.');
+							}
+							return false;
+						}
+						if (expired) {
+							stop();
+							connectionPopup?.close();
+							connectionPopup = null;
+							connectionActive = false;
+							connectionBusy = false;
+							chatGPTAuthorizationUrl = '';
+							chatGPTDevice = null;
+							error = 'The connection window timed out. Try connecting again.';
+							return false;
+						}
+					} catch (e) {
+						stop();
+						if (!isCurrentInSettings()) return false;
+						connectionPopup?.close();
+						connectionPopup = null;
+						connectionActive = false;
 						connectionBusy = false;
 						chatGPTAuthorizationUrl = '';
 						chatGPTDevice = null;
-						error = 'The connection window timed out. Try connecting again.';
+						error = (e as Error).message;
+						return false;
 					}
-				} catch (e) {
-					clearInterval(connectionPoll);
-					connectionBusy = false;
-					chatGPTAuthorizationUrl = '';
-					chatGPTDevice = null;
-					error = (e as Error).message;
-				} finally {
-					polling = false;
 				}
-			}, 1500);
+			});
 		} catch (e) {
-			connectionPopup?.close();
+			popup?.close();
+			if (connectionPopup === popup) connectionPopup = null;
+			if (!isCurrentInSettings()) return;
+			connectionActive = false;
 			connectionBusy = false;
 			chatGPTAuthorizationUrl = '';
 			chatGPTDevice = null;
@@ -1884,10 +2065,15 @@
 	async function cancelChatGPTDevice() {
 		const current = chatGPTDevice;
 		connectionAttempt++;
-		clearInterval(connectionPoll);
+		connectionActive = false;
+		connectionPoll?.stop();
+		connectionPoll = undefined;
+		connectionPopup?.close();
+		connectionPopup = null;
 		connectionBusy = false;
+		chatGPTAuthorizationUrl = '';
 		chatGPTDevice = null;
-		if (current) {
+		if (current && user) {
 			try {
 				await request('/api/connections/chatgpt', { action: 'cancel', loginId: current.loginId });
 			} catch {
@@ -2041,7 +2227,7 @@
 		}
 		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
-		kitchen = result.state;
+		replaceKitchen(result.state);
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
@@ -2053,8 +2239,8 @@
 						(item) => item.recipeId === recipe.id && !item.completedAt
 					);
 					if (meal) openCookDialog(meal);
-					else selected = recipe;
-				} else selected = recipe ?? null;
+					else openRecipeDetail(recipe.id);
+				} else openRecipeDetail(recipe?.id ?? null);
 			} else if (effect.type === 'ui') {
 				butlerChat?.close();
 				openButlerControl(effect.action);
@@ -2062,7 +2248,7 @@
 		}
 		const appliedSnapshot = JSON.stringify(kitchen);
 		notify('Basil’s changes applied.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) kitchen = previousKitchen;
+			if (JSON.stringify(kitchen) === appliedSnapshot) replaceKitchen(previousKitchen);
 			else notify('Your kitchen changed again. Review the current values before editing.');
 		});
 		return appliedSnapshot;
@@ -2087,7 +2273,7 @@
 				openImport();
 				break;
 			case 'pantry-add':
-				modal = 'pantry';
+				openModal('pantry');
 				break;
 			case 'onboarding':
 				openOnboarding();
@@ -2113,7 +2299,7 @@
 				void logout();
 				break;
 			case 'delete-account':
-				if (!managedAuth) modal = 'delete';
+				if (!managedAuth) openModal('delete');
 				else void openSettings();
 				break;
 			case 'leave-household':
@@ -2126,18 +2312,18 @@
 				dictateRecipe();
 				break;
 			case 'generate':
-				modal = 'generate';
+				openModal('generate');
 				break;
 			case 'search':
 				if (capabilities.recipeSearch) {
-					modal = 'search';
+					openModal('search');
 					error = '';
 				} else {
 					openImport();
 				}
 				break;
 			case 'taste':
-				modal = 'taste';
+				openModal('taste');
 				break;
 		}
 	}
@@ -2149,7 +2335,7 @@
 		try {
 			const result = await ai('generate');
 			kitchen.recipes = insertRecipes(kitchen.recipes, result.recipes);
-			modal = '';
+			openModal('');
 			page = 'discover';
 			filter = 'For you';
 			notify('Recipes generated.');
@@ -2202,7 +2388,7 @@
 				})
 				.join('\n');
 			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n').slice(0, 20000);
-			modal = 'pantry';
+			openModal('pantry');
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
 			if (generation === scanGeneration) {
@@ -2288,7 +2474,7 @@
 		if (forRecipe && !modal) {
 			mobileNav = false;
 			error = '';
-			modal = 'import';
+			openModal('import');
 		}
 		const plan = planVoiceStart({
 			forRecipe,
@@ -2317,7 +2503,7 @@
 		if (modal !== plan.targetDialog) {
 			mobileNav = false;
 			error = '';
-			modal = plan.targetDialog;
+			openModal(plan.targetDialog);
 		}
 		activeVoiceImportSession = importSession;
 		const owner = user?.id;
@@ -2356,17 +2542,18 @@
 	}
 
 	function saveRecipe(r: Recipe) {
-		r.saved = !r.saved;
+		const live = recipesById.get(r.id);
+		if (!live) return;
+		live.saved = !live.saved;
 		kitchen.recipes = [...kitchen.recipes];
-		notify(r.saved ? 'Saved to your collection.' : 'Removed from your collection.');
+		notify(live.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
 	function toggleRecipeHidden(recipe: Recipe) {
 		const hidden = !recipe.hidden;
 		kitchen.recipes = kitchen.recipes.map((item) =>
 			item.id === recipe.id ? { ...item, hidden } : item
 		);
-		selected = null;
-		selectedMealServings = undefined;
+		openRecipeDetail(null);
 		notify(
 			hidden
 				? `${recipe.title} hidden. Show hidden recipes to find it again.`
@@ -2374,31 +2561,32 @@
 		);
 	}
 	function openNewRecipe() {
+		const trigger = activeFocusedElement();
 		mobileNav = false;
 		resetMealDialogState();
 		resumeDialog = '';
-		modal = '';
+		openModal('');
 		error = '';
-		selected = null;
-		selectedMealServings = undefined;
+		openRecipeDetail(null);
+		editorReturnFocus = trigger;
 		editingRecipeMode = 'create';
 		editingRecipe = createBlankRecipe();
 	}
 	function editSavedRecipe(recipe: Recipe) {
-		const next = beginEditSavedRecipe(kitchen.recipes, selected, recipe);
+		const next = beginEditSavedRecipe(kitchen.recipes, selectedId, recipe.id);
 		if (!next) return;
-		selected = next.selected;
-		editingRecipeMode = next.editingRecipeMode;
-		editingRecipe = next.editingRecipe;
+		selectedId = next.selectedId;
+		openRecipeEditor(next.editingRecipe, next.editingRecipeMode);
 	}
 	function saveEditedRecipe(updated: Recipe) {
 		if (editingRecipeMode === 'create') {
 			const saved = finalizeManualRecipe(updated);
 			kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
-			editingRecipe = null;
-			editingRecipeMode = 'edit';
+			const returnTarget = editorReturnFocus;
+			closeRecipeEditor();
+			detailReturnFocus = returnTarget;
 			selectedMealServings = undefined;
-			selected = kitchen.recipes.find((item) => item.id === saved.id) ?? saved;
+			selectedId = saved.id;
 			page = 'saved';
 			priorityPantryIds = [];
 			query = '';
@@ -2406,12 +2594,13 @@
 			notify('Recipe saved to your collection.');
 			return;
 		}
-		const next = applyEditedRecipe(kitchen.recipes, selected, updated);
-		editingRecipe = next.editingRecipe;
-		editingRecipeMode = next.editingRecipeMode;
+		const next = applyEditedRecipe(kitchen.recipes, selectedId, updated);
+		const returnTarget = editorReturnFocus;
+		closeRecipeEditor();
 		if (!next.saved) return;
 		kitchen.recipes = next.recipes;
-		selected = next.selected;
+		if (!selectedId) detailReturnFocus = returnTarget;
+		selectedId = next.selectedId;
 		notify(
 			next.nutritionNeedsRefresh
 				? 'Recipe updated. Refresh its nutrition estimate.'
@@ -2419,11 +2608,11 @@
 		);
 	}
 	function askDeleteRecipe(recipe: Recipe) {
-		const next = beginDeleteSavedRecipe(selected, recipe);
+		const next = beginDeleteSavedRecipe(kitchen.recipes, selectedId, recipe.id);
 		if (!next) return;
-		selected = next.selected;
-		recipeToDelete = next.recipeToDelete;
-		modal = next.modal;
+		selectedId = next.selectedId;
+		recipeToDeleteId = next.recipeToDeleteId;
+		openModal(next.modal);
 	}
 	function weekStartForDate(value: string) {
 		const date = new Date(`${value}T12:00:00`);
@@ -2431,24 +2620,61 @@
 		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
 		return dateKey(date);
 	}
-	function weekOffsetForDate(value: string) {
-		const target = new Date(`${value}T12:00:00`);
-		if (Number.isNaN(target.getTime())) return weekOffset;
-		target.setDate(target.getDate() - ((target.getDay() + 6) % 7));
-		const currentMonday = new Date();
-		currentMonday.setHours(12, 0, 0, 0);
-		currentMonday.setDate(currentMonday.getDate() - ((currentMonday.getDay() + 6) % 7));
-		const utcTarget = Date.UTC(target.getFullYear(), target.getMonth(), target.getDate());
-		const utcCurrent = Date.UTC(
-			currentMonday.getFullYear(),
-			currentMonday.getMonth(),
-			currentMonday.getDate()
-		);
-		return Math.round((utcTarget - utcCurrent) / (7 * 86_400_000));
+	function weekOffsetForDate(value: string, today = new Date()) {
+		const start = weekStartForDate(value);
+		if (start === value && Number.isNaN(new Date(`${value}T12:00:00`).getTime())) return weekOffset;
+		return weekOffsetFromStarts(start, weekStartForDate(dateKey(today)));
+	}
+	async function scrollCalendarToDate(targetDate: string, instant = false) {
+		const token = ++calendarScrollToken;
+		await tick();
+		if (
+			token !== calendarScrollToken ||
+			page !== 'planner' ||
+			!calendarGrid?.isConnected ||
+			typeof window === 'undefined' ||
+			typeof window.matchMedia !== 'function' ||
+			!window.matchMedia('(max-width: 900px)').matches ||
+			calendarGrid.scrollWidth <= calendarGrid.clientWidth
+		) {
+			return;
+		}
+		const dayCard =
+			Array.from(calendarGrid.querySelectorAll<HTMLElement>('.calendar-day')).find(
+				(day) => day.dataset.date === targetDate
+			) ??
+			(targetDate === dateKey(new Date())
+				? calendarGrid.querySelector<HTMLElement>('.calendar-day.today')
+				: null);
+		if (!dayCard) return;
+		const gridRect = calendarGrid.getBoundingClientRect();
+		const dayRect = dayCard.getBoundingClientRect();
+		const styles = window.getComputedStyle(calendarGrid);
+		const scrollPaddingStart =
+			Number.parseFloat(styles.scrollPaddingInlineStart) ||
+			Number.parseFloat(styles.scrollPaddingLeft) ||
+			0;
+		const left = calendarDayScrollLeft({
+			dayLeft: dayRect.left,
+			gridLeft: gridRect.left,
+			clientLeft: calendarGrid.clientLeft,
+			scrollLeft: calendarGrid.scrollLeft,
+			scrollPaddingStart,
+			scrollWidth: calendarGrid.scrollWidth,
+			clientWidth: calendarGrid.clientWidth
+		});
+		calendarGrid.scrollTo({
+			left,
+			behavior: instant || prefersReducedMotion() ? 'instant' : 'smooth'
+		});
+	}
+	function showCurrentWeek() {
+		weekOffset = 0;
+		void scrollCalendarToDate(dateKey(new Date()));
 	}
 	function resetMealDialogState() {
 		pickingForSlot = false;
-		plannedRecipe = null;
+		plannedRecipeId = null;
 		mealDate = '';
 		mealSlot = 'Dinner';
 		plannedServings = 2;
@@ -2475,9 +2701,9 @@
 	function confirmDeleteRecipe() {
 		const next = confirmDeleteSavedRecipe(
 			kitchen,
-			selected,
+			selectedId,
 			selectedMealServings,
-			recipeToDelete,
+			recipeToDeleteId,
 			weekStartForDate
 		);
 		if (!next) return;
@@ -2486,10 +2712,11 @@
 		kitchen.shopping = next.shopping;
 		kitchen.preferences.ratings = next.ratings;
 		for (const startDate of next.affectedWeeks) refreshWeekShopping(startDate);
-		selected = next.selected;
+		if (!next.selectedId) detailReturnFocus = null;
+		selectedId = next.selectedId;
 		selectedMealServings = next.selectedMealServings;
-		recipeToDelete = next.recipeToDelete;
-		modal = next.modal;
+		recipeToDeleteId = next.recipeToDeleteId;
+		openModal(next.modal);
 		notify(
 			`${next.deletedRecipe.title} deleted, along with ${next.impactedMealsCount} planned meal${next.impactedMealsCount === 1 ? '' : 's'}.`
 		);
@@ -2641,8 +2868,7 @@
 		}
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
-		selected = null;
-		selectedMealServings = undefined;
+		openRecipeDetail(null);
 		page = 'shopping';
 		notify(
 			additions.length
@@ -2651,9 +2877,9 @@
 		);
 	}
 	function openRecipePicker(slotTarget?: { date: string; slot: string }) {
+		const trigger = activeFocusedElement();
 		resetMealDialogState();
-		selected = null;
-		selectedMealServings = undefined;
+		openRecipeDetail(null);
 		if (slotTarget) {
 			pickingForSlot = true;
 			mealDate = slotTarget.date;
@@ -2662,6 +2888,7 @@
 			mealDate = dateKey(new Date());
 			mealSlot = 'Dinner';
 		}
+		if (!modal) modalReturnFocus = trigger;
 		modal = 'pickRecipe';
 	}
 	function choosePickedRecipe(recipe: Recipe) {
@@ -2680,11 +2907,12 @@
 			kitchen.meals.push(created);
 			refreshWeekShopping(scheduledWeek);
 			weekOffset = weekOffsetForDate(scheduledDate);
-			selectedMealServings = undefined;
-			selected = null;
+			if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
+			openRecipeDetail(null);
 			resetMealDialogState();
-			modal = '';
+			openModal('');
 			page = 'planner';
+			void scrollCalendarToDate(scheduledDate);
 			notify(`${recipe.title} scheduled.`, () => {
 				const existing = kitchen.meals.find((entry) => entry.id === created.id);
 				if (!existing) return;
@@ -2698,31 +2926,35 @@
 		const preservedDate = mealDate;
 		const preservedSlot = ['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot) ? mealSlot : 'Dinner';
 		resetMealDialogState();
-		const next = pickRecipeForPlan(selected, recipe, preservedDate, dateKey(new Date()));
-		selected = next.selected;
-		plannedRecipe = next.plannedRecipe;
+		const next = pickRecipeForPlan(selectedId, recipe, preservedDate, dateKey(new Date()));
+		selectedId = next.selectedId;
+		plannedRecipeId = next.plannedRecipeId;
 		plannedServings = next.plannedServings;
 		mealDate = next.mealDate;
 		mealSlot = preservedSlot;
-		modal = next.modal;
+		openModal(next.modal);
 	}
 	function planRecipe(r: Recipe, servings = r.servings) {
+		const trigger = activeFocusedElement();
 		resetMealDialogState();
-		const next = beginPlanRecipe(selected, r, servings, dateKey(new Date()));
-		selected = next.selected;
-		plannedRecipe = next.plannedRecipe;
+		const next = beginPlanRecipe(selectedId, r, servings, dateKey(new Date()));
+		selectedId = next.selectedId;
+		plannedRecipeId = next.plannedRecipeId;
 		plannedServings = next.plannedServings;
 		mealDate = next.mealDate;
 		mealSlot = 'Dinner';
+		if (!modal) modalReturnFocus = trigger;
 		modal = next.modal;
 	}
 	function editPlannedMeal(meal: Meal) {
 		if (meal.completedAt) return;
+		const trigger = activeFocusedElement();
 		resetMealDialogState();
 		editingMealId = meal.id;
 		mealDate = meal.date;
 		mealSlot = meal.slot;
 		plannedServings = meal.servings;
+		if (!modal) modalReturnFocus = trigger;
 		modal = 'editMeal';
 	}
 	function saveMealChanges(event?: SubmitEvent) {
@@ -2742,15 +2974,18 @@
 		refreshWeekShopping(weekStartForDate(meal.date));
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
-		modal = '';
+		openModal('');
+		void scrollCalendarToDate(updatedDate);
 		notify('Meal plan updated.');
 	}
 	function openCookDialog(meal: Meal) {
 		if (meal.completedAt) return;
+		const trigger = activeFocusedElement();
 		resetMealDialogState();
 		cookingMealId = meal.id;
 		deductPantry = false;
 		leftoverServings = 0;
+		if (!modal) modalReturnFocus = trigger;
 		modal = 'cookMeal';
 	}
 	function markMealCooked(event?: SubmitEvent) {
@@ -2768,16 +3003,22 @@
 		const recipeId = meal.recipeId;
 		const servingsCooked = meal.servings;
 		const startDate = weekStartForDate(meal.date);
+		const returnTarget = modalReturnFocus;
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
 		refreshWeekShopping(startDate);
 		resetMealDialogState();
-		modal = '';
+		openModal('');
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
-		selectedMealServings = servingsCooked;
-		if (recipe) selected = recipe;
+		if (recipe) {
+			detailReturnFocus = returnTarget;
+			selectedMealServings = servingsCooked;
+			selectedId = recipe.id;
+		} else {
+			openRecipeDetail(null);
+		}
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
 	}
 	function restockPantryItems(selectedIds?: string[]) {
@@ -2856,22 +3097,32 @@
 	}
 	function addMeal(event?: SubmitEvent) {
 		event?.preventDefault();
-		const result = completePlanMeal(plannedRecipe, mealDate, mealSlot, plannedServings);
+		const result = completePlanMeal(
+			kitchen.recipes,
+			plannedRecipeId,
+			mealDate,
+			mealSlot,
+			plannedServings
+		);
 		if (!result.ok) {
 			if (result.reason === 'invalidServings') {
 				notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
 			}
 			return;
 		}
+		const scheduledDate = result.meal.date;
 		kitchen.meals.push(result.meal);
-		refreshWeekShopping(weekStartForDate(result.meal.date));
-		weekOffset = weekOffsetForDate(result.meal.date);
-		plannedRecipe = result.plannedRecipe;
+		refreshWeekShopping(weekStartForDate(scheduledDate));
+		weekOffset = weekOffsetForDate(scheduledDate);
+		if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
+		plannedRecipeId = result.plannedRecipeId;
+		detailReturnFocus = null;
 		selectedMealServings = result.selectedMealServings;
-		selected = result.selected;
+		selectedId = result.selectedId;
 		resetMealDialogState();
-		modal = result.modal;
+		openModal(result.modal);
 		page = result.page;
+		void scrollCalendarToDate(scheduledDate);
 		notify('Meal scheduled.');
 	}
 	function applyHouseholdRoster(data: {
@@ -2901,7 +3152,7 @@
 			openAuthentication();
 			return;
 		}
-		modal = 'household';
+		openModal('household');
 		error = '';
 		householdBusy = true;
 		try {
@@ -2949,7 +3200,7 @@
 	function askRemoveMember(member: HouseholdMember) {
 		if (!canManageHousehold || member.role === 'owner' || member.id === user?.id) return;
 		memberToRemove = member;
-		modal = 'removeMember';
+		openModal('removeMember');
 		error = '';
 	}
 	async function confirmRemoveMember() {
@@ -2977,17 +3228,21 @@
 			openAuthentication();
 			return;
 		}
+		const trigger = activeFocusedElement();
 		error = '';
 		householdBusy = true;
 		try {
 			const data = await refreshHousehold();
 			if ((data.members ?? []).length <= 1) {
+				if (!modal) modalReturnFocus = trigger;
 				modal = 'household';
 				notify('You already have your own personal kitchen.');
 			} else {
+				if (!modal) modalReturnFocus = trigger;
 				modal = 'leave';
 			}
 		} catch (e) {
+			if (!modal) modalReturnFocus = trigger;
 			modal = 'household';
 			error = (e as Error).message;
 		} finally {
@@ -3045,12 +3300,21 @@
 		}
 	}
 	async function refreshNutrition() {
-		if (!selected || !needAI()) return;
+		const target = selected;
+		if (!target || !needAI()) return;
+		const targetId = target.id;
+		const requestedServings = target.servings;
+		const requestedIngredients = JSON.stringify(target.ingredients);
 		busy = true;
 		try {
-			const result = await ai('nutrition', { recipe: selected });
-			selected.nutrition = result.nutrition;
-			selected.nutritionStale = false;
+			const result = await ai('nutrition', { recipe: target });
+			const live = recipesById.get(targetId);
+			if (!live) return;
+			const changedInFlight =
+				live.servings !== requestedServings ||
+				JSON.stringify(live.ingredients) !== requestedIngredients;
+			live.nutrition = result.nutrition;
+			live.nutritionStale = changedInFlight;
 			kitchen.recipes = [...kitchen.recipes];
 			notify('Nutrition estimate refreshed, per serving.');
 		} catch (e) {
@@ -3061,6 +3325,16 @@
 	}
 	function applyClosedModalState(next: ReturnType<typeof closeModalDialog<HouseholdMember>>) {
 		if (
+			modal === 'settings' &&
+			(connectionActive ||
+				connectionPoll?.active ||
+				connectionPopup ||
+				chatGPTDevice ||
+				chatGPTAuthorizationUrl)
+		) {
+			void cancelChatGPTDevice();
+		}
+		if (
 			modal === 'plan' ||
 			modal === 'pickRecipe' ||
 			modal === 'editMeal' ||
@@ -3068,26 +3342,26 @@
 		) {
 			resetMealDialogState();
 		}
-		plannedRecipe = next.plannedRecipe;
+		plannedRecipeId = next.plannedRecipeId;
 		editingMealId = next.editingMealId;
 		cookingMealId = next.cookingMealId;
-		recipeToDelete = next.recipeToDelete;
+		recipeToDeleteId = next.recipeToDeleteId;
 		memberToRemove = next.memberToRemove;
 		inviteCode = next.inviteCode;
 		currentInviteId = next.currentInviteId;
 		resumeDialog = next.resumeDialog;
 		if (next.onboardingStatus) kitchen.preferences.onboardingStatus = next.onboardingStatus;
-		modal = next.modal;
+		openModal(next.modal);
 		error = '';
 	}
 	function closeDialog() {
 		applyClosedModalState(
 			closeModalDialog({
 				modal,
-				selected,
+				selectedId,
 				selectedMealServings,
-				plannedRecipe,
-				recipeToDelete,
+				plannedRecipeId,
+				recipeToDeleteId,
 				editingMealId,
 				cookingMealId,
 				memberToRemove,
@@ -3098,6 +3372,37 @@
 			})
 		);
 	}
+	function handleWindowKeydown(e: Pick<KeyboardEvent, 'key' | 'defaultPrevented'>) {
+		const result = dismissEscapeLayer(e, {
+			modal,
+			editingRecipe,
+			editingRecipeMode,
+			selectedId,
+			selectedMealServings,
+			mobileNav,
+			pantryDraft,
+			plannedRecipeId,
+			recipeToDeleteId,
+			editingMealId,
+			cookingMealId,
+			memberToRemove,
+			inviteCode,
+			currentInviteId,
+			resumeDialog,
+			onboardingStatus: kitchen.preferences.onboardingStatus
+		});
+		if (result.dismissed === 'modal') {
+			applyClosedModalState(result.state);
+		} else if (result.dismissed === 'editingRecipe') {
+			closeRecipeEditor();
+		} else if (result.dismissed === 'selected') {
+			openRecipeDetail(result.state.selectedId, result.state.selectedMealServings);
+		} else if (result.dismissed === 'mobileNav') {
+			mobileNav = result.state.mobileNav;
+		} else if (result.dismissed === 'pantryDraft') {
+			void cancelPantryEdit();
+		}
+	}
 	function openImport(text?: string) {
 		resumeDialog = '';
 		if (text !== undefined) {
@@ -3106,7 +3411,7 @@
 		}
 		error = '';
 		mobileNav = false;
-		modal = 'import';
+		openModal('import');
 	}
 	function importRecipe(url: string) {
 		if (voiceTarget === 'import') clearVoiceSession();
@@ -3129,10 +3434,13 @@
 		const saved = { ...recipe, saved: true, nutritionStale };
 		kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
 		if (voiceTarget === 'import') clearVoiceSession();
+		const returnTarget = modalReturnFocus;
 		importSession = emptyImportSession();
 		resumeDialog = '';
-		modal = '';
-		selected = saved;
+		openModal('');
+		detailReturnFocus = returnTarget;
+		selectedMealServings = undefined;
+		selectedId = saved.id;
 		page = 'saved';
 		query = '';
 		filter = 'For you';
@@ -3189,7 +3497,7 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
-			apiKey = '';
+			clearAIConnectionState();
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
@@ -3197,7 +3505,7 @@
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			syncing = false;
-			modal = '';
+			openModal('');
 			notify('Your account and personal data have been deleted.');
 		} catch (e) {
 			error = (e as Error).message;
@@ -3282,7 +3590,7 @@
 				applyRoster: applyHouseholdRoster
 			});
 			syncing = false;
-			modal = '';
+			openModal('');
 			notify('You now have your own kitchen.');
 		} catch (e) {
 			syncing = false;
@@ -3365,41 +3673,7 @@
 	><title>{nav.find((item) => item.id === page)?.name || 'Discover'} · Flavorithm</title
 	></svelte:head
 >
-<svelte:window
-	onkeydown={(e) => {
-		const result = dismissEscapeLayer(e, {
-			modal,
-			editingRecipe,
-			editingRecipeMode,
-			selected,
-			selectedMealServings,
-			mobileNav,
-			pantryDraft,
-			plannedRecipe,
-			recipeToDelete,
-			editingMealId,
-			cookingMealId,
-			memberToRemove,
-			inviteCode,
-			currentInviteId,
-			resumeDialog,
-			onboardingStatus: kitchen.preferences.onboardingStatus
-		});
-		if (result.dismissed === 'modal') {
-			applyClosedModalState(result.state);
-		} else if (result.dismissed === 'editingRecipe') {
-			editingRecipe = result.state.editingRecipe;
-			editingRecipeMode = result.state.editingRecipeMode ?? 'edit';
-		} else if (result.dismissed === 'selected') {
-			selected = result.state.selected;
-			selectedMealServings = result.state.selectedMealServings;
-		} else if (result.dismissed === 'mobileNav') {
-			mobileNav = result.state.mobileNav;
-		} else if (result.dismissed === 'pantryDraft') {
-			void cancelPantryEdit();
-		}
-	}}
-/>
+<svelte:window onkeydown={handleWindowKeydown} />
 <input
 	class="visually-hidden"
 	tabindex="-1"
@@ -3541,7 +3815,7 @@
 					>
 				</section>
 				{#if page === 'discover'}<div class="mobile-pantry-actions">
-						<button class="secondary" type="button" onclick={() => (modal = 'pantry')}
+						<button class="secondary" type="button" onclick={() => openModal('pantry')}
 							><Plus size={18} />Ingredients</button
 						>
 						<button
@@ -3568,7 +3842,7 @@
 							<h2>What’s in your kitchen?</h2>
 							<p>Add ingredients to inspire your recipes.</p>
 							<div class="banner-actions">
-								<button class="cream-button" type="button" onclick={() => (modal = 'pantry')}
+								<button class="cream-button" type="button" onclick={() => openModal('pantry')}
 									><Plus size={17} /> Add your ingredients <ArrowRight size={17} /></button
 								><button
 									class="banner-icon"
@@ -3601,8 +3875,9 @@
 					<div class="section-heading">
 						<div>
 							<h2>
-								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span class="small-spark"
-									>✷</span
+								{page === 'saved' ? 'Saved recipes' : 'Recipe ideas'}<span
+									class="small-spark"
+									aria-hidden="true">✷</span
 								>
 							</h2>
 						</div>
@@ -3615,7 +3890,7 @@
 							<button
 								class="primary"
 								onclick={() => {
-									modal = 'generate';
+									openModal('generate');
 									error = '';
 								}}><Sparkles size={17} /> Generate</button
 							>
@@ -3687,7 +3962,7 @@
 								<button
 									class="secondary"
 									onclick={() => {
-										modal = 'generate';
+										openModal('generate');
 										error = '';
 									}}><Sparkles size={16} /> Generate with AI</button
 								>
@@ -3703,10 +3978,7 @@
 								<div class="recipe-image">
 									<button
 										class="image-open"
-										onclick={() => {
-											selectedMealServings = undefined;
-											selected = recipe;
-										}}
+										onclick={() => openRecipeDetail(recipe.id)}
 										aria-label={`Open ${recipe.title}`}
 										><img
 											src={recipe.image || recipePlaceholder(recipe)}
@@ -3714,9 +3986,7 @@
 											alt={recipe.title}
 											loading={i > 2 ? 'lazy' : 'eager'}
 										/></button
-									>{#if recipe.hidden || recipe.tags[0] || recipe.cuisine}<span class="recipe-badge"
-											>{recipe.hidden ? 'Hidden' : recipe.tags[0] || recipe.cuisine}</span
-										>{/if}<button
+									><button
 										class:saved={recipe.saved}
 										class="save-recipe"
 										onclick={() => saveRecipe(recipe)}
@@ -3730,14 +4000,14 @@
 											{recipe.rating ? `★ ${recipe.rating.toFixed(1)}` : ''}</span
 										>
 									</div>
-									<button
-										class="recipe-title"
-										onclick={() => {
-											selectedMealServings = undefined;
-											selected = recipe;
-										}}>{recipe.title}<ArrowUpRight size={18} /></button
+									<button class="recipe-title" onclick={() => openRecipeDetail(recipe.id)}
+										>{recipe.title}<ArrowUpRight size={18} /></button
 									>
 									<p>{recipe.description}</p>
+									{#if recipe.hidden || recipe.tags.length}<ul class="recipe-tags">
+											{#if recipe.hidden}<li class="recipe-badge">Hidden</li>{/if}
+											{#each recipe.tags as tag}<li class="recipe-badge">{tag}</li>{/each}
+										</ul>{/if}
 									<div class="recipe-meta">
 										<span><Clock size={14} />{recipe.time} min</span>{#if recipe.difficulty}<span
 												><ChefHat size={14} />{recipe.difficulty}</span
@@ -3784,7 +4054,7 @@
 							</div>{/if}{/if}{#if capabilities.recipeSearch}<button
 							class="browse-link"
 							onclick={() => {
-								modal = 'search';
+								openModal('search');
 								error = '';
 							}}>Find recipes online <ArrowUpRight size={16} /></button
 						>{/if}
@@ -3795,7 +4065,7 @@
 						<h1>Your pantry<span class="heading-spark" aria-hidden="true">✳</span></h1>
 						<p>Track ingredients and quantities you have on hand.</p>
 					</div>
-					<button class="primary" onclick={() => (modal = 'pantry')}
+					<button class="primary" onclick={() => openModal('pantry')}
 						><Plus size={18} /> Add ingredients</button
 					>
 				</section>
@@ -4046,7 +4316,7 @@
 						</h2>
 						<button class="icon-button" onclick={() => weekOffset++} aria-label="Next week"
 							><ChevronRight size={20} /></button
-						><button class="text-button" onclick={() => (weekOffset = 0)}>This week</button>
+						><button class="text-button" onclick={showCurrentWeek}>This week</button>
 					</div>
 					<button
 						class="secondary"
@@ -4067,11 +4337,12 @@
 					>
 				</div>
 				{#key weekOffset}<div
+						bind:this={calendarGrid}
 						class="calendar-grid"
 						in:revealMotion|global={{ y: 8, duration: 220 }}
 					>
 						{#each week as day}{@const dayKey = dateKey(day)}
-							<div class:today={dayKey === todayKey} class="calendar-day">
+							<div data-date={dayKey} class:today={dayKey === todayKey} class="calendar-day">
 								<div class="day-heading">
 									<span>{weekdayFormatter.format(day)}</span><b>{day.getDate()}</b>
 								</div>
@@ -4081,10 +4352,7 @@
 												recipesById.get(meal.recipeId)}{#if recipe}<div class="calendar-meal">
 													<button
 														class="meal-open"
-														onclick={() => {
-															selectedMealServings = meal.servings;
-															selected = recipe;
-														}}
+														onclick={() => openRecipeDetail(recipe.id, meal.servings)}
 														>{#if !mobileCalendar}<img
 																src={recipe.image || recipePlaceholder(recipe)}
 																onerror={(event) => recipeImageError(event, recipe)}
@@ -4163,10 +4431,7 @@
 													>Clear leftovers <Check size={15} /></button
 												>{/if}<button
 												class="text-button"
-												onclick={() => {
-													selectedMealServings = undefined;
-													selected = recipe;
-												}}
+												onclick={() => openRecipeDetail(recipe.id)}
 												>{recipe.rating ? 'View rating' : 'Rate recipe'} <Star size={15} /></button
 											>
 										</div>
@@ -4348,16 +4613,14 @@
 		<RecipeDetail
 			recipe={selected}
 			initialServings={selectedMealServings ?? selected.servings}
+			returnFocus={detailReturnFocus}
 			bind:completedSteps={
 				() => cookingSteps[cookingSessionKey] ?? [],
 				(steps) => {
 					cookingSteps[cookingSessionKey] = steps;
 				}
 			}
-			close={() => {
-				selected = null;
-				selectedMealServings = undefined;
-			}}
+			close={() => openRecipeDetail(null)}
 			save={() => saveRecipe(selected!)}
 			shop={(servings) =>
 				shoppingFor(
@@ -4372,10 +4635,14 @@
 			toggleHidden={() => toggleRecipeHidden(selected!)}
 			{busy}
 			rate={(n) => {
-				selected!.rating = n;
-				kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [selected!.id]: n };
+				if (!selected) return;
+				kitchen.preferences.ratings = applyRecipeRating(selected, kitchen.preferences.ratings, n);
 				kitchen.recipes = [...kitchen.recipes];
-				notify('Rating saved. Future recipes will use your feedback.');
+				notify(
+					n === undefined
+						? 'Rating cleared.'
+						: 'Rating saved. Future recipes will use your feedback.'
+				);
 			}}
 		/>
 	</div>{/if}
@@ -4383,11 +4650,11 @@
 			recipe={editingRecipe}
 			mode={editingRecipeMode}
 			canUploadCover={Boolean(user) && online}
+			returnFocus={editorReturnFocus}
 			cancel={() => {
-				const next = cancelEditSavedRecipe(selected);
-				selected = next.selected;
-				editingRecipe = next.editingRecipe;
-				editingRecipeMode = next.editingRecipeMode;
+				const next = cancelEditSavedRecipe(selectedId);
+				selectedId = next.selectedId;
+				closeRecipeEditor();
 			}}
 			save={saveEditedRecipe}
 		/>{/key}{/if}
@@ -4396,7 +4663,7 @@
 			<div
 				class="flavor-dialog"
 				class:onboarding-dialog={modal === 'onboarding'}
-				use:focusTrap
+				use:focusTrap={{ returnFocus: modalReturnFocus }}
 				class:wide={modal === 'settings' ||
 					modal === 'pickRecipe' ||
 					modal === 'import' ||
@@ -5285,18 +5552,15 @@
 		flex: 1 1 220px;
 		max-width: 320px;
 		min-height: 44px;
-		padding: 0 12px;
-		border: 1px solid var(--line);
-		background: var(--surface);
 	}
 	.pantry-search input {
 		width: 100%;
 		min-width: 0;
 		font-size: 14px;
-		padding: 9px 0;
+		padding: 9px 10px;
 	}
 	.pantry-categories {
-		padding-bottom: 2px;
+		padding-bottom: 4px;
 	}
 	.expiry-filters {
 		display: flex;
@@ -5310,14 +5574,16 @@
 		align-items: center;
 		gap: 9px;
 		padding: 8px 12px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		font-size: 14px;
 	}
 	.expiry-filters button.active {
-		background: var(--green);
-		color: var(--paper);
-		border-color: var(--green);
+		padding: 7px 11px;
+		background: var(--chip-active-bg);
+		color: var(--ink);
+		border: 2px solid var(--chip-active-border);
+		font-weight: 700;
 	}
 	.expiry-filters button span {
 		min-width: 22px;
@@ -5497,7 +5763,7 @@
 		font-weight: 400;
 		color: var(--ink);
 		background: var(--surface);
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 	}
 	.filtered-pantry-empty {
 		padding: 32px 12px;
@@ -5516,13 +5782,13 @@
 	.shopping-name {
 		width: 100%;
 		min-width: 0;
-		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		padding: 4px 5px;
 		font-weight: 500;
 	}
-	.shopping-name:focus {
-		border-color: var(--line);
+	input.shopping-name {
+		padding: 7px 8px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
 	}
 	.shopping-source {
 		padding-left: 5px;
@@ -5539,18 +5805,15 @@
 	.shopping-quantity input {
 		min-width: 0;
 		width: 72px;
-		padding: 8px 5px;
-		border-color: transparent;
-		background: transparent;
+		padding: 7px 6px;
+		border: 1px solid var(--control-border);
+		background: var(--surface);
 		text-align: right;
 		font-size: 14px;
 	}
 	.shopping-quantity input:last-child {
 		width: 70px;
 		text-align: left;
-	}
-	.shopping-quantity input:focus {
-		border-color: var(--line);
 	}
 	.calendar-meal-actions {
 		min-height: 34px;
@@ -5645,7 +5908,7 @@
 		min-height: 44px;
 		padding: 12px 14px;
 		margin: 22px 0;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		background: var(--surface);
 		cursor: pointer;
 		font-size: 14px;
@@ -5655,7 +5918,7 @@
 		height: 24px;
 		flex: 0 0 24px;
 		margin-top: 1px;
-		accent-color: var(--green);
+		accent-color: var(--ink);
 	}
 	.cook-option span {
 		display: flex;
@@ -5701,6 +5964,9 @@
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
+		}
+		.expiry-filters button.active {
+			padding-inline: 5px;
 		}
 		.ingredient-meta {
 			flex-direction: row;

@@ -4,20 +4,20 @@ import type { AppState, Meal, Recipe } from '#lib/types.ts';
 import { resolveClosedDialog, type ResumeDialog } from '#lib/voice-capture.ts';
 
 export type RecipeSubflowReset = {
-	selected: null;
+	selectedId: null;
 	selectedMealServings: undefined;
 	editingRecipe: null;
 	editingRecipeMode: 'edit';
-	recipeToDelete: null;
-	plannedRecipe: null;
+	recipeToDeleteId: null;
+	plannedRecipeId: null;
 };
 
 export type ModalDialogState<TMember = unknown> = {
 	modal: string;
-	selected: Recipe | null;
+	selectedId: string | null;
 	selectedMealServings?: number;
-	plannedRecipe: Recipe | null;
-	recipeToDelete: Recipe | null;
+	plannedRecipeId: string | null;
+	recipeToDeleteId: string | null;
 	editingMealId: string;
 	cookingMealId: string;
 	memberToRemove: TMember | null;
@@ -41,14 +41,19 @@ export function isRecipeDetailInert(modal: string, editingRecipe: Recipe | null)
 	return Boolean(modal || editingRecipe);
 }
 
+export function resolveSelectedRecipe(recipes: Recipe[], selectedId: string | null): Recipe | null {
+	if (!selectedId) return null;
+	return recipes.find((item) => item.id === selectedId) ?? null;
+}
+
 export function clearRecipeSubflowState(): RecipeSubflowReset {
 	return {
-		selected: null,
+		selectedId: null,
 		selectedMealServings: undefined,
 		editingRecipe: null,
 		editingRecipeMode: 'edit',
-		recipeToDelete: null,
-		plannedRecipe: null
+		recipeToDeleteId: null,
+		plannedRecipeId: null
 	};
 }
 
@@ -64,25 +69,25 @@ export function cloneRecipeDraft(recipe: Recipe): Recipe {
 
 export function beginEditSavedRecipe(
 	recipes: Recipe[],
-	selected: Recipe | null,
-	recipe: Recipe
-): { selected: Recipe | null; editingRecipe: Recipe; editingRecipeMode: 'edit' } | null {
-	const saved = recipes.find((item) => item.id === recipe.id && item.saved);
+	selectedId: string | null,
+	recipeId: string
+): { selectedId: string | null; editingRecipe: Recipe; editingRecipeMode: 'edit' } | null {
+	const saved = recipes.find((item) => item.id === recipeId && item.saved);
 	if (!saved) return null;
 	return {
-		selected,
+		selectedId,
 		editingRecipe: cloneRecipeDraft(saved),
 		editingRecipeMode: 'edit'
 	};
 }
 
-export function cancelEditSavedRecipe(selected: Recipe | null): {
-	selected: Recipe | null;
+export function cancelEditSavedRecipe(selectedId: string | null): {
+	selectedId: string | null;
 	editingRecipe: null;
 	editingRecipeMode: 'edit';
 } {
 	return {
-		selected,
+		selectedId,
 		editingRecipe: null,
 		editingRecipeMode: 'edit'
 	};
@@ -90,11 +95,11 @@ export function cancelEditSavedRecipe(selected: Recipe | null): {
 
 export function applyEditedRecipe(
 	recipes: Recipe[],
-	selected: Recipe | null,
+	selectedId: string | null,
 	updated: Recipe
 ): {
 	recipes: Recipe[];
-	selected: Recipe | null;
+	selectedId: string | null;
 	editingRecipe: null;
 	editingRecipeMode: 'edit';
 	saved: Recipe | null;
@@ -104,7 +109,7 @@ export function applyEditedRecipe(
 	if (!previous || !previous.saved) {
 		return {
 			recipes,
-			selected,
+			selectedId,
 			editingRecipe: null,
 			editingRecipeMode: 'edit',
 			saved: null,
@@ -129,7 +134,7 @@ export function applyEditedRecipe(
 	};
 	return {
 		recipes: recipes.map((item) => (item.id === saved.id ? saved : item)),
-		selected: saved,
+		selectedId: saved.id,
 		editingRecipe: null,
 		editingRecipeMode: 'edit',
 		saved,
@@ -138,26 +143,28 @@ export function applyEditedRecipe(
 }
 
 export function beginDeleteSavedRecipe(
-	selected: Recipe | null,
-	recipe: Recipe
+	recipes: Recipe[],
+	selectedId: string | null,
+	recipeId: string
 ): {
-	selected: Recipe | null;
-	recipeToDelete: Recipe;
+	selectedId: string | null;
+	recipeToDeleteId: string;
 	modal: 'deleteRecipe';
 } | null {
-	if (!recipe.saved) return null;
+	const saved = recipes.find((item) => item.id === recipeId && item.saved);
+	if (!saved) return null;
 	return {
-		selected,
-		recipeToDelete: recipe,
+		selectedId,
+		recipeToDeleteId: saved.id,
 		modal: 'deleteRecipe'
 	};
 }
 
 export function confirmDeleteSavedRecipe(
 	kitchen: AppState,
-	selected: Recipe | null,
+	selectedId: string | null,
 	selectedMealServings: number | undefined,
-	recipeToDelete: Recipe | null,
+	recipeToDeleteId: string | null,
 	weekStartForDate: (date: string) => string
 ): {
 	recipes: Recipe[];
@@ -167,12 +174,14 @@ export function confirmDeleteSavedRecipe(
 	affectedWeeks: string[];
 	impactedMealsCount: number;
 	deletedRecipe: Recipe;
-	selected: Recipe | null;
+	selectedId: string | null;
 	selectedMealServings: number | undefined;
-	recipeToDelete: null;
+	recipeToDeleteId: null;
 	modal: '';
 } | null {
-	const recipe = recipeToDelete;
+	const recipe = recipeToDeleteId
+		? kitchen.recipes.find((item) => item.id === recipeToDeleteId)
+		: undefined;
 	if (!recipe) return null;
 	const impactedMeals = kitchen.meals.filter((meal) => meal.recipeId === recipe.id);
 	const affectedWeeks = [...new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)))];
@@ -186,7 +195,7 @@ export function confirmDeleteSavedRecipe(
 		ratings = { ...ratings };
 		delete ratings[recipe.id];
 	}
-	const closingSelected = selected?.id === recipe.id;
+	const closingSelected = selectedId === recipe.id;
 	return {
 		recipes,
 		meals,
@@ -195,28 +204,28 @@ export function confirmDeleteSavedRecipe(
 		affectedWeeks,
 		impactedMealsCount: impactedMeals.length,
 		deletedRecipe: recipe,
-		selected: closingSelected ? null : selected,
+		selectedId: closingSelected ? null : selectedId,
 		selectedMealServings: closingSelected ? undefined : selectedMealServings,
-		recipeToDelete: null,
+		recipeToDeleteId: null,
 		modal: ''
 	};
 }
 
 export function beginPlanRecipe(
-	selected: Recipe | null,
+	selectedId: string | null,
 	recipe: Recipe,
 	servings: number | undefined,
 	todayDate: string
 ): {
-	selected: Recipe | null;
-	plannedRecipe: Recipe;
+	selectedId: string | null;
+	plannedRecipeId: string;
 	plannedServings: number;
 	mealDate: string;
 	modal: 'plan';
 } {
 	return {
-		selected,
-		plannedRecipe: recipe,
+		selectedId,
+		plannedRecipeId: recipe.id,
 		plannedServings: servings ?? recipe.servings,
 		mealDate: todayDate,
 		modal: 'plan'
@@ -224,20 +233,20 @@ export function beginPlanRecipe(
 }
 
 export function pickRecipeForPlan(
-	selected: Recipe | null,
+	selectedId: string | null,
 	recipe: Recipe,
 	mealDate: string,
 	todayDate: string
 ): {
-	selected: Recipe | null;
-	plannedRecipe: Recipe;
+	selectedId: string | null;
+	plannedRecipeId: string;
 	plannedServings: number;
 	mealDate: string;
 	modal: 'plan';
 } {
 	return {
-		selected,
-		plannedRecipe: recipe,
+		selectedId,
+		plannedRecipeId: recipe.id,
 		plannedServings: recipe.servings,
 		mealDate: mealDate || todayDate,
 		modal: 'plan'
@@ -245,7 +254,8 @@ export function pickRecipeForPlan(
 }
 
 export function completePlanMeal(
-	plannedRecipe: Recipe | null,
+	recipes: Recipe[],
+	plannedRecipeId: string | null,
 	mealDate: string,
 	mealSlot: string,
 	plannedServings: number,
@@ -255,12 +265,15 @@ export function completePlanMeal(
 	| {
 			ok: true;
 			meal: Meal;
-			plannedRecipe: null;
-			selected: null;
+			plannedRecipeId: null;
+			selectedId: null;
 			selectedMealServings: undefined;
 			modal: '';
 			page: 'planner';
 	  } {
+	const plannedRecipe = plannedRecipeId
+		? recipes.find((item) => item.id === plannedRecipeId)
+		: undefined;
 	if (!plannedRecipe || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) {
 		return { ok: false, reason: 'missing' };
 	}
@@ -276,8 +289,8 @@ export function completePlanMeal(
 			recipeId: plannedRecipe.id,
 			servings: plannedServings
 		},
-		plannedRecipe: null,
-		selected: null,
+		plannedRecipeId: null,
+		selectedId: null,
 		selectedMealServings: undefined,
 		modal: '',
 		page: 'planner'
@@ -288,10 +301,10 @@ export function closeModalDialog<TMember = unknown>(
 	state: ModalDialogState<TMember>
 ): ModalDialogState<TMember> {
 	const next: ModalDialogState<TMember> = { ...state };
-	if (state.modal === 'plan') next.plannedRecipe = null;
+	if (state.modal === 'plan') next.plannedRecipeId = null;
 	if (state.modal === 'editMeal') next.editingMealId = '';
 	if (state.modal === 'cookMeal') next.cookingMealId = '';
-	if (state.modal === 'deleteRecipe') next.recipeToDelete = null;
+	if (state.modal === 'deleteRecipe') next.recipeToDeleteId = null;
 	if (state.modal === 'removeMember') next.memberToRemove = null;
 	if (state.modal === 'household') {
 		next.inviteCode = '';
@@ -337,12 +350,12 @@ export function dismissEscapeLayer<TMember = unknown, TPantryDraft = unknown>(
 			}
 		};
 	}
-	if (state.selected) {
+	if (state.selectedId) {
 		return {
 			dismissed: 'selected',
 			state: {
 				...state,
-				selected: null,
+				selectedId: null,
 				selectedMealServings: undefined
 			}
 		};

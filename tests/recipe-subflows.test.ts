@@ -14,6 +14,7 @@ import {
 	dismissEscapeLayer,
 	isRecipeDetailInert,
 	pickRecipeForPlan,
+	resolveSelectedRecipe,
 	type EscapeLayerState
 } from '../src/lib/recipe-subflows.ts';
 import type { AppState, Recipe } from '../src/lib/types.ts';
@@ -74,11 +75,11 @@ function makeEscapeState(overrides: Partial<EscapeLayerState> = {}): EscapeLayer
 	return {
 		modal: '',
 		editingRecipe: null,
-		selected: null,
+		selectedId: null,
 		selectedMealServings: undefined,
 		mobileNav: false,
-		plannedRecipe: null,
-		recipeToDelete: null,
+		plannedRecipeId: null,
+		recipeToDeleteId: null,
 		editingMealId: '',
 		cookingMealId: '',
 		memberToRemove: null,
@@ -90,15 +91,30 @@ function makeEscapeState(overrides: Partial<EscapeLayerState> = {}): EscapeLayer
 	};
 }
 
-test('editing an open saved recipe preserves selected on cancel and updates selected + nutritionStale on save', () => {
+test('resolveSelectedRecipe reflects live kitchen recipes across replacements and deletions', () => {
+	const initial = makeRecipe({ title: 'Initial Title', servings: 4 });
+	const other = makeRecipe({ id: 'chili', title: 'Smoky Chili' });
+
+	assert.equal(resolveSelectedRecipe([initial, other], null), null);
+	assert.equal(resolveSelectedRecipe([initial, other], initial.id), initial);
+
+	// Replacing kitchen.recipes with synced/undo state returns the updated Recipe object.
+	const synced = makeRecipe({ title: 'Synced Title', servings: 6, rating: 5 });
+	assert.equal(resolveSelectedRecipe([synced, other], initial.id), synced);
+
+	// Replacing kitchen.recipes without the recipe resolves to null instead of keeping a stale object.
+	assert.equal(resolveSelectedRecipe([other], initial.id), null);
+});
+
+test('editing an open saved recipe preserves selectedId on cancel and updates saved recipe + nutritionStale on save', () => {
 	const original = makeRecipe();
 	const other = makeRecipe({ id: 'chili', title: 'Smoky Chili' });
 	const recipes = [original, other];
 
-	// Open RecipeEditor from RecipeDetail: selected stays mounted and wrapper becomes inert.
-	const started = beginEditSavedRecipe(recipes, original, original);
+	// Open RecipeEditor from RecipeDetail: selectedId stays set and wrapper becomes inert.
+	const started = beginEditSavedRecipe(recipes, original.id, original.id);
 	assert.ok(started);
-	assert.equal(started.selected, original);
+	assert.equal(started.selectedId, original.id);
 	assert.equal(started.editingRecipeMode, 'edit');
 	assert.notEqual(started.editingRecipe, original);
 	assert.equal(isRecipeDetailInert('', started.editingRecipe), true);
@@ -109,33 +125,36 @@ test('editing an open saved recipe preserves selected on cancel and updates sele
 	assert.equal(original.title, 'Lemon Herb Pasta');
 	assert.equal(original.ingredients[0].quantity, 400);
 
-	const canceled = cancelEditSavedRecipe(started.selected);
-	assert.equal(canceled.selected, original);
+	const canceled = cancelEditSavedRecipe(started.selectedId);
+	assert.equal(canceled.selectedId, original.id);
 	assert.equal(canceled.editingRecipe, null);
 	assert.equal(canceled.editingRecipeMode, 'edit');
 	assert.equal(isRecipeDetailInert('', canceled.editingRecipe), false);
 
-	// Saving non-ingredient/non-serving changes updates selected without marking nutrition stale.
-	const renamed = applyEditedRecipe(recipes, original, {
+	// Saving non-ingredient/non-serving changes updates recipe without marking nutrition stale.
+	const renamed = applyEditedRecipe(recipes, original.id, {
 		...original,
 		title: 'Weeknight Lemon Pasta'
 	});
 	assert.equal(renamed.editingRecipe, null);
 	assert.equal(renamed.nutritionNeedsRefresh, false);
-	assert.equal(renamed.selected?.title, 'Weeknight Lemon Pasta');
-	assert.equal(renamed.selected?.nutritionStale, undefined);
+	assert.equal(renamed.selectedId, original.id);
+	const renamedSelected = resolveSelectedRecipe(renamed.recipes, renamed.selectedId);
+	assert.equal(renamedSelected?.title, 'Weeknight Lemon Pasta');
+	assert.equal(renamedSelected?.nutritionStale, undefined);
 
-	// Saving serving or ingredient changes assigns selected = saved and marks nutritionStale true.
-	const rescaled = applyEditedRecipe(renamed.recipes, renamed.selected, {
+	// Saving serving or ingredient changes updates recipes[0] and marks nutritionStale true.
+	const rescaled = applyEditedRecipe(renamed.recipes, renamed.selectedId, {
 		...renamed.saved!,
 		servings: 6
 	});
 	assert.equal(rescaled.editingRecipe, null);
 	assert.equal(rescaled.editingRecipeMode, 'edit');
 	assert.equal(rescaled.nutritionNeedsRefresh, true);
-	assert.equal(rescaled.selected?.servings, 6);
-	assert.equal(rescaled.selected?.nutritionStale, true);
-	assert.equal(rescaled.recipes[0], rescaled.selected);
+	const rescaledSelected = resolveSelectedRecipe(rescaled.recipes, rescaled.selectedId);
+	assert.equal(rescaledSelected?.servings, 6);
+	assert.equal(rescaledSelected?.nutritionStale, true);
+	assert.equal(rescaled.recipes[0], rescaledSelected);
 
 	// Manual recipes with zero nutrition keep nutritionStale true until non-zero nutrition is entered.
 	const manualZero = makeRecipe({
@@ -153,37 +172,44 @@ test('editing an open saved recipe preserves selected on cancel and updates sele
 			protein: 0
 		}
 	});
-	const manualRenamed = applyEditedRecipe([manualZero], manualZero, {
+	const manualRenamed = applyEditedRecipe([manualZero], manualZero.id, {
 		...manualZero,
 		title: 'Hearty Manual Stew'
 	});
 	assert.equal(manualRenamed.nutritionNeedsRefresh, false);
-	assert.equal(manualRenamed.selected?.nutritionStale, true);
+	assert.equal(
+		resolveSelectedRecipe(manualRenamed.recipes, manualRenamed.selectedId)?.nutritionStale,
+		true
+	);
 
-	const manualWithNutrition = applyEditedRecipe(manualRenamed.recipes, manualRenamed.selected, {
+	const manualWithNutrition = applyEditedRecipe(manualRenamed.recipes, manualRenamed.selectedId, {
 		...manualRenamed.saved!,
 		nutrition: { ...manualRenamed.saved!.nutrition, calories: 420, protein: 28 }
 	});
 	assert.equal(manualWithNutrition.nutritionNeedsRefresh, false);
-	assert.equal(manualWithNutrition.selected?.nutritionStale, false);
+	assert.equal(
+		resolveSelectedRecipe(manualWithNutrition.recipes, manualWithNutrition.selectedId)
+			?.nutritionStale,
+		false
+	);
 });
 
-test('Basil edit subflow with selected === null keeps selected null on cancel and opens saved recipe on save', () => {
+test('Basil edit subflow with selectedId === null keeps selectedId null on cancel and opens saved recipe on save', () => {
 	const savedRecipe = makeRecipe();
 	const unsavedRecipe = makeRecipe({ id: 'unsaved', saved: false });
 	const recipes = [savedRecipe, unsavedRecipe];
 
-	assert.equal(beginEditSavedRecipe(recipes, null, unsavedRecipe), null);
+	assert.equal(beginEditSavedRecipe(recipes, null, unsavedRecipe.id), null);
 
-	const started = beginEditSavedRecipe(recipes, null, savedRecipe);
+	const started = beginEditSavedRecipe(recipes, null, savedRecipe.id);
 	assert.ok(started);
-	assert.equal(started.selected, null);
+	assert.equal(started.selectedId, null);
 
-	const canceled = cancelEditSavedRecipe(started.selected);
-	assert.equal(canceled.selected, null);
+	const canceled = cancelEditSavedRecipe(started.selectedId);
+	assert.equal(canceled.selectedId, null);
 	assert.equal(canceled.editingRecipe, null);
 
-	const applied = applyEditedRecipe(recipes, started.selected, {
+	const applied = applyEditedRecipe(recipes, started.selectedId, {
 		...started.editingRecipe,
 		ingredients: [
 			...started.editingRecipe.ingredients,
@@ -192,15 +218,16 @@ test('Basil edit subflow with selected === null keeps selected null on cancel an
 	});
 	assert.equal(applied.editingRecipe, null);
 	assert.equal(applied.nutritionNeedsRefresh, true);
-	assert.equal(applied.selected?.id, savedRecipe.id);
-	assert.equal(applied.selected?.nutritionStale, true);
+	assert.equal(applied.selectedId, savedRecipe.id);
+	assert.equal(resolveSelectedRecipe(applied.recipes, applied.selectedId)?.nutritionStale, true);
 });
 
-test('delete subflow keeps selected on Keep recipe and clears selected + kitchen references on confirm', () => {
+test('delete subflow keeps selectedId on Keep recipe and clears selectedId + kitchen references on confirm', () => {
 	const target = makeRecipe({ rating: 5 });
 	const keptRecipe = makeRecipe({ id: 'soup', title: 'Tomato Soup' });
+	const unsaved = makeRecipe({ id: 'draft', saved: false });
 	const kitchen = makeKitchen({
-		recipes: [target, keptRecipe],
+		recipes: [target, keptRecipe, unsaved],
 		meals: [
 			{ id: 'm1', date: '2026-11-18', slot: 'Dinner', recipeId: target.id, servings: 4 },
 			{ id: 'm2', date: '2026-11-19', slot: 'Lunch', recipeId: keptRecipe.id, servings: 2 }
@@ -237,42 +264,42 @@ test('delete subflow keeps selected on Keep recipe and clears selected + kitchen
 		}
 	});
 
-	assert.equal(beginDeleteSavedRecipe(target, makeRecipe({ saved: false })), null);
+	assert.equal(beginDeleteSavedRecipe(kitchen.recipes, target.id, unsaved.id), null);
 
-	const asked = beginDeleteSavedRecipe(target, target);
+	const asked = beginDeleteSavedRecipe(kitchen.recipes, target.id, target.id);
 	assert.ok(asked);
-	assert.equal(asked.selected, target);
-	assert.equal(asked.recipeToDelete, target);
+	assert.equal(asked.selectedId, target.id);
+	assert.equal(asked.recipeToDeleteId, target.id);
 	assert.equal(asked.modal, 'deleteRecipe');
 	assert.equal(isRecipeDetailInert(asked.modal, null), true);
 
-	// Clicking "Keep recipe" runs closeModalDialog: clears delete dialog and preserves selected.
+	// Clicking "Keep recipe" runs closeModalDialog: clears delete dialog and preserves selectedId.
 	const kept = closeModalDialog(
 		makeEscapeState({
 			modal: asked.modal,
-			selected: asked.selected,
+			selectedId: asked.selectedId,
 			selectedMealServings: 6,
-			recipeToDelete: asked.recipeToDelete
+			recipeToDeleteId: asked.recipeToDeleteId
 		})
 	);
 	assert.equal(kept.modal, '');
-	assert.equal(kept.recipeToDelete, null);
-	assert.equal(kept.selected, target);
+	assert.equal(kept.recipeToDeleteId, null);
+	assert.equal(kept.selectedId, target.id);
 	assert.equal(kept.selectedMealServings, 6);
 	assert.equal(isRecipeDetailInert(kept.modal, null), false);
 
-	// Confirming delete removes recipe, meals, shopping items, rating, and clears selected.
-	const deleted = confirmDeleteSavedRecipe(kitchen, target, 6, target, () => '2026-11-16');
+	// Confirming delete removes recipe, meals, shopping items, rating, and clears selectedId.
+	const deleted = confirmDeleteSavedRecipe(kitchen, target.id, 6, target.id, () => '2026-11-16');
 	assert.ok(deleted);
-	assert.equal(deleted.selected, null);
+	assert.equal(deleted.selectedId, null);
 	assert.equal(deleted.selectedMealServings, undefined);
-	assert.equal(deleted.recipeToDelete, null);
+	assert.equal(deleted.recipeToDeleteId, null);
 	assert.equal(deleted.modal, '');
 	assert.equal(deleted.impactedMealsCount, 1);
 	assert.deepEqual(deleted.affectedWeeks, ['2026-11-16']);
 	assert.deepEqual(
 		deleted.recipes.map((r) => r.id),
-		[keptRecipe.id]
+		[keptRecipe.id, unsaved.id]
 	);
 	assert.deepEqual(
 		deleted.meals.map((m) => m.id),
@@ -285,33 +312,34 @@ test('delete subflow keeps selected on Keep recipe and clears selected + kitchen
 	assert.deepEqual(deleted.ratings, { [keptRecipe.id]: 4 });
 });
 
-test('meal scheduling separates plannedRecipe from selected across RecipeDetail and planner pickRecipe flows', () => {
+test('meal scheduling separates plannedRecipeId from selectedId across RecipeDetail and planner pickRecipe flows', () => {
 	const openRecipe = makeRecipe();
 	const pickedRecipe = makeRecipe({ id: 'curry', title: 'Chickpea Curry', servings: 3 });
+	const recipes = [openRecipe, pickedRecipe];
 
-	// 1. Plan from open RecipeDetail with custom servings, then cancel -> selected stays open.
-	const fromDetail = beginPlanRecipe(openRecipe, openRecipe, 6, '2026-11-21');
-	assert.equal(fromDetail.selected, openRecipe);
-	assert.equal(fromDetail.plannedRecipe, openRecipe);
+	// 1. Plan from open RecipeDetail with custom servings, then cancel -> selectedId stays open.
+	const fromDetail = beginPlanRecipe(openRecipe.id, openRecipe, 6, '2026-11-21');
+	assert.equal(fromDetail.selectedId, openRecipe.id);
+	assert.equal(fromDetail.plannedRecipeId, openRecipe.id);
 	assert.equal(fromDetail.plannedServings, 6);
 	assert.equal(fromDetail.modal, 'plan');
 
 	const canceledFromDetail = closeModalDialog(
 		makeEscapeState({
 			modal: fromDetail.modal,
-			selected: fromDetail.selected,
+			selectedId: fromDetail.selectedId,
 			selectedMealServings: 5,
-			plannedRecipe: fromDetail.plannedRecipe
+			plannedRecipeId: fromDetail.plannedRecipeId
 		})
 	);
 	assert.equal(canceledFromDetail.modal, '');
-	assert.equal(canceledFromDetail.plannedRecipe, null);
-	assert.equal(canceledFromDetail.selected, openRecipe);
+	assert.equal(canceledFromDetail.plannedRecipeId, null);
+	assert.equal(canceledFromDetail.selectedId, openRecipe.id);
 	assert.equal(canceledFromDetail.selectedMealServings, 5);
 
-	// Confirming addMeal intentionally closes RecipeDetail and schedules plannedRecipe.
+	// Confirming addMeal intentionally closes RecipeDetail and schedules plannedRecipeId.
 	assert.deepEqual(
-		completePlanMeal(openRecipe, '2026-11-21', 'Snack', 4, () => 'meal-1'),
+		completePlanMeal(recipes, openRecipe.id, '2026-11-21', 'Snack', 4, () => 'meal-1'),
 		{
 			ok: false,
 			reason: 'missing'
@@ -319,7 +347,7 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 	);
 	for (const badServings of [0, 2.5, MAX_SERVINGS + 1]) {
 		assert.deepEqual(
-			completePlanMeal(openRecipe, '2026-11-21', 'Dinner', badServings, () => 'meal-1'),
+			completePlanMeal(recipes, openRecipe.id, '2026-11-21', 'Dinner', badServings, () => 'meal-1'),
 			{
 				ok: false,
 				reason: 'invalidServings'
@@ -327,7 +355,8 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 		);
 	}
 	const highYield = completePlanMeal(
-		openRecipe,
+		recipes,
+		openRecipe.id,
 		'2026-11-21',
 		'Dinner',
 		MAX_SERVINGS,
@@ -336,7 +365,8 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 	assert.equal(highYield.ok, true);
 	if (highYield.ok) assert.equal(highYield.meal.servings, MAX_SERVINGS);
 	const scheduledFromDetail = completePlanMeal(
-		fromDetail.plannedRecipe,
+		recipes,
+		fromDetail.plannedRecipeId,
 		fromDetail.mealDate,
 		'Dinner',
 		fromDetail.plannedServings,
@@ -351,17 +381,17 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 			recipeId: openRecipe.id,
 			servings: 6
 		});
-		assert.equal(scheduledFromDetail.plannedRecipe, null);
-		assert.equal(scheduledFromDetail.selected, null);
+		assert.equal(scheduledFromDetail.plannedRecipeId, null);
+		assert.equal(scheduledFromDetail.selectedId, null);
 		assert.equal(scheduledFromDetail.selectedMealServings, undefined);
 		assert.equal(scheduledFromDetail.modal, '');
 		assert.equal(scheduledFromDetail.page, 'planner');
 	}
 
-	// 2. Plan via planner pickRecipe: selected stays null so canceling returns to planner.
+	// 2. Plan via planner pickRecipe: selectedId stays null so canceling returns to planner.
 	const fromPicker = pickRecipeForPlan(null, pickedRecipe, '', '2026-11-22');
-	assert.equal(fromPicker.selected, null);
-	assert.equal(fromPicker.plannedRecipe, pickedRecipe);
+	assert.equal(fromPicker.selectedId, null);
+	assert.equal(fromPicker.plannedRecipeId, pickedRecipe.id);
 	assert.equal(fromPicker.plannedServings, 3);
 	assert.equal(fromPicker.mealDate, '2026-11-22');
 	assert.equal(fromPicker.modal, 'plan');
@@ -369,13 +399,13 @@ test('meal scheduling separates plannedRecipe from selected across RecipeDetail 
 	const canceledFromPicker = closeModalDialog(
 		makeEscapeState({
 			modal: fromPicker.modal,
-			selected: fromPicker.selected,
-			plannedRecipe: fromPicker.plannedRecipe
+			selectedId: fromPicker.selectedId,
+			plannedRecipeId: fromPicker.plannedRecipeId
 		})
 	);
 	assert.equal(canceledFromPicker.modal, '');
-	assert.equal(canceledFromPicker.plannedRecipe, null);
-	assert.equal(canceledFromPicker.selected, null);
+	assert.equal(canceledFromPicker.plannedRecipeId, null);
+	assert.equal(canceledFromPicker.selectedId, null);
 });
 
 test('settings, onboarding, resumeDialog, and identity reset helpers preserve or clear recipe state appropriately', () => {
@@ -386,32 +416,32 @@ test('settings, onboarding, resumeDialog, and identity reset helpers preserve or
 	const closedSettings = closeModalDialog(
 		makeEscapeState({
 			modal: 'settings',
-			selected: activeRecipe,
+			selectedId: activeRecipe.id,
 			selectedMealServings: 4
 		})
 	);
 	assert.equal(closedSettings.modal, '');
-	assert.equal(closedSettings.selected, activeRecipe);
+	assert.equal(closedSettings.selectedId, activeRecipe.id);
 	assert.equal(isRecipeDetailInert(closedSettings.modal, null), false);
 
-	// Settings -> Onboarding dismissed via closeModalDialog records skipped onboarding without dropping selected.
+	// Settings -> Onboarding dismissed via closeModalDialog records skipped onboarding without dropping selectedId.
 	const closedOnboarding = closeModalDialog(
 		makeEscapeState({
 			modal: 'onboarding',
-			selected: activeRecipe,
+			selectedId: activeRecipe.id,
 			onboardingStatus: undefined
 		})
 	);
 	assert.equal(closedOnboarding.modal, '');
 	assert.equal(closedOnboarding.onboardingStatus, 'skipped');
-	assert.equal(closedOnboarding.selected, activeRecipe);
+	assert.equal(closedOnboarding.selectedId, activeRecipe.id);
 
 	// Settings or auth opened during recipe import or pantry dictation resumes target dialog when closed.
 	const resumedImport = closeModalDialog(
 		makeEscapeState({
 			modal: 'settings',
 			resumeDialog: 'import',
-			selected: null
+			selectedId: null
 		})
 	);
 	assert.equal(resumedImport.modal, 'import');
@@ -421,46 +451,46 @@ test('settings, onboarding, resumeDialog, and identity reset helpers preserve or
 		makeEscapeState({
 			modal: 'auth',
 			resumeDialog: 'pantry',
-			selected: activeRecipe
+			selectedId: activeRecipe.id
 		})
 	);
 	assert.equal(resumedPantry.modal, 'pantry');
 	assert.equal(resumedPantry.resumeDialog, '');
-	assert.equal(resumedPantry.selected, activeRecipe);
+	assert.equal(resumedPantry.selectedId, activeRecipe.id);
 
 	const closedPantry = closeModalDialog(
 		makeEscapeState({
 			modal: 'pantry',
 			resumeDialog: 'pantry',
-			selected: activeRecipe
+			selectedId: activeRecipe.id
 		})
 	);
 	assert.equal(closedPantry.modal, '');
 	assert.equal(closedPantry.resumeDialog, '');
-	assert.equal(closedPantry.selected, activeRecipe);
+	assert.equal(closedPantry.selectedId, activeRecipe.id);
 
 	// Account, household, and freshKitchen reset helper clears all transient recipe state.
 	assert.deepEqual(clearRecipeSubflowState(), {
-		selected: null,
+		selectedId: null,
 		selectedMealServings: undefined,
 		editingRecipe: null,
 		editingRecipeMode: 'edit',
-		recipeToDelete: null,
-		plannedRecipe: null
+		recipeToDeleteId: null,
+		plannedRecipeId: null
 	});
 });
 
-test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe, selected, mobileNav, then pantryDraft', () => {
+test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe, selectedId, mobileNav, then pantryDraft', () => {
 	const activeRecipe = makeRecipe();
 	const draft = makeRecipe({ title: 'Draft Edit' });
 	const pantryEdit = { id: 'p1', quantity: 2, unit: 'g', category: 'Pantry', expires: '' };
 
 	let state = makeEscapeState({
 		modal: 'deleteRecipe',
-		recipeToDelete: activeRecipe,
+		recipeToDeleteId: activeRecipe.id,
 		editingRecipe: draft,
 		editingRecipeMode: 'create',
-		selected: activeRecipe,
+		selectedId: activeRecipe.id,
 		selectedMealServings: 6,
 		mobileNav: true,
 		pantryDraft: pantryEdit
@@ -478,9 +508,9 @@ test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe
 	assert.equal(step.dismissed, 'modal');
 	state = step.state;
 	assert.equal(state.modal, '');
-	assert.equal(state.recipeToDelete, null);
+	assert.equal(state.recipeToDeleteId, null);
 	assert.equal(state.editingRecipe, draft);
-	assert.equal(state.selected, activeRecipe);
+	assert.equal(state.selectedId, activeRecipe.id);
 	assert.equal(state.selectedMealServings, 6);
 	assert.equal(state.mobileNav, true);
 	assert.equal(state.pantryDraft, pantryEdit);
@@ -491,16 +521,16 @@ test('layered Escape ignores defaultPrevented and dismisses modal, editingRecipe
 	state = step.state;
 	assert.equal(state.editingRecipe, null);
 	assert.equal(state.editingRecipeMode, 'edit');
-	assert.equal(state.selected, activeRecipe);
+	assert.equal(state.selectedId, activeRecipe.id);
 	assert.equal(state.selectedMealServings, 6);
 	assert.equal(state.mobileNav, true);
 	assert.equal(state.pantryDraft, pantryEdit);
 
-	// 3rd Escape dismisses selected and clears selectedMealServings, keeping mobileNav and pantryDraft.
+	// 3rd Escape dismisses selectedId and clears selectedMealServings, keeping mobileNav and pantryDraft.
 	step = dismissEscapeLayer({ key: 'Escape' }, state);
 	assert.equal(step.dismissed, 'selected');
 	state = step.state;
-	assert.equal(state.selected, null);
+	assert.equal(state.selectedId, null);
 	assert.equal(state.selectedMealServings, undefined);
 	assert.equal(state.mobileNav, true);
 	assert.equal(state.pantryDraft, pantryEdit);
