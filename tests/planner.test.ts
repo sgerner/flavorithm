@@ -17,6 +17,7 @@ import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
+import * as importSessionMod from '../src/lib/import-session.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import { calendarDayScrollLeft, weekOffsetFromStarts } from '../src/lib/planner.ts';
@@ -24,6 +25,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -99,6 +101,9 @@ function injectPlannerHook(svelteSource: string): string {
 		set editingRecipe(value: Recipe | null) { editingRecipe = value; },
 		get editingRecipeMode() { return editingRecipeMode; },
 		set editingRecipeMode(value: 'create' | 'edit') { editingRecipeMode = value; },
+		setRecipeEditor: (value: { requestCancel: () => void | Promise<void> } | undefined) => {
+			recipeEditor = value as any;
+		},
 		get modal() { return modal; },
 		set modal(value: string) { modal = value; },
 		get resumeDialog() { return resumeDialog; },
@@ -114,6 +119,8 @@ function injectPlannerHook(svelteSource: string): string {
 		set mobileNav(value: boolean) { mobileNav = value; },
 		get pantryDraft() { return pantryDraft; },
 		set pantryDraft(value: PantryDraft | null) { pantryDraft = value; },
+		get editingShoppingId() { return editingShoppingId; },
+		startEditingShoppingItem,
 		closeRecipeDetail,
 		closeRecipeEditor,
 		closeDialog,
@@ -180,6 +187,7 @@ type PlannerHarnessApi = {
 	selectedMealServings: number | undefined;
 	editingRecipe: Recipe | null;
 	editingRecipeMode: 'create' | 'edit';
+	setRecipeEditor: (value: { requestCancel: () => void | Promise<void> } | undefined) => void;
 	modal: string;
 	resumeDialog: string;
 	recipeToDelete: Recipe | null;
@@ -187,6 +195,8 @@ type PlannerHarnessApi = {
 	setButlerChat: (value: { close: () => void | Promise<void> } | undefined) => void;
 	mobileNav: boolean;
 	pantryDraft: workflowsMod.PantryDraft | null;
+	readonly editingShoppingId: string;
+	startEditingShoppingItem: (item: AppState['shopping'][number]) => Promise<void>;
 	closeRecipeDetail: () => void;
 	closeRecipeEditor: () => void;
 	closeDialog: () => void;
@@ -224,6 +234,7 @@ function createModuleMap() {
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
+		'#lib/import-session.ts': importSessionMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
@@ -236,6 +247,7 @@ function createModuleMap() {
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
+		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/components/ModalDialog.svelte': noopComponentModule,
 		'#lib/components/MobileDrawer.svelte': noopComponentModule,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
@@ -246,15 +258,7 @@ function createModuleMap() {
 		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
 			default: noopComponent,
-			emptyImportSession: () => ({
-				url: '',
-				text: '',
-				photo: '',
-				photoName: '',
-				draft: null,
-				baseline: null,
-				assumptions: []
-			})
+			emptyImportSession: importSessionMod.emptyImportSession
 		}
 	} as Record<string, unknown>;
 }
@@ -1116,20 +1120,53 @@ test('handleWindowKeydown dismisses one Escape layer at a time in strict precede
 		assert.equal(api.mobileNav, true);
 		assert.ok(api.pantryDraft);
 
-		// 6. Closes mobileNav drawer
+		api.page = 'shopping';
+		if (api.kitchen.shopping.length === 0) {
+			api.kitchen.shopping = [
+				{ id: 'shop-1', name: 'Lemons', quantity: 3, unit: 'pieces', checked: false }
+			];
+		}
+		await api.startEditingShoppingItem(api.kitchen.shopping[0]);
+		api.kitchen.shopping[0].name = 'Edited lemons';
+		assert.equal(api.editingShoppingId, api.kitchen.shopping[0].id);
+
+		// 6. Closes mobileNav drawer before inline row edits
 		const esc6 = makeKeyEvent('Escape');
 		api.handleWindowKeydown(esc6);
 		assert.equal(esc6.defaultPrevented, true);
 		assert.equal(api.mobileNav, false);
+		assert.equal(api.editingShoppingId, api.kitchen.shopping[0].id);
 		assert.ok(api.pantryDraft);
 
-		// 7. Cancels inline pantryDraft edit last
+		// 7. Cancels active shopping row edit when on the shopping page
 		const esc7 = makeKeyEvent('Escape');
 		api.handleWindowKeydown(esc7);
 		assert.equal(esc7.defaultPrevented, true);
+		assert.equal(api.editingShoppingId, '');
+		assert.equal(api.kitchen.shopping[0].name, 'Lemons');
+		assert.ok(api.pantryDraft);
+
+		// 8. Cancels inline pantryDraft edit last
+		const esc8 = makeKeyEvent('Escape');
+		api.handleWindowKeydown(esc8);
+		assert.equal(esc8.defaultPrevented, true);
 		assert.equal(api.pantryDraft, null);
 		await Promise.resolve();
 		await Promise.resolve();
+
+		// Also delegates editingRecipe window Escape to RecipeEditor.requestCancel when mounted
+		let requestCancelCalls = 0;
+		api.editingRecipe = draftRecipe;
+		api.setRecipeEditor({
+			requestCancel: () => {
+				requestCancelCalls += 1;
+			}
+		});
+		const escGuard = makeKeyEvent('Escape');
+		api.handleWindowKeydown(escGuard);
+		assert.equal(escGuard.defaultPrevented, true);
+		assert.equal(requestCancelCalls, 1);
+		assert.equal(api.editingRecipe?.id, draftRecipe.id);
 	} finally {
 		dispose();
 	}
