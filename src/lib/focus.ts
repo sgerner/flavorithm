@@ -20,7 +20,7 @@ export type FocusHandoffOptions = {
 };
 
 export const FOCUSABLE_SELECTOR =
-	'button:not([disabled]),a[href],input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])';
+	'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),summary:not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])';
 
 const ITEM_SELECTOR =
 	'article,li,[role="listitem"],.pantry-row,.shopping-row,.calendar-meal,.cooked-history-row,.member-row,.invite-row,.draft-ingredient,.draft-step';
@@ -349,7 +349,7 @@ export function focusTrap(node: HTMLElement, options: FocusTrapOptions = {}) {
 					const returnTarget = resolveTrapReturnTarget(fallbackOption);
 					originalFocus = null;
 					originalSnapshot = null;
-					returnTarget?.focus();
+					returnTarget?.focus({ preventScroll: true });
 				}
 			});
 		}

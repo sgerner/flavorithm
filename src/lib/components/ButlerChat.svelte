@@ -545,13 +545,20 @@
 		align-items: center;
 		gap: 5px;
 		padding: 4px 10px 4px 4px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		border-radius: 40px;
 		color: var(--surface);
 		background: var(--ink);
 		box-shadow: 0 4px 20px #0002;
 		font-size: 12px;
 		font-weight: 650;
+	}
+	.butler-launcher:focus-visible {
+		outline: 2px solid var(--focus-outer);
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 2px var(--focus-inner),
+			0 4px 20px #0002;
 	}
 	.butler-panel {
 		animation: butler-arrival 180ms ease-out;
@@ -624,7 +631,11 @@
 		overscroll-behavior: contain;
 	}
 	.butler-transcript:focus-visible {
-		outline-offset: -2px;
+		outline: 2px solid var(--focus-outer);
+		outline-offset: -4px;
+		box-shadow:
+			inset 0 0 0 2px var(--focus-inner),
+			inset 0 0 0 6px var(--focus-inner);
 	}
 	.butler-introduction p {
 		font:
@@ -644,7 +655,7 @@
 		gap: 12px;
 		min-height: 44px;
 		padding: 10px 12px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		text-align: left;
 		border-radius: 10px;
 		font-size: 12px;
@@ -829,7 +840,7 @@
 		flex-shrink: 0;
 		display: flex;
 		gap: 8px;
-		border: 1px solid var(--line);
+		border: 1px solid var(--control-border);
 		border-radius: 12px;
 		padding: 8px;
 		align-items: flex-end;
@@ -845,15 +856,36 @@
 		font-size: 14px;
 		padding: 5px;
 	}
-	textarea:focus {
+	textarea:focus,
+	textarea:focus-visible {
 		outline: none;
+		box-shadow: none;
 	}
 	textarea[readonly] {
 		opacity: 0.7;
 	}
 	form:focus-within {
-		outline: 2px solid var(--green);
+		outline: 2px solid var(--focus-outer);
 		outline-offset: 2px;
+		box-shadow: 0 0 0 2px var(--focus-inner);
+	}
+	@media (forced-colors: active) {
+		.butler-launcher:focus-visible,
+		form:focus-within {
+			outline: 2px solid Highlight;
+			outline-offset: 2px;
+			box-shadow: none;
+		}
+		.butler-transcript:focus-visible {
+			outline: 2px solid Highlight;
+			outline-offset: -2px;
+			box-shadow: none;
+		}
+		form textarea:focus,
+		form textarea:focus-visible {
+			outline: none;
+			box-shadow: none;
+		}
 	}
 	.butler-send {
 		width: 40px;
