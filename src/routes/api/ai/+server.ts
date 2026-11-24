@@ -2,7 +2,7 @@ import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import type { RequestHandler } from './$types';
-import { AIRequestError, resolvePublicFetcher, runAIRequest } from '#lib/server/ai.ts';
+import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
 
 const MAX_REQUEST_BYTES = 9_000_000;
@@ -71,7 +71,7 @@ export const POST: RequestHandler = async (event) => {
 		}
 
 		let connection: { accessToken: string; codex?: boolean } | undefined;
-		let providerFetch = resolvePublicFetcher(event);
+		let providerFetch = event.fetch;
 		if (
 			body &&
 			typeof body === 'object' &&

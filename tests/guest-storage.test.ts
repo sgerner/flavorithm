@@ -8,6 +8,7 @@ import {
 	clearAccountStorage,
 	clearGuestData,
 	clearGuestKitchen,
+	isLocalSessionExpiredResponse,
 	migrateGuestKitchenOnSignup,
 	quarantineLegacyKitchen,
 	readCachedAccount,
@@ -16,6 +17,9 @@ import {
 	restoreExpiredSessionAccount,
 	restoreGuestKitchen,
 	sanitizeKitchenState,
+	SESSION_EXPIRED_CODE,
+	shouldPersistGuestKitchen,
+	shouldScheduleAutoSync,
 	teardownToGuestKitchen
 } from '../src/lib/guest-storage.ts';
 import {
@@ -689,4 +693,161 @@ test('signup preparation sanitizes guest state while preserving sample flags for
 	);
 	assert.deepEqual(syncedState.meals, []);
 	assert.ok(syncedState.recipes.every((recipe) => !recipe.saved && !recipe.sampleSaved));
+});
+
+test('extracted session-expiry decision helpers distinguish session_expired 401s from provider/unmarked 401s and gate persistence/auto-sync', () => {
+	const user: User = {
+		id: 'u-expiry',
+		name: 'Ada',
+		email: 'ada@example.test',
+		householdId: 'hh-expiry'
+	};
+
+	assert.equal(
+		isLocalSessionExpiredResponse({
+			status: 401,
+			managedAuth: false,
+			user,
+			data: { error: 'Authentication required', code: SESSION_EXPIRED_CODE }
+		}),
+		true
+	);
+	assert.equal(
+		isLocalSessionExpiredResponse({
+			status: 401,
+			managedAuth: false,
+			user,
+			data: { error: 'Connect a ChatGPT account before using your plan.' }
+		}),
+		false
+	);
+	assert.equal(
+		isLocalSessionExpiredResponse({
+			status: 409,
+			managedAuth: false,
+			user,
+			data: { error: 'Connect a ChatGPT account before using your plan.', code: 'provider_auth' }
+		}),
+		false
+	);
+	assert.equal(
+		isLocalSessionExpiredResponse({
+			status: 401,
+			managedAuth: true,
+			user,
+			data: { error: 'Authentication required', code: SESSION_EXPIRED_CODE }
+		}),
+		false
+	);
+	assert.equal(
+		isLocalSessionExpiredResponse({
+			status: 401,
+			managedAuth: false,
+			user: null,
+			data: { error: 'Authentication required', code: SESSION_EXPIRED_CODE }
+		}),
+		false
+	);
+
+	assert.equal(
+		shouldPersistGuestKitchen({
+			managedAuth: false,
+			user: null,
+			sessionExpired: false,
+			guestPersistenceReady: true
+		}),
+		true
+	);
+	assert.equal(
+		shouldPersistGuestKitchen({
+			managedAuth: false,
+			user: null,
+			sessionExpired: true,
+			guestPersistenceReady: true
+		}),
+		false
+	);
+	assert.equal(
+		shouldPersistGuestKitchen({
+			managedAuth: false,
+			user,
+			sessionExpired: false,
+			guestPersistenceReady: true
+		}),
+		false
+	);
+
+	assert.equal(
+		shouldScheduleAutoSync({
+			user,
+			sessionExpired: false,
+			pendingSync: true,
+			syncing: false,
+			syncErrors: '',
+			online: true
+		}),
+		true
+	);
+	assert.equal(
+		shouldScheduleAutoSync({
+			user,
+			sessionExpired: true,
+			pendingSync: true,
+			syncing: false,
+			syncErrors: '',
+			online: true
+		}),
+		false
+	);
+});
+
+test('kitchenSync.restore always returns true when pending journal records exist even without a confirmed baseline', () => {
+	const user: User = {
+		id: 'u-journal-only',
+		name: 'Grace',
+		email: 'grace@example.test',
+		householdId: 'hh-journal-only'
+	};
+	const values = new Map<string, string>();
+	const storage = memoryStorage(values);
+	const base = createNewUserState();
+	const local = createNewUserState();
+	local.pantry = [
+		{ id: 'journal-lentils', name: 'red lentils', quantity: 2, unit: 'bags', category: 'Grains' }
+	];
+	writePendingJournal(storage, {
+		userId: user.id,
+		householdId: user.householdId,
+		writerId: 'writer-1',
+		base,
+		local,
+		etag: null,
+		createdAt: 100,
+		updatedAt: 200,
+		writeId: 'write-1'
+	});
+
+	let restoredState = createNewUserState();
+	const sync = createKitchenSync({
+		storage,
+		getUser: () => user,
+		getState: () => restoredState,
+		setState: (next) => {
+			restoredState = structuredClone(next);
+		},
+		onStatus: () => {},
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: createNewUserState(),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (candidate) => ({ state: candidate, etag: 'v2' })
+		})
+	});
+
+	assert.equal(sync.restore(user), true);
+	assert.deepEqual(restoredState.pantry, local.pantry);
 });

@@ -210,6 +210,57 @@ export function clearAccountStorage(storage: StorageLike, userId: string): void 
 	}
 }
 
+export const SESSION_EXPIRED_CODE = 'session_expired';
+export const SESSION_EXPIRED_MESSAGE =
+	'Your session expired. Sign in again to sync edits saved on this device.';
+
+export function isLocalSessionExpiredResponse(options: {
+	status: number;
+	managedAuth: boolean;
+	user: User | null;
+	data: unknown;
+}): boolean {
+	return (
+		options.status === 401 &&
+		!options.managedAuth &&
+		Boolean(options.user) &&
+		isRecord(options.data) &&
+		options.data.code === SESSION_EXPIRED_CODE
+	);
+}
+
+export function shouldPersistGuestKitchen(options: {
+	managedAuth: boolean;
+	user: User | null;
+	sessionExpired: boolean;
+	guestPersistenceReady: boolean;
+}): boolean {
+	return (
+		!options.managedAuth &&
+		!options.user &&
+		!options.sessionExpired &&
+		options.guestPersistenceReady
+	);
+}
+
+export function shouldScheduleAutoSync(options: {
+	user: User | null;
+	sessionExpired: boolean;
+	pendingSync: boolean;
+	syncing: boolean;
+	syncErrors: string;
+	online: boolean;
+}): boolean {
+	return (
+		Boolean(options.user) &&
+		!options.sessionExpired &&
+		options.pendingSync &&
+		!options.syncing &&
+		!options.syncErrors &&
+		options.online
+	);
+}
+
 export function resolveLocalAuthTransition(options: {
 	previousMode: string;
 	nextMode: string;

@@ -162,12 +162,16 @@
 	import {
 		clearAccountStorage,
 		clearGuestData,
+		isLocalSessionExpiredResponse,
 		quarantineLegacyKitchen,
 		readCachedAccount,
 		resolveLocalAuthTransition,
 		resolveRegistrationGuestSeed,
 		restoreExpiredSessionAccount,
 		sanitizeKitchenState,
+		SESSION_EXPIRED_MESSAGE,
+		shouldPersistGuestKitchen,
+		shouldScheduleAutoSync,
 		teardownToGuestKitchen
 	} from '#lib/guest-storage.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
@@ -520,24 +524,14 @@
 							: '';
 				}
 			} catch {}
+			fetch('/api/voice')
+				.then((r) => (r.ok ? r.json() : null))
+				.then((data) => {
+					if (user?.id === owner) localVoiceAvailable = Boolean(data?.localAvailable);
+				})
+				.catch(() => {});
 		}
 		return () => clearVoiceSession();
-	});
-	$effect(() => {
-		const owner = voiceOwner;
-		const expired = sessionExpired;
-		if (typeof window === 'undefined') return;
-		if (!owner || expired) {
-			localVoiceAvailable = false;
-			return;
-		}
-		fetch('/api/voice')
-			.then((r) => (r.ok ? r.json() : null))
-			.then((data) => {
-				if (user?.id === owner && !sessionExpired)
-					localVoiceAvailable = Boolean(data?.localAvailable);
-			})
-			.catch(() => {});
 	});
 	$effect(() => {
 		if (
@@ -641,8 +635,6 @@
 	let showStarter = $state(true);
 	let imageInput: HTMLInputElement;
 	let deferredInstall = $state<any>(null);
-	const SESSION_EXPIRED_MESSAGE =
-		'Your session expired. Sign in again to sync edits saved on this device.';
 	function markSessionExpired(announce = false) {
 		if (managedAuth || !user) return;
 		clearTimeout(saveTimer);
@@ -1160,10 +1152,12 @@
 				clearManagedIdentity();
 				renewManagedSession({ status: 401 });
 			} else if (
-				response.status === 401 &&
-				!managedAuth &&
-				user &&
-				data?.code === 'session_expired'
+				isLocalSessionExpiredResponse({
+					status: response.status,
+					managedAuth,
+					user,
+					data
+				})
 			) {
 				markSessionExpired(true);
 			}
@@ -1209,7 +1203,7 @@
 		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
 		if (managedAuth && (!user || !kitchenLoaded)) return;
 		const sanitized = sanitizeKitchenState(JSON.parse(rawSnapshot));
-		if (!managedAuth && !user && !sessionExpired && guestPersistenceReady) {
+		if (shouldPersistGuestKitchen({ managedAuth, user, sessionExpired, guestPersistenceReady })) {
 			try {
 				localStorage.setItem('flavorithm-guest-kitchen', JSON.stringify(sanitized));
 			} catch {
@@ -1218,7 +1212,7 @@
 		}
 		if (user) kitchenSync?.stage(sanitized);
 		clearTimeout(saveTimer);
-		if (user && !sessionExpired && pendingSync && !syncing && !syncErrors && online)
+		if (shouldScheduleAutoSync({ user, sessionExpired, pendingSync, syncing, syncErrors, online }))
 			saveTimer = setTimeout(() => {
 				void retrySync();
 			}, 500);
@@ -1248,13 +1242,18 @@
 					const response = await fetch('/api/state');
 					const data = await response.json();
 					if (!response.ok) {
-						if (response.status === 401) {
-							if (managedAuth) {
-								clearManagedIdentity();
-								renewManagedSession({ status: 401 });
-							} else if (user && data?.code === 'session_expired') {
-								markSessionExpired(true);
-							}
+						if (response.status === 401 && managedAuth) {
+							clearManagedIdentity();
+							renewManagedSession({ status: 401 });
+						} else if (
+							isLocalSessionExpiredResponse({
+								status: response.status,
+								managedAuth,
+								user,
+								data
+							})
+						) {
+							markSessionExpired(true);
 						}
 						throw Object.assign(new Error(data.error || 'Could not load your kitchen.'), {
 							status: response.status,
@@ -1283,13 +1282,18 @@
 					});
 					const data = await response.json();
 					if (!response.ok) {
-						if (response.status === 401) {
-							if (managedAuth) {
-								clearManagedIdentity();
-								renewManagedSession({ status: 401 });
-							} else if (user && data?.code === 'session_expired') {
-								markSessionExpired(true);
-							}
+						if (response.status === 401 && managedAuth) {
+							clearManagedIdentity();
+							renewManagedSession({ status: 401 });
+						} else if (
+							isLocalSessionExpiredResponse({
+								status: response.status,
+								managedAuth,
+								user,
+								data
+							})
+						) {
+							markSessionExpired(true);
 						}
 						throw Object.assign(new Error(data.error || 'Could not sync your kitchen.'), {
 							status: response.status,
@@ -1443,17 +1447,12 @@
 						kitchen = createNewUserState();
 						hasSampleRecords = false;
 						user = cached;
-						if (kitchenSync?.restore(cached)) {
-							showStarter = false;
-							kitchenLoaded = true;
-							if (online) kitchenSync?.failLoad((error as Error).message);
-						} else if (online) {
-							showStarter = false;
-							kitchenLoaded = true;
-							kitchenSync?.failLoad((error as Error).message);
-						} else {
-							restoreGuestSession({ preserveLastAccount: true });
-						}
+						showStarter = false;
+						kitchenLoaded = true;
+						kitchenSync?.restore(cached);
+						if (online) kitchenSync?.failLoad((error as Error).message);
+					} else {
+						restoreGuestSession();
 					}
 				}
 				syncing = false;
@@ -2276,7 +2275,7 @@
 		);
 	}
 	function hasAIConnection() {
-		return Boolean(user && !sessionExpired) && !usingHostAI && hasPersonalAIReady();
+		return Boolean(user && !sessionExpired) && hasPersonalAIReady();
 	}
 	async function needAI() {
 		if (!user || sessionExpired) {

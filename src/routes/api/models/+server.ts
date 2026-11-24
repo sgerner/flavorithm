@@ -3,11 +3,9 @@ import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
 import type { RequestHandler } from './$types';
-import { AIRequestError, getPublicModelCatalog, resolvePublicFetcher } from '#lib/server/ai.ts';
+import { AIRequestError, getPublicModelCatalog } from '#lib/server/ai.ts';
 
-export const GET: RequestHandler = async (event) => {
-	const { locals, url } = event;
-	const catalogFetcher = resolvePublicFetcher(event);
+export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 	if (!locals.user)
 		return Response.json(
 			{ error: 'Authentication required', code: 'session_expired' },
@@ -26,11 +24,11 @@ export const GET: RequestHandler = async (event) => {
 					{ headers: { 'cache-control': 'no-store' } }
 				);
 			}
-			const catalogPromise = getPublicModelCatalog(catalogFetcher).catch(() => null);
+			const catalogPromise = getPublicModelCatalog(fetch).catch(() => null);
 			const connection = await getChatGPTConnection(
 				host ? host.userId : locals.user.id,
 				host ? host.accountId : accountId,
-				event.fetch
+				fetch
 			);
 			const [result, catalogData] = await Promise.all([
 				listChatGPTModels(connection.accessToken, connection.fetcher),
@@ -46,7 +44,7 @@ export const GET: RequestHandler = async (event) => {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
-		return Response.json(await getPublicModelCatalog(catalogFetcher), {
+		return Response.json(await getPublicModelCatalog(fetch), {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {
