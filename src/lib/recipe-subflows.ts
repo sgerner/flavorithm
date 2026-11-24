@@ -121,8 +121,9 @@ export function applyEditedRecipe(
 		JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
 	const nutritionChanged = JSON.stringify(previous.nutrition) !== JSON.stringify(updated.nutrition);
 	const zeroNutrition = hasZeroNutrition(updated.nutrition);
+	const { sampleSaved: _sampleSaved, ...cleanUpdated } = updated;
 	const saved: Recipe = {
-		...updated,
+		...cleanUpdated,
 		saved: true,
 		nutritionStale: nutritionNeedsRefresh
 			? true

@@ -107,7 +107,7 @@ test('resolveSelectedRecipe reflects live kitchen recipes across replacements an
 });
 
 test('editing an open saved recipe preserves selectedId on cancel and updates saved recipe + nutritionStale on save', () => {
-	const original = makeRecipe();
+	const original = makeRecipe({ sampleSaved: true });
 	const other = makeRecipe({ id: 'chili', title: 'Smoky Chili' });
 	const recipes = [original, other];
 
@@ -142,6 +142,7 @@ test('editing an open saved recipe preserves selectedId on cancel and updates sa
 	const renamedSelected = resolveSelectedRecipe(renamed.recipes, renamed.selectedId);
 	assert.equal(renamedSelected?.title, 'Weeknight Lemon Pasta');
 	assert.equal(renamedSelected?.nutritionStale, undefined);
+	assert.equal('sampleSaved' in renamed.saved!, false);
 
 	// Saving serving or ingredient changes updates recipes[0] and marks nutritionStale true.
 	const rescaled = applyEditedRecipe(renamed.recipes, renamed.selectedId, {
