@@ -83,6 +83,8 @@ test('Host AI remaps unrecoverable credential failures to 503 host_ai_unavailabl
 		'member@example.com',
 		'correct horse battery'
 	);
+	let now = Date.now();
+	t.mock.method(Date, 'now', () => now);
 	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = admin.user.id;
 	try {
 		const grant = storage.saveChatGPTAccount({
@@ -98,17 +100,22 @@ test('Host AI remaps unrecoverable credential failures to 503 host_ai_unavailabl
 				idToken: 'admin-id-secret',
 				codexAccountId: 'codex-secret-acct'
 			},
-			expiresAt: Date.now() + 3600_000,
+			expiresAt: now + 3600_000,
 			earliestRefreshAt: 0
 		});
 		host.configureHostAI(admin.user.id, grant.id, 'codex-shared-model');
 
 		const aiRoute = await import('../src/routes/api/ai/+server.ts');
 		const modelsRoute = await import('../src/routes/api/models/+server.ts');
+		const oauth = await import('../src/lib/server/chatgpt-oauth.ts');
 		const { defaultPreferences } = await import('../src/lib/data.ts');
 
-		// Transient refresh outage returns 502 without clearing admin credentials.
-		t.mock.method(globalThis, 'fetch', async () => new Response('outage', { status: 503 }));
+		// Transient refresh outage returns 502 without clearing admin credentials and arms a per-account cooldown.
+		let tokenPosts = 0;
+		t.mock.method(globalThis, 'fetch', async () => {
+			tokenPosts += 1;
+			return new Response('outage', { status: 503 });
+		});
 		const transient = await aiRoute.POST({
 			locals: { user: member.user },
 			fetch: async () => Response.json({ error: { message: 'Revoked' } }, { status: 401 }),
@@ -125,9 +132,32 @@ test('Host AI remaps unrecoverable credential failures to 503 host_ai_unavailabl
 			})
 		} as any);
 		assert.equal(transient.status, 502);
+		assert.equal(tokenPosts, 1);
 		assert.ok(host.getHostAI(), 'transient refresh errors keep Host AI credentials intact');
 
-		// Terminal refresh error clears admin credentialEnvelope and returns 503 host_ai_unavailable.
+		// Immediate follow-up during the 502 cooldown returns 503 without hammering the token endpoint.
+		const coolingDown = await aiRoute.POST({
+			locals: { user: member.user },
+			fetch: async () => Response.json({ error: { message: 'Revoked' } }, { status: 401 }),
+			request: new Request('https://flavorithm.example/api/ai', {
+				method: 'POST',
+				headers: { origin: 'https://flavorithm.example', 'content-type': 'application/json' },
+				body: JSON.stringify({
+					action: 'generate',
+					provider: 'chatgpt',
+					model: 'codex-shared-model',
+					connectionId: host.HOST_CONNECTION_ID,
+					preferences: defaultPreferences
+				})
+			})
+		} as any);
+		assert.equal(coolingDown.status, 503);
+		assert.equal((await coolingDown.json()).code, 'chatgpt_refresh_not_ready');
+		assert.equal(tokenPosts, 1);
+		assert.ok(host.getHostAI());
+
+		// After the cooldown elapses, a terminal refresh error clears admin credentialEnvelope and returns 503 host_ai_unavailable.
+		now += oauth.REFRESH_FAILURE_COOLDOWN_MS + 1;
 		t.mock.method(globalThis, 'fetch', async () =>
 			Response.json({ error: { code: 'invalid_grant' } }, { status: 400 })
 		);

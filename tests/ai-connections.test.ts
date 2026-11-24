@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+	CHATGPT_OAUTH_POLL_INTERVAL_MS,
+	CHATGPT_OAUTH_TTL_MS,
 	reconcileModelPreferences,
 	searchConnections,
-	searchModels
+	searchModels,
+	startConnectionPoll
 } from '../src/lib/ai-connections.ts';
 import { transformModelCatalog, runAIRequest, AIRequestError } from '../src/lib/server/ai.ts';
 
@@ -164,4 +167,369 @@ test('unsupported providers and invalid model reasoning are rejected before any 
 			(error: unknown) => error instanceof AIRequestError && error.status === 400
 		);
 	}
+});
+
+function pollEnvironment(initialNow = 1_000) {
+	let currentNow = initialNow;
+	let hidden = false;
+	let nextId = 1;
+	const intervals = new Map<number, { fn: () => void; intervalMs: number }>();
+	const listeners = new Set<() => void>();
+
+	const document = {
+		get hidden() {
+			return hidden;
+		},
+		addEventListener(type: 'visibilitychange', listener: () => void) {
+			assert.equal(type, 'visibilitychange');
+			listeners.add(listener);
+		},
+		removeEventListener(type: 'visibilitychange', listener: () => void) {
+			assert.equal(type, 'visibilitychange');
+			listeners.delete(listener);
+		}
+	};
+
+	const setIntervalFn = ((fn: () => void, intervalMs?: number) => {
+		const id = nextId++;
+		intervals.set(id, { fn, intervalMs: Number(intervalMs) });
+		return id as unknown as ReturnType<typeof setInterval>;
+	}) as typeof setInterval;
+
+	const clearIntervalFn = ((id: ReturnType<typeof setInterval>) => {
+		intervals.delete(Number(id));
+	}) as typeof clearInterval;
+
+	return {
+		document,
+		intervals,
+		listeners,
+		now: () => currentNow,
+		advanceTime(ms: number) {
+			currentNow += ms;
+		},
+		setHidden(value: boolean) {
+			hidden = value;
+			for (const listener of [...listeners]) listener();
+		},
+		async tickAll() {
+			for (const entry of [...intervals.values()]) {
+				entry.fn();
+			}
+			await new Promise((resolve) => setImmediate(resolve));
+		},
+		setInterval: setIntervalFn,
+		clearInterval: clearIntervalFn
+	};
+}
+
+test('connection poll cleans up interval and visibility listener on modal close', async () => {
+	const env = pollEnvironment();
+	let modal = 'settings';
+	let attempt = 1;
+	let owner: string | null = 'user-1';
+	let polls = 0;
+
+	const handle = startConnectionPoll({
+		intervalMs: 5_000,
+		expiresAt: env.now() + 60_000,
+		attempt: 1,
+		getAttempt: () => attempt,
+		owner: 'user-1',
+		getOwner: () => owner,
+		isOpen: () => modal === 'settings',
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: async () => {
+			polls++;
+		}
+	});
+
+	assert.equal(handle.active, true);
+	assert.equal(env.intervals.size, 1);
+	assert.equal(env.listeners.size, 1);
+
+	await env.tickAll();
+	assert.equal(polls, 1);
+
+	// Closing settings via closeDialog / cancelChatGPTDevice stops the timer and removes listener.
+	modal = '';
+	handle.stop();
+	handle.stop();
+	assert.equal(handle.active, false);
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+
+	await env.tickAll();
+	env.setHidden(true);
+	env.setHidden(false);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(polls, 1);
+
+	// Starting a poll after leaving settings is an immediate no-op.
+	const skipped = startConnectionPoll({
+		intervalMs: 5_000,
+		attempt: 1,
+		getAttempt: () => attempt,
+		owner: 'user-1',
+		getOwner: () => owner,
+		isOpen: () => modal === 'settings',
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: () => {
+			polls++;
+		}
+	});
+	assert.equal(skipped.active, false);
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+
+	// Modal leaving settings without explicit stop() also self-terminates on next tick.
+	modal = 'settings';
+	const autoStop = startConnectionPoll({
+		intervalMs: CHATGPT_OAUTH_POLL_INTERVAL_MS,
+		attempt: 1,
+		getAttempt: () => attempt,
+		owner: 'user-1',
+		getOwner: () => owner,
+		isOpen: () => modal === 'settings',
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: () => {
+			polls++;
+		}
+	});
+	assert.equal(env.intervals.size, 1);
+	modal = 'onboarding';
+	await env.tickAll();
+	assert.equal(autoStop.active, false);
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+	assert.equal(polls, 1);
+});
+
+test('connection poll clears timer on owner mismatch from account deletion or attempt change', async () => {
+	const env = pollEnvironment();
+	let attempt = 1;
+	let owner: string | null = 'user-1';
+	let polls = 0;
+
+	const handle = startConnectionPoll({
+		intervalMs: 5_000,
+		expiresAt: env.now() + 60_000,
+		attempt: 1,
+		getAttempt: () => attempt,
+		owner: 'user-1',
+		getOwner: () => owner,
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: () => {
+			polls++;
+		}
+	});
+
+	// Even if the tab is hidden when the account is deleted, the next tick clears the interval.
+	env.setHidden(true);
+	owner = null;
+	await env.tickAll();
+	assert.equal(handle.active, false);
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+	assert.equal(polls, 0);
+
+	// Mid-flight account deletion or attempt increment stops the timer as soon as the request settles.
+	env.setHidden(false);
+	await new Promise((resolve) => setImmediate(resolve));
+	owner = 'user-1';
+	attempt = 2;
+	let finishPoll!: () => void;
+	const inFlightHandle = startConnectionPoll({
+		intervalMs: 1_500,
+		attempt: 2,
+		getAttempt: () => attempt,
+		owner: 'user-1',
+		getOwner: () => owner,
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: () =>
+			new Promise<void>((resolve) => {
+				polls++;
+				finishPoll = resolve;
+			})
+	});
+
+	const pendingTick = env.tickAll();
+	assert.equal(polls, 1);
+	attempt = 3;
+	owner = null;
+	finishPoll();
+	await pendingTick;
+	assert.equal(inFlightHandle.active, false);
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+});
+
+test('connection poll pauses while document is hidden and runs one immediate check upon return', async () => {
+	const env = pollEnvironment();
+	let polls = 0;
+
+	const handle = startConnectionPoll({
+		intervalMs: 5_000,
+		expiresAt: env.now() + 15 * 60_000,
+		attempt: 1,
+		getAttempt: () => 1,
+		owner: 'user-1',
+		getOwner: () => 'user-1',
+		isOpen: () => true,
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: async () => {
+			polls++;
+		}
+	});
+
+	await env.tickAll();
+	assert.equal(polls, 1);
+
+	// User switches to auth.openai.com tab: background ticks pause completely.
+	env.setHidden(true);
+	await env.tickAll();
+	await env.tickAll();
+	await env.tickAll();
+	assert.equal(polls, 1);
+	assert.equal(handle.active, true);
+
+	// User returns to Flavorithm tab: one immediate poll runs, and subsequent interval ticks resume.
+	env.setHidden(false);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(polls, 2);
+	assert.equal(handle.active, true);
+
+	await env.tickAll();
+	assert.equal(polls, 3);
+
+	handle.stop();
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+});
+
+test('connection poll runs one final check at wall-clock expiry before stopping', async () => {
+	const env = pollEnvironment(10_000);
+	const observed: boolean[] = [];
+
+	const oauthHandle = startConnectionPoll({
+		intervalMs: CHATGPT_OAUTH_POLL_INTERVAL_MS,
+		expiresAt: env.now() + CHATGPT_OAUTH_TTL_MS,
+		attempt: 1,
+		getAttempt: () => 1,
+		owner: 'user-1',
+		getOwner: () => 'user-1',
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: ({ expired }) => {
+			observed.push(expired);
+		}
+	});
+
+	env.advanceTime(CHATGPT_OAUTH_TTL_MS - 1);
+	await env.tickAll();
+	assert.deepEqual(observed, [false]);
+	assert.equal(oauthHandle.active, true);
+
+	env.advanceTime(1);
+	await env.tickAll();
+	assert.deepEqual(observed, [false, true]);
+	assert.equal(oauthHandle.active, false);
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+
+	// Returning to a tab after expiry also runs one final check to detect completed logins.
+	env.setHidden(true);
+	const returnChecks: boolean[] = [];
+	const deviceHandle = startConnectionPoll({
+		intervalMs: 5_000,
+		expiresAt: env.now() + 30_000,
+		attempt: 2,
+		getAttempt: () => 2,
+		owner: 'user-1',
+		getOwner: () => 'user-1',
+		document: env.document,
+		now: env.now,
+		setInterval: env.setInterval,
+		clearInterval: env.clearInterval,
+		poll: ({ expired }) => {
+			returnChecks.push(expired);
+		}
+	});
+
+	env.advanceTime(45_000);
+	await env.tickAll();
+	assert.deepEqual(returnChecks, []);
+
+	env.setHidden(false);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(returnChecks, [true]);
+	assert.equal(deviceHandle.active, false);
+	assert.equal(env.intervals.size, 0);
+	assert.equal(env.listeners.size, 0);
+});
+
+test('reconcileModelPreferences drops missing models and prunes unsupported reasoning controls', () => {
+	const models = [
+		{
+			id: 'codex-mini',
+			name: 'Codex Mini',
+			vision: true,
+			reasoning: { efforts: ['low', 'high'], toggle: false, budgetMin: 1024, budgetMax: 4096 }
+		},
+		{
+			id: 'plain-model',
+			name: 'Plain Model',
+			vision: false
+		}
+	];
+
+	assert.deepEqual(
+		reconcileModelPreferences(models, 'missing-model', { effort: 'high', enabled: true }),
+		{ model: '', reasoning: undefined }
+	);
+	assert.deepEqual(reconcileModelPreferences(models, 'plain-model', { effort: 'high' }), {
+		model: 'plain-model',
+		reasoning: undefined
+	});
+	assert.deepEqual(
+		reconcileModelPreferences(models, 'codex-mini', {
+			enabled: true,
+			effort: 'medium',
+			budgetTokens: 2048
+		}),
+		{
+			model: 'codex-mini',
+			reasoning: { budgetTokens: 2048 }
+		}
+	);
+	assert.deepEqual(
+		reconcileModelPreferences(models, 'codex-mini', {
+			effort: 'high',
+			budgetTokens: 9999
+		}),
+		{
+			model: 'codex-mini',
+			reasoning: { effort: 'high' }
+		}
+	);
 });

@@ -598,3 +598,85 @@ test('mid-TTL revoked Codex token refreshes once, rebuilds codexSubscriptionFetc
 	assert.equal(storage.getChatGPTAccount(owner.userId, polled.accountId)?.credentialEnvelope, null);
 	assert.equal(oauth.listChatGPTAccounts(owner.userId)[0]?.connected, false);
 });
+
+test('missing codexAccountId clears credentials only after claiming the refresh lease', async (t) => {
+	const owner = await user();
+	const f = fixture();
+	const now = Date.now();
+	t.mock.method(Date, 'now', () => now);
+	const broken = storage.saveChatGPTAccount({
+		userId: owner.userId,
+		mode: 'local',
+		clientId: device.CODEX_CLIENT_ID,
+		subject: 'subject-missing:acct',
+		email: 'owner@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'codex-access',
+			refreshToken: 'codex-refresh',
+			idToken: 'codex-id'
+		},
+		expiresAt: now + 3_600_000,
+		earliestRefreshAt: 0
+	});
+
+	// If another worker holds the refresh/reauth lease, buildChatGPTConnection must not wipe credentials.
+	assert.equal(
+		storage.claimChatGPTRefreshLease(owner.userId, broken.id, 'other-worker', now + 15_000, now),
+		true
+	);
+	await assert.rejects(oauth.getChatGPTConnection(owner.userId, broken.id, f.fetcher), {
+		status: 401,
+		code: 'chatgpt_account_reauth_required'
+	});
+	assert.ok(
+		storage.getChatGPTAccount(owner.userId, broken.id)?.credentialEnvelope,
+		'credentials remain untouched while another worker holds the lease'
+	);
+
+	// If that worker finishes saving valid Codex credentials, subsequent connection resolution succeeds.
+	assert.equal(
+		storage.persistRefreshedChatGPTCredentials({
+			userId: owner.userId,
+			accountId: broken.id,
+			leaseToken: 'other-worker',
+			credentials: {
+				accessToken: 'repaired-access',
+				refreshToken: 'repaired-refresh',
+				idToken: 'repaired-id',
+				codexAccountId: 'repaired-codex-acct'
+			},
+			expiresAt: now + 3_600_000,
+			earliestRefreshAt: 0,
+			scopes: ['codex.subscription']
+		}),
+		true
+	);
+	const repaired = await oauth.getChatGPTConnection(owner.userId, broken.id, f.fetcher);
+	assert.equal(repaired.accessToken, 'repaired-access');
+
+	// When uncontended and still missing codexAccountId on re-read under lease, credentials are cleared cleanly.
+	storage.saveChatGPTAccount({
+		userId: owner.userId,
+		accountId: broken.id,
+		mode: 'local',
+		clientId: device.CODEX_CLIENT_ID,
+		subject: 'subject-missing:acct',
+		email: 'owner@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'codex-access-2',
+			refreshToken: 'codex-refresh-2',
+			idToken: 'codex-id-2'
+		},
+		expiresAt: now + 3_600_000,
+		earliestRefreshAt: 0
+	});
+	await assert.rejects(oauth.getChatGPTConnection(owner.userId, broken.id, f.fetcher), {
+		status: 401,
+		code: 'chatgpt_account_reauth_required'
+	});
+	const cleared = storage.getChatGPTAccount(owner.userId, broken.id)!;
+	assert.equal(cleared.credentialEnvelope, null);
+	assert.equal(cleared.refreshLockToken, null);
+});

@@ -101,3 +101,117 @@ export function reconcileModelPreferences(
 		reasoning: Object.keys(next).length ? next : undefined
 	};
 }
+
+export const CHATGPT_OAUTH_POLL_INTERVAL_MS = 1_500;
+export const CHATGPT_OAUTH_TTL_MS = 10 * 60_000;
+
+export type PollDocument = {
+	readonly hidden?: boolean;
+	addEventListener?: (type: 'visibilitychange', listener: () => void) => void;
+	removeEventListener?: (type: 'visibilitychange', listener: () => void) => void;
+};
+
+export type ConnectionPollHandle = {
+	stop: () => void;
+	readonly active: boolean;
+};
+
+export type ConnectionPollOptions = {
+	intervalMs: number;
+	expiresAt?: number;
+	attempt: number;
+	getAttempt: () => number;
+	owner: string;
+	getOwner: () => string | null | undefined;
+	isOpen?: () => boolean;
+	poll: (context: {
+		expired: boolean;
+		stop: () => void;
+	}) => Promise<boolean | void> | boolean | void;
+	document?: PollDocument | null;
+	now?: () => number;
+	setInterval?: typeof globalThis.setInterval;
+	clearInterval?: typeof globalThis.clearInterval;
+};
+
+export function startConnectionPoll(options: ConnectionPollOptions): ConnectionPollHandle {
+	const doc =
+		options.document !== undefined
+			? options.document
+			: typeof globalThis.document !== 'undefined'
+				? globalThis.document
+				: null;
+	const now = options.now ?? Date.now;
+	const setIntervalFn = options.setInterval ?? globalThis.setInterval;
+	const clearIntervalFn = options.clearInterval ?? globalThis.clearInterval;
+
+	const isValid = () =>
+		options.getAttempt() === options.attempt &&
+		options.getOwner() === options.owner &&
+		(options.isOpen ? options.isOpen() : true);
+
+	if (!isValid()) {
+		return {
+			stop() {},
+			get active() {
+				return false;
+			}
+		};
+	}
+
+	let active = true;
+	let inFlight = false;
+	let timer: ReturnType<typeof globalThis.setInterval> | undefined;
+
+	const stop = () => {
+		if (!active) return;
+		active = false;
+		if (timer !== undefined) clearIntervalFn(timer);
+		doc?.removeEventListener?.('visibilitychange', onVisibilityChange);
+	};
+
+	const runTick = async () => {
+		if (!active) return;
+		if (!isValid()) {
+			stop();
+			return;
+		}
+		if (doc?.hidden || inFlight) return;
+		const expired = options.expiresAt !== undefined && now() >= options.expiresAt;
+		inFlight = true;
+		try {
+			const keepGoing = await options.poll({ expired, stop });
+			if (keepGoing === false || expired || !isValid()) {
+				stop();
+			}
+		} catch (error) {
+			stop();
+			throw error;
+		} finally {
+			inFlight = false;
+		}
+	};
+
+	function onVisibilityChange() {
+		if (!active) return;
+		if (!isValid()) {
+			stop();
+			return;
+		}
+		if (!doc?.hidden) {
+			void runTick();
+		}
+	}
+
+	doc?.addEventListener?.('visibilitychange', onVisibilityChange);
+	timer = setIntervalFn(() => {
+		void runTick();
+	}, options.intervalMs);
+
+	return {
+		stop,
+		get active() {
+			return active;
+		}
+	};
+}
