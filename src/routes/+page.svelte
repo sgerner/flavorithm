@@ -6266,4 +6266,12 @@
 		min-height: 40px;
 		padding-inline: 6px;
 	}
+	@media (forced-colors: active) {
+		.expiry-filters button.active {
+			background: Highlight;
+			color: HighlightText;
+			border: 1px solid Highlight;
+			forced-color-adjust: none;
+		}
+	}
 </style>

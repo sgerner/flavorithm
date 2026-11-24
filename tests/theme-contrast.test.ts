@@ -52,6 +52,28 @@ function oklchToSrgb(L: number, C: number, h: number): Rgb {
 	return [toSrgb(r), toSrgb(g), toSrgb(b)];
 }
 
+function parseOklchExpr(expr: string): { L: number; C: number; h: number | null } | null {
+	const value = expr.trim();
+	if (!value.startsWith('oklch(') || !value.endsWith(')')) return null;
+	const parts = value
+		.slice(6, -1)
+		.trim()
+		.split(' ')
+		.map((part) => part.trim())
+		.filter(Boolean);
+	if (parts.length !== 3) return null;
+	const [rawL, rawC, rawH] = parts;
+	const L = rawL.endsWith('%') ? parseFloat(rawL.slice(0, -1)) / 100 : parseFloat(rawL);
+	const C = parseFloat(rawC);
+	const h = rawH === 'none' ? null : parseFloat(rawH.endsWith('deg') ? rawH.slice(0, -3) : rawH);
+	if (Number.isNaN(L) || Number.isNaN(C) || (h !== null && Number.isNaN(h))) return null;
+	return { L, C, h };
+}
+
+function circularHueDistance(h1: number, h2: number): number {
+	const diff = Math.abs(h1 - h2) % 360;
+	return diff > 180 ? 360 - diff : diff;
+}
 function splitTopLevelComma(input: string): [string, string] {
 	let depth = 0;
 	for (let i = 0; i < input.length; i++) {
@@ -124,22 +146,9 @@ function resolveColor(expr: string, vars: Record<string, string>, dark: boolean)
 			parseInt(hex.slice(4, 6), 16) / 255
 		];
 	}
-	if (value.startsWith('oklch(') && value.endsWith(')')) {
-		const parts = value
-			.slice(6, -1)
-			.trim()
-			.split(' ')
-			.map((part) => part.trim())
-			.filter(Boolean);
-		if (parts.length === 3) {
-			const [rawL, rawC, rawH] = parts;
-			const L = rawL.endsWith('%') ? parseFloat(rawL.slice(0, -1)) / 100 : parseFloat(rawL);
-			const C = parseFloat(rawC);
-			const h = rawH === 'none' ? 0 : parseFloat(rawH.endsWith('deg') ? rawH.slice(0, -3) : rawH);
-			if (!Number.isNaN(L) && !Number.isNaN(C) && !Number.isNaN(h)) {
-				return oklchToSrgb(L, C, h);
-			}
-		}
+	const parsedOklch = parseOklchExpr(value);
+	if (parsedOklch) {
+		return oklchToSrgb(parsedOklch.L, parsedOklch.C, parsedOklch.h ?? 0);
 	}
 	throw new Error(`Unsupported color expression: ${value}`);
 }
@@ -467,15 +476,21 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 
 				const greenRatio = contrastRatio(green, bg);
 				if (greenRatio < 4.5)
-					failures.push(`${mode} --green text/chip on ${surfaceName} = ${greenRatio.toFixed(2)}`);
-				if (greenRatio < 3)
-					failures.push(
-						`${mode} --green focus outline on ${surfaceName} = ${greenRatio.toFixed(2)}`
-					);
+					failures.push(`${mode} --green text/icon on ${surfaceName} = ${greenRatio.toFixed(2)}`);
+
+				const warningTextRatio = contrastRatio(warningInk, bg);
+				if (warningTextRatio < 4.5)
+					failures.push(`${mode} --warning-ink on ${surfaceName} = ${warningTextRatio.toFixed(2)}`);
 
 				const dangerTextRatio = contrastRatio(dangerInk, bg);
 				if (dangerTextRatio < 4.5)
 					failures.push(`${mode} --danger-ink on ${surfaceName} = ${dangerTextRatio.toFixed(2)}`);
+
+				const chipBorderSurfaceRatio = contrastRatio(chipActiveBorder, bg);
+				if (chipBorderSurfaceRatio < 3)
+					failures.push(
+						`${mode} --chip-active-border on ${surfaceName} = ${chipBorderSurfaceRatio.toFixed(2)}`
+					);
 			}
 
 			const chipActiveTextRatio = contrastRatio(ink, chipActiveBg);
@@ -491,6 +506,23 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 			const focusRingRatio = contrastRatio(focusOuter, focusInner);
 			if (focusRingRatio < 3)
 				failures.push(`${mode} --focus-outer on --focus-inner = ${focusRingRatio.toFixed(2)}`);
+
+			const focusSurfaces: Array<[string, Rgb]> = [
+				...surfaces,
+				['--green', green],
+				['--ink', ink],
+				['--danger-fill', dangerFill],
+				['--chip-active-bg', chipActiveBg],
+				['.inspiration-banner (#294b37)', resolveColor('#294b37', vars, dark)]
+			];
+			for (const [focusSurfaceName, bg] of focusSurfaces) {
+				const maxRingRatio = Math.max(contrastRatio(focusOuter, bg), contrastRatio(focusInner, bg));
+				if (maxRingRatio < 3) {
+					failures.push(
+						`${mode} dual-ring focus on ${focusSurfaceName} = ${maxRingRatio.toFixed(2)}`
+					);
+				}
+			}
 
 			const primaryRatio = contrastRatio(onGreen, green);
 			if (primaryRatio < 4.5)
@@ -512,6 +544,14 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 			const warningBadgeRatio = contrastRatio(warningInk, warningSurface);
 			if (warningBadgeRatio < 4.5)
 				failures.push(`${mode} .expiry-badge.soon = ${warningBadgeRatio.toFixed(2)}`);
+
+			const warningInkBodyRatio = contrastRatio(ink, warningSurface);
+			if (warningInkBodyRatio < 4.5)
+				failures.push(`${mode} --ink on --warning-surface = ${warningInkBodyRatio.toFixed(2)}`);
+
+			const warningMutedBodyRatio = contrastRatio(muted, warningSurface);
+			if (warningMutedBodyRatio < 4.5)
+				failures.push(`${mode} --muted on --warning-surface = ${warningMutedBodyRatio.toFixed(2)}`);
 
 			const expiredBadgeRatio = contrastRatio(dangerInk, dangerSurface);
 			if (expiredBadgeRatio < 4.5)
@@ -541,6 +581,292 @@ test('all 24 selectable themes are imported once and calibrated across all 48 li
 	}
 
 	assert.deepEqual(failures, []);
+
+	// Verify #122 active-chip and dual-ring focus rules remain intact in app.css
+	for (const chipSelector of ['.filter-tabs button.active', '.shopping-filters button.active']) {
+		const chipRule = appRules.find((rule) => !rule.media && rule.selector === chipSelector);
+		assert.ok(chipRule, `Expected standalone ${chipSelector} rule in src/app.css`);
+		assert.ok(chipRule.body.includes('var(--chip-active-bg)'));
+		assert.ok(chipRule.body.includes('var(--chip-active-border)'));
+		assert.ok(!chipRule.body.includes('var(--green)'));
+	}
+
+	const primaryGroupRule = appRules.find(
+		(rule) => !rule.media && rule.selector.includes('nav button.current')
+	);
+	assert.ok(primaryGroupRule, 'Expected nav button.current primary group rule');
+	assert.ok(!primaryGroupRule.selector.includes('.filter-tabs'));
+	assert.ok(!primaryGroupRule.selector.includes('.shopping-filters'));
+	assert.ok(!primaryGroupRule.selector.includes('.expiry-filters'));
+
+	const focusRule = appRules.find(
+		(rule) => !rule.media && rule.selector.includes('button:focus-visible')
+	);
+	assert.ok(focusRule, 'Expected global button:focus-visible rule');
+	assert.ok(focusRule.body.includes('var(--focus-outer)'));
+	assert.ok(focusRule.body.includes('var(--focus-inner)'));
+	assert.ok(!focusRule.body.includes('var(--green)'));
+});
+
+test('calibrated theme tokens preserve Skeleton v5 palette hue identity across all 24 themes', () => {
+	const appCss = fs.readFileSync(APP_CSS_PATH, 'utf8');
+	const appRules = extractTopLevelRuleBlocks(appCss);
+	const themes = loadSelectableThemes();
+
+	const tokenReferenceMap: Record<string, [string] | [string, string]> = {
+		'--theme-light-paper': ['--color-surface-50'],
+		'--theme-light-wash': ['--color-surface-100'],
+		'--theme-dark-paper': ['--color-surface-950'],
+		'--theme-dark-wash': ['--color-surface-900'],
+		'--muted': ['--color-surface-700', '--color-surface-200'],
+		'--green': ['--color-primary-800', '--color-primary-200'],
+		'--accent': ['--color-secondary-200']
+	};
+
+	const hueFailures: string[] = [];
+	for (const theme of themes) {
+		const skeletonCss = fs.readFileSync(path.join(SKELETON_THEMES_DIR, `${theme}.css`), 'utf8');
+		const skeletonDecls = parseDeclarations(skeletonCss);
+		const themeRule = appRules.find(
+			(rule) => !rule.media && rule.selector === `html[data-theme='${theme}']`
+		);
+		if (!themeRule) continue;
+
+		const overrides = parseDeclarations(themeRule.body);
+		for (const [prop, rawVal] of Object.entries(overrides)) {
+			const refs = tokenReferenceMap[prop];
+			assert.ok(refs, `Unexpected calibrated theme property ${prop} in ${theme}`);
+
+			const checkPair = (expr: string, refToken: string, modeLabel: string) => {
+				if (expr === `var(${refToken})`) return;
+				const calibrated = parseOklchExpr(expr);
+				assert.ok(calibrated, `${theme} ${prop} (${modeLabel}) must be oklch() or var(): ${expr}`);
+				const skeletonRaw = skeletonDecls[refToken];
+				assert.ok(skeletonRaw, `Missing ${refToken} in Skeleton ${theme}.css`);
+				const skeletonParsed = parseOklchExpr(skeletonRaw);
+				assert.ok(skeletonParsed, `Expected oklch() for ${refToken} in Skeleton ${theme}.css`);
+
+				if (skeletonParsed.C === 0 || skeletonParsed.h === null) {
+					if (calibrated.C !== 0) {
+						hueFailures.push(
+							`${theme} ${prop} (${modeLabel}) introduced chroma ${calibrated.C} on achromatic ${refToken} (${skeletonRaw})`
+						);
+					}
+					return;
+				}
+				if (calibrated.C === 0 || calibrated.h === null) {
+					hueFailures.push(
+						`${theme} ${prop} (${modeLabel}) dropped hue on chromatic ${refToken} (${skeletonRaw})`
+					);
+					return;
+				}
+				const delta = circularHueDistance(calibrated.h, skeletonParsed.h);
+				if (delta > 1) {
+					hueFailures.push(
+						`${theme} ${prop} (${modeLabel}) hue ${calibrated.h}deg drifted ${delta.toFixed(2)}deg from ${refToken} (${skeletonRaw})`
+					);
+				}
+			};
+
+			if (rawVal.startsWith('light-dark(') && rawVal.endsWith(')')) {
+				assert.equal(refs.length, 2, `${theme} ${prop} uses light-dark() without paired refs`);
+				const [lightExpr, darkExpr] = splitTopLevelComma(rawVal.slice(11, -1));
+				checkPair(lightExpr, refs[0], 'light');
+				checkPair(darkExpr, refs[1], 'dark');
+			} else {
+				checkPair(rawVal, refs[0], 'all');
+			}
+		}
+	}
+
+	assert.deepEqual(hueFailures, []);
+});
+
+test('@media (forced-colors: active) uses system colors, resets dual-ring shadows, and covers active/badge states', () => {
+	const systemColorTokens = new Set([
+		'Canvas',
+		'CanvasText',
+		'LinkText',
+		'VisitedText',
+		'ActiveText',
+		'ButtonFace',
+		'ButtonText',
+		'ButtonBorder',
+		'Field',
+		'FieldText',
+		'Highlight',
+		'HighlightText',
+		'SelectedItem',
+		'SelectedItemText',
+		'Mark',
+		'MarkText',
+		'GrayText',
+		'AccentColor',
+		'AccentColorText',
+		'transparent',
+		'currentColor',
+		'inherit',
+		'none'
+	]);
+
+	function collectFiles(dir: string): string[] {
+		const out: string[] = [];
+		for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+			const full = path.join(dir, entry.name);
+			if (entry.isDirectory()) out.push(...collectFiles(full));
+			else if (entry.name.endsWith('.css') || entry.name.endsWith('.svelte')) out.push(full);
+		}
+		return out;
+	}
+
+	function extractStyles(file: string, content: string): string[] {
+		if (file.endsWith('.css')) return [content];
+		const blocks: string[] = [];
+		let pos = 0;
+		while (pos < content.length) {
+			const openStart = content.indexOf('<style', pos);
+			if (openStart === -1) break;
+			const openEnd = content.indexOf('>', openStart + 6);
+			if (openEnd === -1) break;
+			const closeStart = content.indexOf('</style>', openEnd + 1);
+			if (closeStart === -1) break;
+			blocks.push(content.slice(openEnd + 1, closeStart));
+			pos = closeStart + 8;
+		}
+		return blocks;
+	}
+
+	function parseProps(body: string): Array<{ prop: string; value: string }> {
+		const props: Array<{ prop: string; value: string }> = [];
+		for (const rawDecl of stripCssComments(body).split(';')) {
+			const colonIdx = rawDecl.indexOf(':');
+			if (colonIdx === -1) continue;
+			const prop = rawDecl.slice(0, colonIdx).trim();
+			const value = rawDecl.slice(colonIdx + 1).trim();
+			if (prop && value) props.push({ prop, value });
+		}
+		return props;
+	}
+
+	const issues: string[] = [];
+	const allForcedSelectors = new Set<string>();
+
+	for (const file of collectFiles(path.join(ROOT, 'src'))) {
+		const rel = path.relative(ROOT, file);
+		const content = fs.readFileSync(file, 'utf8');
+		for (const css of extractStyles(file, content)) {
+			const rules = extractTopLevelRuleBlocks(css);
+			const fileForcedFocusResetSelectors = new Set<string>();
+
+			for (const rule of rules) {
+				if (!rule.media || !rule.media.includes('forced-colors: active')) continue;
+				const props = parseProps(rule.body);
+				const propMap = new Map(props.map((p) => [p.prop, p.value]));
+				const selectors = rule.selector.split(',').map((s) => s.trim());
+				for (const sel of selectors) {
+					allForcedSelectors.add(sel);
+					if (propMap.get('box-shadow') === 'none') {
+						fileForcedFocusResetSelectors.add(sel);
+					}
+				}
+
+				for (const { prop, value } of props) {
+					if (
+						prop === 'color' ||
+						prop === 'background' ||
+						prop === 'background-color' ||
+						prop === 'border-color' ||
+						prop === 'outline-color'
+					) {
+						if (!systemColorTokens.has(value)) {
+							issues.push(`${rel} forced-colors (${rule.selector}): non-system ${prop}: ${value}`);
+						}
+					} else if (prop === 'border' || prop === 'outline') {
+						if (value !== 'none' && value !== '0') {
+							const tokens = value
+								.split(' ')
+								.map((t) => t.trim())
+								.filter(Boolean);
+							const colorTok = tokens[tokens.length - 1];
+							if (!systemColorTokens.has(colorTok)) {
+								issues.push(
+									`${rel} forced-colors (${rule.selector}): non-system ${prop} color: ${value}`
+								);
+							}
+						}
+					}
+				}
+
+				if (propMap.get('forced-color-adjust') === 'none') {
+					const bg = propMap.get('background') ?? propMap.get('background-color');
+					const fg = propMap.get('color');
+					if (!bg || !fg || !systemColorTokens.has(bg) || !systemColorTokens.has(fg)) {
+						issues.push(
+							`${rel} forced-colors (${rule.selector}): forced-color-adjust: none requires paired system background + color`
+						);
+					}
+				}
+			}
+
+			// Every rule setting a dual-ring var(--focus-inner) box-shadow must reset box-shadow in forced-colors
+			for (const rule of rules) {
+				if (rule.media) continue;
+				if (!rule.body.includes('var(--focus-inner)')) continue;
+				for (const sel of rule.selector.split(',').map((s) => s.trim())) {
+					if (!fileForcedFocusResetSelectors.has(sel)) {
+						issues.push(
+							`${rel} (${sel}): dual-ring var(--focus-inner) focus rule missing forced-colors box-shadow: none reset`
+						);
+					}
+				}
+			}
+		}
+	}
+
+	const requiredForcedSelectors = [
+		'button:focus-visible',
+		'a:focus-visible',
+		"[tabindex]:where(:not([tabindex='-1'])):focus-visible",
+		'nav button.current',
+		'.primary',
+		'.filter-tabs button.active',
+		'.shopping-filters button.active',
+		'.expiry-filters button.active',
+		'.theme-grid button.active',
+		'.steps-list li button.done',
+		'.check-box.checked',
+		'.quiz-options.quiz-time input:checked + span',
+		'.expiry-badge',
+		'.member-role',
+		'.toast',
+		'.flavor-dialog',
+		'.recipe-dialog'
+	];
+	for (const req of requiredForcedSelectors) {
+		if (!allForcedSelectors.has(req)) {
+			issues.push(`Missing @media (forced-colors: active) coverage for ${req}`);
+		}
+	}
+
+	const pageSvelte = fs.readFileSync(PAGE_SVELTE_PATH, 'utf8');
+	const pageRules = extractStyles(PAGE_SVELTE_PATH, pageSvelte).flatMap((css) =>
+		extractTopLevelRuleBlocks(css)
+	);
+	const hasScopedExpiryForced = pageRules.some(
+		(rule) =>
+			Boolean(rule.media && rule.media.includes('forced-colors: active')) &&
+			rule.selector
+				.split(',')
+				.map((s) => s.trim())
+				.includes('.expiry-filters button.active')
+	);
+	if (!hasScopedExpiryForced) {
+		issues.push(
+			'src/routes/+page.svelte must define scoped @media (forced-colors: active) override for .expiry-filters button.active'
+		);
+	}
+
+	assert.deepEqual(issues, []);
 });
 
 test('zero custom foreground declarations lack a paired or theme-verified background token (Failure F24)', () => {
@@ -656,6 +982,13 @@ test('zero custom foreground declarations lack a paired or theme-verified backgr
 	const appCss = fs.readFileSync(APP_CSS_PATH, 'utf8');
 	assert.ok(appCss.includes('@media (forced-colors: active)'));
 	assert.ok(appCss.includes('@media (prefers-contrast: more)'));
+
+	// Confirm .danger-action moved to global app.css is only used in +page.svelte
+	const dangerActionFiles = collectStyleFiles(path.join(ROOT, 'src'))
+		.filter((file) => fs.readFileSync(file, 'utf8').includes('danger-action'))
+		.map((file) => path.relative(ROOT, file))
+		.sort();
+	assert.deepEqual(dangerActionFiles, ['src/app.css', 'src/routes/+page.svelte']);
 });
 
 test('selectorSpecificity evaluates :where() and :not() in linear time without backtracking', () => {
