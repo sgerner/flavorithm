@@ -17,11 +17,14 @@ import {
 	movePurchasesToPantry,
 	normalizeIngredientName,
 	normalizePantryDraft,
+	normalizeShoppingItem,
 	reconcileShoppingList,
 	restockDepletedPantryItems,
 	restoreShoppingItem,
 	retireCheckedShoppingItems,
+	revertShoppingItem,
 	shopForScope,
+	snapshotShoppingItem,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -625,14 +628,15 @@ test('mid-week meal completion deducts pantry first and retires uncovered weekly
 	assert.ok(remainingUnchecked);
 	assert.equal(remainingUnchecked.quantity, 8);
 
-	// Case 3: Opting out of pantry deduction preserves checked purchase for Saturday
+	// Case 3: Opting out of pantry deduction (deductPantry: false) leaves both pantry stock
+	// and checked weekly purchases unchanged so they cover Saturday
 	const externalMeal = completeMeal(
 		state({
-			pantry: [],
+			pantry: [pantry('chicken', 4, 'oz')],
 			recipes: [chickenDinner],
 			meals,
 			shopping: [
-				shopping('tue-bought', 'chicken', 12, 'oz', true, weekKey),
+				shopping('tue-bought', 'chicken', 8, 'oz', true, weekKey),
 				shopping('sat-needed', 'chicken', 12, 'oz', false, weekKey)
 			]
 		}),
@@ -640,11 +644,12 @@ test('mid-week meal completion deducts pantry first and retires uncovered weekly
 		{ deductPantry: false, leftoverServings: 0 },
 		now
 	);
+	assert.equal(externalMeal.pantry[0].quantity, 4);
 	assert.equal(
 		externalMeal.shopping.filter((item) => item.sourceKey === weekKey && !item.checked).length,
 		0
 	);
-	assert.equal(externalMeal.shopping.find((item) => item.id === 'tue-bought')?.quantity, 12);
+	assert.equal(externalMeal.shopping.find((item) => item.id === 'tue-bought')?.quantity, 8);
 });
 
 test('adding non-expired pantry stock retires checked rows once per scope and refreshes weekly deficits', () => {
@@ -1156,6 +1161,71 @@ test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and 
 		fallbackRanked.map((item) => item.id),
 		['blank-lot', 'invalid-lot']
 	);
+});
+
+test('normalizeShoppingItem trims, bounds lengths, and clamps or defaults quantities', () => {
+	const blank = shopping('blank', '   ', null as unknown as number, '  ', false, 'recipe:soup');
+	normalizeShoppingItem(blank);
+	assert.equal(blank.name, 'Shopping item');
+	assert.equal(blank.unit, 'piece');
+	assert.equal(blank.quantity, 1);
+
+	const oversized = shopping(
+		'long',
+		`  ${'a'.repeat(240)}  `,
+		5_000_000,
+		` ${'u'.repeat(50)} `,
+		true
+	);
+	normalizeShoppingItem(oversized);
+	assert.equal(oversized.name, 'a'.repeat(200));
+	assert.equal(oversized.unit, 'u'.repeat(40));
+	assert.equal(oversized.quantity, 1_000_000);
+
+	const tiny = shopping('tiny', ' garlic ', 0, ' cloves ', false);
+	normalizeShoppingItem(tiny);
+	assert.equal(tiny.name, 'garlic');
+	assert.equal(tiny.unit, 'cloves');
+	assert.equal(tiny.quantity, 0.01);
+
+	const nonFinite = shopping('nan', 'salt', Number.NaN, 'tsp', false);
+	normalizeShoppingItem(nonFinite);
+	assert.equal(nonFinite.quantity, 1);
+
+	const withDraft = shopping('draft-item', 'San Marzano tomatoes', 2.5, 'cans', false);
+	const validDraft = { name: '  Roma tomatoes  ', quantity: 4, unit: ' lb ' };
+	normalizeShoppingItem(withDraft, validDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'lb');
+	assert.deepEqual(validDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'lb' });
+
+	const clearedDraft = { name: '   ', quantity: null, unit: '   ' };
+	normalizeShoppingItem(withDraft, clearedDraft);
+	assert.equal(withDraft.name, 'Roma tomatoes');
+	assert.equal(withDraft.quantity, 4);
+	assert.equal(withDraft.unit, 'piece');
+	assert.deepEqual(clearedDraft, { name: 'Roma tomatoes', quantity: 4, unit: 'piece' });
+});
+
+test('snapshotShoppingItem and revertShoppingItem restore pre-edit fields while keeping row metadata', () => {
+	const item = shopping('row-1', 'Olive oil', 2, 'tbsp', false, 'week:2026-10-19');
+	const snapshot = snapshotShoppingItem(item);
+
+	item.name = '   ';
+	normalizeShoppingItem(item);
+	item.name = 'Garlic';
+	item.quantity = 12;
+	item.unit = 'cloves';
+	item.checked = true;
+
+	revertShoppingItem(item, snapshot);
+	assert.equal(item.id, 'row-1');
+	assert.equal(item.name, 'Olive oil');
+	assert.equal(item.quantity, 2);
+	assert.equal(item.unit, 'tbsp');
+	assert.equal(item.checked, true);
+	assert.equal(item.sourceKey, 'week:2026-10-19');
 });
 
 test('restockDepletedPantryItems moves selected or all zero-quantity rows while keeping stored name and unit', () => {
