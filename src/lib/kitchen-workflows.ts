@@ -687,16 +687,15 @@ const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 function parseStrictDateKey(
 	value: string
 ): { year: number; month: number; day: number } | undefined {
-	const trimmed = value.trim();
-	if (!DATE_KEY_RE.test(trimmed)) return undefined;
-	return parseCalendarDate(trimmed);
+	if (!DATE_KEY_RE.test(value)) return undefined;
+	return parseCalendarDate(value);
 }
 
 function formatUtcCalendarKey(date: Date): string {
 	return `${String(date.getUTCFullYear()).padStart(4, '0')}-${String(date.getUTCMonth() + 1).padStart(2, '0')}-${String(date.getUTCDate()).padStart(2, '0')}`;
 }
 
-export function weekStartForDate(value: string | Date): string | undefined {
+export function weekStartForDate(value: string | Date | undefined): string | undefined {
 	const parsed =
 		value instanceof Date
 			? calendarDate(value)
@@ -713,11 +712,11 @@ export function weekStartForDate(value: string | Date): string | undefined {
 
 export function refreshWeekShopping(
 	state: Pick<AppState, 'recipes' | 'pantry' | 'meals' | 'shopping'>,
-	startDate: string,
+	startDate: string | undefined,
 	now: Date = new Date()
 ): ShoppingItem[] {
-	const trimmed = typeof startDate === 'string' ? startDate.trim() : '';
-	const parsed = parseStrictDateKey(trimmed);
+	const startKey = typeof startDate === 'string' ? startDate : '';
+	const parsed = parseStrictDateKey(startKey);
 	if (!parsed) return state.shopping;
 	const start = new Date(0);
 	start.setUTCFullYear(parsed.year, parsed.month, parsed.day);
@@ -733,7 +732,7 @@ export function refreshWeekShopping(
 		meals.some((meal) => meal.recipeId === recipe.id)
 	);
 	const additions = buildShoppingList(recipes, state.pantry, meals, safeNow);
-	return reconcileShoppingList(state.shopping, additions, `week:${trimmed}`);
+	return reconcileShoppingList(state.shopping, additions, `week:${startKey}`);
 }
 
 export function schedulePlannedMeal(
@@ -751,24 +750,24 @@ export function schedulePlannedMeal(
 	| { status: 'invalid-date'; state: AppState }
 	| { status: 'invalid-slot'; state: AppState }
 	| { status: 'invalid-servings'; state: AppState } {
-	const normalizedDate = typeof input.date === 'string' ? input.date.trim() : '';
-	const weekStart = weekStartForDate(normalizedDate);
+	const recipe = input.recipeId
+		? state.recipes.find((item) => item.id === input.recipeId)
+		: undefined;
+	if (!recipe) return { status: 'missing-recipe', state };
+	const date = typeof input.date === 'string' ? input.date : '';
+	const weekStart = weekStartForDate(date);
 	if (!weekStart) {
 		return { status: 'invalid-date', state };
 	}
 	if (!['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
 		return { status: 'invalid-slot', state };
 	}
-	const recipe = input.recipeId
-		? state.recipes.find((item) => item.id === input.recipeId)
-		: undefined;
-	if (!recipe) return { status: 'missing-recipe', state };
 	if (!isValidServings(input.servings)) {
 		return { status: 'invalid-servings', state };
 	}
 	const meal: Meal = {
 		id: input.id ?? globalThis.crypto.randomUUID(),
-		date: normalizedDate,
+		date,
 		slot: input.slot,
 		recipeId: recipe.id,
 		servings: input.servings
@@ -797,8 +796,8 @@ export function savePlannedMealChanges(
 	const meal = state.meals.find((item) => item.id === input.mealId);
 	if (!meal) return { status: 'missing', state };
 	if (meal.completedAt) return { status: 'completed', state };
-	const normalizedDate = typeof input.date === 'string' ? input.date.trim() : '';
-	const nextWeek = weekStartForDate(normalizedDate);
+	const date = typeof input.date === 'string' ? input.date : '';
+	const nextWeek = weekStartForDate(date);
 	if (!nextWeek) {
 		return { status: 'invalid-date', state };
 	}
@@ -813,7 +812,7 @@ export function savePlannedMealChanges(
 		item.id === input.mealId
 			? promoteSampleMeal({
 					...item,
-					date: normalizedDate,
+					date,
 					slot: input.slot,
 					servings: Math.round(input.servings)
 				})

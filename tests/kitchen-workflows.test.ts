@@ -1592,20 +1592,25 @@ test('filterPantryItems excludes zero-quantity rows from Expiring soon while kee
 	);
 });
 
-test('weekStartForDate accepts YYYY-MM-DD strings and Dates and returns undefined for malformed dates', () => {
+test('weekStartForDate accepts strict YYYY-MM-DD strings, Dates, and undefined and returns undefined for malformed dates', () => {
 	assert.equal(weekStartForDate('2026-10-19'), '2026-10-19');
 	assert.equal(weekStartForDate('2026-10-22'), '2026-10-19');
 	assert.equal(weekStartForDate('2026-10-25'), '2026-10-19');
 	assert.equal(weekStartForDate(new Date(2026, 9, 25, 23, 30)), '2026-10-19');
 	assert.equal(weekStartForDate('2024-02-29'), '2024-02-26');
+	assert.equal(weekStartForDate(undefined), undefined);
 
 	for (const malformed of [
 		'',
 		'   ',
+		' 2026-10-22 ',
+		'2026-1-02',
 		'not-a-date',
+		'2026-02-29',
 		'2026-02-30',
 		'2026-13-01',
 		'2026-00-10',
+		'2026-10-00',
 		'2026-10-32',
 		'2026/10/22',
 		'2026-10-22T00:00:00Z'
@@ -1623,10 +1628,22 @@ test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar d
 	});
 	const initial = state({ recipes: [pasta] });
 
+	const missingRecipeAttempt = schedulePlannedMeal(initial, {
+		recipeId: 'deleted-recipe',
+		date: 'not-a-date',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(missingRecipeAttempt.status, 'missing-recipe');
+	assert.equal(missingRecipeAttempt.state, initial);
+
 	for (const badDate of [
 		'',
 		'   ',
+		' 2026-10-22 ',
+		'2026-1-02',
 		'not-a-date',
+		'2026-02-29',
 		'2026-02-30',
 		'2026-13-01',
 		'2026/10/22',
@@ -1656,7 +1673,7 @@ test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar d
 	const scheduled = schedulePlannedMeal(initial, {
 		id: 'meal-1',
 		recipeId: 'pasta',
-		date: '  2026-10-22  ',
+		date: '2026-10-22',
 		slot: 'Dinner',
 		servings: 2
 	});
@@ -1669,7 +1686,10 @@ test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar d
 	for (const badDate of [
 		'',
 		'   ',
+		' 2026-10-22 ',
+		'2026-1-02',
 		'not-a-date',
+		'2026-02-29',
 		'2026-02-30',
 		'2026-13-01',
 		'2026/10/22',
@@ -1688,4 +1708,5 @@ test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar d
 	}
 
 	assert.equal(refreshWeekShopping(scheduled.state, '2026-02-30'), scheduled.state.shopping);
+	assert.equal(refreshWeekShopping(scheduled.state, undefined), scheduled.state.shopping);
 });

@@ -77,6 +77,9 @@ function injectPlannerHook(svelteSource: string): string {
 		openRecipePicker,
 		choosePickedRecipe,
 		openCookDialog,
+		markMealCooked,
+		planRecipe,
+		addMeal,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
 		saveMealChanges,
@@ -146,6 +149,9 @@ type PlannerHarnessApi = {
 	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
 	choosePickedRecipe: (recipe: Recipe) => void;
 	openCookDialog: (meal: Meal) => void;
+	markMealCooked: (event?: SubmitEvent) => void;
+	planRecipe: (recipe: Recipe, servings?: number) => void;
+	addMeal: (event?: SubmitEvent) => void;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
 	saveMealChanges: () => void;
@@ -923,6 +929,96 @@ test('saveEditedRecipe refuses to downgrade to a 2-way merge when editingRecipeB
 		assert.equal(result.status, 'error');
 		assert.match(result.error ?? '', /original recipe baseline/i);
 		assert.equal(api.kitchen.recipes[0].title, 'Original Title');
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('markMealCooked leaves pantry untouched by default and ignores meals completed concurrently', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = {
+			...makeRecipe('r-pantry-guard', 'Garlic Pasta'),
+			servings: 2,
+			ingredients: [{ name: 'spaghetti', quantity: 200, unit: 'g' }]
+		};
+		const meal: Meal = {
+			id: 'meal-guard',
+			date: '2026-11-23',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: 2
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			pantry: [
+				{ id: 'p-spaghetti', name: 'spaghetti', quantity: 500, unit: 'g', category: 'Grains' }
+			],
+			recipes: [recipe],
+			meals: [meal]
+		};
+
+		api.openCookDialog(meal);
+		assert.equal(api.deductPantry, false);
+		api.markMealCooked();
+
+		assert.ok(api.kitchen.meals[0].completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 500);
+
+		// Simulate opening the dialog before a peer household member completes the meal with leftovers:
+		const secondMeal: Meal = {
+			id: 'meal-concurrent',
+			date: '2026-11-24',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: 2
+		};
+		api.kitchen = {
+			...api.kitchen,
+			meals: [secondMeal]
+		};
+		api.openCookDialog(secondMeal);
+		const peerCompletedAt = '2026-11-24T18:00:00.000Z';
+		api.kitchen = {
+			...api.kitchen,
+			pantry: [
+				{ id: 'p-spaghetti', name: 'spaghetti', quantity: 300, unit: 'g', category: 'Grains' }
+			],
+			meals: [{ ...secondMeal, completedAt: peerCompletedAt, leftoverServings: 1 }]
+		};
+
+		api.markMealCooked();
+		assert.equal(api.kitchen.meals[0].completedAt, peerCompletedAt);
+		assert.equal(api.kitchen.meals[0].leftoverServings, 1);
+		assert.equal(api.kitchen.pantry[0].quantity, 300);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('addMeal and saveMealChanges reject malformed calendar dates in the planner shell', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-strict-date', 'Roasted Carrots');
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [] };
+
+		api.planRecipe(recipe, 2);
+		api.setPlannedDraft('2026-02-30', 'Dinner', 2);
+		api.addMeal();
+		assert.equal(api.kitchen.meals.length, 0);
+		assert.equal(api.kitchen.shopping.length, 0);
+
+		api.setPlannedDraft('2026-11-24', 'Dinner', 2);
+		api.addMeal();
+		assert.equal(api.kitchen.meals.length, 1);
+
+		api.editPlannedMeal(api.kitchen.meals[0]);
+		api.setPlannedDraft(' 2026-11-25 ', 'Dinner', 4);
+		api.saveMealChanges();
+		assert.equal(api.kitchen.meals[0].date, '2026-11-24');
+		assert.equal(api.kitchen.meals[0].servings, 2);
 	} finally {
 		harness.dispose();
 	}
