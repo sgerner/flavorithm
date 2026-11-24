@@ -25,7 +25,8 @@ process.env.PROTOCOL_HEADER = 'x-flavorithm-protocol';
 process.env.HOST_HEADER = 'x-flavorithm-host';
 process.env.PORT_HEADER = '';
 process.env.BODY_SIZE_LIMIT ||= '10M';
-const { handler } = await import('./build/handler.js');
+/** @type {{ handler: (req: import('node:http').IncomingMessage, res: import('node:http').ServerResponse) => unknown }} */
+const { handler } = await import(/** @type {string} */ ('./build/handler.js'));
 const server = createServer((req, res) => {
 	req.headers['x-flavorithm-protocol'] = configuredOrigin.protocol.slice(0, -1);
 	req.headers['x-flavorithm-host'] = configuredOrigin.host;
