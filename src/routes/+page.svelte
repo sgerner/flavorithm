@@ -102,7 +102,6 @@
 	import {
 		addPantryItems,
 		backfillSampleData,
-		clearSampleData,
 		completeMeal,
 		deleteMeal,
 		deleteRecipe,
@@ -185,8 +184,10 @@
 		reconcileChatGPTPreferences,
 		runConcurrentModelCatalog,
 		runHouseholdTransition,
+		runLocalAuthenticateWorkflow,
 		runOpenSettingsWorkflow,
 		runReconnectWorkflow,
+		runSampleCleanupWorkflow,
 		runSignedInHydration
 	} from '#lib/client-workflows.ts';
 	import {
@@ -214,7 +215,6 @@
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
-	let hasSampleRecords = $state(true);
 	let user = $state<User | null>(null);
 	let ready = $state(false);
 	let kitchenLoaded = $state(false);
@@ -449,7 +449,6 @@
 		editingRecipe = null;
 		editingRecipeMode = 'edit';
 		kitchen = createInitialState();
-		hasSampleRecords = true;
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
 		showStarter = false;
@@ -765,7 +764,6 @@
 				clearManagedIdentity();
 			} else {
 				kitchen = createInitialState();
-				hasSampleRecords = true;
 				localStorage.removeItem('flavorithm-last-account');
 				kitchenLoaded = true;
 			}
@@ -923,7 +921,6 @@
 			else delete updated.expires;
 			return updated;
 		});
-		hasSampleRecords = hasSampleData(kitchen);
 		const editedId = draft.id;
 		pantryDraft = null;
 		if (!restoreFocus) return;
@@ -955,7 +952,6 @@
 	function removePantryItem(item: AppState['pantry'][number]) {
 		if (pantryDraft?.id === item.id) pantryDraft = null;
 		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
-		hasSampleRecords = hasSampleData(kitchen);
 	}
 	function resetPantryFilters() {
 		pantryQuery = '';
@@ -1005,7 +1001,9 @@
 	let plannerMeals = $derived.by(() => {
 		const byDateSlot = new Map<string, Meal[]>();
 		const completed: Meal[] = [];
+		let hasSampleMeal = false;
 		for (const meal of kitchen.meals) {
+			if (meal.sample) hasSampleMeal = true;
 			const slotKey = mealSlotKey(meal.date, meal.slot);
 			const bucket = byDateSlot.get(slotKey);
 			if (bucket) bucket.push(meal);
@@ -1013,8 +1011,11 @@
 			if (meal.completedAt) completed.push(meal);
 		}
 		completed.sort((a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? ''));
-		return { mealsByDateSlot: byDateSlot, completedMeals: completed };
+		return { mealsByDateSlot: byDateSlot, completedMeals: completed, hasSampleMeal };
 	});
+	let hasSampleRecords = $derived(
+		page === 'planner' ? hasSampleData(kitchen, plannerMeals.hasSampleMeal) : hasSampleData(kitchen)
+	);
 	let mealsByDateSlot = $derived(plannerMeals.mealsByDateSlot);
 	let completedMeals = $derived(plannerMeals.completedMeals);
 	let renderableCompletedMeals = $derived(
@@ -1149,7 +1150,6 @@
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
 		kitchen = deleteMeal(kitchen, meal.id);
-		hasSampleRecords = hasSampleData(kitchen);
 		pruneEditingShoppingState();
 		notify('Planned meal removed.', () => {
 			if (
@@ -1157,7 +1157,6 @@
 				!kitchen.meals.some((entry) => entry.id === removed.id)
 			) {
 				kitchen = upsertMeal(kitchen, removed, undefined, { preserveSample: true });
-				hasSampleRecords = hasSampleData(kitchen);
 				pruneEditingShoppingState();
 			}
 		});
@@ -1264,9 +1263,7 @@
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				const sanitized = sanitizeKitchenState(state);
-				kitchen = sanitized;
-				hasSampleRecords = hasSampleData(sanitized);
+				kitchen = sanitizeKitchenState(state);
 			},
 			onStatus: (status) => {
 				syncReady = status.ready;
@@ -1319,7 +1316,6 @@
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
-			hasSampleRecords = true;
 			showStarter = false;
 		} else {
 			const started = localStorage.getItem('flavorithm-started') === 'yes';
@@ -1332,7 +1328,6 @@
 					const loaded = started ? sanitized : backfillSampleData(sanitized);
 					if (!themes.includes(loaded.preferences.theme)) loaded.preferences.theme = 'nosh';
 					kitchen = loaded;
-					hasSampleRecords = hasSampleData(loaded);
 				}
 			} catch {}
 			showStarter = !started;
@@ -1364,7 +1359,6 @@
 					clearGuestData(localStorage);
 					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
-					hasSampleRecords = true;
 					kitchenLoaded = false;
 					showStarter = false;
 				}
@@ -1512,7 +1506,6 @@
 	});
 	function adoptKitchen(state: AppState) {
 		const sanitized = sanitizeKitchenState(state);
-		hasSampleRecords = hasSampleData(sanitized);
 		if (user && kitchenSync) {
 			const snapshotUser = $state.snapshot(user);
 			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
@@ -1583,40 +1576,34 @@
 	}
 
 	function freshKitchen() {
-		clearEditingShoppingState();
-		if (!hasSampleData(kitchen)) {
-			hasSampleRecords = false;
-			showStarter = false;
-			if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
-			return;
-		}
-		const previousKitchen = sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)));
-		const wasShowingStarter = showStarter;
-		const previousStarted =
-			!user && !managedAuth ? localStorage.getItem('flavorithm-started') : null;
-		kitchen = clearSampleData(previousKitchen);
-		hasSampleRecords = hasSampleData(kitchen);
-		pantryDraft = null;
-		resetPantryFilters();
-		const appliedSnapshot = JSON.stringify(kitchen);
-		showStarter = false;
-		if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
-		if (modal === 'settings') closeDialog();
-		notify('Sample data cleared.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) {
+		runSampleCleanupWorkflow({
+			commitInlineEdits: () => {
+				commitInlineEdits();
+				clearEditingShoppingState();
+			},
+			getKitchen: () => kitchen,
+			setKitchen: (next) => {
+				kitchen = next;
+			},
+			onCleaned: () => {
+				pantryDraft = null;
+				resetPantryFilters();
+			},
+			onUndoRestore: (restored) => {
 				pantryDraft = null;
 				clearEditingShoppingState();
-				kitchen = previousKitchen;
-				hasSampleRecords = hasSampleData(previousKitchen);
-				if (wasShowingStarter && !user && !managedAuth) {
-					showStarter = true;
-					if (previousStarted === null) localStorage.removeItem('flavorithm-started');
-					else localStorage.setItem('flavorithm-started', previousStarted);
-				}
-				notify('Sample data restored.');
-			} else {
-				notify('Your kitchen changed again. Review the current values before editing.');
-			}
+				kitchen = restored;
+			},
+			getShowStarter: () => showStarter,
+			setShowStarter: (show) => {
+				showStarter = show;
+			},
+			isGuest: () => !user && !managedAuth,
+			storage: localStorage,
+			closeSettingsIfOpen: () => {
+				if (modal === 'settings') closeDialog();
+			},
+			notify
 		});
 	}
 	function navigate(id: string) {
@@ -1741,54 +1728,48 @@
 			commitInlineEdits();
 			clearTimeout(saveTimer);
 			const isRegister = authMode === 'register';
-			const guestKitchen = isRegister
-				? clearSampleData(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))))
-				: null;
-			const result = await request('/api/auth', { action: authMode, name, email, password });
-			const authenticatedUser: User = result.user;
-			password = '';
-			showStarter = false;
-			clearHouseholdViewState();
-			stateEtag = null;
-			kitchen = guestKitchen ?? createNewUserState();
-			hasSampleRecords = hasSampleData(kitchen);
-			user = authenticatedUser;
-			kitchenSync?.prepare(authenticatedUser);
-			kitchenLoaded = true;
-			saveLastAccount(authenticatedUser);
-			if (guestKitchen) {
-				kitchen = guestKitchen;
-				hasSampleRecords = hasSampleData(guestKitchen);
-				kitchenSync?.stage(guestKitchen);
-				if (!syncErrors) {
+			const {
+				user: authenticatedUser,
+				guestKitchen,
+				stateLoaded
+			} = await runLocalAuthenticateWorkflow({
+				authMode,
+				getKitchen: () => kitchen,
+				authenticateRequest: () =>
+					request('/api/auth', { action: authMode, name, email, password }),
+				onAuthenticated: (nextUser, initialKitchen) => {
+					password = '';
+					showStarter = false;
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = initialKitchen;
+					user = nextUser;
+					kitchenSync?.prepare(nextUser);
+					kitchenLoaded = true;
+					saveLastAccount(nextUser);
+				},
+				stageGuestKitchen: (cleanedGuest) => {
+					kitchen = cleanedGuest;
+					kitchenSync?.stage(cleanedGuest);
+				},
+				hasSyncError: () => Boolean(syncErrors),
+				clearGuestStorage: () => {
 					clearGuestKitchen(localStorage);
 					clearGuestData(localStorage);
+				},
+				fetchState: () => request('/api/state'),
+				createState: (state) => request('/api/state', { state }, 'PUT'),
+				adoptKitchen,
+				hasPendingSnapshot: () => Boolean(kitchenSync?.snapshot()),
+				syncKitchen: async () => {
+					await kitchenSync?.sync();
+				},
+				isOnline: () => online,
+				retrySync: () => retrySync(),
+				failStateLoad: (message) => {
+					kitchenSync?.failLoad(message);
 				}
-			}
-			let stateLoaded = false;
-			try {
-				const saved = await request('/api/state');
-				if (guestKitchen) {
-					adoptKitchen(saved.state || createNewUserState());
-					if (!saved.state && !kitchenSync?.snapshot()) {
-						const created = await request('/api/state', { state: guestKitchen }, 'PUT');
-						adoptKitchen(created.state || guestKitchen);
-					} else {
-						await kitchenSync?.sync();
-					}
-				} else if (saved.state) {
-					adoptKitchen(saved.state);
-					if (online && kitchenSync?.snapshot()) await retrySync();
-				} else {
-					const initial = createNewUserState();
-					const created = await request('/api/state', { state: initial }, 'PUT');
-					adoptKitchen(created.state || initial);
-					if (online && kitchenSync?.snapshot()) await retrySync();
-				}
-				stateLoaded = true;
-			} catch (stateError) {
-				kitchenSync?.failLoad((stateError as Error).message);
-			}
+			});
 			syncing = false;
 			if (stateLoaded) {
 				await refreshConnections().catch(() =>
@@ -1857,7 +1838,6 @@
 			pantryDraft = null;
 			resetPantryFilters();
 			kitchen = createInitialState();
-			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
@@ -2445,7 +2425,6 @@
 		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
-		hasSampleRecords = hasSampleData(kitchen);
 		pruneEditingShoppingState();
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
@@ -2469,7 +2448,6 @@
 		notify('Basil’s changes applied.', () => {
 			if (JSON.stringify(kitchen) === appliedSnapshot) {
 				kitchen = previousKitchen;
-				hasSampleRecords = hasSampleData(previousKitchen);
 				pruneEditingShoppingState();
 			} else notify('Your kitchen changed again. Review the current values before editing.');
 		});
@@ -2919,7 +2897,6 @@
 		r.saved = !r.saved;
 		delete r.sampleSaved;
 		kitchen.recipes = [...kitchen.recipes];
-		hasSampleRecords = hasSampleData(kitchen);
 		notify(r.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
 	function toggleRecipeHidden(recipe: Recipe) {
@@ -2978,7 +2955,6 @@
 		const wasSaved = Boolean(previous?.saved);
 		const nutritionNeedsRefresh = recipeNeedsNutritionRefresh(previous, updated);
 		kitchen = applyEditedRecipe(kitchen, updated);
-		hasSampleRecords = hasSampleData(kitchen);
 		pruneEditingShoppingState();
 		editingRecipe = null;
 		editingRecipeMode = 'edit';
@@ -3065,7 +3041,6 @@
 		if (!recipe) return;
 		const impactedMealCount = kitchen.meals.filter((meal) => meal.recipeId === recipe.id).length;
 		kitchen = deleteRecipe(kitchen, recipe.id);
-		hasSampleRecords = hasSampleData(kitchen);
 		pruneEditingShoppingState();
 		recipeToDelete = null;
 		modal = '';
@@ -3294,7 +3269,6 @@
 			slot: mealSlot,
 			servings: Math.round(plannedServings)
 		});
-		hasSampleRecords = hasSampleData(kitchen);
 		pruneEditingShoppingState();
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
@@ -3331,7 +3305,6 @@
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
-		hasSampleRecords = hasSampleData(kitchen);
 		pruneEditingShoppingState();
 		resetMealDialogState();
 		modal = '';
@@ -3348,7 +3321,6 @@
 		if (!result.restockedCount) return;
 		kitchen.pantry = result.pantry;
 		kitchen.shopping = result.shopping;
-		hasSampleRecords = hasSampleData(kitchen);
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
 		const singleName =
@@ -3369,7 +3341,6 @@
 			) {
 				kitchen.pantry = previousPantry;
 				kitchen.shopping = previousShopping;
-				hasSampleRecords = hasSampleData(kitchen);
 				if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 					clearEditingShoppingState();
 			} else {
@@ -3609,7 +3580,6 @@
 					clearHouseholdViewState();
 					stateEtag = null;
 					kitchen = createNewUserState();
-					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -3891,7 +3861,6 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
-			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
@@ -3983,7 +3952,6 @@
 					clearHouseholdViewState();
 					stateEtag = null;
 					kitchen = createNewUserState();
-					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -4272,7 +4240,7 @@
 				/>{/if}
 			{#if showStarter && hasSampleRecords}<div class="starter-note">
 					<span><Sparkles size={14} /> Sample kitchen</span><button onclick={freshKitchen}
-						>Start fresh <ArrowRight size={13} /></button
+						>Clear sample data</button
 					><button
 						aria-label="Dismiss sample kitchen notice"
 						onclick={() => {
@@ -4584,7 +4552,6 @@
 										kitchen.pantry = kitchen.pantry.filter(
 											(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
 										);
-										hasSampleRecords = hasSampleData(kitchen);
 									}}>Clear depleted items</button
 								></span
 							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
