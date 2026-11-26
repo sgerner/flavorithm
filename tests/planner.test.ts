@@ -10,6 +10,7 @@ import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
@@ -65,6 +66,7 @@ function injectPlannerHook(svelteSource: string): string {
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
 		get deductPantry() { return deductPantry; },
+		set deductPantry(value: boolean) { deductPantry = value; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
 		get recipesById() { return recipesById; },
@@ -125,7 +127,7 @@ type PlannerHarnessApi = {
 	authMetadataLoaded: boolean;
 	readonly week: Date[];
 	weekOffset: number;
-	readonly deductPantry: boolean;
+	deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
 	readonly mealsByDateSlot: Map<string, Meal[]>;
@@ -184,6 +186,7 @@ function createModuleMap() {
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/status.ts': statusMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
@@ -812,7 +815,12 @@ test('marking a meal cooked keeps pantry deduction opt-in', () => {
 		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
 
 		api.openCookDialog(meal);
+		assert.equal(api.deductPantry, false);
 
+		api.deductPantry = true;
+		assert.equal(api.deductPantry, true);
+
+		api.openCookDialog(meal);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
