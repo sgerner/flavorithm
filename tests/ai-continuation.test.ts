@@ -22,6 +22,7 @@ import {
 	type PendingAIContinuation
 } from '../src/lib/ai-continuation.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
@@ -604,6 +605,7 @@ function createReactivePage(options?: {
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
@@ -669,6 +671,9 @@ function createReactivePage(options?: {
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected page dependency ${id}`);
 		},
 		Date,
