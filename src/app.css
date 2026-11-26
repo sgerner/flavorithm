@@ -95,7 +95,8 @@ button {
 	background: none;
 	color: inherit;
 }
-button:disabled {
+button:disabled,
+button[aria-disabled='true'] {
 	opacity: 0.5;
 	cursor: not-allowed;
 }
@@ -342,7 +343,7 @@ main {
 	align-items: center;
 	justify-content: center;
 }
-.icon-button:hover {
+.icon-button:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--wash);
 }
 .mobile-menu {
@@ -1140,6 +1141,10 @@ main {
 	width: 100%;
 	padding: 10px 12px;
 	font-size: 14px;
+}
+.inline-add .icon-button,
+.inline-add .text-button {
+	flex: 0 0 auto;
 }
 .shopping-complete {
 	display: flex;
@@ -3047,6 +3052,12 @@ html.dark[data-theme='nosh'] {
 	.inline-add input {
 		min-width: 0;
 		font-size: 16px;
+	}
+
+	.inline-add .icon-button {
+		width: 44px;
+		height: 44px;
+		flex: 0 0 44px;
 	}
 
 	.inline-add .text-button {
