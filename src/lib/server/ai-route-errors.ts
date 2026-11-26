@@ -62,7 +62,8 @@ export function mapSignedInAIRouteError(
 		error instanceof AIRequestError ||
 		error instanceof ApiError
 	) {
-		const code = 'code' in error && typeof error.code === 'string' ? error.code : undefined;
+		const code =
+			'code' in error && typeof error.code === 'string' && error.code ? error.code : undefined;
 		const retryAfter =
 			'retryAfter' in error &&
 			typeof error.retryAfter === 'number' &&

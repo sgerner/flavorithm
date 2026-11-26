@@ -88,6 +88,7 @@
 		preferenceSummary
 	} from '#lib/domain.ts';
 	import {
+		addPantryItems,
 		backfillSampleData,
 		clearSampleData,
 		completeMeal,
@@ -96,16 +97,17 @@
 		filterPantryItems,
 		hasSampleData,
 		listPantryCategories,
+		movePurchasesToPantry,
 		normalizeIngredientName,
 		normalizePantryDraft,
 		promoteSampleIngredient,
 		normalizeShoppingItem,
-		reconcileShoppingList,
+		refreshWeekShopping as refreshWeekShoppingItems,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
 		revertShoppingItem,
+		shopForScope,
 		snapshotShoppingItem,
-		transferPurchasedItemsToPantry,
 		unitInfo,
 		type PantryDraft,
 		type ShoppingItemDraft,
@@ -127,8 +129,14 @@
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
+	import {
+		BUTLER_HISTORY_LIMIT,
+		pairButlerHistory,
+		type ButlerChatResult
+	} from '#lib/butler-chat.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
+	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
 	import {
@@ -1540,7 +1548,8 @@
 		const parsed = parseIngredientLines(boundedInput);
 		const rejectedInput = Math.max(0, segments.length - parsed.length);
 		commitInlineEdits();
-		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
 		const existingKeys = new Set(
 			kitchen.pantry
 				.filter((item) => !item.sample && !item.expires?.trim())
@@ -1580,8 +1589,13 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
-		const applied = JSON.stringify(kitchen.pantry);
+		const updated = addPantryItems(kitchen, additions);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
 		modal = '';
 		const acceptedCount = additions.length;
@@ -1594,8 +1608,18 @@
 		notify(
 			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}.`,
 			() => {
-				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-				else notify('Your pantry changed again. Review the current quantities before editing.');
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else notify('Your pantry changed again. Review the current quantities before editing.');
 			}
 		);
 	}
@@ -2328,7 +2352,11 @@
 			{
 				prompt: message,
 				messages: [
-					...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
+					...pairButlerHistory(
+						history,
+						(turn) => turn.content.slice(0, 8000),
+						BUTLER_HISTORY_LIMIT
+					),
 					{ role: 'user', content: message }
 				],
 				context
@@ -2337,7 +2365,7 @@
 		);
 		if (owner !== `${user?.id}:${user?.householdId}`)
 			throw new Error('The active kitchen changed. Ask Basil again.');
-		return result as { reply: string; commands: unknown[] };
+		return result as ButlerChatResult;
 	}
 	function applyButler(commands: unknown[], expectedSnapshot: string) {
 		if (JSON.stringify(kitchen) !== expectedSnapshot) {
@@ -2848,19 +2876,7 @@
 		leftoverServings = 0;
 	}
 	function refreshWeekShopping(startDate: string) {
-		const start = new Date(`${startDate}T12:00:00`);
-		if (Number.isNaN(start.getTime())) return;
-		const dates = Array.from({ length: 7 }, (_, index) => {
-			const day = new Date(start);
-			day.setDate(day.getDate() + index);
-			return dateKey(day);
-		});
-		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
-		const recipes = kitchen.recipes.filter((recipe) =>
-			meals.some((meal) => meal.recipeId === recipe.id)
-		);
-		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		kitchen.shopping = refreshWeekShoppingItems(kitchen, startDate);
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 			clearEditingShoppingState();
 	}
@@ -2951,7 +2967,6 @@
 		);
 		let lotCount = kitchen.pantry.length;
 		const accepted: AppState['shopping'] = [];
-		const acceptedIds = new Set<string>();
 		for (const item of checked) {
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40);
@@ -2968,7 +2983,6 @@
 				unit,
 				quantity: Math.min(1_000_000, item.quantity)
 			});
-			acceptedIds.add(item.id);
 		}
 		if (!accepted.length) {
 			notify(
@@ -2978,10 +2992,33 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, accepted);
-		kitchen.shopping = kitchen.shopping.filter((i) => !acceptedIds.has(i.id));
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const updated = movePurchasesToPantry(kitchen);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		notify(
-			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`,
+			() => {
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else {
+					notify('Your kitchen changed again. Review the current values before editing.');
+				}
+			}
 		);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
@@ -2991,11 +3028,14 @@
 		}
 		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
+		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
+		kitchen.shopping = shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		selected = null;
 		page = 'shopping';
 		notify(
-			additions.length
+			uncheckedCount
 				? 'Shopping list ready. Your pantry is already accounted for.'
 				: 'You have everything you need. Happy cooking!'
 		);
@@ -3859,15 +3899,19 @@
 		<div class="bottom-nav">
 			<button onclick={household}><Users size={18} /> My household <Plus size={15} /></button
 			><button onclick={() => openSettings()}><Settings size={18} /> Settings & themes</button
-			><button
+			><ToggleButton
+				pressed={kitchen.preferences.dark}
 				onclick={() => {
 					kitchen.preferences.dark = !kitchen.preferences.dark;
 				}}
-				>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}{kitchen
-					.preferences.dark
-					? 'Light mode'
-					: 'Dark mode'}<span class="mode-toggle" class:on={kitchen.preferences.dark}
-				></span></button
+				>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+						size={18}
+						aria-hidden="true"
+					/>{/if}Dark mode<span
+					class="mode-toggle"
+					class:on={kitchen.preferences.dark}
+					aria-hidden="true"
+				></span></ToggleButton
 			>
 		</div>
 		<button class="profile-button" onclick={() => (user ? openSettings() : openAuthentication())}
@@ -3893,16 +3937,20 @@
 				<b>{nav.find((n) => n.id === page)?.name || 'Discover'}</b>
 			</div>
 			<div class="topbar-actions">
-				<button
+				<ToggleButton
 					class="icon-button"
-					aria-label="Switch color mode"
+					label="Dark color mode"
+					pressed={kitchen.preferences.dark}
 					onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-					>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}</button
+					>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+							size={18}
+							aria-hidden="true"
+						/>{/if}</ToggleButton
 				><button
 					class="top-avatar"
 					aria-label={user ? 'Open household and account' : 'Sign in or create an account'}
 					onclick={() => (user ? household() : openAuthentication())}
-					>{user?.name.slice(0, 1) || 'Y'}</button
+					><span aria-hidden="true">{user?.name.slice(0, 1) || 'Y'}</span></button
 				>
 			</div>
 		</header>
@@ -4041,12 +4089,17 @@
 							class:can-scroll-left={filterOverflow.left}
 							class:can-scroll-right={filterOverflow.right}
 						>
-							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
-								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
-										type="button"
+							<div
+								class="filter-tabs"
+								role="group"
+								aria-label="Filter recipes"
+								bind:this={filterTabs}
+								onscroll={syncFilterOverflow}
+							>
+								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<ToggleButton
 										data-filter={item}
-										class:active={filter === item}
-										aria-pressed={filter === item}
+										class={{ active: filter === item }}
+										pressed={filter === item}
 										onclick={() => {
 											lastActivePill = 'filter';
 											priorityPantryIds = [];
@@ -4054,17 +4107,20 @@
 										}}
 										>{#if item === 'For you'}<Sparkles
 												size={14}
-											/>{:else if item === PANTRY_FILTER}<Carrot size={14} />{/if}{item}</button
+												aria-hidden="true"
+											/>{:else if item === PANTRY_FILTER}<Carrot
+												size={14}
+												aria-hidden="true"
+											/>{/if}{item}</ToggleButton
 									>{/each}
-								<button
-									type="button"
+								<ToggleButton
 									data-filter="hidden"
-									class:active={showHiddenRecipes}
-									aria-pressed={showHiddenRecipes}
+									class={{ active: showHiddenRecipes }}
+									pressed={showHiddenRecipes}
 									onclick={() => {
 										lastActivePill = 'hidden';
 										showHiddenRecipes = !showHiddenRecipes;
-									}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+									}}>Hidden recipes</ToggleButton
 								>
 							</div>
 						</div>
@@ -4256,19 +4312,21 @@
 				<div class="pantry-controls">
 					<div class="pantry-filter-bar">
 						<label class="search-box pantry-search">
-							<Search size={17} /><span class="visually-hidden">Search pantry</span><input
-								type="search"
-								placeholder="Search pantry"
-								bind:value={pantryQuery}
-							/>
+							<Search size={17} aria-hidden="true" /><span class="visually-hidden"
+								>Search pantry</span
+							><input type="search" placeholder="Search pantry" bind:value={pantryQuery} />
 						</label>
 						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
-							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
-									type="button"
-									class:active={pantryFilter === option.id}
-									aria-pressed={pantryFilter === option.id}
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<ToggleButton
+									class={{ active: pantryFilter === option.id }}
+									pressed={pantryFilter === option.id}
 									onclick={() => (pantryFilter = option.id)}
-									>{option.label}<span>{option.count}</span></button
+									><span>{option.label}</span><span class="visually-hidden">{', '}</span><span
+										class="expiry-count"
+										>{option.count}<span class="visually-hidden"
+											>{` ${option.count === 1 ? 'item' : 'items'}`}</span
+										></span
+									></ToggleButton
 								>{/each}
 						</div>
 					</div>
@@ -4277,19 +4335,17 @@
 							role="group"
 							aria-label="Filter pantry by category"
 						>
-							<button
-								type="button"
-								class:active={pantryCategory === 'all'}
-								aria-pressed={pantryCategory === 'all'}
-								onclick={() => (pantryCategory = 'all')}>All categories</button
-							>{#each pantryCategories as category (category.key)}<button
-									type="button"
-									class:active={pantryCategory.toLowerCase() === category.key}
-									aria-pressed={pantryCategory.toLowerCase() === category.key}
+							<ToggleButton
+								class={{ active: pantryCategory === 'all' }}
+								pressed={pantryCategory === 'all'}
+								onclick={() => (pantryCategory = 'all')}>All categories</ToggleButton
+							>{#each pantryCategories as category (category.key)}<ToggleButton
+									class={{ active: pantryCategory.toLowerCase() === category.key }}
+									pressed={pantryCategory.toLowerCase() === category.key}
 									onclick={() =>
 										(pantryCategory =
 											pantryCategory.toLowerCase() === category.key ? 'all' : category.label)}
-									>{category.label}</button
+									>{category.label}</ToggleButton
 								>{/each}
 						</div>{/if}
 				</div>
@@ -4304,7 +4360,8 @@
 						<div class="pantry-list" role="list" aria-label="Pantry ingredients">
 							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
 									item.expires
-								)}{@const depleted = Number.isFinite(item.quantity) && item.quantity <= 0}
+								)}{@const itemDomId = encodeURIComponent(item.id)}{@const depleted =
+									Number.isFinite(item.quantity) && item.quantity <= 0}
 								<div
 									class="pantry-row"
 									class:editing={pantryDraft?.id === item.id}
@@ -4326,9 +4383,8 @@
 													<span class="ingredient-symbol" aria-hidden="true"
 														>{ingredientEmoji(item.name)}</span
 													><span class="ingredient-title-line"
-														><b class="pantry-name">{item.name}</b>{#if item.sample}<small
-																class="sample-badge">Sample</small
-															>{/if}</span
+														><b id={`pantry-item-${itemDomId}`} class="pantry-name">{item.name}</b
+														>{#if item.sample}<small class="sample-badge">Sample</small>{/if}</span
 													>
 												</span>
 												<div class="pantry-edit-actions">
@@ -4341,51 +4397,78 @@
 														type="button"
 														class="icon-button pantry-remove-button"
 														aria-label={`Remove ${item.name}`}
-														onclick={() => removePantryItem(item)}><X size={16} /></button
+														onclick={() => removePantryItem(item)}
+														><X size={16} aria-hidden="true" /></button
 													>
 												</div>
 											</div>
-											<div class="pantry-edit-fields">
-												<label class="pantry-field"
-													><span>Quantity</span><input
+											<div
+												class="pantry-edit-fields"
+												role="group"
+												aria-labelledby={`pantry-item-${itemDomId}`}
+											>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-amount-${itemDomId}`}
+														><span>Amount</span><span class="visually-hidden"
+															>{` of ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-amount-${itemDomId}`}
 														type="number"
 														min="0"
 														max="1000000"
 														step="any"
 														bind:value={pantryDraft.quantity}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Unit</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-unit-${itemDomId}`}
+														><span>Unit</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-unit-${itemDomId}`}
 														type="text"
 														maxlength="40"
 														bind:value={pantryDraft.unit}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Category</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-category-${itemDomId}`}
+														><span>Category</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-category-${itemDomId}`}
 														type="text"
 														maxlength="100"
 														list="pantry-category-suggestions"
 														bind:value={pantryDraft.category}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Best before</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-expiry-${itemDomId}`}
+														><span>Best before</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-expiry-${itemDomId}`}
 														type="date"
 														bind:value={pantryDraft.expires}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												>
+													/>
+												</div>
 											</div>
 										</form>{:else}<span class="pantry-ingredient">
 											<span class="ingredient-symbol" aria-hidden="true"
 												>{ingredientEmoji(item.name)}</span
 											><span class="ingredient-meta"
 												><span class="ingredient-title-line"
-													><b class="pantry-name">{item.name}</b>{#if item.sample}<small
-															class="sample-badge">Sample</small
-														>{/if}</span
+													><b id={`pantry-item-${itemDomId}`} class="pantry-name">{item.name}</b
+													>{#if item.sample}<small class="sample-badge">Sample</small>{/if}</span
 												><span class="ingredient-tags"
 													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
 													>{#if depleted}<button
@@ -4398,7 +4481,7 @@
 															type="button"
 															class="text-button use-first"
 															onclick={() => useFirstIngredients([item])}
-															><Sparkles size={14} />Use first</button
+															><Sparkles size={14} aria-hidden="true" />Use first</button
 														>{/if}</span
 												></span
 											>
@@ -4414,7 +4497,11 @@
 											>{#if item.expires}<small class="pantry-date">{item.expires}</small
 												>{/if}</span
 										>
-										<div class="pantry-row-actions">
+										<div
+											class="pantry-row-actions"
+											role="group"
+											aria-labelledby={`pantry-item-${itemDomId}`}
+										>
 											<button
 												type="button"
 												class="text-button pantry-edit-button"
@@ -4425,7 +4512,8 @@
 												type="button"
 												class="icon-button pantry-remove-button"
 												aria-label={`Remove ${item.name}`}
-												onclick={() => removePantryItem(item)}><X size={16} /></button
+												onclick={() => removePantryItem(item)}
+												><X size={16} aria-hidden="true" /></button
 											>
 										</div>{/if}
 								</div>{/each}
@@ -5159,19 +5247,25 @@
 					<h2>Settings</h2>
 					<div class="settings-section">
 						<h3>Appearance</h3>
-						<div class="theme-grid">
-							{#each themes as theme}<button
-									class:active={kitchen.preferences.theme === theme}
-									aria-pressed={kitchen.preferences.theme === theme}
+						<div class="theme-grid" role="group" aria-label="Color theme">
+							{#each themes as theme}<ToggleButton
+									class={{ active: kitchen.preferences.theme === theme }}
+									pressed={kitchen.preferences.theme === theme}
 									onclick={() => (kitchen.preferences.theme = theme)}
-									>{theme}{#if kitchen.preferences.theme === theme}<Check size={13} />{/if}</button
+									>{theme}{#if kitchen.preferences.theme === theme}<Check
+											size={13}
+											aria-hidden="true"
+										/>{/if}</ToggleButton
 								>{/each}
 						</div>
-						<button
-							class="secondary"
+						<ToggleButton
+							class={{ secondary: true, active: kitchen.preferences.dark }}
+							pressed={kitchen.preferences.dark}
 							onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-							>{#if kitchen.preferences.dark}<Sun size={16} />{:else}<Moon size={16} />{/if}Switch
-							to {kitchen.preferences.dark ? 'light' : 'dark'} mode</button
+							>{#if kitchen.preferences.dark}<Sun size={16} aria-hidden="true" />{:else}<Moon
+									size={16}
+									aria-hidden="true"
+								/>{/if}Dark appearance</ToggleButton
 						>
 					</div>
 
@@ -5783,7 +5877,7 @@
 		flex-wrap: wrap;
 		margin: 0;
 	}
-	.expiry-filters button {
+	.expiry-filters :global(button) {
 		min-height: 44px;
 		display: inline-flex;
 		align-items: center;
@@ -5793,14 +5887,14 @@
 		background: var(--surface);
 		font-size: 14px;
 	}
-	.expiry-filters button.active {
+	.expiry-filters :global(button.active) {
 		padding: 7px 11px;
 		background: var(--chip-active-bg);
 		color: var(--ink);
 		border: 2px solid var(--chip-active-border);
 		font-weight: 700;
 	}
-	.expiry-filters button span {
+	.expiry-filters .expiry-count {
 		min-width: 22px;
 		padding: 2px 5px;
 		background: color-mix(in srgb, currentColor 12%, transparent);
@@ -6217,13 +6311,13 @@
 			grid-template-columns: repeat(3, minmax(0, 1fr));
 			width: 100%;
 		}
-		.expiry-filters button {
+		.expiry-filters :global(button) {
 			justify-content: center;
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
 		}
-		.expiry-filters button.active {
+		.expiry-filters :global(button.active) {
 			padding-inline: 5px;
 		}
 		.ingredient-meta {
