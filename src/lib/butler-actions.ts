@@ -153,19 +153,22 @@ export function isButlerKitchenMutation(command: ButlerCommand): boolean {
 	return !['navigate', 'recipe.open', 'ui'].includes(command.type);
 }
 
+function isOpenOnlyButlerAction(action: Pick<ButlerHistoryAction, 'commands'>): boolean {
+	return (
+		action.commands.length > 0 &&
+		action.commands.every((command) => !isButlerKitchenMutation(command))
+	);
+}
+
 /** Append `[User applied: ...]` and/or `[User opened: ...]` notes for applied action cards on a turn. */
 export function formatButlerHistoryContent(
 	message: Pick<ButlerHistoryInputMessage, 'content' | 'actions'>
 ): string {
 	const applied = message.actions
-		?.filter(
-			(action) => action.status === 'applied' && action.commands.some(isButlerKitchenMutation)
-		)
+		?.filter((action) => action.status === 'applied' && !isOpenOnlyButlerAction(action))
 		.map((action) => action.title);
 	const opened = message.actions
-		?.filter(
-			(action) => action.status === 'applied' && !action.commands.some(isButlerKitchenMutation)
-		)
+		?.filter((action) => action.status === 'applied' && isOpenOnlyButlerAction(action))
 		.map((action) => action.title);
 	const notes = [
 		applied?.length ? `[User applied: ${applied.join('; ')}]` : '',

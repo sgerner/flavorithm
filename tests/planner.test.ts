@@ -11,6 +11,7 @@ import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerActionsMod from '../src/lib/butler-actions.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
@@ -65,6 +66,7 @@ function injectPlannerHook(svelteSource: string): string {
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
 		get deductPantry() { return deductPantry; },
+		set deductPantry(value: boolean) { deductPantry = value; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
 		get recipesById() { return recipesById; },
@@ -121,6 +123,10 @@ function injectPlannerHook(svelteSource: string): string {
 					} as any)
 				: null;
 		},
+		setApiKey: (value: string) => {
+			apiKey = value;
+		},
+		askButler,
 		applyButler,
 		openButlerControl,
 		confirmPendingExport,
@@ -159,7 +165,7 @@ type PlannerHarnessApi = {
 	authMetadataLoaded: boolean;
 	readonly week: Date[];
 	weekOffset: number;
-	readonly deductPantry: boolean;
+	deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
 	readonly mealsByDateSlot: Map<string, Meal[]>;
@@ -191,6 +197,13 @@ type PlannerHarnessApi = {
 	editingRecipeMode: 'create' | 'edit';
 	pendingSync: boolean;
 	setPendingSyncSnapshot: (localState: AppState | null) => void;
+	setApiKey: (value: string) => void;
+	askButler: (
+		message: string,
+		history: butlerChatMod.ButlerTurn[],
+		signal?: AbortSignal,
+		recipeDrafts?: Recipe[]
+	) => Promise<butlerChatMod.ButlerChatResult>;
 	applyButler: (commands: unknown[], expectedSnapshot: string) => string;
 	openButlerControl: (
 		target: Extract<butlerMod.ButlerCommand, { type: 'ui' }>['action']
@@ -235,6 +248,7 @@ function createModuleMap() {
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-actions.ts': butlerActionsMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
@@ -391,6 +405,8 @@ function createReactivePlanner() {
 			this.type = options?.type ?? '';
 		}
 	}
+	const aiRequests: Record<string, unknown>[] = [];
+	let aiResponse: butlerChatMod.ButlerChatResult = { reply: 'Ready.', commands: [] };
 	const storage = makeMemoryStorage();
 	const sandbox: Record<string, unknown> = {
 		exports,
@@ -450,10 +466,19 @@ function createReactivePlanner() {
 			},
 			scrollTo: () => {}
 		},
-		fetch: async (input: unknown) => {
+		fetch: async (input: unknown, init?: RequestInit) => {
 			const path = String(input);
 			if (path === '/api/export') {
 				return new Response(JSON.stringify({ exported: true, version: 1 }), {
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				});
+			}
+			if (path === '/api/ai') {
+				if (typeof init?.body === 'string') {
+					aiRequests.push(JSON.parse(init.body) as Record<string, unknown>);
+				}
+				return new Response(JSON.stringify(aiResponse), {
 					status: 200,
 					headers: { 'content-type': 'application/json' }
 				});
@@ -472,7 +497,17 @@ function createReactivePlanner() {
 	const dispose = svelteClient.effect_root(() => {
 		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
 	});
-	return { api, assignedUrls, downloads, storage, dispose };
+	return {
+		api,
+		assignedUrls,
+		downloads,
+		aiRequests,
+		setAiResponse: (next: butlerChatMod.ButlerChatResult) => {
+			aiResponse = next;
+		},
+		storage,
+		dispose
+	};
 }
 
 test('unmodified +page.svelte compiles cleanly and avoids linear recipe scans and per-item toLocaleDateString in planner', () => {
@@ -917,7 +952,12 @@ test('marking a meal cooked keeps pantry deduction opt-in', () => {
 		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
 
 		api.openCookDialog(meal);
+		assert.equal(api.deductPantry, false);
 
+		api.deductPantry = true;
+		assert.equal(api.deductPantry, true);
+
+		api.openCookDialog(meal);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
@@ -1239,6 +1279,92 @@ test('applyButler gates sign-out and confirmPendingExport downloads and preserve
 			false
 		);
 		assert.equal(api.editingRecipe, null);
+
+		// Verify createButlerChat + askButler controller integration preserves droppedCommands warnings,
+		// frozen details, and split [User applied]/[User opened] paired history.
+		api.kitchen.preferences.usePersonalAI = true;
+		api.kitchen.preferences.provider = 'openai';
+		api.kitchen.preferences.model = 'gpt-4.1-mini';
+		api.setApiKey('sk-test-key');
+
+		let chatDraft = '';
+		let chatMessages: butlerChatMod.ButlerChatMessage[] = [];
+		let chatDrafts: Recipe[] = [];
+		let chatBusy = false;
+		let chatError = '';
+		let chatFailedPrompt = '';
+		const controller = butlerChatMod.createButlerChat({
+			getKitchen: () => JSON.parse(JSON.stringify(api.kitchen)) as AppState,
+			getOwner: () => `${api.user?.id ?? ''}:${api.user?.householdId ?? ''}`,
+			isWorking: () => chatBusy,
+			getDraft: () => chatDraft,
+			setDraft: (value) => {
+				chatDraft = value;
+			},
+			getMessages: () => chatMessages,
+			setMessages: (value) => {
+				chatMessages = value;
+			},
+			getRecipeDrafts: () => chatDrafts,
+			setRecipeDrafts: (value) => {
+				chatDrafts = value;
+			},
+			setBusy: (value) => {
+				chatBusy = value;
+			},
+			setError: (value) => {
+				chatError = value;
+			},
+			getFailedPrompt: () => chatFailedPrompt,
+			setFailedPrompt: (value) => {
+				chatFailedPrompt = value;
+			},
+			request: (prompt, history, signal, recipeDrafts) =>
+				api.askButler(prompt, history, signal, recipeDrafts)
+		});
+
+		harness.setAiResponse({
+			reply: 'Added thyme and prepared your shopping export.',
+			commands: [
+				{
+					type: 'pantry.upsert',
+					item: { id: 'p-thyme', name: 'Thyme', quantity: 1, unit: 'bunch', category: 'Produce' }
+				},
+				{ type: 'ui', action: 'export-shopping' }
+			],
+			droppedCommands: 1
+		});
+		chatDraft = 'Add thyme and export shopping';
+		await controller.send();
+		assert.equal(chatError, '');
+		assert.equal(chatMessages.length, 2);
+		assert.equal(chatMessages[1].warning, '1 invalid action was omitted from this reply.');
+		assert.equal(chatMessages[1].actions?.length, 2);
+
+		const firstCard = chatMessages[1].actions![0];
+		const secondCard = chatMessages[1].actions![1];
+		chatMessages[1].snapshot = api.applyButler(firstCard.commands, chatMessages[1].snapshot!);
+		firstCard.status = 'applied';
+		chatMessages[1].snapshot = api.applyButler(secondCard.commands, chatMessages[1].snapshot!);
+		secondCard.status = 'applied';
+		api.closeDialog();
+
+		harness.setAiResponse({ reply: 'All set.', commands: [] });
+		chatDraft = 'Follow up';
+		await controller.send();
+		const secondPayload = harness.aiRequests.at(-1) as {
+			messages: butlerChatMod.ButlerTurn[];
+		};
+		assert.deepEqual(secondPayload.messages, [
+			{ role: 'user', content: 'Add thyme and export shopping' },
+			{
+				role: 'assistant',
+				content:
+					'Added thyme and prepared your shopping export.\n\n[User applied: Thyme]\n[User opened: Export shopping list]'
+			},
+			{ role: 'user', content: 'Follow up' }
+		]);
+		controller.destroy();
 	} finally {
 		harness.dispose();
 	}
