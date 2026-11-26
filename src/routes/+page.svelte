@@ -88,6 +88,7 @@
 		preferenceSummary
 	} from '#lib/domain.ts';
 	import {
+		addPantryItems,
 		backfillSampleData,
 		clearSampleData,
 		completeMeal,
@@ -96,16 +97,17 @@
 		filterPantryItems,
 		hasSampleData,
 		listPantryCategories,
+		movePurchasesToPantry,
 		normalizeIngredientName,
 		normalizePantryDraft,
 		promoteSampleIngredient,
 		normalizeShoppingItem,
-		reconcileShoppingList,
+		refreshWeekShopping as refreshWeekShoppingItems,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
 		revertShoppingItem,
+		shopForScope,
 		snapshotShoppingItem,
-		transferPurchasedItemsToPantry,
 		unitInfo,
 		type PantryDraft,
 		type ShoppingItemDraft,
@@ -1555,7 +1557,8 @@
 		const parsed = parseIngredientLines(boundedInput);
 		const rejectedInput = Math.max(0, segments.length - parsed.length);
 		commitInlineEdits();
-		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
 		const existingKeys = new Set(
 			kitchen.pantry
 				.filter((item) => !item.sample && !item.expires?.trim())
@@ -1595,8 +1598,13 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
-		const applied = JSON.stringify(kitchen.pantry);
+		const updated = addPantryItems(kitchen, additions);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
 		modal = '';
 		const acceptedCount = additions.length;
@@ -1609,8 +1617,18 @@
 		notify(
 			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}.`,
 			() => {
-				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-				else notify('Your pantry changed again. Review the current quantities before editing.');
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else notify('Your pantry changed again. Review the current quantities before editing.');
 			}
 		);
 	}
@@ -2807,19 +2825,7 @@
 		leftoverServings = 0;
 	}
 	function refreshWeekShopping(startDate: string) {
-		const start = new Date(`${startDate}T12:00:00`);
-		if (Number.isNaN(start.getTime())) return;
-		const dates = Array.from({ length: 7 }, (_, index) => {
-			const day = new Date(start);
-			day.setDate(day.getDate() + index);
-			return dateKey(day);
-		});
-		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
-		const recipes = kitchen.recipes.filter((recipe) =>
-			meals.some((meal) => meal.recipeId === recipe.id)
-		);
-		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		kitchen.shopping = refreshWeekShoppingItems(kitchen, startDate);
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 			clearEditingShoppingState();
 	}
@@ -2910,7 +2916,6 @@
 		);
 		let lotCount = kitchen.pantry.length;
 		const accepted: AppState['shopping'] = [];
-		const acceptedIds = new Set<string>();
 		for (const item of checked) {
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40);
@@ -2927,7 +2932,6 @@
 				unit,
 				quantity: Math.min(1_000_000, item.quantity)
 			});
-			acceptedIds.add(item.id);
 		}
 		if (!accepted.length) {
 			notify(
@@ -2937,10 +2941,33 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, accepted);
-		kitchen.shopping = kitchen.shopping.filter((i) => !acceptedIds.has(i.id));
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const updated = movePurchasesToPantry(kitchen);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		notify(
-			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`,
+			() => {
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else {
+					notify('Your kitchen changed again. Review the current values before editing.');
+				}
+			}
 		);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
@@ -2950,11 +2977,14 @@
 		}
 		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
+		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
+		kitchen.shopping = shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		selected = null;
 		page = 'shopping';
 		notify(
-			additions.length
+			uncheckedCount
 				? 'Shopping list ready. Your pantry is already accounted for.'
 				: 'You have everything you need. Happy cooking!'
 		);

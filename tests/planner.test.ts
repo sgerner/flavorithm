@@ -65,6 +65,7 @@ function injectPlannerHook(svelteSource: string): string {
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
 		get deductPantry() { return deductPantry; },
+		set deductPantry(value: boolean) { deductPantry = value; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
 		set cookedHistoryLimit(value: number) { cookedHistoryLimit = value; },
 		get recipesById() { return recipesById; },
@@ -125,7 +126,7 @@ type PlannerHarnessApi = {
 	authMetadataLoaded: boolean;
 	readonly week: Date[];
 	weekOffset: number;
-	readonly deductPantry: boolean;
+	deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
 	readonly mealsByDateSlot: Map<string, Meal[]>;
@@ -810,7 +811,12 @@ test('marking a meal cooked keeps pantry deduction opt-in', () => {
 		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
 
 		api.openCookDialog(meal);
+		assert.equal(api.deductPantry, false);
 
+		api.deductPantry = true;
+		assert.equal(api.deductPantry, true);
+
+		api.openCookDialog(meal);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
