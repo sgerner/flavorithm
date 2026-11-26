@@ -14,6 +14,7 @@ const oauthStorage = await import('../src/lib/server/oauth-storage.ts');
 const { handle } = await import('../src/hooks.server.ts');
 
 const modelsRoute = await import('../src/routes/api/models/+server.ts');
+const aiRoute = await import('../src/routes/api/ai/+server.ts');
 const authApiRoute = await import('../src/routes/api/auth/+server.ts');
 const chatgptRoute = await import('../src/routes/api/connections/chatgpt/+server.ts');
 const chatgptCallbackRoute =
@@ -824,4 +825,119 @@ test('/auth/meta, /auth/login, /auth/callback, and /auth/logout work across loca
 	assert.equal(proxyLogout.response.headers.get('cache-control'), 'no-store');
 	assert.equal(backend.getSessionBinding(bindingToken), null);
 	assert.ok(proxySessionJar.deleteCalls.includes('flavorithm_session'));
+});
+
+test('/api/ai maps ChatGPT 504 timeouts, 499 cancellations, and error codes with no-store headers', async () => {
+	configureMode('local');
+	process.env.FLAVORITHM_OAUTH_ENCRYPTION_KEY = randomBytes(32).toString('base64');
+	const { user, token } = await backend.registerUser(
+		'AI Timeout Tester',
+		'ai-timeout-route@example.test',
+		'secure password for ai timeout route'
+	);
+	const savedAccount = oauthStorage.saveChatGPTAccount({
+		userId: user.id,
+		mode: 'hosted',
+		clientId: 'flavorithm-hosted-client',
+		subject: 'chatgpt-timeout-subject',
+		email: user.email,
+		scopes: ['openid', 'profile', 'email', 'offline_access', 'chatgpt.tokens.use.direct'],
+		credentials: {
+			accessToken: 'direct-access-token',
+			refreshToken: 'direct-refresh-token',
+			idToken: 'direct-id-token'
+		},
+		expiresAt: Date.now() + 3_600_000,
+		earliestRefreshAt: 0
+	});
+
+	const timeoutResponse = await invokeHookedRoute({
+		path: '/api/ai',
+		handler: aiRoute.POST,
+		jar: cookieJar({ flavorithm_session: token }),
+		body: {
+			action: 'chat',
+			provider: 'chatgpt',
+			connectionId: savedAccount.id,
+			model: 'gpt-5',
+			messages: [{ role: 'user', content: 'Plan Wednesday dinner.' }],
+			context: JSON.stringify({
+				recipes: [],
+				meals: [],
+				pantry: [],
+				shopping: [],
+				today: '2026-10-23'
+			})
+		},
+		fetcher: async (input) => {
+			if (String(input) === 'https://api.openai.com/v1/responses') {
+				throw new DOMException('The operation timed out.', 'TimeoutError');
+			}
+			throw new Error(`Unexpected fetch URL: ${String(input)}`);
+		}
+	});
+	assert.equal(timeoutResponse.response.status, 504);
+	assert.match(timeoutResponse.response.headers.get('cache-control') ?? '', /no-store/);
+	assert.deepEqual(await timeoutResponse.response.json(), {
+		error: 'ChatGPT took too long to respond. Please try again.',
+		code: 'timeout'
+	});
+
+	const cancelledResponse = await invokeHookedRoute({
+		path: '/api/ai',
+		handler: aiRoute.POST,
+		jar: cookieJar({ flavorithm_session: token }),
+		body: {
+			action: 'chat',
+			provider: 'chatgpt',
+			connectionId: savedAccount.id,
+			model: 'gpt-5',
+			messages: [{ role: 'user', content: 'Plan Wednesday dinner.' }],
+			context: JSON.stringify({
+				recipes: [],
+				meals: [],
+				pantry: [],
+				shopping: [],
+				today: '2026-10-23'
+			})
+		},
+		fetcher: async (input) => {
+			if (String(input) === 'https://api.openai.com/v1/responses') {
+				throw new DOMException('Aborted', 'AbortError');
+			}
+			throw new Error(`Unexpected fetch URL: ${String(input)}`);
+		}
+	});
+	assert.equal(cancelledResponse.response.status, 499);
+	assert.match(cancelledResponse.response.headers.get('cache-control') ?? '', /no-store/);
+	assert.deepEqual(await cancelledResponse.response.json(), {
+		error: 'The AI request was cancelled.',
+		code: 'request_cancelled'
+	});
+
+	const missingAccountResponse = await invokeHookedRoute({
+		path: '/api/ai',
+		handler: aiRoute.POST,
+		jar: cookieJar({ flavorithm_session: token }),
+		body: {
+			action: 'chat',
+			provider: 'chatgpt',
+			connectionId: 'missing-account-id',
+			model: 'gpt-5',
+			messages: [{ role: 'user', content: 'Plan Wednesday dinner.' }],
+			context: JSON.stringify({
+				recipes: [],
+				meals: [],
+				pantry: [],
+				shopping: [],
+				today: '2026-10-23'
+			})
+		}
+	});
+	assert.equal(missingAccountResponse.response.status, 404);
+	assert.match(missingAccountResponse.response.headers.get('cache-control') ?? '', /no-store/);
+	assert.deepEqual(await missingAccountResponse.response.json(), {
+		error: 'ChatGPT account was not found.',
+		code: 'chatgpt_account_not_found'
+	});
 });
