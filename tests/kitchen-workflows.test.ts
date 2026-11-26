@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { ButlerCommandSchema } from '../src/lib/butler.ts';
 import { createInitialState, createNewUserState } from '../src/lib/data.ts';
 import { rankPantryRecipes, rankRecipes } from '../src/lib/discovery.ts';
 import {
@@ -1156,6 +1157,41 @@ test('registration cleanup strips untouched sample items, validates schemas, and
 
 	// Legacy snapshots without sample properties remain schema-valid too.
 	assert.ok(validateAppState(createNewUserState()));
+
+	// Non-finite meal servings and leftoverServings are rejected by both server and Butler schemas.
+	const infiniteServingsState = createInitialState();
+	infiniteServingsState.meals[0].servings = Number.POSITIVE_INFINITY;
+	assert.equal(validateAppState(infiniteServingsState), null);
+	const infiniteLeftoversState = createInitialState();
+	infiniteLeftoversState.meals[0].leftoverServings = Number.POSITIVE_INFINITY;
+	assert.equal(validateAppState(infiniteLeftoversState), null);
+	assert.equal(
+		ButlerCommandSchema.safeParse({
+			type: 'meal.upsert',
+			meal: {
+				id: 'meal-inf',
+				date: '2026-11-18',
+				slot: 'Dinner',
+				recipeId: 'lemon-herb-chicken',
+				servings: Number.POSITIVE_INFINITY
+			}
+		}).success,
+		false
+	);
+	assert.equal(
+		ButlerCommandSchema.safeParse({
+			type: 'meal.upsert',
+			meal: {
+				id: 'meal-inf-leftovers',
+				date: '2026-11-18',
+				slot: 'Dinner',
+				recipeId: 'lemon-herb-chicken',
+				servings: 2,
+				leftoverServings: Number.POSITIVE_INFINITY
+			}
+		}).success,
+		false
+	);
 
 	// Guest schedules a real meal in the starter week and generates that week's shopping list.
 	const now = new Date(2026, 10, 18, 12);

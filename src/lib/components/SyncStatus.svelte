@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { CloudOff, RefreshCw, Download } from '@lucide/svelte';
 	import { revealMotion } from '#lib/motion.ts';
+	import DisclosureButton from '#lib/components/DisclosureButton.svelte';
 	import type { AppState } from '#lib/types.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	let {
@@ -26,7 +27,9 @@
 		exportPending: () => void;
 		error?: string;
 	} = $props();
+	const reviewPanelId = $props.id();
 	let review = $state(false);
+	let reviewOpen = $derived(review && conflicts.length > 0);
 	let conflictLabels = $derived.by(() => {
 		const counts = new Map<string, number>();
 		return conflicts.map((conflict) => {
@@ -136,20 +139,23 @@
 			{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
 		</div>
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
-		{#if (pending || error.includes('quarantined')) && !(review && conflicts.length)}
-			<button class="secondary" type="button" onclick={exportPending}
-				><Download size={16} /> Back up my changes</button
-			>
-		{/if}
 		{#if conflicts.length}
-			<button class="secondary" type="button" onclick={() => (review = !review)}
-				>{review ? 'Hide changes' : 'Review changes'}</button
+			<DisclosureButton
+				class="secondary"
+				expanded={reviewOpen}
+				controls={reviewOpen ? reviewPanelId : undefined}
+				onclick={() => (review = !review)}>Review changes</DisclosureButton
 			>
 		{:else if online && !syncing}<button class="secondary" type="button" onclick={retry}
 				>Retry sync</button
 			>{/if}
-		{#if review && conflicts.length}
-			<div class="sync-review">
+		{#if (pending || conflicts.length > 0 || (ready && Boolean(error)) || error.includes('quarantined')) && !reviewOpen}
+			<button class="secondary" type="button" onclick={exportPending}
+				><Download size={16} /> Back up my changes</button
+			>
+		{/if}
+		{#if reviewOpen}
+			<div id={reviewPanelId} class="sync-review">
 				<p>
 					Your edits are kept on this device until you choose. Independent changes will be kept
 					either way.
@@ -189,11 +195,9 @@
 					</ul>
 				</div>
 				<div class="sync-actions">
-					{#if pending || error.includes('quarantined')}<button
-							class="secondary"
-							type="button"
-							onclick={exportPending}><Download size={16} /> Back up my changes</button
-						>{/if}
+					<button class="secondary" type="button" onclick={exportPending}
+						><Download size={16} /> Back up my changes</button
+					>
 					<button
 						class="secondary"
 						type="button"
