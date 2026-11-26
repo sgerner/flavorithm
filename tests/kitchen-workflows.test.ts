@@ -8,6 +8,7 @@ import {
 	unitInfo as domainUnitInfo
 } from '../src/lib/domain.ts';
 import {
+	addPantryItems,
 	backfillSampleData,
 	clampLeftoverServings,
 	clearSampleData,
@@ -18,6 +19,7 @@ import {
 	filterPantryItems,
 	hasSampleData,
 	listPantryCategories,
+	movePurchasesToPantry,
 	normalizeIngredientName,
 	normalizePantryDraft,
 	promoteSampleBookmark,
@@ -27,7 +29,9 @@ import {
 	reconcileShoppingList,
 	restockDepletedPantryItems,
 	restoreShoppingItem,
+	retireCheckedShoppingItems,
 	revertShoppingItem,
+	shopForScope,
 	snapshotShoppingItem,
 	transferPurchasedItemsToPantry
 } from '../src/lib/kitchen-workflows.ts';
@@ -563,6 +567,231 @@ test('completing a meal deducts compatible pantry quantities once and never goes
 	);
 });
 
+test('mid-week meal completion deducts pantry first and retires uncovered weekly checked rows', () => {
+	const chickenDinner = recipe({
+		id: 'roast-chicken',
+		servings: 2,
+		ingredients: [{ name: 'chicken', quantity: 12, unit: 'oz' }]
+	});
+	const meals = [
+		{ id: 'tuesday', date: '2026-10-20', slot: 'Dinner', recipeId: 'roast-chicken', servings: 2 },
+		{ id: 'saturday', date: '2026-10-24', slot: 'Dinner', recipeId: 'roast-chicken', servings: 2 }
+	];
+	const weekKey = 'week:2026-10-19';
+	const now = new Date('2026-10-20T18:00:00.000Z');
+
+	// Case 1: 0 pantry, 12 oz checked for Tuesday + 12 oz unchecked for Saturday (or only 12 oz checked)
+	for (const initialShopping of [
+		[
+			shopping('tue-bought', 'chicken', 12, 'oz', true, weekKey),
+			shopping('sat-needed', 'chicken', 12, 'oz', false, weekKey),
+			shopping('recipe-scope', 'chicken', 12, 'oz', true, 'recipe:roast-chicken')
+		],
+		[
+			shopping('tue-bought-only', 'chicken', 12, 'oz', true, weekKey),
+			shopping('recipe-scope', 'chicken', 12, 'oz', true, 'recipe:roast-chicken')
+		]
+	]) {
+		const completed = completeMeal(
+			state({
+				pantry: [],
+				recipes: [chickenDinner],
+				meals,
+				shopping: initialShopping
+			}),
+			'tuesday',
+			{ deductPantry: true, leftoverServings: 0 },
+			now
+		);
+		const weekRows = completed.shopping.filter((item) => item.sourceKey === weekKey);
+		assert.equal(weekRows.length, 1);
+		assert.equal(weekRows[0].checked, false);
+		assert.equal(weekRows[0].quantity, 12);
+		assert.equal(weekRows[0].unit, 'oz');
+		// Independent recipe:<id> scope stays untouched
+		assert.equal(completed.shopping.find((item) => item.id === 'recipe-scope')?.quantity, 12);
+	}
+
+	// Case 2: 4 oz in pantry + 12 oz checked in week scope -> 4 oz pantry used, 8 oz retired in place
+	const partial = completeMeal(
+		state({
+			pantry: [pantry('chicken', 4, 'oz')],
+			recipes: [chickenDinner],
+			meals,
+			shopping: [
+				shopping('checked-pack', 'chicken', 12, 'oz', true, weekKey),
+				shopping('remaining-need', 'chicken', 8, 'oz', false, weekKey)
+			]
+		}),
+		'tuesday',
+		{ deductPantry: true, leftoverServings: 0 },
+		now
+	);
+	assert.equal(partial.pantry[0].quantity, 0);
+	const keptChecked = partial.shopping.find((item) => item.id === 'checked-pack');
+	assert.ok(keptChecked);
+	assert.equal(keptChecked.checked, true);
+	assert.equal(keptChecked.quantity, 4);
+	const remainingUnchecked = partial.shopping.find(
+		(item) => item.sourceKey === weekKey && !item.checked
+	);
+	assert.ok(remainingUnchecked);
+	assert.equal(remainingUnchecked.quantity, 8);
+
+	// Case 3: Opting out of pantry deduction (deductPantry: false) leaves both pantry stock
+	// and checked weekly purchases unchanged so they cover Saturday
+	const externalMeal = completeMeal(
+		state({
+			pantry: [pantry('chicken', 4, 'oz')],
+			recipes: [chickenDinner],
+			meals,
+			shopping: [
+				shopping('tue-bought', 'chicken', 8, 'oz', true, weekKey),
+				shopping('sat-needed', 'chicken', 12, 'oz', false, weekKey)
+			]
+		}),
+		'tuesday',
+		{ deductPantry: false, leftoverServings: 0 },
+		now
+	);
+	assert.equal(externalMeal.pantry[0].quantity, 4);
+	assert.equal(
+		externalMeal.shopping.filter((item) => item.sourceKey === weekKey && !item.checked).length,
+		0
+	);
+	assert.equal(externalMeal.shopping.find((item) => item.id === 'tue-bought')?.quantity, 8);
+});
+
+test('adding non-expired pantry stock retires checked rows once per scope and refreshes weekly deficits', () => {
+	const chickenDinner = recipe({
+		id: 'roast-chicken',
+		servings: 2,
+		ingredients: [{ name: 'chicken', quantity: 12, unit: 'oz' }]
+	});
+	const meals = [
+		{ id: 'tuesday', date: '2026-10-20', slot: 'Dinner', recipeId: 'roast-chicken', servings: 2 },
+		{ id: 'saturday', date: '2026-10-24', slot: 'Dinner', recipeId: 'roast-chicken', servings: 2 }
+	];
+	const weekKey = 'week:2026-10-19';
+	const now = new Date('2026-10-20T12:00:00.000Z');
+
+	const shelved = addPantryItems(
+		state({
+			pantry: [],
+			recipes: [chickenDinner],
+			meals,
+			shopping: [
+				shopping('week-checked', 'chicken', 12, 'oz', true, weekKey),
+				shopping('week-unchecked', 'chicken', 12, 'oz', false, weekKey),
+				shopping('recipe-checked', 'chicken', 12, 'oz', true, 'recipe:roast-chicken'),
+				shopping('recipe-unchecked', 'chicken', 4, 'oz', false, 'recipe:roast-chicken')
+			]
+		}),
+		[shopping('added-chicken', 'chicken', 12, 'oz', true)],
+		now,
+		() => 'pantry-chicken'
+	);
+
+	assert.equal(shelved.pantry.length, 1);
+	assert.equal(shelved.pantry[0].quantity, 12);
+	const weekItems = shelved.shopping.filter((item) => item.sourceKey === weekKey);
+	assert.equal(weekItems.length, 1);
+	assert.equal(weekItems[0].checked, false);
+	assert.equal(weekItems[0].quantity, 12);
+	// Recipe scope also retired its own 12 oz checked row independently while keeping unchecked
+	const recipeItems = shelved.shopping.filter((item) => item.sourceKey === 'recipe:roast-chicken');
+	assert.deepEqual(
+		recipeItems.map(({ id, checked, quantity }) => ({ id, checked, quantity })),
+		[{ id: 'recipe-unchecked', checked: false, quantity: 4 }]
+	);
+
+	// Expired pantry additions never retire checked rows
+	const withExpired = retireCheckedShoppingItems(
+		[shopping('week-checked', 'chicken', 12, 'oz', true, weekKey)],
+		[{ name: 'chicken', quantity: 12, unit: 'oz', expires: '2026-10-01' }],
+		now
+	);
+	assert.equal(withExpired.length, 1);
+	assert.equal(withExpired[0].quantity, 12);
+
+	// Small cross-unit retirement preserves 0.000001 shopping precision in place
+	const microRetired = retireCheckedShoppingItems(
+		[shopping('gal-checked', 'broth', 1, 'gal', true, weekKey)],
+		[{ name: 'broth', quantity: 1, unit: 'tbsp' }],
+		now
+	);
+	assert.equal(microRetired.length, 1);
+	assert.equal(microRetired[0].unit, 'gal');
+	assert.equal(microRetired[0].quantity, 0.996094);
+
+	// Moving purchased items to pantry refreshes active weekly scopes
+	const transferred = movePurchasesToPantry(
+		state({
+			pantry: [],
+			recipes: [chickenDinner],
+			meals,
+			shopping: [shopping('only-checked', 'chicken', 12, 'oz', true, weekKey)]
+		}),
+		now,
+		() => 'moved-chicken'
+	);
+	assert.equal(transferred.pantry[0].quantity, 12);
+	assert.equal(transferred.shopping.length, 1);
+	assert.equal(transferred.shopping[0].checked, false);
+	assert.equal(transferred.shopping[0].quantity, 12);
+});
+
+test('shopForScope clears completed recipe scopes, preserves partial mid-trip rows, and counts unchecked items', () => {
+	const pastaRecipe = recipe({
+		id: 'pasta',
+		servings: 2,
+		ingredients: [
+			{ name: 'olive oil', quantity: 1, unit: 'cup' },
+			{ name: 'garlic', quantity: 2, unit: 'cloves' }
+		]
+	});
+	const additions = buildShoppingList([pastaRecipe], []);
+	const recipeScope = 'recipe:pasta';
+
+	// Completed recipe scope: all existing rows in recipe:pasta are checked -> cleared and rebuilt fresh
+	const completedExisting = [
+		shopping('old-oil', 'olive oil', 1, 'cup', true, recipeScope),
+		shopping('old-garlic', 'garlic', 2, 'clove', true, recipeScope),
+		shopping('week-row', 'olive oil', 1, 'cup', true, 'week:2026-10-19')
+	];
+	const reshopped = shopForScope(completedExisting, additions, recipeScope);
+	assert.equal(reshopped.uncheckedCount, 2);
+	assert.equal(
+		reshopped.shopping.filter((item) => item.sourceKey === recipeScope && item.checked).length,
+		0
+	);
+	assert.equal(
+		reshopped.shopping.filter((item) => item.sourceKey === recipeScope && !item.checked).length,
+		2
+	);
+	assert.equal(reshopped.shopping.find((item) => item.id === 'week-row')?.checked, true);
+
+	// Partial mid-trip recipe scope: unchecked row remains -> checked row preserved and subtracted
+	const partialExisting = [
+		shopping('mid-oil', 'olive oil', 1, 'cup', true, recipeScope),
+		shopping('mid-garlic', 'garlic', 2, 'clove', false, recipeScope)
+	];
+	const midTrip = shopForScope(partialExisting, additions, recipeScope);
+	assert.equal(midTrip.uncheckedCount, 1);
+	assert.equal(midTrip.shopping.find((item) => item.id === 'mid-oil')?.checked, true);
+	assert.equal(midTrip.shopping.find((item) => item.id === 'mid-garlic')?.checked, false);
+
+	// Weekly scope fully covered by checked rows -> keeps checked rows and reports 0 unchecked
+	const weekCovered = shopForScope(
+		[shopping('bought-oil', 'olive oil', 1, 'cup', true, 'week:2026-10-19')],
+		[shopping('need-oil', 'olive oil', 1, 'cup', false)],
+		'week:2026-10-19'
+	);
+	assert.equal(weekCovered.uncheckedCount, 0);
+	assert.equal(weekCovered.shopping.length, 1);
+	assert.equal(weekCovered.shopping[0].checked, true);
+});
+
 test('completion consumes soonest-expiring usable lots first and skips expired lots', () => {
 	const plannedRecipe = recipe({
 		id: 'sauce',
@@ -793,6 +1022,24 @@ test('transferring merged weekly purchases moves only the checked quantity and l
 	assert.deepEqual(cookedWithDeduction.meals[0].pantryDeductions, [
 		{ pantryId: 'olive oil-cup', name: 'olive oil', quantity: 0.5, unit: 'cup' }
 	]);
+
+	const cookedWithPurchase = completeMeal(
+		shopper,
+		'wed',
+		{ deductPantry: true, leftoverServings: 2 },
+		new Date('2026-10-21T18:00:00.000Z')
+	);
+	assert.deepEqual(cookedWithPurchase.meals[0].pantryDeductions, [
+		{ pantryId: 'olive oil-cup', name: 'olive oil', quantity: 0.5, unit: 'cup' }
+	]);
+	assert.deepEqual(cookedWithPurchase.shopping, []);
+
+	const restockedRemote = structuredClone(shopper);
+	restockedRemote.pantry[0].quantity = 1.5;
+	const mergedWithRestock = mergeKitchenStates(shopper, cookedWithPurchase, restockedRemote);
+	assert.deepEqual(mergedWithRestock.conflicts, []);
+	assert.equal(mergedWithRestock.state.pantry[0].quantity, 1);
+	assert.deepEqual(mergedWithRestock.state.shopping, []);
 
 	const cookedWithoutDeduction = completeMeal(
 		base,
