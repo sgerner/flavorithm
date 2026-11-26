@@ -1,16 +1,27 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createNewUserState, defaultPreferences } from '../src/lib/data.ts';
+import { createInitialState, createNewUserState, defaultPreferences } from '../src/lib/data.ts';
+import { buildShoppingList } from '../src/lib/domain.ts';
 import { createKitchenSync } from '../src/lib/client-sync.ts';
 import {
 	entitledChatGPTAccountId,
+	prepareGuestKitchenForAuth,
 	reconcileChatGPTPreferences,
 	runConcurrentModelCatalog,
 	runHouseholdTransition,
+	runLocalAuthenticateWorkflow,
 	runOpenSettingsWorkflow,
 	runReconnectWorkflow,
+	runSampleCleanupWorkflow,
 	runSignedInHydration
 } from '../src/lib/client-workflows.ts';
+import { clearGuestData, clearGuestKitchen } from '../src/lib/guest-storage.ts';
+import {
+	hasSampleData,
+	normalizeIngredientName,
+	promoteSampleIngredient,
+	reconcileShoppingList
+} from '../src/lib/kitchen-workflows.ts';
 import type { AppState, Preferences, User } from '../src/lib/types.ts';
 
 function deferred<T>() {
@@ -522,4 +533,389 @@ test('reconcileChatGPTPreferences clears stale host-chatgpt model while preservi
 	});
 	assert.equal(reportedAccountId, 'personal-1');
 	assert.equal(asyncCompleted, true);
+});
+
+test('runSampleCleanupWorkflow clears sample records in place, restores via Undo, and guards post-cleanup edits', () => {
+	const storage = memoryStorage();
+	let kitchen = createInitialState();
+	// Promote one sample staple and add a real manual shopping item.
+	kitchen.pantry = kitchen.pantry.map((item) =>
+		item.id === 'pantry-eggs' ? promoteSampleIngredient({ ...item, quantity: 6 }) : item
+	);
+	kitchen.shopping.push({
+		id: 'manual-coffee',
+		name: 'coffee beans',
+		quantity: 1,
+		unit: 'bag',
+		checked: false
+	});
+
+	let showStarter = true;
+	let guestMode = true;
+	let modal = 'settings';
+	let inlineCommitted = 0;
+	let cleanedHooks = 0;
+	let undoRestores = 0;
+	const notifications: Array<{ message: string; undo?: () => void }> = [];
+
+	const cleaned = runSampleCleanupWorkflow({
+		commitInlineEdits: () => {
+			inlineCommitted += 1;
+		},
+		getKitchen: () => kitchen,
+		setKitchen: (next) => {
+			kitchen = next;
+		},
+		onCleaned: () => {
+			cleanedHooks += 1;
+		},
+		onUndoRestore: (restored) => {
+			undoRestores += 1;
+			kitchen = restored;
+		},
+		getShowStarter: () => showStarter,
+		setShowStarter: (show) => {
+			showStarter = show;
+		},
+		isGuest: () => guestMode,
+		storage,
+		closeSettingsIfOpen: () => {
+			if (modal === 'settings') modal = '';
+		},
+		notify: (message, undo) => {
+			notifications.push({ message, undo });
+		}
+	});
+
+	assert.equal(cleaned, true);
+	assert.equal(inlineCommitted, 1);
+	assert.equal(cleanedHooks, 1);
+	assert.equal(modal, '');
+	assert.equal(showStarter, false);
+	assert.equal(storage.getItem('flavorithm-started'), 'yes');
+	assert.equal(hasSampleData(kitchen), false);
+	assert.deepEqual(
+		kitchen.pantry.map((item) => ({ id: item.id, quantity: item.quantity })),
+		[{ id: 'pantry-eggs', quantity: 6 }]
+	);
+	assert.deepEqual(
+		kitchen.shopping.map((item) => item.id),
+		['manual-coffee']
+	);
+	assert.equal(notifications.length, 1);
+	assert.equal(notifications[0].message, 'Sample data cleared.');
+	assert.equal(typeof notifications[0].undo, 'function');
+
+	// Undo while kitchen is unchanged restores sample records, starter banner, and unstarted storage state.
+	notifications[0].undo!();
+	assert.equal(undoRestores, 1);
+	assert.equal(hasSampleData(kitchen), true);
+	assert.equal(kitchen.pantry.length, 7);
+	assert.equal(kitchen.meals.length, 3);
+	assert.equal(showStarter, true);
+	assert.equal(storage.getItem('flavorithm-started'), null);
+	assert.equal(notifications.at(-1)?.message, 'Sample data restored.');
+
+	// Re-run cleanup after user already dismissed starter banner ('flavorithm-started' === 'yes'), then mutate kitchen before Undo.
+	storage.setItem('flavorithm-started', 'yes');
+	showStarter = false;
+	runSampleCleanupWorkflow({
+		commitInlineEdits: () => {},
+		getKitchen: () => kitchen,
+		setKitchen: (next) => {
+			kitchen = next;
+		},
+		onCleaned: () => {},
+		onUndoRestore: (restored) => {
+			kitchen = restored;
+		},
+		getShowStarter: () => showStarter,
+		setShowStarter: (show) => {
+			showStarter = show;
+		},
+		isGuest: () => guestMode,
+		storage,
+		closeSettingsIfOpen: () => {},
+		notify: (message, undo) => {
+			notifications.push({ message, undo });
+		}
+	});
+	const secondUndo = notifications.at(-1)?.undo;
+	assert.equal(typeof secondUndo, 'function');
+
+	// Mutating the kitchen invalidates the Undo snapshot so user edits are not overwritten.
+	kitchen.shopping.push({
+		id: 'new-oat-milk',
+		name: 'oat milk',
+		quantity: 1,
+		unit: 'carton',
+		checked: false
+	});
+	secondUndo!();
+	assert.equal(hasSampleData(kitchen), false);
+	assert.equal(
+		kitchen.shopping.some((item) => item.id === 'new-oat-milk'),
+		true
+	);
+	assert.equal(
+		notifications.at(-1)?.message,
+		'Your kitchen changed again. Review the current values before editing.'
+	);
+
+	// Calling runSampleCleanupWorkflow when no sample data remains is a safe no-op that marks started.
+	const countBeforeNoop = notifications.length;
+	showStarter = true;
+	storage.removeItem('flavorithm-started');
+	const noopResult = runSampleCleanupWorkflow({
+		commitInlineEdits: () => {},
+		getKitchen: () => kitchen,
+		setKitchen: (next) => {
+			kitchen = next;
+		},
+		onCleaned: () => {},
+		onUndoRestore: () => {},
+		getShowStarter: () => showStarter,
+		setShowStarter: (show) => {
+			showStarter = show;
+		},
+		isGuest: () => guestMode,
+		storage,
+		closeSettingsIfOpen: () => {},
+		notify: (message, undo) => {
+			notifications.push({ message, undo });
+		}
+	});
+	assert.equal(noopResult, false);
+	assert.equal(showStarter, false);
+	assert.equal(storage.getItem('flavorithm-started'), 'yes');
+	assert.equal(notifications.length, countBeforeNoop);
+});
+
+test('runLocalAuthenticateWorkflow strips sample records on register, leaves live kitchen untouched on /api/auth failure, and skips guest staging on login', async () => {
+	const now = new Date(2026, 10, 18, 12);
+	const weekStart = '2026-11-16';
+	const storage = memoryStorage();
+	storage.setItem('flavorithm-guest-kitchen', '{"pantry":[]}');
+	storage.setItem('flavorithm-started', 'yes');
+
+	let liveKitchen = createInitialState();
+	// Promote eggs, schedule a real Thursday meal, and generate weekly shopping while sample staples are present.
+	liveKitchen.pantry = liveKitchen.pantry.map((item) =>
+		item.id === 'pantry-eggs' ? promoteSampleIngredient({ ...item, quantity: 6 }) : item
+	);
+	liveKitchen.meals = [
+		{
+			id: 'meal-week-tue',
+			date: '2026-11-17',
+			slot: 'Dinner',
+			recipeId: 'lemon-herb-chicken',
+			servings: 2,
+			sample: true
+		},
+		{
+			id: 'user-orzo-dinner',
+			date: '2026-11-19',
+			slot: 'Dinner',
+			recipeId: 'lemon-chickpea-orzo',
+			servings: 2
+		}
+	];
+	liveKitchen.shopping = reconcileShoppingList(
+		[{ id: 'manual-tea', name: 'green tea', quantity: 1, unit: 'box', checked: false }],
+		buildShoppingList(liveKitchen.recipes, liveKitchen.pantry, liveKitchen.meals, now),
+		`week:${weekStart}`
+	);
+
+	// 1. Failed /api/auth leaves live guest kitchen, sample records, and guest storage untouched.
+	let activeUser: User | null = null;
+	await assert.rejects(
+		() =>
+			runLocalAuthenticateWorkflow({
+				authMode: 'register',
+				getKitchen: () => liveKitchen,
+				authenticateRequest: async () => {
+					throw new Error('Email is already registered');
+				},
+				onAuthenticated: (nextUser, initialKitchen) => {
+					activeUser = nextUser;
+					liveKitchen = initialKitchen;
+				},
+				stageGuestKitchen: () => {
+					throw new Error('Should not stage on auth failure');
+				},
+				hasSyncError: () => false,
+				clearGuestStorage: () => {
+					clearGuestKitchen(storage);
+					clearGuestData(storage);
+				},
+				fetchState: async () => ({ state: null }),
+				createState: async (state) => ({ state }),
+				adoptKitchen: () => {},
+				hasPendingSnapshot: () => false,
+				syncKitchen: async () => {},
+				isOnline: () => true,
+				retrySync: async () => {},
+				failStateLoad: () => {},
+				now
+			}),
+		/Email is already registered/
+	);
+	assert.equal(activeUser, null);
+	assert.equal(hasSampleData(liveKitchen), true);
+	assert.equal(storage.getItem('flavorithm-guest-kitchen'), '{"pantry":[]}');
+	assert.equal(storage.getItem('flavorithm-started'), 'yes');
+
+	// 2. Successful register strips untouched sample records, refreshes weekly shopping, stages into sync, and uploads clean state.
+	const registeredUser: User = {
+		id: 'user-reg',
+		householdId: 'home-reg',
+		name: 'Grace Hopper',
+		email: 'grace@example.test'
+	};
+	let serverState: AppState | null = null;
+	let serverEtag = '';
+	let syncError = '';
+	const sync = createKitchenSync({
+		storage,
+		getUser: () => activeUser,
+		getState: () => liveKitchen,
+		setState: (next) => {
+			liveKitchen = structuredClone(next);
+		},
+		onStatus: (status) => {
+			syncError = status.error;
+		},
+		transport: (owner) => ({
+			identity: { userId: owner.id, householdId: owner.householdId },
+			get: async () => ({
+				state: structuredClone(serverState ?? createNewUserState()),
+				etag: serverEtag,
+				userId: owner.id,
+				householdId: owner.householdId
+			}),
+			put: async (candidate) => {
+				serverState = structuredClone(candidate);
+				serverEtag = 'etag-reg-1';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+
+	const regOutcome = await runLocalAuthenticateWorkflow({
+		authMode: 'register',
+		getKitchen: () => liveKitchen,
+		authenticateRequest: async () => ({ user: registeredUser }),
+		onAuthenticated: (nextUser, initialKitchen) => {
+			liveKitchen = initialKitchen;
+			activeUser = nextUser;
+			sync.prepare(nextUser);
+		},
+		stageGuestKitchen: (cleanedGuest) => {
+			liveKitchen = cleanedGuest;
+			sync.stage(cleanedGuest);
+		},
+		hasSyncError: () => Boolean(syncError),
+		clearGuestStorage: () => {
+			clearGuestKitchen(storage);
+			clearGuestData(storage);
+		},
+		fetchState: async () => ({ state: serverState }),
+		createState: async (state) => {
+			serverState = structuredClone(state);
+			serverEtag = 'etag-reg-1';
+			return { state: structuredClone(serverState) };
+		},
+		adoptKitchen: (state) => {
+			sync.initialize(activeUser!, state, serverEtag);
+		},
+		hasPendingSnapshot: () => Boolean(sync.snapshot()),
+		syncKitchen: async () => {
+			await sync.sync();
+		},
+		isOnline: () => true,
+		retrySync: async () => {
+			await sync.sync();
+		},
+		failStateLoad: (msg) => sync.failLoad(msg),
+		now
+	});
+
+	assert.equal(regOutcome.stateLoaded, true);
+	assert.ok(regOutcome.guestKitchen);
+	assert.equal(storage.getItem('flavorithm-guest-kitchen'), null);
+	assert.equal(storage.getItem('flavorithm-started'), null);
+	assert.equal(sync.snapshot(), null);
+	assert.ok(serverState);
+	const persistedState = serverState as AppState;
+	assert.equal(hasSampleData(persistedState), false);
+	assert.deepEqual(
+		persistedState.pantry.map((item) => ({ id: item.id, quantity: item.quantity })),
+		[{ id: 'pantry-eggs', quantity: 6 }]
+	);
+	assert.deepEqual(
+		persistedState.meals.map((meal) => meal.id),
+		['user-orzo-dinner']
+	);
+	assert.equal(
+		persistedState.shopping.some((item) => item.id === 'manual-tea'),
+		true
+	);
+	assert.equal(
+		persistedState.shopping.some((item) => normalizeIngredientName(item.name) === 'chicken thigh'),
+		false
+	);
+	assert.equal(
+		persistedState.shopping.some((item) => normalizeIngredientName(item.name) === 'chickpea'),
+		true
+	);
+
+	// 3. Login mode never stages guest sample/local kitchen into an existing account.
+	const guestWithSample = createInitialState();
+	assert.equal(prepareGuestKitchenForAuth('login', guestWithSample, now), null);
+	let stagedOnLogin = false;
+	const existingServerState = createNewUserState();
+	existingServerState.pantry.push({
+		id: 'acct-salt',
+		name: 'sea salt',
+		quantity: 1,
+		unit: 'box',
+		category: 'Spices'
+	});
+	let loginAdopted = null as AppState | null;
+	const loginOutcome = await runLocalAuthenticateWorkflow({
+		authMode: 'login',
+		getKitchen: () => guestWithSample,
+		authenticateRequest: async () => ({
+			user: {
+				id: 'existing-1',
+				householdId: 'existing-home',
+				name: 'Alan Turing',
+				email: 'alan@example.test'
+			}
+		}),
+		onAuthenticated: () => {},
+		stageGuestKitchen: () => {
+			stagedOnLogin = true;
+		},
+		hasSyncError: () => false,
+		clearGuestStorage: () => {},
+		fetchState: async () => ({ state: existingServerState }),
+		createState: async (state) => ({ state }),
+		adoptKitchen: (state) => {
+			loginAdopted = state;
+		},
+		hasPendingSnapshot: () => false,
+		syncKitchen: async () => {},
+		isOnline: () => true,
+		retrySync: async () => {},
+		failStateLoad: () => {},
+		now
+	});
+	assert.equal(loginOutcome.guestKitchen, null);
+	assert.equal(loginOutcome.stateLoaded, true);
+	assert.equal(stagedOnLogin, false);
+	assert.deepEqual(
+		loginAdopted?.pantry.map((item) => item.id),
+		['acct-salt']
+	);
 });
