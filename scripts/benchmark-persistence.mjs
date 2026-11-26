@@ -487,7 +487,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 		// 1. Theme / color mode immediate DOM update
 		const themeToggle = await evaluate(`(async () => {
 			window.__perfMetrics.reset();
-			const btn = document.querySelector('button[aria-label="Switch color mode"]');
+			const btn = document.querySelector('button[aria-label="Dark color mode"]');
 			const t0 = performance.now();
 			btn.click();
 			await Promise.resolve();
@@ -499,7 +499,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 		})()`);
 		assert.equal(themeToggle.darkClassImmediate, true);
 		await pause(600);
-		await evaluate(`document.querySelector('button[aria-label="Switch color mode"]').click()`);
+		await evaluate(`document.querySelector('button[aria-label="Dark color mode"]').click()`);
 		await pause(600);
 
 		// 2. Shopping inline draft 12-keystroke burst + commit
@@ -564,9 +564,9 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 		await pause(150);
 
 		const pantryDraftBurst = await evaluate(`(async () => {
-			const labels = Array.from(document.querySelectorAll('.pantry-row.editing label.pantry-field'));
-			const unitLabel = labels.find((el) => el.textContent?.includes('Unit'));
-			const input = unitLabel?.querySelector('input');
+			const fields = Array.from(document.querySelectorAll('.pantry-row.editing .pantry-field'));
+			const unitField = fields.find((el) => el.textContent?.includes('Unit'));
+			const input = unitField?.querySelector('input');
 			input.focus();
 			window.__perfMetrics.reset();
 			const chars = 'tablespoons!';
