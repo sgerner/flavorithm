@@ -83,6 +83,7 @@
 	import { createInitialState, createNewUserState } from '#lib/data.ts';
 	import { buildShoppingList, parseIngredientLines, preferenceSummary } from '#lib/domain.ts';
 	import {
+		addPantryItems,
 		backfillSampleData,
 		clearSampleData,
 		completeMeal,
@@ -93,20 +94,20 @@
 		indexUsablePantry,
 		listPantryCategories,
 		matchRecipePantry,
-		mergePantryAdditions,
+		movePurchasesToPantry,
 		msUntilNextLocalMidnight,
 		normalizeIngredientName,
 		normalizePantryDraft,
 		normalizeShoppingItem,
 		normalizeStagedScanDraft,
 		promoteSampleIngredient,
-		reconcileShoppingList,
+		refreshWeekShopping as refreshWeekShoppingItems,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
 		revertShoppingItem,
+		shopForScope,
 		snapshotShoppingItem,
 		stageScannedIngredients,
-		transferPurchasedItemsToPantry,
 		unitInfo,
 		type PantryDraft,
 		type ShoppingItemDraft,
@@ -129,19 +130,27 @@
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
+	import {
+		BUTLER_HISTORY_LIMIT,
+		pairButlerHistory,
+		type ButlerChatResult
+	} from '#lib/butler-chat.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
+	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
 	import {
-		VoiceCapture,
 		appendDictatedText,
+		isVoiceTargetActive,
+		parseQuickShoppingItems,
 		planVoiceRetry,
 		planVoiceStart,
 		resolveClosedDialog,
+		VoiceCapture,
 		type ResumeDialog,
-		type VoiceDialog,
-		type VoiceState
+		type VoiceState,
+		type VoiceTarget
 	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import {
@@ -494,18 +503,28 @@
 	let voiceRetained = $state(false);
 	let voiceError = $state('');
 	let voiceBusy = $derived(voiceStarting || voiceState !== 'idle');
-	let voiceTarget = $state<'' | VoiceDialog>('');
+	let voiceTarget = $state<VoiceTarget | ''>('');
+	let shoppingVoiceInput = $state(false);
+	let shoppingMicButton = $state<HTMLButtonElement>();
+	let voiceSessionEl = $state<HTMLDivElement>();
+	let voiceStopButton = $state<HTMLButtonElement>();
+	let voiceCancelButton = $state<HTMLButtonElement>();
+	let voiceRetryButton = $state<HTMLButtonElement>();
+	let voiceReturnFocus: HTMLElement | null = null;
 	let voiceCapture: VoiceCapture | undefined;
 	let activeVoiceImportSession: ImportSession | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
 		const owner = voiceOwner;
 		if (typeof window === 'undefined') return;
-		clearVoiceSession();
-		voiceApiKey = '';
-		voiceProvider = 'auto';
-		voiceModel = '';
-		localVoiceAvailable = false;
+		untrack(() => {
+			clearVoiceSession(false);
+			shoppingVoiceInput = false;
+			voiceApiKey = '';
+			voiceProvider = 'auto';
+			voiceModel = '';
+			localVoiceAvailable = false;
+		});
 		if (owner) {
 			try {
 				const saved = JSON.parse(localStorage.getItem(`flavorithm-voice:${owner}`) || '{}');
@@ -527,16 +546,7 @@
 				})
 				.catch(() => {});
 		}
-		return () => clearVoiceSession();
-	});
-	$effect(() => {
-		if (
-			voiceTarget &&
-			(voiceStarting || voiceState !== 'idle') &&
-			(modal !== voiceTarget || (voiceTarget === 'import' && isReviewingImportDraft(importSession)))
-		) {
-			clearVoiceSession();
-		}
+		return () => untrack(() => clearVoiceSession(false));
 	});
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
@@ -1597,7 +1607,8 @@
 			Math.max(0, segments.length - parsedManual.length) +
 			Math.max(0, scannedRaw.length - validScanned.length);
 		commitInlineEdits();
-		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
 		const existingKeys = new Set(
 			kitchen.pantry
 				.filter((item) => !item.sample && !item.expires?.trim())
@@ -1637,8 +1648,13 @@
 			);
 			return;
 		}
-		kitchen.pantry = mergePantryAdditions(kitchen.pantry, additions);
-		const applied = JSON.stringify(kitchen.pantry);
+		const updated = addPantryItems(kitchen, additions, currentCalendarNow());
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
 		stagedScanItems = [];
 		modal = '';
@@ -1652,8 +1668,18 @@
 		notify(
 			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}.`,
 			() => {
-				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-				else notify('Your pantry changed again. Review the current quantities before editing.');
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else notify('Your pantry changed again. Review the current quantities before editing.');
 			}
 		);
 	}
@@ -2294,6 +2320,25 @@
 	}
 	let butlerChat = $state<ButlerChat>();
 	let butlerOpen = $state(false);
+	let voiceOverlay = $derived(
+		Boolean(butlerOpen || editingRecipe || (!modal && (selected || mobileNav)))
+	);
+	$effect(() => {
+		if (!voiceTarget) return;
+		if (
+			voiceBusy &&
+			!isVoiceTargetActive(voiceTarget, {
+				modal,
+				page,
+				overlay: voiceOverlay,
+				reviewingDraft: isReviewingImportDraft(importSession)
+			})
+		) {
+			clearVoiceSession();
+		} else if (voiceTarget === 'shopping' && page !== 'shopping') {
+			clearVoiceSession();
+		}
+	});
 	let cookingSteps = $state<Record<string, number[]>>({});
 	let selectedMealServings = $state<number | undefined>();
 	let cookingSessionKey = $derived(
@@ -2331,7 +2376,11 @@
 			{
 				prompt: message,
 				messages: [
-					...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
+					...pairButlerHistory(
+						history,
+						(turn) => turn.content.slice(0, 8000),
+						BUTLER_HISTORY_LIMIT
+					),
 					{ role: 'user', content: message }
 				],
 				context
@@ -2340,7 +2389,7 @@
 		);
 		if (owner !== `${user?.id}:${user?.householdId}`)
 			throw new Error('The active kitchen changed. Ask Basil again.');
-		return result as { reply: string; commands: unknown[] };
+		return result as ButlerChatResult;
 	}
 	function applyButler(commands: unknown[], expectedSnapshot: string) {
 		if (JSON.stringify(kitchen) !== expectedSnapshot) {
@@ -2519,19 +2568,64 @@
 			if (imageInput) imageInput.value = '';
 		}
 	}
-	function clearVoiceSession() {
-		voiceCapture?.cancel();
+	function isFocusManagedByVoice(): boolean {
+		if (typeof document === 'undefined') return false;
+		const active = document.activeElement;
+		return (
+			!active ||
+			active === document.body ||
+			active === voiceReturnFocus ||
+			active === shoppingMicButton ||
+			Boolean(voiceSessionEl?.contains(active))
+		);
+	}
+	function scheduleVoiceIdleFocus(endedTarget: VoiceTarget | '', restoreEl: HTMLElement | null) {
+		if (!endedTarget || !restoreEl) return;
+		void tick().then(() => {
+			if (
+				!voiceBusy &&
+				!voiceRetained &&
+				isVoiceTargetActive(endedTarget, {
+					modal,
+					page,
+					overlay: voiceOverlay,
+					reviewingDraft: isReviewingImportDraft(importSession)
+				}) &&
+				restoreEl.isConnected &&
+				!(restoreEl as HTMLButtonElement).disabled
+			) {
+				restoreEl.focus();
+			}
+		});
+	}
+	function clearVoiceSession(restoreFocus = true) {
+		const { endedTarget, restoreEl, shouldRestore } = untrack(() => {
+			const target = voiceTarget;
+			const el = target === 'shopping' ? (shoppingMicButton ?? voiceReturnFocus) : voiceReturnFocus;
+			return {
+				endedTarget: target,
+				restoreEl: el,
+				shouldRestore: restoreFocus && Boolean(target) && isFocusManagedByVoice()
+			};
+		});
+		const current = voiceCapture;
 		voiceCapture = undefined;
+		current?.cancel();
 		voiceStarting = false;
 		voiceState = 'idle';
 		voiceRetained = false;
 		voiceError = '';
 		voiceTarget = '';
+		voiceReturnFocus = null;
 		activeVoiceImportSession = undefined;
+		if (shouldRestore) {
+			scheduleVoiceIdleFocus(endedTarget, restoreEl);
+		}
 	}
 	function openVoiceSettings() {
 		if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
 		else if (voiceTarget === 'pantry' || voiceTarget === 'import') resumeDialog = voiceTarget;
+		else resumeDialog = '';
 		void openSettings('voice');
 	}
 	function discardVoiceRecording() {
@@ -2577,23 +2671,21 @@
 		});
 	}
 	function dictate() {
-		void startDictation(false);
+		if (voiceBusy) return;
+		void startDictation('pantry');
 	}
 	function dictateRecipe() {
-		void startDictation(true);
-	}
-	async function startDictation(forRecipe: boolean) {
 		if (voiceBusy) return;
-		if (forRecipe) {
-			importSession.reviewingDraft = false;
-			if (!modal) {
-				mobileNav = false;
-				error = '';
-				modal = 'import';
-			}
-		}
+		void startDictation('import');
+	}
+	function dictateShopping() {
+		if (voiceBusy) return;
+		void startDictation('shopping');
+	}
+	async function startDictation(target: VoiceTarget) {
+		if (voiceBusy) return;
 		const plan = planVoiceStart({
-			forRecipe,
+			target,
 			modal,
 			provider: voiceProvider,
 			localAvailable: localVoiceAvailable,
@@ -2612,31 +2704,91 @@
 			notify(plan.message);
 			return;
 		}
-		clearVoiceSession();
+		const activeEl =
+			typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+				? document.activeElement
+				: null;
+		clearVoiceSession(false);
 		resumeDialog = '';
-		voiceStarting = true;
-		voiceTarget = plan.targetDialog;
-		if (plan.targetDialog === 'import') {
+		voiceReturnFocus = target === 'shopping' ? (shoppingMicButton ?? activeEl) : activeEl;
+		if (target === 'import') {
 			importSession.reviewingDraft = false;
-		}
-		if (modal !== plan.targetDialog) {
+			if (modal !== 'import') openImport();
+		} else if (target === 'pantry') {
 			mobileNav = false;
 			error = '';
-			modal = plan.targetDialog;
+			modal = 'pantry';
+		} else {
+			mobileNav = false;
+			error = '';
+			modal = '';
+			if (page !== 'shopping') navigate('shopping');
 		}
+		voiceStarting = true;
+		voiceTarget = target;
 		activeVoiceImportSession = importSession;
 		const owner = user?.id;
-		const targetDialog = plan.targetDialog;
 		const capture = new VoiceCapture({
 			state: (value) => {
-				if (voiceCapture === capture) voiceState = value;
+				if (voiceCapture !== capture) return;
+				const focusInVoiceUi = isFocusManagedByVoice();
+				voiceState = value;
+				if (value === 'recording') {
+					if (focusInVoiceUi) {
+						void tick().then(() => {
+							if (voiceCapture === capture && voiceState === 'recording') {
+								voiceStopButton?.focus();
+							}
+						});
+					}
+				} else if (value === 'transcribing') {
+					if (focusInVoiceUi) {
+						void tick().then(() => {
+							if (voiceCapture === capture && voiceState === 'transcribing') {
+								voiceCancelButton?.focus();
+							}
+						});
+					}
+				} else if (value === 'idle') {
+					voiceStarting = false;
+					if (capture.hasRetainedAudio) {
+						if (focusInVoiceUi) {
+							void tick().then(() => {
+								if (voiceCapture === capture && voiceRetained) {
+									voiceRetryButton?.focus();
+								}
+							});
+						}
+					} else {
+						const endedTarget = voiceTarget;
+						const restoreEl =
+							endedTarget === 'shopping'
+								? (shoppingMicButton ?? voiceReturnFocus)
+								: voiceReturnFocus;
+						voiceTarget = '';
+						voiceReturnFocus = null;
+						if (focusInVoiceUi) {
+							scheduleVoiceIdleFocus(endedTarget, restoreEl);
+						}
+					}
+				}
 			},
 			retained: (value) => {
 				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
-				if (voiceCapture !== capture) return;
-				if (targetDialog === 'import') {
+				if (
+					voiceCapture !== capture ||
+					voiceTarget !== target ||
+					!isVoiceTargetActive(target, {
+						modal,
+						page,
+						overlay: voiceOverlay,
+						reviewingDraft: isReviewingImportDraft(importSession)
+					})
+				)
+					return;
+				if (target === 'import') {
 					if (
 						!activeVoiceImportSession ||
 						!canAppendImportTranscript({
@@ -2650,11 +2802,17 @@
 						return;
 					voiceError = '';
 					importSession.text = appendDictatedText('import', importSession.text, text);
-				} else {
-					if (user?.id !== owner || modal !== 'pantry') return;
+				} else if (target === 'pantry') {
+					if (user?.id !== owner) return;
 					voiceError = '';
 					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
+				} else {
+					if (user?.id !== owner) return;
+					voiceError = '';
+					shoppingText = appendDictatedText('shopping', shoppingText, text);
+					shoppingVoiceInput = true;
+					notify('Review your items, then add them.');
 				}
 			},
 			error: (message) => {
@@ -2665,10 +2823,29 @@
 			}
 		});
 		voiceCapture = capture;
+		void tick().then(() => {
+			if (voiceCapture === capture && isFocusManagedByVoice()) {
+				if (voiceState === 'recording') voiceStopButton?.focus();
+				else if (voiceStarting) voiceCancelButton?.focus();
+			}
+		});
 		try {
 			await capture.start({ provider: plan.provider, model: voiceModel, apiKey: voiceApiKey });
 		} finally {
-			if (voiceCapture === capture) voiceStarting = false;
+			if (voiceCapture === capture) {
+				const focusInVoiceUi = isFocusManagedByVoice();
+				voiceStarting = false;
+				if (voiceState === 'idle' && !capture.hasRetainedAudio) {
+					const endedTarget = voiceTarget;
+					const restoreEl =
+						endedTarget === 'shopping' ? (shoppingMicButton ?? voiceReturnFocus) : voiceReturnFocus;
+					voiceTarget = '';
+					voiceReturnFocus = null;
+					if (focusInVoiceUi) {
+						scheduleVoiceIdleFocus(endedTarget, restoreEl);
+					}
+				}
+			}
 		}
 	}
 
@@ -2835,19 +3012,7 @@
 		leftoverServings = 0;
 	}
 	function refreshWeekShopping(startDate: string) {
-		const start = new Date(`${startDate}T12:00:00`);
-		if (Number.isNaN(start.getTime())) return;
-		const dates = Array.from({ length: 7 }, (_, index) => {
-			const day = new Date(start);
-			day.setDate(day.getDate() + index);
-			return dateKey(day);
-		});
-		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
-		const recipes = kitchen.recipes.filter((recipe) =>
-			meals.some((meal) => meal.recipeId === recipe.id)
-		);
-		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		kitchen.shopping = refreshWeekShoppingItems(kitchen, startDate);
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 			clearEditingShoppingState();
 	}
@@ -2892,35 +3057,30 @@
 	function addShoppingQuickItem() {
 		const raw = shoppingText.trim();
 		if (!raw) return;
-		const match = raw.match(
-			/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
-		);
-		const quantity = match ? Number(match[1]) : 1;
-		if (!Number.isFinite(quantity) || quantity <= 0) {
-			notify('Enter a quantity above zero.');
+		const parsed = parseQuickShoppingItems(raw, { split: shoppingVoiceInput });
+		if (parsed.error) {
+			notify(parsed.error);
 			return;
 		}
-		const name = (match ? match[3] : raw).trim().slice(0, 200);
-		if (!name) return;
+		const additions = parsed.items;
+		if (!additions.length) return;
 		if (kitchen.shopping.length >= 1_000) {
 			notify('Your shopping list can hold up to 1,000 items.');
 			return;
 		}
-		const unit = (match?.[2] || 'piece').trim().slice(0, 40) || 'piece';
-		const newItem = {
-			id: crypto.randomUUID(),
-			name,
-			quantity: Math.min(1_000_000, quantity),
-			unit,
-			checked: false
-		};
+		const available = 1_000 - kitchen.shopping.length;
+		const accepted = additions.slice(0, available);
 		const firstCheckedIndex = kitchen.shopping.findIndex((item) => item.checked);
 		if (firstCheckedIndex === -1) {
-			kitchen.shopping.push(newItem);
+			kitchen.shopping.push(...accepted);
 		} else {
-			kitchen.shopping.splice(firstCheckedIndex, 0, newItem);
+			kitchen.shopping.splice(firstCheckedIndex, 0, ...accepted);
 		}
 		shoppingText = '';
+		shoppingVoiceInput = false;
+		if (accepted.length < additions.length) {
+			notify('Your shopping list can hold up to 1,000 items.');
+		}
 	}
 	function movePurchasedToPantry() {
 		commitInlineEdits();
@@ -2938,12 +3098,13 @@
 		);
 		let lotCount = kitchen.pantry.length;
 		const accepted: AppState['shopping'] = [];
-		const acceptedIds = new Set<string>();
 		for (const item of checked) {
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40);
 			if (!name || !unit || !Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-			const key = `${normalizeIngredientName(name)}\u0000${unitInfo(unit).dimension}`;
+			const normalized = normalizeIngredientName(name);
+			if (!normalized) continue;
+			const key = `${normalized}\u0000${unitInfo(unit).dimension}`;
 			if (!existingKeys.has(key)) {
 				if (lotCount >= 1_000) continue;
 				existingKeys.add(key);
@@ -2955,7 +3116,6 @@
 				unit,
 				quantity: Math.min(1_000_000, item.quantity)
 			});
-			acceptedIds.add(item.id);
 		}
 		if (!accepted.length) {
 			notify(
@@ -2965,10 +3125,33 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, accepted);
-		kitchen.shopping = kitchen.shopping.filter((i) => !acceptedIds.has(i.id));
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const updated = movePurchasesToPantry(kitchen, currentCalendarNow());
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		notify(
-			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`,
+			() => {
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else {
+					notify('Your kitchen changed again. Review the current values before editing.');
+				}
+			}
 		);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
@@ -2978,11 +3161,14 @@
 		}
 		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
+		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
+		kitchen.shopping = shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		selected = null;
 		page = 'shopping';
 		notify(
-			additions.length
+			uncheckedCount
 				? 'Shopping list ready. Your pantry is already accounted for.'
 				: 'You have everything you need. Happy cooking!'
 		);
@@ -3152,10 +3338,11 @@
 	function useFirstIngredients(items: AppState['pantry']) {
 		commitInlineEdits();
 		const targetIds = new Set(items.map((item) => item.id));
+		const now = currentCalendarNow();
 		const targets = kitchen.pantry.filter(
 			(item) =>
 				targetIds.has(item.id) &&
-				expiryStatus(item.expires) === 'soon' &&
+				expiryStatus(item.expires, now) === 'soon' &&
 				Number.isFinite(item.quantity) &&
 				item.quantity > 0 &&
 				item.name.trim()
@@ -3430,6 +3617,9 @@
 		if (modal === 'household') {
 			inviteCode = '';
 			currentInviteId = '';
+		}
+		if ((modal === 'pantry' || modal === 'import') && voiceTarget === modal) {
+			clearVoiceSession();
 		}
 		if (modal === 'onboarding') dismissOnboarding();
 		else {
@@ -3762,6 +3952,56 @@
 	}
 </script>
 
+{#snippet voiceSession()}
+	{#if voiceBusy}<div class="voice-session" bind:this={voiceSessionEl} in:revealMotion>
+			<p role="status" aria-live="polite">
+				{voiceStarting
+					? 'Opening microphone…'
+					: voiceState === 'recording'
+						? 'Listening… up to 2 minutes'
+						: 'Transcribing…'}
+			</p>
+			<div class="dialog-actions">
+				{#if voiceState === 'recording'}<button
+						bind:this={voiceStopButton}
+						type="button"
+						class="primary"
+						onclick={() => voiceCapture?.stop()}>Stop recording</button
+					>{/if}<button
+					bind:this={voiceCancelButton}
+					type="button"
+					class="secondary"
+					onclick={() => clearVoiceSession()}>Cancel voice</button
+				>
+			</div>
+		</div>{:else if voiceRetained}<div
+			class="voice-session voice-recovery"
+			bind:this={voiceSessionEl}
+			in:revealMotion
+		>
+			<p class="voice-error-copy" role="alert">
+				{voiceError || 'Voice transcription failed. Your recording is ready to retry.'}
+			</p>
+			<p class="voice-recovery-note">
+				Your recording is kept in this tab so you can retry without speaking again.
+			</p>
+			<div class="dialog-actions voice-recovery-actions">
+				<button
+					bind:this={voiceRetryButton}
+					class="primary"
+					type="button"
+					onclick={() => {
+						void retryVoiceTranscription();
+					}}><RefreshCw size={16} /> Retry transcription</button
+				><button class="secondary" type="button" onclick={openVoiceSettings}
+					><Settings size={16} /> Open Settings</button
+				><button class="text-button" type="button" onclick={discardVoiceRecording}
+					>Discard recording</button
+				>
+			</div>
+		</div>{/if}
+{/snippet}
+
 {#if ready}
 	<div inert={!!modal || !!selected || !!editingRecipe}>
 		<ButlerChat
@@ -3847,15 +4087,19 @@
 		<div class="bottom-nav">
 			<button onclick={household}><Users size={18} /> My household <Plus size={15} /></button
 			><button onclick={() => openSettings()}><Settings size={18} /> Settings & themes</button
-			><button
+			><ToggleButton
+				pressed={kitchen.preferences.dark}
 				onclick={() => {
 					kitchen.preferences.dark = !kitchen.preferences.dark;
 				}}
-				>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}{kitchen
-					.preferences.dark
-					? 'Light mode'
-					: 'Dark mode'}<span class="mode-toggle" class:on={kitchen.preferences.dark}
-				></span></button
+				>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+						size={18}
+						aria-hidden="true"
+					/>{/if}Dark mode<span
+					class="mode-toggle"
+					class:on={kitchen.preferences.dark}
+					aria-hidden="true"
+				></span></ToggleButton
 			>
 		</div>
 		<button class="profile-button" onclick={() => (user ? openSettings() : openAuthentication())}
@@ -3881,16 +4125,20 @@
 				<b>{nav.find((n) => n.id === page)?.name || 'Discover'}</b>
 			</div>
 			<div class="topbar-actions">
-				<button
+				<ToggleButton
 					class="icon-button"
-					aria-label="Switch color mode"
+					label="Dark color mode"
+					pressed={kitchen.preferences.dark}
 					onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-					>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}</button
+					>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+							size={18}
+							aria-hidden="true"
+						/>{/if}</ToggleButton
 				><button
 					class="top-avatar"
 					aria-label={user ? 'Open household and account' : 'Sign in or create an account'}
 					onclick={() => (user ? household() : openAuthentication())}
-					>{user?.name.slice(0, 1) || 'Y'}</button
+					><span aria-hidden="true">{user?.name.slice(0, 1) || 'Y'}</span></button
 				>
 			</div>
 		</header>
@@ -4029,12 +4277,17 @@
 							class:can-scroll-left={filterOverflow.left}
 							class:can-scroll-right={filterOverflow.right}
 						>
-							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
-								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
-										type="button"
+							<div
+								class="filter-tabs"
+								role="group"
+								aria-label="Filter recipes"
+								bind:this={filterTabs}
+								onscroll={syncFilterOverflow}
+							>
+								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<ToggleButton
 										data-filter={item}
-										class:active={filter === item}
-										aria-pressed={filter === item}
+										class={{ active: filter === item }}
+										pressed={filter === item}
 										onclick={() => {
 											lastActivePill = 'filter';
 											priorityPantryIds = [];
@@ -4042,17 +4295,20 @@
 										}}
 										>{#if item === 'For you'}<Sparkles
 												size={14}
-											/>{:else if item === PANTRY_FILTER}<Carrot size={14} />{/if}{item}</button
+												aria-hidden="true"
+											/>{:else if item === PANTRY_FILTER}<Carrot
+												size={14}
+												aria-hidden="true"
+											/>{/if}{item}</ToggleButton
 									>{/each}
-								<button
-									type="button"
+								<ToggleButton
 									data-filter="hidden"
-									class:active={showHiddenRecipes}
-									aria-pressed={showHiddenRecipes}
+									class={{ active: showHiddenRecipes }}
+									pressed={showHiddenRecipes}
 									onclick={() => {
 										lastActivePill = 'hidden';
 										showHiddenRecipes = !showHiddenRecipes;
-									}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+									}}>Hidden recipes</ToggleButton
 								>
 							</div>
 						</div>
@@ -4244,19 +4500,21 @@
 				<div class="pantry-controls">
 					<div class="pantry-filter-bar">
 						<label class="search-box pantry-search">
-							<Search size={17} /><span class="visually-hidden">Search pantry</span><input
-								type="search"
-								placeholder="Search pantry"
-								bind:value={pantryQuery}
-							/>
+							<Search size={17} aria-hidden="true" /><span class="visually-hidden"
+								>Search pantry</span
+							><input type="search" placeholder="Search pantry" bind:value={pantryQuery} />
 						</label>
 						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
-							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires, pantryNow) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires, pantryNow) === 'expired').length }] as option}<button
-									type="button"
-									class:active={pantryFilter === option.id}
-									aria-pressed={pantryFilter === option.id}
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires, pantryNow) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires, pantryNow) === 'expired').length }] as option}<ToggleButton
+									class={{ active: pantryFilter === option.id }}
+									pressed={pantryFilter === option.id}
 									onclick={() => (pantryFilter = option.id)}
-									>{option.label}<span>{option.count}</span></button
+									><span>{option.label}</span><span class="visually-hidden">{', '}</span><span
+										class="expiry-count"
+										>{option.count}<span class="visually-hidden"
+											>{` ${option.count === 1 ? 'item' : 'items'}`}</span
+										></span
+									></ToggleButton
 								>{/each}
 						</div>
 					</div>
@@ -4265,19 +4523,17 @@
 							role="group"
 							aria-label="Filter pantry by category"
 						>
-							<button
-								type="button"
-								class:active={pantryCategory === 'all'}
-								aria-pressed={pantryCategory === 'all'}
-								onclick={() => (pantryCategory = 'all')}>All categories</button
-							>{#each pantryCategories as category (category.key)}<button
-									type="button"
-									class:active={pantryCategory.toLowerCase() === category.key}
-									aria-pressed={pantryCategory.toLowerCase() === category.key}
+							<ToggleButton
+								class={{ active: pantryCategory === 'all' }}
+								pressed={pantryCategory === 'all'}
+								onclick={() => (pantryCategory = 'all')}>All categories</ToggleButton
+							>{#each pantryCategories as category (category.key)}<ToggleButton
+									class={{ active: pantryCategory.toLowerCase() === category.key }}
+									pressed={pantryCategory.toLowerCase() === category.key}
 									onclick={() =>
 										(pantryCategory =
 											pantryCategory.toLowerCase() === category.key ? 'all' : category.label)}
-									>{category.label}</button
+									>{category.label}</ToggleButton
 								>{/each}
 						</div>{/if}
 				</div>
@@ -4293,7 +4549,8 @@
 							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
 									item.expires,
 									pantryNow
-								)}{@const depleted = Number.isFinite(item.quantity) && item.quantity <= 0}
+								)}{@const itemDomId = encodeURIComponent(item.id)}{@const depleted =
+									Number.isFinite(item.quantity) && item.quantity <= 0}
 								<div
 									class="pantry-row"
 									class:editing={pantryDraft?.id === item.id}
@@ -4315,9 +4572,8 @@
 													<span class="ingredient-symbol" aria-hidden="true"
 														>{ingredientEmoji(item.name)}</span
 													><span class="ingredient-title-line"
-														><b class="pantry-name">{item.name}</b>{#if item.sample}<small
-																class="sample-badge">Sample</small
-															>{/if}</span
+														><b id={`pantry-item-${itemDomId}`} class="pantry-name">{item.name}</b
+														>{#if item.sample}<small class="sample-badge">Sample</small>{/if}</span
 													>
 												</span>
 												<div class="pantry-edit-actions">
@@ -4330,51 +4586,78 @@
 														type="button"
 														class="icon-button pantry-remove-button"
 														aria-label={`Remove ${item.name}`}
-														onclick={() => removePantryItem(item)}><X size={16} /></button
+														onclick={() => removePantryItem(item)}
+														><X size={16} aria-hidden="true" /></button
 													>
 												</div>
 											</div>
-											<div class="pantry-edit-fields">
-												<label class="pantry-field"
-													><span>Quantity</span><input
+											<div
+												class="pantry-edit-fields"
+												role="group"
+												aria-labelledby={`pantry-item-${itemDomId}`}
+											>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-amount-${itemDomId}`}
+														><span>Amount</span><span class="visually-hidden"
+															>{` of ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-amount-${itemDomId}`}
 														type="number"
 														min="0"
 														max="1000000"
 														step="any"
 														bind:value={pantryDraft.quantity}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Unit</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-unit-${itemDomId}`}
+														><span>Unit</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-unit-${itemDomId}`}
 														type="text"
 														maxlength="40"
 														bind:value={pantryDraft.unit}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Category</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-category-${itemDomId}`}
+														><span>Category</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-category-${itemDomId}`}
 														type="text"
 														maxlength="100"
 														list="pantry-category-suggestions"
 														bind:value={pantryDraft.category}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Best before</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-expiry-${itemDomId}`}
+														><span>Best before</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-expiry-${itemDomId}`}
 														type="date"
 														bind:value={pantryDraft.expires}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												>
+													/>
+												</div>
 											</div>
 										</form>{:else}<span class="pantry-ingredient">
 											<span class="ingredient-symbol" aria-hidden="true"
 												>{ingredientEmoji(item.name)}</span
 											><span class="ingredient-meta"
 												><span class="ingredient-title-line"
-													><b class="pantry-name">{item.name}</b>{#if item.sample}<small
-															class="sample-badge">Sample</small
-														>{/if}</span
+													><b id={`pantry-item-${itemDomId}`} class="pantry-name">{item.name}</b
+													>{#if item.sample}<small class="sample-badge">Sample</small>{/if}</span
 												><span class="ingredient-tags"
 													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
 													>{#if depleted}<button
@@ -4387,7 +4670,7 @@
 															type="button"
 															class="text-button use-first"
 															onclick={() => useFirstIngredients([item])}
-															><Sparkles size={14} />Use first</button
+															><Sparkles size={14} aria-hidden="true" />Use first</button
 														>{/if}</span
 												></span
 											>
@@ -4403,7 +4686,11 @@
 											>{#if item.expires}<small class="pantry-date">{item.expires}</small
 												>{/if}</span
 										>
-										<div class="pantry-row-actions">
+										<div
+											class="pantry-row-actions"
+											role="group"
+											aria-labelledby={`pantry-item-${itemDomId}`}
+										>
 											<button
 												type="button"
 												class="text-button pantry-edit-button"
@@ -4414,7 +4701,8 @@
 												type="button"
 												class="icon-button pantry-remove-button"
 												aria-label={`Remove ${item.name}`}
-												onclick={() => removePantryItem(item)}><X size={16} /></button
+												onclick={() => removePantryItem(item)}
+												><X size={16} aria-hidden="true" /></button
 											>
 										</div>{/if}
 								</div>{/each}
@@ -4650,6 +4938,7 @@
 									}}>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
+						{#if voiceTarget === 'shopping' && !modal && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
 						<form
 							class="inline-add"
 							onsubmit={(e) => {
@@ -4660,9 +4949,19 @@
 							<Plus size={18} /><input
 								aria-label="Add shopping item"
 								placeholder="Anything else for the basket?"
-								maxlength="200"
+								maxlength="2000"
 								bind:value={shoppingText}
-							/><button class="text-button">Add</button>
+								oninput={() => {
+									if (!shoppingText.trim()) shoppingVoiceInput = false;
+								}}
+							/><button
+								bind:this={shoppingMicButton}
+								type="button"
+								class="icon-button"
+								aria-label="Dictate shopping items"
+								aria-disabled={voiceBusy || undefined}
+								onclick={dictateShopping}><Mic size={18} /></button
+							><button type="submit" class="text-button">Add</button>
 						</form>
 						{#each visibleShopping as item (item.id)}<div
 								class:checked={item.checked}
@@ -4867,50 +5166,7 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceBusy}<div
-						class="voice-session"
-						in:revealMotion
-					>
-						<p role="status" aria-live="polite">
-							{voiceStarting
-								? 'Opening microphone…'
-								: voiceState === 'recording'
-									? 'Listening… up to 2 minutes'
-									: 'Transcribing…'}
-						</p>
-						<div class="dialog-actions">
-							{#if voiceState === 'recording'}<button
-									class="primary"
-									type="button"
-									onclick={() => voiceCapture?.stop()}>Stop recording</button
-								>{/if}<button class="secondary" type="button" onclick={clearVoiceSession}
-								>Cancel voice</button
-							>
-						</div>
-					</div>{:else if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceRetained}<div
-						class="voice-session voice-recovery"
-						in:revealMotion
-					>
-						<p class="voice-error-copy" role="alert">
-							{voiceError || 'Voice transcription failed. Your recording is ready to retry.'}
-						</p>
-						<p class="voice-recovery-note">
-							Your recording is kept in this tab so you can retry without speaking again.
-						</p>
-						<div class="dialog-actions voice-recovery-actions">
-							<button
-								class="primary"
-								type="button"
-								onclick={() => {
-									void retryVoiceTranscription();
-								}}><RefreshCw size={16} /> Retry transcription</button
-							><button class="secondary" type="button" onclick={openVoiceSettings}
-								><Settings size={16} /> Open Settings</button
-							><button class="text-button" type="button" onclick={discardVoiceRecording}
-								>Discard recording</button
-							>
-						</div>
-					</div>{/if}
+				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
 
 				<button
 					class="icon-button dialog-close"
@@ -5199,19 +5455,25 @@
 					<h2>Settings</h2>
 					<div class="settings-section">
 						<h3>Appearance</h3>
-						<div class="theme-grid">
-							{#each themes as theme}<button
-									class:active={kitchen.preferences.theme === theme}
-									aria-pressed={kitchen.preferences.theme === theme}
+						<div class="theme-grid" role="group" aria-label="Color theme">
+							{#each themes as theme}<ToggleButton
+									class={{ active: kitchen.preferences.theme === theme }}
+									pressed={kitchen.preferences.theme === theme}
 									onclick={() => (kitchen.preferences.theme = theme)}
-									>{theme}{#if kitchen.preferences.theme === theme}<Check size={13} />{/if}</button
+									>{theme}{#if kitchen.preferences.theme === theme}<Check
+											size={13}
+											aria-hidden="true"
+										/>{/if}</ToggleButton
 								>{/each}
 						</div>
-						<button
-							class="secondary"
+						<ToggleButton
+							class={{ secondary: true, active: kitchen.preferences.dark }}
+							pressed={kitchen.preferences.dark}
 							onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-							>{#if kitchen.preferences.dark}<Sun size={16} />{:else}<Moon size={16} />{/if}Switch
-							to {kitchen.preferences.dark ? 'light' : 'dark'} mode</button
+							>{#if kitchen.preferences.dark}<Sun size={16} aria-hidden="true" />{:else}<Moon
+									size={16}
+									aria-hidden="true"
+								/>{/if}Dark appearance</ToggleButton
 						>
 					</div>
 
@@ -5733,14 +5995,14 @@
 		border-bottom: 2px solid var(--accent);
 	}
 	.voice-session.voice-recovery {
-		border-bottom-color: #b55439;
+		border-bottom-color: var(--danger-ink);
 	}
 	.voice-session p {
 		font-size: 16px;
 		margin: 0 0 10px;
 	}
 	.voice-session .voice-error-copy {
-		color: #b55439;
+		color: var(--danger-ink);
 		font-weight: 500;
 	}
 	.voice-session .voice-recovery-note {
@@ -5823,7 +6085,7 @@
 		flex-wrap: wrap;
 		margin: 0;
 	}
-	.expiry-filters button {
+	.expiry-filters :global(button) {
 		min-height: 44px;
 		display: inline-flex;
 		align-items: center;
@@ -5833,14 +6095,14 @@
 		background: var(--surface);
 		font-size: 14px;
 	}
-	.expiry-filters button.active {
+	.expiry-filters :global(button.active) {
 		padding: 7px 11px;
 		background: var(--chip-active-bg);
 		color: var(--ink);
 		border: 2px solid var(--chip-active-border);
 		font-weight: 700;
 	}
-	.expiry-filters button span {
+	.expiry-filters .expiry-count {
 		min-width: 22px;
 		padding: 2px 5px;
 		background: color-mix(in srgb, currentColor 12%, transparent);
@@ -5914,24 +6176,6 @@
 	.pantry-date {
 		font-size: 12px;
 		color: var(--muted);
-	}
-	.expiry-badge {
-		font-size: 12px;
-		color: var(--muted);
-	}
-	.expiry-badge.depleted {
-		background: var(--wash);
-		color: var(--ink);
-		padding: 2px 6px;
-		font-weight: 600;
-	}
-	.expiry-badge.expired {
-		color: #a43f36;
-		font-weight: 600;
-	}
-	.expiry-badge.soon {
-		color: #926b17;
-		font-weight: 600;
 	}
 	.use-first,
 	.restock-item {
@@ -6227,13 +6471,6 @@
 		color: var(--muted);
 		line-height: 1.5;
 	}
-	.danger-action {
-		background: #a43f36;
-		color: white;
-	}
-	.dialog-actions .danger-action:hover {
-		background: #87332c;
-	}
 	@media (max-width: 650px) {
 		.pantry-controls {
 			gap: 8px;
@@ -6257,13 +6494,13 @@
 			grid-template-columns: repeat(3, minmax(0, 1fr));
 			width: 100%;
 		}
-		.expiry-filters button {
+		.expiry-filters :global(button) {
 			justify-content: center;
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
 		}
-		.expiry-filters button.active {
+		.expiry-filters :global(button.active) {
 			padding-inline: 5px;
 		}
 		.ingredient-meta {
@@ -6363,16 +6600,6 @@
 		color: var(--muted);
 		overflow-wrap: anywhere;
 	}
-	.member-role {
-		padding: 4px 7px;
-		background: var(--wash);
-		color: var(--muted);
-		font-size: 12px;
-	}
-	.member-role.owner-role {
-		background: var(--accent);
-		color: var(--ink);
-	}
 	.member-remove {
 		min-height: 40px;
 		padding-inline: 6px;
@@ -6450,6 +6677,14 @@
 		}
 		.staged-scan-category {
 			min-width: 0;
+		}
+	}
+	@media (forced-colors: active) {
+		.expiry-filters :global(button.active) {
+			background: Highlight;
+			color: HighlightText;
+			border: 1px solid Highlight;
+			forced-color-adjust: none;
 		}
 	}
 </style>

@@ -674,12 +674,18 @@ function allocateRecipePantry(
 	recipe: Recipe,
 	pantryOrIndex: Ingredient[] | PantryLotIndex,
 	options: { servings?: number; now?: Date } = {}
-): RecipePantryMatch & { consumedLots: WorkingLot[] } {
+): RecipePantryMatch & { consumedLots: WorkingLot[]; uncoveredByBucket: Map<string, number> } {
 	const ingredients = recipe.ingredients.filter(
 		(item) => Number.isFinite(item.quantity) && item.quantity > 0 && item.unit.trim()
 	);
 	if (!ingredients.length) {
-		return { matchedCount: 0, available: 0, expiring: 0, consumedLots: [] };
+		return {
+			matchedCount: 0,
+			available: 0,
+			expiring: 0,
+			consumedLots: [],
+			uncoveredByBucket: new Map()
+		};
 	}
 
 	const rawNow = options.now ?? new Date();
@@ -756,7 +762,15 @@ function allocateRecipePantry(
 		}
 	}
 
-	if (!buckets.size) return { matchedCount, available: 0, expiring: 0, consumedLots };
+	const uncoveredByBucket = new Map<string, number>();
+	for (const [key, bucket] of buckets) {
+		const uncoveredBase = Math.max(0, bucket.requiredBase - bucket.allocatedBase);
+		if (uncoveredBase > 0) uncoveredByBucket.set(key, uncoveredBase);
+	}
+
+	if (!buckets.size) {
+		return { matchedCount, available: 0, expiring: 0, consumedLots, uncoveredByBucket };
+	}
 	let availabilitySum = 0;
 	let expiringSum = 0;
 	for (const bucket of buckets.values()) {
@@ -767,7 +781,8 @@ function allocateRecipePantry(
 		matchedCount,
 		available: availabilitySum / buckets.size,
 		expiring: expiringSum / buckets.size,
-		consumedLots
+		consumedLots,
+		uncoveredByBucket
 	};
 }
 
@@ -788,16 +803,22 @@ export function matchRecipePantry(
 
 /**
  * Deduct a recipe's scaled ingredient quantities from usable compatible pantry lots using the
- * shared lot allocator, consuming soonest-expiring lots first and never going below zero.
+ * shared lot allocator, returning updated pantry stock and any uncovered demand in base units.
  */
-export function deductRecipeFromPantry(
+export function consumeRecipeFromPantry(
 	pantry: Ingredient[],
 	recipe: Recipe,
 	servings: number,
 	now: Date = new Date()
-): Ingredient[] {
+): { pantry: Ingredient[]; uncoveredByBucket: Map<string, number> } {
 	const remaining = pantry.map((item) => ({ ...item }));
-	const { consumedLots } = allocateRecipePantry(recipe, pantry, { servings, now });
+	if (!Number.isFinite(servings) || !(servings > 0)) {
+		return { pantry: remaining, uncoveredByBucket: new Map() };
+	}
+	const { consumedLots, uncoveredByBucket } = allocateRecipePantry(recipe, pantry, {
+		servings,
+		now
+	});
 	for (const lot of consumedLots) {
 		const item = remaining[lot.pantryIndex];
 		if (!item || !(lot.unitFactor > 0)) continue;
@@ -806,7 +827,20 @@ export function deductRecipeFromPantry(
 			quantity: roundLotQuantity(Math.max(0, lot.remainingBase / lot.unitFactor))
 		};
 	}
-	return remaining;
+	return { pantry: remaining, uncoveredByBucket };
+}
+
+/**
+ * Deduct a recipe's scaled ingredient quantities from usable compatible pantry lots using the
+ * shared lot allocator, consuming soonest-expiring lots first and never going below zero.
+ */
+export function deductRecipeFromPantry(
+	pantry: Ingredient[],
+	recipe: Recipe,
+	servings: number,
+	now: Date = new Date()
+): Ingredient[] {
+	return consumeRecipeFromPantry(pantry, recipe, servings, now).pantry;
 }
 
 type ShoppingRequirement = {
