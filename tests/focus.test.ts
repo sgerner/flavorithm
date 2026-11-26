@@ -10,6 +10,7 @@ import { compile } from 'svelte/compiler';
 import ts from 'typescript';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerActionsMod from '../src/lib/butler-actions.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
@@ -1144,6 +1145,7 @@ test('compiled ButlerChat.svelte restores launcher focus across close/toggle/Esc
 		'./BasilAvatar.svelte': { default: noop },
 		'./ChatMarkdown.svelte': { default: noop },
 		'#lib/butler-actions.ts': butlerActionsMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/focus.ts': focusMod
 	};
 
@@ -1328,6 +1330,7 @@ test('compiled +page.svelte handleWindowKeydown always clears mobileNav on Escap
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
@@ -1339,6 +1342,8 @@ test('compiled +page.svelte handleWindowKeydown always clears mobileNav on Escap
 		'#lib/components/ButlerChat.svelte': { default: noop },
 		'#lib/components/RecipeEditor.svelte': { default: noop },
 		'#lib/components/SyncStatus.svelte': { default: noop },
+		'#lib/components/ToggleButton.svelte': { default: noop },
+		'#lib/components/DisclosureButton.svelte': { default: noop },
 		'#lib/components/AIConnection.svelte': { default: noop },
 		'#lib/components/VoiceSettings.svelte': { default: noop },
 		'#lib/components/RecipeImport.svelte': {
