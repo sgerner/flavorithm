@@ -735,6 +735,25 @@ test('hooks.server and POST /api/recipe-import require sessions across all auth 
 		assert.equal(unstructuredWithHostRes.status, 200);
 		assert.equal(hostAiCalls, 1);
 		assert.equal((await unstructuredWithHostRes.json()).recipe.title, 'Honey Ricotta Toast');
+
+		const personalSelectedWithoutConnection = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: '198.51.100.24',
+				user: member.user,
+				body: {
+					url: 'https://recipes.example.com/unstructured-ricotta-toast',
+					usePersonalAI: true
+				},
+				fetcher: async () => {
+					hostAiCalls += 1;
+					throw new Error('Host AI must not be used when personal AI is explicitly selected');
+				}
+			}) as never,
+			{ pageFetcher: mockPageFetcher }
+		);
+		assert.equal(personalSelectedWithoutConnection.status, 422);
+		assert.equal(hostAiCalls, 1);
+
 		host.configureHostAI(hostAdmin.user.id);
 		delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
 		delete process.env.FLAVORITHM_HOST_AI_SHARED;

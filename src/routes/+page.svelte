@@ -3792,7 +3792,7 @@
 									model: kitchen.preferences.model,
 									reasoning: kitchen.preferences.reasoning
 								}
-							: {})
+							: { usePersonalAI: true })
 				},
 				'POST',
 				signal
