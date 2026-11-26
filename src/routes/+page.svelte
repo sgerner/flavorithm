@@ -3728,21 +3728,40 @@
 					: undefined
 			: undefined;
 		if (standaloneUrl) {
-			const connected = hasAIConnection();
+			if (!user) {
+				openAuthentication();
+				notify(
+					managedAuth
+						? 'Sign in through your organization to import recipes.'
+						: 'Create an account or sign in to import recipes.'
+				);
+				resumeDialog = 'import';
+				return null;
+			}
+			const useHost = Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI);
+			const connected = !useHost && hasAIConnection();
 			return request(
 				'/api/recipe-import',
 				{
 					url: standaloneUrl,
-					...(connected
+					...(useHost && chatGPT.host
 						? {
-								...(kitchen.preferences.provider === 'chatgpt'
-									? { connectionId: kitchen.preferences.chatgptAccountId }
-									: { apiKey }),
-								provider: kitchen.preferences.provider,
-								model: kitchen.preferences.model,
-								reasoning: kitchen.preferences.reasoning
+								usePersonalAI: false,
+								provider: 'chatgpt',
+								model: chatGPT.host.model,
+								connectionId: HOST_CONNECTION_ID
 							}
-						: {})
+						: connected
+							? {
+									usePersonalAI: true,
+									...(kitchen.preferences.provider === 'chatgpt'
+										? { connectionId: kitchen.preferences.chatgptAccountId }
+										: { apiKey }),
+									provider: kitchen.preferences.provider,
+									model: kitchen.preferences.model,
+									reasoning: kitchen.preferences.reasoning
+								}
+							: { usePersonalAI: true })
 				},
 				'POST',
 				signal
