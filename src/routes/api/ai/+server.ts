@@ -1,11 +1,45 @@
 import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
-import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
+import { ChatGPTOAuthError, getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import type { RequestHandler } from './$types';
 import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
 
 const MAX_REQUEST_BYTES = 9_000_000;
+
+function aiErrorHeaders(status: number, retryAfter?: number): Record<string, string> {
+	return {
+		'cache-control': 'no-store',
+		...(status === 429 && retryAfter !== undefined
+			? { 'Retry-After': String(Math.max(1, Math.ceil(retryAfter))) }
+			: {})
+	};
+}
+
+function mapAIErrorResponse(error: unknown): Response {
+	if (
+		error instanceof ChatGPTInferenceError ||
+		error instanceof ChatGPTOAuthError ||
+		error instanceof AIRequestError ||
+		error instanceof ApiError
+	) {
+		const code =
+			'code' in error && typeof error.code === 'string' && error.code ? error.code : undefined;
+		const retryAfter =
+			'retryAfter' in error && typeof error.retryAfter === 'number' ? error.retryAfter : undefined;
+		return Response.json(
+			{ error: error.message, ...(code ? { code } : {}) },
+			{
+				status: error.status,
+				headers: aiErrorHeaders(error.status, retryAfter)
+			}
+		);
+	}
+	return Response.json(
+		{ error: 'The AI request could not be completed.' },
+		{ status: 500, headers: { 'cache-control': 'no-store' } }
+	);
+}
 
 export const POST: RequestHandler = async (event) => {
 	try {
@@ -105,15 +139,7 @@ export const POST: RequestHandler = async (event) => {
 			}
 		);
 	} catch (error) {
-		if (error instanceof ChatGPTInferenceError)
-			return Response.json({ error: error.message, code: error.code }, { status: error.status });
-		if (error instanceof ApiError) {
-			return Response.json({ error: error.message }, { status: error.status });
-		}
-		if (error instanceof AIRequestError) {
-			return Response.json({ error: error.message }, { status: error.status });
-		}
-		return Response.json({ error: 'The AI request could not be completed.' }, { status: 500 });
+		return mapAIErrorResponse(error);
 	}
 };
 
