@@ -10,6 +10,7 @@ import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
@@ -36,6 +37,7 @@ import {
 	validateRegistrationName
 } from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
+import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
@@ -274,6 +276,9 @@ function compileServerModule(
 		'svelte/internal/disclose-version': {},
 		'svelte/internal/server': svelteServer,
 		'@lucide/svelte': iconProxy,
+		'./ToggleButton.svelte': noopComponent,
+		'#lib/components/ToggleButton.svelte': noopComponent,
+		'#lib/components/DisclosureButton.svelte': noopComponent,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
@@ -291,6 +296,7 @@ function compileServerModule(
 		'#lib/domain.ts': domainMod,
 		'#lib/import-session.ts': importSessionMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
+		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
@@ -298,6 +304,7 @@ function compileServerModule(
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/search-picker.ts': searchPickerMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
@@ -956,6 +963,8 @@ const pageHookCode = `
 const hookedPageSource = injectScriptHook(rawPageSource, pageHookCode);
 const pageSsrCompiled = compileServerModule('src/routes/+page.svelte', hookedPageSource, {
 	'#lib/components/FormField.svelte': formFieldMod,
+	'#lib/components/ToggleButton.svelte': noopComponent,
+	'#lib/components/DisclosureButton.svelte': noopComponent,
 	'#lib/components/RecipeDetail.svelte': { default: noopComponent },
 	'#lib/components/ButlerChat.svelte': { default: noopComponent },
 	'#lib/components/RecipeEditor.svelte': { default: noopComponent },
@@ -1172,6 +1181,8 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
+		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
