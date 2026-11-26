@@ -609,6 +609,153 @@ test('recipe.upsert refreshes scheduled week and existing recipe scopes, and rec
 	assert.deepEqual(result.effects, [{ type: 'recipe.open', id: target.id, mode: 'edit' }]);
 });
 
+test('meal.complete deducts pantry when enabled and retains later weekly deficits', () => {
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'spinach', quantity: 2, unit: 'cup' }];
+	current.pantry = [
+		{ id: 'spinach', name: 'spinach', quantity: 2, unit: 'cup', category: 'Produce' }
+	];
+	current.meals = [
+		{
+			id: 'thursday',
+			recipeId: recipe.id,
+			date: '2026-10-22',
+			slot: 'Dinner',
+			servings: 2
+		},
+		{
+			id: 'saturday',
+			recipeId: recipe.id,
+			date: '2026-10-24',
+			slot: 'Dinner',
+			servings: 2
+		}
+	];
+	const now = new Date('2026-10-22T18:00:00Z');
+	const withShopping = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.equal(withShopping.shopping.length, 1);
+	assert.equal(withShopping.shopping[0].quantity, 2);
+
+	// deductPantry: true deducts Thursday's 2 cup spinach so Saturday's 2 cup deficit remains
+	const afterThursday = applyButlerCommands(
+		withShopping,
+		[{ type: 'meal.complete', id: 'thursday', deductPantry: true }],
+		now
+	).state;
+	assert.equal(afterThursday.pantry[0].quantity, 0);
+	assert.equal(afterThursday.shopping.length, 1);
+	assert.equal(afterThursday.shopping[0].checked, false);
+	assert.equal(afterThursday.shopping[0].quantity, 2);
+
+	// Explicit deductPantry: false opts out of pantry deduction and preserves checked rows
+	const optedOut = applyButlerCommands(
+		withShopping,
+		[{ type: 'meal.complete', id: 'thursday', deductPantry: false }],
+		now
+	).state;
+	assert.equal(optedOut.pantry[0].quantity, 2);
+	assert.equal(optedOut.shopping.length, 0);
+
+	const withCheckedPurchase = structuredClone(withShopping);
+	withCheckedPurchase.shopping = [
+		{
+			...withCheckedPurchase.shopping[0],
+			id: 'checked-spinach',
+			checked: true,
+			quantity: 2
+		}
+	];
+	const optedOutWithChecked = applyButlerCommands(
+		withCheckedPurchase,
+		[{ type: 'meal.complete', id: 'thursday', deductPantry: false }],
+		now
+	).state;
+	assert.equal(optedOutWithChecked.pantry[0].quantity, 2);
+	assert.deepEqual(optedOutWithChecked.shopping, withCheckedPurchase.shopping);
+});
+
+test('pantry.upsert retires matching checked rows once per scope and refreshes active and touched weeks regardless of order', () => {
+	const current = createInitialState();
+	const recipe = current.recipes[0];
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'chicken', quantity: 12, unit: 'oz' }];
+	current.pantry = [];
+	current.meals = [
+		{
+			id: 'tuesday',
+			recipeId: recipe.id,
+			date: '2026-10-20',
+			slot: 'Dinner',
+			servings: 2
+		},
+		{
+			id: 'saturday',
+			recipeId: recipe.id,
+			date: '2026-10-24',
+			slot: 'Dinner',
+			servings: 2
+		}
+	];
+	current.shopping = [
+		{
+			id: 'week-checked',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'week-unchecked',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: false,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'recipe-checked',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	];
+	const now = new Date('2026-10-20T12:00:00Z');
+	const pantryCmd = {
+		type: 'pantry.upsert' as const,
+		item: { id: 'chicken', name: 'chicken', quantity: 12, unit: 'oz', category: 'Meat' }
+	};
+	const result = applyButlerCommands(current, [pantryCmd], now).state;
+	assert.equal(result.pantry[0].quantity, 12);
+	assert.equal(result.shopping.length, 1);
+	assert.equal(result.shopping[0].sourceKey, 'week:2026-10-19');
+	assert.equal(result.shopping[0].checked, false);
+	assert.equal(result.shopping[0].quantity, 12);
+
+	// Also order-independent when paired with meal.upsert in another week
+	const nextWeekMealCmd = {
+		type: 'meal.upsert' as const,
+		meal: {
+			id: 'monday-next',
+			recipeId: recipe.id,
+			date: '2026-10-26',
+			slot: 'Dinner' as const,
+			servings: 2
+		}
+	};
+	const pantryThenMeal = applyButlerCommands(current, [pantryCmd, nextWeekMealCmd], now).state;
+	const mealThenPantry = applyButlerCommands(current, [nextWeekMealCmd, pantryCmd], now).state;
+	assert.deepEqual(pantryThenMeal.shopping, mealThenPantry.shopping);
+});
+
 test('ButlerResponseSchema JSON schema requires deductPantry on meal.complete and describes completion fields', () => {
 	const schema = z.toJSONSchema(ButlerResponseSchema) as Record<string, any>;
 	const variants: Record<string, any>[] =

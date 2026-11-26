@@ -143,18 +143,74 @@ export async function listChatGPTModels(
 		);
 	return { providers: [{ id: 'chatgpt', name: 'ChatGPT plan', models }] };
 }
+export type ChatGPTResponseAction =
+	'generate' | 'vision' | 'nutrition' | 'import' | 'capture' | 'chat';
+
+function isRecipeAction(action?: ChatGPTResponseAction): boolean {
+	return !action || action === 'generate' || action === 'import' || action === 'capture';
+}
+
+function incompleteMessage(action?: ChatGPTResponseAction): string {
+	if (isRecipeAction(action))
+		return 'ChatGPT stopped before finishing the recipe. Please try again.';
+	if (action === 'chat') return 'ChatGPT stopped before finishing Basil’s reply. Please try again.';
+	if (action === 'vision')
+		return 'ChatGPT stopped before finishing ingredient recognition. Please try again.';
+	return 'ChatGPT stopped before finishing the nutrition estimate. Please try again.';
+}
+
+function unconfirmedStreamMessage(action?: ChatGPTResponseAction): string {
+	if (isRecipeAction(action))
+		return 'ChatGPT ended the stream before confirming completion. No partial recipe was saved.';
+	if (action === 'chat')
+		return 'ChatGPT ended the stream before confirming completion. No partial reply was shown.';
+	return 'ChatGPT ended the stream before confirming completion. Please try again.';
+}
+
+function emptyOutputMessage(action?: ChatGPTResponseAction): string {
+	if (isRecipeAction(action))
+		return 'ChatGPT completed without recipe text. Try a different request.';
+	if (action === 'chat') return 'ChatGPT completed without a reply. Try a different request.';
+	if (action === 'vision')
+		return 'ChatGPT completed without ingredient results. Try a different request.';
+	return 'ChatGPT completed without a nutrition estimate. Try a different request.';
+}
+
+function isCallerAbort(
+	error: unknown,
+	timeoutSignal: AbortSignal,
+	callerSignal?: AbortSignal
+): boolean {
+	if (callerSignal?.aborted) return true;
+	if (timeoutSignal.aborted) return false;
+	return error instanceof Error && error.name === 'AbortError';
+}
+
+function isTimeoutFailure(error: unknown, signal: AbortSignal): boolean {
+	if (error instanceof Error && error.name === 'TimeoutError') return true;
+	const reason = signal.aborted ? signal.reason : undefined;
+	return reason instanceof Error && reason.name === 'TimeoutError';
+}
+
 export async function chatGPTResponse(
 	options: {
 		accessToken: string;
 		model: string;
 		instructions: string;
 		prompt: string;
+		action?: ChatGPTResponseAction;
 		image?: string;
 		reasoning?: ReasoningSettings;
+		signal?: AbortSignal;
+		timeoutMs?: number;
 	},
 	fetcher: typeof fetch = fetch
 ): Promise<string> {
-	const controller = AbortSignal.timeout(TIMEOUT_MS);
+	if (options.signal?.aborted) {
+		throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+	}
+	const controller = AbortSignal.timeout(options.timeoutMs ?? TIMEOUT_MS);
+	const requestSignal = options.signal ? AbortSignal.any([controller, options.signal]) : controller;
 	const content = options.image
 		? [
 				{ type: 'input_text', text: options.prompt },
@@ -172,7 +228,7 @@ export async function chatGPTResponse(
 				'User-Agent': 'Flavorithm/1.0'
 			},
 			redirect: 'error',
-			signal: controller,
+			signal: requestSignal,
 			body: JSON.stringify({
 				model: options.model,
 				...(options.reasoning?.effort ? { reasoning: { effort: options.reasoning.effort } } : {}),
@@ -182,7 +238,17 @@ export async function chatGPTResponse(
 				stream: true
 			})
 		});
-	} catch {
+	} catch (error) {
+		if (isCallerAbort(error, controller, options.signal)) {
+			throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+		}
+		if (controller.aborted || isTimeoutFailure(error, controller)) {
+			throw new ChatGPTInferenceError(
+				'ChatGPT took too long to respond. Please try again.',
+				504,
+				'timeout'
+			);
+		}
 		throw new ChatGPTInferenceError(
 			'Could not reach ChatGPT. Check your connection and try again.'
 		);
@@ -203,6 +269,18 @@ export async function chatGPTResponse(
 	let bytes = 0;
 	let output = '';
 	let completed = false;
+	let onAbort: (() => void) | undefined;
+	const streamTimeout = new Promise<never>((_, reject) => {
+		const abort = () =>
+			reject(requestSignal.reason ?? new DOMException('The operation timed out.', 'TimeoutError'));
+		if (requestSignal.aborted) {
+			abort();
+			return;
+		}
+		onAbort = abort;
+		requestSignal.addEventListener('abort', onAbort, { once: true });
+	});
+	streamTimeout.catch(() => {});
 
 	function consumeEvent(raw: string) {
 		const data = raw
@@ -222,9 +300,7 @@ export async function chatGPTResponse(
 		if (event.type === 'response.failed' || event.type === 'error')
 			throw upstreamFailure(event, 502);
 		if (event.type === 'response.incomplete')
-			throw new ChatGPTInferenceError(
-				'ChatGPT stopped before finishing the recipe. Please try again.'
-			);
+			throw new ChatGPTInferenceError(incompleteMessage(options.action));
 		if (event.type === 'response.completed') {
 			if (event.response?.status && event.response.status !== 'completed')
 				throw new ChatGPTInferenceError('ChatGPT did not complete the request.');
@@ -285,7 +361,7 @@ export async function chatGPTResponse(
 
 	try {
 		while (true) {
-			const { done, value } = await reader.read();
+			const { done, value } = await Promise.race([reader.read(), streamTimeout]);
 			if (done) break;
 			bytes += value.byteLength;
 			if (bytes > MAX_RESPONSE_BYTES)
@@ -304,21 +380,28 @@ export async function chatGPTResponse(
 			}
 		}
 	} catch (error) {
-		await reader.cancel().catch(() => {});
+		void reader.cancel().catch(() => {});
 		if (error instanceof ChatGPTInferenceError) throw error;
+		if (isCallerAbort(error, controller, options.signal)) {
+			throw new ChatGPTInferenceError('The AI request was cancelled.', 499, 'request_cancelled');
+		}
+		if (controller.aborted || isTimeoutFailure(error, controller)) {
+			throw new ChatGPTInferenceError(
+				'ChatGPT took too long to respond. Please try again.',
+				504,
+				'timeout'
+			);
+		}
 		throw new ChatGPTInferenceError(
 			'The ChatGPT connection was interrupted before completion. Please try again.'
 		);
 	} finally {
-		reader.releaseLock();
+		if (onAbort) requestSignal.removeEventListener('abort', onAbort);
+		try {
+			reader.releaseLock();
+		} catch {}
 	}
-	if (!completed)
-		throw new ChatGPTInferenceError(
-			'ChatGPT ended the stream before confirming completion. No partial recipe was saved.'
-		);
-	if (!output.trim())
-		throw new ChatGPTInferenceError(
-			'ChatGPT completed without recipe text. Try a different request.'
-		);
+	if (!completed) throw new ChatGPTInferenceError(unconfirmedStreamMessage(options.action));
+	if (!output.trim()) throw new ChatGPTInferenceError(emptyOutputMessage(options.action));
 	return output;
 }
