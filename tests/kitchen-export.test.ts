@@ -57,7 +57,8 @@ function renderSyncStatusHtml(props: {
 		'svelte/internal/server': svelteServer,
 		'svelte/internal/disclose-version': {},
 		'@lucide/svelte': iconProxy,
-		'#lib/motion.ts': { revealMotion: () => ({}) }
+		'#lib/motion.ts': { revealMotion: () => ({}) },
+		'#lib/components/DisclosureButton.svelte': noopComponent
 	};
 	runInNewContext(syncStatusServerJs, {
 		exports,
