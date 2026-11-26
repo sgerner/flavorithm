@@ -88,6 +88,7 @@
 		preferenceSummary
 	} from '#lib/domain.ts';
 	import {
+		addPantryItems,
 		backfillSampleData,
 		clearSampleData,
 		cookPlannedMeal,
@@ -96,19 +97,19 @@
 		filterPantryItems,
 		hasSampleData,
 		listPantryCategories,
+		movePurchasesToPantry,
 		normalizeIngredientName,
 		normalizePantryDraft,
 		promoteSampleIngredient,
 		normalizeShoppingItem,
-		reconcileShoppingList,
 		refreshWeekShopping,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
 		revertShoppingItem,
 		savePlannedMealChanges,
 		schedulePlannedMeal,
+		shopForScope,
 		snapshotShoppingItem,
-		transferPurchasedItemsToPantry,
 		unitInfo,
 		weekStartForDate,
 		type PantryDraft,
@@ -1579,7 +1580,8 @@
 		const parsed = parseIngredientLines(boundedInput);
 		const rejectedInput = Math.max(0, segments.length - parsed.length);
 		commitInlineEdits();
-		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
 		const existingKeys = new Set(
 			kitchen.pantry
 				.filter((item) => !item.sample && !item.expires?.trim())
@@ -1619,8 +1621,13 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
-		const applied = JSON.stringify(kitchen.pantry);
+		const updated = addPantryItems(kitchen, additions);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
 		modal = '';
 		const acceptedCount = additions.length;
@@ -1633,8 +1640,18 @@
 		notify(
 			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}.`,
 			() => {
-				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-				else notify('Your pantry changed again. Review the current quantities before editing.');
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else notify('Your pantry changed again. Review the current quantities before editing.');
 			}
 		);
 	}
@@ -2946,7 +2963,6 @@
 		);
 		let lotCount = kitchen.pantry.length;
 		const accepted: AppState['shopping'] = [];
-		const acceptedIds = new Set<string>();
 		for (const item of checked) {
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40);
@@ -2963,7 +2979,6 @@
 				unit,
 				quantity: Math.min(1_000_000, item.quantity)
 			});
-			acceptedIds.add(item.id);
 		}
 		if (!accepted.length) {
 			notify(
@@ -2973,10 +2988,33 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, accepted);
-		kitchen.shopping = kitchen.shopping.filter((i) => !acceptedIds.has(i.id));
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const updated = movePurchasesToPantry(kitchen);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		notify(
-			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`,
+			() => {
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else {
+					notify('Your kitchen changed again. Review the current values before editing.');
+				}
+			}
 		);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
@@ -2986,11 +3024,14 @@
 		}
 		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
+		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
+		kitchen.shopping = shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		selectedId = null;
 		page = 'shopping';
 		notify(
-			additions.length
+			uncheckedCount
 				? 'Shopping list ready. Your pantry is already accounted for.'
 				: 'You have everything you need. Happy cooking!'
 		);
