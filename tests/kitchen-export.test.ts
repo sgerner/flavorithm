@@ -34,13 +34,18 @@ const svelteServer = nodeRequire('svelte/internal/server') as Record<string, unk
 const noopComponent = () => {};
 const iconProxy = new Proxy({}, { get: () => noopComponent });
 
-const syncStatusServerJs = ts.transpileModule(
-	compile(readFileSync('src/lib/components/SyncStatus.svelte', 'utf8'), {
-		filename: 'src/lib/components/SyncStatus.svelte',
-		generate: 'server'
-	}).js.code,
-	{ compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }
-).outputText;
+function compileServerSvelte(filename: string): string {
+	return ts.transpileModule(
+		compile(readFileSync(filename, 'utf8'), {
+			filename,
+			generate: 'server'
+		}).js.code,
+		{ compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }
+	).outputText;
+}
+
+const disclosureButtonServerJs = compileServerSvelte('src/lib/components/DisclosureButton.svelte');
+const syncStatusServerJs = compileServerSvelte('src/lib/components/SyncStatus.svelte');
 
 function renderSyncStatusHtml(props: {
 	kitchen: AppState;
@@ -51,13 +56,28 @@ function renderSyncStatusHtml(props: {
 	conflicts: SyncConflict[];
 	error?: string;
 }): string {
-	const exports: { default?: any } = {};
-	const modMap: Record<string, unknown> = {
+	const baseModMap: Record<string, unknown> = {
 		svelte,
 		'svelte/internal/server': svelteServer,
 		'svelte/internal/disclose-version': {},
 		'@lucide/svelte': iconProxy,
 		'#lib/motion.ts': { revealMotion: () => ({}) }
+	};
+	const disclosureExports: { default?: any } = {};
+	runInNewContext(disclosureButtonServerJs, {
+		exports: disclosureExports,
+		require: (id: string) => {
+			if (id in baseModMap) return baseModMap[id];
+			throw new Error(`Unexpected DisclosureButton dependency ${id}`);
+		}
+	});
+	const exports: { default?: any } = {};
+	const modMap: Record<string, unknown> = {
+		...baseModMap,
+		'#lib/components/DisclosureButton.svelte': {
+			__esModule: true,
+			default: disclosureExports.default
+		}
 	};
 	runInNewContext(syncStatusServerJs, {
 		exports,
