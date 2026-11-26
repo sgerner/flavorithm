@@ -711,8 +711,8 @@
 		font-weight: 600;
 	}
 	.destructive {
-		background: #963e38;
-		color: #fff;
+		background: var(--danger-fill);
+		color: var(--on-danger-fill);
 	}
 	.action-result {
 		display: inline-flex;

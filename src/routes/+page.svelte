@@ -5892,14 +5892,14 @@
 		border-bottom: 2px solid var(--accent);
 	}
 	.voice-session.voice-recovery {
-		border-bottom-color: #b55439;
+		border-bottom-color: var(--danger-ink);
 	}
 	.voice-session p {
 		font-size: 16px;
 		margin: 0 0 10px;
 	}
 	.voice-session .voice-error-copy {
-		color: #b55439;
+		color: var(--danger-ink);
 		font-weight: 500;
 	}
 	.voice-session .voice-recovery-note {
@@ -6073,24 +6073,6 @@
 	.pantry-date {
 		font-size: 12px;
 		color: var(--muted);
-	}
-	.expiry-badge {
-		font-size: 12px;
-		color: var(--muted);
-	}
-	.expiry-badge.depleted {
-		background: var(--wash);
-		color: var(--ink);
-		padding: 2px 6px;
-		font-weight: 600;
-	}
-	.expiry-badge.expired {
-		color: #a43f36;
-		font-weight: 600;
-	}
-	.expiry-badge.soon {
-		color: #926b17;
-		font-weight: 600;
 	}
 	.use-first,
 	.restock-item {
@@ -6386,13 +6368,6 @@
 		color: var(--muted);
 		line-height: 1.5;
 	}
-	.danger-action {
-		background: #a43f36;
-		color: white;
-	}
-	.dialog-actions .danger-action:hover {
-		background: #87332c;
-	}
 	@media (max-width: 650px) {
 		.pantry-controls {
 			gap: 8px;
@@ -6522,16 +6497,6 @@
 		color: var(--muted);
 		overflow-wrap: anywhere;
 	}
-	.member-role {
-		padding: 4px 7px;
-		background: var(--wash);
-		color: var(--muted);
-		font-size: 12px;
-	}
-	.member-role.owner-role {
-		background: var(--accent);
-		color: var(--ink);
-	}
 	.member-remove {
 		min-height: 40px;
 		padding-inline: 6px;
@@ -6560,5 +6525,13 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	@media (forced-colors: active) {
+		.expiry-filters button.active {
+			background: Highlight;
+			color: HighlightText;
+			border: 1px solid Highlight;
+			forced-color-adjust: none;
+		}
 	}
 </style>
