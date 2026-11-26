@@ -11,6 +11,7 @@ import { render } from 'svelte/server';
 import ts from 'typescript';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
@@ -20,6 +21,7 @@ import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
+import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import { readPendingJournal } from '../src/lib/offline-sync.ts';
 import * as plannerMod from '../src/lib/planner.ts';
@@ -56,6 +58,7 @@ const stateRoute = await import('../src/routes/api/state/+server.ts');
 const aiRoute = await import('../src/routes/api/ai/+server.ts');
 const modelsRoute = await import('../src/routes/api/models/+server.ts');
 const connectionsRoute = await import('../src/routes/api/connections/chatgpt/+server.ts');
+const exportRoute = await import('../src/routes/api/export/+server.ts');
 const voiceRoute = await import('../src/routes/api/voice/+server.ts');
 const syncStatusPath: string = '../src/lib/components/SyncStatus.svelte';
 const { default: SyncStatus } = await import(syncStatusPath);
@@ -104,7 +107,8 @@ function injectPageHook(svelteSource: string): string {
 		openSettings,
 		authenticate,
 		logout,
-		deleteAccount
+		deleteAccount,
+		exportKitchen
 	});
 `;
 	return svelteSource.slice(0, instanceEnd) + hook + svelteSource.slice(instanceEnd);
@@ -148,6 +152,7 @@ type SessionPageApi = {
 	authenticate: (event: SubmitEvent) => Promise<void>;
 	logout: () => Promise<void>;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	exportKitchen: () => Promise<void>;
 };
 
 const noopComponent = () => {};
@@ -287,6 +292,9 @@ function createServerClient() {
 				if (path === '/api/voice' && method === 'GET') {
 					return voiceRoute.GET(resolvedEvent);
 				}
+				if (path === '/api/export' && method === 'GET') {
+					return exportRoute.GET(resolvedEvent);
+				}
 				return Response.json({ error: `Unhandled route ${method} ${path}` }, { status: 404 });
 			}
 		});
@@ -350,6 +358,36 @@ function createPageInstance(
 	let nextTimerId = 1;
 	const activeTimers = new Set<number>();
 	const activeAutoSyncTimers = new Set<number>();
+	const downloads: Array<{ filename: string; content: string; type: string }> = [];
+	const blobUrls = new Map<string, { content: string; type: string }>();
+	class RecordedBlob {
+		readonly textContent: string;
+		readonly type: string;
+		constructor(parts: Array<string>, init?: { type?: string }) {
+			this.textContent = parts.join('');
+			this.type = init?.type ?? '';
+		}
+		async text() {
+			return this.textContent;
+		}
+	}
+	const customUrl = Object.assign(
+		function URLProxy(input: string | URL, base?: string | URL) {
+			return new URL(input, base);
+		},
+		{
+			createObjectURL: (blob: unknown) => {
+				const token = `blob:test-${blobUrls.size + 1}`;
+				const recorded = blob as RecordedBlob;
+				blobUrls.set(token, {
+					content: typeof recorded?.textContent === 'string' ? recorded.textContent : '',
+					type: typeof recorded?.type === 'string' ? recorded.type : ''
+				});
+				return token;
+			},
+			revokeObjectURL: () => {}
+		}
+	);
 	let api!: SessionPageApi;
 
 	const modMap: Record<string, unknown> = {
@@ -387,11 +425,13 @@ function createPageInstance(
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
+		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
@@ -411,6 +451,9 @@ function createPageInstance(
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected +page.svelte dependency ${id}`);
 		},
 		Date,
@@ -428,8 +471,11 @@ function createPageInstance(
 		Error,
 		RangeError,
 		TypeError,
+		DOMException,
+		Blob: RecordedBlob,
+		CSS: { escape: (value: string) => value },
 		Promise,
-		URL,
+		URL: customUrl,
 		URLSearchParams,
 		Headers,
 		Response,
@@ -461,7 +507,20 @@ function createPageInstance(
 			documentElement: {
 				dataset: {} as Record<string, string>,
 				classList: { toggle: () => {} }
-			}
+			},
+			createElement: (tag: string) => ({
+				tag,
+				href: '',
+				download: '',
+				click() {
+					const payload = blobUrls.get(this.href);
+					downloads.push({
+						filename: this.download,
+						content: payload?.content ?? '',
+						type: payload?.type ?? ''
+					});
+				}
+			})
 		},
 		navigator: {
 			get onLine() {
@@ -599,6 +658,13 @@ function createPageInstance(
 			} finally {
 				await settleAsyncWork();
 			}
+		},
+		get downloads() {
+			return downloads;
+		},
+		async exportKitchen() {
+			await api.exportKitchen();
+			await settleAsyncWork();
 		}
 	};
 }
@@ -1147,6 +1213,15 @@ test('real +page.svelte keeps sessionExpired false and sync active on /api/ai an
 		assert.equal(app.autoSyncCount, syncCountDuringExpired);
 		assert.equal(app.activeAutoSyncTimers, 0);
 		assert.equal(app.pendingSync, true);
+
+		// Exporting while sessionExpired downloads a local backup with pending edits and the session-expired notice.
+		await app.exportKitchen();
+		assert.equal(app.downloads.length, 1);
+		const exported = JSON.parse(app.downloads[0].content);
+		assert.equal(exported.source, 'offline');
+		assert.equal(exported.hasPendingChanges, true);
+		assert.equal(exported.state.pantry[0].quantity, 3);
+		assert.match(app.toast, /session expired/i);
 	} finally {
 		app.dispose();
 	}
