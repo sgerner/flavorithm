@@ -99,21 +99,160 @@ test('ChatGPT reasoning uses the Responses effort field only when explicitly sel
 	}
 });
 test('ChatGPT rejects incomplete, failed, or abruptly ended streams instead of saving partial recipes', async () => {
-	for (const events of [
-		[{ type: 'response.output_text.delta', delta: 'partial' }],
-		[{ type: 'response.incomplete' }],
+	await assert.rejects(
+		() =>
+			chatGPTResponse(options, async () =>
+				stream([{ type: 'response.output_text.delta', delta: 'partial' }])
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 502 &&
+			/No partial recipe was saved/.test(error.message)
+	);
+	await assert.rejects(
+		() => chatGPTResponse(options, async () => stream([{ type: 'response.incomplete' }])),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 502 &&
+			/finishing the recipe/.test(error.message)
+	);
+	await assert.rejects(
+		() =>
+			chatGPTResponse(options, async () =>
+				stream([{ type: 'response.completed', response: { status: 'completed', output: [] } }])
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 502 &&
+			/without recipe text/.test(error.message)
+	);
+	await assert.rejects(
+		() =>
+			chatGPTResponse(options, async () =>
+				stream([
+					{
+						type: 'response.failed',
+						response: { error: { code: 'subscription_sharing_usage_limit_exceeded' } }
+					}
+				])
+			),
+		ChatGPTInferenceError
+	);
+});
+test('ChatGPT uses action-aware stream error messages for Basil chat and non-recipe calls and returns 504 on timeouts', async () => {
+	const chatRequest = {
+		action: 'chat',
+		provider: 'chatgpt',
+		connectionId: 'owned-account',
+		model: 'account-model',
+		messages: [{ role: 'user', content: 'Plan Wednesday dinner.' }],
+		context: JSON.stringify({
+			recipes: [],
+			meals: [],
+			pantry: [],
+			shopping: [],
+			today: '2026-10-23'
+		})
+	};
+	for (const [events, pattern] of [
+		[[{ type: 'response.incomplete' }], /Basil’s reply/],
+		[[{ type: 'response.output_text.delta', delta: '{"reply":' }], /No partial reply was shown/],
 		[
-			{
-				type: 'response.failed',
-				response: { error: { code: 'subscription_sharing_usage_limit_exceeded' } }
-			}
+			[{ type: 'response.completed', response: { status: 'completed', output: [] } }],
+			/without a reply/
 		]
-	]) {
+	] as const) {
 		await assert.rejects(
-			() => chatGPTResponse(options, async () => stream(events)),
-			ChatGPTInferenceError
+			() =>
+				runAIRequest(chatRequest, async () => stream([...events]), undefined, {
+					accessToken: 'resolved-by-server'
+				}),
+			(error: unknown) =>
+				error instanceof ChatGPTInferenceError &&
+				error.status === 502 &&
+				pattern.test(error.message) &&
+				!/recipe/i.test(error.message)
 		);
 	}
+
+	await assert.rejects(
+		() =>
+			chatGPTResponse({ ...options, action: 'vision' }, async () =>
+				stream([{ type: 'response.incomplete' }])
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 502 &&
+			/ingredient recognition/.test(error.message)
+	);
+
+	await assert.rejects(
+		() =>
+			chatGPTResponse(
+				{ ...options, action: 'chat', timeoutMs: 15 },
+				async (_input, init) =>
+					new Promise<Response>((_, reject) => {
+						const socket = setTimeout(() => {}, 1000);
+						init?.signal?.addEventListener(
+							'abort',
+							() => {
+								clearTimeout(socket);
+								reject(init.signal?.reason);
+							},
+							{ once: true }
+						);
+					})
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 504 &&
+			error.code === 'timeout' &&
+			/took too long to respond/.test(error.message)
+	);
+
+	let streamTimer: ReturnType<typeof setTimeout> | undefined;
+	await assert.rejects(
+		() =>
+			chatGPTResponse(
+				{ ...options, action: 'chat', timeoutMs: 15 },
+				async () =>
+					new Response(
+						new ReadableStream({
+							pull() {
+								return new Promise<void>((resolve) => {
+									streamTimer = setTimeout(resolve, 1000);
+								});
+							},
+							cancel() {
+								clearTimeout(streamTimer);
+							}
+						}),
+						{ headers: { 'content-type': 'text/event-stream' } }
+					)
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 504 &&
+			error.code === 'timeout' &&
+			/took too long to respond/.test(error.message)
+	);
+	clearTimeout(streamTimer);
+
+	const abortController = new AbortController();
+	await assert.rejects(
+		() =>
+			chatGPTResponse(
+				{ ...options, action: 'chat', signal: abortController.signal },
+				async (_input, init) => {
+					abortController.abort();
+					throw init?.signal?.reason ?? new DOMException('Aborted', 'AbortError');
+				}
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 499 &&
+			error.code === 'request_cancelled'
+	);
 });
 test('ChatGPT usage-limit failures surface without a fallback API call', async () => {
 	let calls = 0;

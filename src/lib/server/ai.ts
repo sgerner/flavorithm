@@ -3,7 +3,13 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpsRequest, type RequestOptions } from 'node:https';
 import { isIP } from 'node:net';
 import { z } from 'zod';
-import { ButlerResponseSchema } from '#lib/butler.ts';
+import { ButlerCommandSchema, ButlerResponseSchema, type ButlerCommand } from '#lib/butler.ts';
+import {
+	buildStructuredRecipeDraft,
+	isStandaloneRecipeUrl,
+	parseRecipeServings,
+	type ScrapedRecipeMetadata
+} from '#lib/recipe-scraper.ts';
 import type { Ingredient, Preferences, Recipe } from '#lib/types.ts';
 import { PROVIDER_ENDPOINTS } from './provider-endpoints.ts';
 import {
@@ -514,6 +520,12 @@ export function validateAIRequest(
 	return request;
 }
 
+let recipePageFetcherForTests: SecureRecipePageFetcher | undefined;
+
+export function setRecipePageFetcherForTests(fetcher: SecureRecipePageFetcher | undefined): void {
+	recipePageFetcherForTests = fetcher;
+}
+
 export async function runAIRequest(
 	input: unknown,
 	fetcher: Fetcher = fetch,
@@ -531,64 +543,19 @@ export async function runAIRequest(
 		return searchRecipes(request.prompt, requestFetcher, requestSignal);
 	}
 
-	const { provider, model, apiKey } = request;
-	const selectedModel = model?.trim();
-	const selectedApiKey = provider === 'chatgpt' ? connection?.accessToken : apiKey?.trim();
-	if (provider === 'chatgpt' && !selectedApiKey)
-		throw new AIRequestError('Connect a ChatGPT account before using your plan.', 401);
-	if (!provider || !selectedModel || !selectedApiKey) {
-		throw new AIRequestError('A provider, model, and API key are required.');
-	}
-	if (provider !== 'chatgpt' && !Object.hasOwn(PROVIDER_ENDPOINTS, provider))
-		throw new AIRequestError(
-			'This provider needs an integration that Flavorithm does not support yet.'
-		);
-	let catalogReasoning = false;
-	if (request.reasoning && Object.keys(request.reasoning).length) {
-		const catalog = connection?.codex
-			? await listChatGPTModels(connection.accessToken, requestFetcher)
-			: await getPublicModelCatalog(fetcher);
-		assertRequestActive(requestSignal);
-		const metadata: ConnectionModel['reasoning'] = catalog.providers
-			.find(
-				(p) =>
-					p.id === (connection?.codex ? 'chatgpt' : provider === 'chatgpt' ? 'openai' : provider)
-			)
-			?.models.find((m) => m.id === selectedModel)?.reasoning;
-		if (
-			!metadata ||
-			(request.reasoning.effort && !metadata.efforts.includes(request.reasoning.effort)) ||
-			(request.reasoning.enabled !== undefined && !metadata.toggle) ||
-			(request.reasoning.budgetTokens !== undefined &&
-				(metadata.budgetMin === undefined ||
-					request.reasoning.budgetTokens < metadata.budgetMin ||
-					request.reasoning.budgetTokens > (metadata.budgetMax ?? 32_768)))
-		)
-			throw new AIRequestError('Choose reasoning settings supported by the selected model.');
-		if (
-			request.reasoning.enabled === false &&
-			(request.reasoning.effort || request.reasoning.budgetTokens !== undefined)
-		)
-			throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
-		catalogReasoning = true;
-		if (
-			provider === 'anthropic' &&
-			metadata.budgetMin !== undefined &&
-			request.reasoning.enabled !== false &&
-			(request.reasoning.enabled || request.reasoning.effort) &&
-			request.reasoning.budgetTokens === undefined
-		)
-			request.reasoning.budgetTokens = Math.min(
-				metadata.budgetMax ?? 32_768,
-				Math.max(2048, metadata.budgetMin)
-			);
-	}
-	const reasoningActive = isReasoningActive(
-		provider,
-		selectedModel,
-		request.reasoning,
-		catalogReasoning
+	const validated = await validateProviderAndReasoning(
+		{
+			provider: request.provider,
+			model: request.model,
+			apiKey: request.apiKey,
+			reasoning: request.reasoning
+		},
+		connection,
+		requestFetcher,
+		requestSignal
 	);
+	request.reasoning = validated.reasoning;
+	const { provider, selectedModel, selectedApiKey, reasoningActive } = validated;
 	if (request.action === 'import') {
 		if (!request.url) throw new AIRequestError('A recipe URL is required to import a recipe.');
 		onValidated?.();
@@ -639,6 +606,77 @@ export async function runAIRequest(
 	);
 
 	return validateResult(request.action, modelResult);
+}
+
+async function validateProviderAndReasoning(
+	input: {
+		provider?: string;
+		model?: string;
+		apiKey?: string;
+		reasoning?: ReasoningSettings;
+	},
+	connection: { accessToken: string; codex?: boolean } | undefined,
+	requestFetcher: Fetcher,
+	requestSignal?: AbortSignal
+): Promise<{
+	provider: AIProvider;
+	selectedModel: string;
+	selectedApiKey: string;
+	reasoning?: ReasoningSettings;
+	reasoningActive: boolean;
+}> {
+	const { provider, model, apiKey } = input;
+	const selectedModel = model?.trim();
+	const selectedApiKey = provider === 'chatgpt' ? connection?.accessToken : apiKey?.trim();
+	if (provider === 'chatgpt' && !selectedApiKey)
+		throw new AIRequestError('Connect a ChatGPT account before using your plan.', 401);
+	if (!provider || !selectedModel || !selectedApiKey) {
+		throw new AIRequestError('A provider, model, and API key are required.');
+	}
+	if (provider !== 'chatgpt' && !Object.hasOwn(PROVIDER_ENDPOINTS, provider))
+		throw new AIRequestError(
+			'This provider needs an integration that Flavorithm does not support yet.'
+		);
+	let catalogReasoning = false;
+	const reasoning = input.reasoning ? { ...input.reasoning } : undefined;
+	if (reasoning && Object.keys(reasoning).length) {
+		const catalog = connection?.codex
+			? await listChatGPTModels(connection.accessToken, requestFetcher)
+			: await getPublicModelCatalog(requestFetcher);
+		assertRequestActive(requestSignal);
+		const metadata: ConnectionModel['reasoning'] = catalog.providers
+			.find(
+				(p) =>
+					p.id === (connection?.codex ? 'chatgpt' : provider === 'chatgpt' ? 'openai' : provider)
+			)
+			?.models.find((m) => m.id === selectedModel)?.reasoning;
+		if (
+			!metadata ||
+			(reasoning.effort && !metadata.efforts.includes(reasoning.effort)) ||
+			(reasoning.enabled !== undefined && !metadata.toggle) ||
+			(reasoning.budgetTokens !== undefined &&
+				(metadata.budgetMin === undefined ||
+					reasoning.budgetTokens < metadata.budgetMin ||
+					reasoning.budgetTokens > (metadata.budgetMax ?? 32_768)))
+		)
+			throw new AIRequestError('Choose reasoning settings supported by the selected model.');
+		if (reasoning.enabled === false && (reasoning.effort || reasoning.budgetTokens !== undefined))
+			throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
+		catalogReasoning = true;
+		if (
+			provider === 'anthropic' &&
+			metadata.budgetMin !== undefined &&
+			reasoning.enabled !== false &&
+			(reasoning.enabled || reasoning.effort) &&
+			reasoning.budgetTokens === undefined
+		)
+			reasoning.budgetTokens = Math.min(
+				metadata.budgetMax ?? 32_768,
+				Math.max(2048, metadata.budgetMin)
+			);
+	}
+	const reasoningActive = isReasoningActive(provider, selectedModel, reasoning, catalogReasoning);
+	return { provider, selectedModel, selectedApiKey, reasoning, reasoningActive };
 }
 
 function buildPrompt(request: AIRequest): string {
@@ -767,9 +805,11 @@ function parseDataImage(image: string | undefined) {
 	};
 }
 
+const underlyingFetchers = new WeakMap<Fetcher, Fetcher>();
+
 function withRequestSignal(fetcher: Fetcher, requestSignal?: AbortSignal): Fetcher {
 	if (!requestSignal) return fetcher;
-	return async (input, init) => {
+	const wrapped: Fetcher = async (input, init) => {
 		assertRequestActive(requestSignal);
 		const signal = init?.signal ? AbortSignal.any([init.signal, requestSignal]) : requestSignal;
 		try {
@@ -781,6 +821,8 @@ function withRequestSignal(fetcher: Fetcher, requestSignal?: AbortSignal): Fetch
 			throw error;
 		}
 	};
+	underlyingFetchers.set(wrapped, underlyingFetchers.get(fetcher) ?? fetcher);
+	return wrapped;
 }
 
 function assertRequestActive(requestSignal?: AbortSignal) {
@@ -980,6 +1022,7 @@ async function callOpenAICompatible(
 				{
 					accessToken: apiKey,
 					model,
+					action,
 					instructions: promptFor(action),
 					prompt,
 					image: image?.dataUrl,
@@ -1171,16 +1214,108 @@ function parseModelJson(value: unknown): unknown {
 	}
 }
 
+const ButlerChatEnvelopeSchema = z.object({
+	reply: z.string().trim().min(1).max(12_000),
+	commands: z.array(z.unknown()).max(50)
+});
+
+function rawStringId(value: unknown): string | undefined {
+	if (typeof value !== 'string') return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 && trimmed.length <= 100 ? trimmed : undefined;
+}
+
+function isolateButlerChatResult(value: unknown) {
+	const envelope = ButlerChatEnvelopeSchema.safeParse(value);
+	if (!envelope.success) throw invalidProviderResult();
+	const parsedCommands: ButlerCommand[] = [];
+	const validRecipeIds = new Set<string>();
+	const validMealIds = new Set<string>();
+	const validPantryIds = new Set<string>();
+	const validShoppingIds = new Set<string>();
+	const droppedRecipeIds = new Set<string>();
+	const droppedMealIds = new Set<string>();
+	const droppedPantryIds = new Set<string>();
+	const droppedShoppingIds = new Set<string>();
+	let invalidCommands = 0;
+
+	for (const rawCommand of envelope.data.commands) {
+		const parsed = ButlerCommandSchema.safeParse(rawCommand);
+		if (parsed.success) {
+			parsedCommands.push(parsed.data);
+			if (parsed.data.type === 'recipe.upsert') validRecipeIds.add(parsed.data.recipe.id);
+			else if (parsed.data.type === 'meal.upsert') validMealIds.add(parsed.data.meal.id);
+			else if (parsed.data.type === 'pantry.upsert') validPantryIds.add(parsed.data.item.id);
+			else if (parsed.data.type === 'shopping.upsert') validShoppingIds.add(parsed.data.item.id);
+			continue;
+		}
+		invalidCommands += 1;
+		if (rawCommand && typeof rawCommand === 'object') {
+			const candidate = rawCommand as Record<string, any>;
+			if (candidate.type === 'recipe.upsert') {
+				const id = rawStringId(candidate.recipe?.id);
+				if (id) droppedRecipeIds.add(id);
+			} else if (candidate.type === 'meal.upsert') {
+				const id = rawStringId(candidate.meal?.id);
+				if (id) droppedMealIds.add(id);
+			} else if (candidate.type === 'pantry.upsert') {
+				const id = rawStringId(candidate.item?.id);
+				if (id) droppedPantryIds.add(id);
+			} else if (candidate.type === 'shopping.upsert') {
+				const id = rawStringId(candidate.item?.id);
+				if (id) droppedShoppingIds.add(id);
+			}
+		}
+	}
+
+	for (const id of validRecipeIds) droppedRecipeIds.delete(id);
+	for (const id of validMealIds) droppedMealIds.delete(id);
+	for (const id of validPantryIds) droppedPantryIds.delete(id);
+	for (const id of validShoppingIds) droppedShoppingIds.delete(id);
+
+	const afterRecipeFilter = parsedCommands.filter((command) => {
+		if (command.type === 'meal.upsert' && droppedRecipeIds.has(command.meal.recipeId)) {
+			validMealIds.delete(command.meal.id);
+			droppedMealIds.add(command.meal.id);
+			return false;
+		}
+		if (
+			(command.type === 'recipe.open' || command.type === 'recipe.delete') &&
+			droppedRecipeIds.has(command.id)
+		) {
+			return false;
+		}
+		return true;
+	});
+	for (const command of afterRecipeFilter) {
+		if (command.type === 'meal.upsert') droppedMealIds.delete(command.meal.id);
+	}
+
+	const commands = afterRecipeFilter.filter((command) => {
+		if (
+			(command.type === 'meal.complete' || command.type === 'meal.delete') &&
+			droppedMealIds.has(command.id)
+		) {
+			return false;
+		}
+		if (command.type === 'pantry.delete' && droppedPantryIds.has(command.id)) return false;
+		if (command.type === 'shopping.delete' && droppedShoppingIds.has(command.id)) return false;
+		return true;
+	});
+
+	const droppedCommands = invalidCommands;
+	return droppedCommands > 0
+		? { reply: envelope.data.reply, commands, droppedCommands }
+		: { reply: envelope.data.reply, commands };
+}
+
 function validateResult(
 	action: Exclude<AIAction, 'search' | 'import' | 'capture'>,
 	value: unknown
 ) {
 	switch (action) {
-		case 'chat': {
-			const result = ButlerResponseSchema.safeParse(value);
-			if (!result.success) throw invalidProviderResult();
-			return result.data;
-		}
+		case 'chat':
+			return isolateButlerChatResult(value);
 		case 'generate': {
 			const result = GeneratedRecipesSchema.safeParse(value);
 			if (!result.success) throw invalidProviderResult();
@@ -1760,6 +1895,124 @@ async function captureRecipe(
 	};
 }
 
+export type RecipeUrlImportFallback = {
+	provider?: string;
+	model?: string;
+	apiKey?: string;
+	reasoning?: ReasoningSettings;
+	connection?: { accessToken: string; codex?: boolean };
+	fetcher?: Fetcher;
+};
+
+export async function importRecipeFromUrl(
+	input: {
+		url: string;
+		authenticated?: boolean;
+		resolveFallback?: () => Promise<RecipeUrlImportFallback | null>;
+	},
+	pageFetcher: SecureRecipePageFetcher = recipePageFetcherForTests ?? secureRecipePageFetcher,
+	requestSignal?: AbortSignal
+): Promise<{ recipe: Recipe; assumptions: string[] }> {
+	const rawUrl = input.url?.trim() ?? '';
+	if (!rawUrl) throw new AIRequestError('A recipe URL is required to import a recipe.', 400);
+	const selectedUrl = validateCaptureRecipeUrl(rawUrl);
+	assertRequestActive(requestSignal);
+	const response = await pageFetcher(selectedUrl.href, 'capture', requestSignal);
+	assertRequestActive(requestSignal);
+	if (!response.ok) {
+		throw new AIRequestError(`Recipe page returned status ${response.status}.`, 502);
+	}
+	const contentType = response.headers.get('content-type') ?? '';
+	if (!/^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType)) {
+		throw new AIRequestError('The selected page did not return HTML.', 415);
+	}
+	let html: string;
+	try {
+		html = await response.text();
+	} catch {
+		throw new AIRequestError('Recipe page could not be read.', 502);
+	}
+	if (new TextEncoder().encode(html).byteLength > MAX_RECIPE_PAGE_BYTES) {
+		throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
+	}
+
+	const sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
+	const structured = extractScrapedRecipe(html);
+	if (structured) {
+		return buildStructuredRecipeDraft(structured, sourceUrl);
+	}
+
+	const pageText = htmlToRecipeText(html);
+	if (!pageText) {
+		throw new AIRequestError('The selected page does not contain readable recipe content.', 422);
+	}
+
+	const fallback = input.resolveFallback ? await input.resolveFallback() : null;
+	if (!fallback) {
+		throw new AIRequestError(
+			input.authenticated
+				? 'This page does not include structured recipe data. Connect a model in Settings to extract it, or paste the recipe text.'
+				: 'This page does not include structured recipe data. Create an account and connect a model in Settings to extract it, or paste the recipe text.',
+			422
+		);
+	}
+
+	assertRequestActive(requestSignal);
+	const requestFetcher = withRequestSignal(fallback.fetcher ?? fetch, requestSignal);
+	const { provider, selectedModel, selectedApiKey, reasoning, reasoningActive } =
+		await validateProviderAndReasoning(
+			{
+				provider: fallback.provider,
+				model: fallback.model,
+				apiKey: fallback.apiKey,
+				reasoning: fallback.reasoning
+			},
+			fallback.connection,
+			requestFetcher,
+			requestSignal
+		);
+
+	const prompt = buildCapturePrompt({
+		userText: '',
+		pageText,
+		sourceUrl
+	});
+	assertRequestActive(requestSignal);
+	const modelResult = await callProvider(
+		provider,
+		selectedModel,
+		selectedApiKey,
+		'capture',
+		prompt,
+		undefined,
+		requestFetcher,
+		reasoning,
+		reasoningActive,
+		requestSignal
+	);
+	const parsed = CapturedRecipeDraftSchema.safeParse(modelResult);
+	if (!parsed.success) throw invalidProviderResult();
+	const { assumptions: modelAssumptions, ...draft } = parsed.data;
+	const serverAssumptions: string[] = [];
+	const ingredients = draft.ingredients.map((ingredient) => {
+		const coerced = coerceCaptureIngredient(ingredient);
+		if (coerced.assumption) serverAssumptions.push(coerced.assumption);
+		return coerced.ingredient;
+	});
+	return {
+		recipe: {
+			id: crypto.randomUUID(),
+			...draft,
+			ingredients,
+			image: '',
+			...(sourceUrl ? { source: sourceUrl } : {}),
+			saved: false,
+			provenance: 'web-import'
+		},
+		assumptions: mergeCaptureAssumptions(modelAssumptions, serverAssumptions)
+	};
+}
+
 const MAX_CAPTURE_ASSUMPTIONS = 30;
 const MAX_CAPTURE_ASSUMPTION_LENGTH = 300;
 const UNFETCHED_LINK_WARNING =
@@ -1892,10 +2145,6 @@ function mergeCaptureAssumptions(
 	const cappedAdded = cleanAdded.slice(0, remainingBudget);
 	const keepExisting = Math.max(0, remainingBudget - cappedAdded.length);
 	return [...cappedPrefix, ...cleanExisting.slice(0, keepExisting), ...cappedAdded];
-}
-
-function isStandaloneRecipeUrl(value: string): boolean {
-	return /^https?:\/\/[^\s]+$/i.test(value.trim());
 }
 
 function containsRecipeUrl(value: string): boolean {
@@ -2441,6 +2690,115 @@ function normalizeStructuredRecipe(value: Record<string, unknown>): ImportedReci
 	return normalized;
 }
 
+function extractScrapedRecipe(html: string): ScrapedRecipeMetadata | undefined {
+	const record = findJsonLdRecipeRecord(html);
+	if (!record) return undefined;
+	const base = normalizeStructuredRecipe(record);
+	if (!base) return undefined;
+	const { servings } = parseRecipeServings(base.yield);
+	const mergeNutrition = canMergeSourceNutrition(base, servings);
+	const nutritionNote = skippedScrapedNutritionNote(base, servings, mergeNutrition);
+	const cuisine = scalarText(record.recipeCuisine).slice(0, 100);
+	const categoryTags = extractTagList(record.recipeCategory);
+	const keywordTags = extractTagList(record.keywords);
+	const tags = [...new Set([...categoryTags, ...keywordTags])].slice(0, 30);
+	return {
+		...base,
+		nutrition: mergeNutrition ? base.nutrition : undefined,
+		...(nutritionNote ? { nutritionNote } : {}),
+		...(cuisine ? { cuisine } : {}),
+		...(tags.length ? { tags } : {})
+	};
+}
+
+function skippedScrapedNutritionNote(
+	sourceRecipe: ImportedRecipeData,
+	servings: number,
+	mergeNutrition: boolean
+): string | undefined {
+	if (mergeNutrition) return undefined;
+	if (!skippedStructuredNutrition.has(sourceRecipe) && !sourceRecipe.nutrition) return undefined;
+	if (sourceRecipe.servingSize) {
+		const basis = parseSingleServingBasis(sourceRecipe.servingSize, sourceRecipe.yield);
+		if (!basis.supported) {
+			return normalizeCaptureAssumption(
+				`Skipped page nutrition for serving size "${sourceRecipe.servingSize}" because values were not per single serving; defaulted to 0 for review.`
+			);
+		}
+		if (basis.requiredServings !== undefined && basis.requiredServings !== servings) {
+			return normalizeCaptureAssumption(
+				`Skipped page nutrition for "${sourceRecipe.servingSize}" because the draft uses ${servings} servings; defaulted to 0 for review.`
+			);
+		}
+	}
+	return 'Skipped page nutrition because values were not per single serving; defaulted to 0 for review.';
+}
+
+function findJsonLdRecipeRecord(html: string): Record<string, unknown> | undefined {
+	const candidates: unknown[] = [];
+	let scripts = 0;
+	let jsonLdScript = false;
+	for (const token of scanHtmlTokens(html)) {
+		if (token.kind === 'tag' && token.name === 'script') {
+			if (token.closing) {
+				jsonLdScript = false;
+			} else if (!token.selfClosing) {
+				scripts += 1;
+				const type = readHtmlAttribute(token.attributes, 'type')
+					?.split(';')[0]
+					.trim()
+					.toLowerCase();
+				jsonLdScript = scripts <= 50 && type === 'application/ld+json';
+			}
+			continue;
+		}
+		if (token.kind !== 'raw-text' || token.tag !== 'script' || !jsonLdScript) continue;
+		const source = trimJsonLdSource(token.text);
+		try {
+			candidates.push(JSON.parse(source));
+		} catch {
+			// Ignore invalid JSON-LD blocks and continue looking for a valid Recipe node.
+		}
+	}
+
+	const stack = [...candidates];
+	let visited = 0;
+	let enqueued = stack.length;
+	while (stack.length && visited < 10_000) {
+		const value = stack.pop();
+		visited += 1;
+		if (Array.isArray(value)) {
+			for (let index = Math.min(value.length, 10_000 - enqueued) - 1; index >= 0; index -= 1) {
+				stack.push(value[index]);
+				enqueued += 1;
+			}
+			continue;
+		}
+		if (!value || typeof value !== 'object') continue;
+		const record = value as Record<string, unknown>;
+		if (isRecipeNode(record) && normalizeStructuredRecipe(record)) {
+			return record;
+		}
+		for (const child of Object.values(record).slice(0, 100)) {
+			if (child && typeof child === 'object' && enqueued < 10_000) {
+				stack.push(child);
+				enqueued += 1;
+			}
+		}
+	}
+	return undefined;
+}
+
+function extractTagList(value: unknown): string[] {
+	const raw = scalarText(value);
+	if (!raw) return [];
+	return raw
+		.split(/[,;]+/)
+		.map((entry) => entry.trim().slice(0, 100))
+		.filter(Boolean)
+		.slice(0, 30);
+}
+
 function flattenInstructionText(value: unknown): string[] {
 	const output: string[] = [];
 	const stack = [value];
@@ -2457,8 +2815,8 @@ function flattenInstructionText(value: unknown): string[] {
 		} else if (item && typeof item === 'object') {
 			const record = item as Record<string, unknown>;
 			if (typeof record.text === 'string') stack.push(record.text);
-			else if (typeof record.name === 'string') stack.push(record.name);
 			else if ('itemListElement' in record) stack.push(record.itemListElement);
+			else if (typeof record.name === 'string') stack.push(record.name);
 		}
 	}
 	return output;
@@ -3196,7 +3554,8 @@ type PublicCatalogCacheEntry = {
 let publicCatalogCache = new WeakMap<Fetcher, PublicCatalogCacheEntry>();
 
 function publicCatalogKey(fetcher: Fetcher): Fetcher {
-	return fetcher.name === 'server_fetch' ? globalThis.fetch : fetcher;
+	const baseFetcher = underlyingFetchers.get(fetcher) ?? fetcher;
+	return baseFetcher.name === 'server_fetch' ? globalThis.fetch : baseFetcher;
 }
 
 export async function getSupportedModels(

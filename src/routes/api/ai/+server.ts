@@ -8,28 +8,29 @@ import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts'
 
 const MAX_REQUEST_BYTES = 9_000_000;
 
-function aiErrorHeaders(retryAfter?: number, status?: number): Record<string, string> {
+function aiErrorHeaders(status: number, retryAfter?: number): Record<string, string> {
 	return {
 		'cache-control': 'no-store',
 		...(status === 429 ? { 'Retry-After': String(Math.max(1, Math.ceil(retryAfter ?? 60))) } : {})
 	};
 }
 
-function aiErrorResponse(error: unknown): Response {
+function mapAIErrorResponse(error: unknown): Response {
 	if (
 		error instanceof ChatGPTInferenceError ||
 		error instanceof ChatGPTOAuthError ||
-		error instanceof ApiError ||
-		error instanceof AIRequestError
+		error instanceof AIRequestError ||
+		error instanceof ApiError
 	) {
+		const code =
+			'code' in error && typeof error.code === 'string' && error.code ? error.code : undefined;
+		const retryAfter =
+			'retryAfter' in error && typeof error.retryAfter === 'number' ? error.retryAfter : undefined;
 		return Response.json(
-			{
-				error: error.message,
-				...(error.code ? { code: error.code } : {})
-			},
+			{ error: error.message, ...(code ? { code } : {}) },
 			{
 				status: error.status,
-				headers: aiErrorHeaders(error.retryAfter, error.status)
+				headers: aiErrorHeaders(error.status, retryAfter)
 			}
 		);
 	}
@@ -68,26 +69,26 @@ export const POST: RequestHandler = async (event) => {
 			throw new AIRequestError('Request body must contain valid JSON.');
 		}
 
-		const isObjectBody = Boolean(body && typeof body === 'object' && !Array.isArray(body));
-		const record = isObjectBody ? (body as Record<string, unknown>) : null;
-		const isSearch = record?.action === 'search';
+		let parsed = parseAIRequest(body, event.request.signal);
+		const record = body as Record<string, unknown>;
+		const isSearch = parsed.action === 'search';
 		const host = isSearch ? null : getHostAIFor(user.id);
 		let usingHost = false;
 
-		if (record && !isSearch) {
-			const explicitPersonal = record.usePersonalAI === true;
+		if (!isSearch) {
+			const explicitPersonal = parsed.usePersonalAI === true;
 			const explicitHost =
-				record.usePersonalAI === false || record.connectionId === HOST_CONNECTION_ID;
+				parsed.usePersonalAI === false || parsed.connectionId === HOST_CONNECTION_ID;
 			const hasPersonalApiKey =
-				typeof record.provider === 'string' &&
-				record.provider !== 'chatgpt' &&
-				typeof record.apiKey === 'string' &&
-				record.apiKey.trim().length > 0;
+				typeof parsed.provider === 'string' &&
+				parsed.provider !== 'chatgpt' &&
+				typeof parsed.apiKey === 'string' &&
+				parsed.apiKey.trim().length > 0;
 			const hasPersonalChatGPT =
-				record.provider === 'chatgpt' &&
-				typeof record.connectionId === 'string' &&
-				record.connectionId.trim().length > 0 &&
-				record.connectionId !== HOST_CONNECTION_ID;
+				parsed.provider === 'chatgpt' &&
+				typeof parsed.connectionId === 'string' &&
+				parsed.connectionId.trim().length > 0 &&
+				parsed.connectionId !== HOST_CONNECTION_ID;
 			const usePersonal =
 				explicitPersonal || (!explicitHost && (hasPersonalApiKey || hasPersonalChatGPT));
 
@@ -104,13 +105,12 @@ export const POST: RequestHandler = async (event) => {
 					model: host.model,
 					connectionId: host.accountId
 				};
+				parsed = parseAIRequest(body, event.request.signal);
 				usingHost = true;
 			} else if (!host && explicitHost) {
 				throw new ApiError(400, 'Host AI is not enabled. Connect a personal model in Settings.');
 			}
 		}
-
-		const parsed = parseAIRequest(body, event.request.signal);
 
 		let connection: { accessToken: string; codex?: boolean } | undefined;
 		let providerFetch = event.fetch;
@@ -156,7 +156,7 @@ export const POST: RequestHandler = async (event) => {
 			}
 		);
 	} catch (error) {
-		return aiErrorResponse(error);
+		return mapAIErrorResponse(error);
 	}
 };
 
