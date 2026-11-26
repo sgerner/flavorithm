@@ -264,6 +264,9 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date: customDate ?? Date,
@@ -317,6 +320,9 @@ function createReactivePlanner() {
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date,
