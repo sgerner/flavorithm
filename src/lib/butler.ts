@@ -2,15 +2,18 @@ import { z } from 'zod';
 import type { AppState, Ingredient, ShoppingItem } from './types.ts';
 import { COVER_PATH } from './cover-upload.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
-import { buildShoppingList, normalizeName, unitInfo } from './domain.ts';
+import { normalizeName, unitInfo } from './domain.ts';
 import {
+	activeWeeklyScopes,
 	completeMeal,
 	convertCompatibleQuantity,
+	expiryStatus,
 	findPantryMergeDestination,
 	promoteSampleBookmark,
 	promoteSampleIngredient,
 	promoteSampleMeal,
-	reconcileShoppingList,
+	refreshWeekShopping,
+	retireCheckedShoppingItems,
 	transferPurchasedItemsToPantry
 } from './kitchen-workflows.ts';
 
@@ -261,37 +264,39 @@ function upsertPantryItem(pantryItems: Ingredient[], item: Ingredient): Ingredie
 	);
 }
 
-function recordShoppingMetadata(
-	items: ShoppingItem[],
-	activeWeeks: Set<string>,
-	knownGeneratedIds: Set<string>
-) {
+function recordGeneratedShoppingIds(items: ShoppingItem[], knownGeneratedIds: Set<string>) {
 	for (const item of items) {
-		const sourceKey = item.sourceKey?.trim();
-		if (!sourceKey) continue;
-		knownGeneratedIds.add(item.id);
-		const week = sourceKey.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1];
-		if (week) activeWeeks.add(week);
+		if (item.sourceKey?.trim()) knownGeneratedIds.add(item.id);
 	}
 }
 
 function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
-function refreshShoppingWeek(state: AppState, startKey: string, now: Date) {
-	const start = new Date(startKey + 'T12:00:00');
-	if (!Number.isFinite(start.getTime()) || calendarKey(start) !== startKey) return;
-	const end = new Date(startKey + 'T12:00:00');
-	end.setDate(end.getDate() + 6);
-	const endKey = calendarKey(end);
-	const meals = state.meals.filter(
-		(item) => !item.completedAt && item.date >= startKey && item.date <= endKey
-	);
-	state.shopping = reconcileShoppingList(
-		state.shopping,
-		buildShoppingList(state.recipes, state.pantry, meals, now),
-		`week:${startKey}`
-	);
+function isUsablePantryExpiry(expires: string | undefined, now: Date): boolean {
+	const status = expiryStatus(expires, now);
+	return status !== 'expired' && (!expires?.trim() || status !== 'unknown');
+}
+
+function addedNonExpiredPantryItem(
+	previous: Ingredient | undefined,
+	next: Ingredient,
+	now: Date
+): Ingredient | undefined {
+	if (!isUsablePantryExpiry(next.expires, now)) return undefined;
+	if (!Number.isFinite(next.quantity) || !(next.quantity > 0) || !next.unit.trim())
+		return undefined;
+	if (!previous || !isUsablePantryExpiry(previous.expires, now)) return next;
+	if (
+		normalizeName(previous.name) !== normalizeName(next.name) ||
+		unitInfo(previous.unit).dimension !== unitInfo(next.unit).dimension
+	) {
+		return next;
+	}
+	const previousInNextUnit =
+		convertCompatibleQuantity(previous.quantity, previous.unit, next.unit) ?? 0;
+	const delta = next.quantity - Math.max(0, previousInNextUnit);
+	return delta > 0 ? { ...next, quantity: delta } : undefined;
 }
 
 function clampLeftoverServings(value: number, servings: number): number {
@@ -332,10 +337,12 @@ export function applyButlerCommands(
 	now: Date = new Date()
 ): { state: AppState; effects: ButlerEffect[] } {
 	const commands = z.array(ButlerCommandSchema).max(50).parse(input);
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	let state = structuredClone(current);
-	const activeWeeks = new Set<string>();
+	const trackedWeeks = new Set(activeWeeklyScopes(state.shopping));
 	const knownGeneratedIds = new Set<string>();
-	recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
+	recordGeneratedShoppingIds(state.shopping, knownGeneratedIds);
+	let shouldRefreshWeeks = false;
 	const effects: ButlerEffect[] = [];
 	const pantryMutations: PantryMutation[] = [];
 	const deductedIngredientNames = new Set<string>();
@@ -366,9 +373,11 @@ export function applyButlerCommands(
 						...state.preferences.ratings,
 						[updated.id]: updated.rating
 					};
+				shouldRefreshWeeks = true;
 				break;
 			}
 			case 'recipe.delete':
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
 				requireId(state.recipes, command.id);
 				state.recipes = state.recipes.filter((item) => item.id !== command.id);
 				state.meals = state.meals.filter((item) => item.recipeId !== command.id);
@@ -376,9 +385,13 @@ export function applyButlerCommands(
 					(item) => item.sourceKey !== `recipe:${command.id}` || item.checked
 				);
 				if (state.preferences.ratings) delete state.preferences.ratings[command.id];
+				shouldRefreshWeeks = true;
 				break;
 			case 'pantry.upsert': {
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
 				const promoted = promoteSampleIngredient(command.item);
+				const previousById = state.pantry.find((item) => item.id === promoted.id);
+				const added = addedNonExpiredPantryItem(previousById, promoted, safeNow);
 				const targetId = resolvePantryUpsertTargetId(state.pantry, promoted);
 				const beforeCurrent = current.pantry.find((item) => item.id === targetId);
 				const beforeStep = state.pantry.find((item) => item.id === targetId);
@@ -392,9 +405,14 @@ export function applyButlerCommands(
 					afterDeduction: deductedPantryIds.has(promoted.id)
 				});
 				state.pantry = nextPantry;
+				if (added) {
+					state.shopping = retireCheckedShoppingItems(state.shopping, [added], safeNow);
+				}
+				shouldRefreshWeeks = true;
 				break;
 			}
 			case 'pantry.delete':
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
 				requireId(state.pantry, command.id);
 				pantryMutations.push({
 					kind: 'delete',
@@ -402,6 +420,7 @@ export function applyButlerCommands(
 					beforeStep: state.pantry.find((item) => item.id === command.id)
 				});
 				state.pantry = state.pantry.filter((item) => item.id !== command.id);
+				shouldRefreshWeeks = true;
 				break;
 			case 'meal.upsert': {
 				requireId(state.recipes, command.meal.recipeId);
@@ -425,14 +444,17 @@ export function applyButlerCommands(
 				} else {
 					state.meals = upsert(state.meals, baseMeal);
 				}
+				shouldRefreshWeeks = true;
 				break;
 			}
 			case 'meal.delete':
 				requireId(state.meals, command.id);
 				state.meals = state.meals.filter((item) => item.id !== command.id);
+				shouldRefreshWeeks = true;
 				break;
 			case 'meal.complete': {
 				requireId(state.meals, command.id);
+				for (const week of activeWeeklyScopes(state.shopping)) trackedWeeks.add(week);
 				const targetMeal = state.meals.find((item) => item.id === command.id);
 				const beforePantry = state.pantry;
 				if (command.deductPantry && targetMeal && !targetMeal.completedAt) {
@@ -454,7 +476,7 @@ export function applyButlerCommands(
 						deductPantry: command.deductPantry,
 						leftoverServings: command.leftoverServings ?? 0
 					},
-					now
+					safeNow
 				);
 				if (state.pantry !== beforePantry) {
 					for (const item of state.pantry) {
@@ -462,11 +484,13 @@ export function applyButlerCommands(
 						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
 					}
 				}
+				recordGeneratedShoppingIds(state.shopping, knownGeneratedIds);
+				shouldRefreshWeeks = true;
 				break;
 			}
 			case 'shopping.upsert':
 				state.shopping = upsert(state.shopping, command.item);
-				recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
+				recordGeneratedShoppingIds(state.shopping, knownGeneratedIds);
 				break;
 			case 'shopping.delete': {
 				const removed = state.shopping.find((item) => item.id === command.id);
@@ -482,10 +506,12 @@ export function applyButlerCommands(
 				break;
 			}
 			case 'shopping.generate': {
-				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : now);
+				const start = new Date(command.weekStart ? command.weekStart + 'T12:00:00' : safeNow);
 				if (!command.weekStart) start.setDate(start.getDate() - ((start.getDay() + 6) % 7));
-				refreshShoppingWeek(state, calendarKey(start), now);
-				recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
+				const weekKey = calendarKey(start);
+				trackedWeeks.add(weekKey);
+				state.shopping = refreshWeekShopping(state, weekKey, safeNow);
+				recordGeneratedShoppingIds(state.shopping, knownGeneratedIds);
 				break;
 			}
 			case 'preferences.update':
@@ -540,19 +566,14 @@ export function applyButlerCommands(
 			}
 		}
 	}
-	const weeks = new Set(deletedCheckedWeeks);
-	if (
-		commands.some(
-			(command) =>
-				(command.type.startsWith('recipe.') && command.type !== 'recipe.open') ||
-				command.type.startsWith('meal.') ||
-				command.type.startsWith('pantry.')
-		)
-	) {
-		recordShoppingMetadata(state.shopping, activeWeeks, knownGeneratedIds);
-		for (const week of activeWeeks) weeks.add(week);
+	const weeksToRefresh = new Set(deletedCheckedWeeks);
+	if (shouldRefreshWeeks) {
+		for (const week of trackedWeeks) weeksToRefresh.add(week);
+		for (const week of activeWeeklyScopes(state.shopping)) weeksToRefresh.add(week);
 	}
-	for (const week of weeks) refreshShoppingWeek(state, week, now);
+	for (const week of weeksToRefresh) {
+		state.shopping = refreshWeekShopping(state, week, safeNow);
+	}
 	if (
 		state.recipes.length > MAX_RECIPES ||
 		state.pantry.length > 1000 ||
