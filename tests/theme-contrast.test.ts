@@ -831,7 +831,7 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 		'.primary',
 		'.filter-tabs button.active',
 		'.shopping-filters button.active',
-		'.expiry-filters button.active',
+		'.expiry-filters :global(button.active)',
 		'.theme-grid button.active',
 		'.steps-list li button.done',
 		'.check-box.checked',
@@ -858,11 +858,11 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 			rule.selector
 				.split(',')
 				.map((s) => s.trim())
-				.includes('.expiry-filters button.active')
+				.includes('.expiry-filters :global(button.active)')
 	);
 	if (!hasScopedExpiryForced) {
 		issues.push(
-			'src/routes/+page.svelte must define scoped @media (forced-colors: active) override for .expiry-filters button.active'
+			'src/routes/+page.svelte must define a global @media (forced-colors: active) override for .expiry-filters button.active'
 		);
 	}
 

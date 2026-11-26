@@ -176,6 +176,7 @@
 		quarantineLegacyKitchen,
 		sanitizeKitchenState
 	} from '#lib/guest-storage.ts';
+	import { exportKitchenArchive } from '#lib/kitchen-export.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
@@ -305,7 +306,9 @@
 	});
 	let toast = $state('');
 	let toastUndo = $state<(() => void) | null>(null);
+	let toastActionLabel = $state('Undo');
 	let toastVersion = 0;
+	let exporting = $state(false);
 	let busy = $state(false);
 	let scanBusy = $state(false);
 	let scanController: AbortController | undefined;
@@ -954,12 +957,14 @@
 	function dateKey(date: Date) {
 		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 	}
-	function notify(message: string, undo?: () => void) {
+	function notify(message: string, undo?: () => void, actionLabel = 'Undo') {
 		toast = message;
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+		toastActionLabel = undo ? actionLabel : 'Undo';
 		toastUndo = undo
 			? () => {
 					toastUndo = null;
+					toastActionLabel = 'Undo';
 					toast = '';
 					if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
 				}
@@ -970,6 +975,7 @@
 				if (toastVersion === version) {
 					toast = '';
 					toastUndo = null;
+					toastActionLabel = 'Undo';
 				}
 			},
 			undo ? 10000 : 4200
@@ -1153,7 +1159,13 @@
 			try {
 				localStorage.setItem('flavorithm-guest-kitchen', JSON.stringify(sanitized));
 			} catch {
-				notify('Device storage is full. Export your kitchen before leaving.');
+				notify(
+					'Device storage is full. Export your kitchen before leaving.',
+					() => {
+						void exportKitchen();
+					},
+					'Export now'
+				);
 			}
 		}
 		if (user) kitchenSync?.stage(sanitized);
@@ -1472,13 +1484,7 @@
 		}
 	}
 	function exportPendingChanges() {
-		const snapshot = kitchenSync?.snapshot();
-		if (snapshot)
-			download(
-				JSON.stringify(snapshot.local, null, 2),
-				'flavorithm-pending-kitchen.json',
-				'application/json'
-			);
+		void exportKitchen();
 	}
 	async function flushKitchen() {
 		commitInlineEdits();
@@ -3695,11 +3701,30 @@
 		);
 	}
 	async function exportKitchen() {
+		if (exporting) return;
+		exporting = true;
 		try {
-			const data = await request('/api/export');
-			download(JSON.stringify(data, null, 2), 'flavorithm-kitchen.json', 'application/json');
+			commitInlineEdits();
+			const currentUser = user ? ($state.snapshot(user) as User) : null;
+			const currentState = $state.snapshot(kitchen) as AppState;
+			if (ready && currentUser && (!managedAuth || kitchenLoaded)) {
+				kitchenSync?.stage(sanitizeKitchenState(currentState));
+			}
+			const result = await exportKitchenArchive({
+				user: currentUser,
+				state: currentState,
+				online: online && navigator.onLine,
+				pendingSnapshot: currentUser ? (kitchenSync?.snapshot() ?? null) : null,
+				hasPendingSync: currentUser ? pendingSync : false,
+				storage: currentUser ? localStorage : null,
+				fetcher: currentUser ? fetch : undefined
+			});
+			download(result.json, result.filename, 'application/json');
+			notify(result.notice);
 		} catch (e) {
-			notify((e as Error).message);
+			notify((e as Error).message || 'Could not export your kitchen.');
+		} finally {
+			exporting = false;
 		}
 	}
 	function download(content: string, filename: string, type: string) {
@@ -5037,11 +5062,13 @@
 	{scanBusy ? 'Scanning photo for ingredients…' : toast}
 </div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}>Undo</button
+		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}
+				>{toastActionLabel}</button
 			>{/if}<button
 			onclick={() => {
 				toast = '';
 				toastUndo = null;
+				toastActionLabel = 'Undo';
 			}}
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
@@ -5453,25 +5480,31 @@
 							<div class="dialog-actions">
 								<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
 							</div>
-						</div>{/if}{#if user}<div class="settings-section">
-							<h3>Your data</h3>
-							<p class="muted">
-								{managedAuth
-									? 'Export your account and shared kitchen.'
-									: 'Export your account and shared kitchen, or permanently remove your account.'}
-							</p>
-							<div class="dialog-actions">
-								<button class="secondary" onclick={exportKitchen}
-									><Download size={16} /> Export my data</button
-								>{#if !managedAuth}<button
-										class="text-button danger"
-										onclick={() => {
-											modal = 'delete';
-											error = '';
-										}}>Delete account</button
-									>{/if}
-							</div>
-						</div>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}
+						</div>{/if}
+					<div class="settings-section">
+						<h3>Your data</h3>
+						<p class="muted">
+							{#if !user}
+								Export the kitchen saved in this browser as JSON.
+							{:else if managedAuth}
+								Export your account and shared kitchen.
+							{:else}
+								Export your account and shared kitchen, or permanently remove your account.
+							{/if}
+						</p>
+						<div class="dialog-actions">
+							<button class="secondary" onclick={exportKitchen}
+								><Download size={16} /> Export my data</button
+							>{#if user && !managedAuth}<button
+									class="text-button danger"
+									onclick={() => {
+										modal = 'delete';
+										error = '';
+									}}>Delete account</button
+								>{/if}
+						</div>
+					</div>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<div class="dialog-actions">
 						{#if user && (!managedAuth || providerLogoutUrl)}<button
 								class="text-button"
@@ -6527,7 +6560,7 @@
 		padding-inline: 6px;
 	}
 	@media (forced-colors: active) {
-		.expiry-filters button.active {
+		.expiry-filters :global(button.active) {
 			background: Highlight;
 			color: HighlightText;
 			border: 1px solid Highlight;
