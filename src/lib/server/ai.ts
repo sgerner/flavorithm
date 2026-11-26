@@ -3,7 +3,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpsRequest, type RequestOptions } from 'node:https';
 import { isIP } from 'node:net';
 import { z } from 'zod';
-import { ButlerResponseSchema } from '#lib/butler.ts';
+import { ButlerCommandSchema, ButlerResponseSchema, type ButlerCommand } from '#lib/butler.ts';
 import {
 	buildStructuredRecipeDraft,
 	isStandaloneRecipeUrl,
@@ -782,6 +782,7 @@ async function callOpenAICompatible(
 				{
 					accessToken: apiKey,
 					model,
+					action,
 					instructions: promptFor(action),
 					prompt,
 					image: image?.dataUrl,
@@ -927,16 +928,108 @@ function parseModelJson(value: unknown): unknown {
 	}
 }
 
+const ButlerChatEnvelopeSchema = z.object({
+	reply: z.string().trim().min(1).max(12_000),
+	commands: z.array(z.unknown()).max(50)
+});
+
+function rawStringId(value: unknown): string | undefined {
+	if (typeof value !== 'string') return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 && trimmed.length <= 100 ? trimmed : undefined;
+}
+
+function isolateButlerChatResult(value: unknown) {
+	const envelope = ButlerChatEnvelopeSchema.safeParse(value);
+	if (!envelope.success) throw invalidProviderResult();
+	const parsedCommands: ButlerCommand[] = [];
+	const validRecipeIds = new Set<string>();
+	const validMealIds = new Set<string>();
+	const validPantryIds = new Set<string>();
+	const validShoppingIds = new Set<string>();
+	const droppedRecipeIds = new Set<string>();
+	const droppedMealIds = new Set<string>();
+	const droppedPantryIds = new Set<string>();
+	const droppedShoppingIds = new Set<string>();
+	let invalidCommands = 0;
+
+	for (const rawCommand of envelope.data.commands) {
+		const parsed = ButlerCommandSchema.safeParse(rawCommand);
+		if (parsed.success) {
+			parsedCommands.push(parsed.data);
+			if (parsed.data.type === 'recipe.upsert') validRecipeIds.add(parsed.data.recipe.id);
+			else if (parsed.data.type === 'meal.upsert') validMealIds.add(parsed.data.meal.id);
+			else if (parsed.data.type === 'pantry.upsert') validPantryIds.add(parsed.data.item.id);
+			else if (parsed.data.type === 'shopping.upsert') validShoppingIds.add(parsed.data.item.id);
+			continue;
+		}
+		invalidCommands += 1;
+		if (rawCommand && typeof rawCommand === 'object') {
+			const candidate = rawCommand as Record<string, any>;
+			if (candidate.type === 'recipe.upsert') {
+				const id = rawStringId(candidate.recipe?.id);
+				if (id) droppedRecipeIds.add(id);
+			} else if (candidate.type === 'meal.upsert') {
+				const id = rawStringId(candidate.meal?.id);
+				if (id) droppedMealIds.add(id);
+			} else if (candidate.type === 'pantry.upsert') {
+				const id = rawStringId(candidate.item?.id);
+				if (id) droppedPantryIds.add(id);
+			} else if (candidate.type === 'shopping.upsert') {
+				const id = rawStringId(candidate.item?.id);
+				if (id) droppedShoppingIds.add(id);
+			}
+		}
+	}
+
+	for (const id of validRecipeIds) droppedRecipeIds.delete(id);
+	for (const id of validMealIds) droppedMealIds.delete(id);
+	for (const id of validPantryIds) droppedPantryIds.delete(id);
+	for (const id of validShoppingIds) droppedShoppingIds.delete(id);
+
+	const afterRecipeFilter = parsedCommands.filter((command) => {
+		if (command.type === 'meal.upsert' && droppedRecipeIds.has(command.meal.recipeId)) {
+			validMealIds.delete(command.meal.id);
+			droppedMealIds.add(command.meal.id);
+			return false;
+		}
+		if (
+			(command.type === 'recipe.open' || command.type === 'recipe.delete') &&
+			droppedRecipeIds.has(command.id)
+		) {
+			return false;
+		}
+		return true;
+	});
+	for (const command of afterRecipeFilter) {
+		if (command.type === 'meal.upsert') droppedMealIds.delete(command.meal.id);
+	}
+
+	const commands = afterRecipeFilter.filter((command) => {
+		if (
+			(command.type === 'meal.complete' || command.type === 'meal.delete') &&
+			droppedMealIds.has(command.id)
+		) {
+			return false;
+		}
+		if (command.type === 'pantry.delete' && droppedPantryIds.has(command.id)) return false;
+		if (command.type === 'shopping.delete' && droppedShoppingIds.has(command.id)) return false;
+		return true;
+	});
+
+	const droppedCommands = invalidCommands;
+	return droppedCommands > 0
+		? { reply: envelope.data.reply, commands, droppedCommands }
+		: { reply: envelope.data.reply, commands };
+}
+
 function validateResult(
 	action: Exclude<AIAction, 'search' | 'import' | 'capture'>,
 	value: unknown
 ) {
 	switch (action) {
-		case 'chat': {
-			const result = ButlerResponseSchema.safeParse(value);
-			if (!result.success) throw invalidProviderResult();
-			return result.data;
-		}
+		case 'chat':
+			return isolateButlerChatResult(value);
 		case 'generate': {
 			const result = GeneratedRecipesSchema.safeParse(value);
 			if (!result.success) throw invalidProviderResult();
