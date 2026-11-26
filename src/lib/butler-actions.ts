@@ -268,9 +268,14 @@ export function reconcileButlerUndoViews(
 		reverted: Set<string>
 	): boolean => Boolean(id && ((!prev.has(id) && appliedMap.has(id)) || reverted.has(id)));
 
+	const editorCreatedOrOpenedByBatch = Boolean(
+		view.editingRecipeId &&
+		((!prevRecipes.has(view.editingRecipeId) && appliedRecipes.has(view.editingRecipeId)) ||
+			effects.some((effect) => effect.type === 'recipe.open' && effect.id === view.editingRecipeId))
+	);
 	const closeSelected = isStaleId(view.selectedId, prevRecipes, appliedRecipes, revertedRecipeIds);
 	const closeEditor =
-		view.editingRecipeMode === 'create'
+		view.editingRecipeMode === 'create' && !editorCreatedOrOpenedByBatch
 			? false
 			: isStaleId(view.editingRecipeId, prevRecipes, appliedRecipes, revertedRecipeIds);
 	const clearRecipeToDelete = isStaleId(

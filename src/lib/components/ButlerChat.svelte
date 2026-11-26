@@ -241,7 +241,7 @@
 			if (message.snapshot !== JSON.stringify(kitchen))
 				throw new Error('Your kitchen changed. Ask Basil for an updated proposal.');
 			const snapshot = await apply(action.commands, message.snapshot);
-			if (!chat.alive || token !== chat.generation) return;
+			if (!chat.alive || token !== chat.generation || activeOwner !== owner) return;
 			message.snapshot = snapshot;
 			const savedIds = action.commands.flatMap((command) =>
 				command.type === 'recipe.upsert' ? [command.recipe.id] : []

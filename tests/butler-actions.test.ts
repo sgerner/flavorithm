@@ -609,10 +609,18 @@ test('undo reconciliation omits undo for navigation/dialog actions and closes st
 	const editorCleanup = reconcileButlerUndoViews(
 		previous,
 		compoundResult.state,
-		{ editingRecipeId: 'basil-risotto' },
+		{ editingRecipeId: 'basil-risotto', editingRecipeMode: 'edit' },
 		compoundResult.effects
 	);
 	assert.equal(editorCleanup.closeEditor, true);
+
+	const createdInCreateModeCleanup = reconcileButlerUndoViews(
+		previous,
+		compoundResult.state,
+		{ editingRecipeId: 'basil-risotto', editingRecipeMode: 'create' },
+		[]
+	);
+	assert.equal(createdInCreateModeCleanup.closeEditor, true);
 
 	const cookCleanup = reconcileButlerUndoViews(
 		previous,
