@@ -47,7 +47,8 @@ const IngredientInputSchema = z.object({
 	quantity: z.number().nonnegative().max(1_000_000),
 	unit: z.string().max(40),
 	category: z.string().max(100),
-	expires: z.string().max(50).optional()
+	expires: z.string().max(50).optional(),
+	sample: z.boolean().optional()
 });
 
 const PreferencesInputSchema = z.object({
@@ -72,6 +73,7 @@ const PreferencesInputSchema = z.object({
 		})
 		.optional(),
 	chatgptAccountId: z.string().max(100).optional(),
+	usePersonalAI: z.boolean().optional(),
 	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
@@ -111,6 +113,7 @@ const RecipeInputSchema = z.object({
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
+	sampleSaved: z.boolean().optional(),
 	hidden: z.boolean().optional()
 });
 
@@ -134,6 +137,7 @@ const AIRequestSchema = z
 			.optional(),
 		apiKey: z.string().max(1_000).optional(),
 		connectionId: z.string().max(100).optional(),
+		usePersonalAI: z.boolean().optional(),
 		pantry: z.array(IngredientInputSchema).max(1_000).optional().default([]),
 		preferences: PreferencesInputSchema.optional(),
 		recipes: z.array(RecipeInputSchema).max(250).optional().default([]),

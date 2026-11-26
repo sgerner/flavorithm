@@ -422,3 +422,119 @@ test('/api/ai propagates upstream 429 Retry-After headers and returns 499 on can
 	const cancelledBody = (await cancelled.json()) as { error: string; code?: string };
 	assert.equal(cancelledBody.code, 'request_cancelled');
 });
+
+test('/api/ai validates payloads before refreshing expired ChatGPT OAuth tokens, and ApiError/auth routes preserve codes and Retry-After', async () => {
+	const oauthStorage = await import('../src/lib/server/oauth-storage.ts');
+	const authRoute = await import('../src/routes/api/auth/+server.ts');
+
+	const account = await backend.registerUser(
+		'Validation Order Chef',
+		'validation-order-ai@example.com',
+		'a secure validation order password'
+	);
+	const expiredGrant = oauthStorage.saveChatGPTAccount({
+		userId: account.user.id,
+		mode: 'local',
+		clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+		subject: 'expired-subject:acct',
+		email: 'expired@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'expired-access-token',
+			refreshToken: 'refresh-token-must-not-run',
+			idToken: 'id-token',
+			codexAccountId: 'acct-1'
+		},
+		expiresAt: Date.now() - 60_000,
+		earliestRefreshAt: 0
+	});
+
+	let fetchCalls = 0;
+	const invalidExpiredRes = await aiRoute.POST(
+		makeAIEvent(
+			account.user,
+			{
+				action: 'nutrition',
+				usePersonalAI: true,
+				provider: 'chatgpt',
+				connectionId: expiredGrant.id,
+				model: 'gpt-5-codex'
+				// Missing required `recipe` field
+			},
+			async () => {
+				fetchCalls += 1;
+				throw new Error('OAuth refresh or upstream fetch must not run for invalid payloads');
+			}
+		) as never
+	);
+	assert.equal(invalidExpiredRes.status, 400);
+	assert.equal(fetchCalls, 0);
+
+	// ApiError string-code constructor path serializes `code` via errorResponse and /api/ai
+	const codedError = new backend.ApiError(409, 'Confirm replace first.', 'confirm_replace');
+	assert.equal(codedError.code, 'confirm_replace');
+	const codedResponse = backend.errorResponse(codedError);
+	assert.equal(codedResponse.status, 409);
+	assert.equal(codedResponse.headers.get('retry-after'), null);
+	assert.deepEqual(await codedResponse.json(), {
+		error: 'Confirm replace first.',
+		code: 'confirm_replace'
+	});
+
+	// /api/auth rate limiting propagates Retry-After header via errorResponse
+	const rateLimitedIp = '203.0.113.199';
+	for (let i = 0; i < 10; i++) {
+		const res = await authRoute.POST({
+			request: new Request('https://flavorithm.example/api/auth', {
+				method: 'POST',
+				headers: {
+					origin: 'https://flavorithm.example',
+					'content-type': 'application/json'
+				},
+				body: JSON.stringify({
+					action: 'login',
+					email: 'nobody@example.com',
+					password: 'wrong-password-long-enough'
+				})
+			}),
+			locals: { user: null, authMode: 'local' },
+			cookies: {
+				set() {},
+				get() {
+					return undefined;
+				},
+				delete() {}
+			},
+			getClientAddress: () => rateLimitedIp
+		} as never);
+		assert.equal(res.status, 401);
+	}
+	const authLimited = await authRoute.POST({
+		request: new Request('https://flavorithm.example/api/auth', {
+			method: 'POST',
+			headers: {
+				origin: 'https://flavorithm.example',
+				'content-type': 'application/json'
+			},
+			body: JSON.stringify({
+				action: 'login',
+				email: 'nobody@example.com',
+				password: 'wrong-password-long-enough'
+			})
+		}),
+		locals: { user: null, authMode: 'local' },
+		cookies: {
+			set() {},
+			get() {
+				return undefined;
+			},
+			delete() {}
+		},
+		getClientAddress: () => rateLimitedIp
+	} as never);
+	assert.equal(authLimited.status, 429);
+	const authRetryAfter = authLimited.headers.get('retry-after');
+	assert.ok(authRetryAfter && Number(authRetryAfter) > 0);
+	const authLimitedBody = (await authLimited.json()) as { error: string };
+	assert.match(authLimitedBody.error, /Try again in \d+ (?:minute|minutes|second|seconds)/);
+});

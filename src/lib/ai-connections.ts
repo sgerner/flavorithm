@@ -1,5 +1,7 @@
 import type { Ingredient, Preferences, Recipe } from './types.ts';
 
+export const HOST_CONNECTION_ID = 'host-chatgpt';
+
 export function formatRetryWait(seconds: number): string {
 	const safeSeconds = Math.max(1, Math.ceil(seconds));
 	if (safeSeconds >= 60) {
@@ -79,26 +81,37 @@ export function buildAIPayload(
 		preferences: Preferences;
 		apiKey: string;
 		selectedModel?: ConnectionModel;
+		hostModel?: string;
+		usePersonalAI?: boolean;
 		pantry?: Ingredient[];
 		recipes?: Recipe[];
 		prompt?: string;
 		extra?: Record<string, unknown>;
 	}
 ): Record<string, unknown> {
-	const { preferences, apiKey, selectedModel, extra = {} } = options;
+	const { preferences, apiKey, selectedModel, hostModel, usePersonalAI, extra = {} } = options;
 	if (action === 'search') {
 		return { action, ...extra };
 	}
 	const reasoning = preferences.reasoning ?? (selectedModel?.reasoning ? {} : undefined);
-	const base: Record<string, unknown> = {
-		action,
-		...(preferences.provider === 'chatgpt'
-			? { connectionId: preferences.chatgptAccountId }
-			: { apiKey }),
-		provider: preferences.provider,
-		model: preferences.model,
-		...(reasoning !== undefined ? { reasoning } : {})
-	};
+	const base: Record<string, unknown> = hostModel
+		? {
+				action,
+				usePersonalAI: false,
+				provider: 'chatgpt',
+				model: hostModel,
+				connectionId: HOST_CONNECTION_ID
+			}
+		: {
+				action,
+				...(usePersonalAI !== undefined ? { usePersonalAI } : {}),
+				...(preferences.provider === 'chatgpt'
+					? { connectionId: preferences.chatgptAccountId }
+					: { apiKey }),
+				provider: preferences.provider,
+				model: preferences.model,
+				...(reasoning !== undefined ? { reasoning } : {})
+			};
 	if (action === 'generate') {
 		const trimmedPrompt = options.prompt?.trim();
 		return {

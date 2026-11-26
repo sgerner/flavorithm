@@ -293,6 +293,26 @@ test('buildAIPayload scopes task-required fields per action and signals default 
 	assert.equal(generatePayload.prompt, 'quick dinner');
 	assert.deepEqual(generatePayload.reasoning, {});
 
+	const hostNutritionPayload = buildAIPayload('nutrition', {
+		preferences: { ...prefs, reasoning: { effort: 'high' } },
+		apiKey: 'secret-must-not-leak',
+		selectedModel: reasoningModel,
+		hostModel: 'gpt-5-codex',
+		usePersonalAI: false,
+		pantry,
+		recipes: [rated],
+		prompt: 'stale prompt',
+		extra: { recipe: rated }
+	});
+	assert.deepEqual(hostNutritionPayload, {
+		action: 'nutrition',
+		usePersonalAI: false,
+		provider: 'chatgpt',
+		model: 'gpt-5-codex',
+		connectionId: 'host-chatgpt',
+		recipe: rated
+	});
+
 	assert.equal(parseRetryAfter('45'), 45);
 	assert.equal(parseRetryAfter('Thu, 01 Jan 1970 00:02:00 GMT', 0), 120);
 	assert.equal(formatRetryWait(45), '45 seconds');
