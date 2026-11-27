@@ -530,10 +530,16 @@ export async function runAIRequest(
 ) {
 	const request = validateAIRequest(input, { signal: requestSignal });
 	const requestFetcher = withRequestSignal(fetcher, requestSignal);
+	let validatedNotified = false;
+	const notifyValidated = () => {
+		if (validatedNotified) return;
+		validatedNotified = true;
+		onValidated?.();
+	};
 
 	if (request.action === 'search') {
 		if (!request.prompt) throw new AIRequestError('A search query is required.');
-		onValidated?.();
+		notifyValidated();
 		return searchRecipes(request.prompt, requestFetcher, requestSignal);
 	}
 
@@ -546,13 +552,14 @@ export async function runAIRequest(
 		},
 		connection,
 		requestFetcher,
-		requestSignal
+		requestSignal,
+		notifyValidated
 	);
 	request.reasoning = validated.reasoning;
 	const { provider, selectedModel, selectedApiKey, reasoningActive } = validated;
 	if (request.action === 'import') {
 		if (!request.url) throw new AIRequestError('A recipe URL is required to import a recipe.');
-		onValidated?.();
+		notifyValidated();
 		return importRecipe(
 			request.url,
 			provider,
@@ -566,7 +573,7 @@ export async function runAIRequest(
 		);
 	}
 	if (request.action === 'capture') {
-		onValidated?.();
+		notifyValidated();
 		return captureRecipe(
 			request,
 			provider,
@@ -585,7 +592,7 @@ export async function runAIRequest(
 		throw new AIRequestError('Ingredient photos must be 5 MB or smaller.', 413);
 	}
 	assertRequestActive(requestSignal);
-	onValidated?.();
+	notifyValidated();
 	const modelResult = await callProvider(
 		provider,
 		selectedModel,
@@ -611,7 +618,8 @@ async function validateProviderAndReasoning(
 	},
 	connection: { accessToken: string; codex?: boolean } | undefined,
 	requestFetcher: Fetcher,
-	requestSignal?: AbortSignal
+	requestSignal?: AbortSignal,
+	onBeforeCatalogFetch?: () => void
 ): Promise<{
 	provider: AIProvider;
 	selectedModel: string;
@@ -623,7 +631,9 @@ async function validateProviderAndReasoning(
 	const selectedModel = model?.trim();
 	const selectedApiKey = provider === 'chatgpt' ? connection?.accessToken : apiKey?.trim();
 	if (provider === 'chatgpt' && !selectedApiKey)
-		throw new AIRequestError('Connect a ChatGPT account before using your plan.', 401);
+		throw new AIRequestError('Connect a ChatGPT account before using your plan.', 401, {
+			code: 'chatgpt_reauth_required'
+		});
 	if (!provider || !selectedModel || !selectedApiKey) {
 		throw new AIRequestError('A provider, model, and API key are required.');
 	}
@@ -633,7 +643,11 @@ async function validateProviderAndReasoning(
 		);
 	let catalogReasoning = false;
 	const reasoning = input.reasoning ? { ...input.reasoning } : undefined;
+	if (reasoning?.enabled === false && (reasoning.effort || reasoning.budgetTokens !== undefined)) {
+		throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
+	}
 	if (reasoning && Object.keys(reasoning).length) {
+		onBeforeCatalogFetch?.();
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
 			: await getPublicModelCatalog(requestFetcher);
@@ -654,8 +668,6 @@ async function validateProviderAndReasoning(
 					reasoning.budgetTokens > (metadata.budgetMax ?? 32_768)))
 		)
 			throw new AIRequestError('Choose reasoning settings supported by the selected model.');
-		if (reasoning.enabled === false && (reasoning.effort || reasoning.budgetTokens !== undefined))
-			throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
 		catalogReasoning = true;
 		if (
 			provider === 'anthropic' &&
@@ -3425,7 +3437,7 @@ function upstreamError(
 		return new AIRequestError(
 			`${service} rejected your API key. Enter a valid API key in Settings → AI connection.`,
 			401,
-			{ code: 'provider_auth_error' }
+			{ code: 'provider_auth' }
 		);
 	}
 	if (status === 403) {

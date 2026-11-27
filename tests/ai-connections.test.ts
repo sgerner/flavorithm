@@ -6,6 +6,7 @@ import {
 	buildAIPayload,
 	formatRetryWait,
 	parseRetryAfter,
+	reconcileModelPreferences,
 	resolveConnectionModel,
 	searchConnections,
 	searchModels,
@@ -636,4 +637,50 @@ test('connection poll runs one final check at wall-clock expiry before stopping'
 	assert.equal(deviceHandle.active, false);
 	assert.equal(env.intervals.size, 0);
 	assert.equal(env.listeners.size, 0);
+});
+
+test('reconcileModelPreferences drops missing models and prunes unsupported reasoning controls', () => {
+	const models = [
+		{
+			id: 'codex-mini',
+			name: 'Codex Mini',
+			vision: true,
+			reasoning: { efforts: ['low', 'high'], toggle: false, budgetMin: 1024, budgetMax: 4096 }
+		},
+		{
+			id: 'plain-model',
+			name: 'Plain Model',
+			vision: false
+		}
+	];
+
+	assert.deepEqual(
+		reconcileModelPreferences(models, 'missing-model', { effort: 'high', enabled: true }),
+		{ model: '', reasoning: undefined }
+	);
+	assert.deepEqual(reconcileModelPreferences(models, 'plain-model', { effort: 'high' }), {
+		model: 'plain-model',
+		reasoning: undefined
+	});
+	assert.deepEqual(
+		reconcileModelPreferences(models, 'codex-mini', {
+			enabled: true,
+			effort: 'medium',
+			budgetTokens: 2048
+		}),
+		{
+			model: 'codex-mini',
+			reasoning: { budgetTokens: 2048 }
+		}
+	);
+	assert.deepEqual(
+		reconcileModelPreferences(models, 'codex-mini', {
+			effort: 'high',
+			budgetTokens: 9999
+		}),
+		{
+			model: 'codex-mini',
+			reasoning: { effort: 'high' }
+		}
+	);
 });

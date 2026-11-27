@@ -302,7 +302,7 @@ test('/api/ai consumes rate-limit quota only after local validation and returns 
 				provider: 'openai',
 				model: 'o3-mini',
 				apiKey: 'secret-key',
-				reasoning: { effort: 'extreme' },
+				reasoning: { enabled: false, effort: 'high' },
 				recipe: generatedRecipe
 			},
 			expectedStatus: 400
@@ -537,4 +537,219 @@ test('/api/ai validates payloads before refreshing expired ChatGPT OAuth tokens,
 	assert.ok(authRetryAfter && Number(authRetryAfter) > 0);
 	const authLimitedBody = (await authLimited.json()) as { error: string };
 	assert.match(authLimitedBody.error, /Try again in \d+ (?:minute|minutes|second|seconds)/);
+});
+
+test('/api/ai consumes quota once before token refresh/catalog fetches, maps provider credential errors to 409, and enforces FLAVORITHM_HOST_AI_SHARED=true gating', async (t) => {
+	const oauthStorage = await import('../src/lib/server/oauth-storage.ts');
+	const hostAI = await import('../src/lib/server/host-ai.ts');
+
+	// 1. Unauthenticated /api/ai returns 401 session_expired; signed-in provider 401s map to 409.
+	const unauthRes = await aiRoute.POST(
+		makeAIEvent(null, { action: 'search', prompt: 'soup' }, fetch) as never
+	);
+	assert.equal(unauthRes.status, 401);
+	assert.deepEqual(await unauthRes.json(), {
+		error: 'Authentication required',
+		code: 'session_expired'
+	});
+
+	const chef = await backend.registerUser(
+		'Contract Chef',
+		'contract-chef-ai@example.com',
+		'a secure contract chef password'
+	);
+	const apiKeyAuthRes = await aiRoute.POST(
+		makeAIEvent(
+			chef.user,
+			{
+				action: 'nutrition',
+				provider: 'openai',
+				model: 'gpt-4.1-mini',
+				apiKey: 'bad-key',
+				recipe: generatedRecipe
+			},
+			async () =>
+				new Response(JSON.stringify({ error: { message: 'Incorrect API key' } }), {
+					status: 401,
+					headers: { 'content-type': 'application/json' }
+				})
+		) as never
+	);
+	assert.equal(apiKeyAuthRes.status, 409);
+	const apiKeyAuthBody = (await apiKeyAuthRes.json()) as { error: string; code?: string };
+	assert.equal(apiKeyAuthBody.code, 'provider_auth');
+
+	// 2. Mid-TTL revoked ChatGPT token refresh retry in withChatGPTConnection consumes quota only once.
+	const retryUser = await backend.registerUser(
+		'Retry Quota Chef',
+		'retry-quota-ai@example.com',
+		'a secure retry quota password'
+	);
+	const grant = oauthStorage.saveChatGPTAccount({
+		userId: retryUser.user.id,
+		mode: 'local',
+		clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+		subject: 'retry-quota-subject:acct',
+		email: 'retry-quota@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'revoked-mid-ttl-token',
+			refreshToken: 'valid-refresh-token',
+			idToken: 'id-token',
+			codexAccountId: 'acct-retry'
+		},
+		expiresAt: Date.now() + 3_600_000,
+		earliestRefreshAt: 0
+	});
+	t.mock.method(globalThis, 'fetch', async () =>
+		Response.json({
+			access_token: 'fresh-rotated-token',
+			refresh_token: 'fresh-refresh-token',
+			expires_in: 3600
+		})
+	);
+	let chatgptCalls = 0;
+	const retriedOk = await aiRoute.POST(
+		makeAIEvent(
+			retryUser.user,
+			{
+				action: 'nutrition',
+				provider: 'chatgpt',
+				model: 'gpt-5-codex',
+				connectionId: grant.id,
+				recipe: generatedRecipe
+			},
+			async () => {
+				chatgptCalls += 1;
+				if (chatgptCalls === 1) {
+					return Response.json({ error: { message: 'Token revoked' } }, { status: 401 });
+				}
+				const sse =
+					`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: JSON.stringify(nutrition) })}\r\n\r\n` +
+					`data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed' } })}\r\n\r\n` +
+					'data: [DONE]\r\n\r\n';
+				return new Response(sse, {
+					status: 200,
+					headers: { 'content-type': 'text/event-stream' }
+				});
+			}
+		) as never
+	);
+	assert.equal(retriedOk.status, 200);
+	assert.equal(chatgptCalls, 2);
+
+	// Because the retried request consumed only 1 slot (not 2), 29 slots remain (including catalog-checked requests).
+	for (let i = 0; i < 29; i++) {
+		const res = await aiRoute.POST(
+			makeAIEvent(
+				retryUser.user,
+				{
+					action: 'nutrition',
+					provider: 'openai',
+					model: 'o3-mini',
+					apiKey: 'secret-key',
+					reasoning: { effort: 'extreme' },
+					recipe: generatedRecipe
+				},
+				async () => Response.json(modelCatalog)
+			) as never
+		);
+		assert.equal(res.status, 400);
+	}
+	const quotaExhausted = await aiRoute.POST(
+		makeAIEvent(
+			retryUser.user,
+			{
+				action: 'nutrition',
+				provider: 'openai',
+				model: 'o3-mini',
+				apiKey: 'secret-key',
+				reasoning: { effort: 'extreme' },
+				recipe: generatedRecipe
+			},
+			async () => {
+				throw new Error('Catalog fetch must not run once hourly quota is exhausted');
+			}
+		) as never
+	);
+	assert.equal(quotaExhausted.status, 429);
+
+	// 3. Host AI default-off gate: without FLAVORITHM_HOST_AI_SHARED=true, non-admin users never receive host credentials.
+	const admin = await backend.registerUser(
+		'Gate Admin',
+		'gate-admin-ai@example.com',
+		'a secure gate admin password'
+	);
+	const member = await backend.registerUser(
+		'Gate Member',
+		'gate-member-ai@example.com',
+		'a secure gate member password'
+	);
+	const prevAdminId = process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+	const prevShared = process.env.FLAVORITHM_HOST_AI_SHARED;
+	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = admin.user.id;
+	delete process.env.FLAVORITHM_HOST_AI_SHARED;
+	try {
+		const hostGrant = oauthStorage.saveChatGPTAccount({
+			userId: admin.user.id,
+			mode: 'local',
+			clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+			subject: 'gate-admin-subject:acct',
+			email: 'gate-admin-ai@example.com',
+			scopes: ['codex.subscription'],
+			credentials: {
+				accessToken: 'admin-private-host-token',
+				refreshToken: 'admin-private-refresh',
+				idToken: 'admin-id',
+				codexAccountId: 'acct-gate-admin'
+			},
+			expiresAt: Date.now() + 3_600_000,
+			earliestRefreshAt: 0
+		});
+		hostAI.configureHostAI(admin.user.id, hostGrant.id, 'gpt-5-codex');
+
+		assert.ok(hostAI.getHostAIFor(admin.user.id), 'admin can access own configured Host AI');
+		assert.equal(
+			hostAI.getHostAIFor(member.user.id),
+			null,
+			'non-admin member must not receive Host AI without FLAVORITHM_HOST_AI_SHARED=true'
+		);
+
+		let upstreamHostCalls = 0;
+		for (const memberPayload of [
+			{
+				action: 'nutrition',
+				usePersonalAI: false,
+				provider: 'chatgpt',
+				model: 'gpt-5-codex',
+				connectionId: hostAI.HOST_CONNECTION_ID,
+				recipe: generatedRecipe
+			},
+			{
+				action: 'nutrition',
+				recipe: generatedRecipe
+			}
+		]) {
+			const res = await aiRoute.POST(
+				makeAIEvent(member.user, memberPayload, async () => {
+					upstreamHostCalls += 1;
+					return new Response();
+				}) as never
+			);
+			assert.equal(res.status, 400);
+		}
+		assert.equal(upstreamHostCalls, 0);
+
+		process.env.FLAVORITHM_HOST_AI_SHARED = 'false';
+		assert.equal(hostAI.getHostAIFor(member.user.id), null);
+
+		process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
+		assert.equal(hostAI.getHostAIFor(member.user.id)?.accountId, hostGrant.id);
+	} finally {
+		hostAI.configureHostAI(admin.user.id);
+		if (prevAdminId === undefined) delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+		else process.env.FLAVORITHM_HOST_ADMIN_USER_ID = prevAdminId;
+		if (prevShared === undefined) delete process.env.FLAVORITHM_HOST_AI_SHARED;
+		else process.env.FLAVORITHM_HOST_AI_SHARED = prevShared;
+	}
 });
