@@ -1,13 +1,108 @@
+import type { ShoppingItem } from './types.ts';
 import { MAX_VOICE_SECONDS, type VoiceOptions, type VoiceProvider } from './voice-config.ts';
 export type VoiceState = 'idle' | 'recording' | 'transcribing';
 export type VoiceDialog = 'pantry' | 'import';
+export type VoiceTarget = VoiceDialog | 'shopping';
 export type ResumeDialog = '' | VoiceDialog;
+
+const QUICK_SHOPPING_ITEM_PATTERN =
+	/^(\d+(?:\.\d+)?)(?:\s*(g|grams?|kg|kilograms?|mg|oz|ounces?|lbs?|pounds?|ml|milliliters?|millilitres?|l|liters?|litres?|cups?|tbsp|tablespoons?|tsp|teaspoons?|pt|pints?|qt|quarts?|gal|gallons?|pieces?|whole|each|cans?|cloves?|bunch(?:es)?|heads?|slices?|loaf|loaves|bottles?|packs?|packages?|bags?|boxes?|jars?)\s+(?:of\s+)?|\s+)(.+)$/i;
 
 class VoiceUserError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = 'VoiceUserError';
 	}
+}
+
+export function isVoiceTargetActive(
+	target: VoiceTarget | '',
+	view: {
+		modal: string;
+		page: string;
+		overlay?: boolean;
+		reviewingDraft?: boolean;
+	}
+): boolean {
+	if (!target || view.overlay) return false;
+	if (target === 'shopping') return view.page === 'shopping' && !view.modal;
+	if (target === 'import' && view.reviewingDraft) return false;
+	return view.modal === target;
+}
+
+export function appendVoiceTranscript(
+	current: string,
+	transcript: string,
+	separator = ', ',
+	maxLength?: number
+): string {
+	const incoming = transcript.trim();
+	if (!incoming) return maxLength !== undefined ? current.slice(0, maxLength) : current;
+	const existing =
+		separator === '\n' ? current.replace(/\s+$/, '') : current.replace(/[\s,;.]+$/, '');
+	const merged = existing ? `${existing}${separator}${incoming}` : incoming;
+	return maxLength !== undefined ? merged.slice(0, maxLength) : merged;
+}
+
+export type QuickShoppingParseOptions = {
+	createId?: () => string;
+	split?: boolean;
+};
+
+export type QuickShoppingParseResult = {
+	items: ShoppingItem[];
+	error?: string;
+};
+
+export function parseQuickShoppingItems(
+	input: string,
+	options?: (() => string) | QuickShoppingParseOptions
+): QuickShoppingParseResult {
+	const resolvedOptions: QuickShoppingParseOptions =
+		typeof options === 'function' ? { createId: options } : (options ?? {});
+	const createId = resolvedOptions.createId ?? (() => globalThis.crypto.randomUUID());
+	const split = resolvedOptions.split ?? true;
+	const segments = (split ? input.split(/[,\n;]/) : [input])
+		.map((segment) => segment.trim())
+		.filter(Boolean);
+	const items: ShoppingItem[] = [];
+	for (let i = 0; i < segments.length; i++) {
+		let value = split ? segments[i].replace(/\.+$/, '').trim() : segments[i];
+		if (split && segments.length > 1 && i > 0) value = value.replace(/^and\s+/i, '').trim();
+		if (!value) continue;
+		const match = value.match(QUICK_SHOPPING_ITEM_PATTERN);
+		if (match) {
+			const parsedQuantity = Number(match[1]);
+			if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
+				return { items: [], error: 'Enter a quantity above zero.' };
+			}
+			const rawName = match[3].trim().slice(0, 200);
+			if (!rawName) continue;
+			const quantity = Math.min(
+				1_000_000,
+				Math.round(parsedQuantity * 100) / 100 || parsedQuantity
+			);
+			const unit = (match[2] ? match[2].toLowerCase() : 'piece').slice(0, 40);
+			items.push({
+				id: createId(),
+				name: rawName,
+				quantity,
+				unit,
+				checked: false
+			});
+		} else {
+			const rawName = value.slice(0, 200);
+			if (!rawName) continue;
+			items.push({
+				id: createId(),
+				name: rawName,
+				quantity: 1,
+				unit: 'piece',
+				checked: false
+			});
+		}
+	}
+	return { items };
 }
 
 export function resolveVoiceProvider(
@@ -22,33 +117,38 @@ export function resolveVoiceProvider(
 export type VoiceStartPlan =
 	| {
 			action: 'auth';
-			targetDialog: VoiceDialog;
-			resumeDialog: VoiceDialog;
+			targetDialog: VoiceTarget;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
 			action: 'settings';
-			targetDialog: VoiceDialog;
-			resumeDialog: VoiceDialog;
+			targetDialog: VoiceTarget;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
 			action: 'start';
-			targetDialog: VoiceDialog;
+			targetDialog: VoiceTarget;
 			provider: Exclude<VoiceProvider, 'auto'>;
 	  };
 
 export function planVoiceStart(input: {
-	forRecipe: boolean;
+	forRecipe?: boolean;
+	target?: VoiceTarget;
 	modal: string;
 	provider: VoiceProvider;
 	localAvailable: boolean;
 	signedIn: boolean;
 	apiKey: string;
 }): VoiceStartPlan {
-	const targetDialog: VoiceDialog = input.forRecipe ? 'import' : 'pantry';
-	const resumeDialog: VoiceDialog =
-		input.modal === 'pantry' || input.modal === 'import' ? input.modal : targetDialog;
+	const targetDialog: VoiceTarget = input.target ?? (input.forRecipe ? 'import' : 'pantry');
+	const resumeDialog: ResumeDialog =
+		input.modal === 'pantry' || input.modal === 'import'
+			? input.modal
+			: targetDialog === 'shopping'
+				? ''
+				: targetDialog;
 	const resolved = resolveVoiceProvider(input.provider, input.localAvailable, input.signedIn);
 	if (resolved !== 'browser' && !input.signedIn) {
 		return {
@@ -84,12 +184,12 @@ export function planVoiceStart(input: {
 export type VoiceRetryPlan =
 	| {
 			action: 'auth';
-			resumeDialog: VoiceDialog;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
 			action: 'settings';
-			resumeDialog: VoiceDialog;
+			resumeDialog: ResumeDialog;
 			message: string;
 	  }
 	| {
@@ -103,14 +203,18 @@ export type VoiceRetryPlan =
 
 export function planVoiceRetry(input: {
 	modal: string;
-	voiceTarget: VoiceDialog;
+	voiceTarget: VoiceTarget;
 	provider: VoiceProvider;
 	localAvailable: boolean;
 	signedIn: boolean;
 	apiKey: string;
 }): VoiceRetryPlan {
-	const resumeDialog: VoiceDialog =
-		input.modal === 'pantry' || input.modal === 'import' ? input.modal : input.voiceTarget;
+	const resumeDialog: ResumeDialog =
+		input.modal === 'pantry' || input.modal === 'import'
+			? input.modal
+			: input.voiceTarget === 'shopping'
+				? ''
+				: input.voiceTarget;
 	if (!input.signedIn) {
 		return {
 			action: 'auth',
@@ -162,12 +266,15 @@ export function resolveClosedDialog(
 	};
 }
 
-export function appendDictatedText(target: VoiceDialog, current: string, incoming: string): string {
+export function appendDictatedText(target: VoiceTarget, current: string, incoming: string): string {
 	const text = incoming.trim();
-	if (!text) return current;
+	if (!text) return target === 'import' ? current.slice(0, 20000) : current;
 	if (target === 'import') {
 		const base = current.replace(/\s+$/, '');
 		return [base, text].filter(Boolean).join('\n').slice(0, 20000);
+	}
+	if (target === 'shopping') {
+		return appendVoiceTranscript(current, text, ', ', 2000);
 	}
 	const base = current.trim().replace(/,+\s*$/, '');
 	return [base, text].filter(Boolean).join(', ');

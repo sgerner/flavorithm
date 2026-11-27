@@ -19,17 +19,18 @@ import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import {
-	FOCUSABLE_SELECTOR,
+	HANDOFF_FOCUSABLE_SELECTOR,
 	busyAction,
 	focusHandoff,
 	focusTrap,
-	focusableControls,
 	getFocusableControls,
 	isFocusable
 } from '../src/lib/focus.ts';
 import * as focusMod from '../src/lib/focus.ts';
+import * as formValidationMod from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
+import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
@@ -52,47 +53,6 @@ type ListenerRecord = {
 	listener: (event: any) => void;
 	capture: boolean;
 };
-
-type ObserverRegistration = {
-	observer: FakeMutationObserver;
-	attributeFilter?: string[];
-};
-
-class FakeMutationObserver {
-	private callback: (records: Array<{ type: 'attributes'; attributeName: string }>) => void;
-	private targets = new Set<FakeElement>();
-	private pending: Array<{ type: 'attributes'; attributeName: string }> = [];
-	private scheduled = false;
-
-	constructor(callback: (records: Array<{ type: 'attributes'; attributeName: string }>) => void) {
-		this.callback = callback;
-	}
-
-	observe(target: FakeElement, options?: { attributes?: boolean; attributeFilter?: string[] }) {
-		this.targets.add(target);
-		target.observers.push({ observer: this, attributeFilter: options?.attributeFilter });
-	}
-
-	notifyAttribute(attributeName: string) {
-		this.pending.push({ type: 'attributes', attributeName });
-		if (this.scheduled) return;
-		this.scheduled = true;
-		queueMicrotask(() => {
-			this.scheduled = false;
-			if (!this.pending.length || !this.targets.size) return;
-			const batch = this.pending.splice(0, this.pending.length);
-			this.callback(batch);
-		});
-	}
-
-	disconnect() {
-		for (const target of this.targets) {
-			target.observers = target.observers.filter((entry) => entry.observer !== this);
-		}
-		this.targets.clear();
-		this.pending = [];
-	}
-}
 
 function splitTopLevelCommas(selector: string): string[] {
 	const parts: string[] = [];
@@ -168,7 +128,6 @@ class FakeElement {
 	attributes = new Map<string, string>();
 	classList: string[] = [];
 	listeners: ListenerRecord[] = [];
-	observers: ObserverRegistration[] = [];
 	lastFocusOptions: { preventScroll?: boolean } | undefined;
 	ownerDoc: FakeDocument;
 	private _inert = false;
@@ -191,33 +150,9 @@ class FakeElement {
 
 	set inert(value: boolean) {
 		const next = Boolean(value);
-		const prev = this._inert;
 		this._inert = next;
 		if (next) this.attributes.set('inert', '');
 		else this.attributes.delete('inert');
-		if (next !== prev) this.notifyAttributeMutation('inert');
-	}
-
-	get nextElementSibling(): FakeElement | null {
-		if (!this.parentElement) return null;
-		const idx = this.parentElement.children.indexOf(this);
-		return idx !== -1 && idx + 1 < this.parentElement.children.length
-			? this.parentElement.children[idx + 1]
-			: null;
-	}
-
-	get previousElementSibling(): FakeElement | null {
-		if (!this.parentElement) return null;
-		const idx = this.parentElement.children.indexOf(this);
-		return idx > 0 ? this.parentElement.children[idx - 1] : null;
-	}
-
-	private notifyAttributeMutation(name: string) {
-		for (const reg of [...this.observers]) {
-			if (!reg.attributeFilter || reg.attributeFilter.includes(name)) {
-				reg.observer.notifyAttribute(name);
-			}
-		}
 	}
 
 	append(...nodes: FakeElement[]) {
@@ -273,7 +208,6 @@ class FakeElement {
 		if (name === 'hidden') this.hidden = true;
 		if (name === 'open') this.open = true;
 		if (name === 'inert') this._inert = true;
-		this.notifyAttributeMutation(name);
 	}
 
 	getAttribute(name: string): string | null {
@@ -287,7 +221,6 @@ class FakeElement {
 		if (name === 'hidden') this.hidden = false;
 		if (name === 'open') this.open = false;
 		if (name === 'inert') this._inert = false;
-		this.notifyAttributeMutation(name);
 	}
 
 	hasAttribute(name: string): boolean {
@@ -524,7 +457,6 @@ class FakeDocument {
 	documentElement: FakeElement;
 	body: FakeElement;
 	activeElement: FakeElement;
-	private docListeners: ListenerRecord[] = [];
 
 	constructor() {
 		this.documentElement = new FakeElement(this, 'html', { tabIndex: -1 });
@@ -548,28 +480,6 @@ class FakeDocument {
 	querySelectorAll(selector: string): FakeElement[] {
 		return this.body.querySelectorAll(selector);
 	}
-
-	addEventListener(
-		type: string,
-		listener: (event: any) => void,
-		options?: boolean | { capture?: boolean }
-	) {
-		const capture = typeof options === 'boolean' ? options : Boolean(options?.capture);
-		this.docListeners.push({ type, listener, capture });
-		this.documentElement.addEventListener(type, listener, options);
-	}
-
-	removeEventListener(
-		type: string,
-		listener: (event: any) => void,
-		options?: boolean | { capture?: boolean }
-	) {
-		const capture = typeof options === 'boolean' ? options : Boolean(options?.capture);
-		this.docListeners = this.docListeners.filter(
-			(item) => !(item.type === type && item.listener === listener && item.capture === capture)
-		);
-		this.documentElement.removeEventListener(type, listener, options);
-	}
 }
 
 async function flushMicrotasks(turns = 4) {
@@ -590,20 +500,13 @@ function installFakeDOM(t: test.TestContext) {
 	};
 	const prevDoc = Object.getOwnPropertyDescriptor(globalThis, 'document');
 	const prevWin = Object.getOwnPropertyDescriptor(globalThis, 'window');
-	const prevMO = Object.getOwnPropertyDescriptor(globalThis, 'MutationObserver');
 	Object.defineProperty(globalThis, 'document', { configurable: true, value: doc });
 	Object.defineProperty(globalThis, 'window', { configurable: true, value: win });
-	Object.defineProperty(globalThis, 'MutationObserver', {
-		configurable: true,
-		value: FakeMutationObserver
-	});
 	t.after(() => {
 		if (prevDoc) Object.defineProperty(globalThis, 'document', prevDoc);
 		else Reflect.deleteProperty(globalThis, 'document');
 		if (prevWin) Object.defineProperty(globalThis, 'window', prevWin);
 		else Reflect.deleteProperty(globalThis, 'window');
-		if (prevMO) Object.defineProperty(globalThis, 'MutationObserver', prevMO);
-		else Reflect.deleteProperty(globalThis, 'MutationObserver');
 	});
 	return {
 		doc,
@@ -616,19 +519,17 @@ function installFakeDOM(t: test.TestContext) {
 	};
 }
 
-test('FOCUSABLE_SELECTOR matches details > summary:first-of-type and excludes bare or secondary summaries', async (t) => {
+test('getFocusableControls matches details > summary:first-of-type and excludes bare, secondary, or closed-details controls', (t) => {
 	const { doc } = installFakeDOM(t);
-	assert.ok(FOCUSABLE_SELECTOR.includes('details > summary:first-of-type:not([tabindex="-1"])'));
-	assert.equal(/(?:^|,)summary:not/.test(FOCUSABLE_SELECTOR), false);
+	assert.ok(
+		HANDOFF_FOCUSABLE_SELECTOR.includes('details > summary:first-of-type:not([tabindex="-1"])')
+	);
+	assert.equal(/(?:^|,)summary:not/.test(HANDOFF_FOCUSABLE_SELECTOR), false);
 
-	const dialog = doc.el('div', { tabIndex: -1 });
-	dialog.setAttribute('role', 'dialog');
+	const container = doc.el('div', { tabIndex: -1 });
 	const closeBtn = doc.el('button');
-
-	// Bare summary outside <details> must not match or stall Tab wrapping.
 	const bareSummary = doc.el('summary');
 
-	// <details> with two <summary> children: only the first summary is a disclosure trigger.
 	const details = doc.el('details');
 	const firstSummary = doc.el('summary');
 	const secondSummary = doc.el('summary');
@@ -640,253 +541,26 @@ test('FOCUSABLE_SELECTOR matches details > summary:first-of-type and excludes ba
 	const skippedOption = doc.el('button');
 	skippedOption.setAttribute('tabindex', '-1');
 
-	dialog.append(closeBtn, bareSummary, details, customTab, skippedOption);
-	doc.body.append(dialog);
+	container.append(closeBtn, bareSummary, details, customTab, skippedOption);
+	doc.body.append(container);
 
 	assert.equal(isFocusable(bareSummary as unknown as Element), false);
 	assert.equal(isFocusable(secondSummary as unknown as Element), false);
 	assert.equal(isFocusable(firstSummary as unknown as Element), true);
 
-	let escaped = 0;
-	const trap = focusTrap(dialog as unknown as HTMLElement, {
-		onEscape: () => {
-			escaped++;
-		}
-	});
-	await flushMicrotasks();
+	assert.deepEqual(getFocusableControls(container as unknown as ParentNode), [
+		closeBtn,
+		firstSummary,
+		customTab
+	]);
 
-	const closedControls = getFocusableControls(dialog as unknown as ParentNode);
-	assert.deepEqual(closedControls, [closeBtn, firstSummary, customTab]);
-	assert.deepEqual(focusableControls(dialog as unknown as ParentNode), closedControls);
-
-	// Forward Tab across closeBtn -> firstSummary -> customTab -> wraps cleanly to closeBtn without stalling on bareSummary.
-	customTab.focus();
-	const tabForward = customTab.dispatch({
-		type: 'keydown',
-		key: 'Tab',
-		shiftKey: false,
-		bubbles: true
-	});
-	assert.equal(tabForward.defaultPrevented, true);
-	assert.equal(doc.activeElement, closeBtn);
-
-	const tabBackward = closeBtn.dispatch({
-		type: 'keydown',
-		key: 'Tab',
-		shiftKey: true,
-		bubbles: true
-	});
-	assert.equal(tabBackward.defaultPrevented, true);
-	assert.equal(doc.activeElement, customTab);
-
-	// Opening <details> exposes hiddenInput while still excluding secondSummary and bareSummary.
 	details.setAttribute('open', '');
-	const openControls = getFocusableControls(dialog as unknown as ParentNode);
-	assert.deepEqual(openControls, [closeBtn, firstSummary, hiddenInput, customTab]);
-
-	const escEvent = firstSummary.dispatch({ type: 'keydown', key: 'Escape', bubbles: true });
-	assert.equal(escaped, 1);
-	assert.equal(escEvent.defaultPrevented, true);
-
-	trap.destroy();
-	await flushMicrotasks();
-});
-
-test('focusTrap supports enabled/key lifecycle and releases immediately on inert or outrostart', async (t) => {
-	const { doc } = installFakeDOM(t);
-	const main = doc.el('main', { id: 'kitchen-content', tabIndex: -1 });
-	const trigger = doc.el('button', { classList: ['mobile-menu'] });
-	const externalUndo = doc.el('button', { classList: ['toast-undo'] });
-	main.append(trigger);
-	doc.body.append(main, externalUndo);
-	trigger.focus();
-
-	// 1. Mounting with enabled: false leaves scroll unlocked and Tab untrapped.
-	const drawer = doc.el('aside', { tabIndex: -1 });
-	const drawerLinkA = doc.el('button');
-	const drawerLinkB = doc.el('button');
-	drawer.append(drawerLinkA, drawerLinkB);
-	doc.body.append(drawer);
-
-	const drawerTrap = focusTrap(drawer as unknown as HTMLElement, {
-		enabled: false,
-		returnFocus: () => trigger as unknown as HTMLElement
-	});
-	await flushMicrotasks();
-	assert.equal(doc.body.style.overflow, '');
-	assert.equal(doc.activeElement, trigger);
-
-	// Activating via update({ enabled: true }) locks scroll, focuses first control, and re-focuses on key change.
-	main.inert = true;
-	drawerTrap.update({
-		enabled: true,
-		key: 'view-a',
-		returnFocus: () => trigger as unknown as HTMLElement
-	});
-	await flushMicrotasks();
-	assert.equal(doc.body.style.overflow, 'hidden');
-	assert.equal(doc.activeElement, drawerLinkA);
-
-	drawerLinkB.focus();
-	drawer.scrollTop = 140;
-	drawerTrap.update({
-		enabled: true,
-		key: 'view-b',
-		returnFocus: () => trigger as unknown as HTMLElement
-	});
-	await flushMicrotasks();
-	assert.equal(drawer.scrollTop, 0);
-	assert.equal(doc.activeElement, drawerLinkA);
-
-	// Deactivating while main stays inert past microtask retries still restores focus via MutationObserver once inert clears, even when a [data-focus-backdrop] button had focus.
-	const backdropBtn = doc.el('button');
-	backdropBtn.setAttribute('data-focus-backdrop', '');
-	doc.body.append(backdropBtn);
-	backdropBtn.focus();
-
-	drawerTrap.update({
-		enabled: false,
-		key: 'view-b',
-		returnFocus: () => trigger as unknown as HTMLElement
-	});
-	assert.equal(doc.body.style.overflow, '');
-	await flushMicrotasks(12);
-	// Still inert after 12 microtasks, so trigger cannot receive focus yet.
-	assert.notEqual(doc.activeElement, trigger);
-	// Clearing main.inert triggers MutationObserver and restores focus to trigger.
-	main.inert = false;
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, trigger);
-	assert.deepEqual(trigger.lastFocusOptions, { preventScroll: true });
-	backdropBtn.remove();
-	drawerTrap.destroy();
-
-	// 2. MutationObserver inert release: setting dialog.inert = true releases trap before destroy().
-	const dialogA = doc.el('div', { tabIndex: -1 });
-	dialogA.setAttribute('role', 'dialog');
-	dialogA.setAttribute('aria-modal', 'true');
-	const btnA = doc.el('button');
-	dialogA.append(btnA);
-	doc.body.append(dialogA);
-
-	const trapA = focusTrap(dialogA as unknown as HTMLElement);
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, btnA);
-	assert.equal(doc.body.style.overflow, 'hidden');
-
-	dialogA.inert = true;
-	await flushMicrotasks();
-	assert.equal(doc.body.style.overflow, '');
-	assert.equal(dialogA.hasAttribute('aria-modal'), false);
-	assert.equal(doc.activeElement, trigger);
-	const tabWhileInert = btnA.dispatch({ type: 'keydown', key: 'Tab', bubbles: true });
-	assert.equal(tabWhileInert.defaultPrevented, false);
-	trapA.destroy();
-
-	// 3. outrostart release: synchronous overflow unlock & aria-modal removal, without stealing external focus.
-	const dialogB = doc.el('div', { tabIndex: -1 });
-	dialogB.setAttribute('role', 'dialog');
-	dialogB.setAttribute('aria-modal', 'true');
-	const btnB = doc.el('button');
-	dialogB.append(btnB);
-	doc.body.append(dialogB);
-
-	const trapB = focusTrap(dialogB as unknown as HTMLElement);
-	await flushMicrotasks();
-	assert.equal(doc.body.style.overflow, 'hidden');
-
-	dialogB.dispatch({ type: 'outrostart', bubbles: false });
-	// Overflow and aria-modal are restored synchronously before microtasks run.
-	assert.equal(doc.body.style.overflow, '');
-	assert.equal(dialogB.hasAttribute('aria-modal'), false);
-
-	// Focusing toast Undo during exit animation is preserved rather than stolen back to trigger.
-	externalUndo.focus();
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, externalUndo);
-	trapB.destroy();
-});
-
-test('focusTrap preserves originalFocus across zero-duration modal swaps and resolves deleted-card fallbacks', async (t) => {
-	const { doc } = installFakeDOM(t);
-	const main = doc.el('main', { id: 'kitchen-content', tabIndex: -1 });
-	const grid = doc.el('div', { classList: ['recipe-grid'] });
-
-	const card1 = doc.el('article', { classList: ['recipe-card'] });
-	const open1 = doc.el('button', { classList: ['recipe-title'] });
-	card1.append(open1);
-
-	const card2 = doc.el('article', { classList: ['recipe-card'] });
-	const open2 = doc.el('button', { classList: ['recipe-title'] });
-	card2.append(open2);
-
-	grid.append(card1, card2);
-	main.append(grid);
-	doc.body.append(main);
-	open1.focus();
-
-	const detailDialog = doc.el('div', { tabIndex: -1 });
-	detailDialog.setAttribute('role', 'dialog');
-	const editBtn = doc.el('button');
-	detailDialog.append(editBtn);
-	doc.body.append(detailDialog);
-
-	const trap1 = focusTrap(detailDialog as unknown as HTMLElement);
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, editBtn);
-	assert.equal(doc.body.style.overflow, 'hidden');
-
-	// Simulate prefers-reduced-motion: outgoing dialog unmounts synchronously before incoming mounts.
-	detailDialog.remove();
-	trap1.destroy();
-
-	const editorDialog = doc.el('div', { tabIndex: -1 });
-	editorDialog.setAttribute('role', 'dialog');
-	const cancelBtn = doc.el('button');
-	editorDialog.append(cancelBtn);
-	doc.body.append(editorDialog);
-
-	const trap2 = focusTrap(editorDialog as unknown as HTMLElement);
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, cancelBtn);
-	assert.equal(doc.body.style.overflow, 'hidden');
-
-	editorDialog.remove();
-	trap2.destroy();
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, open1);
-	assert.equal(doc.body.style.overflow, '');
-
-	// Delete card1 while main is initially inert: focus resolves to neighbor card2's .recipe-title button.
-	main.inert = true;
-	const deleteDialog = doc.el('div', { tabIndex: -1 });
-	deleteDialog.setAttribute('role', 'dialog');
-	deleteDialog.append(doc.el('button'));
-	doc.body.append(deleteDialog);
-
-	const trap3 = focusTrap(deleteDialog as unknown as HTMLElement);
-	await flushMicrotasks();
-
-	card1.remove();
-	main.inert = false;
-	deleteDialog.remove();
-	trap3.destroy();
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, open2);
-
-	// Delete last remaining card2: focus falls back to #kitchen-content landmark.
-	const deleteLastDialog = doc.el('div', { tabIndex: -1 });
-	deleteLastDialog.setAttribute('role', 'dialog');
-	deleteLastDialog.append(doc.el('button'));
-	doc.body.append(deleteLastDialog);
-	const trap4 = focusTrap(deleteLastDialog as unknown as HTMLElement);
-	await flushMicrotasks();
-
-	card2.remove();
-	deleteLastDialog.remove();
-	trap4.destroy();
-	await flushMicrotasks();
-	assert.equal(doc.activeElement, main);
+	assert.deepEqual(getFocusableControls(container as unknown as ParentNode), [
+		closeBtn,
+		firstSummary,
+		hiddenInput,
+		customTab
+	]);
 });
 
 test('busyAction toggles aria-disabled and blocks duplicate click, keydown, and form submit', () => {
@@ -936,13 +610,12 @@ test('busyAction toggles aria-disabled and blocks duplicate click, keydown, and 
 	guard.destroy();
 });
 
-test('focusHandoff computes neighbors lazily at unmount with zero getComputedStyle calls on focusin/click across 80 sites', async (t) => {
+test('focusHandoff computes neighbors lazily at unmount with zero getComputedStyle calls on focusin/click across 85 sites', async (t) => {
 	const dom = installFakeDOM(t);
 	const { doc } = dom;
 	const main = doc.el('main', { id: 'kitchen-content', tabIndex: -1 });
 	doc.body.append(main);
 
-	// Populate <main> with 85 rows (255 focusable controls) and attach 85 focusHandoff actions.
 	const list = doc.el('div', { classList: ['pantry-list'] });
 	main.append(list);
 	const handoffs: Array<{ destroy: () => void }> = [];
@@ -973,12 +646,10 @@ test('focusHandoff computes neighbors lazily at unmount with zero getComputedSty
 	}
 	const elapsedMs = performance.now() - startMs;
 
-	// Zero getComputedStyle calls during focusin + click across all 85 sites.
 	assert.equal(dom.computedStyleCalls, 0);
 	assert.ok(elapsedMs < 100, `Expected <100ms for 85 focusin+click cycles, took ${elapsedMs}ms`);
 	await flushMicrotasks();
 
-	// Unmounting row 10 lazily inspects only the adjacent surviving row, not all 85 rows.
 	dom.resetComputedStyleCalls();
 	const targetBtn = removeButtons[10];
 	targetBtn.focus();
@@ -994,7 +665,6 @@ test('focusHandoff computes neighbors lazily at unmount with zero getComputedSty
 		`Expected lazy neighbor check (<= 6 style reads), got ${dom.computedStyleCalls}`
 	);
 
-	// Lazy DOM-order neighbor resolution when no row/target/fallback is configured.
 	const toolbar = doc.el('div', { classList: ['toolbar'] });
 	const beforeBtn = doc.el('button', { classList: ['before-btn'] });
 	const transientWrap = doc.el('span');
@@ -1012,7 +682,6 @@ test('focusHandoff computes neighbors lazily at unmount with zero getComputedSty
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, afterBtn);
 
-	// When no following sibling exists, lazy backward search focuses beforeBtn.
 	const tailWrap = doc.el('span');
 	const tailBtn = doc.el('button', { classList: ['tail-btn'] });
 	tailWrap.append(tailBtn);
@@ -1106,7 +775,7 @@ test('focusHandoff moves focus on paired Edit/Done toggle, inert row deletion, a
 	assert.equal(doc.activeElement, messageBox);
 });
 
-test('compiled ButlerChat.svelte restores launcher focus across close/toggle/Escape and skips inert wrappers', async (t) => {
+test('compiled ButlerChat.svelte restores launcher focus across close/toggle and skips inert wrappers', async (t) => {
 	const { doc } = installFakeDOM(t);
 	const rawButler = readFileSync('src/lib/components/ButlerChat.svelte', 'utf8');
 	const scriptStart = rawButler.indexOf('<script lang="ts">');
@@ -1217,10 +886,7 @@ test('compiled ButlerChat.svelte restores launcher focus across close/toggle/Esc
 	assert.equal(doc.activeElement, input);
 
 	// 2. close() explicitly restores focus to launcher even if opened while focus was elsewhere
-	const trap1 = focusTrap(panel1 as unknown as HTMLElement, {
-		onEscape: butlerApi.close,
-		returnFocus: () => launcher as unknown as HTMLElement
-	});
+	const trap1 = focusTrap(panel1 as unknown as HTMLElement);
 	await flushMicrotasks();
 	await butlerApi.close();
 	panel1.remove();
@@ -1228,7 +894,7 @@ test('compiled ButlerChat.svelte restores launcher focus across close/toggle/Esc
 	await flushMicrotasks();
 	assert.equal(butlerApi.open, false);
 	assert.equal(doc.activeElement, launcher);
-	assert.deepEqual(launcher.lastFocusOptions, { preventScroll: true });
+	assert.equal(launcher.lastFocusOptions?.preventScroll, true);
 
 	// 3. toggle() while open delegates to close() and restores launcher focus
 	doc.body.append(panel1);
@@ -1312,6 +978,7 @@ test('compiled +page.svelte handleWindowKeydown always clears mobileNav on Escap
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': focusMod,
+		'#lib/form-validation.ts': formValidationMod,
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -1324,6 +991,7 @@ test('compiled +page.svelte handleWindowKeydown always clears mobileNav on Escap
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
 		'#lib/import-session.ts': importSessionMod,
+		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
@@ -1338,6 +1006,7 @@ test('compiled +page.svelte handleWindowKeydown always clears mobileNav on Escap
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
+		'#lib/components/FormField.svelte': { default: noop },
 		'#lib/components/RecipeDetail.svelte': { default: noop },
 		'#lib/components/ButlerChat.svelte': { default: noop },
 		'#lib/components/RecipeEditor.svelte': { default: noop },

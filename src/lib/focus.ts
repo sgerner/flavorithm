@@ -1,28 +1,62 @@
-/** Shared keyboard focus primitives: modal focus traps, busy guards, and unmount handoffs. */
+/** Keep keyboard focus in a modal and return it to its trigger on close. */
+let activeTraps = 0;
+let originalOverflow = '';
+let originalFocus: HTMLElement | null = null;
+
+export function focusTrap(node: HTMLElement) {
+	const previous = document.activeElement as HTMLElement | null;
+	const controls = () =>
+		Array.from(
+			node.querySelectorAll<HTMLElement>(
+				'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])'
+			)
+		).filter((el) => el.offsetParent !== null);
+	queueMicrotask(() => {
+		(controls()[0] || node).focus();
+	});
+	function keydown(event: KeyboardEvent) {
+		if (event.key !== 'Tab') return;
+		const elements = controls();
+		if (!elements.length) {
+			event.preventDefault();
+			node.focus();
+			return;
+		}
+		const first = elements[0],
+			last = elements[elements.length - 1];
+		if (event.shiftKey && (document.activeElement === first || document.activeElement === node)) {
+			event.preventDefault();
+			last.focus();
+		} else if (!event.shiftKey && document.activeElement === last) {
+			event.preventDefault();
+			first.focus();
+		}
+	}
+	node.addEventListener('keydown', keydown);
+	if (activeTraps === 0) {
+		originalOverflow = document.body.style.overflow;
+		originalFocus = previous;
+	}
+	activeTraps += 1;
+	document.body.style.overflow = 'hidden';
+	return {
+		destroy() {
+			node.removeEventListener('keydown', keydown);
+			activeTraps -= 1;
+			if (activeTraps === 0) {
+				document.body.style.overflow = originalOverflow;
+				const returnTarget = originalFocus;
+				queueMicrotask(() => {
+					if (activeTraps === 0 && returnTarget?.isConnected && !returnTarget.closest('[inert]'))
+						returnTarget.focus({ preventScroll: true });
+				});
+			}
+		}
+	};
+}
 
 export type FocusTarget =
 	HTMLElement | string | (() => HTMLElement | null | undefined) | null | undefined;
-
-export type FocusTrapOptions = {
-	enabled?: boolean;
-	key?: unknown;
-	returnFocus?: FocusTarget;
-	fallback?: FocusTarget;
-	onEscape?: () => void;
-};
-
-type ResolvedTrapOptions = {
-	enabled: boolean;
-	key: unknown;
-	returnFocus?: FocusTarget;
-	fallback?: FocusTarget;
-	onEscape?: () => void;
-};
-
-type TrapEntry = {
-	node: HTMLElement;
-	deactivate: (exiting?: boolean) => void;
-};
 
 export type FocusHandoffOptions = {
 	/** Selector for the repeating row element when deleting list items. */
@@ -35,20 +69,8 @@ export type FocusHandoffOptions = {
 	fallback?: FocusTarget;
 };
 
-export const FOCUSABLE_SELECTOR =
+export const HANDOFF_FOCUSABLE_SELECTOR =
 	'button:not([disabled]):not([tabindex="-1"]),a[href]:not([tabindex="-1"]),input:not([disabled]):not([tabindex="-1"]),select:not([disabled]):not([tabindex="-1"]),textarea:not([disabled]):not([tabindex="-1"]),details > summary:first-of-type:not([tabindex="-1"]),[tabindex]:not([tabindex="-1"])';
-
-const ITEM_SELECTOR =
-	'article,li,[role="listitem"],.pantry-row,.shopping-row,.calendar-meal,.cooked-history-row,.member-row,.invite-row,.draft-ingredient,.draft-step';
-
-type TriggerSnapshot = {
-	item: HTMLElement | null;
-	container: HTMLElement | null;
-	itemMatcher: string;
-	itemIndex: number;
-	controlSelector: string;
-	controlIndex: number;
-};
 
 type AncestorAnchor = {
 	el: HTMLElement;
@@ -71,60 +93,19 @@ type HandoffSnapshot = {
 	ancestors: AncestorAnchor[];
 };
 
-const activeTraps: TrapEntry[] = [];
-const MAX_RESTORE_MICROTASK_RETRIES = 8;
-let originalOverflow = '';
-let originalFocus: HTMLElement | null = null;
-let originalSnapshot: TriggerSnapshot | null = null;
-let handoffFocus: HTMLElement | null = null;
-let handoffOverflow: string | null = null;
-let handoffSnapshot: TriggerSnapshot | null = null;
-let restoreGeneration = 0;
-let cancelPendingRestore: (() => void) | null = null;
-let lastOutsideFocus: HTMLElement | null = null;
-let trackedDoc: Document | null = null;
-
-function ensureFocusTracker() {
-	if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
-	if (trackedDoc === document) return;
-	trackedDoc = document;
-	document.addEventListener(
-		'focusin',
-		(event) => {
-			if (activeTraps.length > 0) return;
-			const target = event.target as HTMLElement | null;
-			if (target && target !== document.body && target !== document.documentElement) {
-				lastOutsideFocus = target;
-			}
-		},
-		true
-	);
-}
-
-function resolveTrapOptions(param?: FocusTrapOptions | boolean): ResolvedTrapOptions {
-	if (typeof param === 'boolean') return { enabled: param, key: undefined };
-	return {
-		enabled: param?.enabled ?? true,
-		key: param?.key,
-		returnFocus: param?.returnFocus,
-		fallback: param?.fallback,
-		onEscape: param?.onEscape
-	};
-}
-
-function escapeIdentifier(value: string) {
+function escapeCssIdent(value: string) {
 	return typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
 		? CSS.escape(value)
 		: value.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
 }
 
-function isInert(el: Element | null | undefined): boolean {
+function isInertElement(el: Element | null | undefined): boolean {
 	if (!el) return true;
 	if ((el as HTMLElement & { inert?: boolean }).inert || el.hasAttribute?.('inert')) return true;
 	return Boolean(el.closest?.('[inert]'));
 }
 
-function isDetailsOpen(details: Element): boolean {
+function isDetailsElementOpen(details: Element): boolean {
 	return Boolean((details as HTMLDetailsElement).open || details.hasAttribute?.('open'));
 }
 
@@ -137,11 +118,11 @@ function isFirstSummaryOfDetails(el: Element): boolean {
 	return false;
 }
 
-function isHiddenInClosedDetails(el: Element, boundary?: ParentNode | null): boolean {
+function isClosedDetailsDescendant(el: Element, boundary?: ParentNode | null): boolean {
 	let current: Element | null = el;
 	while (current && current !== boundary) {
 		const parent: HTMLElement | null = current.parentElement;
-		if (parent && parent.tagName === 'DETAILS' && !isDetailsOpen(parent)) {
+		if (parent && parent.tagName === 'DETAILS' && !isDetailsElementOpen(parent)) {
 			let firstSummary: Element | null = null;
 			for (const child of Array.from(parent.children)) {
 				if (child.tagName === 'SUMMARY') {
@@ -156,7 +137,7 @@ function isHiddenInClosedDetails(el: Element, boundary?: ParentNode | null): boo
 	return false;
 }
 
-function isVisible(el: HTMLElement): boolean {
+function isVisibleElement(el: HTMLElement): boolean {
 	if (el.isConnected === false) return false;
 	if ((el as HTMLElement & { hidden?: boolean }).hidden || el.hasAttribute?.('hidden')) {
 		return false;
@@ -181,13 +162,13 @@ export function isFocusable(el: Element | null | undefined): el is HTMLElement {
 	if (!el || typeof (el as HTMLElement).focus !== 'function') return false;
 	const htmlEl = el as HTMLElement;
 	if (htmlEl.isConnected === false) return false;
-	if (htmlEl.hasAttribute?.('disabled') || isInert(htmlEl)) return false;
+	if (htmlEl.hasAttribute?.('disabled') || isInertElement(htmlEl)) return false;
 	if (typeof htmlEl.tabIndex === 'number' && htmlEl.tabIndex < 0) return false;
 	if (htmlEl.tagName === 'SUMMARY' && !htmlEl.hasAttribute?.('tabindex')) {
 		if (!isFirstSummaryOfDetails(htmlEl)) return false;
 	}
-	if (isHiddenInClosedDetails(htmlEl)) return false;
-	return isVisible(htmlEl);
+	if (isClosedDetailsDescendant(htmlEl)) return false;
+	return isVisibleElement(htmlEl);
 }
 
 /** True when an element can safely receive programmatic focus(), including tabindex="-1" landmarks. */
@@ -198,52 +179,29 @@ function isProgrammaticallyFocusable(el: Element | null | undefined): el is HTML
 		if (htmlEl === document.body || htmlEl === document.documentElement) return false;
 	}
 	if (htmlEl.isConnected === false) return false;
-	if (htmlEl.hasAttribute?.('disabled') || isInert(htmlEl)) return false;
+	if (htmlEl.hasAttribute?.('disabled') || isInertElement(htmlEl)) return false;
 	if (htmlEl.tagName === 'SUMMARY' && !htmlEl.hasAttribute?.('tabindex')) {
 		if (!isFirstSummaryOfDetails(htmlEl)) return false;
 	}
-	if (isHiddenInClosedDetails(htmlEl)) return false;
-	return isVisible(htmlEl);
+	if (isClosedDetailsDescendant(htmlEl)) return false;
+	return isVisibleElement(htmlEl);
 }
 
 /** Return ordered Tab-focusable descendants within root. */
 export function getFocusableControls(root: ParentNode): HTMLElement[] {
 	if (!root || typeof root.querySelectorAll !== 'function') return [];
-	return Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-		(el) => !isHiddenInClosedDetails(el, root) && isFocusable(el)
+	return Array.from(root.querySelectorAll<HTMLElement>(HANDOFF_FOCUSABLE_SELECTOR)).filter(
+		(el) => !isClosedDetailsDescendant(el, root) && isFocusable(el)
 	);
 }
-
-export const focusableControls = getFocusableControls;
 
 function selectorForElement(el: HTMLElement): string {
 	const firstClass = el.classList?.[0];
-	if (firstClass) return `${el.tagName.toLowerCase()}.${escapeIdentifier(firstClass)}`;
+	if (firstClass) return `${el.tagName.toLowerCase()}.${escapeCssIdent(firstClass)}`;
 	return el.tagName.toLowerCase();
 }
 
-function matchingChildren(container: HTMLElement | null, selector: string): HTMLElement[] {
-	if (!container || !selector || container.isConnected === false || isInert(container)) return [];
-	return Array.from(container.children).filter(
-		(child): child is HTMLElement =>
-			typeof (child as HTMLElement).matches === 'function' &&
-			child.matches(selector) &&
-			!isInert(child) &&
-			isVisible(child as HTMLElement)
-	);
-}
-
-function resolveRawFocusElement(target: FocusTarget): HTMLElement | null {
-	if (!target) return null;
-	if (typeof target === 'function') return target() ?? null;
-	if (typeof target === 'string') {
-		if (typeof document === 'undefined') return null;
-		return document.querySelector<HTMLElement>(target);
-	}
-	return target;
-}
-
-function resolveTarget(
+function resolveHandoffOptionTarget(
 	target: FocusTarget,
 	scopes?: Array<ParentNode | null | undefined>
 ): HTMLElement | null {
@@ -273,7 +231,7 @@ function resolveTarget(
 	return isProgrammaticallyFocusable(target) ? target : null;
 }
 
-function focusControlInItem(
+function focusControlInRow(
 	item: HTMLElement,
 	controlSelector: string,
 	controlIndex = 0
@@ -287,389 +245,6 @@ function focusControlInItem(
 	const itemControls = getFocusableControls(item);
 	if (!itemControls.length) return null;
 	return itemControls[Math.min(Math.max(0, controlIndex), itemControls.length - 1)];
-}
-
-function captureTriggerSnapshot(trigger: HTMLElement | null): TriggerSnapshot | null {
-	if (!trigger || typeof trigger.focus !== 'function') return null;
-	if (
-		typeof document !== 'undefined' &&
-		(trigger === document.body || trigger === document.documentElement)
-	) {
-		return null;
-	}
-	if (trigger.isConnected === false || trigger.hasAttribute?.('disabled') || !isVisible(trigger)) {
-		return null;
-	}
-	const item = (trigger.closest?.(ITEM_SELECTOR) as HTMLElement | null) ?? null;
-	if (!item) return null;
-	const container = item.parentElement;
-	const itemMatcher = selectorForElement(item);
-	// Ignore ancestor [inert] here because Svelte applies inert on .app-shell in render_effect
-	// before use:focusTrap mounts in user effect.
-	const siblings = container
-		? Array.from(container.children).filter(
-				(child): child is HTMLElement =>
-					typeof (child as HTMLElement).matches === 'function' &&
-					child.matches(itemMatcher) &&
-					isVisible(child as HTMLElement)
-			)
-		: [];
-	const itemIndex = siblings.indexOf(item);
-	const itemControls = Array.from(item.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
-		(el) =>
-			el.isConnected !== false &&
-			!el.hasAttribute?.('disabled') &&
-			!(typeof el.tabIndex === 'number' && el.tabIndex < 0) &&
-			!(
-				el.tagName === 'SUMMARY' &&
-				!el.hasAttribute?.('tabindex') &&
-				!isFirstSummaryOfDetails(el)
-			) &&
-			!isHiddenInClosedDetails(el) &&
-			isVisible(el)
-	);
-	return {
-		item,
-		container,
-		itemMatcher,
-		itemIndex: Math.max(0, itemIndex),
-		controlSelector: selectorForElement(trigger),
-		controlIndex: Math.max(0, itemControls.indexOf(trigger))
-	};
-}
-
-function resolveTrapReturnTarget(
-	savedFocus: HTMLElement | null,
-	savedSnapshot: TriggerSnapshot | null,
-	returnFocusOption?: FocusTarget,
-	fallbackOption?: FocusTarget
-): HTMLElement | null {
-	const explicitReturn = resolveTarget(returnFocusOption);
-	if (explicitReturn) return explicitReturn;
-	if (isProgrammaticallyFocusable(savedFocus)) return savedFocus;
-	if (savedSnapshot) {
-		const { item, container, itemMatcher, itemIndex, controlSelector, controlIndex } =
-			savedSnapshot;
-		if (item && item.isConnected !== false && !isInert(item) && isVisible(item)) {
-			const withinSameItem = focusControlInItem(item, controlSelector, controlIndex);
-			if (withinSameItem) return withinSameItem;
-		}
-		const remaining = matchingChildren(container, itemMatcher);
-		if (remaining.length > 0) {
-			const neighbor = remaining[Math.min(itemIndex, remaining.length - 1)];
-			const neighborControl = focusControlInItem(neighbor, controlSelector, controlIndex);
-			if (neighborControl) return neighborControl;
-		}
-	}
-	const explicitFallback = resolveTarget(fallbackOption);
-	if (explicitFallback) return explicitFallback;
-	if (typeof document !== 'undefined') {
-		const landmark = document.getElementById('kitchen-content');
-		if (isProgrammaticallyFocusable(landmark)) return landmark;
-	}
-	return null;
-}
-
-function hasExternalActiveFocus(
-	preferredTarget: HTMLElement | null,
-	closingNode: HTMLElement
-): boolean {
-	if (typeof document === 'undefined') return false;
-	const active = document.activeElement as HTMLElement | null;
-	if (!active || active === document.body || active === document.documentElement) return false;
-	if (active === preferredTarget || active === closingNode || closingNode.contains?.(active)) {
-		return false;
-	}
-	if (active.closest?.('[inert], [hidden], [data-focus-backdrop]')) return false;
-	return isProgrammaticallyFocusable(active);
-}
-
-function scheduleFocusRestore(
-	closingNode: HTMLElement,
-	savedFocus: HTMLElement | null,
-	savedSnapshot: TriggerSnapshot | null,
-	returnFocusOpt?: FocusTarget,
-	fallbackOpt?: FocusTarget
-) {
-	cancelPendingRestore?.();
-	const token = ++restoreGeneration;
-
-	let restoreObserver: MutationObserver | null = null;
-	let rafId: number | null = null;
-	let cleaned = false;
-
-	const currentPreferred = () => resolveRawFocusElement(returnFocusOpt) ?? savedFocus;
-
-	const onExternalFocusIn = () => {
-		if (hasExternalActiveFocus(currentPreferred(), closingNode)) cleanup();
-	};
-
-	const cleanup = () => {
-		if (cleaned) return;
-		cleaned = true;
-		restoreObserver?.disconnect();
-		restoreObserver = null;
-		if (rafId !== null && typeof cancelAnimationFrame === 'function') {
-			cancelAnimationFrame(rafId);
-		}
-		rafId = null;
-		if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
-			document.removeEventListener('focusin', onExternalFocusIn);
-		}
-		if (cancelPendingRestore === cleanup) cancelPendingRestore = null;
-	};
-	cancelPendingRestore = cleanup;
-
-	const attempt = (): 'done' | 'inert' => {
-		if (cleaned || token !== restoreGeneration || activeTraps.length !== 0) {
-			cleanup();
-			return 'done';
-		}
-		handoffFocus = null;
-		handoffOverflow = null;
-		handoffSnapshot = null;
-
-		const preferred = currentPreferred();
-		if (hasExternalActiveFocus(preferred, closingNode)) {
-			cleanup();
-			return 'done';
-		}
-		if (
-			preferred &&
-			preferred.isConnected !== false &&
-			isVisible(preferred) &&
-			isInert(preferred)
-		) {
-			return 'inert';
-		}
-		const returnTarget = resolveTrapReturnTarget(
-			savedFocus,
-			savedSnapshot,
-			returnFocusOpt,
-			fallbackOpt
-		);
-		returnTarget?.focus({ preventScroll: true });
-		cleanup();
-		return 'done';
-	};
-
-	let retries = 0;
-	const pollMicrotask = () => {
-		if (attempt() !== 'inert') return;
-		const preferred = currentPreferred();
-		if (restoreObserver === null && preferred && typeof MutationObserver !== 'undefined') {
-			restoreObserver = new MutationObserver(() => {
-				attempt();
-			});
-			let current: HTMLElement | null = preferred;
-			while (current) {
-				restoreObserver.observe(current, { attributes: true, attributeFilter: ['inert'] });
-				current = current.parentElement;
-			}
-			if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
-				document.addEventListener('focusin', onExternalFocusIn);
-			}
-		}
-		if (rafId === null && typeof requestAnimationFrame === 'function') {
-			rafId = requestAnimationFrame(() => {
-				rafId = null;
-				if (attempt() === 'inert' && restoreObserver === null) cleanup();
-			});
-		}
-		if (retries < MAX_RESTORE_MICROTASK_RETRIES) {
-			retries += 1;
-			queueMicrotask(pollMicrotask);
-		} else if (restoreObserver === null && rafId === null) {
-			cleanup();
-		}
-	};
-
-	queueMicrotask(pollMicrotask);
-}
-
-/** Keep keyboard focus in an active modal or drawer, route Escape, and restore focus on close. */
-export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean) {
-	let currentOptions = resolveTrapOptions(param);
-	let active = false;
-	let focusGeneration = 0;
-	let inertObserver: MutationObserver | null = null;
-	const controls = () => getFocusableControls(node);
-
-	function focusInitial(force = false) {
-		const token = ++focusGeneration;
-		const applyFocus = (): boolean => {
-			if (!active || token !== focusGeneration || isInert(node) || node.isConnected === false) {
-				return true;
-			}
-			const current = (
-				typeof document !== 'undefined' ? document.activeElement : null
-			) as HTMLElement | null;
-			if (!force && current && current !== node && node.contains?.(current)) {
-				return true;
-			}
-			(controls()[0] || node).focus({ preventScroll: true });
-			const after = (
-				typeof document !== 'undefined' ? document.activeElement : null
-			) as HTMLElement | null;
-			return Boolean(after && (after === node || node.contains?.(after)));
-		};
-		queueMicrotask(() => {
-			if (!applyFocus() && typeof requestAnimationFrame === 'function') {
-				requestAnimationFrame(() => {
-					if (active && token === focusGeneration) applyFocus();
-				});
-			}
-		});
-	}
-
-	function keydown(event: KeyboardEvent) {
-		if (!active) return;
-		if (event.key === 'Escape' && !event.defaultPrevented && currentOptions.onEscape) {
-			event.stopPropagation();
-			event.preventDefault();
-			currentOptions.onEscape();
-			return;
-		}
-		if (event.key !== 'Tab') return;
-		const elements = controls();
-		if (!elements.length) {
-			event.preventDefault();
-			node.focus({ preventScroll: true });
-			return;
-		}
-		const first = elements[0];
-		const last = elements[elements.length - 1];
-		const current = (
-			typeof document !== 'undefined' ? document.activeElement : null
-		) as HTMLElement | null;
-		const outside = !current || !node.contains?.(current);
-		if (outside) {
-			event.preventDefault();
-			(event.shiftKey ? last : first).focus({ preventScroll: true });
-		} else if (event.shiftKey && (current === first || current === node)) {
-			event.preventDefault();
-			last.focus({ preventScroll: true });
-		} else if (!event.shiftKey && (current === last || current === node)) {
-			event.preventDefault();
-			first.focus({ preventScroll: true });
-		}
-	}
-
-	function outrostart(event: Event) {
-		if (event.target === node) deactivate(true);
-	}
-
-	const entry: TrapEntry = {
-		node,
-		deactivate
-	};
-
-	function deactivate(exiting = false) {
-		if (!active) {
-			if (exiting) node.removeAttribute?.('aria-modal');
-			return;
-		}
-		active = false;
-		focusGeneration += 1;
-		node.removeEventListener('keydown', keydown);
-		node.removeEventListener('outrostart', outrostart);
-		inertObserver?.disconnect();
-		inertObserver = null;
-		if (exiting) node.removeAttribute?.('aria-modal');
-
-		const index = activeTraps.indexOf(entry);
-		if (index !== -1) activeTraps.splice(index, 1);
-
-		if (activeTraps.length === 0) {
-			if (typeof document !== 'undefined') {
-				document.body.style.overflow = originalOverflow;
-			}
-			const savedFocus = originalFocus;
-			const savedSnapshot = originalSnapshot;
-			const savedOverflow = originalOverflow;
-			const returnFocusOpt = currentOptions.returnFocus;
-			const fallbackOpt = currentOptions.fallback;
-			handoffFocus = savedFocus ?? resolveRawFocusElement(returnFocusOpt);
-			handoffOverflow = savedOverflow;
-			handoffSnapshot = savedSnapshot;
-			originalFocus = null;
-			originalSnapshot = null;
-
-			scheduleFocusRestore(node, savedFocus, savedSnapshot, returnFocusOpt, fallbackOpt);
-		}
-	}
-
-	function activate() {
-		if (active || !currentOptions.enabled || node.isConnected === false || isInert(node)) return;
-		ensureFocusTracker();
-		const currentActive = (
-			typeof document !== 'undefined' ? document.activeElement : null
-		) as HTMLElement | null;
-		const previous =
-			currentActive &&
-			(typeof document === 'undefined' ||
-				(currentActive !== document.body && currentActive !== document.documentElement))
-				? currentActive
-				: lastOutsideFocus;
-		const exitingTraps = activeTraps.filter(
-			(item) => item.node.isConnected === false || isInert(item.node)
-		);
-
-		if (activeTraps.length === 0) {
-			originalOverflow =
-				handoffOverflow ?? (typeof document !== 'undefined' ? document.body.style.overflow : '');
-			const explicitTrigger = resolveRawFocusElement(currentOptions.returnFocus);
-			const trigger = handoffFocus ?? explicitTrigger ?? previous;
-			originalFocus = trigger;
-			originalSnapshot = handoffSnapshot ?? captureTriggerSnapshot(trigger);
-			handoffFocus = null;
-			handoffOverflow = null;
-			handoffSnapshot = null;
-		}
-		restoreGeneration += 1;
-		cancelPendingRestore?.();
-
-		active = true;
-		activeTraps.push(entry);
-		for (const stale of exitingTraps) stale.deactivate(true);
-
-		if (typeof document !== 'undefined') {
-			document.body.style.overflow = 'hidden';
-		}
-		node.addEventListener('keydown', keydown);
-		node.addEventListener('outrostart', outrostart);
-
-		if (typeof MutationObserver !== 'undefined') {
-			inertObserver?.disconnect();
-			inertObserver = new MutationObserver(() => {
-				if (isInert(node)) deactivate(true);
-			});
-			inertObserver.observe(node, { attributes: true, attributeFilter: ['inert'] });
-		}
-
-		focusInitial(false);
-	}
-
-	if (currentOptions.enabled) activate();
-
-	return {
-		update(nextParam?: FocusTrapOptions | boolean) {
-			const next = resolveTrapOptions(nextParam);
-			const keyChanged = next.key !== currentOptions.key;
-			currentOptions = next;
-			if (currentOptions.enabled && !active) {
-				activate();
-			} else if (!currentOptions.enabled && active) {
-				deactivate(false);
-			} else if (currentOptions.enabled && active && keyChanged) {
-				node.scrollTop = 0;
-				focusInitial(true);
-			}
-		},
-		destroy() {
-			deactivate(true);
-		}
-	};
 }
 
 /** Keep an active control focusable via aria-disabled="true" while blocking repeat activations. */
@@ -742,8 +317,8 @@ function isMatchingActiveRow(
 		el.parentElement === container &&
 		typeof (el as HTMLElement).matches === 'function' &&
 		el.matches(selector) &&
-		!isInert(el) &&
-		isVisible(el as HTMLElement)
+		!isInertElement(el) &&
+		isVisibleElement(el as HTMLElement)
 	);
 }
 
@@ -754,7 +329,7 @@ function resolveLazyNeighborRow(snapshot: HandoffSnapshot): HTMLElement | null {
 		!rowContainer ||
 		!rowSelector ||
 		rowContainer.isConnected === false ||
-		isInert(rowContainer)
+		isInertElement(rowContainer)
 	) {
 		return null;
 	}
@@ -793,18 +368,26 @@ function resolveLazyNeighborRow(snapshot: HandoffSnapshot): HTMLElement | null {
 }
 
 function firstFocusableInSubtree(el: Element): HTMLElement | null {
-	if (isInert(el) || (el as HTMLElement).hasAttribute?.('hidden')) return null;
-	if (typeof el.matches === 'function' && el.matches(FOCUSABLE_SELECTOR) && isFocusable(el)) {
+	if (isInertElement(el) || (el as HTMLElement).hasAttribute?.('hidden')) return null;
+	if (
+		typeof el.matches === 'function' &&
+		el.matches(HANDOFF_FOCUSABLE_SELECTOR) &&
+		isFocusable(el)
+	) {
 		return el;
 	}
 	return getFocusableControls(el)[0] ?? null;
 }
 
 function lastFocusableInSubtree(el: Element): HTMLElement | null {
-	if (isInert(el) || (el as HTMLElement).hasAttribute?.('hidden')) return null;
+	if (isInertElement(el) || (el as HTMLElement).hasAttribute?.('hidden')) return null;
 	const descendants = getFocusableControls(el);
 	if (descendants.length > 0) return descendants[descendants.length - 1];
-	if (typeof el.matches === 'function' && el.matches(FOCUSABLE_SELECTOR) && isFocusable(el)) {
+	if (
+		typeof el.matches === 'function' &&
+		el.matches(HANDOFF_FOCUSABLE_SELECTOR) &&
+		isFocusable(el)
+	) {
 		return el;
 	}
 	return null;
@@ -818,7 +401,7 @@ function resolveLazyDomNeighbor(snapshot: HandoffSnapshot): HTMLElement | null {
 	let anchorIndex = 0;
 	for (let i = ancestors.length - 1; i >= 0; i--) {
 		const el = ancestors[i].el;
-		if (el.isConnected === false || isInert(el) || !isVisible(el)) {
+		if (el.isConnected === false || isInertElement(el) || !isVisibleElement(el)) {
 			anchorIndex = i;
 			break;
 		}
@@ -826,7 +409,7 @@ function resolveLazyDomNeighbor(snapshot: HandoffSnapshot): HTMLElement | null {
 
 	for (let level = anchorIndex; level < ancestors.length; level++) {
 		const link = ancestors[level];
-		if (link.parent.isConnected === false || isInert(link.parent)) continue;
+		if (link.parent.isConnected === false || isInertElement(link.parent)) continue;
 		const siblings = link.parent.children;
 		let startIdx: number;
 		if (link.el.parentElement === link.parent) {
@@ -846,7 +429,7 @@ function resolveLazyDomNeighbor(snapshot: HandoffSnapshot): HTMLElement | null {
 
 	for (let level = anchorIndex; level < ancestors.length; level++) {
 		const link = ancestors[level];
-		if (link.parent.isConnected === false || isInert(link.parent)) continue;
+		if (link.parent.isConnected === false || isInertElement(link.parent)) continue;
 		const siblings = link.parent.children;
 		let endIdx: number;
 		if (link.el.parentElement === link.parent) {
@@ -865,7 +448,7 @@ function resolveLazyDomNeighbor(snapshot: HandoffSnapshot): HTMLElement | null {
 		if (
 			link.parent !== neighborRoot &&
 			typeof link.parent.matches === 'function' &&
-			link.parent.matches(FOCUSABLE_SELECTOR) &&
+			link.parent.matches(HANDOFF_FOCUSABLE_SELECTOR) &&
 			isFocusable(link.parent)
 		) {
 			return link.parent;
@@ -883,7 +466,7 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 	let snapshot: HandoffSnapshot | null = null;
 
 	function captureSnapshot() {
-		if (node.isConnected === false || isInert(node)) return;
+		if (node.isConnected === false || isInertElement(node)) return;
 		const scope =
 			(node.closest?.('[role="dialog"], main') as HTMLElement | null) ??
 			(typeof document !== 'undefined' ? document.body : null);
@@ -939,7 +522,9 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 		const active = document.activeElement as HTMLElement | null;
 		if (!active || active === document.body || active === document.documentElement) return true;
 		if (active === node) return true;
-		if (active.isConnected === false || isInert(active) || !isVisible(active)) return true;
+		if (active.isConnected === false || isInertElement(active) || !isVisibleElement(active)) {
+			return true;
+		}
 		return false;
 	}
 
@@ -951,13 +536,16 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 			scope &&
 			typeof document !== 'undefined' &&
 			scope !== document.body &&
-			(scope.isConnected === false || isInert(scope) || !isVisible(scope))
+			(scope.isConnected === false || isInertElement(scope) || !isVisibleElement(scope))
 		) {
 			return null;
 		}
 
 		const activeWithin =
-			withinEl && withinEl.isConnected !== false && !isInert(withinEl) && isVisible(withinEl)
+			withinEl &&
+			withinEl.isConnected !== false &&
+			!isInertElement(withinEl) &&
+			isVisibleElement(withinEl)
 				? withinEl
 				: null;
 		const docRoot = typeof document !== 'undefined' ? document : null;
@@ -967,19 +555,19 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 			const neighborRow = resolveLazyNeighborRow(snapshot);
 			if (neighborRow) {
 				if (currentOptions.target) {
-					const targeted = resolveTarget(currentOptions.target, [neighborRow]);
+					const targeted = resolveHandoffOptionTarget(currentOptions.target, [neighborRow]);
 					if (targeted) return targeted;
 				}
-				const rowMatch = focusControlInItem(neighborRow, controlSelector);
+				const rowMatch = focusControlInRow(neighborRow, controlSelector);
 				if (rowMatch) return rowMatch;
 			}
-			const fallbackFromRow = resolveTarget(currentOptions.fallback, fallbackScopes);
+			const fallbackFromRow = resolveHandoffOptionTarget(currentOptions.fallback, fallbackScopes);
 			if (fallbackFromRow) return fallbackFromRow;
 		} else {
 			const targetScopes = currentOptions.within ? [activeWithin] : [scope, docRoot];
-			const primary = resolveTarget(currentOptions.target, targetScopes);
+			const primary = resolveHandoffOptionTarget(currentOptions.target, targetScopes);
 			if (primary) return primary;
-			const fallback = resolveTarget(currentOptions.fallback, fallbackScopes);
+			const fallback = resolveHandoffOptionTarget(currentOptions.fallback, fallbackScopes);
 			if (fallback) return fallback;
 		}
 
@@ -995,7 +583,8 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 
 	function recoverIfLost() {
 		if (!hadFocus) return;
-		const nodeUnavailable = node.isConnected === false || isInert(node) || !isVisible(node);
+		const nodeUnavailable =
+			node.isConnected === false || isInertElement(node) || !isVisibleElement(node);
 		if (!nodeUnavailable) return;
 		hadFocus = false;
 		if (!isFocusDropped()) return;
@@ -1016,7 +605,7 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 				(related !== document.body && related !== document.documentElement)) &&
 			related.isConnected !== false &&
 			!related.hasAttribute?.('disabled') &&
-			!isInert(related) &&
+			!isInertElement(related) &&
 			!node.contains?.(related)
 		) {
 			hadFocus = false;
@@ -1026,7 +615,8 @@ export function focusHandoff(node: HTMLElement, options: FocusHandoffOptions = {
 		// WillRemoveChild BEFORE node.isConnected becomes false; defer clearing hadFocus.
 		queueMicrotask(() => {
 			if (destroyed) return;
-			const nodeUnavailable = node.isConnected === false || isInert(node) || !isVisible(node);
+			const nodeUnavailable =
+				node.isConnected === false || isInertElement(node) || !isVisibleElement(node);
 			if (nodeUnavailable) {
 				recoverIfLost();
 				return;

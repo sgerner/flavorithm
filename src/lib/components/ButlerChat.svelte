@@ -283,11 +283,18 @@
 		class:motion-paused={paused}
 		style={viewportStyle}
 		id="butler-panel"
-		use:focusTrap={{ onEscape: close, returnFocus: () => launcher }}
+		use:focusTrap
 		role="dialog"
 		aria-modal="true"
 		tabindex="-1"
 		aria-label="Chat with Basil"
+		onkeydown={(event) => {
+			if (event.key === 'Escape') {
+				event.stopPropagation();
+				event.preventDefault();
+				close();
+			}
+		}}
 	>
 		<header>
 			<BasilAvatar {mood} size={46} active={open && !paused} />
@@ -720,8 +727,8 @@
 		font-weight: 600;
 	}
 	.destructive {
-		background: #963e38;
-		color: #fff;
+		background: var(--danger-fill);
+		color: var(--on-danger-fill);
 	}
 	.action-result {
 		display: inline-flex;

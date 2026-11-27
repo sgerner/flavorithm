@@ -146,6 +146,11 @@
 				use:focusHandoff={{ fallback: '#kitchen-content' }}
 				onclick={retry}>Retry sync</button
 			>{/if}
+		{#if (pending || conflicts.length > 0 || (ready && Boolean(error))) && !reviewOpen}
+			<button class="secondary" type="button" onclick={exportPending}
+				><Download size={16} /> Back up my changes</button
+			>
+		{/if}
 		{#if reviewOpen}
 			<div id={reviewPanelId} class="sync-review">
 				<p>

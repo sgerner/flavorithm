@@ -3,18 +3,25 @@
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { tick, untrack } from 'svelte';
 	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
+	import {
+		NUTRITION_FIELDS,
+		emptyRecipeDraftValidation,
+		fieldAria,
+		focusFirstInvalid,
+		validateRecipeDraftFields
+	} from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
 	import {
-		describeInvalidControl,
 		hasRecipeEditorChanges,
 		insertDraftItem,
+		isValidNutrition,
 		MAX_DRAFT_INGREDIENTS,
 		MAX_DRAFT_STEPS,
-		moveDraftItem,
-		openClosedImportNotes
+		moveDraftItem
 	} from '#lib/recipe-draft.ts';
 	import { ArrowDown, ArrowUp, Check, Plus, X } from '@lucide/svelte';
 	import type { Recipe } from '#lib/types.ts';
+	import FormField from './FormField.svelte';
 	let {
 		recipe,
 		mode = 'edit',
@@ -44,15 +51,24 @@
 		nutrition: { ...initialDraft.nutrition }
 	});
 	let tagsText = $state(initialTagsText);
-	let error = $state('');
+	let submitted = $state(false);
+	let uploadError = $state('');
 	let uploading = $state(false);
 	let confirmingDiscard = $state(false);
+	let nutritionOpen = $state(untrack(() => !isValidNutrition(draft.nutrition)));
 	let photoInput = $state<HTMLInputElement>();
 	let formEl = $state<HTMLFormElement>();
-	let nutritionDetails = $state<HTMLDetailsElement>();
 	let cancelButton = $state<HTMLButtonElement>();
 	let keepEditingButton = $state<HTMLButtonElement>();
-	let pendingInvalid: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement | null = null;
+	let validation = $derived(
+		submitted
+			? validateRecipeDraftFields(draft, {
+					tagsText,
+					checkImage: true,
+					coverPathPattern: COVER_PATH
+				})
+			: emptyRecipeDraftValidation()
+	);
 	function scrollAndFocus(row: HTMLElement | undefined, control: HTMLElement | null | undefined) {
 		row?.scrollIntoView({ block: 'nearest' });
 		control?.scrollIntoView({ block: 'nearest' });
@@ -152,30 +168,6 @@
 				?.focus({ preventScroll: true });
 		}
 	}
-	async function handleInvalid(event: Event) {
-		const target = event.target;
-		if (!(
-			target instanceof HTMLInputElement ||
-			target instanceof HTMLTextAreaElement ||
-			target instanceof HTMLSelectElement
-		)) {
-			return;
-		}
-		openClosedImportNotes(target);
-		if (nutritionDetails?.open) nutritionOpen = true;
-		event.preventDefault();
-		if (pendingInvalid) return;
-		pendingInvalid = target;
-		confirmingDiscard = false;
-		error = describeInvalidControl(target);
-		await tick();
-		const control = pendingInvalid;
-		pendingInvalid = null;
-		scrollAndFocus(
-			control.closest<HTMLElement>('.field, .draft-ingredient, .draft-step') ?? undefined,
-			control
-		);
-	}
 	async function requestCancel() {
 		if (
 			!hasRecipeEditorChanges(
@@ -202,7 +194,7 @@
 		if (!canUploadCover || !file || uploading) return;
 		uploading = true;
 		confirmingDiscard = false;
-		error = '';
+		uploadError = '';
 		try {
 			const body = await prepareCover(file);
 			const response = await fetch('/api/recipe-covers', {
@@ -214,37 +206,34 @@
 			if (!response.ok) throw new Error(result.error || 'Could not upload the cover photo.');
 			draft.image = result.image;
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not read that photo.';
+			uploadError = cause instanceof Error ? cause.message : 'Could not read that photo.';
 		} finally {
 			uploading = false;
 			input.value = '';
 		}
 	}
-	const nutritionFields: [keyof Recipe['nutrition'], string][] = [
-		['calories', 'Calories (kcal)'],
-		['fat', 'Fat (g)'],
-		['saturatedFat', 'Saturated fat (g)'],
-		['sodium', 'Sodium (mg)'],
-		['carbs', 'Carbohydrates (g)'],
-		['fiber', 'Fiber (g)'],
-		['sugar', 'Sugar (g)'],
-		['protein', 'Protein (g)']
-	];
-	function isNutritionValid(target: Recipe): boolean {
-		return nutritionFields.every(
-			([key]) =>
-				typeof target.nutrition[key] === 'number' &&
-				Number.isFinite(target.nutrition[key]) &&
-				target.nutrition[key] >= 0 &&
-				target.nutrition[key] <= 1000000
-		);
-	}
-	let nutritionOpen = $state(untrack(() => !isNutritionValid(draft)));
 	async function saveDraft(event: SubmitEvent) {
 		event.preventDefault();
 		if (uploading) return;
-		error = '';
+		uploadError = '';
 		confirmingDiscard = false;
+		const check = validateRecipeDraftFields(draft, {
+			tagsText,
+			checkImage: true,
+			coverPathPattern: COVER_PATH
+		});
+		if (check.hasErrors) {
+			submitted = true;
+			if (check.hasNutritionErrors) nutritionOpen = true;
+			await tick();
+			if (!focusFirstInvalid(formEl)) {
+				const addButtons = formEl?.querySelectorAll<HTMLButtonElement>('.draft-list-add');
+				if (check.ingredientsList) addButtons?.[0]?.focus({ preventScroll: true });
+				else if (check.stepsList) addButtons?.[1]?.focus({ preventScroll: true });
+			}
+			return;
+		}
+		submitted = false;
 		const title = draft.title.trim();
 		const tags = [
 			...new Set(
@@ -261,64 +250,6 @@
 		}));
 		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
 		const image = draft.image.trim();
-		if (image && !COVER_PATH.test(image)) {
-			try {
-				const url = new URL(image);
-				if (url.protocol !== 'https:' || url.username || url.password)
-					throw new Error('Invalid image');
-			} catch {
-				error = 'Use a public HTTPS image URL, or leave it blank.';
-				return;
-			}
-		}
-		const invalidNutritionIndex = nutritionFields.findIndex(
-			([key]) =>
-				typeof draft.nutrition[key] !== 'number' ||
-				!Number.isFinite(draft.nutrition[key]) ||
-				draft.nutrition[key] < 0 ||
-				draft.nutrition[key] > 1000000
-		);
-		const nutritionValid = invalidNutritionIndex === -1;
-		if (
-			!title ||
-			title.length > 200 ||
-			!Number.isInteger(draft.time) ||
-			draft.time < 1 ||
-			draft.time > 100000 ||
-			!Number.isInteger(draft.servings) ||
-			draft.servings < 1 ||
-			draft.servings > 10000 ||
-			!ingredients.length ||
-			ingredients.length > MAX_DRAFT_INGREDIENTS ||
-			ingredients.some(
-				(item) =>
-					!item.name ||
-					item.name.length > 200 ||
-					!item.unit ||
-					item.unit.length > 40 ||
-					!Number.isFinite(item.quantity) ||
-					item.quantity <= 0 ||
-					item.quantity > 1000000
-			) ||
-			!steps.length ||
-			steps.length > MAX_DRAFT_STEPS ||
-			steps.some((step) => step.length > 10000) ||
-			tags.length > 30 ||
-			tags.some((tag) => tag.length > 100) ||
-			!nutritionValid
-		) {
-			if (!nutritionValid) nutritionOpen = true;
-			error =
-				'Check the title, cooking time, servings, tags, ingredient quantities, cooking steps, and nutrition values.';
-			if (invalidNutritionIndex !== -1 && nutritionDetails) {
-				nutritionDetails.open = true;
-				await tick();
-				const input =
-					nutritionDetails.querySelectorAll<HTMLInputElement>('input')[invalidNutritionIndex];
-				scrollAndFocus(input?.closest<HTMLElement>('.field') ?? undefined, input);
-			}
-			return;
-		}
 		try {
 			save({
 				...draft,
@@ -332,7 +263,7 @@
 				steps
 			});
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not save this recipe.';
+			uploadError = cause instanceof Error ? cause.message : 'Could not save this recipe.';
 		}
 	}
 </script>
@@ -340,7 +271,7 @@
 <div class="modal-backdrop" transition:backdropMotion|global>
 	<div
 		class="flavor-dialog wide capture-dialog recipe-editor-dialog"
-		use:focusTrap={{ onEscape: cancel }}
+		use:focusTrap
 		role="dialog"
 		aria-modal="true"
 		aria-labelledby="recipe-editor-title"
@@ -354,42 +285,55 @@
 				: 'Changes are saved to your recipe collection.'}
 		</p>
 		<form
+			novalidate
 			bind:this={formEl}
 			onsubmit={saveDraft}
-			oninvalidcapture={handleInvalid}
 			oninput={() => (confirmingDiscard = false)}
 		>
 			<div class="draft-summary">
-				<label class="field draft-title"
-					>Title<input bind:value={draft.title} required maxlength="200" /></label
+				<FormField id="editor-title" class="draft-title" label="Title" error={validation.title}>
+					{#snippet children(field)}
+						<input bind:value={draft.title} maxlength="200" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="editor-time" label="Time (minutes)" error={validation.time}>
+					{#snippet children(field)}
+						<input type="number" bind:value={draft.time} min="1" max="100000" step="1" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="editor-servings" label="Servings" error={validation.servings}>
+					{#snippet children(field)}
+						<input
+							type="number"
+							bind:value={draft.servings}
+							min="1"
+							max="10000"
+							step="1"
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				<FormField id="editor-cuisine" label="Cuisine" error={validation.cuisine}>
+					{#snippet children(field)}
+						<input bind:value={draft.cuisine} maxlength="100" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="editor-difficulty" label="Difficulty" error={validation.difficulty}>
+					{#snippet children(field)}
+						<input bind:value={draft.difficulty} maxlength="80" {...field} />
+					{/snippet}
+				</FormField>
+				<FormField
+					id="editor-description"
+					class="full-field"
+					label="Description"
+					error={validation.description}
 				>
-				<label class="field"
-					>Time (minutes)<input
-						type="number"
-						bind:value={draft.time}
-						min="1"
-						max="100000"
-						step="1"
-						required
-					/></label
-				>
-				<label class="field"
-					>Servings<input
-						type="number"
-						bind:value={draft.servings}
-						min="1"
-						max="10000"
-						step="1"
-						required
-					/></label
-				>
-				<label class="field">Cuisine<input bind:value={draft.cuisine} maxlength="100" /></label>
-				<label class="field">Difficulty<input bind:value={draft.difficulty} maxlength="80" /></label
-				>
-				<label class="field full-field"
-					>Description<textarea bind:value={draft.description} maxlength="10000" rows="2"
-					></textarea></label
-				>
+					{#snippet children(field)}
+						<textarea bind:value={draft.description} maxlength="10000" rows="2" {...field}
+						></textarea>
+					{/snippet}
+				</FormField>
 				<div class="full-field cover-picker">
 					<img
 						src={draft.image || recipePlaceholder(draft)}
@@ -407,6 +351,7 @@
 						<button
 							type="button"
 							class="secondary"
+							aria-describedby="editor-cover-help"
 							use:busyAction={uploading}
 							onclick={() => {
 								if (!uploading) photoInput?.click();
@@ -427,28 +372,46 @@
 								draft.image = '';
 							}}>Remove cover</button
 						>{/if}
-					<p class="muted">
+					<p class="muted" id="editor-cover-help">
 						{canUploadCover
 							? 'JPG, PNG, or WebP up to 10 MB. Photos are resized and shared with your household.'
 							: 'Paste a public HTTPS image link below, or sign in while online to upload a cover photo.'}
 					</p>
 				</div>
-				{#if !COVER_PATH.test(draft.image)}<label class="field full-field"
-						>Image URL<input
-							bind:value={draft.image}
-							maxlength="4000"
-							type="text"
-							placeholder="https://… (optional)"
-							disabled={uploading}
-						/></label
-					>{/if}
-				<label class="field full-field"
-					>Tags<input
-						bind:value={tagsText}
-						maxlength="3029"
-						placeholder="weeknight, vegetarian"
-					/></label
+				{#if !COVER_PATH.test(draft.image)}<FormField
+						id="editor-image"
+						class="full-field"
+						label="Image URL"
+						help="Optional public HTTPS image URL."
+						error={validation.image}
+					>
+						{#snippet children(field)}
+							<input
+								bind:value={draft.image}
+								maxlength="4000"
+								type="text"
+								placeholder="https://… (optional)"
+								disabled={uploading}
+								{...field}
+							/>
+						{/snippet}
+					</FormField>{/if}
+				<FormField
+					id="editor-tags"
+					class="full-field"
+					label="Tags"
+					help="Separate tags with commas (up to 30 tags)."
+					error={validation.tags}
 				>
+					{#snippet children(field)}
+						<input
+							bind:value={tagsText}
+							maxlength="3029"
+							placeholder="weeknight, vegetarian"
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
 			</div>
 			<div class="draft-section-heading">
 				<h3>Ingredients</h3>
@@ -459,33 +422,44 @@
 					onclick={() => void addIngredient()}><Plus size={17} />Add</button
 				>
 			</div>
+			{#if validation.ingredientsList}<p class="error" id="editor-ingredients-error">
+					{validation.ingredientsList}
+				</p>{/if}
 			<div class="draft-ingredients">
-				{#each draft.ingredients as item, i}<div class="draft-ingredient">
+				{#each draft.ingredients as item, i}{@const rowError =
+						validation.ingredients[i]}{@const nameAria = fieldAria(`editor-ingredient-${i}-name`, {
+						error: rowError?.name
+					})}{@const qtyAria = fieldAria(`editor-ingredient-${i}-quantity`, {
+						error: rowError?.quantity
+					})}{@const unitAria = fieldAria(`editor-ingredient-${i}-unit`, {
+						error: rowError?.unit
+					})}
+					<div class="draft-ingredient">
 						<input
 							class="ingredient-name"
 							aria-label={`Ingredient ${i + 1}`}
 							bind:value={item.name}
-							required
 							maxlength="100"
 							placeholder="Ingredient"
+							{...nameAria.props}
 						/>
 						<input
 							class="ingredient-quantity"
 							aria-label={`Quantity for ingredient ${i + 1}`}
 							type="number"
 							bind:value={item.quantity}
-							required
 							min="0.000001"
 							max="1000000"
 							step="any"
+							{...qtyAria.props}
 						/>
 						<input
 							class="ingredient-unit"
 							aria-label={`Unit for ingredient ${i + 1}`}
 							bind:value={item.unit}
-							required
 							maxlength="40"
 							placeholder="Unit"
+							{...unitAria.props}
 						/>
 						<div class="draft-row-actions">
 							<button
@@ -516,7 +490,14 @@
 								onclick={() => void removeIngredient(i)}><X size={18} /></button
 							>
 						</div>
-					</div>{/each}
+					</div>
+					{#if rowError?.name}<p class="error draft-row-error" id={nameAria.errorId}>
+							{rowError.name}
+						</p>{/if}{#if rowError?.quantity}<p class="error draft-row-error" id={qtyAria.errorId}>
+							{rowError.quantity}
+						</p>{/if}{#if rowError?.unit}<p class="error draft-row-error" id={unitAria.errorId}>
+							{rowError.unit}
+						</p>{/if}{/each}
 			</div>
 			<button
 				class="secondary draft-list-add"
@@ -533,14 +514,19 @@
 					onclick={() => void addStep()}><Plus size={17} />Add</button
 				>
 			</div>
+			{#if validation.stepsList}<p class="error" id="editor-steps-error">
+					{validation.stepsList}
+				</p>{/if}
 			<div class="draft-steps">
-				{#each draft.steps as _, i}<div class="draft-step">
+				{#each draft.steps as _, i}{@const stepError = validation.steps[i] || ''}{@const stepAria =
+						fieldAria(`editor-step-${i}`, { error: stepError })}
+					<div class="draft-step">
 						<span>{i + 1}</span><textarea
 							aria-label={`Step ${i + 1}`}
 							bind:value={draft.steps[i]}
-							required
 							maxlength="10000"
-							rows="2"></textarea>
+							rows="2"
+							{...stepAria.props}></textarea>
 						<div class="draft-row-actions">
 							<button
 								class="icon-button"
@@ -570,7 +556,10 @@
 								onclick={() => void removeStep(i)}><X size={18} /></button
 							>
 						</div>
-					</div>{/each}
+					</div>
+					{#if stepError}<p class="error draft-row-error" id={stepAria.errorId}>
+							{stepError}
+						</p>{/if}{/each}
 			</div>
 			<button
 				class="secondary draft-list-add"
@@ -578,26 +567,35 @@
 				disabled={draft.steps.length >= MAX_DRAFT_STEPS}
 				onclick={() => void addStep()}><Plus size={17} />Add step</button
 			>
-			<details class="import-notes" bind:this={nutritionDetails} bind:open={nutritionOpen}>
+			<details class="import-notes" bind:open={nutritionOpen}>
 				<summary>Nutrition estimates</summary>
-				<p>
+				<p id="editor-nutrition-help">
 					Estimated values per serving. Ingredient or serving changes will mark these values as
 					stale.
 				</p>
 				<div class="draft-summary">
-					{#each nutritionFields as [key, label]}<label class="field"
-							>{label}<input
-								type="number"
-								min="0"
-								max="1000000"
-								step="any"
-								required
-								bind:value={draft.nutrition[key]}
-							/></label
-						>{/each}
+					{#each NUTRITION_FIELDS as [key, label]}<FormField
+							id={`editor-nutrition-${key}`}
+							{label}
+							helpIds={['editor-nutrition-help']}
+							error={validation.nutrition[key] || ''}
+						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="0"
+									max="1000000"
+									step="any"
+									bind:value={draft.nutrition[key]}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>{/each}
 				</div>
 			</details>
-			{#if error}<p class="error" role="alert">{error}</p>{/if}
+			{#if uploadError || validation.summary}<p class="error" role="alert">
+					{uploadError || validation.summary}
+				</p>{/if}
 			<div class="draft-footer" class:confirming-discard={confirmingDiscard}>
 				{#if confirmingDiscard}
 					<p class="discard-prompt" role="status">Discard unsaved changes?</p>
@@ -640,7 +638,7 @@
 		font-size: 13px;
 		margin-top: 10px;
 	}
-	.recipe-editor-dialog .full-field {
+	.recipe-editor-dialog :global(.full-field) {
 		grid-column: 1 / -1;
 	}
 	@media (max-width: 650px) {
