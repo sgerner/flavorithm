@@ -1,4 +1,4 @@
-import { parseIngredientLines } from './domain.ts';
+import { parseCalendarDate, parseIngredientLines } from './domain.ts';
 import {
 	MAX_COOKING_TIME,
 	MAX_DRAFT_INGREDIENTS,
@@ -102,12 +102,15 @@ export function focusFirstInvalid(container: ParentNode | null | undefined): HTM
 }
 
 export function validateMealDate(value: string): string {
-	const trimmed = value.trim();
-	if (!trimmed || !/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+	if (!value.trim()) {
 		return 'Choose a date for this meal.';
 	}
-	const parsed = new Date(`${trimmed}T12:00:00`);
-	if (Number.isNaN(parsed.getTime())) {
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+		return !/^\d{4}-\d{2}-\d{2}$/.test(value.trim())
+			? 'Choose a date for this meal.'
+			: 'Choose a valid calendar date.';
+	}
+	if (!parseCalendarDate(value)) {
 		return 'Choose a valid calendar date.';
 	}
 	return '';

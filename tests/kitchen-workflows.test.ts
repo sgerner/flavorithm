@@ -15,6 +15,7 @@ import {
 	clearSampleData,
 	completeMeal,
 	convertCompatibleQuantity,
+	cookPlannedMeal,
 	deleteMeal,
 	deleteRecipe,
 	deleteShoppingItem,
@@ -38,6 +39,8 @@ import {
 	retireCheckedShoppingItems,
 	revertShoppingItem,
 	saveEditedRecipe,
+	savePlannedMealChanges,
+	schedulePlannedMeal,
 	shopForScope,
 	snapshotShoppingItem,
 	transferPurchasedItemsToPantry,
@@ -976,6 +979,126 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
+});
+
+test('schedulePlannedMeal rejects missing recipes without creating orphaned meal entries', () => {
+	const existingRecipe = recipe({
+		id: 'tacos',
+		ingredients: [{ name: 'lime', quantity: 2, unit: 'each' }]
+	});
+	const initial = state({ recipes: [existingRecipe] });
+
+	const missing = schedulePlannedMeal(initial, {
+		id: 'meal-1',
+		recipeId: 'removed-recipe',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(missing.status, 'missing-recipe');
+	assert.equal(missing.state, initial);
+	assert.equal(missing.state.meals.length, 0);
+	assert.equal(missing.state.shopping.length, 0);
+
+	const scheduled = schedulePlannedMeal(initial, {
+		id: 'meal-2',
+		recipeId: 'tacos',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		servings: 100
+	});
+	assert.equal(scheduled.status, 'scheduled');
+	assert.equal(scheduled.state.meals.length, 1);
+	assert.equal(scheduled.state.meals[0].recipeId, 'tacos');
+	assert.equal(scheduled.state.meals[0].servings, 100);
+	assert.equal(scheduled.state.shopping.length, 1);
+	assert.equal(scheduled.state.shopping[0].quantity, 100);
+
+	const outOfRange = schedulePlannedMeal(initial, {
+		id: 'meal-3',
+		recipeId: 'tacos',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		servings: 10_001
+	});
+	assert.equal(outOfRange.status, 'invalid-servings');
+	assert.equal(outOfRange.state, initial);
+});
+
+test('savePlannedMealChanges and cookPlannedMeal guard concurrently completed or removed meals', () => {
+	const plannedRecipe = recipe({
+		id: 'stew',
+		servings: 2,
+		ingredients: [{ name: 'olive oil', quantity: 2, unit: 'tbsp' }]
+	});
+	const openState = state({
+		pantry: [pantry('olive oil', 1, 'cup')],
+		recipes: [plannedRecipe],
+		meals: [{ id: 'dinner', date: '2026-10-22', slot: 'Dinner', recipeId: 'stew', servings: 2 }]
+	});
+
+	const firstCook = cookPlannedMeal(
+		openState,
+		{ mealId: 'dinner', deductPantry: true, leftoverServings: 1 },
+		new Date('2026-10-22T19:00:00.000Z')
+	);
+	assert.equal(firstCook.status, 'cooked');
+	const completedSnapshot = structuredClone(firstCook.state);
+	assert.equal(completedSnapshot.meals[0].completedAt, '2026-10-22T19:00:00.000Z');
+	assert.equal(completedSnapshot.meals[0].leftoverServings, 1);
+	assert.ok(Math.abs(completedSnapshot.pantry[0].quantity - 0.875) < 0.001);
+
+	// Concurrent edit attempt on an already-cooked meal produces zero mutations:
+	const editCompleted = savePlannedMealChanges(firstCook.state, {
+		mealId: 'dinner',
+		date: '2026-10-24',
+		slot: 'Lunch',
+		servings: 6
+	});
+	assert.equal(editCompleted.status, 'completed');
+	assert.equal(editCompleted.state, firstCook.state);
+	assert.deepEqual(editCompleted.state, completedSnapshot);
+
+	// Concurrent cook attempt on an already-cooked meal produces zero mutations:
+	const recookCompleted = cookPlannedMeal(
+		firstCook.state,
+		{ mealId: 'dinner', deductPantry: true, leftoverServings: 0 },
+		new Date('2026-10-22T20:00:00.000Z')
+	);
+	assert.equal(recookCompleted.status, 'completed');
+	assert.equal(recookCompleted.state, firstCook.state);
+	assert.deepEqual(recookCompleted.state, completedSnapshot);
+
+	// Concurrent edit/cook attempt on a deleted meal produces zero mutations:
+	const deletedMealState = { ...openState, meals: [] };
+	const editMissing = savePlannedMealChanges(deletedMealState, {
+		mealId: 'dinner',
+		date: '2026-10-23',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(editMissing.status, 'missing');
+	assert.equal(editMissing.state, deletedMealState);
+
+	const cookMissing = cookPlannedMeal(deletedMealState, {
+		mealId: 'dinner',
+		deductPantry: true,
+		leftoverServings: 0
+	});
+	assert.equal(cookMissing.status, 'missing');
+	assert.equal(cookMissing.state, deletedMealState);
+
+	// Updating an open planned meal works normally and reconciles shopping:
+	const rescheduled = savePlannedMealChanges(openState, {
+		mealId: 'dinner',
+		date: '2026-10-29',
+		slot: 'Lunch',
+		servings: 4
+	});
+	assert.equal(rescheduled.status, 'updated');
+	assert.equal(rescheduled.state.meals[0].date, '2026-10-29');
+	assert.equal(rescheduled.state.meals[0].slot, 'Lunch');
+	assert.equal(rescheduled.state.meals[0].servings, 4);
 });
 
 test('editing a recipe refreshes scheduled weeks and existing recipe scopes independently while keeping manual and checked rows', () => {
@@ -1963,6 +2086,125 @@ test('filterPantryItems excludes zero-quantity rows from Expiring soon while kee
 		),
 		['spinach-depleted', 'rice-stocked']
 	);
+});
+
+test('weekStartForDate accepts strict YYYY-MM-DD strings, Dates, and undefined and returns empty string for malformed dates', () => {
+	assert.equal(weekStartForDate('2026-10-19'), '2026-10-19');
+	assert.equal(weekStartForDate('2026-10-22'), '2026-10-19');
+	assert.equal(weekStartForDate('2026-10-25'), '2026-10-19');
+	assert.equal(weekStartForDate(new Date(2026, 9, 25, 23, 30)), '2026-10-19');
+	assert.equal(weekStartForDate('2024-02-29'), '2024-02-26');
+	assert.equal(weekStartForDate(undefined), '');
+
+	for (const malformed of [
+		'',
+		'   ',
+		' 2026-10-22 ',
+		'2026-1-02',
+		'not-a-date',
+		'2026-02-29',
+		'2026-02-30',
+		'2026-13-01',
+		'2026-00-10',
+		'2026-10-00',
+		'2026-10-32',
+		'2026/10/22',
+		'2026-10-22T00:00:00Z'
+	]) {
+		assert.equal(weekStartForDate(malformed), '', `expected '' for "${malformed}"`);
+	}
+	assert.equal(weekStartForDate(new Date(Number.NaN)), '');
+});
+
+test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar dates without mutating state', () => {
+	const pasta = recipe({
+		id: 'pasta',
+		servings: 2,
+		ingredients: [{ name: 'spaghetti', quantity: 200, unit: 'g' }]
+	});
+	const initial = state({ recipes: [pasta] });
+
+	const missingRecipeAttempt = schedulePlannedMeal(initial, {
+		recipeId: 'deleted-recipe',
+		date: 'not-a-date',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(missingRecipeAttempt.status, 'missing-recipe');
+	assert.equal(missingRecipeAttempt.state, initial);
+
+	for (const badDate of [
+		'',
+		'   ',
+		' 2026-10-22 ',
+		'2026-1-02',
+		'not-a-date',
+		'2026-02-29',
+		'2026-02-30',
+		'2026-13-01',
+		'2026/10/22',
+		'2026-10-22T00:00:00Z'
+	]) {
+		const attempt = schedulePlannedMeal(initial, {
+			recipeId: 'pasta',
+			date: badDate,
+			slot: 'Dinner',
+			servings: 2
+		});
+		assert.equal(attempt.status, 'invalid-date', `expected invalid-date for "${badDate}"`);
+		assert.equal(attempt.state, initial);
+		assert.equal(attempt.state.meals.length, 0);
+		assert.equal(attempt.state.shopping.length, 0);
+	}
+
+	const invalidSlotAttempt = schedulePlannedMeal(initial, {
+		recipeId: 'pasta',
+		date: '2026-10-22',
+		slot: 'Snack',
+		servings: 2
+	});
+	assert.equal(invalidSlotAttempt.status, 'invalid-slot');
+	assert.equal(invalidSlotAttempt.state, initial);
+
+	const scheduled = schedulePlannedMeal(initial, {
+		id: 'meal-1',
+		recipeId: 'pasta',
+		date: '2026-10-22',
+		slot: 'Dinner',
+		servings: 2
+	});
+	assert.equal(scheduled.status, 'scheduled');
+	if (scheduled.status !== 'scheduled') return;
+	assert.equal(scheduled.meal.date, '2026-10-22');
+	assert.equal(scheduled.state.shopping.length, 1);
+	assert.equal(scheduled.state.shopping[0].sourceKey, 'week:2026-10-19');
+
+	for (const badDate of [
+		'',
+		'   ',
+		' 2026-10-22 ',
+		'2026-1-02',
+		'not-a-date',
+		'2026-02-29',
+		'2026-02-30',
+		'2026-13-01',
+		'2026/10/22',
+		'2026-10-22T00:00:00Z'
+	]) {
+		const editAttempt = savePlannedMealChanges(scheduled.state, {
+			mealId: 'meal-1',
+			date: badDate,
+			slot: 'Dinner',
+			servings: 4
+		});
+		assert.equal(editAttempt.status, 'invalid-date', `expected invalid-date for "${badDate}"`);
+		assert.equal(editAttempt.state, scheduled.state);
+		assert.equal(editAttempt.state.meals[0].date, '2026-10-22');
+		assert.equal(editAttempt.state.meals[0].servings, 2);
+	}
+
+	assert.equal(refreshWeekShopping(scheduled.state, '2026-02-30'), scheduled.state);
+	assert.equal(refreshWeekShopping(scheduled.state, undefined), scheduled.state);
 });
 
 test('weekStartForDate and refreshWeekShopping handle undefined and Date/string inputs safely', () => {

@@ -1,5 +1,16 @@
+<script module lang="ts">
+	import type { RecipeFieldConflict, RecipeMergeOptions } from '#lib/recipe-collection.ts';
+
+	export type RecipeEditorSaveResult =
+		| { status: 'saved' }
+		| { status: 'conflict'; conflicts: RecipeFieldConflict[] }
+		| { status: 'unsaved' | 'deleted'; conflicts?: RecipeFieldConflict[] }
+		| { status: 'error'; error: string };
+</script>
+
 <script lang="ts">
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
+	import { cloneRecipe } from '#lib/recipe-collection.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { tick, untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
@@ -24,42 +35,74 @@
 	import FormField from './FormField.svelte';
 	let {
 		recipe,
+		liveRecipe = recipe,
 		mode = 'edit',
 		canUploadCover = false,
 		cancel,
 		save
 	}: {
 		recipe: Recipe;
+		liveRecipe?: Recipe | null;
 		mode?: 'create' | 'edit';
 		canUploadCover?: boolean;
 		cancel: () => void;
-		save: (recipe: Recipe) => void;
+		save: (recipe: Recipe, options?: RecipeMergeOptions) => RecipeEditorSaveResult | void;
 	} = $props();
-	const initialDraft = untrack(() => ({
-		...recipe,
-		tags: [...recipe.tags],
-		ingredients: recipe.ingredients.map((item) => ({ ...item })),
-		steps: [...recipe.steps],
-		nutrition: { ...recipe.nutrition }
-	}));
+	const initialDraft = untrack(() => cloneRecipe(recipe));
 	const initialTagsText = initialDraft.tags.join(', ');
-	let draft = $state<Recipe>({
-		...initialDraft,
-		tags: [...initialDraft.tags],
-		ingredients: initialDraft.ingredients.map((item) => ({ ...item })),
-		steps: [...initialDraft.steps],
-		nutrition: { ...initialDraft.nutrition }
-	});
+	let draft = $state<Recipe>(cloneRecipe(initialDraft));
 	let tagsText = $state(initialTagsText);
 	let submitted = $state(false);
 	let uploadError = $state('');
+	let conflicts = $state<RecipeFieldConflict[]>([]);
+	let promptedRemoval = $state<'unsaved' | 'deleted' | null>(null);
+	let remoteRemoval = $derived(
+		mode === 'edit'
+			? !liveRecipe
+				? 'deleted'
+				: initialDraft.saved && !liveRecipe.saved
+					? 'unsaved'
+					: null
+			: null
+	);
+	let activeRemoval = $derived(mode === 'edit' ? (remoteRemoval ?? promptedRemoval) : null);
 	let uploading = $state(false);
 	let confirmingDiscard = $state(false);
 	let nutritionOpen = $state(untrack(() => !isValidNutrition(draft.nutrition)));
 	let photoInput = $state<HTMLInputElement>();
+	let alertBox = $state<HTMLElement>();
+	let errorBox = $state<HTMLElement>();
 	let formEl = $state<HTMLFormElement>();
 	let cancelButton = $state<HTMLButtonElement>();
 	let keepEditingButton = $state<HTMLButtonElement>();
+	$effect(() => {
+		if (
+			!remoteRemoval &&
+			promptedRemoval &&
+			liveRecipe &&
+			(!initialDraft.saved || liveRecipe.saved)
+		) {
+			promptedRemoval = null;
+		}
+	});
+	function summarizeValue(value: unknown): string {
+		if (value === undefined || value === null || value === '') return 'None';
+		if (Array.isArray(value)) {
+			if (!value.length) return 'None';
+			const text = value
+				.map((entry) => {
+					if (entry && typeof entry === 'object' && 'name' in entry) {
+						const item = entry as { name: string; quantity: number; unit: string };
+						return `${item.quantity} ${item.unit} ${item.name}`;
+					}
+					return String(entry);
+				})
+				.join('; ');
+			return text.length > 180 ? `${text.slice(0, 180)}…` : text;
+		}
+		const text = String(value);
+		return text.length > 180 ? `${text.slice(0, 180)}…` : text;
+	}
 	let validation = $derived(
 		submitted
 			? validateRecipeDraftFields(draft, {
@@ -212,8 +255,7 @@
 			input.value = '';
 		}
 	}
-	async function saveDraft(event: SubmitEvent) {
-		event.preventDefault();
+	async function submitDraft(options?: RecipeMergeOptions) {
 		if (uploading) return;
 		uploadError = '';
 		confirmingDiscard = false;
@@ -250,21 +292,52 @@
 		}));
 		const steps = draft.steps.map((step) => step.trim()).filter(Boolean);
 		const image = draft.image.trim();
+		const validated = cloneRecipe({
+			...draft,
+			title,
+			description: draft.description.trim().slice(0, 10000),
+			image,
+			cuisine: draft.cuisine.trim().slice(0, 100),
+			difficulty: draft.difficulty.trim().slice(0, 80),
+			tags,
+			ingredients,
+			steps
+		});
 		try {
-			save({
-				...draft,
-				title,
-				description: draft.description.trim().slice(0, 10000),
-				image,
-				cuisine: draft.cuisine.trim().slice(0, 100),
-				difficulty: draft.difficulty.trim().slice(0, 80),
-				tags,
-				ingredients,
-				steps
-			});
+			const result = save(validated, options);
+			if (!result || result.status === 'saved') {
+				conflicts = [];
+				promptedRemoval = null;
+				uploadError = '';
+				return;
+			}
+			if (result.status === 'error') {
+				uploadError = result.error;
+				await tick();
+				errorBox?.scrollIntoView({ block: 'nearest' });
+				return;
+			}
+			if (result.status === 'unsaved' || result.status === 'deleted') {
+				promptedRemoval = result.status;
+				conflicts = result.conflicts ? [...result.conflicts] : [];
+				await tick();
+				alertBox?.scrollIntoView({ block: 'nearest' });
+				return;
+			}
+			if (result.status === 'conflict') {
+				conflicts = [...result.conflicts];
+				await tick();
+				alertBox?.scrollIntoView({ block: 'nearest' });
+			}
 		} catch (cause) {
 			uploadError = cause instanceof Error ? cause.message : 'Could not save this recipe.';
+			await tick();
+			errorBox?.scrollIntoView({ block: 'nearest' });
 		}
+	}
+	function saveDraft(event: SubmitEvent) {
+		event.preventDefault();
+		void submitDraft();
 	}
 </script>
 
@@ -286,6 +359,69 @@
 				? 'Add a personal recipe to your collection.'
 				: 'Changes are saved to your recipe collection.'}
 		</p>
+		{#if conflicts.length}
+			<section class="editor-alert" role="alert" bind:this={alertBox}>
+				<strong>Competing household edits need your choice</strong>
+				<p>
+					A household member updated the same fields while you were editing. Independent edits on
+					other fields will be preserved either way.
+				</p>
+				<ul>
+					{#each conflicts as conflict (conflict.field)}
+						<li>
+							<b>{conflict.label}</b>
+							<div>Your draft: {summarizeValue(conflict.draft)}</div>
+							<div>Household: {summarizeValue(conflict.household)}</div>
+						</li>
+					{/each}
+				</ul>
+				<div class="editor-alert-actions">
+					<button
+						class="secondary"
+						type="button"
+						disabled={uploading}
+						onclick={() =>
+							void submitDraft({
+								prefer: 'household',
+								...(activeRemoval ? { resave: true } : {})
+							})}>Use household values</button
+					>
+					<button
+						class="primary"
+						type="button"
+						disabled={uploading}
+						onclick={() =>
+							void submitDraft({
+								prefer: 'draft',
+								...(activeRemoval ? { resave: true } : {})
+							})}><Check size={18} />Keep my draft</button
+					>
+				</div>
+			</section>
+		{:else if activeRemoval}
+			<section class="editor-alert" role="alert" bind:this={alertBox}>
+				<strong
+					>{activeRemoval === 'deleted'
+						? 'A household member deleted this recipe'
+						: 'A household member unsaved this recipe'}</strong
+				>
+				<p>
+					{activeRemoval === 'deleted'
+						? 'This recipe was removed from your household while you were editing. Your draft and cover photo are still here — re-save to keep it, or discard your draft.'
+						: 'This recipe was removed from your saved collection while you were editing. Your draft and cover photo are still here — re-save to keep it, or discard your draft.'}
+				</p>
+				<div class="editor-alert-actions">
+					<button class="secondary" type="button" onclick={cancel}>Discard draft</button>
+					<button
+						class="primary"
+						type="button"
+						disabled={uploading}
+						onclick={() => void submitDraft({ resave: true })}
+						><Check size={18} />Re-save recipe</button
+					>
+				</div>
+			</section>
+		{/if}
 		<form
 			novalidate
 			bind:this={formEl}
@@ -588,7 +724,7 @@
 						</FormField>{/each}
 				</div>
 			</details>
-			{#if uploadError || validation.summary}<p class="error" role="alert">
+			{#if uploadError || validation.summary}<p class="error" role="alert" bind:this={errorBox}>
 					{uploadError || validation.summary}
 				</p>{/if}
 			<div class="draft-footer" class:confirming-discard={confirmingDiscard}>
@@ -622,6 +758,44 @@
 </div>
 
 <style>
+	.editor-alert {
+		padding: 14px 16px;
+		margin: 0 0 18px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		border-left: 3px solid var(--green);
+		font-size: 14px;
+	}
+	.editor-alert strong {
+		display: block;
+		font-size: 15px;
+		margin-bottom: 4px;
+	}
+	.editor-alert p {
+		color: var(--muted);
+		font-size: 14px;
+		line-height: 1.6;
+	}
+	.editor-alert ul {
+		margin: 10px 0 0;
+		padding-inline-start: 18px;
+		max-height: 14rem;
+		overflow: auto;
+	}
+	.editor-alert li {
+		padding-block: 4px;
+		overflow-wrap: anywhere;
+	}
+	.editor-alert-actions {
+		display: flex;
+		flex-wrap: wrap;
+		justify-content: flex-end;
+		gap: 8px;
+		margin-top: 12px;
+	}
+	.editor-alert-actions button {
+		min-height: 44px;
+	}
 	.cover-picker img {
 		width: 100%;
 		height: 180px;
@@ -639,6 +813,9 @@
 	@media (max-width: 650px) {
 		.recipe-editor-dialog {
 			padding: 28px 16px 20px;
+		}
+		.editor-alert-actions button {
+			width: 100%;
 		}
 	}
 </style>

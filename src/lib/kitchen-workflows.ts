@@ -9,7 +9,7 @@ import {
 	unitInfo,
 	type UnitInfo
 } from './domain.ts';
-import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
+import { isValidServings, MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 import { hasZeroNutrition } from './recipe-collection.ts';
 import { seedPantry, seedRecipes } from './data.ts';
 export {
@@ -307,27 +307,15 @@ export function revertShoppingItem(
 }
 
 const MAX_SHOPPING_ITEMS = 1_000;
+const DATE_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function parseCalendarKey(value: string): { year: number; month: number; day: number } | undefined {
-	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
-	if (!match) return undefined;
-	const year = Number(match[1]);
-	const month = Number(match[2]) - 1;
-	const day = Number(match[3]);
-	const parsed = new Date(0);
-	parsed.setUTCFullYear(year, month, day);
-	parsed.setUTCHours(0, 0, 0, 0);
-	if (
-		parsed.getUTCFullYear() !== year ||
-		parsed.getUTCMonth() !== month ||
-		parsed.getUTCDate() !== day
-	)
-		return undefined;
-	return { year, month, day };
+	if (!DATE_KEY_RE.test(value)) return undefined;
+	return parseCalendarDate(value);
 }
 
 function formatCalendarKey(date: { year: number; month: number; day: number }): string {
-	return `${date.year}-${String(date.month + 1).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`;
+	return `${String(date.year).padStart(4, '0')}-${String(date.month + 1).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`;
 }
 
 function mondayKeyForParts(parts: { year: number; month: number; day: number }): string {
@@ -342,12 +330,12 @@ function mondayKeyForParts(parts: { year: number; month: number; day: number }):
 	});
 }
 
-/** Return the Monday YYYY-MM-DD calendar key for a local date string or Date instance. */
+/** Return the Monday YYYY-MM-DD calendar key for a strict YYYY-MM-DD string or Date, or '' if invalid. */
 export function weekStartForDate(value: string | Date | undefined): string {
 	if (!value) return '';
 	if (typeof value === 'string') {
 		const parsed = parseCalendarKey(value);
-		if (!parsed) return value;
+		if (!parsed) return '';
 		return mondayKeyForParts(parsed);
 	}
 	const parts = calendarDate(value);
@@ -990,6 +978,37 @@ const NUTRITION_KEYS: (keyof Recipe['nutrition'])[] = [
 ];
 
 /**
+ * Sync personal recipe rating preferences and refresh any scheduled weekly or existing
+ * single-recipe shopping scopes affected by saving `updated` into `recipes`.
+ */
+export function reconcileSavedRecipe(
+	state: AppState,
+	recipes: Recipe[],
+	updated: Recipe,
+	now: Date = new Date()
+): AppState {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const preferences =
+		updated.rating !== undefined
+			? {
+					...state.preferences,
+					ratings: {
+						...state.preferences.ratings,
+						[updated.id]: updated.rating
+					}
+				}
+			: state.preferences;
+
+	let next: AppState = { ...state, recipes, preferences };
+	const plannedMealDates = next.meals
+		.filter((meal) => !meal.completedAt && meal.recipeId === updated.id)
+		.map((meal) => meal.date);
+	next = refreshWeeks(next, affectedWeekStarts(next.shopping, plannedMealDates), safeNow);
+	next = refreshRecipeShopping(next, updated.id, safeNow);
+	return next;
+}
+
+/**
  * Insert or update a recipe, track provenance, nutrition staleness, and ratings, and refresh
  * affected weekly and existing single-recipe shopping scopes.
  */
@@ -1018,24 +1037,7 @@ export function upsertRecipe(state: AppState, recipe: Recipe, now: Date = new Da
 	const recipes = previous
 		? state.recipes.map((item) => (item.id === updated.id ? updated : item))
 		: [...state.recipes, updated];
-	const preferences =
-		updated.rating !== undefined
-			? {
-					...state.preferences,
-					ratings: {
-						...state.preferences.ratings,
-						[updated.id]: updated.rating
-					}
-				}
-			: state.preferences;
-
-	let next: AppState = { ...state, recipes, preferences };
-	const plannedMealDates = next.meals
-		.filter((meal) => !meal.completedAt && meal.recipeId === updated.id)
-		.map((meal) => meal.date);
-	next = refreshWeeks(next, affectedWeekStarts(next.shopping, plannedMealDates), safeNow);
-	next = refreshRecipeShopping(next, updated.id, safeNow);
-	return next;
+	return reconcileSavedRecipe(state, recipes, updated, safeNow);
 }
 
 /** Save an edited recipe (whether previously saved or unsaved) into the recipe collection. */
@@ -1179,6 +1181,126 @@ export function completeMeal(
 	}
 
 	return refreshWeeks({ ...state, meals, pantry, shopping }, weeksToRefresh, safeNow);
+}
+
+export function schedulePlannedMeal(
+	state: AppState,
+	input: {
+		id?: string;
+		recipeId: string | null | undefined;
+		date: string;
+		slot: string;
+		servings: number;
+	},
+	now: Date = new Date()
+):
+	| { status: 'scheduled'; state: AppState; meal: Meal }
+	| { status: 'missing-recipe'; state: AppState }
+	| { status: 'invalid-date'; state: AppState }
+	| { status: 'invalid-slot'; state: AppState }
+	| { status: 'invalid-servings'; state: AppState } {
+	const recipe = input.recipeId
+		? state.recipes.find((item) => item.id === input.recipeId)
+		: undefined;
+	if (!recipe) return { status: 'missing-recipe', state };
+	const date = typeof input.date === 'string' ? input.date : '';
+	const weekStart = weekStartForDate(date);
+	if (!weekStart) {
+		return { status: 'invalid-date', state };
+	}
+	if (!['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
+		return { status: 'invalid-slot', state };
+	}
+	if (!isValidServings(input.servings)) {
+		return { status: 'invalid-servings', state };
+	}
+	const meal: Meal = {
+		id: input.id ?? globalThis.crypto.randomUUID(),
+		date,
+		slot: input.slot,
+		recipeId: recipe.id,
+		servings: input.servings
+	};
+	return { status: 'scheduled', state: upsertMeal(state, meal, now), meal };
+}
+
+export function savePlannedMealChanges(
+	state: AppState,
+	input: {
+		mealId: string;
+		date: string;
+		slot: string;
+		servings: number;
+	},
+	now: Date = new Date()
+):
+	| { status: 'updated'; state: AppState }
+	| { status: 'missing'; state: AppState }
+	| { status: 'completed'; state: AppState }
+	| { status: 'invalid-date'; state: AppState }
+	| { status: 'invalid-slot'; state: AppState }
+	| { status: 'invalid-servings'; state: AppState } {
+	const meal = state.meals.find((item) => item.id === input.mealId);
+	if (!meal) return { status: 'missing', state };
+	if (meal.completedAt) return { status: 'completed', state };
+	const date = typeof input.date === 'string' ? input.date : '';
+	const nextWeek = weekStartForDate(date);
+	if (!nextWeek) {
+		return { status: 'invalid-date', state };
+	}
+	if (!['Breakfast', 'Lunch', 'Dinner'].includes(input.slot)) {
+		return { status: 'invalid-slot', state };
+	}
+	if (!isValidServings(input.servings)) {
+		return { status: 'invalid-servings', state };
+	}
+	const nextState = upsertMeal(
+		state,
+		{
+			...meal,
+			date,
+			slot: input.slot,
+			servings: Math.round(input.servings)
+		},
+		now
+	);
+	return { status: 'updated', state: nextState };
+}
+
+export function cookPlannedMeal(
+	state: AppState,
+	input: {
+		mealId: string;
+		deductPantry: boolean;
+		leftoverServings: number;
+	},
+	now: Date = new Date()
+):
+	| { status: 'cooked'; state: AppState; meal: Meal; recipe: Recipe | undefined }
+	| { status: 'missing'; state: AppState }
+	| { status: 'completed'; state: AppState }
+	| { status: 'invalid-leftovers'; state: AppState; meal: Meal } {
+	const meal = state.meals.find((item) => item.id === input.mealId);
+	if (!meal) return { status: 'missing', state };
+	if (meal.completedAt) return { status: 'completed', state };
+	if (
+		!Number.isInteger(input.leftoverServings) ||
+		input.leftoverServings < 0 ||
+		input.leftoverServings > meal.servings
+	) {
+		return { status: 'invalid-leftovers', state, meal };
+	}
+	const completed = completeMeal(
+		state,
+		meal.id,
+		{
+			deductPantry: input.deductPantry,
+			leftoverServings: Math.round(input.leftoverServings)
+		},
+		now
+	);
+	const recipe = completed.recipes.find((item) => item.id === meal.recipeId);
+	return { status: 'cooked', state: completed, meal, recipe };
 }
 
 const seedPantryById = new Map(seedPantry.map((item) => [item.id, item]));

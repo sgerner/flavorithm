@@ -84,6 +84,8 @@ function injectPlannerHook(svelteSource: string): string {
 		choosePickedRecipe,
 		openCookDialog,
 		markMealCooked,
+		planRecipe,
+		addMeal,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
 		saveMealChanges,
@@ -101,6 +103,12 @@ function injectPlannerHook(svelteSource: string): string {
 		logout,
 		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
+		openRecipeEditor,
+		editSavedRecipe: openRecipeEditor,
+		saveEditedRecipe,
+		clearEditingBaseline: () => {
+			editingRecipeBase = null;
+		},
 		exportKitchen,
 		exportPendingChanges,
 		startPantryEdit,
@@ -186,15 +194,24 @@ type PlannerHarnessApi = {
 	choosePickedRecipe: (recipe: Recipe) => void;
 	openCookDialog: (meal: Meal) => void;
 	markMealCooked: (event?: SubmitEvent) => Promise<void>;
+	planRecipe: (recipe: Recipe, servings?: number) => void;
+	addMeal: (event?: SubmitEvent) => Promise<void>;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
-	saveMealChanges: () => void;
+	saveMealChanges: (event?: SubmitEvent) => Promise<void>;
 	setPlannedDraft: (date: string, slot: string, servings: number) => void;
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
 	logout: () => Promise<void>;
 	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	openRecipeEditor: (recipe: Recipe) => void;
+	editSavedRecipe: (recipe: Recipe) => void;
+	saveEditedRecipe: (
+		updated: Recipe,
+		options?: recipeCollectionMod.RecipeMergeOptions
+	) => { status: string; error?: string };
+	clearEditingBaseline: () => void;
 	exportKitchen: () => Promise<void>;
 	exportPendingChanges: () => void;
 	startPantryEdit: (item: AppState['pantry'][number]) => Promise<void>;
@@ -1094,6 +1111,150 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('saveEditedRecipe refuses to downgrade to a 2-way merge when editingRecipeBase is null', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const saved = { ...makeRecipe('r-editor', 'Original Title'), saved: true };
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [saved] };
+
+		api.editSavedRecipe(saved);
+		api.clearEditingBaseline();
+
+		const draft = { ...saved, title: 'Edited Title' };
+		const result = api.saveEditedRecipe(draft);
+		assert.equal(result.status, 'error');
+		assert.match(result.error ?? '', /original recipe baseline/i);
+		assert.equal(api.kitchen.recipes[0].title, 'Original Title');
+
+		// Unsaved recipes opened via openRecipeEditor save cleanly and refresh scheduled weekly shopping:
+		const unsaved = {
+			...makeRecipe('r-unsaved', 'Draft Stew'),
+			saved: false,
+			servings: 2,
+			ingredients: [{ name: 'carrot', quantity: 2, unit: 'each' }]
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [unsaved],
+			meals: [
+				{
+					id: 'm-unsaved',
+					date: '2026-11-24',
+					slot: 'Dinner',
+					recipeId: unsaved.id,
+					servings: 2
+				}
+			]
+		};
+		api.openRecipeEditor(unsaved);
+		const savedResult = api.saveEditedRecipe({
+			...unsaved,
+			title: 'Saved Stew',
+			ingredients: [{ name: 'carrot', quantity: 5, unit: 'each' }]
+		});
+		assert.equal(savedResult.status, 'saved');
+		assert.equal(api.kitchen.recipes[0].saved, true);
+		assert.equal(api.kitchen.recipes[0].title, 'Saved Stew');
+		assert.equal(
+			api.kitchen.shopping.find((item) => item.sourceKey === 'week:2026-11-23')?.quantity,
+			5
+		);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('markMealCooked leaves pantry untouched by default and ignores meals completed concurrently', async () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = {
+			...makeRecipe('r-pantry-guard', 'Garlic Pasta'),
+			servings: 2,
+			ingredients: [{ name: 'spaghetti', quantity: 200, unit: 'g' }]
+		};
+		const meal: Meal = {
+			id: 'meal-guard',
+			date: '2026-11-23',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: 2
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			pantry: [
+				{ id: 'p-spaghetti', name: 'spaghetti', quantity: 500, unit: 'g', category: 'Grains' }
+			],
+			recipes: [recipe],
+			meals: [meal]
+		};
+
+		api.openCookDialog(meal);
+		assert.equal(api.deductPantry, false);
+		await api.markMealCooked();
+
+		assert.ok(api.kitchen.meals[0].completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 500);
+
+		// Simulate opening the dialog before a peer household member completes the meal with leftovers:
+		const secondMeal: Meal = {
+			id: 'meal-concurrent',
+			date: '2026-11-24',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: 2
+		};
+		api.kitchen = {
+			...api.kitchen,
+			meals: [secondMeal]
+		};
+		api.openCookDialog(secondMeal);
+		const peerCompletedAt = '2026-11-24T18:00:00.000Z';
+		api.kitchen = {
+			...api.kitchen,
+			pantry: [
+				{ id: 'p-spaghetti', name: 'spaghetti', quantity: 300, unit: 'g', category: 'Grains' }
+			],
+			meals: [{ ...secondMeal, completedAt: peerCompletedAt, leftoverServings: 1 }]
+		};
+
+		await api.markMealCooked();
+		assert.equal(api.kitchen.meals[0].completedAt, peerCompletedAt);
+		assert.equal(api.kitchen.meals[0].leftoverServings, 1);
+		assert.equal(api.kitchen.pantry[0].quantity, 300);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('addMeal and saveMealChanges reject malformed calendar dates in the planner shell', async () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-strict-date', 'Roasted Carrots');
+		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [] };
+
+		api.planRecipe(recipe, 2);
+		api.setPlannedDraft('2026-02-30', 'Dinner', 2);
+		await api.addMeal();
+		assert.equal(api.kitchen.meals.length, 0);
+		assert.equal(api.kitchen.shopping.length, 0);
+
+		api.setPlannedDraft('2026-11-24', 'Dinner', 2);
+		await api.addMeal();
+		assert.equal(api.kitchen.meals.length, 1);
+
+		api.editPlannedMeal(api.kitchen.meals[0]);
+		api.setPlannedDraft(' 2026-11-25 ', 'Dinner', 4);
+		await api.saveMealChanges();
+		assert.equal(api.kitchen.meals[0].date, '2026-11-24');
+		assert.equal(api.kitchen.meals[0].servings, 2);
+	} finally {
+		harness.dispose();
+	}
 });
 
 test('+page.svelte exportKitchen commits inline edits, merges account state, and distinguishes 401 expiry and offline modes', async () => {

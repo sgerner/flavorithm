@@ -413,6 +413,21 @@ test('signup migration sanitizes guest state for immediate sync and retains jour
 	);
 });
 
+test('sanitizeKitchenState preserves manual recipe provenance alongside web-import and ai-generated', () => {
+	const state = structuredClone(createInitialState()) as AppState;
+	state.recipes = [
+		{ ...state.recipes[0], id: 'manual-1', provenance: 'manual', saved: true },
+		{ ...state.recipes[0], id: 'web-1', provenance: 'web-import', saved: true },
+		{ ...state.recipes[0], id: 'ai-1', provenance: 'ai-generated', saved: true }
+	];
+	const sanitized = sanitizeKitchenState(state);
+	assert.deepEqual(
+		sanitized.recipes.map((recipe) => recipe.provenance),
+		['manual', 'web-import', 'ai-generated']
+	);
+	assert.ok(validateAppState(sanitized));
+});
+
 test('signup preparation sanitizes guest state while preserving sample flags for selective cleanup', async () => {
 	const guest = createInitialState();
 	guest.pantry = guest.pantry.map((item) =>

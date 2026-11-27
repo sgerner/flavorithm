@@ -394,7 +394,7 @@ function injectContinuationHook(svelteSource: string): string {
 		get resumeDialog() { return resumeDialog; },
 		set resumeDialog(value: ResumeDialog) { resumeDialog = value; },
 		get selected() { return selected; },
-		set selected(value: Recipe | null) { selected = value; },
+		set selected(value: Recipe | null) { selectedId = value?.id ?? null; },
 		get selectedMealServings() { return selectedMealServings; },
 		set selectedMealServings(value: number | undefined) { selectedMealServings = value; },
 		get selectedDetailTab() { return selectedDetailTab; },
