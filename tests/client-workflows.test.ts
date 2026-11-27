@@ -493,6 +493,48 @@ test('reconnectKitchen performs 1 /api/state read whether household identity cha
 	assert.equal(serverState2.pantry[0]?.name, 'Bread flour');
 });
 
+test('reconcileChatGPTPreferences clears stale host-chatgpt model while preserving personal reasoning and runConcurrentModelCatalog awaits async onResult', async () => {
+	const preferences: Preferences = {
+		...defaultPreferences,
+		provider: 'chatgpt',
+		chatgptAccountId: 'host-chatgpt',
+		model: 'codex-shared-model',
+		reasoning: { effort: 'high' }
+	};
+	reconcileChatGPTPreferences(preferences, {
+		host: null,
+		accounts: [{ id: 'personal-1', connected: true, planEnabled: true }]
+	});
+	assert.equal(preferences.chatgptAccountId, 'personal-1');
+	assert.equal(preferences.model, '');
+	assert.deepEqual(preferences.reasoning, { effort: 'high' });
+
+	let reportedAccountId: string | null = null;
+	let asyncCompleted = false;
+	await runConcurrentModelCatalog({
+		isCurrent: () => true,
+		getEntitledAccountId: () =>
+			entitledChatGPTAccountId(preferences, [
+				{ id: 'personal-1', connected: true, planEnabled: true }
+			]),
+		fetchPublicCatalog: async () => ({ providers: [] }),
+		fetchAccountCatalog: async () => {
+			throw Object.assign(new Error('Host AI is currently unavailable.'), {
+				status: 503,
+				code: 'host_ai_unavailable'
+			});
+		},
+		onResult: async ({ account, queriedAccountId }) => {
+			assert.equal(account.status, 'rejected');
+			reportedAccountId = queriedAccountId;
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			asyncCompleted = true;
+		}
+	});
+	assert.equal(reportedAccountId, 'personal-1');
+	assert.equal(asyncCompleted, true);
+});
+
 test('runSampleCleanupWorkflow clears sample records in place, restores via Undo, and guards post-cleanup edits', () => {
 	const storage = memoryStorage();
 	let kitchen = createInitialState();
