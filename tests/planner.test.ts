@@ -9,6 +9,7 @@ import { render } from 'svelte/server';
 import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
+import * as aiContinuationMod from '../src/lib/ai-continuation.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
@@ -234,6 +235,7 @@ function createModuleMap() {
 			motionDuration: () => 0,
 			prefersReducedMotion: () => true
 		},
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,

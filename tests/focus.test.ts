@@ -9,6 +9,7 @@ import * as svelteAnimate from 'svelte/animate';
 import { compile } from 'svelte/compiler';
 import ts from 'typescript';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
+import * as aiContinuationMod from '../src/lib/ai-continuation.ts';
 import * as butlerActionsMod from '../src/lib/butler-actions.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as butlerMod from '../src/lib/butler.ts';
@@ -813,6 +814,7 @@ test('compiled ButlerChat.svelte restores launcher focus across close/toggle and
 		'@lucide/svelte': iconProxy,
 		'./BasilAvatar.svelte': { default: noop },
 		'./ChatMarkdown.svelte': { default: noop },
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/butler-actions.ts': butlerActionsMod,
 		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/focus.ts': focusMod
@@ -1002,6 +1004,7 @@ test('compiled +page.svelte handleWindowKeydown always clears mobileNav on Escap
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
@@ -1131,21 +1134,24 @@ test('compiled +page.svelte handleWindowKeydown always clears mobileNav on Escap
 		assert.equal(api.mobileNav, false);
 		assert.equal(api.modal, '');
 
-		// 3. Window Escape with editingRecipe + modal + mobileNav clears editingRecipe first AND clears mobileNav without closing underlying modal.
+		// 3. Window Escape with modal layered over editingRecipe + mobileNav clears modal and mobileNav first without clearing underlying editingRecipe; next Escape clears editingRecipe.
 		api.mobileNav = true;
-		api.modal = 'import';
+		api.modal = 'settings';
 		api.editingRecipe = structuredClone(sampleRecipe);
 		api.editingRecipeMode = 'create';
 		pressEscape();
 		await flushMicrotasks();
 		assert.equal(api.mobileNav, false);
-		assert.equal(api.editingRecipe, null);
-		assert.equal(api.editingRecipeMode, 'edit');
-		assert.equal(api.modal, 'import');
+		assert.equal(api.modal, '');
+		assert.equal(api.editingRecipe?.id, sampleRecipe.id);
+		assert.equal(api.editingRecipeMode, 'create');
 
+		api.mobileNav = true;
 		pressEscape();
 		await flushMicrotasks();
-		assert.equal(api.modal, '');
+		assert.equal(api.mobileNav, false);
+		assert.equal(api.editingRecipe, null);
+		assert.equal(api.editingRecipeMode, 'edit');
 
 		// 4. Window Escape with selected + mobileNav clears both and resets selectedMealServings.
 		api.mobileNav = true;
