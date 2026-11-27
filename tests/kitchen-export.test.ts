@@ -801,3 +801,45 @@ test('server GET /api/export enforces HTTP 401 for guests and returns confirmed 
 	assert.equal(body.user.id, registered.user.id);
 	assert.equal(Array.isArray(body.state.recipes), true);
 });
+
+test('exportKitchenArchive and SyncStatus preserve quarantined journal entries in backups', async () => {
+	const user: User = {
+		id: 'quarantine-cook',
+		name: 'Quarantine Cook',
+		email: 'quarantine@example.test',
+		householdId: 'quarantine-home'
+	};
+	const storage = memoryStorage();
+	storage.setItem(
+		`flavorithm-pending-journal:v1:${user.id}:${user.householdId}:corrupt-slot`,
+		'{"broken":true'
+	);
+
+	const kitchen = createNewUserState();
+	const offlineBackup = await exportKitchenArchive({
+		user,
+		state: kitchen,
+		online: false,
+		storage,
+		now: fixedNow
+	});
+	const parsed = JSON.parse(offlineBackup.json) as {
+		source: string;
+		quarantined?: Array<{ slot: string; raw: string }>;
+	};
+	assert.equal(parsed.source, 'offline');
+	assert.equal(parsed.quarantined?.length, 1);
+	assert.equal(parsed.quarantined?.[0]?.slot, 'corrupt-slot');
+	assert.equal(parsed.quarantined?.[0]?.raw, '{"broken":true');
+
+	const quarantinedUnloadedHtml = renderSyncStatusHtml({
+		kitchen,
+		online: false,
+		ready: false,
+		pending: false,
+		syncing: false,
+		conflicts: [],
+		error: 'A saved offline journal entry could not be read safely and was quarantined.'
+	});
+	assert.match(quarantinedUnloadedHtml, /Back up my changes/);
+});

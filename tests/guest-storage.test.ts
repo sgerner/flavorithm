@@ -726,7 +726,32 @@ test('extracted session-expiry decision helpers distinguish session_expired 401s
 			status: 409,
 			managedAuth: false,
 			user,
-			data: { error: 'Connect a ChatGPT account before using your plan.', code: 'provider_auth' }
+			data: {
+				error: 'Reconnect this ChatGPT account to continue.',
+				code: 'chatgpt_reauth_required'
+			}
+		}),
+		false
+	);
+	assert.equal(
+		isLocalSessionExpiredResponse({
+			status: 409,
+			managedAuth: false,
+			user,
+			data: { error: 'Invalid API key.', code: 'provider_auth' }
+		}),
+		false
+	);
+	assert.equal(
+		isLocalSessionExpiredResponse({
+			status: 503,
+			managedAuth: false,
+			user,
+			data: {
+				error:
+					'Host AI is currently unavailable. Choose another connection in Settings or contact the host administrator.',
+				code: 'host_ai_unavailable'
+			}
 		}),
 		false
 	);

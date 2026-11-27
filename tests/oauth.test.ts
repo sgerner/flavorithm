@@ -31,10 +31,13 @@ type CodeData = {
 const codeData = new Map<string, CodeData>();
 let nextClientNumber = 1;
 let refreshCount = 0;
+let refreshPostAttempts = 0;
 let revocationAttempts = 0;
 let revocationFails = false;
 const revokedTokens: string[] = [];
 let refreshErrorCode: string | null = null;
+let refreshHttpStatus = 400;
+let refreshCustomResponse: (() => Response | Promise<Response>) | null = null;
 const refreshTokensSeen: string[] = [];
 let refreshGate: Promise<void> | null = null;
 let refreshStarted: (() => void) | null = null;
@@ -113,7 +116,9 @@ globalThis.fetch = async (input, init) => {
 			});
 		}
 		if (form.get('grant_type') === 'refresh_token') {
-			if (refreshErrorCode) return responseJson({ error: refreshErrorCode }, 400);
+			refreshPostAttempts += 1;
+			if (refreshCustomResponse) return await refreshCustomResponse();
+			if (refreshErrorCode) return responseJson({ error: refreshErrorCode }, refreshHttpStatus);
 			refreshCount += 1;
 			refreshTokensSeen.push(form.get('refresh_token') ?? '');
 			const refreshNumber = refreshCount;
@@ -928,6 +933,209 @@ test('connection API offers device auth, supports configured hosted OAuth, and f
 	assert.equal((await route.GET(anonymous as never)).status, 401);
 });
 
+test('mid-TTL upstream 401 refreshes once across concurrent callers, retries routes, preserves transient credentials, and remaps personal reauth to 409', async (t) => {
+	const modelsRoute = await import('../src/routes/api/models/+server.ts');
+	const aiRoute = await import('../src/routes/api/ai/+server.ts');
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const { defaultPreferences, seedRecipes } = await import('../src/lib/data.ts');
+	const user = await createLocalUser('oauth-mid-ttl-recovery@example.com');
+	const realNow = Date.now.bind(Date);
+	let offsetMs = 0;
+	t.mock.method(Date, 'now', () => realNow() + offsetMs);
+
+	// Unauthenticated callers still receive HTTP 401 with code session_expired.
+	const unauthModels = await modelsRoute.GET({
+		locals: { user: null },
+		fetch: async () => Response.json({}),
+		url: new URL('http://127.0.0.1:3000/api/models')
+	} as never);
+	assert.equal(unauthModels.status, 401);
+	assert.equal((await unauthModels.json()).code, 'session_expired');
+	const unauthAI = await aiRoute.POST({
+		locals: { user: null },
+		fetch: async () => Response.json({}),
+		request: new Request('http://127.0.0.1:3000/api/ai', {
+			method: 'POST',
+			headers: { origin: 'http://127.0.0.1:3000', 'content-type': 'application/json' },
+			body: JSON.stringify({ action: 'generate' })
+		})
+	} as never);
+	assert.equal(unauthAI.status, 401);
+	assert.equal((await unauthAI.json()).code, 'session_expired');
+
+	const authUrl = await beginFlow(user);
+	const connected = await callbackFor(authUrl, { issuedClientId: 'oaiapp_mid_ttl' });
+	assert.equal(connected.response.status, 200);
+	const account = oauth.listChatGPTAccounts(user.user.id)[0]!;
+	const initialToken = `access-${connected.clientId}`;
+
+	// Token is still mid-TTL (expires 1 hour from now), yet OpenAI revokes it early.
+	const seenTokens: string[] = [];
+	const beforeRefreshes = refreshCount;
+	const providerFetch: typeof fetch = async (input, init) => {
+		const target = String(input);
+		if (target === 'https://models.dev/api.json') return Response.json({});
+		const auth = new Headers(init?.headers).get('authorization') ?? '';
+		seenTokens.push(auth);
+		if (auth === `Bearer ${initialToken}`) {
+			return Response.json({ error: { message: 'Token revoked' } }, { status: 401 });
+		}
+		if (target === 'https://api.openai.com/v1/models') {
+			return Response.json({
+				models: [{ slug: 'gpt-5', display_name: 'GPT-5', visibility: 'list' }]
+			});
+		}
+		return new Response(
+			`data: ${JSON.stringify({
+				type: 'response.completed',
+				response: {
+					status: 'completed',
+					output: [
+						{
+							content: [
+								{
+									type: 'output_text',
+									text: JSON.stringify({
+										recipes: [seedRecipes[0], seedRecipes[1], seedRecipes[2]]
+									})
+								}
+							]
+						}
+					]
+				}
+			})}\n\n`,
+			{ headers: { 'content-type': 'text/event-stream' } }
+		);
+	};
+
+	const [modelsRes, aiRes] = await Promise.all([
+		modelsRoute.GET({
+			locals: { user: user.user },
+			fetch: providerFetch,
+			url: new URL(
+				`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+			)
+		} as never),
+		aiRoute.POST({
+			locals: { user: user.user },
+			fetch: providerFetch,
+			request: new Request('http://127.0.0.1:3000/api/ai', {
+				method: 'POST',
+				headers: { origin: 'http://127.0.0.1:3000', 'content-type': 'application/json' },
+				body: JSON.stringify({
+					action: 'generate',
+					provider: 'chatgpt',
+					model: 'gpt-5',
+					connectionId: account.id,
+					preferences: defaultPreferences
+				})
+			})
+		} as never)
+	]);
+	assert.equal(modelsRes.status, 200);
+	assert.equal(aiRes.status, 200);
+	assert.equal(refreshCount - beforeRefreshes, 1, 'concurrent 401s rotate the refresh token once');
+	assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, true);
+
+	// Transient 5xx refresh failure returns 502 without clearing encrypted credentials and arms a per-account cooldown.
+	refreshErrorCode = 'server_error';
+	refreshHttpStatus = 503;
+	try {
+		const transient = await modelsRoute.GET({
+			locals: { user: user.user },
+			fetch: async (input: RequestInfo | URL) =>
+				String(input) === 'https://models.dev/api.json'
+					? Response.json({})
+					: Response.json({ error: { message: 'Unauthorized' } }, { status: 401 }),
+			url: new URL(
+				`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+			)
+		} as never);
+		assert.equal(transient.status, 502);
+		assert.equal((await transient.json()).code, 'chatgpt_refresh_failed');
+		const afterTransient = storage.getChatGPTAccount(user.user.id, account.id)!;
+		assert.ok(afterTransient.credentialEnvelope);
+		assert.ok(afterTransient.earliestRefreshAt > Date.now());
+		assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, true);
+
+		const postsAfterTransient = refreshPostAttempts;
+		const coolingDown = await modelsRoute.GET({
+			locals: { user: user.user },
+			fetch: async (input: RequestInfo | URL) =>
+				String(input) === 'https://models.dev/api.json'
+					? Response.json({})
+					: Response.json({ error: { message: 'Unauthorized' } }, { status: 401 }),
+			url: new URL(
+				`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+			)
+		} as never);
+		assert.equal(coolingDown.status, 503);
+		assert.equal((await coolingDown.json()).code, 'chatgpt_refresh_not_ready');
+		assert.equal(
+			refreshPostAttempts,
+			postsAfterTransient,
+			'forced refresh during 502 cooldown skips token endpoint POST'
+		);
+
+		// Even if earliest_refresh_at is 0 in SQLite, the per-account forcedRefreshCooldowns map still blocks forced fetches inside the cooldown window.
+		backend
+			.getDatabase()
+			.prepare(
+				'UPDATE chatgpt_oauth_accounts SET earliest_refresh_at = 0 WHERE user_id = ? AND id = ?'
+			)
+			.run(user.user.id, account.id);
+		await assert.rejects(
+			oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id),
+			(error: unknown) =>
+				error instanceof oauth.ChatGPTOAuthError &&
+				error.status === 503 &&
+				error.code === 'chatgpt_refresh_not_ready'
+		);
+		assert.equal(
+			refreshPostAttempts,
+			postsAfterTransient,
+			'module-level forced-refresh cooldown blocks fetches inside cooldown window'
+		);
+	} finally {
+		refreshErrorCode = null;
+		refreshHttpStatus = 400;
+	}
+
+	offsetMs += oauth.REFRESH_FAILURE_COOLDOWN_MS + 1_000;
+
+	// Retry also returning 401 clears personal credentials and remaps signed-in response to 409 chatgpt_reauth_required.
+	const retryRejected = await aiRoute.POST({
+		locals: { user: user.user },
+		fetch: async () => Response.json({ error: { message: 'Still invalid' } }, { status: 401 }),
+		request: new Request('http://127.0.0.1:3000/api/ai', {
+			method: 'POST',
+			headers: { origin: 'http://127.0.0.1:3000', 'content-type': 'application/json' },
+			body: JSON.stringify({
+				action: 'generate',
+				provider: 'chatgpt',
+				model: 'gpt-5',
+				connectionId: account.id,
+				preferences: defaultPreferences
+			})
+		})
+	} as never);
+	assert.equal(retryRejected.status, 409);
+	assert.equal((await retryRejected.json()).code, 'chatgpt_reauth_required');
+	assert.equal(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope, null);
+	assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, false);
+
+	// Subsequent signed-in model catalog calls while disconnected also return 409 chatgpt_reauth_required.
+	const disconnectedModels = await modelsRoute.GET({
+		locals: { user: user.user },
+		fetch: async () => Response.json({}),
+		url: new URL(
+			`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+		)
+	} as never);
+	assert.equal(disconnectedModels.status, 409);
+	assert.equal((await disconnectedModels.json()).code, 'chatgpt_reauth_required');
+});
+
 test('OAuth tables index foreign-key and expiry columns and avoid table scans on cleanups and cascades', async () => {
 	await import('../src/lib/server/oauth-storage.ts');
 	const database = backend.getDatabase();
@@ -999,4 +1207,526 @@ test('OAuth tables index foreign-key and expiry columns and avoid table scans on
 		true,
 		'Expected MULTI-INDEX OR plan for codex_device_attempts cleanup'
 	);
+});
+
+test('bare 401 and server-config OAuth errors on token refresh return 502 with credentials retained while terminal invalid_grant 401 clears credentials', async () => {
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const user = await createLocalUser('oauth-bare-401@example.com');
+	const authUrl = await beginFlow(user);
+	const connected = await callbackFor(authUrl, { issuedClientId: 'oaiapp_bare_401' });
+	assert.equal(connected.response.status, 200);
+	const account = oauth.listChatGPTAccounts(user.user.id)[0]!;
+	const database = backend.getDatabase();
+
+	const resetForRefresh = () => {
+		database
+			.prepare(
+				'UPDATE chatgpt_oauth_accounts SET expires_at = ?, earliest_refresh_at = 0 WHERE user_id = ? AND id = ?'
+			)
+			.run(Date.now() - 1_000, user.user.id, account.id);
+	};
+
+	try {
+		for (const responseFactory of [
+			() => new Response('', { status: 401 }),
+			() => responseJson({}, 401),
+			() => responseJson({ error: 'invalid_client' }, 401),
+			() => responseJson({ error: 'unauthorized_client' }, 401)
+		]) {
+			resetForRefresh();
+			refreshCustomResponse = responseFactory;
+			await assert.rejects(
+				oauth.getChatGPTAccessToken(user.user.id, account.id),
+				(error: unknown) =>
+					error instanceof oauth.ChatGPTOAuthError &&
+					error.status === 502 &&
+					error.code === 'chatgpt_refresh_failed'
+			);
+			const stored = storage.getChatGPTAccount(user.user.id, account.id)!;
+			assert.ok(stored.credentialEnvelope, 'non-terminal 401 retains stored credentials');
+			assert.ok(stored.earliestRefreshAt > Date.now());
+			assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, true);
+		}
+
+		// Terminal 401 carrying invalid_grant clears credentials and requires reauth.
+		resetForRefresh();
+		refreshCustomResponse = () => responseJson({ error: 'invalid_grant' }, 401);
+		await assert.rejects(
+			oauth.getChatGPTAccessToken(user.user.id, account.id),
+			(error: unknown) =>
+				error instanceof oauth.ChatGPTOAuthError &&
+				error.status === 401 &&
+				error.code === 'chatgpt_account_reauth_required'
+		);
+		assert.equal(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope, null);
+		assert.equal(oauth.listChatGPTAccounts(user.user.id)[0]?.connected, false);
+	} finally {
+		refreshCustomResponse = null;
+	}
+});
+
+test('forced refresh honors earliestRefreshAt backoff unless another worker already rotated the rejected token', async () => {
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const modelsRoute = await import('../src/routes/api/models/+server.ts');
+	const user = await createLocalUser('oauth-forced-backoff@example.com');
+	const authUrl = await beginFlow(user);
+	const connected = await callbackFor(authUrl, { issuedClientId: 'oaiapp_forced_backoff' });
+	assert.equal(connected.response.status, 200);
+	const account = oauth.listChatGPTAccounts(user.user.id)[0]!;
+	const initialToken = `access-${connected.clientId}`;
+
+	backend
+		.getDatabase()
+		.prepare(
+			'UPDATE chatgpt_oauth_accounts SET earliest_refresh_at = ? WHERE user_id = ? AND id = ?'
+		)
+		.run(Date.now() + 30_000, user.user.id, account.id);
+
+	const beforePosts = refreshPostAttempts;
+	await assert.rejects(
+		oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id, initialToken),
+		(error: unknown) =>
+			error instanceof oauth.ChatGPTOAuthError &&
+			error.status === 503 &&
+			error.code === 'chatgpt_refresh_not_ready'
+	);
+	assert.equal(refreshPostAttempts, beforePosts);
+
+	const routeBackoff = await modelsRoute.GET({
+		locals: { user: user.user },
+		fetch: async (input: RequestInfo | URL) =>
+			String(input) === 'https://models.dev/api.json'
+				? Response.json({})
+				: Response.json({ error: { message: 'Revoked' } }, { status: 401 }),
+		url: new URL(
+			`http://127.0.0.1:3000/api/models?connection=chatgpt&accountId=${encodeURIComponent(account.id)}`
+		)
+	} as never);
+	assert.equal(routeBackoff.status, 503);
+	assert.equal((await routeBackoff.json()).code, 'chatgpt_refresh_not_ready');
+	assert.equal(refreshPostAttempts, beforePosts);
+	assert.ok(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope);
+
+	// If another worker already rotated the access token and set a new earliest_refresh_at, callers rejecting the old token reuse the rotated token.
+	const stored = storage.getChatGPTAccount(user.user.id, account.id)!;
+	const existingCreds = storage.decryptChatGPTCredentials(
+		user.user.id,
+		stored.id,
+		stored.mode,
+		stored.credentialEnvelope!
+	);
+	assert.equal(
+		storage.claimChatGPTRefreshLease(user.user.id, account.id, 'rotator', Date.now() + 15_000),
+		true
+	);
+	assert.equal(
+		storage.persistRefreshedChatGPTCredentials({
+			userId: user.user.id,
+			accountId: account.id,
+			leaseToken: 'rotator',
+			credentials: {
+				...existingCreds,
+				accessToken: 'already-rotated-token',
+				refreshToken: 'already-rotated-refresh'
+			},
+			expiresAt: Date.now() + 3_600_000,
+			earliestRefreshAt: Date.now() + 30_000,
+			scopes: [...requestedScopes]
+		}),
+		true
+	);
+	const reused = await oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id, initialToken);
+	assert.equal(reused, 'already-rotated-token');
+	assert.equal(refreshPostAttempts, beforePosts);
+});
+
+test('cross-lease refresh race re-checks freshness after claiming the lease and never replays a rotated refresh token', async (t) => {
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const user = await createLocalUser('oauth-cross-lease@example.com');
+	const authUrl = await beginFlow(user);
+	const connected = await callbackFor(authUrl, { issuedClientId: 'oaiapp_cross_lease' });
+	assert.equal(connected.response.status, 200);
+	const account = oauth.listChatGPTAccounts(user.user.id)[0]!;
+	const initialToken = `access-${connected.clientId}`;
+
+	// Case 1: Another process already holds the lease and rotates credentials before releasing it.
+	const baseCreds = storage.decryptChatGPTCredentials(
+		user.user.id,
+		account.id,
+		'local',
+		storage.getChatGPTAccount(user.user.id, account.id)!.credentialEnvelope!
+	);
+	assert.equal(
+		storage.claimChatGPTRefreshLease(
+			user.user.id,
+			account.id,
+			'worker-a-lease-1',
+			Date.now() + 10_000
+		),
+		true
+	);
+	const beforePosts = refreshPostAttempts;
+	refreshErrorCode = 'refresh_token_reused';
+	refreshHttpStatus = 400;
+	try {
+		const waiting = oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id, initialToken);
+		await new Promise((resolve) => setTimeout(resolve, 40));
+		assert.equal(
+			storage.persistRefreshedChatGPTCredentials({
+				userId: user.user.id,
+				accountId: account.id,
+				leaseToken: 'worker-a-lease-1',
+				credentials: {
+					...baseCreds,
+					accessToken: 'worker-a-access-1',
+					refreshToken: 'worker-a-refresh-1'
+				},
+				expiresAt: Date.now() + 3_600_000,
+				earliestRefreshAt: 0,
+				scopes: [...requestedScopes]
+			}),
+			true
+		);
+		assert.equal(await waiting, 'worker-a-access-1');
+		assert.equal(refreshPostAttempts, beforePosts);
+		assert.ok(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope);
+
+		// Case 2: Worker B reads stale pre-lease credentials, and Worker A completes rotation right before Worker B claims the lease.
+		const realNow = Date.now.bind(Date);
+		let nowCalls = 0;
+		let injectedCrossProcessRotation = false;
+		const nowMock = t.mock.method(Date, 'now', () => {
+			nowCalls += 1;
+			const value = realNow();
+			if (nowCalls === 4 && !injectedCrossProcessRotation) {
+				injectedCrossProcessRotation = true;
+				assert.equal(
+					storage.claimChatGPTRefreshLease(
+						user.user.id,
+						account.id,
+						'worker-a-lease-2',
+						value + 10_000,
+						value
+					),
+					true
+				);
+				assert.equal(
+					storage.persistRefreshedChatGPTCredentials({
+						userId: user.user.id,
+						accountId: account.id,
+						leaseToken: 'worker-a-lease-2',
+						credentials: {
+							...baseCreds,
+							accessToken: 'worker-a-access-2',
+							refreshToken: 'worker-a-refresh-2'
+						},
+						expiresAt: value + 3_600_000,
+						earliestRefreshAt: 0,
+						scopes: [...requestedScopes]
+					}),
+					true
+				);
+			}
+			return value;
+		});
+		try {
+			const postLeaseChecked = await oauth.forceRefreshChatGPTAccessToken(
+				user.user.id,
+				account.id,
+				'worker-a-access-1'
+			);
+			assert.equal(injectedCrossProcessRotation, true);
+			assert.equal(postLeaseChecked, 'worker-a-access-2');
+			assert.equal(
+				refreshPostAttempts,
+				beforePosts,
+				'post-lease re-check avoids replaying stale refresh token'
+			);
+			assert.ok(storage.getChatGPTAccount(user.user.id, account.id)?.credentialEnvelope);
+		} finally {
+			nowMock.mock.restore();
+		}
+
+		// Case 3: Worker B enters token POST under lease, its lease expires mid-refresh while Worker A rotates the token, and Worker B's stale POST returns refresh_token_reused.
+		let offsetMs = 0;
+		const midFlightNowMock = t.mock.method(Date, 'now', () => realNow() + offsetMs);
+		let releaseInFlight!: () => void;
+		let enteredInFlight!: () => void;
+		const enteredPromise = new Promise<void>((resolve) => {
+			enteredInFlight = resolve;
+		});
+		const inFlightGate = new Promise<void>((resolve) => {
+			releaseInFlight = resolve;
+		});
+		refreshErrorCode = null;
+		refreshCustomResponse = async () => {
+			enteredInFlight();
+			await inFlightGate;
+			return responseJson({ error: 'refresh_token_reused' }, 400);
+		};
+		try {
+			const staleEnvelope = storage.getChatGPTAccount(
+				user.user.id,
+				account.id
+			)!.credentialEnvelope!;
+			const midFlight = oauth.forceRefreshChatGPTAccessToken(
+				user.user.id,
+				account.id,
+				'worker-a-access-2'
+			);
+			await enteredPromise;
+
+			// Advance past Worker B's 30s lease so Worker A can claim a new lease and rotate credentials mid-refresh.
+			offsetMs += 31_000;
+			assert.equal(
+				storage.claimChatGPTRefreshLease(
+					user.user.id,
+					account.id,
+					'worker-a-lease-3',
+					Date.now() + 10_000
+				),
+				true
+			);
+			assert.equal(
+				storage.persistRefreshedChatGPTCredentials({
+					userId: user.user.id,
+					accountId: account.id,
+					leaseToken: 'worker-a-lease-3',
+					credentials: {
+						...baseCreds,
+						accessToken: 'worker-a-access-3',
+						refreshToken: 'worker-a-refresh-3'
+					},
+					expiresAt: Date.now() + 3_600_000,
+					earliestRefreshAt: 0,
+					scopes: [...requestedScopes]
+				}),
+				true
+			);
+
+			releaseInFlight();
+			assert.equal(
+				await midFlight,
+				'worker-a-access-3',
+				'mid-refresh rotation by another lease preserves and returns the rotated token'
+			);
+			assert.equal(
+				oauth.clearTerminalChatGPTCredentials(
+					user.user.id,
+					account.id,
+					'refresh_token_reused',
+					staleEnvelope
+				),
+				false,
+				'stale failed credentialEnvelope never clears a newly rotated credential set'
+			);
+			const preserved = storage.getChatGPTAccount(user.user.id, account.id)!;
+			assert.ok(preserved.credentialEnvelope);
+			assert.equal(
+				storage.decryptChatGPTCredentials(
+					user.user.id,
+					preserved.id,
+					preserved.mode,
+					preserved.credentialEnvelope!
+				).accessToken,
+				'worker-a-access-3'
+			);
+		} finally {
+			refreshCustomResponse = null;
+			midFlightNowMock.mock.restore();
+		}
+	} finally {
+		refreshErrorCode = null;
+		refreshHttpStatus = 400;
+	}
+});
+
+test('in-process coalescing shares strictly one network refresh across N concurrent callers and across an in-flight read resolving to the rejected token', async () => {
+	const user = await createLocalUser('oauth-coalesce@example.com');
+	const authUrl = await beginFlow(user);
+	const connected = await callbackFor(authUrl, { issuedClientId: 'oaiapp_coalesce' });
+	assert.equal(connected.response.status, 200);
+	const account = oauth.listChatGPTAccounts(user.user.id)[0]!;
+	const database = backend.getDatabase();
+
+	// 1. N = 8 concurrent expired-token callers produce strictly 1 token fetch.
+	database
+		.prepare(
+			'UPDATE chatgpt_oauth_accounts SET expires_at = ?, earliest_refresh_at = 0 WHERE user_id = ? AND id = ?'
+		)
+		.run(Date.now() - 1_000, user.user.id, account.id);
+	const n = 8;
+	const postsBeforeBatch = refreshPostAttempts;
+	const batchTokens = await Promise.all(
+		Array.from({ length: n }, () => oauth.getChatGPTAccessToken(user.user.id, account.id))
+	);
+	assert.equal(refreshPostAttempts - postsBeforeBatch, 1);
+	assert.equal(new Set(batchTokens).size, 1);
+
+	// 2. N = 8 concurrent forced-refresh callers produce strictly 1 token fetch.
+	const staleBatchToken = batchTokens[0]!;
+	const postsBeforeForcedBatch = refreshPostAttempts;
+	const forcedBatchTokens = await Promise.all(
+		Array.from({ length: n }, () =>
+			oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id, staleBatchToken)
+		)
+	);
+	assert.equal(refreshPostAttempts - postsBeforeForcedBatch, 1);
+	assert.equal(new Set(forcedBatchTokens).size, 1);
+
+	// 3. Expire token so getChatGPTAccessToken enters an in-flight refresh that resolves to expectedTokenA while concurrent forced callers reject expectedTokenA.
+	database
+		.prepare(
+			'UPDATE chatgpt_oauth_accounts SET expires_at = ?, earliest_refresh_at = 0 WHERE user_id = ? AND id = ?'
+		)
+		.run(Date.now() - 1_000, user.user.id, account.id);
+
+	const expectedTokenA = `access-refreshed-${refreshCount + 1}`;
+	let releaseFirst!: () => void;
+	let firstEntered!: () => void;
+	const firstEnteredPromise = new Promise<void>((resolve) => {
+		firstEntered = resolve;
+	});
+	refreshStarted = () => {
+		firstEntered();
+	};
+	refreshGate = new Promise<void>((resolve) => {
+		releaseFirst = resolve;
+	});
+
+	try {
+		const inFlightRead = oauth.getChatGPTAccessToken(user.user.id, account.id);
+		await firstEnteredPromise;
+
+		// While inFlightRead is still in flight (and will resolve to expectedTokenA), 3 concurrent callers reject expectedTokenA.
+		const postsBeforeForced = refreshPostAttempts;
+		let releaseForced!: () => void;
+		refreshStarted = null;
+		refreshGate = new Promise<void>((resolve) => {
+			releaseForced = resolve;
+		});
+
+		const forcedCallers = [
+			oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id, expectedTokenA),
+			oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id, expectedTokenA),
+			oauth.forceRefreshChatGPTAccessToken(user.user.id, account.id, expectedTokenA)
+		];
+
+		releaseFirst();
+		assert.equal(await inFlightRead, expectedTokenA);
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		releaseForced();
+
+		const forcedTokens = await Promise.all(forcedCallers);
+		const expectedTokenB = `access-refreshed-${refreshCount}`;
+		assert.deepEqual(forcedTokens, [expectedTokenB, expectedTokenB, expectedTokenB]);
+		assert.equal(
+			refreshPostAttempts - postsBeforeForced,
+			1,
+			'all concurrent callers rejecting the resolved token share strictly one network refresh'
+		);
+	} finally {
+		refreshGate = null;
+		refreshStarted = null;
+	}
+});
+
+test('mapSignedInAIRouteError enforces one signed-in 401/409/503 error contract across personal ChatGPT, Host AI, API-key 401s, and 429 Retry-After', async () => {
+	const { AIRequestError } = await import('../src/lib/server/ai.ts');
+	const { ChatGPTInferenceError } = await import('../src/lib/server/chatgpt-inference.ts');
+	const { mapSignedInAIRouteError } = await import('../src/lib/server/ai-route-errors.ts');
+	const storage = await import('../src/lib/server/oauth-storage.ts');
+	const hostOwner = await createLocalUser('oauth-host-contract@example.com');
+	const hostAccount = storage.saveChatGPTAccount({
+		userId: hostOwner.user.id,
+		mode: 'local',
+		clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+		subject: 'host-contract-sub',
+		email: 'host-contract@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'host-contract-access',
+			refreshToken: 'host-contract-refresh',
+			idToken: 'host-contract-id',
+			codexAccountId: 'acct-host-contract'
+		},
+		expiresAt: Date.now() + 3_600_000,
+		earliestRefreshAt: 0
+	});
+
+	const apiKey401 = mapSignedInAIRouteError(new AIRequestError('Provider rejected API key.', 401), {
+		userId: 'user-1',
+		isChatGPTProvider: false,
+		fallbackMessage: 'AI failed'
+	});
+	assert.equal(apiKey401.status, 409);
+	assert.equal(apiKey401.headers.get('cache-control'), 'no-store');
+	assert.equal((await apiKey401.json()).code, 'provider_auth');
+
+	const chatgpt401 = mapSignedInAIRouteError(
+		new ChatGPTInferenceError('Reconnect.', 401, 'token_expired'),
+		{
+			userId: 'user-1',
+			isChatGPTProvider: true,
+			personalAccountId: 'acct-1',
+			fallbackMessage: 'AI failed'
+		}
+	);
+	assert.equal(chatgpt401.status, 409);
+	assert.equal((await chatgpt401.json()).code, 'chatgpt_reauth_required');
+
+	const hostNonTerminal401 = mapSignedInAIRouteError(
+		new ChatGPTInferenceError('Upstream unauthorized.', 401, 'token_expired'),
+		{
+			userId: 'user-1',
+			usingHostAI: true,
+			hostTarget: { userId: hostOwner.user.id, accountId: hostAccount.id },
+			isChatGPTProvider: true,
+			fallbackMessage: 'Models failed'
+		}
+	);
+	assert.equal(hostNonTerminal401.status, 503);
+	assert.equal((await hostNonTerminal401.json()).code, 'host_ai_unavailable');
+	assert.ok(
+		storage.getChatGPTAccount(hostOwner.user.id, hostAccount.id)?.credentialEnvelope,
+		'non-terminal 401 on shared host never clears host credentials'
+	);
+
+	const hostTerminalRefresh = mapSignedInAIRouteError(
+		new oauth.ChatGPTOAuthError(
+			401,
+			'Reconnect this ChatGPT account to continue.',
+			'chatgpt_account_reauth_required',
+			'invalid_grant'
+		),
+		{
+			userId: 'user-1',
+			usingHostAI: true,
+			hostTarget: { userId: hostOwner.user.id, accountId: hostAccount.id },
+			isChatGPTProvider: true,
+			fallbackMessage: 'Models failed'
+		}
+	);
+	assert.equal(hostTerminalRefresh.status, 503);
+	assert.equal((await hostTerminalRefresh.json()).code, 'host_ai_unavailable');
+	assert.equal(
+		storage.getChatGPTAccount(hostOwner.user.id, hostAccount.id)?.credentialEnvelope,
+		null,
+		'terminal refresh code clears host credentials through leased helper'
+	);
+
+	const rateLimited = mapSignedInAIRouteError(
+		Object.assign(new AIRequestError('Rate limit reached.', 429), {
+			code: 'rate_limited',
+			retryAfter: 8.2
+		}),
+		{
+			userId: 'user-1',
+			isChatGPTProvider: false,
+			fallbackMessage: 'AI failed'
+		}
+	);
+	assert.equal(rateLimited.status, 429);
+	assert.equal(rateLimited.headers.get('retry-after'), '9');
+	assert.equal((await rateLimited.json()).code, 'rate_limited');
 });

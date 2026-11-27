@@ -1,15 +1,15 @@
 import { z } from 'zod';
-import type { RequestHandler } from './$types';
+import type { RequestEvent } from './$types';
 import {
 	AIRequestError,
 	importRecipeFromUrl,
-	type RecipeUrlImportFallback
+	type RecipeUrlImportFallback,
+	type SecureRecipePageFetcher
 } from '#lib/server/ai.ts';
 import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
 import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import { ApiError, assertSameOrigin, clientAddress, consumeRateLimit } from '#lib/server/db.ts';
-import { getHostAIFor } from '#lib/server/host-ai.ts';
-import { getAuthMode } from '#lib/server/sso.ts';
+import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 
 const MAX_IMPORT_REQUEST_BYTES = 64_000;
 
@@ -31,10 +31,15 @@ const recipeImportRequestSchema = z.object({
 		})
 		.optional(),
 	apiKey: z.string().max(1_000).optional(),
-	connectionId: z.string().max(100).optional()
+	connectionId: z.string().max(100).optional(),
+	usePersonalAI: z.boolean().optional()
 });
 
-export const POST: RequestHandler = async (event) => {
+export type RecipeImportRouteOptions = {
+	pageFetcher?: SecureRecipePageFetcher;
+};
+
+export const POST = async (event: RequestEvent, options: RecipeImportRouteOptions = {}) => {
 	try {
 		assertSameOrigin(event.request);
 		if (event.request.headers.get('sec-fetch-site') === 'cross-site') {
@@ -42,17 +47,14 @@ export const POST: RequestHandler = async (event) => {
 		}
 
 		const user = event.locals.user;
-		const authMode = event.locals.authMode ?? getAuthMode() ?? 'invalid';
-		if (!user && authMode !== 'local') {
+		if (!user) {
 			throw new ApiError(401, 'Authentication required', 'session_expired');
 		}
 
 		const ip = clientAddress(event);
 		if (!ip) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`recipe-import-ip:${ip}`, 20, 15 * 60 * 1000);
-		if (user) {
-			consumeRateLimit(`recipe-import-user:${user.id}`, 30, 60 * 60 * 1000);
-		}
+		consumeRateLimit(`recipe-import-user:${user.id}`, 30, 60 * 60 * 1000);
 
 		const contentLength = Number(event.request.headers.get('content-length') ?? 0);
 		if (contentLength > MAX_IMPORT_REQUEST_BYTES) {
@@ -77,30 +79,41 @@ export const POST: RequestHandler = async (event) => {
 		const result = await importRecipeFromUrl(
 			{
 				url: payload.url,
-				authenticated: Boolean(user),
+				authenticated: true,
 				resolveFallback: async (): Promise<RecipeUrlImportFallback | null> => {
-					if (!user) return null;
-
 					const host = getHostAIFor(user.id);
-					if (host) {
+					const provider = payload.provider?.trim();
+					const model = payload.model?.trim();
+					const explicitPersonal = payload.usePersonalAI === true;
+					const explicitHost =
+						payload.usePersonalAI === false || payload.connectionId === HOST_CONNECTION_ID;
+					const hasPersonalApiKey = Boolean(
+						provider && provider !== 'chatgpt' && payload.apiKey?.trim()
+					);
+					const hasPersonalChatGPT = Boolean(
+						provider === 'chatgpt' &&
+						payload.connectionId?.trim() &&
+						payload.connectionId.trim() !== HOST_CONNECTION_ID
+					);
+					const usePersonal =
+						explicitPersonal || (!explicitHost && (hasPersonalApiKey || hasPersonalChatGPT));
+
+					if (host && !usePersonal) {
 						consumeRateLimit(`ai-user:${user.id}`, 30, 60 * 60 * 1000);
 						const resolved = await getChatGPTConnection(host.userId, host.accountId, event.fetch);
 						return {
 							provider: 'chatgpt',
 							model: host.model,
-							reasoning: payload.reasoning,
 							connection: { accessToken: resolved.accessToken, codex: resolved.codex },
 							fetcher: resolved.fetcher
 						};
 					}
 
-					const provider = payload.provider?.trim();
-					const model = payload.model?.trim();
 					if (!provider || !model) return null;
 
 					if (provider === 'chatgpt') {
 						const accountId = payload.connectionId?.trim() ?? '';
-						if (!accountId) return null;
+						if (!accountId || accountId === HOST_CONNECTION_ID) return null;
 						consumeRateLimit(`ai-user:${user.id}`, 30, 60 * 60 * 1000);
 						const resolved = await getChatGPTConnection(user.id, accountId, event.fetch);
 						return {
@@ -124,7 +137,7 @@ export const POST: RequestHandler = async (event) => {
 					};
 				}
 			},
-			undefined,
+			options.pageFetcher,
 			event.request.signal
 		);
 
@@ -134,7 +147,7 @@ export const POST: RequestHandler = async (event) => {
 	} catch (error) {
 		if (error instanceof ChatGPTInferenceError) {
 			return Response.json(
-				error.code ? { error: error.message, code: error.code } : { error: error.message },
+				{ error: error.message, code: error.code },
 				{ status: error.status, headers: { 'cache-control': 'no-store' } }
 			);
 		}
@@ -146,7 +159,7 @@ export const POST: RequestHandler = async (event) => {
 		}
 		if (error instanceof AIRequestError) {
 			return Response.json(
-				error.code ? { error: error.message, code: error.code } : { error: error.message },
+				{ error: error.message },
 				{ status: error.status, headers: { 'cache-control': 'no-store' } }
 			);
 		}

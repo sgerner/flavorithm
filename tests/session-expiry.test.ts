@@ -10,6 +10,7 @@ import { compile } from 'svelte/compiler';
 import { render } from 'svelte/server';
 import ts from 'typescript';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
+import * as aiContinuationMod from '../src/lib/ai-continuation.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
@@ -31,6 +32,7 @@ import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
+import * as stateSchemaMod from '../src/lib/state-schema.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -431,11 +433,13 @@ function createPageInstance(
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
+		'#lib/state-schema.ts': stateSchemaMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
@@ -505,6 +509,7 @@ function createPageInstance(
 		setInterval: () => nextTimerId++,
 		clearInterval: () => {},
 		localStorage: storage,
+		sessionStorage: createStorage(),
 		document: {
 			documentElement: {
 				dataset: {} as Record<string, string>,
@@ -743,6 +748,28 @@ test('real +page.svelte logout and deleteAccount preserve custom flavorithm-gues
 		assert.equal(
 			JSON.parse(storage.getItem('flavorithm-guest-kitchen')!).pantry[0].id,
 			'guest-pantry-1'
+		);
+
+		// Registering a new account from that saved guest kitchen moves the data into the account
+		// and clears guest storage so logging out does not resurrect a stale copy.
+		await app.authenticate({
+			action: 'register',
+			name: 'Registered Guest',
+			email: 'registered-guest@example.test',
+			password,
+			ip: '10.0.0.1'
+		});
+		assert.equal(app.kitchen.pantry[0].id, 'guest-pantry-1');
+		assert.equal(storage.values.has('flavorithm-guest-kitchen'), false);
+		assert.equal(storage.values.has('flavorithm-started'), false);
+
+		await app.logout();
+		assert.equal(app.user, null);
+		assert.equal(app.showStarter, true);
+		assert.equal(app.kitchen.pantry.length, createInitialState().pantry.length);
+		assert.equal(
+			app.kitchen.pantry.some((item) => item.id === 'guest-pantry-1'),
+			false
 		);
 	} finally {
 		app.dispose();
@@ -984,10 +1011,8 @@ test('real +page.svelte signing out or registering during sessionExpired isolate
 			false
 		);
 		assert.equal(readPendingJournal(storage, oldOwner).records.length, 1);
-		assert.equal(
-			JSON.parse(storage.getItem('flavorithm-guest-kitchen')!).pantry[0].id,
-			'guest-tea'
-		);
+		assert.equal(storage.values.has('flavorithm-guest-kitchen'), false);
+		assert.equal(storage.values.has('flavorithm-started'), false);
 
 		const newOwner = structuredClone(JSON.parse(JSON.stringify(app.user)) as User);
 		server.expireSession();
@@ -1001,14 +1026,15 @@ test('real +page.svelte signing out or registering during sessionExpired isolate
 		await app.logout();
 		assert.equal(app.user, null);
 		assert.equal(app.sessionExpired, false);
-		assert.equal(app.kitchen.pantry[0].id, 'guest-tea');
+		assert.equal(app.showStarter, true);
+		assert.equal(app.kitchen.pantry.length, createInitialState().pantry.length);
+		assert.equal(
+			app.kitchen.pantry.some((item) => item.id === 'guest-tea' || item.id === 'private-caviar'),
+			false
+		);
 		assert.deepEqual(app.kitchen.shopping, []);
 		assert.equal(readPendingJournal(storage, oldOwner).records.length, 1);
 		assert.equal(readPendingJournal(storage, newOwner).records.length, 1);
-		assert.equal(
-			JSON.parse(storage.getItem('flavorithm-guest-kitchen')!).pantry[0].id,
-			'guest-tea'
-		);
 	} finally {
 		app.dispose();
 	}
@@ -1039,7 +1065,7 @@ test('real +page.svelte keeps sessionExpired false and sync active on /api/ai an
 		});
 		assert.equal(app.sessionExpired, false);
 
-		// 1. Missing ChatGPT connection context throws 409 provider_auth ("Connect a ChatGPT account before using your plan.") — never 401.
+		// 1. Missing ChatGPT connection context throws 401 in runAIRequest, which /api/ai remaps via ai-route-errors.ts — and even an unmarked 401 from /api/ai never expires the Flavorithm session.
 		await assert.rejects(
 			() =>
 				runAIRequest({
@@ -1050,38 +1076,87 @@ test('real +page.svelte keeps sessionExpired false and sync active on /api/ai an
 				}),
 			(err: unknown) =>
 				err instanceof AIRequestError &&
-				err.status === 409 &&
-				err.code === 'provider_auth' &&
+				err.status === 401 &&
 				/Connect a ChatGPT account/i.test(err.message)
 		);
 
-		// 2. Even an unmarked HTTP 401 from /api/ai without code: 'session_expired' leaves sessionExpired false in +page.svelte request().
-		server.setInterceptor((url) =>
-			url.pathname === '/api/ai'
-				? Response.json(
-						{ error: 'Connect a ChatGPT account before using your plan.' },
-						{ status: 401 }
-					)
-				: null
-		);
+		// 2. Hard rule: a provider 401 or main's provider_auth / host_ai_unavailable codes from /api/ai never expire the Flavorithm session.
+		for (const simulated of [
+			{ status: 401, body: { error: 'Connect a ChatGPT account before using your plan.' } },
+			{
+				status: 409,
+				body: { error: 'Connect a ChatGPT account before using your plan.', code: 'provider_auth' }
+			},
+			{
+				status: 503,
+				body: { error: 'Host AI is temporarily unavailable.', code: 'host_ai_unavailable' }
+			}
+		]) {
+			server.setInterceptor((url) =>
+				url.pathname === '/api/ai'
+					? Response.json(simulated.body, { status: simulated.status })
+					: null
+			);
+			await assert.rejects(
+				() =>
+					app.callAI({
+						action: 'vision',
+						usePersonalAI: true,
+						provider: 'chatgpt',
+						model: 'gpt-4o-mini',
+						image: 'data:image/png;base64,aGVsbG8='
+					}),
+				{
+					status: simulated.status,
+					message: simulated.body.error
+				}
+			);
+			assert.equal(app.sessionExpired, false);
+		}
+		server.setInterceptor(null);
+
+		// 3. Non-ChatGPT API-key upstream 401 on /api/ai surfaces as 502 upstream provider error on main without expiring the session.
 		await assert.rejects(
 			() =>
-				app.callAI({
-					action: 'vision',
-					usePersonalAI: true,
-					provider: 'chatgpt',
-					model: 'gpt-4o-mini',
-					image: 'data:image/png;base64,aGVsbG8='
-				}),
+				app.callAI(
+					{
+						action: 'vision',
+						usePersonalAI: true,
+						provider: 'openai',
+						model: 'gpt-4o-mini',
+						apiKey: 'sk-invalid-key',
+						image: 'data:image/png;base64,aGVsbG8='
+					},
+					async (input) => {
+						const url =
+							typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+						if (url === 'https://models.dev/api.json') {
+							return Response.json({
+								openai: {
+									name: 'OpenAI',
+									env: ['OPENAI_API_KEY'],
+									models: {
+										'gpt-4o-mini': {
+											id: 'gpt-4o-mini',
+											name: 'GPT-4o mini',
+											attachment: true,
+											tool_call: true
+										}
+									}
+								}
+							});
+						}
+						return Response.json({ error: { message: 'Incorrect API key' } }, { status: 401 });
+					}
+				),
 			{
-				status: 401,
-				message: 'Connect a ChatGPT account before using your plan.'
+				status: 502,
+				message: 'AI provider request failed with status 401.'
 			}
 		);
-		server.setInterceptor(null);
 		assert.equal(app.sessionExpired, false);
 
-		// 3. Expired ChatGPT OAuth token returns 409 provider_auth on /api/ai and /api/models without expiring the Flavorithm session.
+		// 4. Expired ChatGPT OAuth token returns 409 chatgpt_reauth_required on /api/ai and /api/models without expiring the Flavorithm session.
 		const expiredAccount = oauthStorage.saveChatGPTAccount({
 			userId: app.user!.id,
 			mode: 'local',
@@ -1110,7 +1185,7 @@ test('real +page.svelte keeps sessionExpired false and sync active on /api/ai an
 				}),
 			{
 				status: 409,
-				code: 'provider_auth',
+				code: 'chatgpt_reauth_required',
 				message: 'Reconnect this ChatGPT account to continue.'
 			}
 		);
@@ -1121,13 +1196,13 @@ test('real +page.svelte keeps sessionExpired false and sync active on /api/ai an
 				app.callModels(`?connection=chatgpt&accountId=${encodeURIComponent(expiredAccount.id)}`),
 			{
 				status: 409,
-				code: 'provider_auth',
+				code: 'chatgpt_reauth_required',
 				message: 'Reconnect this ChatGPT account to continue.'
 			}
 		);
 		assert.equal(app.sessionExpired, false);
 
-		// 4. Upstream OpenAI 401 with an active local token maps to 502 on /api/ai without expiring the Flavorithm session.
+		// 5. Upstream OpenAI 401 with an active local token (and unrefreshable grant) maps to 409 chatgpt_reauth_required on /api/ai without expiring the Flavorithm session.
 		const liveAccount = oauthStorage.saveChatGPTAccount({
 			userId: app.user!.id,
 			mode: 'local',
@@ -1137,7 +1212,7 @@ test('real +page.svelte keeps sessionExpired false and sync active on /api/ai an
 			scopes: ['openid', 'chatgpt.tokens.use.direct'],
 			credentials: {
 				accessToken: 'live-access-token',
-				refreshToken: 'live-refresh-token',
+				refreshToken: '',
 				idToken: 'live-id-token'
 			},
 			expiresAt: Date.now() + 3_600_000,
@@ -1157,8 +1232,8 @@ test('real +page.svelte keeps sessionExpired false and sync active on /api/ai an
 					async () => Response.json({ error: { message: 'upstream 401' } }, { status: 401 })
 				),
 			{
-				status: 502,
-				message: 'Your ChatGPT connection needs to be renewed. Reconnect the selected account.'
+				status: 409,
+				code: 'chatgpt_reauth_required'
 			}
 		);
 		assert.equal(app.sessionExpired, false);

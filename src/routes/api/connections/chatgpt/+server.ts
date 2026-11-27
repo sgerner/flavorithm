@@ -5,6 +5,7 @@ import {
 	isHostAdmin,
 	HOST_CONNECTION_ID
 } from '#lib/server/host-ai.ts';
+import { sessionExpiredResponse } from '#lib/server/ai-route-errors.ts';
 import { startCodexDevice, pollCodexDevice, cancelCodexDevice } from '#lib/server/codex-device.ts';
 import type { RequestHandler } from './$types';
 import { z } from 'zod';
@@ -50,25 +51,38 @@ const bodySchema = z.discriminatedUnion('action', [
 
 function handleError(error: unknown): Response {
 	if (error instanceof ChatGPTOAuthError) {
-		return Response.json({ error: error.message, code: error.code }, { status: error.status });
-	}
-	if (error instanceof ApiError)
+		if (error.code === 'chatgpt_session_expired') {
+			return Response.json(
+				{ error: error.message, code: 'session_expired' },
+				{ status: 401, headers: { 'Cache-Control': 'no-store' } }
+			);
+		}
+		const status = error.status === 401 ? 409 : error.status;
 		return Response.json(
-			error.code ? { error: error.message, code: error.code } : { error: error.message },
-			{ status: error.status }
+			{ error: error.message, code: error.code },
+			{ status, headers: { 'Cache-Control': 'no-store' } }
 		);
+	}
+	if (error instanceof ApiError) {
+		if (error.status === 401) {
+			return Response.json(
+				{ error: error.message, code: 'session_expired' },
+				{ status: 401, headers: { 'Cache-Control': 'no-store' } }
+			);
+		}
+		return Response.json(
+			{ error: error.message },
+			{ status: error.status, headers: { 'Cache-Control': 'no-store' } }
+		);
+	}
 	return Response.json(
 		{ error: 'The ChatGPT connection request could not be completed.' },
-		{ status: 500 }
+		{ status: 500, headers: { 'Cache-Control': 'no-store' } }
 	);
 }
 
 export const GET: RequestHandler = async (event) => {
-	if (!event.locals.user)
-		return Response.json(
-			{ error: 'Authentication required', code: 'session_expired' },
-			{ status: 401 }
-		);
+	if (!event.locals.user) return sessionExpiredResponse();
 	const address = clientAddress(event);
 	const availability = getChatGPTOAuthAvailability({ url: event.url, clientAddress: address });
 	const host = getHostAIFor(event.locals.user.id);
@@ -105,7 +119,7 @@ export const POST: RequestHandler = async (event) => {
 		const fetchSite = event.request.headers.get('sec-fetch-site');
 		if (fetchSite && fetchSite !== 'same-origin')
 			throw new ApiError(403, 'Cross-origin request rejected');
-		if (!event.locals.user) throw new ApiError(401, 'Authentication required', 'session_expired');
+		if (!event.locals.user) return sessionExpiredResponse();
 		const address = clientAddress(event);
 		if (!address) throw new ApiError(403, 'The request source could not be verified');
 		consumeRateLimit(`chatgpt-connection-ip:${address}`, 600, 15 * 60 * 1000);
@@ -145,7 +159,7 @@ export const POST: RequestHandler = async (event) => {
 
 		const sessionToken = event.cookies.get('flavorithm_session');
 		const sessionBinding = getSessionBinding(sessionToken);
-		if (!sessionBinding) throw new ApiError(401, 'Authentication required', 'session_expired');
+		if (!sessionBinding) return sessionExpiredResponse();
 		if (parsed.data.action === 'poll' || parsed.data.action === 'cancel') {
 			consumeRateLimit(`chatgpt-device:${event.locals.user.id}`, 400, 15 * 60 * 1000);
 			const input = {
