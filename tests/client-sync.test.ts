@@ -1163,3 +1163,38 @@ test('initialize records reviewedEtag on conflicts and blocks stale resolution i
 	assert.equal(reconnected.statuses.at(-1)?.reviewedEtag, 'etag-3');
 	assert.match(reconnected.statuses.at(-1)?.error || '', /updated|review/i);
 });
+
+test('sequential offline tab stages within the same millisecond preserve stage order regardless of writerId', (t) => {
+	t.mock.method(Date, 'now', () => 1_764_200_000_000);
+	for (let run = 0; run < 16; run += 1) {
+		const user = makeUser(`user-same-ms-${run}`, `home-same-ms-${run}`);
+		const base = createNewUserState();
+		base.preferences.maxTime = 45;
+		const storage = memoryStorage();
+
+		const tabA = harness({ user, storage });
+		const tabB = harness({ user, storage });
+		tabA.controller.initialize(user, base, 'etag-1');
+		tabB.controller.initialize(user, base, 'etag-1');
+
+		const editA = structuredClone(base);
+		editA.preferences.maxTime = 25;
+		const editB = structuredClone(base);
+		editB.preferences.maxTime = 70;
+
+		tabA.controller.stage(editA);
+		tabB.controller.stage(editB);
+		tabA.controller.clearContext();
+		tabB.controller.clearContext();
+
+		const reloaded = harness({ user, storage });
+		assert.equal(reloaded.controller.restore(user), true);
+		assert.deepEqual(reloaded.statuses.at(-1)?.conflicts, [
+			{
+				path: 'kitchen.preferences.maxTime',
+				local: 70,
+				remote: 45
+			}
+		]);
+	}
+});

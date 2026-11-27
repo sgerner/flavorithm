@@ -350,12 +350,16 @@ export function createKitchenSync(options: {
 				'local'
 			);
 			if (merged.conflicts.length) continue;
+			const latestTimestamp = Math.max(
+				record.pending.updatedAt ?? 0,
+				record.pending.createdAt ?? 0
+			);
 			const pending: PendingKitchen = {
 				...record.pending,
 				base: clone(serverState),
 				local: clone(merged.state),
 				etag,
-				updatedAt: Date.now(),
+				updatedAt: Math.max(Date.now(), latestTimestamp + 1),
 				writeId: randomId()
 			};
 			try {
@@ -557,7 +561,11 @@ export function createKitchenSync(options: {
 			return;
 		}
 
-		const now = Date.now();
+		const latestJournalTimestamp = loaded.records.reduce(
+			(max, record) => Math.max(max, record.pending.createdAt ?? 0, record.pending.updatedAt ?? 0),
+			0
+		);
+		const now = Math.max(Date.now(), latestJournalTimestamp + 1);
 		const pending: PendingKitchen = {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
