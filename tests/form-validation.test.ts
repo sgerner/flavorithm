@@ -9,6 +9,7 @@ import { render } from 'svelte/server';
 import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
+import * as aiContinuationMod from '../src/lib/ai-continuation.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
@@ -308,6 +309,7 @@ function compileServerModule(
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
@@ -1155,10 +1157,33 @@ test('rendered +page.svelte modals resolve aria-describedby and keep unique IDs 
 		api.modal = 'recover';
 		api.email = 'cook@example.com';
 	});
-	assertValidRenderedAccessibility(cliRecoverHtml, '+page recover cli');
+	const cliRecoverTags = assertValidRenderedAccessibility(cliRecoverHtml, '+page recover cli');
+	assert.equal(getTagById(cliRecoverTags, 'cli-recover-email')?.attrs['aria-invalid'], 'false');
 	assert.match(
 		cliRecoverHtml,
 		/npm run auth:reset-password -- --email cook@example\.com --password-stdin/
+	);
+
+	const cliRecoverInvalidHtml = renderPageModal((api) => {
+		api.capabilities = { emailDelivery: false, recipeSearch: false };
+		api.modal = 'recover';
+		api.email = 'invalid-email';
+	});
+	const cliRecoverInvalidTags = assertValidRenderedAccessibility(
+		cliRecoverInvalidHtml,
+		'+page recover cli invalid'
+	);
+	assert.equal(
+		getTagById(cliRecoverInvalidTags, 'cli-recover-email')?.attrs['aria-invalid'],
+		'true'
+	);
+	assert.equal(
+		getTagById(cliRecoverInvalidTags, 'cli-recover-email')?.attrs['aria-describedby'],
+		'cli-recover-email-help cli-recover-email-error'
+	);
+	assert.match(
+		cliRecoverInvalidHtml,
+		/npm run auth:reset-password -- --email you@example\.com --password-stdin/
 	);
 
 	const settingsInvalidHtml = renderPageModal((api) => {
@@ -1247,6 +1272,7 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,

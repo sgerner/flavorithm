@@ -722,6 +722,27 @@ test('auth endpoint rotates session cookies on password change, updates profiles
 		409
 	);
 
+	const wrongEmailPasswordResponse = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{ user: currentVerified },
+			{
+				action: 'updateAccountProfile',
+				email: 'control-wrong-pw@example.com',
+				currentPassword: 'wrong local password'
+			},
+			'192.0.2.30'
+		) as never
+	);
+	assert.equal(wrongEmailPasswordResponse.status, 401);
+	const wrongEmailPasswordBody = (await wrongEmailPasswordResponse.json()) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(wrongEmailPasswordBody.error, 'Current password is incorrect');
+	assert.equal('code' in wrongEmailPasswordBody, false);
+	assert.equal(wrongEmailPasswordBody.code, undefined);
+
 	const secondBrowserSession = await backend.loginUser(
 		'control-user@example.com',
 		'control initial password'
@@ -763,6 +784,15 @@ test('auth endpoint rotates session cookies on password change, updates profiles
 	const userAfterEmailChange = backend.getUserFromSession(emailCookieCall?.value);
 	assert.equal(userAfterEmailChange?.email, 'control-updated@example.com');
 
+	const extraPhoneSession = await backend.loginUser(
+		'control-updated@example.com',
+		'control initial password'
+	);
+	const extraTabletSession = await backend.loginUser(
+		'control-updated@example.com',
+		'control initial password'
+	);
+
 	let setCookieCall: { name: string; value: string; options: Record<string, unknown> } | undefined;
 	const rotateEvent = {
 		...postEvent(
@@ -788,10 +818,14 @@ test('auth endpoint rotates session cookies on password change, updates profiles
 	assert.equal(setCookieCall?.name, 'flavorithm_session');
 	assert.ok(setCookieCall?.value);
 	assert.notEqual(setCookieCall?.value, emailCookieCall?.value);
+	assert.notEqual(setCookieCall?.value, extraPhoneSession.token);
+	assert.notEqual(setCookieCall?.value, extraTabletSession.token);
 	assert.equal(setCookieCall?.options.httpOnly, true);
 	assert.equal(setCookieCall?.options.sameSite, 'lax');
 	assert.equal(setCookieCall?.options.secure, true);
 	assert.equal(backend.getUserFromSession(emailCookieCall?.value), null);
+	assert.equal(backend.getUserFromSession(extraPhoneSession.token), null);
+	assert.equal(backend.getUserFromSession(extraTabletSession.token), null);
 	const activeAfterRotate = backend.getUserFromSession(setCookieCall?.value);
 	assert.equal(activeAfterRotate?.id, userAccount.user.id);
 
@@ -809,6 +843,10 @@ test('auth endpoint rotates session cookies on password change, updates profiles
 			) as never
 		);
 		assert.equal(wrongAttempt.status, 401);
+		const wrongBody = (await wrongAttempt.json()) as Record<string, unknown>;
+		assert.equal(wrongBody.error, 'Current password is incorrect');
+		assert.equal('code' in wrongBody, false);
+		assert.equal(wrongBody.code, undefined);
 	}
 	const rateLimited = await authRoute.POST(
 		postEvent(

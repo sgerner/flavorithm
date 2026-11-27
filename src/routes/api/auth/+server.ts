@@ -173,7 +173,7 @@ export const POST: RequestHandler = async (event) => {
 			consumeRateLimit(`password-reset-ip:${ip}`, 5, 60 * 60 * 1000);
 			consumeRateLimit(`password-reset-email:${email}`, 3, 60 * 60 * 1000);
 			const origin = passwordResetOrigin(event.request);
-			const reset = issuePasswordReset(email);
+			const reset = await issuePasswordReset(email);
 			if (reset) {
 				const resetUrl = new URL('/', origin);
 				resetUrl.searchParams.set('reset', reset.token);

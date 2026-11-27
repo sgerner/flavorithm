@@ -40,7 +40,7 @@ test('CLI password reset rotates seeded passwords, revokes sessions, and unblock
 			import assert from 'node:assert/strict';
 			import { loginUser, issuePasswordReset, getDatabase } from './src/lib/server/db.ts';
 			const session = await loginUser('developer@flavorithm.test', ${JSON.stringify(initialPassword)});
-			const reset = issuePasswordReset('developer@flavorithm.test');
+			const reset = await issuePasswordReset('developer@flavorithm.test');
 			assert.ok(session.token);
 			assert.ok(reset?.token);
 			getDatabase().close();
@@ -180,7 +180,7 @@ test('CLI password reset --password-stdin succeeds without printing secrets and 
 			import { registerUser, loginUser, issuePasswordReset, getDatabase } from './src/lib/server/db.ts';
 			const registered = await registerUser('Stdin Cook', 'stdin-cook@example.test', ${JSON.stringify(initialPassword)});
 			const secondSession = await loginUser('stdin-cook@example.test', ${JSON.stringify(initialPassword)});
-			const reset = issuePasswordReset('stdin-cook@example.test');
+			const reset = await issuePasswordReset('stdin-cook@example.test');
 			assert.ok(registered.token);
 			assert.ok(secondSession.token);
 			assert.ok(reset?.token);

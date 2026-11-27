@@ -25,11 +25,7 @@ function isPublicAuthRequest(
 	pathname: string,
 	mode: 'local' | 'oidc' | 'proxy' | 'invalid'
 ): boolean {
-	if (pathname === '/api/auth' && (request.method === 'GET' || mode === 'local')) return true;
-	if (pathname === '/api/recipe-import' && request.method === 'POST' && mode === 'local') {
-		return true;
-	}
-	return false;
+	return pathname === '/api/auth' && (request.method === 'GET' || mode === 'local');
 }
 
 function isHostedChatGPTCallbackRequest(request: Request, pathname: string): boolean {
@@ -51,7 +47,10 @@ function acceptsHtml(request: Request): boolean {
 }
 
 function unauthorizedApiResponse(): Response {
-	return Response.json({ error: 'Authentication required' }, { status: 401 });
+	return Response.json(
+		{ error: 'Authentication required', code: 'session_expired' },
+		{ status: 401 }
+	);
 }
 
 function unavailableResponse(api: boolean): Response {

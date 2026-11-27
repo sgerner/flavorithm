@@ -359,10 +359,10 @@ test('password recovery tokens are hashed, one-use, expiring, and revoke old ses
 		'hana@example.com',
 		'current secure password'
 	);
-	assert.equal(backend.issuePasswordReset('missing@example.com'), null);
-	const oldToken = backend.issuePasswordReset(account.user.email)!;
+	assert.equal(await backend.issuePasswordReset('missing@example.com'), null);
+	const oldToken = (await backend.issuePasswordReset(account.user.email))!;
 	assert.notEqual(oldToken.token, oldToken.email);
-	const reset = backend.issuePasswordReset(account.user.email)!;
+	const reset = (await backend.issuePasswordReset(account.user.email))!;
 	await assert.rejects(() => backend.resetUserPassword(oldToken.token, 'another secure password'), {
 		status: 400
 	});
@@ -399,7 +399,7 @@ test('password recovery tokens are hashed, one-use, expiring, and revoke old ses
 		status: 400
 	});
 
-	const expired = backend.issuePasswordReset(account.user.email)!;
+	const expired = (await backend.issuePasswordReset(account.user.email))!;
 	const now = Date.now;
 	Date.now = () => now() + 60 * 60 * 1000 + 1;
 	try {
@@ -599,6 +599,24 @@ test('normalized pantry drafts always satisfy validateAppState while raw null qu
 	assert.equal(validated.pantry[0].expires, undefined);
 });
 
+async function assertUnauthorizedWithoutCode(fn: () => Promise<unknown>) {
+	let caught: unknown;
+	await assert.rejects(fn, (error: unknown) => {
+		caught = error;
+		if (typeof error !== 'object' || error === null) return false;
+		assert.ok(error instanceof backend.ApiError);
+		const record = error as { status?: number; code?: string };
+		assert.equal(record.status, 401);
+		assert.equal(record.code, undefined);
+		return true;
+	});
+	const response = backend.errorResponse(caught);
+	assert.equal(response.status, 401);
+	const body = (await response.json()) as Record<string, unknown>;
+	assert.equal('code' in body, false);
+	assert.equal(body.code, undefined);
+}
+
 test('local password rotation keeps a rotated session while revoking other sessions and reset tokens', async () => {
 	const firstDevice = await backend.registerUser(
 		'Nadia Cook',
@@ -606,17 +624,19 @@ test('local password rotation keeps a rotated session while revoking other sessi
 		'initial local password'
 	);
 	const secondDevice = await backend.loginUser('nadia@example.com', 'initial local password');
-	const pendingReset = backend.issuePasswordReset('nadia@example.com')!;
+	const thirdDevice = await backend.loginUser('nadia@example.com', 'initial local password');
+	const pendingReset = (await backend.issuePasswordReset('nadia@example.com'))!;
 
-	await assert.rejects(
-		() =>
-			backend.rotateUserCredentials(
-				firstDevice.user.id,
-				'wrong local password',
-				'rotated local password 123'
-			),
-		{ status: 401 }
+	await assertUnauthorizedWithoutCode(() =>
+		backend.rotateUserCredentials(
+			firstDevice.user.id,
+			'wrong local password',
+			'rotated local password 123'
+		)
 	);
+	assert.equal(backend.getUserFromSession(firstDevice.token)?.id, firstDevice.user.id);
+	assert.equal(backend.getUserFromSession(secondDevice.token)?.id, firstDevice.user.id);
+	assert.equal(backend.getUserFromSession(thirdDevice.token)?.id, firstDevice.user.id);
 	await assert.rejects(
 		() => backend.rotateUserCredentials(firstDevice.user.id, 'initial local password', 'short'),
 		{ status: 400 }
@@ -634,8 +654,10 @@ test('local password rotation keeps a rotated session while revoking other sessi
 	);
 	assert.notEqual(rotated.token, firstDevice.token);
 	assert.notEqual(rotated.token, secondDevice.token);
+	assert.notEqual(rotated.token, thirdDevice.token);
 	assert.equal(backend.getUserFromSession(firstDevice.token), null);
 	assert.equal(backend.getUserFromSession(secondDevice.token), null);
+	assert.equal(backend.getUserFromSession(thirdDevice.token), null);
 	assert.equal(backend.getUserFromSession(rotated.token)?.id, firstDevice.user.id);
 	await assert.rejects(
 		() => backend.resetUserPassword(pendingReset.token, 'another valid password 123'),
@@ -689,17 +711,14 @@ test('local profile updates validate passwords on email changes, revoke other se
 	assert.equal(backend.getUserFromSession(account.token)?.name, 'Updated Chef');
 	assert.equal(backend.getUserFromSession(otherSession.token)?.name, 'Updated Chef');
 
-	await assert.rejects(
-		() => backend.updateAccountProfile(account.user.id, { email: 'new-address@example.com' }),
-		{ status: 401 }
+	await assertUnauthorizedWithoutCode(() =>
+		backend.updateAccountProfile(account.user.id, { email: 'new-address@example.com' })
 	);
-	await assert.rejects(
-		() =>
-			backend.updateAccountProfile(account.user.id, {
-				email: 'new-address@example.com',
-				currentPassword: 'wrong local password'
-			}),
-		{ status: 401 }
+	await assertUnauthorizedWithoutCode(() =>
+		backend.updateAccountProfile(account.user.id, {
+			email: 'new-address@example.com',
+			currentPassword: 'wrong local password'
+		})
 	);
 	await assert.rejects(
 		() =>
@@ -726,7 +745,7 @@ test('local profile updates validate passwords on email changes, revoke other se
 	assert.equal(backend.getUserFromSession(reEmail.token)?.email, 'new-address@example.com');
 
 	const pendingNewVerify = backend.issueEmailVerification(account.user.id)!;
-	const pendingReset = backend.issuePasswordReset('new-address@example.com')!;
+	const pendingReset = (await backend.issuePasswordReset('new-address@example.com'))!;
 	const thirdDevice = await backend.loginUser('new-address@example.com', 'profile secure password');
 	const thirdEmail = await backend.updateAccountProfile(account.user.id, {
 		email: 'third-address@example.com',
