@@ -70,6 +70,39 @@ export function searchModels(models: ConnectionModel[], query: string) {
 	);
 }
 
+export function reconcileModelPreferences(
+	models: ConnectionModel[],
+	modelId: string,
+	reasoning?: ReasoningSettings
+): { model: string; reasoning?: ReasoningSettings } {
+	if (!modelId) return { model: '', reasoning: undefined };
+	const matched = models.find((candidate) => candidate.id === modelId);
+	if (!matched) return { model: '', reasoning: undefined };
+	if (!reasoning || !matched.reasoning) return { model: matched.id, reasoning: undefined };
+	const metadata = matched.reasoning;
+	const next: ReasoningSettings = {};
+	if (reasoning.enabled !== undefined && metadata.toggle) {
+		next.enabled = reasoning.enabled;
+	}
+	if (next.enabled !== false) {
+		if (reasoning.effort && metadata.efforts.includes(reasoning.effort)) {
+			next.effort = reasoning.effort;
+		}
+		if (
+			reasoning.budgetTokens !== undefined &&
+			metadata.budgetMin !== undefined &&
+			reasoning.budgetTokens >= metadata.budgetMin &&
+			reasoning.budgetTokens <= (metadata.budgetMax ?? 32_768)
+		) {
+			next.budgetTokens = reasoning.budgetTokens;
+		}
+	}
+	return {
+		model: matched.id,
+		reasoning: Object.keys(next).length ? next : undefined
+	};
+}
+
 export const CHATGPT_OAUTH_POLL_INTERVAL_MS = 1_500;
 export const CHATGPT_OAUTH_TTL_MS = 10 * 60_000;
 

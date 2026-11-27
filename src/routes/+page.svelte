@@ -174,6 +174,7 @@
 		CHATGPT_OAUTH_POLL_INTERVAL_MS,
 		CHATGPT_OAUTH_TTL_MS,
 		HOST_CONNECTION_ID,
+		reconcileModelPreferences,
 		startConnectionPoll,
 		type ConnectionModel,
 		type ConnectionPollHandle,
@@ -1190,7 +1191,11 @@
 			throw error;
 		}
 		if (!response.ok) {
-			if (response.status === 401 && managedAuth) {
+			if (
+				response.status === 401 &&
+				managedAuth &&
+				(data?.code === 'session_expired' || data?.error === 'Authentication required')
+			) {
 				clearManagedIdentity();
 				renewManagedSession({ status: 401 });
 			}
@@ -1201,7 +1206,7 @@
 			}
 			throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), {
 				status: response.status,
-				code: data.code
+				...(typeof data?.code === 'string' ? { code: data.code } : {})
 			});
 		}
 		if (url === '/api/state') stateEtag = data.state ? response.headers.get('etag') : null;
@@ -1883,7 +1888,7 @@
 			fetchPublicCatalog: () => request('/api/models'),
 			fetchAccountCatalog: (accountId) =>
 				request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`),
-			onResult: ({ catalog, account }) => {
+			onResult: async ({ catalog, account, queriedAccountId }) => {
 				if (catalog.status === 'fulfilled') providers = catalog.value.providers;
 				else
 					catalogError =
@@ -1892,8 +1897,42 @@
 					accountModels = account.value?.providers[0]?.models || [];
 				else {
 					accountModels = [];
-					catalogError =
-						(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+					const code = (account.reason as { code?: string })?.code;
+					if (
+						code === 'chatgpt_reauth_required' ||
+						code === 'provider_auth' ||
+						code === 'host_ai_unavailable'
+					) {
+						await refreshConnections().catch(() => {});
+						if (version !== catalogVersion || user?.id !== owner) return;
+						const fallbackAccountId = entitledChatGPTAccountId(
+							kitchen.preferences,
+							chatGPT.accounts,
+							chatGPT.host
+						);
+						if (fallbackAccountId && fallbackAccountId !== queriedAccountId) {
+							try {
+								const fallback = await request(
+									`/api/models?connection=chatgpt&accountId=${encodeURIComponent(fallbackAccountId)}`
+								);
+								if (version !== catalogVersion || user?.id !== owner) return;
+								accountModels = fallback?.providers[0]?.models || [];
+							} catch (fallbackError) {
+								if (version !== catalogVersion || user?.id !== owner) return;
+								catalogError =
+									(fallbackError as Error)?.message || 'ChatGPT models could not be loaded.';
+							}
+						}
+						if (code === 'host_ai_unavailable') {
+							notify((account.reason as Error)?.message || 'Host AI is currently unavailable.');
+						} else if (activeChatGPTAccount?.connected && !accountModels.length && !catalogError) {
+							catalogError =
+								(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+						}
+					} else {
+						catalogError =
+							(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+					}
 				}
 				catalogLoading = false;
 			}
@@ -1989,6 +2028,34 @@
 		const currentDevice = chatGPTDevice;
 		const attempt = ++connectionAttempt;
 		const owner = user.id;
+		const previousAccountId = kitchen.preferences.chatgptAccountId;
+		const previousModel = kitchen.preferences.model;
+		const previousReasoning = kitchen.preferences.reasoning
+			? { ...kitchen.preferences.reasoning }
+			: undefined;
+		const applyConnectedPreferences = async (reconnectedAccountId: string) => {
+			const sameAccount = Boolean(
+				reconnectedAccountId && reconnectedAccountId === (accountId ?? previousAccountId)
+			);
+			kitchen.preferences.chatgptAccountId = reconnectedAccountId;
+			kitchen.preferences.provider = 'chatgpt';
+			if (!sameAccount) {
+				kitchen.preferences.model = '';
+				kitchen.preferences.reasoning = undefined;
+			}
+			await loadModelCatalog();
+			if (attempt !== connectionAttempt || user?.id !== owner) return false;
+			if (sameAccount) {
+				const reconciled = reconcileModelPreferences(
+					accountModels,
+					previousModel,
+					previousReasoning
+				);
+				kitchen.preferences.model = reconciled.model;
+				kitchen.preferences.reasoning = reconciled.reasoning;
+			}
+			return true;
+		};
 		connectionPoll?.stop();
 		connectionPoll = undefined;
 		connectionPopup?.close();
@@ -2057,12 +2124,12 @@
 								chatGPTDevice = null;
 								await refreshConnections();
 								if (attempt !== connectionAttempt || user?.id !== owner) return false;
-								kitchen.preferences.chatgptAccountId = connected.accountId;
-								kitchen.preferences.provider = 'chatgpt';
-								kitchen.preferences.model = '';
-								kitchen.preferences.reasoning = undefined;
-								await loadModelCatalog();
-								notify('ChatGPT connected. Choose a model.');
+								if (!(await applyConnectedPreferences(connected.accountId))) return false;
+								notify(
+									kitchen.preferences.model
+										? 'ChatGPT reconnected.'
+										: 'ChatGPT connected. Choose a model.'
+								);
 								return false;
 							}
 							if (expired) {
@@ -2101,18 +2168,6 @@
 
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else if (
-				importSession.url ||
-				importSession.text ||
-				importSession.photo ||
-				importSession.draft
-			) {
-				chatGPTAuthorizationUrl = result.authorizationUrl;
-			} else {
-				connectionActive = false;
-				window.location.assign(result.authorizationUrl);
-				return;
-			}
 			const expiresAt =
 				typeof result.expiresAt === 'number' ? result.expiresAt : Date.now() + CHATGPT_OAUTH_TTL_MS;
 			connectionPoll = startConnectionPoll({
@@ -2148,15 +2203,13 @@
 							if (account && connectionChanged) {
 								connectionPopup?.close();
 								connectionPopup = null;
-								kitchen.preferences.chatgptAccountId = account.id;
-								kitchen.preferences.provider = 'chatgpt';
-								kitchen.preferences.model = '';
-								kitchen.preferences.reasoning = undefined;
-								await loadModelCatalog();
+								if (!(await applyConnectedPreferences(account.id))) return false;
 								notify(
-									account.planEnabled
-										? 'ChatGPT connected. Choose a model to cook with your plan.'
-										: 'ChatGPT signed in. Enable plan usage to generate recipes.'
+									!account.planEnabled
+										? 'ChatGPT signed in. Enable plan usage to generate recipes.'
+										: kitchen.preferences.model
+											? 'ChatGPT reconnected.'
+											: 'ChatGPT connected. Choose a model to cook with your plan.'
 								);
 							} else if (!connectionChanged) {
 								connectionPopup = null;
@@ -2331,7 +2384,9 @@
 		try {
 			return await request('/api/ai', buildPayload(useHost), 'POST', signal);
 		} catch (err) {
-			if (useHost && (err as { status?: number })?.status === 400) {
+			const status = (err as { status?: number })?.status;
+			const code = (err as { code?: string })?.code;
+			if (useHost && (status === 400 || code === 'host_ai_unavailable')) {
 				await refreshConnections().catch(() => {});
 				if (!chatGPT.host) {
 					if (hasPersonalAIReady()) {
@@ -2339,6 +2394,12 @@
 					}
 					void openSettings(true);
 				}
+			} else if (
+				code === 'chatgpt_reauth_required' ||
+				code === 'provider_auth' ||
+				code === 'host_ai_unavailable'
+			) {
+				await refreshConnections().catch(() => {});
 			}
 			throw err;
 		}
