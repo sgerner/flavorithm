@@ -46,6 +46,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import * as recipeSubflowsMod from '../src/lib/recipe-subflows.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import * as searchPickerMod from '../src/lib/search-picker.ts';
 import type { AppState, Recipe, User } from '../src/lib/types.ts';
@@ -282,7 +283,7 @@ function compileServerModule(
 		'#lib/components/DisclosureButton.svelte': noopComponent,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': { activeFocusedElement: () => null, focusTrap: () => ({}) },
 		'#lib/form-validation.ts': formValidationMod,
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
@@ -302,6 +303,7 @@ function compileServerModule(
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/recipe-subflows.ts': recipeSubflowsMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/search-picker.ts': searchPickerMod,
 		'#lib/butler.ts': butlerMod,
@@ -1161,7 +1163,7 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'@lucide/svelte': iconProxy,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': { activeFocusedElement: () => null, focusTrap: () => ({}) },
 		'#lib/form-validation.ts': formValidationMod,
 		'#lib/components/FormField.svelte': { default: noopComponent },
 		'#lib/motion.ts': {
@@ -1181,6 +1183,7 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/recipe-subflows.ts': recipeSubflowsMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,

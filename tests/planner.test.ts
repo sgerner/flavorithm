@@ -29,6 +29,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import * as recipeSubflowsMod from '../src/lib/recipe-subflows.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import * as stateSchemaMod from '../src/lib/state-schema.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
@@ -40,6 +41,7 @@ const { MAX_RECIPES } = recipeCollectionMod;
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
 	effect_root: (fn: () => void) => () => void;
+	flush: (fn?: () => void) => void;
 };
 const svelteServer = nodeRequire('svelte/internal/server') as Record<string, unknown>;
 
@@ -68,6 +70,16 @@ function injectPlannerHook(svelteSource: string): string {
 		get week() { return week; },
 		get weekOffset() { return weekOffset; },
 		set weekOffset(value: number) { weekOffset = value; },
+		get modal() { return modal; },
+		get selectedId() { return selectedId; },
+		set selectedId(value: string | null) { selectedId = value; },
+		get selected() { return selected; },
+		get editingRecipe() { return editingRecipe; },
+		get recipeToDelete() { return recipeToDelete; },
+		get plannedRecipe() { return plannedRecipe; },
+		get detailReturnFocus() { return detailReturnFocus; },
+		get editorReturnFocus() { return editorReturnFocus; },
+		get modalReturnFocus() { return modalReturnFocus; },
 		get deductPantry() { return deductPantry; },
 		set deductPantry(value: boolean) { deductPantry = value; },
 		get cookedHistoryLimit() { return cookedHistoryLimit; },
@@ -80,8 +92,19 @@ function injectPlannerHook(svelteSource: string): string {
 		dateKey,
 		mealSlotKey,
 		formatCompletedDate,
+		openRecipeDetail,
+		adoptKitchen,
+		replaceKitchen,
+		editSavedRecipe,
+		closeRecipeEditor,
+		saveEditedRecipe,
+		askDeleteRecipe,
+		handleWindowKeydown,
 		openRecipePicker,
 		choosePickedRecipe,
+		planRecipe,
+		addMeal,
+		closeDialog,
 		openCookDialog,
 		markMealCooked,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
@@ -168,6 +191,15 @@ type PlannerHarnessApi = {
 	authMetadataLoaded: boolean;
 	readonly week: Date[];
 	weekOffset: number;
+	readonly modal: string;
+	selectedId: string | null;
+	readonly selected: Recipe | null;
+	readonly editingRecipe: Recipe | null;
+	readonly recipeToDelete: Recipe | null;
+	readonly plannedRecipe: Recipe | null;
+	readonly detailReturnFocus: HTMLElement | null;
+	readonly editorReturnFocus: HTMLElement | null;
+	readonly modalReturnFocus: HTMLElement | null;
 	deductPantry: boolean;
 	cookedHistoryLimit: number;
 	readonly recipesById: Map<string, Recipe>;
@@ -182,8 +214,21 @@ type PlannerHarnessApi = {
 		formatter: Intl.DateTimeFormat,
 		fallback?: string
 	) => string;
+	openRecipeDetail: (id: string | null, servings?: number) => void;
+	adoptKitchen: (state: AppState) => void;
+	replaceKitchen: (state: AppState) => void;
+	editSavedRecipe: (recipe: Recipe) => void;
+	closeRecipeEditor: () => void;
+	saveEditedRecipe: (updated: Recipe) => void;
+	askDeleteRecipe: (recipe: Recipe) => void;
+	handleWindowKeydown: (
+		event: Pick<KeyboardEvent, 'key' | 'defaultPrevented'> & { preventDefault?: () => void }
+	) => void;
 	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
 	choosePickedRecipe: (recipe: Recipe) => void;
+	planRecipe: (recipe: Recipe, servings?: number) => void;
+	addMeal: (event?: SubmitEvent) => void;
+	closeDialog: () => void;
 	openCookDialog: (meal: Meal) => void;
 	markMealCooked: (event?: SubmitEvent) => Promise<void>;
 	showMoreHistory: () => void;
@@ -220,7 +265,19 @@ function createModuleMap() {
 		'@lucide/svelte': iconProxy,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': {
+			activeFocusedElement: () => {
+				const doc = (
+					globalThis as {
+						document?: { activeElement?: unknown; body?: unknown; documentElement?: unknown };
+					}
+				).document;
+				const active = doc?.activeElement ?? null;
+				if (!active || active === doc?.body || active === doc?.documentElement) return null;
+				return active;
+			},
+			focusTrap: () => ({})
+		},
 		'#lib/form-validation.ts': formValidationMod,
 		'#lib/components/FormField.svelte': { default: noopComponent },
 		'#lib/motion.ts': {
@@ -241,9 +298,18 @@ function createModuleMap() {
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/recipe-subflows.ts': recipeSubflowsMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
-		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
+		'#lib/voice-capture.ts': {
+			...voiceCaptureMod,
+			VoiceCapture: class {
+				cancel() {}
+				discard() {}
+				stop() {}
+				hasRetainedAudio = false;
+			}
+		},
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
@@ -377,6 +443,43 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 	const downloads: Array<{ filename: string; content: string; type: string }> = [];
 	const blobUrls = new Map<string, { content: string; type: string }>();
 	const storage = makeMemoryStorage();
+	const mockDocument = {
+		body: { id: 'body' },
+		documentElement: {
+			id: 'html',
+			dataset: {},
+			classList: { toggle: () => {} }
+		},
+		activeElement: null as unknown,
+		querySelector: () => null,
+		createElement: (tag: string) => {
+			const anchor = {
+				tag,
+				href: '',
+				download: '',
+				click: () => {
+					const payload = blobUrls.get(anchor.href);
+					downloads.push({
+						filename: anchor.download,
+						content: payload?.content ?? '',
+						type: payload?.type ?? ''
+					});
+				}
+			};
+			return anchor;
+		}
+	};
+	mockDocument.activeElement = mockDocument.body;
+	modMap['#lib/focus.ts'] = {
+		activeFocusedElement: () => {
+			const active = mockDocument.activeElement;
+			if (!active || active === mockDocument.body || active === mockDocument.documentElement) {
+				return null;
+			}
+			return active;
+		},
+		focusTrap: () => ({})
+	};
 	const navigatorState = { onLine: options?.onLine ?? true };
 	let fetchImpl: typeof fetch =
 		options?.fetch ??
@@ -462,29 +565,7 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 		clearInterval,
 		localStorage: storage,
 		navigator: navigatorState,
-		document: {
-			documentElement: {
-				dataset: {},
-				classList: { toggle: () => {} }
-			},
-			querySelector: () => null,
-			createElement: (tag: string) => {
-				const anchor = {
-					tag,
-					href: '',
-					download: '',
-					click: () => {
-						const payload = blobUrls.get(anchor.href);
-						downloads.push({
-							filename: anchor.download,
-							content: payload?.content ?? '',
-							type: payload?.type ?? ''
-						});
-					}
-				};
-				return anchor;
-			}
-		},
+		document: mockDocument,
 		window: {
 			location: {
 				assign: (url: string) => assignedUrls.push(url),
@@ -511,6 +592,7 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 			fetchImpl = next;
 		},
 		storage,
+		mockDocument,
 		dispose
 	};
 }
@@ -1009,6 +1091,203 @@ test('marking a meal cooked keeps pantry deduction opt-in', async () => {
 			false
 		);
 		assert.equal(api.deductPantry, false);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('plan dialog preserves open recipe on cancel and keeps selected null when opened from recipe picker', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const activeRecipe = makeRecipe('r-active', 'Active Pasta');
+		const pickedRecipe = makeRecipe('r-picked', 'Picked Curry');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [activeRecipe, pickedRecipe],
+			meals: []
+		};
+
+		// Plan from an open RecipeDetail, then cancel: selected stays open and plannedRecipe clears.
+		api.openRecipeDetail(activeRecipe.id);
+		api.planRecipe(activeRecipe, 6);
+		assert.equal(api.modal, 'plan');
+		assert.equal(api.selected?.id, activeRecipe.id);
+		assert.equal(api.plannedRecipe?.id, activeRecipe.id);
+
+		api.closeDialog();
+		assert.equal(api.modal, '');
+		assert.equal(api.selected?.id, activeRecipe.id);
+		assert.equal(api.plannedRecipe, null);
+
+		// Open recipe picker from planner without slotTarget, choose recipe, then cancel: selected stays null.
+		api.openRecipeDetail(null);
+		api.openRecipePicker();
+		assert.equal(api.modal, 'pickRecipe');
+		assert.equal(api.selected, null);
+		api.choosePickedRecipe(pickedRecipe);
+		assert.equal(api.modal, 'plan');
+		assert.equal(api.selected, null);
+		assert.equal((api.plannedRecipe as Recipe | null)?.id, pickedRecipe.id);
+
+		api.closeDialog();
+		assert.equal(api.modal, '');
+		assert.equal(api.selected, null);
+		assert.equal(api.plannedRecipe, null);
+
+		// Confirming addMeal schedules plannedRecipe and closes open RecipeDetail.
+		api.openRecipeDetail(activeRecipe.id);
+		api.planRecipe(activeRecipe, 5);
+		api.setPlannedDraft('2026-11-24', 'Dinner', 5);
+		api.addMeal();
+		assert.equal(api.modal, '');
+		assert.equal(api.selected, null);
+		assert.equal(api.plannedRecipe, null);
+		assert.equal(api.kitchen.meals.length, 1);
+		assert.equal(api.kitchen.meals[0].recipeId, activeRecipe.id);
+		assert.equal(api.kitchen.meals[0].servings, 5);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('replacing kitchen refreshes derived selected/plannedRecipe/recipeToDelete and clears removed recipe state', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const v1 = makeRecipe('r-sync', 'Initial Lemon Pasta');
+		const keeper = makeRecipe('r-keep', 'Keeper Soup');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [v1, keeper],
+			meals: []
+		};
+
+		// Open RecipeDetail and stack Plan dialog over it.
+		api.openRecipeDetail(v1.id);
+		api.planRecipe(v1, 4);
+		const initialSelected = api.selected;
+		assert.equal(initialSelected, api.kitchen.recipes[0]);
+		assert.equal(initialSelected?.title, 'Initial Lemon Pasta');
+		assert.equal(api.plannedRecipe, api.kitchen.recipes[0]);
+		assert.equal(api.modal, 'plan');
+
+		// Simulate kitchenSync / adoptKitchen / undo replacing kitchen with a fresh Recipe instance for the same ID.
+		const v2: Recipe = { ...v1, title: 'Synced Lemon Pasta', servings: 6, rating: 5 };
+		api.adoptKitchen({
+			...dataMod.createNewUserState(),
+			recipes: [v2, keeper],
+			meals: []
+		});
+		assert.notEqual(api.selected, initialSelected);
+		assert.equal(api.selected, api.kitchen.recipes[0]);
+		assert.equal(api.selected?.title, 'Synced Lemon Pasta');
+		assert.equal(api.selected?.servings, 6);
+		assert.equal(api.selected?.rating, 5);
+		assert.equal(api.plannedRecipe, api.kitchen.recipes[0]);
+		assert.equal(api.modal, 'plan');
+
+		// Simulate kitchen replacement where the open/planned recipe was deleted remotely: clears stale state and modal immediately.
+		api.replaceKitchen({
+			...dataMod.createNewUserState(),
+			recipes: [keeper],
+			meals: []
+		});
+		assert.equal(api.selectedId, null);
+		assert.equal(api.selected, null);
+		assert.equal(api.plannedRecipe, null);
+		assert.equal(api.modal, '');
+
+		// Direct reactive assignment to kitchen also reconciles via $effect.pre when client effects flush.
+		api.openRecipeDetail(keeper.id);
+		api.askDeleteRecipe(keeper);
+		assert.equal((api.selected as Recipe | null)?.id, keeper.id);
+		assert.equal(api.recipeToDelete?.id, keeper.id);
+		assert.equal(api.modal, 'deleteRecipe');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [],
+			meals: []
+		};
+		svelteClient.flush();
+		assert.equal(api.selectedId, null);
+		assert.equal(api.selected, null);
+		assert.equal(api.recipeToDelete, null);
+		assert.equal(api.modal, '');
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('captures detailReturnFocus, editorReturnFocus, and modalReturnFocus before state mutation', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api, mockDocument } = harness;
+		const recipe = makeRecipe('r-focus', 'Focus Pasta');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [recipe],
+			meals: []
+		};
+
+		const cardButton = { id: 'recipe-card-btn' } as unknown as HTMLElement;
+		const editButton = { id: 'recipe-edit-btn' } as unknown as HTMLElement;
+		const deleteButton = { id: 'recipe-delete-btn' } as unknown as HTMLElement;
+
+		mockDocument.activeElement = cardButton;
+		api.openRecipeDetail(recipe.id);
+		mockDocument.activeElement = mockDocument.body;
+		assert.equal(api.detailReturnFocus, cardButton);
+
+		mockDocument.activeElement = editButton;
+		api.editSavedRecipe(recipe);
+		mockDocument.activeElement = mockDocument.body;
+		assert.equal(api.editorReturnFocus, editButton);
+		assert.equal(api.detailReturnFocus, cardButton);
+
+		api.closeRecipeEditor();
+		assert.equal(api.editorReturnFocus, null);
+		assert.equal(api.selected?.id, recipe.id);
+
+		mockDocument.activeElement = deleteButton;
+		api.askDeleteRecipe(recipe);
+		mockDocument.activeElement = mockDocument.body;
+		assert.equal(api.modalReturnFocus, deleteButton);
+		assert.equal(api.modal, 'deleteRecipe');
+
+		api.closeDialog();
+		assert.equal(api.modalReturnFocus, null);
+		assert.equal(api.detailReturnFocus, cardButton);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('window Escape dismisses editingRecipe before selected when both are open', () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-esc', 'Escape Risotto');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [recipe],
+			meals: []
+		};
+
+		api.openRecipeDetail(recipe.id);
+		api.editSavedRecipe(recipe);
+		assert.equal(api.selected?.id, recipe.id);
+		assert.notEqual(api.editingRecipe, null);
+
+		// First Escape closes RecipeEditor while keeping RecipeDetail open.
+		api.handleWindowKeydown({ key: 'Escape', defaultPrevented: false });
+		assert.equal(api.editingRecipe, null);
+		assert.equal(api.selected?.id, recipe.id);
+
+		// Second Escape closes RecipeDetail.
+		api.handleWindowKeydown({ key: 'Escape', defaultPrevented: false });
+		assert.equal(api.selected, null);
+		assert.equal(api.selectedId, null);
 	} finally {
 		harness.dispose();
 	}

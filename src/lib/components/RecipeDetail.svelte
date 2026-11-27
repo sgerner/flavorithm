@@ -2,7 +2,7 @@
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
+	import { focusTrap, type FocusTrapOptions } from '#lib/focus.ts';
 	import { describeBy, fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
@@ -52,6 +52,8 @@
 		toggleHidden,
 		busy,
 		initialServings,
+		returnFocus = null,
+		fallbackFocus = null,
 		completedSteps = $bindable<number[]>([]),
 		tab = $bindable<RecipeTab>('recipe')
 	}: {
@@ -67,6 +69,8 @@
 		toggleHidden: () => void;
 		busy: boolean;
 		initialServings?: number;
+		returnFocus?: FocusTrapOptions['returnFocus'];
+		fallbackFocus?: FocusTrapOptions['fallbackFocus'];
 		completedSteps?: number[];
 		tab?: RecipeTab;
 	} = $props();
@@ -140,7 +144,7 @@
 	<div
 		class="recipe-dialog"
 		transition:dialogMotion|global
-		use:focusTrap
+		use:focusTrap={{ returnFocus, fallbackFocus }}
 		role="dialog"
 		aria-modal="true"
 		aria-label={recipe.title}

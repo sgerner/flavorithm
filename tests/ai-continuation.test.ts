@@ -41,6 +41,7 @@ import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import * as recipeSubflowsMod from '../src/lib/recipe-subflows.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import type { AppState, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
@@ -394,7 +395,7 @@ function injectContinuationHook(svelteSource: string): string {
 		get resumeDialog() { return resumeDialog; },
 		set resumeDialog(value: ResumeDialog) { resumeDialog = value; },
 		get selected() { return selected; },
-		set selected(value: Recipe | null) { selected = value; },
+		set selected(value: Recipe | null) { selectedId = value?.id ?? null; },
 		get selectedMealServings() { return selectedMealServings; },
 		set selectedMealServings(value: number | undefined) { selectedMealServings = value; },
 		get selectedDetailTab() { return selectedDetailTab; },
@@ -589,7 +590,7 @@ function createReactivePage(options?: {
 			prepareAIPhoto: preparePhoto
 		},
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': { focusTrap: () => ({}), activeFocusedElement: () => null },
 		'#lib/form-validation.ts': formValidationMod,
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
@@ -609,6 +610,7 @@ function createReactivePage(options?: {
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/recipe-subflows.ts': recipeSubflowsMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
@@ -620,6 +622,8 @@ function createReactivePage(options?: {
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
+		'#lib/components/FormField.svelte': { default: noopComponent },
+		'#lib/components/ToggleButton.svelte': { default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
 		'#lib/components/SyncStatus.svelte': { default: noopComponent },
