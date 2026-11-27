@@ -54,7 +54,8 @@
 		busy,
 		initialServings,
 		preferences,
-		completedSteps = $bindable<number[]>([])
+		completedSteps = $bindable<number[]>([]),
+		tab = $bindable<RecipeTab>('recipe')
 	}: {
 		recipe: Recipe;
 		close: () => void;
@@ -70,9 +71,9 @@
 		initialServings?: number;
 		preferences?: Pick<Preferences, 'diet' | 'allergies'>;
 		completedSteps?: number[];
+		tab?: RecipeTab;
 	} = $props();
 	let nutritionMode = $state<NutritionMode>('serving');
-	let tab = $state<RecipeTab>('recipe');
 	let completed = $derived(
 		completedSteps.filter(
 			(step) => Number.isInteger(step) && step >= 0 && step < recipe.steps.length
