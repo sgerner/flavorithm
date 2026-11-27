@@ -17,6 +17,7 @@ import * as coverUploadMod from '../src/lib/cover-upload.ts';
 import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
+import * as formValidationMod from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
 import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
@@ -83,6 +84,7 @@ function injectPlannerHook(svelteSource: string): string {
 		openRecipePicker,
 		choosePickedRecipe,
 		openCookDialog,
+		markMealCooked,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
 		saveMealChanges,
@@ -98,6 +100,7 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.recipes = [...kitchen.recipes];
 		},
 		logout,
+		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
 		adoptKitchen,
 		refreshAuth,
@@ -189,6 +192,7 @@ type PlannerHarnessApi = {
 	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
 	choosePickedRecipe: (recipe: Recipe) => void;
 	openCookDialog: (meal: Meal) => void;
+	markMealCooked: (event?: SubmitEvent) => Promise<void>;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
 	saveMealChanges: () => void;
@@ -196,6 +200,7 @@ type PlannerHarnessApi = {
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
 	logout: () => Promise<void>;
+	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
 	adoptKitchen: (state: AppState) => void;
 	refreshAuth: () => Promise<{ stateLoaded?: boolean }>;
@@ -228,6 +233,8 @@ function createModuleMap() {
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/form-validation.ts': formValidationMod,
+		'#lib/components/FormField.svelte': { default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -884,6 +891,7 @@ test('incremental history slicing reveals 20 rows per click, preserves limit acr
 			email: 'sam@example.test',
 			householdId: 'h-2'
 		};
+		api.deletePassword = 'valid-password';
 		await api.deleteAccount({ preventDefault: () => {} } as SubmitEvent);
 		assert.equal(api.cookedHistoryLimit, 20);
 	} finally {
@@ -949,27 +957,71 @@ test('choosing a recipe for a planner slot keeps valid servings above 24', () =>
 	}
 });
 
-test('marking a meal cooked keeps pantry deduction opt-in', () => {
+test('marking a meal cooked keeps pantry deduction opt-in', async () => {
 	const harness = createReactivePlanner();
 	try {
 		const { api } = harness;
 		const recipe = makeRecipe('r-cook', 'Weeknight Pasta');
-		const meal: Meal = {
-			id: 'meal-cook',
+		recipe.ingredients = [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'garlic', quantity: 2, unit: 'clove' }
+		];
+		const firstMeal: Meal = {
+			id: 'meal-cook-1',
 			date: '2026-11-23',
 			slot: 'Dinner',
 			recipeId: recipe.id,
 			servings: recipe.servings
 		};
-		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
+		const secondMeal: Meal = {
+			id: 'meal-cook-2',
+			date: '2026-11-24',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: recipe.servings
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			pantry: [{ id: 'p-oil', name: 'olive oil', quantity: 4, unit: 'tbsp', category: 'Pantry' }],
+			recipes: [recipe],
+			meals: [firstMeal, secondMeal],
+			shopping: [
+				{
+					id: 'checked-garlic',
+					name: 'garlic',
+					quantity: 2,
+					unit: 'clove',
+					checked: true,
+					sourceKey: 'week:2026-11-23'
+				}
+			]
+		};
 
-		api.openCookDialog(meal);
+		api.openCookDialog(firstMeal);
 		assert.equal(api.deductPantry, false);
 
+		await api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === firstMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 4);
+		assert.equal(api.kitchen.shopping.find((item) => item.id === 'checked-garlic')?.quantity, 2);
+		assert.equal(api.deductPantry, false);
+
+		api.openCookDialog(secondMeal);
+		assert.equal(api.deductPantry, false);
 		api.deductPantry = true;
 		assert.equal(api.deductPantry, true);
 
-		api.openCookDialog(meal);
+		api.openCookDialog(secondMeal);
+		assert.equal(api.deductPantry, false);
+
+		api.deductPantry = true;
+		await api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === secondMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 3);
+		assert.equal(
+			api.kitchen.shopping.some((item) => item.id === 'checked-garlic'),
+			false
+		);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();

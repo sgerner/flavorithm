@@ -1391,6 +1391,19 @@ main {
 	display: inline;
 	vertical-align: -0.125em;
 }
+.field .field-help,
+.field .error {
+	margin: 0;
+	font-weight: 400;
+}
+.draft-row-error {
+	margin: 4px 0 10px;
+}
+input[aria-invalid='true'],
+select[aria-invalid='true'],
+textarea[aria-invalid='true'] {
+	border-color: #b55439;
+}
 .dialog-actions {
 	display: flex;
 	align-items: center;
@@ -4591,4 +4604,13 @@ main {
 	.recipe-dialog {
 		border: 1px solid CanvasText;
 	}
+}
+.dark .error {
+	color: var(--danger-ink);
+	border-left-color: currentColor;
+}
+.dark input[aria-invalid='true'],
+.dark select[aria-invalid='true'],
+.dark textarea[aria-invalid='true'] {
+	border-color: #ffb4a2;
 }
