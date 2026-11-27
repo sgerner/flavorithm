@@ -129,14 +129,22 @@
 		{#if saved}
 			<span>Kitchen saved</span>
 		{:else if !online}<CloudOff size={18} aria-hidden="true" /><span
-				>Offline{pending && !error ? ' · Changes pending on this device' : ''}</span
+				>Offline{pending ? ' · Changes pending on this device' : ''}</span
 			>
 		{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
 		{:else if syncing}<RefreshCw size={18} aria-hidden="true" /><span>Syncing your kitchen…</span>
-		{:else if error}<span
-				>{pending ? 'Kitchen sync failed. Your changes are pending.' : 'Kitchen sync failed.'}</span
+		{:else if pending}<span
+				>{error
+					? 'Kitchen sync failed. Your changes are pending.'
+					: 'Changes pending on this device. Waiting to sync.'}</span
 			>
-		{:else if pending}<span>Changes pending on this device. Waiting to sync.</span>
+		{:else if error}<span
+				>{error.includes('invalid')
+					? 'That kitchen change was rejected. No pending changes are queued.'
+					: !ready
+						? 'Kitchen sync failed. No pending changes are queued.'
+						: 'Kitchen storage or sync needs attention. No pending changes are queued.'}</span
+			>
 		{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
 	</div>
 	{#if !saved}
@@ -148,8 +156,10 @@
 				controls={reviewOpen ? reviewPanelId : undefined}
 				onclick={() => (review = !review)}>Review changes</DisclosureButton
 			>
-		{:else if online && !syncing}<button class="secondary" onclick={retry}>Retry sync</button>{/if}
-		{#if (pending || conflicts.length > 0 || (ready && Boolean(error))) && !reviewOpen}
+		{:else if online && !syncing}<button class="secondary" type="button" onclick={retry}
+				>Retry sync</button
+			>{/if}
+		{#if (pending || conflicts.length > 0 || (ready && Boolean(error)) || error.includes('quarantined')) && !reviewOpen}
 			<button class="secondary" type="button" onclick={exportPending}
 				><Download size={16} /> Back up my changes</button
 			>
@@ -195,14 +205,20 @@
 					</ul>
 				</div>
 				<div class="sync-actions">
-					<button class="secondary" onclick={exportPending}
+					<button class="secondary" type="button" onclick={exportPending}
 						><Download size={16} /> Back up my changes</button
 					>
-					<button class="secondary" disabled={syncing || !online} onclick={() => resolve('remote')}
-						>Use household values</button
+					<button
+						class="secondary"
+						type="button"
+						disabled={syncing || !online}
+						onclick={() => resolve('remote')}>Use household values</button
 					>
-					<button class="primary" disabled={syncing || !online} onclick={() => resolve('local')}
-						>Use my values</button
+					<button
+						class="primary"
+						type="button"
+						disabled={syncing || !online}
+						onclick={() => resolve('local')}>Use my values</button
 					>
 				</div>
 			</div>

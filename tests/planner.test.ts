@@ -9,6 +9,7 @@ import { render } from 'svelte/server';
 import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
+import * as aiContinuationMod from '../src/lib/ai-continuation.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
@@ -29,6 +30,7 @@ import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
+import * as stateSchemaMod from '../src/lib/state-schema.ts';
 import * as statusMod from '../src/lib/status.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
@@ -239,6 +241,7 @@ function createModuleMap() {
 			motionDuration: () => 0,
 			prefersReducedMotion: () => true
 		},
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
@@ -259,6 +262,8 @@ function createModuleMap() {
 		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
+		'#lib/state-schema.ts': stateSchemaMod,
+		'#lib/components/ToggleButton.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
