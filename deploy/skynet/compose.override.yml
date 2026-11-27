@@ -11,7 +11,7 @@ services:
       - voice
 
   flavorithm-whisper:
-    image: ghcr.io/ggml-org/whisper.cpp:main@sha256:d167d18f0a3ffb117146047aca2883b58c3392cbfbcfdc0f2c660b0a7c3e6e06
+    image: ghcr.io/ggml-org/whisper.cpp:main@sha256:a02c5bcd922e6d3c3372b23ab84f87a64756efb7cd547372f8033e91fdfbe822
     container_name: flavorithm-whisper
     restart: unless-stopped
     entrypoint: ['whisper-server']
