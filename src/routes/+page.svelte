@@ -462,6 +462,7 @@
 		clearHouseholdViewState();
 		kitchenSync?.clearContext();
 		user = null;
+		resetAccountForms(null);
 		kitchen = createInitialState();
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
@@ -583,6 +584,72 @@
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
 	let verificationBusy = $state(false);
+	let profileName = $state('');
+	let profileEmail = $state('');
+	let profileCurrentPassword = $state('');
+	let profileBusy = $state(false);
+	let profileError = $state('');
+	let profileSubmitted = $state(false);
+	let profileFormEl = $state<HTMLFormElement | undefined>();
+	let currentPassword = $state('');
+	let newPassword = $state('');
+	let confirmNewPassword = $state('');
+	let passwordBusy = $state(false);
+	let passwordError = $state('');
+	let passwordSubmitted = $state(false);
+	let passwordFormEl = $state<HTMLFormElement | undefined>();
+	let profileEmailChanged = $derived(
+		Boolean(user && profileEmail.trim().toLowerCase() !== user.email.toLowerCase())
+	);
+	let profileDirty = $derived(
+		Boolean(user && (profileName.trim() !== user.name || profileEmailChanged))
+	);
+	let profileNameError = $derived(profileSubmitted ? validateRegistrationName(profileName) : '');
+	let profileEmailError = $derived(profileSubmitted ? validateEmail(profileEmail, 'register') : '');
+	let profilePasswordError = $derived(
+		profileSubmitted && profileEmailChanged
+			? !profileCurrentPassword
+				? 'Enter your current password to change your email address.'
+				: validatePassword(profileCurrentPassword, 'login')
+			: ''
+	);
+	let currentPasswordError = $derived(
+		passwordSubmitted ? validatePassword(currentPassword, 'login') : ''
+	);
+	let newPasswordError = $derived(
+		passwordSubmitted ? validatePassword(newPassword, 'register') : ''
+	);
+	let confirmPasswordError = $derived(
+		passwordSubmitted
+			? confirmNewPassword !== newPassword
+				? 'New passwords do not match.'
+				: validatePassword(confirmNewPassword, 'register')
+			: ''
+	);
+	let lastProfileUserKey = '';
+	$effect(() => {
+		const nextKey = user ? `${user.id}:${user.name}:${user.email}` : '';
+		if (nextKey !== lastProfileUserKey) {
+			lastProfileUserKey = nextKey;
+			profileName = user?.name ?? '';
+			profileEmail = user?.email ?? '';
+			profileCurrentPassword = '';
+			profileError = '';
+			profileSubmitted = false;
+		}
+	});
+	function resetAccountForms(account: User | null = user) {
+		profileName = account?.name ?? '';
+		profileEmail = account?.email ?? '';
+		profileCurrentPassword = '';
+		profileError = '';
+		profileSubmitted = false;
+		currentPassword = '';
+		newPassword = '';
+		confirmNewPassword = '';
+		passwordError = '';
+		passwordSubmitted = false;
+	}
 	type ChatGPTAccount = {
 		id: string;
 		label: string;
@@ -715,6 +782,16 @@
 	let recoverEmailError = $derived(
 		formSubmitted && modal === 'recover' ? validateEmail(email, 'recover') : ''
 	);
+	let cliRecoverEmailError = $derived(
+		modal === 'recover' && !capabilities.emailDelivery && email.trim()
+			? validateEmail(email, 'recover')
+			: ''
+	);
+	let cliRecoverCommandEmail = $derived(
+		email.trim() && !validateEmail(email, 'recover')
+			? email.trim().toLowerCase()
+			: 'you@example.com'
+	);
 	let resetPasswordError = $derived(
 		formSubmitted && modal === 'reset' ? validatePassword(password, 'reset') : ''
 	);
@@ -733,7 +810,6 @@
 			emailDelivery: Boolean(data.capabilities?.emailDelivery),
 			recipeSearch: Boolean(data.capabilities?.recipeSearch)
 		};
-		if (modal === 'recover' && !capabilities.emailDelivery) modal = 'auth';
 		const nextUser: User | null = data.user ?? null;
 		const modeChanged = previousMode !== installationAuthMode;
 		const changedIdentity =
@@ -1878,6 +1954,7 @@
 			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
+			resetAccountForms(null);
 			inviteCode = '';
 			currentInviteId = '';
 			joinCode = '';
@@ -2016,6 +2093,7 @@
 		}
 		modal = 'settings';
 		error = '';
+		resetAccountForms(user);
 		const headingId =
 			focusTarget === true || focusTarget === 'ai'
 				? 'ai-connection-heading'
@@ -2025,7 +2103,11 @@
 		await runOpenSettingsWorkflow({
 			initialUserId: user?.id ?? null,
 			getCurrentUserId: () => user?.id ?? null,
-			refreshAuth,
+			refreshAuth: async () => {
+				const result = await refreshAuth();
+				resetAccountForms(user);
+				return result;
+			},
 			loadConnectionsAndCatalog: () => loadModelCatalog(refreshConnections()),
 			onReadyToFocus: headingId
 				? async () => {
@@ -3941,6 +4023,7 @@
 			inviteCode = '';
 			currentInviteId = '';
 		}
+		if (modal === 'settings') resetAccountForms(user);
 		if ((modal === 'pantry' || modal === 'import') && voiceTarget === modal) {
 			clearVoiceSession();
 		}
@@ -4191,6 +4274,7 @@
 			clearAIConnectionState();
 			resetPantryFilters();
 			deletePassword = '';
+			resetAccountForms(null);
 			stateEtag = null;
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
@@ -4222,6 +4306,92 @@
 			verificationBusy = false;
 		}
 	}
+	async function saveAccountProfile(event: SubmitEvent) {
+		event.preventDefault();
+		if (!user || managedAuth) return;
+		const nextName = profileName.trim();
+		const nextEmail = profileEmail.trim();
+		const emailChanged = nextEmail.toLowerCase() !== user.email.toLowerCase();
+		profileError = '';
+		error = '';
+		const nameErr = validateRegistrationName(profileName);
+		const emailErr = validateEmail(profileEmail, 'register');
+		const passErr = emailChanged
+			? !profileCurrentPassword
+				? 'Enter your current password to change your email address.'
+				: validatePassword(profileCurrentPassword, 'login')
+			: '';
+		if (nameErr || emailErr || passErr) {
+			profileSubmitted = true;
+			await tick();
+			focusFirstInvalid(profileFormEl);
+			return;
+		}
+		profileSubmitted = false;
+		profileBusy = true;
+		try {
+			const result = await request('/api/auth', {
+				action: 'updateAccountProfile',
+				name: nextName,
+				email: nextEmail,
+				...(emailChanged ? { currentPassword: profileCurrentPassword } : {})
+			});
+			user = result.user;
+			try {
+				localStorage.setItem('flavorithm-last-account', JSON.stringify(result.user));
+			} catch {}
+			resetAccountForms(result.user);
+			notify(
+				emailChanged
+					? 'Account email updated. Other sessions have been signed out and verification has been reset.'
+					: 'Display name updated.'
+			);
+		} catch (e) {
+			profileError = (e as Error).message;
+			await tick();
+			focusFirstInvalid(profileFormEl);
+		} finally {
+			profileBusy = false;
+		}
+	}
+	async function submitPasswordChange(event: SubmitEvent) {
+		event.preventDefault();
+		if (!user || managedAuth) return;
+		passwordError = '';
+		error = '';
+		const curErr = validatePassword(currentPassword, 'login');
+		const nextErr = validatePassword(newPassword, 'register');
+		const confirmErr =
+			confirmNewPassword !== newPassword
+				? 'New passwords do not match.'
+				: validatePassword(confirmNewPassword, 'register');
+		if (curErr || nextErr || confirmErr) {
+			passwordSubmitted = true;
+			await tick();
+			focusFirstInvalid(passwordFormEl);
+			return;
+		}
+		passwordSubmitted = false;
+		passwordBusy = true;
+		try {
+			const result = await request('/api/auth', {
+				action: 'changePassword',
+				currentPassword,
+				newPassword
+			});
+			user = result.user;
+			currentPassword = '';
+			newPassword = '';
+			confirmNewPassword = '';
+			notify('Password updated. Other sessions have been signed out.');
+		} catch (e) {
+			passwordError = (e as Error).message;
+			await tick();
+			focusFirstInvalid(passwordFormEl);
+		} finally {
+			passwordBusy = false;
+		}
+	}
 	async function recover(event: SubmitEvent) {
 		event.preventDefault();
 		if (managedAuth) {
@@ -4230,7 +4400,7 @@
 		}
 		if (modal !== 'reset' && !capabilities.emailDelivery) {
 			error =
-				'Password recovery is unavailable. Ask the server operator to configure email delivery.';
+				'Email recovery is unavailable on this server. Reset the password with npm run auth:reset-password.';
 			return;
 		}
 		error = '';
@@ -5797,14 +5967,17 @@
 								/>
 							{/snippet}
 						</FormField>
-						{#if authMode === 'login' && capabilities.emailDelivery}<button
+						{#if authMode === 'login'}<button
 								type="button"
 								class="text-button"
 								onclick={() => {
 									modal = 'recover';
 									formSubmitted = false;
 									error = '';
-								}}>Forgot your password?</button
+								}}
+								>{capabilities.emailDelivery
+									? 'Forgot your password?'
+									: 'Forgot your password? CLI recovery'}</button
 							>{/if}{#if error || authValidationSummary}<p
 								class="error"
 								id="auth-form-error"
@@ -5927,17 +6100,18 @@
 							>Edit my taste preferences <SlidersHorizontal size={16} /></button
 						>
 					</div>
-					{#if user}<div class="settings-section">
-							<h3>{managedAuth ? 'Organization account' : 'Account email'}</h3>
-							<p class="muted">
-								{user.email}{managedAuth
-									? ' · Managed by your identity provider'
-									: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
-							</p>
-							{#if !managedAuth}
-								{#if user.emailVerified}<p class="muted">
+					{#if user}{#if managedAuth}<div class="settings-section">
+								<h3>Organization account</h3>
+								<p class="muted">{user.email} · Managed by your identity provider</p>
+							</div>{:else}<div class="settings-section account-controls">
+								<h3>Account profile</h3>
+								<p class="muted">
+									{user.email} · {user.emailVerified ? 'Verified' : 'Not verified'}
+								</p>
+								{#if user.emailVerified}<p class="field-help">
 										Email verification is optional for using your kitchen.
 									</p>{:else}<button
+										type="button"
 										class="secondary"
 										aria-describedby={!capabilities.emailDelivery
 											? 'settings-email-delivery-help'
@@ -5952,8 +6126,150 @@
 											Email delivery is unavailable. Ask the server operator to configure email
 											delivery.
 										</p>{/if}{/if}
-							{/if}
-						</div>{/if}
+								<form
+									novalidate
+									class="account-form"
+									bind:this={profileFormEl}
+									onsubmit={saveAccountProfile}
+								>
+									<FormField
+										id="profile-name"
+										label="Display name"
+										error={profileNameError}
+										errorId={profileError ? 'profile-form-error' : undefined}
+										invalid={Boolean(profileNameError || profileError)}
+										alert={!profileError}
+									>
+										{#snippet children(field)}
+											<input
+												maxlength="80"
+												autocomplete="name"
+												bind:value={profileName}
+												{...field}
+											/>
+										{/snippet}
+									</FormField>
+									<FormField
+										id="profile-email"
+										label="Email address"
+										error={profileEmailError}
+										errorId={profileError ? 'profile-form-error' : undefined}
+										invalid={Boolean(profileEmailError || profileError)}
+										alert={!profileError}
+									>
+										{#snippet children(field)}
+											<input
+												type="email"
+												maxlength="254"
+												autocomplete="email"
+												bind:value={profileEmail}
+												{...field}
+											/>
+										{/snippet}
+									</FormField>
+									<FormField
+										id="profile-current-password"
+										label="Current password"
+										help={profileEmailChanged
+											? 'Confirm with your current password to update your email. Other sessions sign out and verification resets.'
+											: 'Required only when changing your email address.'}
+										error={profilePasswordError}
+										errorId={profileError ? 'profile-form-error' : undefined}
+										invalid={Boolean(profilePasswordError || (profileError && profileEmailChanged))}
+										alert={!profileError}
+									>
+										{#snippet children(field)}
+											<input
+												type="password"
+												maxlength="128"
+												autocomplete="current-password"
+												bind:value={profileCurrentPassword}
+												{...field}
+											/>
+										{/snippet}
+									</FormField>
+									{#if profileError}<p class="error" id="profile-form-error" role="alert">
+											{profileError}
+										</p>{/if}
+									<button type="submit" class="secondary" disabled={profileBusy || !profileDirty}
+										>{profileBusy ? 'Saving profile…' : 'Save profile'}</button
+									>
+								</form>
+							</div>
+							<div class="settings-section account-controls">
+								<h3>Change password</h3>
+								<p class="muted">
+									Keeps this browser signed in and signs out sessions on other devices.
+								</p>
+								<form
+									novalidate
+									class="account-form"
+									bind:this={passwordFormEl}
+									onsubmit={submitPasswordChange}
+								>
+									<FormField
+										id="change-current-password"
+										label="Current password"
+										error={currentPasswordError}
+										errorId={passwordError ? 'password-form-error' : undefined}
+										invalid={Boolean(currentPasswordError || passwordError)}
+										alert={!passwordError}
+									>
+										{#snippet children(field)}
+											<input
+												type="password"
+												maxlength="128"
+												autocomplete="current-password"
+												bind:value={currentPassword}
+												{...field}
+											/>
+										{/snippet}
+									</FormField>
+									<FormField
+										id="change-new-password"
+										label="New password"
+										help="Use between 10 and 128 characters."
+										error={newPasswordError}
+										errorId={passwordError ? 'password-form-error' : undefined}
+										invalid={Boolean(newPasswordError || passwordError)}
+										alert={!passwordError}
+									>
+										{#snippet children(field)}
+											<input
+												type="password"
+												maxlength="128"
+												autocomplete="new-password"
+												bind:value={newPassword}
+												{...field}
+											/>
+										{/snippet}
+									</FormField>
+									<FormField
+										id="change-confirm-password"
+										label="Confirm new password"
+										error={confirmPasswordError}
+										errorId={passwordError ? 'password-form-error' : undefined}
+										invalid={Boolean(confirmPasswordError || passwordError)}
+										alert={!passwordError}
+									>
+										{#snippet children(field)}
+											<input
+												type="password"
+												maxlength="128"
+												autocomplete="new-password"
+												bind:value={confirmNewPassword}
+												{...field}
+											/>
+										{/snippet}
+									</FormField>
+									{#if passwordError}<p class="error" id="password-form-error" role="alert">
+											{passwordError}
+										</p>{/if}
+									<button type="submit" class="secondary" disabled={passwordBusy}
+										>{passwordBusy ? 'Updating password…' : 'Update password'}</button
+									>
+								</form>
+							</div>{/if}{/if}
 					<div class="settings-section">
 						<VoiceSettings
 							bind:provider={voiceProvider}
@@ -6265,56 +6581,121 @@
 							>Permanently delete my account</button
 						>
 					</form>
-				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
+				{:else if (modal === 'recover' || modal === 'reset') && !managedAuth}<span
 						class="dialog-spark">✳</span
 					>
 					<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
-					<p class="muted">
-						{modal === 'reset'
-							? 'Choose a new password to open your kitchen again.'
-							: 'We’ll email a link to reset your password.'}
-					</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={recover}>
-						{#if modal === 'reset'}<FormField
-								id="reset-password"
-								label="New password"
-								help="Use 10 to 128 characters."
-								error={resetPasswordError}
-								errorId={error ? 'recover-form-error' : undefined}
-								invalid={Boolean(resetPasswordError || error)}
-								alert={!error}
+					{#if modal === 'reset' || capabilities.emailDelivery}
+						<p class="muted">
+							{modal === 'reset'
+								? 'Choose a new password to open your kitchen again.'
+								: 'We’ll email a link to reset your password.'}
+						</p>
+						<form novalidate bind:this={dialogFormEl} onsubmit={recover}>
+							{#if modal === 'reset'}<FormField
+									id="reset-password"
+									label="New password"
+									help="Use 10 to 128 characters."
+									error={resetPasswordError}
+									errorId={error ? 'recover-form-error' : undefined}
+									invalid={Boolean(resetPasswordError || error)}
+									alert={!error}
+								>
+									{#snippet children(field)}
+										<input
+											type="password"
+											maxlength="128"
+											autocomplete="new-password"
+											bind:value={password}
+											{...field}
+										/>
+									{/snippet}
+								</FormField>{:else}<FormField
+									id="recover-email"
+									label="Email address"
+									help="We’ll send a reset link if an account matches this email."
+									error={recoverEmailError}
+									errorId={error ? 'recover-form-error' : undefined}
+									invalid={Boolean(recoverEmailError || error)}
+									alert={!error}
+								>
+									{#snippet children(field)}
+										<input type="email" autocomplete="email" bind:value={email} {...field} />
+									{/snippet}
+								</FormField>{/if}{#if error}<p class="error" id="recover-form-error" role="alert">
+									{error}
+								</p>{/if}<button type="submit" class="primary full" disabled={busy}
+								>{busy
+									? 'One moment…'
+									: modal === 'reset'
+										? 'Reset password'
+										: 'Send reset link'}<ArrowRight size={17} /></button
 							>
-								{#snippet children(field)}
-									<input
-										type="password"
-										maxlength="128"
-										autocomplete="new-password"
-										bind:value={password}
-										{...field}
-									/>
-								{/snippet}
-							</FormField>{:else}<FormField
-								id="recover-email"
-								label="Email address"
-								help="We’ll send a reset link if an account matches this email."
-								error={recoverEmailError}
-								errorId={error ? 'recover-form-error' : undefined}
-								invalid={Boolean(recoverEmailError || error)}
-								alert={!error}
+						</form>
+						{#if modal === 'recover'}
+							<button
+								type="button"
+								class="text-button full"
+								onclick={() => {
+									modal = 'auth';
+									authMode = 'login';
+									formSubmitted = false;
+									error = '';
+								}}>Back to sign in</button
 							>
-								{#snippet children(field)}
-									<input type="email" autocomplete="email" bind:value={email} {...field} />
-								{/snippet}
-							</FormField>{/if}{#if error}<p class="error" id="recover-form-error" role="alert">
-								{error}
-							</p>{/if}<button type="submit" class="primary full" disabled={busy}
-							>{busy
-								? 'One moment…'
-								: modal === 'reset'
-									? 'Reset password'
-									: 'Send reset link'}<ArrowRight size={17} /></button
+						{/if}
+					{:else}
+						<p class="muted">
+							Email delivery is not configured on this server, so reset links cannot be sent by
+							email.
+						</p>
+						<FormField
+							id="cli-recover-email"
+							label="Email address"
+							help="Optional: enter your email to prefill the operator reset command."
+							error={cliRecoverEmailError}
+							errorId={error ? 'recover-form-error' : undefined}
+							invalid={Boolean(cliRecoverEmailError || error)}
+							alert={!error}
 						>
-					</form>
+							{#snippet children(field)}
+								<input
+									type="email"
+									maxlength="254"
+									autocomplete="email"
+									bind:value={email}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
+						<div class="cli-recovery-box">
+							<p class="field-help">
+								A server operator can reset a local account password and revoke active sessions from
+								the host or container terminal:
+							</p>
+							<div class="invite-code">
+								<code
+									>npm run auth:reset-password -- --email {cliRecoverCommandEmail} --password-stdin</code
+								>
+							</div>
+							<p class="field-help">
+								Pipe a replacement password via standard input (10–128 characters) to keep it out of
+								shell history and scrollback, or ask the server operator to configure email
+								delivery.
+							</p>
+						</div>
+						{#if error}<p class="error" id="recover-form-error" role="alert">{error}</p>{/if}
+						<button
+							type="button"
+							class="secondary full"
+							onclick={() => {
+								modal = 'auth';
+								authMode = 'login';
+								formSubmitted = false;
+								error = '';
+							}}>Back to sign in</button
+						>
+					{/if}
 				{:else if modal === 'deleteRecipe'}<span class="dialog-spark">✳</span>
 					<h2>Delete saved recipe?</h2>
 					<p class="muted">

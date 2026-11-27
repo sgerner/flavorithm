@@ -951,6 +951,14 @@ const pageHookCode = `
 		set leftoverServings(value: number | null) { leftoverServings = value; },
 		get capabilities() { return capabilities; },
 		set capabilities(value: { emailDelivery: boolean; recipeSearch: boolean }) { capabilities = value; },
+		set profileName(value: string) { profileName = value; },
+		set profileEmail(value: string) { profileEmail = value; },
+		set profileSubmitted(value: boolean) { profileSubmitted = value; },
+		set profileError(value: string) { profileError = value; },
+		set newPassword(value: string) { newPassword = value; },
+		set confirmNewPassword(value: string) { confirmNewPassword = value; },
+		set passwordSubmitted(value: boolean) { passwordSubmitted = value; },
+		set passwordError(value: string) { passwordError = value; },
 		get dialogFormEl() { return dialogFormEl; },
 		set dialogFormEl(value: HTMLFormElement) { dialogFormEl = value; },
 		get authEmailError() { return authEmailError; },
@@ -967,10 +975,10 @@ const pageSsrCompiled = compileServerModule('src/routes/+page.svelte', hookedPag
 	'#lib/components/FormField.svelte': formFieldMod,
 	'#lib/components/ToggleButton.svelte': noopComponent,
 	'#lib/components/DisclosureButton.svelte': noopComponent,
-	'#lib/components/RecipeDetail.svelte': { default: noopComponent },
-	'#lib/components/ButlerChat.svelte': { default: noopComponent },
-	'#lib/components/RecipeEditor.svelte': { default: noopComponent },
-	'#lib/components/SyncStatus.svelte': { default: noopComponent },
+	'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
+	'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
+	'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
+	'#lib/components/SyncStatus.svelte': { __esModule: true, default: noopComponent },
 	'#lib/components/AIConnection.svelte': aiConnectionSsrMod,
 	'#lib/components/VoiceSettings.svelte': voiceSettingsSsrMod,
 	'#lib/components/RecipeImport.svelte': {
@@ -1000,6 +1008,14 @@ type PageFormApi = {
 	cookingMealId: string;
 	leftoverServings: number | null;
 	capabilities: { emailDelivery: boolean; recipeSearch: boolean };
+	profileName: string;
+	profileEmail: string;
+	profileSubmitted: boolean;
+	profileError: string;
+	newPassword: string;
+	confirmNewPassword: string;
+	passwordSubmitted: boolean;
+	passwordError: string;
 	dialogFormEl: HTMLFormElement;
 	readonly authEmailError: string;
 	readonly authPasswordError: string;
@@ -1135,6 +1151,74 @@ test('rendered +page.svelte modals resolve aria-describedby and keep unique IDs 
 		getTagById(searchTags, 'search-query')?.attrs['aria-describedby'],
 		'search-query-help search-unavailable-help search-form-error'
 	);
+
+	const cliRecoverHtml = renderPageModal((api) => {
+		api.capabilities = { emailDelivery: false, recipeSearch: false };
+		api.modal = 'recover';
+		api.email = 'cook@example.com';
+	});
+	const cliRecoverTags = assertValidRenderedAccessibility(cliRecoverHtml, '+page recover cli');
+	assert.equal(getTagById(cliRecoverTags, 'cli-recover-email')?.attrs['aria-invalid'], 'false');
+	assert.match(
+		cliRecoverHtml,
+		/npm run auth:reset-password -- --email cook@example\.com --password-stdin/
+	);
+
+	const cliRecoverInvalidHtml = renderPageModal((api) => {
+		api.capabilities = { emailDelivery: false, recipeSearch: false };
+		api.modal = 'recover';
+		api.email = 'invalid-email';
+	});
+	const cliRecoverInvalidTags = assertValidRenderedAccessibility(
+		cliRecoverInvalidHtml,
+		'+page recover cli invalid'
+	);
+	assert.equal(
+		getTagById(cliRecoverInvalidTags, 'cli-recover-email')?.attrs['aria-invalid'],
+		'true'
+	);
+	assert.equal(
+		getTagById(cliRecoverInvalidTags, 'cli-recover-email')?.attrs['aria-describedby'],
+		'cli-recover-email-help cli-recover-email-error'
+	);
+	assert.match(
+		cliRecoverInvalidHtml,
+		/npm run auth:reset-password -- --email you@example\.com --password-stdin/
+	);
+
+	const settingsInvalidHtml = renderPageModal((api) => {
+		api.capabilities = { emailDelivery: false, recipeSearch: false };
+		api.user = {
+			id: 'u-1',
+			householdId: 'h-1',
+			name: 'Chef',
+			email: 'chef@example.com',
+			emailVerified: false
+		};
+		api.modal = 'settings';
+		api.profileName = 'C';
+		api.profileEmail = 'next@example.com';
+		api.profileSubmitted = true;
+		api.profileError = 'Email already in use.';
+		api.newPassword = 'short';
+		api.confirmNewPassword = 'mismatch-password';
+		api.passwordSubmitted = true;
+		api.passwordError = 'Current password is incorrect.';
+	});
+	const settingsTags = assertValidRenderedAccessibility(
+		settingsInvalidHtml,
+		'+page settings account controls'
+	);
+	assert.equal(getTagById(settingsTags, 'profile-name')?.attrs['aria-invalid'], 'true');
+	assert.equal(
+		getTagById(settingsTags, 'profile-current-password')?.attrs['aria-describedby'],
+		'profile-current-password-help profile-current-password-error profile-form-error'
+	);
+	assert.equal(
+		getTagById(settingsTags, 'change-new-password')?.attrs['aria-describedby'],
+		'change-new-password-help change-new-password-error password-form-error'
+	);
+	assert.equal(getTagById(settingsTags, 'change-confirm-password')?.attrs['aria-invalid'], 'true');
 });
 
 test('login flow allows non-standard non-empty emails to reach server and links server login errors via aria-describedby', async () => {

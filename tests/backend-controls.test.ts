@@ -614,3 +614,313 @@ test('auth endpoint trims valid padded emails and rejects malformed or oversized
 		);
 	}
 });
+
+test('auth endpoint rotates session cookies on password change, updates profiles, and enforces guards', async () => {
+	const userAccount = await backend.registerUser(
+		'Control User',
+		'control-user@example.com',
+		'control initial password'
+	);
+	await backend.registerUser(
+		'Collision User',
+		'collision-route@example.com',
+		'collision initial password'
+	);
+
+	assert.equal(
+		(
+			await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{},
+					{
+						action: 'changePassword',
+						currentPassword: 'control initial password',
+						newPassword: 'control rotated password'
+					},
+					'192.0.2.30'
+				) as never
+			)
+		).status,
+		401
+	);
+
+	const crossOriginEvent = {
+		...postEvent(
+			'/api/auth',
+			{ user: userAccount.user },
+			{ action: 'updateAccountProfile', name: 'Cross Origin' },
+			'192.0.2.30'
+		),
+		request: new Request('https://flavorithm.example/api/auth', {
+			method: 'POST',
+			headers: { origin: 'https://evil.example', 'content-type': 'application/json' },
+			body: JSON.stringify({ action: 'updateAccountProfile', name: 'Cross Origin' })
+		})
+	};
+	assert.equal((await authRoute.POST(crossOriginEvent as never)).status, 403);
+
+	assert.equal(
+		(
+			await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{ user: userAccount.user, authMode: 'oidc' },
+					{ action: 'updateAccountProfile', name: 'Blocked In OIDC' },
+					'192.0.2.30'
+				) as never
+			)
+		).status,
+		403
+	);
+
+	const verifyToken = backend.issueEmailVerification(userAccount.user.id)!;
+	backend.verifyEmailToken(verifyToken.token);
+	const currentVerified = backend.getUserFromSession(userAccount.token)!;
+	assert.equal(currentVerified.emailVerified, true);
+
+	let nameCookieSet = false;
+	const nameOnlyResponse = await authRoute.POST({
+		...postEvent(
+			'/api/auth',
+			{ user: currentVerified },
+			{ action: 'updateAccountProfile', name: 'Renamed Control User' },
+			'192.0.2.30'
+		),
+		cookies: {
+			get: () => userAccount.token,
+			set: () => {
+				nameCookieSet = true;
+			},
+			delete: () => undefined
+		}
+	} as never);
+	assert.equal(nameOnlyResponse.status, 200);
+	assert.equal(nameCookieSet, false);
+	const nameOnlyPayload = (await nameOnlyResponse.json()) as {
+		user: { name: string; email: string; emailVerified: boolean };
+	};
+	assert.equal(nameOnlyPayload.user.name, 'Renamed Control User');
+	assert.equal(nameOnlyPayload.user.emailVerified, true);
+	assert.equal(backend.getUserFromSession(userAccount.token)?.name, 'Renamed Control User');
+
+	assert.equal(
+		(
+			await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{ user: currentVerified },
+					{
+						action: 'updateAccountProfile',
+						email: 'COLLISION-ROUTE@example.com',
+						currentPassword: 'control initial password'
+					},
+					'192.0.2.30'
+				) as never
+			)
+		).status,
+		409
+	);
+
+	const wrongEmailPasswordResponse = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{ user: currentVerified },
+			{
+				action: 'updateAccountProfile',
+				email: 'control-wrong-pw@example.com',
+				currentPassword: 'wrong local password'
+			},
+			'192.0.2.30'
+		) as never
+	);
+	assert.equal(wrongEmailPasswordResponse.status, 401);
+	const wrongEmailPasswordBody = (await wrongEmailPasswordResponse.json()) as Record<
+		string,
+		unknown
+	>;
+	assert.equal(wrongEmailPasswordBody.error, 'Current password is incorrect');
+	assert.equal('code' in wrongEmailPasswordBody, false);
+	assert.equal(wrongEmailPasswordBody.code, undefined);
+
+	const secondBrowserSession = await backend.loginUser(
+		'control-user@example.com',
+		'control initial password'
+	);
+	let emailCookieCall:
+		{ name: string; value: string; options: Record<string, unknown> } | undefined;
+	const emailChangeResponse = await authRoute.POST({
+		...postEvent(
+			'/api/auth',
+			{ user: currentVerified },
+			{
+				action: 'updateAccountProfile',
+				name: 'Renamed Control User',
+				email: 'control-updated@example.com',
+				currentPassword: 'control initial password'
+			},
+			'192.0.2.30'
+		),
+		cookies: {
+			get: () => userAccount.token,
+			set: (name: string, value: string, options: Record<string, unknown>) => {
+				emailCookieCall = { name, value, options };
+			},
+			delete: () => undefined
+		}
+	} as never);
+	assert.equal(emailChangeResponse.status, 200);
+	const emailChangePayload = (await emailChangeResponse.json()) as {
+		user: { email: string; emailVerified: boolean };
+	};
+	assert.equal(emailChangePayload.user.email, 'control-updated@example.com');
+	assert.equal(emailChangePayload.user.emailVerified, false);
+	assert.equal(emailCookieCall?.name, 'flavorithm_session');
+	assert.ok(emailCookieCall?.value);
+	assert.notEqual(emailCookieCall?.value, userAccount.token);
+	assert.notEqual(emailCookieCall?.value, secondBrowserSession.token);
+	assert.equal(backend.getUserFromSession(userAccount.token), null);
+	assert.equal(backend.getUserFromSession(secondBrowserSession.token), null);
+	const userAfterEmailChange = backend.getUserFromSession(emailCookieCall?.value);
+	assert.equal(userAfterEmailChange?.email, 'control-updated@example.com');
+
+	const extraPhoneSession = await backend.loginUser(
+		'control-updated@example.com',
+		'control initial password'
+	);
+	const extraTabletSession = await backend.loginUser(
+		'control-updated@example.com',
+		'control initial password'
+	);
+
+	let setCookieCall: { name: string; value: string; options: Record<string, unknown> } | undefined;
+	const rotateEvent = {
+		...postEvent(
+			'/api/auth',
+			{ user: userAfterEmailChange },
+			{
+				action: 'changePassword',
+				currentPassword: 'control initial password',
+				newPassword: 'control rotated password'
+			},
+			'192.0.2.99'
+		),
+		cookies: {
+			get: () => emailCookieCall?.value,
+			set: (name: string, value: string, options: Record<string, unknown>) => {
+				setCookieCall = { name, value, options };
+			},
+			delete: () => undefined
+		}
+	};
+	const rotateResponse = await authRoute.POST(rotateEvent as never);
+	assert.equal(rotateResponse.status, 200);
+	assert.equal(setCookieCall?.name, 'flavorithm_session');
+	assert.ok(setCookieCall?.value);
+	assert.notEqual(setCookieCall?.value, emailCookieCall?.value);
+	assert.notEqual(setCookieCall?.value, extraPhoneSession.token);
+	assert.notEqual(setCookieCall?.value, extraTabletSession.token);
+	assert.equal(setCookieCall?.options.httpOnly, true);
+	assert.equal(setCookieCall?.options.sameSite, 'lax');
+	assert.equal(setCookieCall?.options.secure, true);
+	assert.equal(backend.getUserFromSession(emailCookieCall?.value), null);
+	assert.equal(backend.getUserFromSession(extraPhoneSession.token), null);
+	assert.equal(backend.getUserFromSession(extraTabletSession.token), null);
+	const activeAfterRotate = backend.getUserFromSession(setCookieCall?.value);
+	assert.equal(activeAfterRotate?.id, userAccount.user.id);
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		const wrongAttempt = await authRoute.POST(
+			postEvent(
+				'/api/auth',
+				{ user: activeAfterRotate },
+				{
+					action: 'changePassword',
+					currentPassword: 'wrong local password',
+					newPassword: 'another rotated password'
+				},
+				`192.0.2.${120 + attempt}`
+			) as never
+		);
+		assert.equal(wrongAttempt.status, 401);
+		const wrongBody = (await wrongAttempt.json()) as Record<string, unknown>;
+		assert.equal(wrongBody.error, 'Current password is incorrect');
+		assert.equal('code' in wrongBody, false);
+		assert.equal(wrongBody.code, undefined);
+	}
+	const rateLimited = await authRoute.POST(
+		postEvent(
+			'/api/auth',
+			{ user: activeAfterRotate },
+			{
+				action: 'changePassword',
+				currentPassword: 'wrong local password',
+				newPassword: 'another rotated password'
+			},
+			'192.0.2.150'
+		) as never
+	);
+	assert.equal(rateLimited.status, 429);
+});
+
+test('unauthenticated password reset request and completion routes enforce per-IP and per-email rate limits', async () => {
+	const previousResend = process.env.RESEND_API_KEY;
+	const previousFrom = process.env.EMAIL_FROM;
+	const previousOrigin = process.env.ORIGIN;
+	try {
+		process.env.RESEND_API_KEY = 'test-resend-rate-limit';
+		process.env.EMAIL_FROM = 'Flavorithm <kitchen@example.com>';
+		process.env.ORIGIN = 'https://flavorithm.example';
+
+		// Per-email limit: max 3 reset requests per hour across distinct IPs before scrypt token hashing runs.
+		for (let index = 0; index < 3; index++) {
+			const ok = await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{},
+					{ action: 'requestPasswordReset', email: 'missing-reset-target@example.com' },
+					`198.51.100.${10 + index}`
+				) as never
+			);
+			assert.equal(ok.status, 200);
+		}
+		const emailLimited = await authRoute.POST(
+			postEvent(
+				'/api/auth',
+				{},
+				{ action: 'requestPasswordReset', email: 'missing-reset-target@example.com' },
+				'198.51.100.19'
+			) as never
+		);
+		assert.equal(emailLimited.status, 429);
+
+		// Per-IP limit: max 5 reset requests per hour from one IP across distinct emails.
+		for (let index = 0; index < 5; index++) {
+			const ok = await authRoute.POST(
+				postEvent(
+					'/api/auth',
+					{},
+					{ action: 'requestPasswordReset', email: `ip-burst-${index}@example.com` },
+					'198.51.100.40'
+				) as never
+			);
+			assert.equal(ok.status, 200);
+		}
+		const ipLimited = await authRoute.POST(
+			postEvent(
+				'/api/auth',
+				{},
+				{ action: 'requestPasswordReset', email: 'ip-burst-extra@example.com' },
+				'198.51.100.40'
+			) as never
+		);
+		assert.equal(ipLimited.status, 429);
+	} finally {
+		if (previousResend === undefined) delete process.env.RESEND_API_KEY;
+		else process.env.RESEND_API_KEY = previousResend;
+		if (previousFrom === undefined) delete process.env.EMAIL_FROM;
+		else process.env.EMAIL_FROM = previousFrom;
+		if (previousOrigin === undefined) delete process.env.ORIGIN;
+		else process.env.ORIGIN = previousOrigin;
+	}
+});

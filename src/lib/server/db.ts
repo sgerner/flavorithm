@@ -173,6 +173,10 @@ if (!sessionColumns.some((column) => column.name === 'client_id')) {
 
 const id = () => randomBytes(16).toString('hex');
 const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
+const PASSWORD_RESET_TOKEN_SALT = Buffer.from('flavorithm:password-reset-token:v1');
+async function hashPasswordResetToken(token: string): Promise<string> {
+	return (await deriveScrypt(token, PASSWORD_RESET_TOKEN_SALT, 32)).toString('hex');
+}
 
 function deriveScrypt(password: string, salt: Buffer, length: number): Promise<Buffer> {
 	return new Promise((resolve, reject) => {
@@ -802,9 +806,12 @@ export async function deleteUserAccount(userId: string, password: string): Promi
 	}
 }
 
-export function issuePasswordReset(emailInput: string): { email: string; token: string } | null {
+export async function issuePasswordReset(
+	emailInput: string
+): Promise<{ email: string; token: string } | null> {
 	const email = emailInput.trim().toLowerCase();
 	const token = randomBytes(32).toString('base64url');
+	const tokenHash = await hashPasswordResetToken(token);
 	const now = Date.now();
 	db.exec('BEGIN IMMEDIATE');
 	try {
@@ -818,7 +825,7 @@ export function issuePasswordReset(emailInput: string): { email: string; token: 
 		db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(user.id);
 		db.prepare(
 			'INSERT INTO password_reset_tokens(token_hash, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)'
-		).run(hashToken(token), user.id, now + PASSWORD_RESET_TTL_MS, now);
+		).run(tokenHash, user.id, now + PASSWORD_RESET_TTL_MS, now);
 		db.exec('COMMIT');
 		return { email: user.email, token };
 	} catch (error) {
@@ -831,7 +838,7 @@ export async function resetUserPassword(token: string, password: string): Promis
 	if (token.length < 20 || token.length > 200 || password.length < 10 || password.length > 128) {
 		throw new ApiError(400, 'Reset link is invalid or expired. Request a new one.');
 	}
-	const tokenHash = hashToken(token);
+	const tokenHash = await hashPasswordResetToken(token);
 	const now = Date.now();
 	const existing = db
 		.prepare(
@@ -859,6 +866,189 @@ export async function resetUserPassword(token: string, password: string): Promis
 		db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(current.user_id);
 		db.prepare('DELETE FROM sessions WHERE user_id = ?').run(current.user_id);
 		db.exec('COMMIT');
+	} catch (error) {
+		db.exec('ROLLBACK');
+		throw error;
+	}
+}
+
+export async function rotateUserCredentials(
+	userId: string,
+	currentPassword: string,
+	newPassword: string
+): Promise<{ user: User; token: string; expiresAt: number }> {
+	if (newPassword.length < 10 || newPassword.length > 128) {
+		throw new ApiError(400, 'Password must be at least 10 characters long');
+	}
+	const row = db
+		.prepare(
+			'SELECT id, name, email, household_id, email_verified_at, password_hash, sso_only FROM users WHERE id = ?'
+		)
+		.get(userId) as (DbUserRow & { password_hash: string; sso_only: number }) | undefined;
+	if (!row) throw new ApiError(401, 'Authentication required');
+	if (row.sso_only) {
+		throw new ApiError(403, 'Local password authentication is disabled for this account.');
+	}
+	if (
+		!currentPassword ||
+		currentPassword.length > 128 ||
+		!(await verifyPassword(currentPassword, row.password_hash))
+	) {
+		throw new ApiError(401, 'Current password is incorrect');
+	}
+	const passwordHash = await passwordDigest(newPassword);
+
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		const current = db
+			.prepare(
+				'SELECT id, name, email, household_id, email_verified_at, password_hash, sso_only FROM users WHERE id = ?'
+			)
+			.get(userId) as (DbUserRow & { password_hash: string; sso_only: number }) | undefined;
+		if (!current) throw new ApiError(401, 'Authentication required');
+		if (current.sso_only) {
+			throw new ApiError(403, 'Local password authentication is disabled for this account.');
+		}
+		if (current.password_hash !== row.password_hash) {
+			throw new ApiError(409, 'Your password changed. Try again.');
+		}
+		db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
+		db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(userId);
+		db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+		const user = toUser(current);
+		const session = createSession(user);
+		db.exec('COMMIT');
+		return { user, ...session };
+	} catch (error) {
+		db.exec('ROLLBACK');
+		throw error;
+	}
+}
+
+export async function updateAccountProfile(
+	userId: string,
+	input: { name?: string; email?: string; currentPassword?: string }
+): Promise<{ user: User; token?: string; expiresAt?: number }> {
+	if (input.name === undefined && input.email === undefined) {
+		throw new ApiError(400, 'Provide a display name or email address to update');
+	}
+	const row = db
+		.prepare(
+			'SELECT id, name, email, household_id, email_verified_at, password_hash, sso_only FROM users WHERE id = ?'
+		)
+		.get(userId) as (DbUserRow & { password_hash: string; sso_only: number }) | undefined;
+	if (!row) throw new ApiError(401, 'Authentication required');
+	if (row.sso_only) {
+		throw new ApiError(403, 'Local account profile controls are disabled for this account.');
+	}
+
+	const nextName = input.name !== undefined ? input.name.trim() : row.name;
+	if (nextName.length < 2 || nextName.length > 80) {
+		throw new ApiError(400, 'Display name must be between 2 and 80 characters');
+	}
+	const nextEmail =
+		input.email !== undefined ? input.email.trim().toLowerCase() : row.email.toLowerCase();
+	if (nextEmail.length > 254 || !z.email().safeParse(nextEmail).success) {
+		throw new ApiError(400, 'Please provide a valid email address');
+	}
+	const emailChanged = nextEmail !== row.email.toLowerCase();
+	if (emailChanged) {
+		if (
+			!input.currentPassword ||
+			input.currentPassword.length > 128 ||
+			!(await verifyPassword(input.currentPassword, row.password_hash))
+		) {
+			throw new ApiError(401, 'Current password is incorrect');
+		}
+	}
+
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		const current = db
+			.prepare(
+				'SELECT id, name, email, household_id, email_verified_at, password_hash, sso_only FROM users WHERE id = ?'
+			)
+			.get(userId) as (DbUserRow & { password_hash: string; sso_only: number }) | undefined;
+		if (!current) throw new ApiError(401, 'Authentication required');
+		if (current.sso_only) {
+			throw new ApiError(403, 'Local account profile controls are disabled for this account.');
+		}
+		if (emailChanged && current.password_hash !== row.password_hash) {
+			throw new ApiError(409, 'Your password changed. Try again.');
+		}
+		if (current.email.toLowerCase() !== row.email.toLowerCase()) {
+			throw new ApiError(409, 'Your account changed. Reload Settings and try again.');
+		}
+		if (emailChanged) {
+			const collision = db
+				.prepare('SELECT id FROM users WHERE email = ? COLLATE NOCASE AND id <> ?')
+				.get(nextEmail, userId) as { id: string } | undefined;
+			if (collision) {
+				throw new ApiError(409, 'An account with that email already exists');
+			}
+			db.prepare('UPDATE users SET name = ?, email = ?, email_verified_at = NULL WHERE id = ?').run(
+				nextName,
+				nextEmail,
+				userId
+			);
+			db.prepare('DELETE FROM email_verification_tokens WHERE user_id = ?').run(userId);
+			db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(userId);
+			db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+			const updated = getCurrentUser(userId);
+			if (!updated) throw new ApiError(401, 'Authentication required');
+			const user = toUser(updated);
+			const session = createSession(user);
+			db.exec('COMMIT');
+			return { user, ...session };
+		}
+		db.prepare('UPDATE users SET name = ? WHERE id = ?').run(nextName, userId);
+		const updated = getCurrentUser(userId);
+		if (!updated) throw new ApiError(401, 'Authentication required');
+		db.exec('COMMIT');
+		return { user: toUser(updated) };
+	} catch (error) {
+		db.exec('ROLLBACK');
+		if (String(error).includes('UNIQUE constraint failed: users.email')) {
+			throw new ApiError(409, 'An account with that email already exists');
+		}
+		throw error;
+	}
+}
+
+export async function resetLocalUserPassword(
+	emailInput: string,
+	password: string
+): Promise<{ email: string }> {
+	if (password.length < 10 || password.length > 128) {
+		throw new ApiError(400, 'Password must be between 10 and 128 characters long');
+	}
+	const email = emailInput.trim().toLowerCase();
+	if (!email || email.length > 254 || !z.email().safeParse(email).success) {
+		throw new ApiError(400, 'Please provide a valid email address');
+	}
+	const existing = db
+		.prepare('SELECT id, email, sso_only FROM users WHERE email = ? COLLATE NOCASE')
+		.get(email) as { id: string; email: string; sso_only: number } | undefined;
+	if (!existing) throw new ApiError(404, `No account found for ${email}`);
+	if (existing.sso_only) {
+		throw new ApiError(403, 'Local password reset is unavailable for organization accounts.');
+	}
+	const passwordHash = await passwordDigest(password);
+
+	db.exec('BEGIN IMMEDIATE');
+	try {
+		const current = db
+			.prepare('SELECT id, email, sso_only FROM users WHERE id = ?')
+			.get(existing.id) as { id: string; email: string; sso_only: number } | undefined;
+		if (!current) throw new ApiError(404, `No account found for ${email}`);
+		if (current.sso_only) {
+			throw new ApiError(403, 'Local password reset is unavailable for organization accounts.');
+		}
+		db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, current.id);
+		db.prepare('DELETE FROM password_reset_tokens WHERE user_id = ?').run(current.id);
+		db.prepare('DELETE FROM sessions WHERE user_id = ?').run(current.id);
+		db.exec('COMMIT');
+		return { email: current.email };
 	} catch (error) {
 		db.exec('ROLLBACK');
 		throw error;
