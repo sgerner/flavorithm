@@ -379,6 +379,7 @@ export function applyButlerCommands(
 						const prev = beforePantry.find((entry) => entry.id === item.id);
 						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
 					}
+					for (const week of touchedWeeks) state = refreshWeekShopping(state, week, safeNow);
 				}
 				recordShoppingScopes(state);
 				break;
@@ -465,6 +466,7 @@ export function applyButlerCommands(
 						const prev = beforePantry.find((entry) => entry.id === item.id);
 						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
 					}
+					for (const week of touchedWeeks) state = refreshWeekShopping(state, week, safeNow);
 				}
 				recordShoppingScopes(state);
 				break;
