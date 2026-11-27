@@ -1,3 +1,5 @@
+import type { ShoppingItem } from './types.ts';
+
 export const voiceProviders = [
 	{
 		id: 'auto',
@@ -227,4 +229,83 @@ export function appendDictatedText(target: VoiceTarget, current: string, incomin
 	}
 	const base = current.trim().replace(/,+\s*$/, '');
 	return [base, text].filter(Boolean).join(', ');
+}
+
+const QUICK_SHOPPING_ITEM_PATTERN =
+	/^(\d+(?:\.\d+)?)(?:\s*(g|grams?|kg|kilograms?|mg|oz|ounces?|lbs?|pounds?|ml|milliliters?|millilitres?|l|liters?|litres?|cups?|tbsp|tablespoons?|tsp|teaspoons?|pt|pints?|qt|quarts?|gal|gallons?|pieces?|whole|each|cans?|cloves?|bunch(?:es)?|heads?|slices?|loaf|loaves|bottles?|packs?|packages?|bags?|boxes?|jars?)\s+(?:of\s+)?|\s+)(.+)$/i;
+
+export function isVoiceTargetActive(
+	target: VoiceTarget | '',
+	view: {
+		modal: string;
+		page: string;
+		overlay?: boolean;
+		reviewingDraft?: boolean;
+	}
+): boolean {
+	if (!target || view.overlay) return false;
+	if (target === 'shopping') return view.page === 'shopping' && !view.modal;
+	if (target === 'import' && view.reviewingDraft) return false;
+	return view.modal === target;
+}
+
+export type QuickShoppingParseOptions = {
+	createId?: () => string;
+	split?: boolean;
+};
+
+export type QuickShoppingParseResult = {
+	items: ShoppingItem[];
+	error?: string;
+};
+
+export function parseQuickShoppingItems(
+	input: string,
+	options?: (() => string) | QuickShoppingParseOptions
+): QuickShoppingParseResult {
+	const resolvedOptions: QuickShoppingParseOptions =
+		typeof options === 'function' ? { createId: options } : (options ?? {});
+	const createId = resolvedOptions.createId ?? (() => globalThis.crypto.randomUUID());
+	const split = resolvedOptions.split ?? true;
+	const segments = (split ? input.split(/[,\n;]/) : [input])
+		.map((segment) => segment.trim())
+		.filter(Boolean);
+	const items: ShoppingItem[] = [];
+	for (let i = 0; i < segments.length; i++) {
+		let value = split ? segments[i].replace(/\.+$/, '').trim() : segments[i];
+		if (split && segments.length > 1 && i > 0) value = value.replace(/^and\s+/i, '').trim();
+		if (!value) continue;
+		const match = value.match(QUICK_SHOPPING_ITEM_PATTERN);
+		if (match) {
+			const parsedQuantity = Number(match[1]);
+			if (!Number.isFinite(parsedQuantity) || parsedQuantity <= 0) {
+				return { items: [], error: 'Enter a quantity above zero.' };
+			}
+			const rawName = match[3].trim().slice(0, 200);
+			if (!rawName) continue;
+			const quantity = Math.min(
+				1_000_000,
+				Math.round(parsedQuantity * 100) / 100 || parsedQuantity
+			);
+			const unit = (match[2] ? match[2].toLowerCase() : 'piece').slice(0, 40);
+			items.push({
+				id: createId(),
+				name: rawName,
+				quantity,
+				unit,
+				checked: false
+			});
+		} else {
+			const rawName = value.slice(0, 200);
+			if (!rawName) continue;
+			items.push({
+				id: createId(),
+				name: rawName,
+				quantity: 1,
+				unit: 'piece',
+				checked: false
+			});
+		}
+	}
+	return { items };
 }

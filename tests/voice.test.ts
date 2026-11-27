@@ -6,6 +6,8 @@ const { transcribeVoice, validateVoiceAudio, localWhisperUrl } =
 const {
 	appendDictatedText,
 	appendVoiceTranscript,
+	isVoiceTargetActive,
+	parseQuickShoppingItems,
 	pcmWav,
 	planVoiceRetry,
 	planVoiceStart,
@@ -434,6 +436,128 @@ test('record/stop converts to WAV, uploads once, and cancellation suppresses a l
 	assert.equal(states.at(-1), 'idle');
 });
 
+test('isVoiceTargetActive tracks modal handoffs, reviewingDraft, shopping page navigation, and overlays', () => {
+	assert.equal(isVoiceTargetActive('', { modal: 'import', page: 'discover' }), false);
+	assert.equal(isVoiceTargetActive('import', { modal: 'import', page: 'discover' }), true);
+	assert.equal(
+		isVoiceTargetActive('import', { modal: 'import', page: 'discover', reviewingDraft: true }),
+		false
+	);
+	assert.equal(
+		isVoiceTargetActive('import', { modal: 'import', page: 'discover', reviewingDraft: false }),
+		true
+	);
+	assert.equal(isVoiceTargetActive('import', { modal: '', page: 'discover' }), false);
+	assert.equal(isVoiceTargetActive('import', { modal: 'pantry', page: 'discover' }), false);
+	assert.equal(
+		isVoiceTargetActive('import', { modal: 'import', page: 'discover', overlay: true }),
+		false
+	);
+
+	assert.equal(isVoiceTargetActive('pantry', { modal: 'pantry', page: 'discover' }), true);
+	assert.equal(isVoiceTargetActive('pantry', { modal: '', page: 'pantry' }), false);
+
+	assert.equal(isVoiceTargetActive('shopping', { modal: '', page: 'shopping' }), true);
+	assert.equal(isVoiceTargetActive('shopping', { modal: '', page: 'discover' }), false);
+	assert.equal(isVoiceTargetActive('shopping', { modal: 'settings', page: 'shopping' }), false);
+	assert.equal(isVoiceTargetActive('shopping', { modal: 'import', page: 'shopping' }), false);
+	assert.equal(
+		isVoiceTargetActive('shopping', { modal: '', page: 'shopping', overlay: true }),
+		false
+	);
+});
+
+test('appendVoiceTranscript merges transcripts cleanly without duplicate separators and enforces maxLength', () => {
+	assert.equal(
+		appendVoiceTranscript('', '  2 avocados, sourdough bread  '),
+		'2 avocados, sourdough bread'
+	);
+	assert.equal(appendVoiceTranscript('milk', '2 avocados'), 'milk, 2 avocados');
+	assert.equal(appendVoiceTranscript('milk, ', '2 avocados'), 'milk, 2 avocados');
+	assert.equal(appendVoiceTranscript('milk;', '2 avocados'), 'milk, 2 avocados');
+	assert.equal(appendVoiceTranscript('2 lemons.', 'olive oil.'), '2 lemons, olive oil.');
+	assert.equal(appendVoiceTranscript('milk', '   '), 'milk');
+	assert.equal(
+		appendVoiceTranscript('Preheat oven to 400F.\n', 'Roast chickpeas 20 minutes.', '\n', 20_000),
+		'Preheat oven to 400F.\nRoast chickpeas 20 minutes.'
+	);
+	assert.equal(appendVoiceTranscript('abcde', 'fghij', '\n', 8), 'abcde\nfg');
+});
+
+test('parseQuickShoppingItems splits voice lists, preserves commas in typed mode, and rejects zero quantities', () => {
+	let seq = 0;
+	const parsed = parseQuickShoppingItems(
+		'200g pasta, 2 lemons; 1.5 kg potatoes\nand 2 cans of black beans, olive oil.',
+		() => `item-${++seq}`
+	);
+	assert.deepEqual(parsed, {
+		items: [
+			{ id: 'item-1', name: 'pasta', quantity: 200, unit: 'g', checked: false },
+			{ id: 'item-2', name: 'lemons', quantity: 2, unit: 'piece', checked: false },
+			{ id: 'item-3', name: 'potatoes', quantity: 1.5, unit: 'kg', checked: false },
+			{ id: 'item-4', name: 'black beans', quantity: 2, unit: 'cans', checked: false },
+			{ id: 'item-5', name: 'olive oil', quantity: 1, unit: 'piece', checked: false }
+		]
+	});
+	assert.deepEqual(parseQuickShoppingItems(' , ; \n '), { items: [] });
+	assert.deepEqual(
+		parseQuickShoppingItems('2% milk', () => 'milk-1'),
+		{
+			items: [{ id: 'milk-1', name: '2% milk', quantity: 1, unit: 'piece', checked: false }]
+		}
+	);
+
+	// Typed quick-add (split: false) keeps commas/semicolons inside a single item name
+	assert.deepEqual(
+		parseQuickShoppingItems('chicken, boneless thighs', {
+			split: false,
+			createId: () => 'typed-1'
+		}),
+		{
+			items: [
+				{
+					id: 'typed-1',
+					name: 'chicken, boneless thighs',
+					quantity: 1,
+					unit: 'piece',
+					checked: false
+				}
+			]
+		}
+	);
+	assert.deepEqual(
+		parseQuickShoppingItems('2 lbs chicken, boneless thighs', {
+			split: false,
+			createId: () => 'typed-2'
+		}),
+		{
+			items: [
+				{
+					id: 'typed-2',
+					name: 'chicken, boneless thighs',
+					quantity: 2,
+					unit: 'lbs',
+					checked: false
+				}
+			]
+		}
+	);
+
+	// Zero quantities return an actionable error in both voice and typed modes
+	assert.deepEqual(parseQuickShoppingItems('0 lemons'), {
+		items: [],
+		error: 'Enter a quantity above zero.'
+	});
+	assert.deepEqual(parseQuickShoppingItems('0.0 kg potatoes', { split: false }), {
+		items: [],
+		error: 'Enter a quantity above zero.'
+	});
+	assert.deepEqual(parseQuickShoppingItems('2 lemons, 0 apples'), {
+		items: [],
+		error: 'Enter a quantity above zero.'
+	});
+});
+
 test('failed uploads retain 16kHz WAV across 401/429/502/503/HTML/empty/malformed/network errors, surface readable messages, retry manually without re-encoding, and free memory on success/discard/cancel/new capture', async (t) => {
 	let stoppedTracks = 0;
 	let decodeCalls = 0;
@@ -781,7 +905,7 @@ test('voice dialog context helpers preserve pantry/import across Settings and Si
 		{ action: 'retry', provider: 'groq' }
 	);
 
-	// Appending phrases formats pantry with commas, shopping with commas, and import with newlines
+	// Appending phrases formats pantry with commas (without stripping trailing periods), shopping with commas, and import with newlines
 	let pantryText = '';
 	pantryText = appendDictatedText('pantry', pantryText, '2 eggs');
 	pantryText = appendDictatedText('pantry', pantryText, 'spinach');
