@@ -5,6 +5,12 @@ import type { AppState, User } from '#lib/types.ts';
 export { isKitchenState, isKitchenStateShape };
 
 export type SyncConflict = { path: string; local: unknown; remote: unknown };
+export type FoldedJournalRef = {
+	writerId: string;
+	writeId?: string;
+	updatedAt: number;
+	createdAt?: number;
+};
 export type PendingKitchen = {
 	userId: string;
 	householdId: string;
@@ -18,6 +24,8 @@ export type PendingKitchen = {
 	createdAt?: number;
 	/** Distinguishes a newer write from an acknowledged snapshot in the same writer slot. */
 	writeId?: string;
+	/** Exact ancestor journal versions already folded into this compacted snapshot. */
+	foldedFrom?: FoldedJournalRef[];
 };
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> &
 	Partial<Pick<Storage, 'key' | 'length'>>;
@@ -171,6 +179,18 @@ export function readQuarantinedJournal(
 	return entries;
 }
 
+function isFoldedJournalRef(value: unknown): value is FoldedJournalRef {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+	const ref = value as Partial<FoldedJournalRef>;
+	return (
+		typeof ref.writerId === 'string' &&
+		ref.writerId.length > 0 &&
+		Number.isFinite(ref.updatedAt) &&
+		(ref.writeId === undefined || typeof ref.writeId === 'string') &&
+		(ref.createdAt === undefined || Number.isFinite(ref.createdAt))
+	);
+}
+
 function parsePending(value: unknown, user: User): PendingKitchen | null {
 	if (
 		!value ||
@@ -188,7 +208,10 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 		((value as PendingKitchen).createdAt !== undefined &&
 			!Number.isFinite((value as PendingKitchen).createdAt)) ||
 		((value as PendingKitchen).writeId !== undefined &&
-			typeof (value as PendingKitchen).writeId !== 'string')
+			typeof (value as PendingKitchen).writeId !== 'string') ||
+		((value as PendingKitchen).foldedFrom !== undefined &&
+			(!Array.isArray((value as PendingKitchen).foldedFrom) ||
+				!(value as PendingKitchen).foldedFrom!.every(isFoldedJournalRef)))
 	) {
 		return null;
 	}
@@ -304,10 +327,6 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 	};
 }
 
-function isState(value: unknown): value is AppState {
-	return isKitchenState(value);
-}
-
 /** One durable latest snapshot per account and household; never stores credentials. */
 export function writePending(storage: StorageLike, pending: PendingKitchen): void {
 	storage.setItem(
@@ -332,8 +351,8 @@ function sameJournalVersion(current: PendingKitchen, expected: PendingKitchen): 
 		current.updatedAt === expected.updatedAt &&
 		current.createdAt === expected.createdAt &&
 		current.etag === expected.etag &&
-		JSON.stringify(current.base) === JSON.stringify(expected.base) &&
-		JSON.stringify(current.local) === JSON.stringify(expected.local)
+		jsonEqual(current.base, expected.base) &&
+		jsonEqual(current.local, expected.local)
 	);
 }
 
@@ -343,25 +362,130 @@ export function clearPendingJournalRecords(
 	user: User,
 	records: PendingJournalRecord[]
 ): void {
+	let firstError: unknown = null;
+	let hasError = false;
 	for (const record of records) {
 		for (const captured of record.keys) {
-			const raw = storage.getItem(captured.key);
-			if (raw === null) continue;
-			let current: PendingKitchen | null = null;
 			try {
-				current = parsePending(JSON.parse(raw), user);
-			} catch {
-				current = null;
+				const raw = storage.getItem(captured.key);
+				if (raw === null) continue;
+				let current: PendingKitchen | null = null;
+				try {
+					current = parsePending(JSON.parse(raw), user);
+				} catch {
+					current = null;
+				}
+				if (current && sameJournalVersion(current, captured.pending))
+					storage.removeItem(captured.key);
+			} catch (error) {
+				if (!hasError) {
+					hasError = true;
+					firstError = error;
+				}
 			}
-			if (current && sameJournalVersion(current, captured.pending))
-				storage.removeItem(captured.key);
 		}
 	}
+	if (hasError) throw firstError;
 }
 
-const equal = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+export function jsonEqual(a: unknown, b: unknown): boolean {
+	if (a && typeof a === 'object' && typeof (a as { toJSON?: unknown }).toJSON === 'function') {
+		a = (a as { toJSON: () => unknown }).toJSON();
+	}
+	if (b && typeof b === 'object' && typeof (b as { toJSON?: unknown }).toJSON === 'function') {
+		b = (b as { toJSON: () => unknown }).toJSON();
+	}
+	if (a === b) return true;
+	if (typeof a === 'number' && !Number.isFinite(a)) a = null;
+	if (typeof b === 'number' && !Number.isFinite(b)) b = null;
+	if (a === b) return true;
+	if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+	if (Array.isArray(a) || Array.isArray(b)) {
+		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+		for (let i = 0; i < a.length; i += 1) {
+			const av = a[i] === undefined ? null : a[i];
+			const bv = b[i] === undefined ? null : b[i];
+			if (!jsonEqual(av, bv)) return false;
+		}
+		return true;
+	}
+	const aObj = a as Record<string, unknown>;
+	const bObj = b as Record<string, unknown>;
+	const aKeys = Object.keys(aObj);
+	const bKeys = Object.keys(bObj);
+	let aDefined = 0;
+	for (let i = 0; i < aKeys.length; i += 1) {
+		const k = aKeys[i];
+		const av = aObj[k];
+		if (av === undefined) continue;
+		aDefined += 1;
+		if (!Object.hasOwn(bObj, k)) return false;
+		const bv = bObj[k];
+		if (bv === undefined || !jsonEqual(av, bv)) return false;
+	}
+	let bDefined = 0;
+	for (let i = 0; i < bKeys.length; i += 1) {
+		if (bObj[bKeys[i]] !== undefined) bDefined += 1;
+	}
+	return aDefined === bDefined;
+}
+
+const equal = jsonEqual;
 const object = (value: unknown): value is Record<string, unknown> =>
 	!!value && typeof value === 'object' && !Array.isArray(value);
+
+function isIdRecord(item: unknown): item is Record<string, unknown> & { id: string } {
+	return object(item) && typeof item.id === 'string';
+}
+
+function indexedById(items: unknown[]): Map<string, Record<string, unknown>> | null {
+	if (!items.every(isIdRecord)) return null;
+	if (new Set(items.map((item) => item.id)).size !== items.length) return null;
+	return new Map(items.map((item) => [item.id, item]));
+}
+
+/**
+ * True when `target` already incorporates every change between `base` and `local`, ignoring
+ * independent edits or items on untouched fields and peer collections.
+ */
+export function causallyIncludesDelta(base: AppState, local: AppState, target: AppState): boolean {
+	const includes = (old: unknown, mine: unknown, candidate: unknown): boolean => {
+		if (equal(mine, old)) return true;
+		if (equal(mine, candidate)) return true;
+		if (mine === undefined || candidate === undefined) return false;
+		if (object(mine) && object(candidate) && (old === undefined || object(old))) {
+			for (const name of new Set([
+				...Object.keys(old || {}),
+				...Object.keys(mine),
+				...Object.keys(candidate)
+			])) {
+				if (
+					!includes(
+						(old as Record<string, unknown> | undefined)?.[name],
+						mine[name],
+						candidate[name]
+					)
+				) {
+					return false;
+				}
+			}
+			return true;
+		}
+		if (Array.isArray(mine) && Array.isArray(candidate) && Array.isArray(old)) {
+			const before = indexedById(old);
+			const left = indexedById(mine);
+			const right = indexedById(candidate);
+			if (before && left && right) {
+				for (const id of new Set([...before.keys(), ...left.keys()])) {
+					if (!includes(before.get(id), left.get(id), right.get(id))) return false;
+				}
+				return true;
+			}
+		}
+		return false;
+	};
+	return includes(base, local, target);
+}
 
 function hasEqualConcurrentPantryQuantityEdit(
 	base: unknown,
@@ -504,6 +628,42 @@ function segmentsStartWith(prefix: PathSegment[], full: PathSegment[]): boolean 
 	});
 }
 
+function reconcileOrphanedMeals(
+	state: AppState,
+	localBranch: AppState,
+	remoteBranch: AppState,
+	conflicts: DetailedConflict[],
+	prefer?: 'local' | 'remote'
+): void {
+	// Deleting a recipe while someone plans it must never create an orphaned meal.
+	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
+	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
+		conflicts.push({
+			path: `kitchen.meals[${meal.id}].recipeId`,
+			local: describeMealRecipe(localBranch, meal.id, meal.recipeId),
+			remote: describeMealRecipe(remoteBranch, meal.id, meal.recipeId),
+			segments: [
+				{ kind: 'prop', key: 'meals' },
+				{ kind: 'id', id: meal.id },
+				{ kind: 'prop', key: 'recipeId' }
+			],
+			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
+		});
+		// Keep the complete proposed meal available for review and backup until a choice is made.
+		const candidates = prefer
+			? (prefer === 'local' ? localBranch : remoteBranch).recipes
+			: [...localBranch.recipes, ...remoteBranch.recipes];
+		const recipe = candidates.find((item) => item.id === meal.recipeId);
+		if (recipe) {
+			if (!recipeIds.has(recipe.id)) {
+				state.recipes.push(structuredClone(recipe));
+			}
+			recipeIds.add(recipe.id);
+		}
+	}
+	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+}
+
 function mergeKitchenStatesDetailed(
 	base: AppState,
 	local: AppState,
@@ -596,33 +756,7 @@ function mergeKitchenStatesDetailed(
 		return conflict(path, segments, mine, theirs);
 	};
 	const state = structuredClone(merge(base, local, remote, 'kitchen', [])) as AppState;
-	// Deleting a recipe while someone plans it must never create an orphaned meal.
-	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
-	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
-		conflicts.push({
-			path: `kitchen.meals[${meal.id}].recipeId`,
-			local: describeMealRecipe(local, meal.id, meal.recipeId),
-			remote: describeMealRecipe(remote, meal.id, meal.recipeId),
-			segments: [
-				{ kind: 'prop', key: 'meals' },
-				{ kind: 'id', id: meal.id },
-				{ kind: 'prop', key: 'recipeId' }
-			],
-			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
-		});
-		{
-			// Keep the complete proposed meal available for review and backup until a choice is made.
-			const candidates = prefer
-				? (prefer === 'local' ? local : remote).recipes
-				: [...local.recipes, ...remote.recipes];
-			const recipe = candidates.find((recipe) => recipe.id === meal.recipeId);
-			if (recipe) {
-				state.recipes.push(structuredClone(recipe));
-				recipeIds.add(recipe.id);
-			}
-		}
-	}
-	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+	reconcileOrphanedMeals(state, local, remote, conflicts, prefer);
 	return { state, conflicts };
 }
 
@@ -672,35 +806,268 @@ function assertSameSyncIdentity(
 	}
 }
 
-/** Apply independent writer snapshots in creation order while retaining conflicts between them. */
-export function mergePendingKitchenJournal(
-	records: PendingJournalRecord[],
-	remote: AppState,
-	prefer?: 'local' | 'remote'
-): { state: AppState; conflicts: SyncConflict[] } {
-	if (!records.length) return { state: structuredClone(remote), conflicts: [] };
-	const stableOrder = [...records].sort(
-		(a, b) =>
-			(a.pending.createdAt ?? a.pending.updatedAt) - (b.pending.createdAt ?? b.pending.updatedAt) ||
-			a.writerId.localeCompare(b.writerId)
+function matchesFoldedRef(record: PendingJournalRecord, ref: FoldedJournalRef): boolean {
+	if (record.writerId !== ref.writerId) return false;
+	if (ref.writeId !== undefined || record.pending.writeId !== undefined) {
+		return Boolean(ref.writeId && record.pending.writeId && ref.writeId === record.pending.writeId);
+	}
+	return record.pending.updatedAt === ref.updatedAt && record.pending.createdAt === ref.createdAt;
+}
+
+/**
+ * True when `target` is listed in `foldedFrom` of at least one surviving unfolded journal record
+ * (directly or transitively through intermediate compacted records).
+ */
+export function isRecordFoldedInto(
+	target: PendingJournalRecord,
+	records: PendingJournalRecord[]
+): boolean {
+	const candidates = records.filter(
+		(record) =>
+			!(record.writerId === target.writerId && sameJournalVersion(record.pending, target.pending))
 	);
-	// Replay a writer's ancestor before a snapshot staged from that already-updated view, even when
-	// both tabs receive the same millisecond timestamp.
-	const dependencies = new Map(stableOrder.map((record) => [record.writerId, new Set<string>()]));
-	for (const ancestor of stableOrder) {
-		if (equal(ancestor.pending.base, ancestor.pending.local)) continue;
-		for (const dependent of stableOrder) {
-			if (ancestor === dependent) continue;
-			const probe = mergeKitchenStates(
-				ancestor.pending.base,
-				ancestor.pending.local,
-				dependent.pending.base
-			);
-			if (!probe.conflicts.length && equal(probe.state, dependent.pending.base)) {
-				dependencies.get(dependent.writerId)?.add(ancestor.writerId);
+	if (!candidates.length) return false;
+	const unfolded = filterUnfoldedJournalRecords(candidates);
+	const visited = new Set<PendingJournalRecord>(unfolded);
+	const queue = [...unfolded];
+	while (queue.length) {
+		const current = queue.shift()!;
+		for (const ref of current.pending.foldedFrom ?? []) {
+			if (matchesFoldedRef(target, ref)) return true;
+			for (const intermediate of candidates) {
+				if (!visited.has(intermediate) && matchesFoldedRef(intermediate, ref)) {
+					visited.add(intermediate);
+					queue.push(intermediate);
+				}
 			}
 		}
 	}
+	return false;
+}
+
+/**
+ * Omit exact ancestor journal versions that were already folded into a surviving compacted entry,
+ * so a partial retirement failure (`removeItem` error) never replays or conflicts against itself.
+ */
+export function filterUnfoldedJournalRecords(
+	records: PendingJournalRecord[]
+): PendingJournalRecord[] {
+	if (records.length <= 1) return records;
+	const byRecency = [...records].sort(
+		(a, b) =>
+			b.pending.updatedAt - a.pending.updatedAt ||
+			(b.pending.createdAt ?? b.pending.updatedAt) - (a.pending.createdAt ?? a.pending.updatedAt) ||
+			b.writerId.localeCompare(a.writerId)
+	);
+	const foldsMap = new Map<PendingJournalRecord, Set<PendingJournalRecord>>(
+		byRecency.map((record) => [record, new Set()])
+	);
+	let hasAnyFoldEdge = false;
+	for (const compactor of byRecency) {
+		for (const ref of compactor.pending.foldedFrom ?? []) {
+			for (const candidate of byRecency) {
+				if (candidate === compactor) continue;
+				if (matchesFoldedRef(candidate, ref)) {
+					foldsMap.get(compactor)!.add(candidate);
+					hasAnyFoldEdge = true;
+				}
+			}
+		}
+	}
+	if (!hasAnyFoldEdge) return records;
+	for (let i = 0; i < byRecency.length; i += 1) {
+		for (let j = i + 1; j < byRecency.length; j += 1) {
+			const newer = byRecency[i];
+			const older = byRecency[j];
+			if (foldsMap.get(newer)!.has(older) && foldsMap.get(older)!.has(newer)) {
+				foldsMap.get(older)!.delete(newer);
+			}
+		}
+	}
+	const surviving = new Set<PendingJournalRecord>();
+	const folded = new Set<PendingJournalRecord>();
+	const settled = () => surviving.size + folded.size >= byRecency.length;
+	while (!settled()) {
+		const remaining = byRecency.filter((record) => !surviving.has(record) && !folded.has(record));
+		const root =
+			remaining.find((candidate) =>
+				remaining.every((other) => other === candidate || !foldsMap.get(other)!.has(candidate))
+			) || remaining[0];
+		surviving.add(root);
+		const queue = [...foldsMap.get(root)!];
+		while (queue.length) {
+			const target = queue.shift()!;
+			if (surviving.has(target) || folded.has(target)) continue;
+			folded.add(target);
+			for (const nested of foldsMap.get(target)!) {
+				if (!surviving.has(nested) && !folded.has(nested)) queue.push(nested);
+			}
+		}
+	}
+	return records.filter((record) => !folded.has(record));
+}
+
+function analyzeCausalRelation(
+	ancestorBase: AppState,
+	ancestorLocal: AppState,
+	dependentBase: AppState,
+	dependentLocal: AppState
+): {
+	hasNonDeletionMutation: boolean;
+	sharesMutatedLeaf: boolean;
+	ancestorHoldsDependentPostImage: boolean;
+} {
+	let hasNonDeletionMutation = false;
+	let sharesMutatedLeaf = false;
+	let ancestorHoldsDependentPostImage = false;
+	const walk = (a0: unknown, a1: unknown, d0: unknown, d1: unknown): void => {
+		const aChanged = !equal(a0, a1);
+		const dChanged = !equal(d0, d1);
+		if (!aChanged && !dChanged) return;
+		if (
+			(a0 === undefined || Array.isArray(a0)) &&
+			(a1 === undefined || Array.isArray(a1)) &&
+			(d0 === undefined || Array.isArray(d0)) &&
+			(d1 === undefined || Array.isArray(d1))
+		) {
+			const mA0 = indexedById(a0 || []);
+			const mA1 = indexedById(a1 || []);
+			const mD0 = indexedById(d0 || []);
+			const mD1 = indexedById(d1 || []);
+			if (mA0 && mA1 && mD0 && mD1) {
+				for (const id of new Set([...mA0.keys(), ...mA1.keys(), ...mD0.keys(), ...mD1.keys()])) {
+					walk(mA0.get(id), mA1.get(id), mD0.get(id), mD1.get(id));
+				}
+				return;
+			}
+		}
+		if (
+			(a0 === undefined || object(a0)) &&
+			(a1 === undefined || object(a1)) &&
+			(d0 === undefined || object(d0)) &&
+			(d1 === undefined || object(d1))
+		) {
+			// Whole-entity creation or deletion (e.g. adding or removing an id-keyed item).
+			if (a0 === undefined || a1 === undefined || d0 === undefined || d1 === undefined) {
+				if (aChanged && a1 !== undefined) hasNonDeletionMutation = true;
+				if (aChanged && dChanged) sharesMutatedLeaf = true;
+				if (!aChanged && dChanged && d1 !== undefined && equal(a0, d1)) {
+					ancestorHoldsDependentPostImage = true;
+				}
+				return;
+			}
+			for (const name of new Set([
+				...Object.keys(a0),
+				...Object.keys(a1),
+				...Object.keys(d0),
+				...Object.keys(d1)
+			])) {
+				walk(a0[name], a1[name], d0[name], d1[name]);
+			}
+			return;
+		}
+		if (aChanged && a1 !== undefined) hasNonDeletionMutation = true;
+		if (aChanged && dChanged) sharesMutatedLeaf = true;
+		if (!aChanged && dChanged && d1 !== undefined && equal(a0, d1)) {
+			ancestorHoldsDependentPostImage = true;
+		}
+	};
+	walk(ancestorBase, ancestorLocal, dependentBase, dependentLocal);
+	return { hasNonDeletionMutation, sharesMutatedLeaf, ancestorHoldsDependentPostImage };
+}
+
+/** Order journal snapshots by folded lineage, creation timestamp, and same-timestamp causal inclusion. */
+export function orderPendingJournalRecords(
+	records: PendingJournalRecord[]
+): PendingJournalRecord[] {
+	const createdAtOf = (record: PendingJournalRecord): number =>
+		record.pending.createdAt ?? record.pending.updatedAt;
+	const stableOrder = [...records].sort(
+		(a, b) => createdAtOf(a) - createdAtOf(b) || a.writerId.localeCompare(b.writerId)
+	);
+	const dependencies = new Map(stableOrder.map((record) => [record.writerId, new Set<string>()]));
+	const dependsOn = (targetId: string, candidateAncestorId: string): boolean => {
+		const visited = new Set<string>();
+		const stack = [targetId];
+		while (stack.length) {
+			const current = stack.pop()!;
+			if (current === candidateAncestorId) return true;
+			if (visited.has(current)) continue;
+			visited.add(current);
+			for (const prev of dependencies.get(current) || []) stack.push(prev);
+		}
+		return false;
+	};
+	const addDependency = (ancestorId: string, dependentId: string): void => {
+		if (ancestorId === dependentId || dependsOn(ancestorId, dependentId)) return;
+		dependencies.get(dependentId)?.add(ancestorId);
+	};
+
+	// Tier 1: If `ancestor` folded an earlier snapshot of a peer that later woke up and staged a
+	// newer delta, replay `ancestor` before that peer's post-fold continuation.
+	for (const ancestor of stableOrder) {
+		for (const ref of ancestor.pending.foldedFrom ?? []) {
+			for (const dependent of stableOrder) {
+				if (
+					dependent !== ancestor &&
+					dependent.writerId === ref.writerId &&
+					!matchesFoldedRef(dependent, ref) &&
+					dependent.pending.updatedAt >= ref.updatedAt
+				) {
+					addDependency(ancestor.writerId, dependent.writerId);
+				}
+			}
+		}
+	}
+
+	// Tier 2: Same-timestamp exact full-snapshot handoffs (`ancestor.local === dependent.base`).
+	for (const ancestor of stableOrder) {
+		if (equal(ancestor.pending.base, ancestor.pending.local)) continue;
+		for (const dependent of stableOrder) {
+			if (ancestor === dependent || createdAtOf(ancestor) !== createdAtOf(dependent)) continue;
+			if (equal(dependent.pending.base, dependent.pending.local)) continue;
+			if (equal(ancestor.pending.local, dependent.pending.base)) {
+				addDependency(ancestor.writerId, dependent.writerId);
+			}
+		}
+	}
+
+	// Tiers 3 & 4: Same-timestamp causal inclusion when concurrent peers also contributed to
+	// `dependent.base`. Apply non-deletion inclusions before pure deletions so an `item -> undefined`
+	// deletion never forms a backward edge ahead of an earlier `undefined -> item` creation.
+	const tier3Edges: Array<[string, string]> = [];
+	const tier4Edges: Array<[string, string]> = [];
+	for (const ancestor of stableOrder) {
+		if (equal(ancestor.pending.base, ancestor.pending.local)) continue;
+		for (const dependent of stableOrder) {
+			if (ancestor === dependent || createdAtOf(ancestor) !== createdAtOf(dependent)) continue;
+			if (equal(dependent.pending.base, dependent.pending.local)) continue;
+			if (
+				!causallyIncludesDelta(
+					ancestor.pending.base,
+					ancestor.pending.local,
+					dependent.pending.base
+				)
+			) {
+				continue;
+			}
+			const relation = analyzeCausalRelation(
+				ancestor.pending.base,
+				ancestor.pending.local,
+				dependent.pending.base,
+				dependent.pending.local
+			);
+			if (relation.ancestorHoldsDependentPostImage) continue;
+			if (relation.hasNonDeletionMutation) {
+				tier3Edges.push([ancestor.writerId, dependent.writerId]);
+			} else if (relation.sharesMutatedLeaf) {
+				tier4Edges.push([ancestor.writerId, dependent.writerId]);
+			}
+		}
+	}
+	for (const [ancestorId, dependentId] of tier3Edges) addDependency(ancestorId, dependentId);
+	for (const [ancestorId, dependentId] of tier4Edges) addDependency(ancestorId, dependentId);
+
 	const ordered: PendingJournalRecord[] = [];
 	const remaining = new Map(stableOrder.map((record) => [record.writerId, record]));
 	while (remaining.size) {
@@ -713,33 +1080,221 @@ export function mergePendingKitchenJournal(
 		ordered.push(next);
 		remaining.delete(next.writerId);
 	}
-	let composedBase = structuredClone(ordered[0].pending.base);
-	let composedLocal = structuredClone(ordered[0].pending.local);
-	const rawLocalConflicts: DetailedConflict[] = [];
+	return ordered;
+}
+
+function composeDeltaPair(
+	firstBase: AppState,
+	firstLocal: AppState,
+	secondBase: AppState,
+	secondLocal: AppState,
+	prefer?: 'local' | 'remote'
+): { base: AppState; local: AppState; conflicts: DetailedConflict[] } {
+	const conflicts: DetailedConflict[] = [];
+	const chooseConflict = (
+		path: string,
+		segments: PathSegment[],
+		b1: unknown,
+		l1: unknown,
+		b2: unknown,
+		l2: unknown
+	): { base: unknown; local: unknown } => {
+		conflicts.push({
+			path,
+			local: l2 === undefined ? undefined : structuredClone(l2),
+			remote: l1 === undefined ? undefined : structuredClone(l1),
+			segments
+		});
+		return prefer === 'local'
+			? { base: b1 !== undefined ? b1 : b2, local: l2 }
+			: { base: b1, local: l1 };
+	};
+	const compose = (
+		b1: unknown,
+		l1: unknown,
+		b2: unknown,
+		l2: unknown,
+		path: string,
+		segments: PathSegment[]
+	): { base: unknown; local: unknown } => {
+		if (equal(l2, b2)) return { base: b1, local: l1 };
+		if (equal(l1, b1)) return { base: b2, local: l2 };
+		if (equal(b2, l1)) return { base: b1, local: l2 };
+
+		if (object(l1) && object(l2)) {
+			if (object(b1) && object(b2)) {
+				const nextBase: Record<string, unknown> = {};
+				const nextLocal: Record<string, unknown> = {};
+				for (const name of new Set([
+					...Object.keys(b1),
+					...Object.keys(l1),
+					...Object.keys(b2),
+					...Object.keys(l2)
+				])) {
+					const entry = compose(b1[name], l1[name], b2[name], l2[name], `${path}.${name}`, [
+						...segments,
+						{ kind: 'prop', key: name }
+					]);
+					if (entry.base !== undefined) nextBase[name] = entry.base;
+					if (entry.local !== undefined) nextLocal[name] = entry.local;
+				}
+				return { base: nextBase, local: nextLocal };
+			}
+			if (b1 === undefined && b2 === undefined) {
+				const nextLocal: Record<string, unknown> = {};
+				for (const name of new Set([...Object.keys(l1), ...Object.keys(l2)])) {
+					const entry = compose(undefined, l1[name], undefined, l2[name], `${path}.${name}`, [
+						...segments,
+						{ kind: 'prop', key: name }
+					]);
+					if (entry.local !== undefined) nextLocal[name] = entry.local;
+				}
+				return { base: undefined, local: nextLocal };
+			}
+		}
+
+		if (Array.isArray(b1) && Array.isArray(l1) && Array.isArray(b2) && Array.isArray(l2)) {
+			const b1Map = indexedById(b1);
+			const l1Map = indexedById(l1);
+			const b2Map = indexedById(b2);
+			const l2Map = indexedById(l2);
+			if (b1Map && l1Map && b2Map && l2Map) {
+				const entries = new Map<string, { base: unknown; local: unknown }>();
+				for (const id of new Set([
+					...l1Map.keys(),
+					...l2Map.keys(),
+					...b1Map.keys(),
+					...b2Map.keys()
+				])) {
+					entries.set(
+						id,
+						compose(b1Map.get(id), l1Map.get(id), b2Map.get(id), l2Map.get(id), `${path}[${id}]`, [
+							...segments,
+							{ kind: 'id', id }
+						])
+					);
+				}
+				const nextBase = [];
+				for (const id of new Set([
+					...b1Map.keys(),
+					...b2Map.keys(),
+					...l1Map.keys(),
+					...l2Map.keys()
+				])) {
+					const value = entries.get(id)?.base;
+					if (value !== undefined) nextBase.push(value);
+				}
+				const nextLocal = [];
+				for (const id of new Set([
+					...l1Map.keys(),
+					...l2Map.keys(),
+					...b1Map.keys(),
+					...b2Map.keys()
+				])) {
+					const value = entries.get(id)?.local;
+					if (value !== undefined) nextLocal.push(value);
+				}
+				return { base: nextBase, local: nextLocal };
+			}
+		}
+
+		const concurrentPantryQuantity =
+			path.startsWith('kitchen.pantry[') &&
+			path.endsWith('].quantity') &&
+			typeof b1 === 'number' &&
+			typeof l1 === 'number' &&
+			typeof b2 === 'number' &&
+			typeof l2 === 'number' &&
+			!equal(firstLocal, secondLocal);
+		if (equal(l1, l2) && !concurrentPantryQuantity) {
+			return { base: b1, local: l1 };
+		}
+		return chooseConflict(path, segments, b1, l1, b2, l2);
+	};
+
+	const composed = compose(firstBase, firstLocal, secondBase, secondLocal, 'kitchen', []);
+	const base = structuredClone(composed.base) as AppState;
+	const local = structuredClone(composed.local) as AppState;
+	reconcileOrphanedMeals(local, secondLocal, firstLocal, conflicts, prefer);
+	return { base, local, conflicts };
+}
+
+function composePendingKitchenJournalDetailed(
+	records: PendingJournalRecord[],
+	prefer?: 'local' | 'remote'
+): {
+	ordered: PendingJournalRecord[];
+	base: AppState;
+	local: AppState;
+	conflicts: DetailedConflict[];
+} | null {
+	const unfolded = filterUnfoldedJournalRecords(records);
+	if (!unfolded.length) return null;
+	const ordered = orderPendingJournalRecords(unfolded);
+	let effectiveBase = structuredClone(ordered[0].pending.base);
+	let effectiveLocal = structuredClone(ordered[0].pending.local);
+	const rawConflicts: DetailedConflict[] = [];
 	for (let index = 1; index < ordered.length; index += 1) {
 		const record = ordered[index];
-		const rebasedBase = mergeKitchenStates(
-			composedLocal,
-			composedBase,
-			record.pending.base,
-			'local'
-		).state;
-		const rebasedLocal = mergeKitchenStates(
-			composedBase,
-			composedLocal,
-			record.pending.base,
-			'local'
-		).state;
-		const step = mergeKitchenStatesDetailed(
+		const step = composeDeltaPair(
+			effectiveBase,
+			effectiveLocal,
 			record.pending.base,
 			record.pending.local,
-			rebasedLocal,
-			'local'
+			prefer
 		);
-		composedBase = rebasedBase;
-		composedLocal = step.state;
-		rawLocalConflicts.push(...step.conflicts);
+		effectiveBase = step.base;
+		effectiveLocal = step.local;
+		rawConflicts.push(...step.conflicts);
 	}
+	return { ordered, base: effectiveBase, local: effectiveLocal, conflicts: rawConflicts };
+}
+
+/** Compose ordered journal records into a single (effectiveBase, effectiveLocal) delta. */
+export function composePendingKitchenJournal(
+	records: PendingJournalRecord[],
+	prefer?: 'local' | 'remote'
+): {
+	ordered: PendingJournalRecord[];
+	base: AppState;
+	local: AppState;
+	conflicts: SyncConflict[];
+} | null {
+	const composed = composePendingKitchenJournalDetailed(records, prefer);
+	if (!composed) return null;
+	const conflicts: SyncConflict[] = [];
+	for (const conflict of composed.conflicts) {
+		const entry: SyncConflict = {
+			path: conflict.path,
+			local: conflict.local,
+			remote: conflict.remote
+		};
+		const existingIndex = conflicts.findIndex((item) => item.path === conflict.path);
+		if (existingIndex >= 0) conflicts[existingIndex] = entry;
+		else conflicts.push(entry);
+	}
+	return {
+		ordered: composed.ordered,
+		base: composed.base,
+		local: composed.local,
+		conflicts
+	};
+}
+
+/** Compose writer snapshots into a net baseline/local delta and reconcile once against remote. */
+export function mergePendingKitchenJournal(
+	records: PendingJournalRecord[],
+	remote: AppState,
+	prefer?: 'local' | 'remote'
+): { state: AppState; conflicts: SyncConflict[] } {
+	const composed = composePendingKitchenJournalDetailed(records, 'local');
+	if (!composed) return { state: structuredClone(remote), conflicts: [] };
+	const {
+		ordered,
+		base: composedBase,
+		local: composedLocal,
+		conflicts: rawLocalConflicts
+	} = composed;
 	const remoteMerged = mergeKitchenStatesDetailed(composedBase, composedLocal, remote, prefer);
 	if (!rawLocalConflicts.length) {
 		return {

@@ -444,6 +444,8 @@
 		editingShoppingDraft = null;
 		shoppingFilter = 'all';
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
+		pendingSyncEchoJson = null;
+		unmodifiedSyncEchoJson = null;
 	}
 	function saveLastAccount(account: User) {
 		if (managedAuth) return;
@@ -1253,6 +1255,8 @@
 		}
 	});
 	let stateEtag: string | null = null;
+	let pendingSyncEchoJson: string | null = null;
+	let unmodifiedSyncEchoJson: string | null = null;
 	let writeChain = Promise.resolve();
 	let saveTimer: ReturnType<typeof setTimeout>;
 	$effect(() => {
@@ -1262,6 +1266,10 @@
 		document.documentElement.classList.toggle('dark', kitchen.preferences.dark);
 		if (managedAuth && (!user || !kitchenLoaded)) return;
 		const sanitized = sanitizeKitchenState(JSON.parse(rawSnapshot));
+		const sanitizedJson = JSON.stringify(sanitized);
+		const isSyncEcho = pendingSyncEchoJson !== null && sanitizedJson === pendingSyncEchoJson;
+		pendingSyncEchoJson = null;
+		if (!isSyncEcho) unmodifiedSyncEchoJson = null;
 		if (!managedAuth && !user && guestPersistenceReady) {
 			try {
 				localStorage.setItem('flavorithm-guest-kitchen', JSON.stringify(sanitized));
@@ -1275,7 +1283,7 @@
 				);
 			}
 		}
-		if (user) kitchenSync?.stage(sanitized);
+		if (user) kitchenSync?.stage(sanitized, isSyncEcho ? { echo: true } : undefined);
 		clearTimeout(saveTimer);
 		if (user && pendingSync && !syncing && !syncErrors && online)
 			saveTimer = setTimeout(() => {
@@ -1309,7 +1317,11 @@
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				kitchen = sanitizeKitchenState(state);
+				const sanitized = sanitizeKitchenState(state);
+				const serialized = JSON.stringify(sanitized);
+				pendingSyncEchoJson = serialized;
+				unmodifiedSyncEchoJson = serialized;
+				kitchen = sanitized;
 			},
 			onStatus: (status) => {
 				syncReady = status.ready;
@@ -1535,14 +1547,34 @@
 		};
 		calendarMediaChanged();
 		calendarMedia?.addEventListener('change', calendarMediaChanged);
+		const releaseSyncLease = () => {
+			kitchenSync?.releaseLease();
+		};
+		const refreshSyncLease = () => {
+			if (document.visibilityState === 'visible') kitchenSync?.refreshLease();
+		};
+		const restoreSyncLease = () => {
+			kitchenSync?.refreshLease();
+		};
+		const leaseRefreshTimer = window.setInterval(() => {
+			kitchenSync?.refreshLease();
+		}, 30_000);
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
+		window.addEventListener('pagehide', releaseSyncLease);
+		window.addEventListener('pageshow', restoreSyncLease);
+		document.addEventListener('visibilitychange', refreshSyncLease);
 		return () => {
 			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
+			window.removeEventListener('pagehide', releaseSyncLease);
+			window.removeEventListener('pageshow', restoreSyncLease);
+			document.removeEventListener('visibilitychange', refreshSyncLease);
+			clearInterval(leaseRefreshTimer);
+			kitchenSync?.releaseLease();
 			clearTimeout(saveTimer);
 			connectionPoll?.stop();
 			connectionPopup?.close();
@@ -1612,7 +1644,14 @@
 		clearTimeout(saveTimer);
 		await writeChain;
 		if (user && kitchenSync) {
-			kitchenSync.stage(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))));
+			const sanitized = sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)));
+			const sanitizedJson = JSON.stringify(sanitized);
+			const isSyncEcho =
+				(pendingSyncEchoJson !== null && sanitizedJson === pendingSyncEchoJson) ||
+				(unmodifiedSyncEchoJson !== null && sanitizedJson === unmodifiedSyncEchoJson);
+			pendingSyncEchoJson = null;
+			if (!isSyncEcho) unmodifiedSyncEchoJson = null;
+			kitchenSync.stage(sanitized, isSyncEcho ? { echo: true } : undefined);
 			await kitchenSync.sync();
 			if (kitchenSync.snapshot())
 				throw new Error(
@@ -4106,7 +4145,16 @@
 			const currentUser = user ? ($state.snapshot(user) as User) : null;
 			const currentState = $state.snapshot(kitchen) as AppState;
 			if (ready && currentUser && (!managedAuth || kitchenLoaded)) {
-				kitchenSync?.stage(sanitizeKitchenState(currentState));
+				const sanitized = sanitizeKitchenState(currentState);
+				const sanitizedJson = JSON.stringify(sanitized);
+				const isSyncEcho =
+					(pendingSyncEchoJson !== null && sanitizedJson === pendingSyncEchoJson) ||
+					(unmodifiedSyncEchoJson !== null && sanitizedJson === unmodifiedSyncEchoJson);
+				if (!isSyncEcho) {
+					pendingSyncEchoJson = null;
+					unmodifiedSyncEchoJson = null;
+				}
+				kitchenSync?.stage(sanitized, isSyncEcho ? { echo: true } : undefined);
 			}
 			const result = await exportKitchenArchive({
 				user: currentUser,
