@@ -862,7 +862,7 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 	);
 	if (!hasScopedExpiryForced) {
 		issues.push(
-			'src/routes/+page.svelte must define scoped @media (forced-colors: active) override for .expiry-filters :global(button.active)'
+			'src/routes/+page.svelte must define a global @media (forced-colors: active) override for .expiry-filters button.active'
 		);
 	}
 

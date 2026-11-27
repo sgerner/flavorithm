@@ -1046,10 +1046,13 @@ const seedSavedRecipesById = new Map(
 );
 
 /** Check whether the kitchen currently contains any untouched sample staples, meals, or bookmarks. */
-export function hasSampleData(state: Pick<AppState, 'pantry' | 'meals' | 'recipes'>): boolean {
+export function hasSampleData(
+	state: Pick<AppState, 'pantry' | 'meals' | 'recipes'>,
+	hasSampleMeal?: boolean
+): boolean {
 	return (
 		state.pantry.some((item) => Boolean(item.sample)) ||
-		state.meals.some((meal) => Boolean(meal.sample)) ||
+		(hasSampleMeal ?? state.meals.some((meal) => Boolean(meal.sample))) ||
 		state.recipes.some((recipe) => Boolean(recipe.saved && recipe.sampleSaved))
 	);
 }

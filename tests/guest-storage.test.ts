@@ -455,3 +455,64 @@ test('signup preparation sanitizes guest state while preserving sample flags for
 	assert.deepEqual(syncedState.meals, []);
 	assert.ok(syncedState.recipes.every((recipe) => !recipe.saved && !recipe.sampleSaved));
 });
+
+test('sanitizeKitchenState preserves manual recipe provenance and sample flags on guest reload', () => {
+	const guest = createInitialState();
+	const baseRecipe = structuredClone(guest.recipes[0]);
+	guest.recipes.push(
+		{
+			...baseRecipe,
+			id: 'manual-pasta',
+			title: 'Manual Pasta',
+			provenance: 'manual',
+			saved: true,
+			sampleSaved: undefined
+		},
+		{
+			...baseRecipe,
+			id: 'imported-soup',
+			title: 'Imported Soup',
+			provenance: 'web-import',
+			saved: true,
+			sampleSaved: undefined
+		},
+		{
+			...baseRecipe,
+			id: 'ai-salad',
+			title: 'AI Salad',
+			provenance: 'ai-generated',
+			saved: true,
+			sampleSaved: undefined
+		},
+		{
+			...baseRecipe,
+			id: 'invalid-provenance',
+			title: 'Unknown Provenance',
+			provenance: 'scraped-legacy' as unknown as AppState['recipes'][number]['provenance'],
+			saved: true,
+			sampleSaved: undefined
+		}
+	);
+
+	const reloaded = sanitizeKitchenState(JSON.parse(JSON.stringify(guest)));
+	assert.ok(validateAppState(reloaded));
+	assert.equal(reloaded.recipes.find((item) => item.id === 'manual-pasta')?.provenance, 'manual');
+	assert.equal(
+		reloaded.recipes.find((item) => item.id === 'imported-soup')?.provenance,
+		'web-import'
+	);
+	assert.equal(reloaded.recipes.find((item) => item.id === 'ai-salad')?.provenance, 'ai-generated');
+	assert.equal(
+		reloaded.recipes.find((item) => item.id === 'invalid-provenance')?.provenance,
+		undefined
+	);
+	assert.equal(reloaded.pantry.filter((item) => item.sample).length, 7);
+	assert.equal(reloaded.meals.filter((meal) => meal.sample).length, 3);
+	assert.equal(reloaded.recipes.filter((recipe) => recipe.sampleSaved).length, 3);
+
+	// Manual recipe survives sample cleanup after guest reload.
+	const cleaned = clearSampleData(reloaded);
+	const manualAfterCleanup = cleaned.recipes.find((item) => item.id === 'manual-pasta');
+	assert.equal(manualAfterCleanup?.saved, true);
+	assert.equal(manualAfterCleanup?.provenance, 'manual');
+});
