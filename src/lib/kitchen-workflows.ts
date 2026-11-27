@@ -1,9 +1,12 @@
 import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
 import {
 	buildShoppingList,
-	dateOrdinal,
+	consumeRecipeFromPantry,
+	deductRecipeFromPantry,
+	expiryStatus,
 	normalizeName,
 	parseCalendarDate,
+	parseIngredientLines,
 	resolveShoppingQuantity,
 	roundShoppingQuantity,
 	unitInfo,
@@ -13,12 +16,21 @@ import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
 import { hasZeroNutrition } from './recipe-collection.ts';
 import { seedPantry, seedRecipes } from './data.ts';
 export {
+	consumeRecipeFromPantry,
+	deductRecipeFromPantry,
+	expiryStatus,
+	indexUsablePantry,
+	matchRecipePantry,
+	msUntilNextLocalMidnight,
 	normalizeName,
 	normalizeName as normalizeIngredientName,
 	parseIngredientLine,
 	parseIngredientLines,
 	unitInfo,
-	type ParsedIngredient
+	type ExpiryStatus,
+	type PantryLotIndex,
+	type ParsedIngredient,
+	type RecipePantryMatch
 } from './domain.ts';
 
 /** Convert a quantity when both units are in the same dimension, otherwise return undefined. */
@@ -69,8 +81,6 @@ function nextFreeGeneratedId(sourceKey: string, key: string, usedIds: Set<string
 	usedIds.add(candidate);
 	return candidate;
 }
-
-export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
 
 export type PantryDraft = {
 	id: string;
@@ -149,23 +159,6 @@ export function filterPantryItems(
 		}
 		return true;
 	});
-}
-
-function calendarDate(value: Date): { year: number; month: number; day: number } | undefined {
-	if (!Number.isFinite(value.getTime())) return undefined;
-	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
-}
-
-/** Classify an expiry by local calendar day; date-only and ISO strings never shift by timezone. */
-export function expiryStatus(expires?: string, now: Date = new Date()): ExpiryStatus {
-	if (!expires?.trim()) return 'unknown';
-	const expiry = parseCalendarDate(expires);
-	const today = calendarDate(now);
-	if (!expiry || !today) return 'unknown';
-	const daysUntilExpiry = dateOrdinal(expiry) - dateOrdinal(today);
-	if (daysUntilExpiry < 0) return 'expired';
-	if (daysUntilExpiry <= 3) return 'soon';
-	return 'fresh';
 }
 
 /**
@@ -350,9 +343,12 @@ export function weekStartForDate(value: string | Date | undefined): string {
 		if (!parsed) return value;
 		return mondayKeyForParts(parsed);
 	}
-	const parts = calendarDate(value);
-	if (!parts) return '';
-	return mondayKeyForParts(parts);
+	if (!Number.isFinite(value.getTime())) return '';
+	return mondayKeyForParts({
+		year: value.getFullYear(),
+		month: value.getMonth(),
+		day: value.getDate()
+	});
 }
 
 function weekDatesForStart(startDate: string): Set<string> | undefined {
@@ -541,6 +537,85 @@ export function restoreShoppingItem(
 	return reconciled.length > MAX_SHOPPING_ITEMS ? existing : reconciled;
 }
 
+export type RecognizedPantryItem = {
+	name: string;
+	quantity: number;
+	unit: string;
+	category: string;
+};
+
+export type StagedPantryItem = {
+	id: string;
+	name: string;
+	quantity: number | string | null;
+	unit: string;
+	category: string;
+};
+
+export type PantryAddition = {
+	name: string;
+	quantity: number | string | null;
+	unit: string;
+	category?: string;
+	expires?: string;
+};
+
+/** Normalize a staged scan row on blur without clamping empty quantities to 0.01. */
+export function normalizeStagedScanDraft(item: StagedPantryItem): StagedPantryItem {
+	item.name = (item.name ?? '').trim().slice(0, 100);
+	item.unit = (item.unit ?? '').trim().slice(0, 40) || 'each';
+	item.category = (item.category ?? '').trim().slice(0, 60) || 'Pantry';
+	if (
+		item.quantity === null ||
+		item.quantity === undefined ||
+		(typeof item.quantity === 'string' && item.quantity.trim() === '')
+	) {
+		item.quantity = null;
+		return item;
+	}
+	const parsed = Number(item.quantity);
+	item.quantity =
+		Number.isFinite(parsed) && parsed > 0
+			? roundPantryQuantity(Math.min(parsed, 1_000_000))
+			: parsed === 0
+				? 0
+				: null;
+	return item;
+}
+
+/** Stage recognized AI vision ingredients for review with clean names, units, and categories. */
+export function stageScannedIngredients(
+	existing: StagedPantryItem[],
+	recognized: RecognizedPantryItem[],
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): StagedPantryItem[] {
+	const staged = existing.map((item) => ({ ...item }));
+	const usedIds = new Set(staged.map((item) => item.id));
+	for (const item of recognized) {
+		const name = item.name.trim().slice(0, 100);
+		if (!name || !Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim())
+			continue;
+		const baseId = createId();
+		let id = baseId;
+		let suffix = 2;
+		while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+		usedIds.add(id);
+		staged.push({
+			id,
+			name,
+			quantity: roundPantryQuantity(item.quantity),
+			unit: unitInfo(item.unit).display.slice(0, 40) || 'each',
+			category: item.category.trim().slice(0, 60) || 'Pantry'
+		});
+	}
+	return staged;
+}
+
+/** Parse comma-, semicolon-, or newline-separated manual pantry entries. */
+export function parseManualPantryInput(input: string): PantryAddition[] {
+	return parseIngredientLines(input);
+}
+
 /**
  * Reconcile explicit user shopping for a recipe or week scope.
  * Clears a recipe:<id> scope first when all of its existing rows are already checked,
@@ -621,8 +696,10 @@ export function retireCheckedShoppingItems(
 		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
 		const status = expiryStatus(item.expires, safeNow);
 		if (status === 'expired' || (Boolean(item.expires?.trim()) && status === 'unknown')) continue;
-		const key = bucketKey(item.name, item.unit);
+		const normalizedName = normalizeName(item.name);
+		if (!normalizedName) continue;
 		const unit = unitInfo(item.unit);
+		const key = `${normalizedName}\u0000${unit.dimension}`;
 		addedByBucket.set(key, (addedByBucket.get(key) ?? 0) + item.quantity * unit.factor);
 	}
 	if (addedByBucket.size === 0) return shopping.map((item) => ({ ...item }));
@@ -638,43 +715,68 @@ export function retireCheckedShoppingItems(
 	});
 }
 
-/** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
-export function transferPurchasedItemsToPantry(
+/** Merge structured or manual additions into pantry stock while preserving recognized categories. */
+export function mergePantryAdditions(
 	pantry: Ingredient[],
-	purchases: ShoppingItem[],
+	additions: PantryAddition[],
 	createId: () => string = () => globalThis.crypto.randomUUID()
 ): Ingredient[] {
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category?: string }
+		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category: string }
 	>();
-	for (const item of purchases) {
-		if (
-			!item.checked ||
-			!Number.isFinite(item.quantity) ||
-			!(item.quantity > 0) ||
-			!item.name.trim() ||
-			!item.unit.trim()
-		)
+	const datedAdditions: Array<{
+		name: string;
+		unit: ReturnType<typeof unitInfo>;
+		quantityBase: number;
+		category: string;
+		expires: string;
+	}> = [];
+	for (const item of additions) {
+		const trimmedName = item.name.trim().slice(0, 200);
+		const quantity = Number(item.quantity);
+		const trimmedUnit = item.unit.trim();
+		if (!trimmedName || !Number.isFinite(quantity) || !(quantity > 0) || !trimmedUnit) continue;
+		const normalizedName = normalizeName(trimmedName);
+		if (!normalizedName) continue;
+		const unit = unitInfo(trimmedUnit);
+		const category = item.category?.trim().slice(0, 100) || 'Pantry';
+		const expires = item.expires?.trim().slice(0, 50);
+		if (expires) {
+			datedAdditions.push({
+				name: trimmedName,
+				unit,
+				quantityBase: quantity * unit.factor,
+				category,
+				expires
+			});
 			continue;
-		const normalizedName = normalizeName(item.name);
-		const unit = unitInfo(item.unit);
+		}
 		const key = `${normalizedName}\u0000${unit.dimension}`;
 		const bucket = buckets.get(key) ?? {
-			name: item.name.trim().slice(0, 200),
+			name: trimmedName,
 			unit,
-			quantityBase: 0
+			quantityBase: 0,
+			category
 		};
-		bucket.quantityBase += item.quantity * unit.factor;
-		const category = item.category?.trim();
-		if (category && (!bucket.category || (bucket.category === 'Pantry' && category !== 'Pantry'))) {
+		bucket.quantityBase += quantity * unit.factor;
+		if (bucket.category === 'Pantry' && category !== 'Pantry') {
 			bucket.category = category;
 		}
 		buckets.set(key, bucket);
 	}
 
 	const usedIds = new Set(result.map((item) => item.id));
+	const allocateId = () => {
+		const baseId = createId();
+		let id = baseId;
+		let suffix = 2;
+		while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+		usedIds.add(id);
+		return id;
+	};
+
 	for (const [key, bucket] of buckets) {
 		const [normalizedName] = key.split('\u0000');
 		const destination = result.find(
@@ -692,24 +794,55 @@ export function transferPurchasedItemsToPantry(
 				1_000_000,
 				roundPantryQuantity(baseline + bucket.quantityBase / unitInfo(destination.unit).factor)
 			);
+			if (!destination.category?.trim()) {
+				destination.category = bucket.category || 'Pantry';
+			}
 			continue;
 		}
 		if (result.length >= 1_000) continue;
 
-		const baseId = createId();
-		let id = baseId;
-		let suffix = 2;
-		while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
-		usedIds.add(id);
 		result.push({
-			id,
+			id: allocateId(),
 			name: bucket.name,
 			quantity: Math.min(1_000_000, roundPantryQuantity(bucket.quantityBase / bucket.unit.factor)),
 			unit: bucket.unit.display.slice(0, 40),
-			category: bucket.category?.slice(0, 100) || 'Pantry'
+			category: bucket.category.slice(0, 100) || 'Pantry'
 		});
 	}
+
+	for (const item of datedAdditions) {
+		if (result.length >= 1_000) break;
+		result.push({
+			id: allocateId(),
+			name: item.name,
+			quantity: Math.min(1_000_000, roundPantryQuantity(item.quantityBase / item.unit.factor)),
+			unit: item.unit.display.slice(0, 40),
+			category: item.category.slice(0, 100) || 'Pantry',
+			expires: item.expires
+		});
+	}
+
 	return result;
+}
+
+/** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
+export function transferPurchasedItemsToPantry(
+	pantry: Ingredient[],
+	purchases: ShoppingItem[],
+	createId: () => string = () => globalThis.crypto.randomUUID()
+): Ingredient[] {
+	return mergePantryAdditions(
+		pantry,
+		purchases
+			.filter((item) => item.checked)
+			.map((item) => ({
+				name: item.name,
+				quantity: item.quantity,
+				unit: item.unit,
+				category: item.category
+			})),
+		createId
+	);
 }
 
 /**
@@ -718,14 +851,52 @@ export function transferPurchasedItemsToPantry(
  */
 export function addPantryItems(
 	state: AppState,
-	additions: ShoppingItem[],
+	additions: PantryAddition[],
 	now: Date = new Date(),
 	createId: () => string = () => globalThis.crypto.randomUUID()
 ): AppState {
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const existingKeys = new Set(
+		state.pantry
+			.filter((item) => !item.sample && !item.expires?.trim())
+			.map((item) => bucketKey(item.name, item.unit))
+	);
+	let lotCount = state.pantry.length;
+	const accepted: PantryAddition[] = [];
+	for (const item of additions) {
+		const name = item.name.trim().slice(0, 200);
+		const quantity = Number(item.quantity);
+		const unit = item.unit.trim().slice(0, 40);
+		if (!name || !unit || !Number.isFinite(quantity) || !(quantity > 0)) continue;
+		const normalized = normalizeName(name);
+		if (!normalized) continue;
+		const hasExpiry = Boolean(item.expires?.trim());
+		const key = `${normalized}\u0000${unitInfo(unit).dimension}`;
+		if (hasExpiry || !existingKeys.has(key)) {
+			if (lotCount >= 1_000) continue;
+			if (!hasExpiry) existingKeys.add(key);
+			lotCount += 1;
+		}
+		accepted.push({
+			name,
+			quantity: Math.min(1_000_000, quantity),
+			unit,
+			category: item.category,
+			expires: item.expires
+		});
+	}
 	const weeks = activeWeeklyScopes(state.shopping);
-	const pantry = transferPurchasedItemsToPantry(state.pantry, additions, createId);
-	const shopping = retireCheckedShoppingItems(state.shopping, additions, safeNow);
+	const pantry = mergePantryAdditions(state.pantry, accepted, createId);
+	const shopping = retireCheckedShoppingItems(
+		state.shopping,
+		accepted.map((item) => ({
+			name: item.name,
+			quantity: Number(item.quantity),
+			unit: item.unit,
+			expires: item.expires
+		})),
+		safeNow
+	);
 	return refreshWeeks({ ...state, pantry, shopping }, weeks, safeNow);
 }
 
@@ -752,7 +923,9 @@ export function movePurchasesToPantry(
 		const name = item.name.trim().slice(0, 200);
 		const unit = item.unit.trim().slice(0, 40);
 		if (!name || !unit || !Number.isFinite(item.quantity) || !(item.quantity > 0)) continue;
-		const key = bucketKey(name, unit);
+		const normalized = normalizeName(name);
+		if (!normalized) continue;
+		const key = `${normalized}\u0000${unitInfo(unit).dimension}`;
 		if (!existingKeys.has(key)) {
 			if (lotCount >= 1_000) continue;
 			existingKeys.add(key);
@@ -842,76 +1015,13 @@ function recipeForMeal(state: AppState, meal: Meal): Recipe | undefined {
 	return state.recipes.find((recipe) => recipe.id === meal.recipeId);
 }
 
-function expiryPriority(expires: string | undefined, now: Date): number {
-	const expiry = expires ? parseCalendarDate(expires) : undefined;
-	const today = calendarDate(now);
-	if (!expiry || !today) return Number.MAX_SAFE_INTEGER;
-	return dateOrdinal(expiry) - dateOrdinal(today);
-}
-
 function consumePantry(
 	pantry: Ingredient[],
 	recipe: Recipe,
 	servings: number,
 	now: Date
 ): { pantry: Ingredient[]; uncoveredByBucket: Map<string, number> } {
-	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
-	const remaining = pantry.map((item) => ({ ...item }));
-	const uncoveredByBucket = new Map<string, number>();
-	if (!Number.isFinite(servings) || !(servings > 0)) {
-		return { pantry: remaining, uncoveredByBucket };
-	}
-	const scale =
-		Number.isFinite(recipe.servings) && recipe.servings > 0 ? servings / recipe.servings : 1;
-
-	for (const ingredient of recipe.ingredients) {
-		if (
-			!Number.isFinite(ingredient.quantity) ||
-			ingredient.quantity <= 0 ||
-			!ingredient.unit.trim()
-		)
-			continue;
-		let need = ingredient.quantity * scale;
-		const candidates = remaining
-			.map((item, index) => ({ item, index }))
-			.filter(({ item }) => normalizeName(item.name) === normalizeName(ingredient.name))
-			.filter(({ item }) => {
-				const status = expiryStatus(item.expires, safeNow);
-				return status !== 'expired' && (!item.expires?.trim() || status !== 'unknown');
-			})
-			.sort(
-				(a, b) =>
-					expiryPriority(a.item.expires, safeNow) - expiryPriority(b.item.expires, safeNow) ||
-					a.index - b.index
-			);
-
-		for (const { item, index } of candidates) {
-			if (need <= 0) break;
-			const available = convertCompatibleQuantity(item.quantity, item.unit, ingredient.unit);
-			if (available === undefined || !(available > 0)) continue;
-			const used = Math.min(need, available);
-			const remainingInRecipeUnit = available - used;
-			const remainingInPantryUnit = convertCompatibleQuantity(
-				remainingInRecipeUnit,
-				ingredient.unit,
-				item.unit
-			);
-			if (remainingInPantryUnit !== undefined)
-				remaining[index] = {
-					...item,
-					quantity: roundPantryQuantity(Math.max(0, remainingInPantryUnit))
-				};
-			need = Math.max(0, need - used);
-		}
-
-		if (need > 0) {
-			const key = bucketKey(ingredient.name, ingredient.unit);
-			const unit = unitInfo(ingredient.unit);
-			uncoveredByBucket.set(key, (uncoveredByBucket.get(key) ?? 0) + need * unit.factor);
-		}
-	}
-
-	return { pantry: remaining, uncoveredByBucket };
+	return consumeRecipeFromPantry(pantry, recipe, servings, now);
 }
 
 function affectedWeekStarts(shopping: ShoppingItem[], dates: Iterable<string>): string[] {

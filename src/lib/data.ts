@@ -102,7 +102,7 @@ export const seedRecipes: Recipe[] = [
 		cuisine: 'Italian-inspired',
 		tags: ['vegetarian', 'quick', 'comfort-food'],
 		ingredients: [
-			{ name: 'cannellini beans', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'cannellini beans', quantity: 1, unit: 'can' },
 			{ name: 'cherry tomatoes', quantity: 10, unit: 'oz' },
 			{ name: 'shallot', quantity: 1, unit: 'whole' },
 			{ name: 'garlic', quantity: 2, unit: 'cloves' },
@@ -146,7 +146,7 @@ export const seedRecipes: Recipe[] = [
 		tags: ['vegetarian', 'quick', 'one-pan'],
 		ingredients: [
 			{ name: 'orzo', quantity: 0.75, unit: 'cup' },
-			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'chickpeas', quantity: 1, unit: 'can' },
 			{ name: 'baby spinach', quantity: 3, unit: 'cups' },
 			{ name: 'vegetable broth', quantity: 2, unit: 'cups' },
 			{ name: 'shallot', quantity: 1, unit: 'whole' },
@@ -231,7 +231,7 @@ export const seedRecipes: Recipe[] = [
 		ingredients: [
 			{ name: 'farro', quantity: 0.75, unit: 'cup' },
 			{ name: 'butternut squash', quantity: 10, unit: 'oz' },
-			{ name: 'red onion', quantity: 1, unit: 'small' },
+			{ name: 'red onion', quantity: 1, unit: 'whole' },
 			{ name: 'baby kale', quantity: 2, unit: 'cups' },
 			{ name: 'feta', quantity: 3, unit: 'oz' },
 			{ name: 'plain Greek yogurt', quantity: 2, unit: 'tbsp' },
@@ -279,7 +279,7 @@ export const seedRecipes: Recipe[] = [
 			{ name: 'garlic', quantity: 2, unit: 'cloves' },
 			{ name: 'lemon', quantity: 1, unit: 'whole' },
 			{ name: 'Persian cucumbers', quantity: 2, unit: 'whole' },
-			{ name: 'tomatoes', quantity: 1, unit: 'medium' },
+			{ name: 'tomatoes', quantity: 1, unit: 'whole' },
 			{ name: 'flatbread', quantity: 2, unit: 'pieces' },
 			{ name: 'fresh mint', quantity: 1, unit: 'tbsp' }
 		],
@@ -317,7 +317,7 @@ export const seedRecipes: Recipe[] = [
 			{ name: 'red lentils', quantity: 0.75, unit: 'cup' },
 			{ name: 'light coconut milk', quantity: 1, unit: 'cup' },
 			{ name: 'vegetable broth', quantity: 1, unit: 'cup' },
-			{ name: 'yellow onion', quantity: 1, unit: 'small' },
+			{ name: 'yellow onion', quantity: 1, unit: 'whole' },
 			{ name: 'garlic', quantity: 3, unit: 'cloves' },
 			{ name: 'fresh ginger', quantity: 1, unit: 'tbsp' },
 			{ name: 'curry powder', quantity: 2, unit: 'tsp' },
@@ -369,7 +369,7 @@ export const seedPantry: Ingredient[] = [
 		id: 'pantry-chickpeas',
 		name: 'chickpeas',
 		quantity: 1,
-		unit: 'can (15 oz)',
+		unit: 'can',
 		category: 'Canned goods'
 	},
 	{ id: 'pantry-eggs', name: 'eggs', quantity: 4, unit: 'whole', category: 'Dairy & eggs' }

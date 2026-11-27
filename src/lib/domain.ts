@@ -123,28 +123,94 @@ const ingredientAliases: Record<string, string> = {
 	'extra-virgin olive oil': 'olive oil',
 	'plain greek yogurt': 'greek yogurt',
 	'plain greek yoghurt': 'greek yogurt',
+	'greek yoghurt': 'greek yogurt',
+	'roma tomato': 'tomato',
 	'roma tomatoes': 'tomato',
 	tomatoes: 'tomato',
 	'baby spinach': 'spinach',
 	'boneless skinless chicken breast': 'chicken breast',
 	'boneless chicken breast': 'chicken breast',
 	'persian cucumber': 'cucumber',
-	'persian cucumbers': 'cucumber'
+	'persian cucumbers': 'cucumber',
+	'crushed garlic': 'garlic'
 };
 
-const singulars: Record<string, string> = {
-	apples: 'apple',
+const nonIdentityModifiers = new Set([
+	'fresh',
+	'freshly',
+	'baby',
+	'minced',
+	'boneless',
+	'skinless',
+	'chopped',
+	'diced',
+	'sliced',
+	'grated',
+	'shredded',
+	'peeled',
+	'trimmed',
+	'halved',
+	'quartered',
+	'drained',
+	'rinsed',
+	'divided',
+	'finely',
+	'roughly',
+	'coarsely',
+	'thinly',
+	'thickly',
+	'ripe',
+	'organic'
+]);
+
+const modifierConjunctions = new Set(['and', 'or', '&']);
+
+const trailingUsageClauses = [
+	', to taste',
+	' to taste',
+	', for garnish',
+	' for garnish',
+	', for serving',
+	' for serving',
+	', optional'
+];
+
+const uncountableWords = new Set([
+	'asparagus',
+	'citrus',
+	'couscous',
+	'greens',
+	'grits',
+	'hummus',
+	'lemongrass',
+	'molasses',
+	'oats',
+	'swiss',
+	'watercress'
+]);
+
+const irregularSingulars: Record<string, string> = {
+	avocadoes: 'avocado',
 	avocados: 'avocado',
-	beans: 'bean',
-	'broccoli florets': 'broccoli floret',
-	carrots: 'carrot',
-	cucumbers: 'cucumber',
-	eggs: 'egg',
-	lemons: 'lemon',
-	limes: 'lime',
-	onions: 'onion',
+	brioches: 'brioche',
+	brownies: 'brownie',
+	chilies: 'chili',
+	chillies: 'chilli',
+	cookies: 'cookie',
+	halves: 'half',
+	jalapenos: 'jalapeno',
+	jalapeños: 'jalapeño',
+	knives: 'knife',
+	leaves: 'leaf',
+	loaves: 'loaf',
+	mangoes: 'mango',
+	mangos: 'mango',
+	pies: 'pie',
 	potatoes: 'potato',
-	tomatoes: 'tomato'
+	quiches: 'quiche',
+	smoothies: 'smoothie',
+	tomatoes: 'tomato',
+	veggies: 'veggie'
 };
 
 function cleanText(value: string): string {
@@ -155,21 +221,127 @@ function cleanText(value: string): string {
 		.replace(/[.,;:]$/, '');
 }
 
+function stripParentheticals(cleaned: string): string {
+	if (!cleaned.includes('(') && !cleaned.includes(')')) return cleaned;
+	const withoutParens = cleanText(cleaned.replace(/\([^)]*\)/g, ' '));
+	if (withoutParens) return withoutParens;
+	return cleanText(cleaned.replace(/[()]/g, ' '));
+}
+
+function stripTrailingClauses(cleaned: string): string {
+	let current = cleaned;
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const clause of trailingUsageClauses) {
+			if (current.endsWith(clause)) {
+				const candidate = cleanText(current.slice(0, -clause.length));
+				if (candidate) {
+					current = candidate;
+					changed = true;
+					break;
+				}
+			}
+		}
+	}
+	return current;
+}
+
+function stripModifiers(cleaned: string): string {
+	const clauses = cleaned.split(',');
+	const allTokens: string[] = [];
+	const keptTokens: string[] = [];
+	for (const rawClause of clauses) {
+		const clauseTokens = rawClause
+			.trim()
+			.split(' ')
+			.map((token) => token.replace(/^,+|,+$/g, ''))
+			.filter(Boolean);
+		allTokens.push(...clauseTokens);
+		const filtered = clauseTokens.filter((token) => !nonIdentityModifiers.has(token));
+		while (filtered.length > 0 && modifierConjunctions.has(filtered[0])) {
+			filtered.shift();
+		}
+		while (filtered.length > 0 && modifierConjunctions.has(filtered[filtered.length - 1])) {
+			filtered.pop();
+		}
+		for (const token of filtered) {
+			if (
+				modifierConjunctions.has(token) &&
+				keptTokens.length > 0 &&
+				modifierConjunctions.has(keptTokens[keptTokens.length - 1])
+			) {
+				continue;
+			}
+			keptTokens.push(token);
+		}
+	}
+	while (keptTokens.length > 0 && modifierConjunctions.has(keptTokens[0])) {
+		keptTokens.shift();
+	}
+	while (keptTokens.length > 0 && modifierConjunctions.has(keptTokens[keptTokens.length - 1])) {
+		keptTokens.pop();
+	}
+	return keptTokens.length > 0 ? keptTokens.join(' ') : allTokens.join(' ');
+}
+
+function singularizeWord(word: string): string {
+	if (word.length <= 2 || uncountableWords.has(word)) return word;
+	const irregular = irregularSingulars[word];
+	if (irregular) return irregular;
+	if (word.endsWith('ss') || word.endsWith('us') || word.endsWith('is')) return word;
+	if (word.length > 3 && word.endsWith('ies') && !/[aeiou]ies$/.test(word)) {
+		return `${word.slice(0, -3)}y`;
+	}
+	if (/(?:sh|ch|x|ss|zz)es$/.test(word)) {
+		return word.slice(0, -2);
+	}
+	if (word.endsWith('s')) {
+		return word.slice(0, -1);
+	}
+	return word;
+}
+
+function singularizePhrase(phrase: string): string {
+	const words = phrase.split(' ').filter(Boolean);
+	if (words.length === 0) return phrase;
+	words[words.length - 1] = singularizeWord(words[words.length - 1]);
+	return words.join(' ');
+}
+
 export function normalizeName(name: string): string {
 	const cleaned = cleanText(name);
-	return ingredientAliases[cleaned] ?? singulars[cleaned] ?? cleaned;
+	if (!cleaned) return '';
+	if (ingredientAliases[cleaned]) return ingredientAliases[cleaned];
+	const deannotated = stripTrailingClauses(stripParentheticals(cleaned));
+	if (!deannotated) return '';
+	if (ingredientAliases[deannotated]) return ingredientAliases[deannotated];
+	const stripped = stripModifiers(deannotated);
+	if (ingredientAliases[stripped]) return ingredientAliases[stripped];
+	const singular = singularizePhrase(stripped);
+	return ingredientAliases[singular] ?? singular;
 }
 
 export function unitInfo(unit: string): UnitInfo {
 	const cleaned = cleanText(unit);
-	return (
-		unitAliases[cleaned] ?? {
-			dimension: `unit:${cleaned}`,
-			factor: 1,
-			display: cleaned || 'each',
-			system: 'custom'
-		}
-	);
+	if (unitAliases[cleaned]) return unitAliases[cleaned];
+	const withoutParens = cleanText(cleaned.replace(/\s*\([^)]*\)/g, ' '));
+	if (withoutParens && /^[a-z][a-z.\s-]*$/.test(withoutParens)) {
+		return (
+			unitAliases[withoutParens] ?? {
+				dimension: `unit:${withoutParens}`,
+				factor: 1,
+				display: withoutParens,
+				system: 'custom'
+			}
+		);
+	}
+	return {
+		dimension: `unit:${cleaned}`,
+		factor: 1,
+		display: cleaned || 'each',
+		system: 'custom'
+	};
 }
 
 const MIN_READABLE_SHOPPING_QUANTITY = 0.05;
@@ -262,6 +434,13 @@ export function parseIngredientLine(raw: string): ParsedIngredient | undefined {
 		const afterAlias = rest.slice(alias.length);
 		if (!/^\.?\s+/.test(afterAlias)) continue;
 		let candidateName = afterAlias.replace(/^\.?\s+/, '').trim();
+		if (candidateName.startsWith('(')) {
+			const closeIndex = candidateName.indexOf(')');
+			if (closeIndex !== -1) {
+				const afterParen = candidateName.slice(closeIndex + 1).trim();
+				if (afterParen) candidateName = afterParen;
+			}
+		}
 		if (/^of$/i.test(candidateName)) candidateName = '';
 		else candidateName = candidateName.replace(/^of\s+/i, '').trim();
 		candidateName = candidateName
@@ -398,6 +577,270 @@ export function dateOrdinal(date: CalendarDate): number {
 
 function localCalendarDate(value: Date): CalendarDate {
 	return { year: value.getFullYear(), month: value.getMonth(), day: value.getDate() };
+}
+
+/** Return milliseconds until the next local calendar midnight (at least 250ms). */
+export function msUntilNextLocalMidnight(now: Date = new Date()): number {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const nextMidnight = new Date(
+		safeNow.getFullYear(),
+		safeNow.getMonth(),
+		safeNow.getDate() + 1,
+		0,
+		0,
+		0,
+		50
+	);
+	return Math.max(250, nextMidnight.getTime() - safeNow.getTime());
+}
+
+export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
+
+/** Classify an expiry by local calendar day; date-only and ISO strings never shift by timezone. */
+export function expiryStatus(expires?: string, now: Date = new Date()): ExpiryStatus {
+	if (!expires?.trim() || !Number.isFinite(now.getTime())) return 'unknown';
+	const expiry = parseCalendarDate(expires);
+	if (!expiry) return 'unknown';
+	const today = localCalendarDate(now);
+	const daysUntilExpiry = dateOrdinal(expiry) - dateOrdinal(today);
+	if (daysUntilExpiry < 0) return 'expired';
+	if (daysUntilExpiry <= 3) return 'soon';
+	return 'fresh';
+}
+
+export type IndexedPantryLot = {
+	pantryIndex: number;
+	unitFactor: number;
+	quantityBase: number;
+	expiry: Exclude<ExpiryStatus, 'expired'>;
+	priority: number;
+	index: number;
+};
+
+export type PantryLotIndex = Map<string, IndexedPantryLot[]>;
+
+export type RecipePantryMatch = {
+	matchedCount: number;
+	available: number;
+	expiring: number;
+};
+
+function roundLotQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
+	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+/** Index positive, non-expired pantry stock by normalized name and unit dimension. */
+export function indexUsablePantry(pantry: Ingredient[], now: Date = new Date()): PantryLotIndex {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const index: PantryLotIndex = new Map();
+	for (let pantryIndex = 0; pantryIndex < pantry.length; pantryIndex++) {
+		const item = pantry[pantryIndex];
+		if (!Number.isFinite(item.quantity) || !(item.quantity > 0) || !item.unit.trim()) continue;
+		const expiry = expiryStatus(item.expires, safeNow);
+		if (expiry === 'expired' || (Boolean(item.expires?.trim()) && expiry === 'unknown')) continue;
+		const normalizedName = normalizeName(item.name);
+		if (!normalizedName) continue;
+		const unit = unitInfo(item.unit);
+		const key = `${normalizedName}\u0000${unit.dimension}`;
+		const parsedExpiry = item.expires?.trim() ? parseCalendarDate(item.expires) : undefined;
+		const priority = parsedExpiry ? dateOrdinal(parsedExpiry) : Number.MAX_SAFE_INTEGER;
+		const lots = index.get(key) ?? [];
+		lots.push({
+			pantryIndex,
+			unitFactor: unit.factor,
+			quantityBase: item.quantity * unit.factor,
+			expiry,
+			priority,
+			index: lots.length
+		});
+		index.set(key, lots);
+	}
+	for (const lots of index.values()) {
+		lots.sort((a, b) => a.priority - b.priority || a.pantryIndex - b.pantryIndex);
+	}
+	return index;
+}
+
+type WorkingLot = {
+	pantryIndex: number;
+	unitFactor: number;
+	initialBase: number;
+	remainingBase: number;
+	expiry: Exclude<ExpiryStatus, 'expired'>;
+};
+
+function allocateRecipePantry(
+	recipe: Recipe,
+	pantryOrIndex: Ingredient[] | PantryLotIndex,
+	options: { servings?: number; now?: Date } = {}
+): RecipePantryMatch & { consumedLots: WorkingLot[]; uncoveredByBucket: Map<string, number> } {
+	const ingredients = recipe.ingredients.filter(
+		(item) => Number.isFinite(item.quantity) && item.quantity > 0 && item.unit.trim()
+	);
+	if (!ingredients.length) {
+		return {
+			matchedCount: 0,
+			available: 0,
+			expiring: 0,
+			consumedLots: [],
+			uncoveredByBucket: new Map()
+		};
+	}
+
+	const rawNow = options.now ?? new Date();
+	const safeNow = Number.isFinite(rawNow.getTime()) ? rawNow : new Date();
+	const index = Array.isArray(pantryOrIndex)
+		? indexUsablePantry(pantryOrIndex, safeNow)
+		: pantryOrIndex;
+	const scale =
+		options.servings !== undefined &&
+		Number.isFinite(recipe.servings) &&
+		recipe.servings > 0 &&
+		Number.isFinite(options.servings) &&
+		options.servings > 0
+			? options.servings / recipe.servings
+			: 1;
+	const remainingByBucket = new Map<string, WorkingLot[]>();
+	const buckets = new Map<
+		string,
+		{ requiredBase: number; allocatedBase: number; expiringBase: number }
+	>();
+	let matchedCount = 0;
+
+	for (const ingredient of ingredients) {
+		const normalizedName = normalizeName(ingredient.name);
+		if (!normalizedName) continue;
+		const unit = unitInfo(ingredient.unit);
+		const key = `${normalizedName}\u0000${unit.dimension}`;
+		const requiredBase = ingredient.quantity * scale * unit.factor;
+		let lots = remainingByBucket.get(key);
+		if (!lots) {
+			lots = (index.get(key) ?? []).map((lot) => ({
+				pantryIndex: lot.pantryIndex,
+				unitFactor: lot.unitFactor,
+				initialBase: lot.quantityBase,
+				remainingBase: lot.quantityBase,
+				expiry: lot.expiry
+			}));
+			remainingByBucket.set(key, lots);
+		}
+
+		let need = requiredBase;
+		let allocatedBase = 0;
+		let expiringBase = 0;
+		for (const lot of lots) {
+			if (need <= 0) break;
+			if (!(lot.remainingBase > 0)) continue;
+			if (need >= lot.remainingBase) {
+				const used = lot.remainingBase;
+				lot.remainingBase = 0;
+				need = Math.max(0, need - used);
+				allocatedBase += used;
+				if (lot.expiry === 'soon') expiringBase += used;
+			} else {
+				const used = need;
+				lot.remainingBase -= used;
+				need = 0;
+				allocatedBase += used;
+				if (lot.expiry === 'soon') expiringBase += used;
+			}
+		}
+		if (allocatedBase > 0) matchedCount++;
+
+		const bucket = buckets.get(key) ?? { requiredBase: 0, allocatedBase: 0, expiringBase: 0 };
+		bucket.requiredBase += requiredBase;
+		bucket.allocatedBase += allocatedBase;
+		bucket.expiringBase += expiringBase;
+		buckets.set(key, bucket);
+	}
+
+	const consumedLots: WorkingLot[] = [];
+	for (const lots of remainingByBucket.values()) {
+		for (const lot of lots) {
+			if (lot.remainingBase < lot.initialBase) consumedLots.push(lot);
+		}
+	}
+
+	const uncoveredByBucket = new Map<string, number>();
+	for (const [key, bucket] of buckets) {
+		const uncoveredBase = Math.max(0, bucket.requiredBase - bucket.allocatedBase);
+		if (uncoveredBase > 0) uncoveredByBucket.set(key, uncoveredBase);
+	}
+
+	if (!buckets.size) {
+		return { matchedCount, available: 0, expiring: 0, consumedLots, uncoveredByBucket };
+	}
+	let availabilitySum = 0;
+	let expiringSum = 0;
+	for (const bucket of buckets.values()) {
+		availabilitySum += Math.min(1, bucket.allocatedBase / bucket.requiredBase);
+		expiringSum += Math.min(1, bucket.expiringBase / bucket.requiredBase);
+	}
+	return {
+		matchedCount,
+		available: availabilitySum / buckets.size,
+		expiring: expiringSum / buckets.size,
+		consumedLots,
+		uncoveredByBucket
+	};
+}
+
+/**
+ * Allocate usable compatible pantry stock across a recipe's ingredients, deducting consumed
+ * lot balances so split ingredient lines never count shared stock twice.
+ */
+export function matchRecipePantry(
+	recipe: Recipe,
+	pantryOrIndex: Ingredient[] | PantryLotIndex,
+	now: Date = new Date()
+): RecipePantryMatch {
+	const { matchedCount, available, expiring } = allocateRecipePantry(recipe, pantryOrIndex, {
+		now
+	});
+	return { matchedCount, available, expiring };
+}
+
+/**
+ * Deduct a recipe's scaled ingredient quantities from usable compatible pantry lots using the
+ * shared lot allocator, returning updated pantry stock and any uncovered demand in base units.
+ */
+export function consumeRecipeFromPantry(
+	pantry: Ingredient[],
+	recipe: Recipe,
+	servings: number,
+	now: Date = new Date()
+): { pantry: Ingredient[]; uncoveredByBucket: Map<string, number> } {
+	const remaining = pantry.map((item) => ({ ...item }));
+	if (!Number.isFinite(servings) || !(servings > 0)) {
+		return { pantry: remaining, uncoveredByBucket: new Map() };
+	}
+	const { consumedLots, uncoveredByBucket } = allocateRecipePantry(recipe, pantry, {
+		servings,
+		now
+	});
+	for (const lot of consumedLots) {
+		const item = remaining[lot.pantryIndex];
+		if (!item || !(lot.unitFactor > 0)) continue;
+		remaining[lot.pantryIndex] = {
+			...item,
+			quantity: roundLotQuantity(Math.max(0, lot.remainingBase / lot.unitFactor))
+		};
+	}
+	return { pantry: remaining, uncoveredByBucket };
+}
+
+/**
+ * Deduct a recipe's scaled ingredient quantities from usable compatible pantry lots using the
+ * shared lot allocator, consuming soonest-expiring lots first and never going below zero.
+ */
+export function deductRecipeFromPantry(
+	pantry: Ingredient[],
+	recipe: Recipe,
+	servings: number,
+	now: Date = new Date()
+): Ingredient[] {
+	return consumeRecipeFromPantry(pantry, recipe, servings, now).pantry;
 }
 
 type ShoppingRequirement = {

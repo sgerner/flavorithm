@@ -103,12 +103,7 @@
 		shouldOpenPantryOnScanError,
 		type PendingAIContinuation
 	} from '#lib/ai-continuation.ts';
-	import {
-		buildShoppingList,
-		normalizeName,
-		parseIngredientLines,
-		preferenceSummary
-	} from '#lib/domain.ts';
+	import { buildShoppingList, parseIngredientLines, preferenceSummary } from '#lib/domain.ts';
 	import {
 		addPantryItems,
 		backfillSampleData,
@@ -119,12 +114,16 @@
 		expiryStatus,
 		filterPantryItems,
 		hasSampleData,
+		indexUsablePantry,
 		listPantryCategories,
+		matchRecipePantry,
 		movePurchasesToPantry,
+		msUntilNextLocalMidnight,
 		normalizeIngredientName,
 		normalizePantryDraft,
-		promoteSampleIngredient,
 		normalizeShoppingItem,
+		normalizeStagedScanDraft,
+		promoteSampleIngredient,
 		recipeForEdit,
 		recipeNeedsNutritionRefresh,
 		refreshWeekShopping,
@@ -134,12 +133,14 @@
 		saveEditedRecipe as applyEditedRecipe,
 		shopForScope,
 		snapshotShoppingItem,
+		stageScannedIngredients,
 		unitInfo,
 		upsertMeal,
 		weekStartForDate,
 		type PantryDraft,
 		type ShoppingItemDraft,
-		type ShoppingItemSnapshot
+		type ShoppingItemSnapshot,
+		type StagedPantryItem
 	} from '#lib/kitchen-workflows.ts';
 	import { rankPantryRecipes, rankRecipes } from '#lib/discovery.ts';
 	import {
@@ -520,6 +521,17 @@
 	let editingRecipeMode = $state<'create' | 'edit'>('edit');
 	let recipeToDelete = $state<Recipe | null>(null);
 	let pantryInput = $state('');
+	let stagedScanItems = $state<StagedPantryItem[]>([]);
+	let hasStagedScanItems = $derived(
+		stagedScanItems.some(
+			(item) =>
+				Boolean(item.name.trim()) &&
+				item.quantity !== null &&
+				item.quantity !== '' &&
+				Number.isFinite(Number(item.quantity)) &&
+				Number(item.quantity) > 0
+		)
+	);
 	let authMode = $state('register');
 	let name = $state('');
 	let email = $state('');
@@ -687,7 +699,9 @@
 			: ''
 	);
 	let pantryFieldError = $derived(
-		formSubmitted && modal === 'pantry' ? validatePantryInput(pantryInput) : ''
+		formSubmitted && modal === 'pantry' && !hasStagedScanItems
+			? validatePantryInput(pantryInput)
+			: ''
 	);
 	let authNameError = $derived(
 		formSubmitted && modal === 'auth' && authMode === 'register'
@@ -747,6 +761,7 @@
 		if (modeChanged && managedAuth) clearManagedIdentity();
 		if (changedIdentity) {
 			cancelScan(true);
+			stagedScanItems = [];
 			kitchenSync?.clearContext();
 			clearVoiceSession();
 			pantryInput = '';
@@ -841,19 +856,27 @@
 		'vox',
 		'wintry'
 	];
-	let activePriorityPantry = $derived(
-		priorityPantryIds.length
-			? kitchen.pantry.filter(
-					(item) =>
-						priorityPantryIds.includes(item.id) &&
-						Number.isFinite(item.quantity) &&
-						item.quantity > 0 &&
-						expiryStatus(item.expires) !== 'expired' &&
-						!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown')
-				)
-			: []
-	);
+	let calendarDayTick = $state(0);
+	function currentCalendarNow(tick = calendarDayTick): Date {
+		void tick;
+		return new Date();
+	}
+	let activePriorityPantry = $derived.by(() => {
+		const now = currentCalendarNow();
+		if (!priorityPantryIds.length) return [];
+		return kitchen.pantry.filter((item) => {
+			if (
+				!priorityPantryIds.includes(item.id) ||
+				!Number.isFinite(item.quantity) ||
+				!(item.quantity > 0)
+			)
+				return false;
+			const status = expiryStatus(item.expires, now);
+			return status !== 'expired' && !(Boolean(item.expires?.trim()) && status === 'unknown');
+		});
+	});
 	let recipes = $derived.by(() => {
+		const now = currentCalendarNow();
 		const matches = kitchen.recipes.filter(
 			(r) =>
 				(page !== 'saved' || r.saved) &&
@@ -872,19 +895,25 @@
 				matches,
 				kitchen.pantry,
 				kitchen.preferences,
-				activePriorityPantry.length ? activePriorityPantry : undefined
+				activePriorityPantry.length ? activePriorityPantry : undefined,
+				now
 			);
 		}
 		return filter === 'For you'
-			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
+			? rankRecipes(matches, kitchen.pantry, kitchen.preferences, now)
 			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
 	});
+	let usablePantryIndex = $derived(indexUsablePantry(kitchen.pantry, currentCalendarNow()));
 	let visiblePantry = $derived(
-		filterPantryItems(kitchen.pantry, {
-			query: pantryQuery,
-			category: pantryCategory,
-			expiry: pantryFilter
-		})
+		filterPantryItems(
+			kitchen.pantry,
+			{
+				query: pantryQuery,
+				category: pantryCategory,
+				expiry: pantryFilter
+			},
+			currentCalendarNow()
+		)
 	);
 	let pantryCategories = $derived(listPantryCategories(kitchen.pantry, pantryCategory));
 	let pantryCategorySuggestions = $derived(
@@ -989,20 +1018,6 @@
 					? 'In date'
 					: 'No date';
 	}
-	let availablePantryNames = $derived(
-		new Set(
-			kitchen.pantry
-				.filter(
-					(item) =>
-						Number.isFinite(item.quantity) &&
-						item.quantity > 0 &&
-						expiryStatus(item.expires) !== 'expired' &&
-						!(Boolean(item.expires?.trim()) && expiryStatus(item.expires) === 'unknown')
-				)
-				.map((item) => normalizeName(item.name))
-				.filter(Boolean)
-		)
-	);
 	let checkedCount = $derived(kitchen.shopping.filter((item) => item.checked).length);
 	let visibleShopping = $derived(
 		shoppingFilter === 'unpurchased'
@@ -1528,6 +1543,26 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
+		let activeDateKey = dateKey(new Date());
+		let midnightTimer: ReturnType<typeof setTimeout> | undefined;
+		const scheduleMidnightRefresh = () => {
+			clearTimeout(midnightTimer);
+			midnightTimer = setTimeout(() => {
+				refreshCalendarDay();
+			}, msUntilNextLocalMidnight(new Date()));
+		};
+		const refreshCalendarDay = () => {
+			const nextDateKey = dateKey(new Date());
+			if (nextDateKey !== activeDateKey) {
+				activeDateKey = nextDateKey;
+				calendarDayTick += 1;
+			}
+			scheduleMidnightRefresh();
+		};
+		const visibilityChanged = () => {
+			if (!document.hidden) refreshCalendarDay();
+		};
+		scheduleMidnightRefresh();
 		const calendarMedia =
 			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
 		const calendarMediaChanged = () => {
@@ -1538,11 +1573,16 @@
 		window.addEventListener('online', connectionChanged);
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
+		window.addEventListener('focus', refreshCalendarDay);
+		document.addEventListener('visibilitychange', visibilityChanged);
 		return () => {
 			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
 			window.removeEventListener('offline', connectionChanged);
+			window.removeEventListener('focus', refreshCalendarDay);
+			document.removeEventListener('visibilitychange', visibilityChanged);
+			clearTimeout(midnightTimer);
 			clearTimeout(saveTimer);
 			connectionPoll?.stop();
 			connectionPopup?.close();
@@ -1657,10 +1697,16 @@
 		page = id;
 		mobileNav = false;
 	}
+	function normalizeStagedScanItem(item: StagedPantryItem) {
+		normalizeStagedScanDraft(item);
+	}
+	function removeStagedScanItem(id: string) {
+		stagedScanItems = stagedScanItems.filter((item) => item.id !== id);
+	}
 	async function addIngredients(event?: SubmitEvent) {
 		event?.preventDefault();
 		if (voiceBusy || busy) return;
-		if (validatePantryInput(pantryInput)) {
+		if (!hasStagedScanItems && validatePantryInput(pantryInput)) {
 			formSubmitted = true;
 			await tick();
 			focusFirstInvalid(dialogFormEl);
@@ -1672,8 +1718,24 @@
 			.split(/[,;\r\n]+(?![^\[\]]*\])/)
 			.map((value) => value.trim())
 			.filter(Boolean);
-		const parsed = parseIngredientLines(boundedInput);
-		const rejectedInput = Math.max(0, segments.length - parsed.length);
+		const parsedManual = parseIngredientLines(boundedInput);
+		const scannedRaw = stagedScanItems.map((item) => ({
+			name: item.name.trim().slice(0, 200),
+			quantity:
+				item.quantity === null ||
+				item.quantity === undefined ||
+				(typeof item.quantity === 'string' && item.quantity.trim() === '')
+					? Number.NaN
+					: Number(item.quantity),
+			unit: item.unit.trim().slice(0, 40) || 'each',
+			category: item.category.trim().slice(0, 100) || 'Pantry'
+		}));
+		const validScanned = scannedRaw.filter(
+			(item) => item.name && Number.isFinite(item.quantity) && item.quantity > 0
+		);
+		const rejectedInput =
+			Math.max(0, segments.length - parsedManual.length) +
+			Math.max(0, scannedRaw.length - validScanned.length);
 		commitInlineEdits();
 		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
 		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
@@ -1686,11 +1748,13 @@
 		);
 		let lotCount = kitchen.pantry.length;
 		let skippedCapacity = 0;
-		const additions: AppState['shopping'] = [];
-		for (const item of parsed) {
+		const additions: Array<{ name: string; quantity: number; unit: string; category: string }> = [];
+		for (const item of [...validScanned, ...parsedManual]) {
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40) || 'each';
-			const key = `${normalizeIngredientName(name)}\u0000${unitInfo(unit).dimension}`;
+			const normalized = normalizeIngredientName(name);
+			if (!normalized) continue;
+			const key = `${normalized}\u0000${unitInfo(unit).dimension}`;
 			if (!existingKeys.has(key)) {
 				if (lotCount >= 1_000) {
 					skippedCapacity += 1;
@@ -1700,12 +1764,10 @@
 				lotCount += 1;
 			}
 			additions.push({
-				id: crypto.randomUUID(),
 				name,
 				quantity: Math.min(1_000_000, item.quantity),
 				unit,
-				category: item.category.slice(0, 100),
-				checked: true
+				category: item.category.trim().slice(0, 100) || 'Pantry'
 			});
 		}
 		if (!additions.length) {
@@ -1716,7 +1778,7 @@
 			);
 			return;
 		}
-		const updated = addPantryItems(kitchen, additions);
+		const updated = addPantryItems(kitchen, additions, currentCalendarNow());
 		kitchen.pantry = updated.pantry;
 		kitchen.shopping = updated.shopping;
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
@@ -1724,6 +1786,7 @@
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
+		stagedScanItems = [];
 		stagedScanFile = null;
 		modal = '';
 		const acceptedCount = additions.length;
@@ -1886,6 +1949,7 @@
 			canManageHousehold = false;
 			clearVoiceSession();
 			pantryInput = '';
+			stagedScanItems = [];
 			importSession = emptyImportSession();
 			resumeDialog = '';
 			clearPendingAIState();
@@ -1907,6 +1971,7 @@
 	function clearPendingAIState() {
 		pendingAIContinuation = null;
 		stagedScanFile = null;
+		stagedScanItems = [];
 		if (imageInput) imageInput.value = '';
 	}
 	function clearAIConnectionState() {
@@ -2825,23 +2890,7 @@
 				notify('No ingredients detected in that photo.');
 				return;
 			}
-			const recognized = items
-				.map((i: { name: string; quantity: number; unit: string; category?: string }) => {
-					const cleanName = String(i.name ?? '')
-						.replace(/[,;\r\n]+/g, ' ')
-						.replace(/\s+/g, ' ')
-						.trim();
-					const cleanCategory = String(i.category ?? '')
-						.replace(/[\[\]\r\n]+/g, ' ')
-						.replace(/\s+/g, ' ')
-						.trim();
-					const displayUnit = unitInfo(String(i.unit ?? '')).display;
-					return cleanCategory
-						? `${i.quantity} ${displayUnit} ${cleanName} [${cleanCategory}]`
-						: `${i.quantity} ${displayUnit} ${cleanName}`;
-				})
-				.join('\n');
-			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n').slice(0, 20000);
+			stagedScanItems = stageScannedIngredients(stagedScanItems, items);
 			if (stagedScanFile === file) stagedScanFile = null;
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
@@ -3378,7 +3427,9 @@
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40);
 			if (!name || !unit || !Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-			const key = `${normalizeIngredientName(name)}\u0000${unitInfo(unit).dimension}`;
+			const normalized = normalizeIngredientName(name);
+			if (!normalized) continue;
+			const key = `${normalized}\u0000${unitInfo(unit).dimension}`;
 			if (!existingKeys.has(key)) {
 				if (lotCount >= 1_000) continue;
 				existingKeys.add(key);
@@ -3401,7 +3452,7 @@
 		}
 		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
 		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
-		const updated = movePurchasesToPantry(kitchen);
+		const updated = movePurchasesToPantry(kitchen, currentCalendarNow());
 		kitchen.pantry = updated.pantry;
 		kitchen.shopping = updated.shopping;
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
@@ -3623,10 +3674,11 @@
 	function useFirstIngredients(items: AppState['pantry']) {
 		commitInlineEdits();
 		const targetIds = new Set(items.map((item) => item.id));
+		const now = currentCalendarNow();
 		const targets = kitchen.pantry.filter(
 			(item) =>
 				targetIds.has(item.id) &&
-				expiryStatus(item.expires) === 'soon' &&
+				expiryStatus(item.expires, now) === 'soon' &&
 				Number.isFinite(item.quantity) &&
 				item.quantity > 0 &&
 				item.name.trim()
@@ -4185,6 +4237,7 @@
 			canManageHousehold = false;
 			clearVoiceSession();
 			pantryInput = '';
+			stagedScanItems = [];
 			importSession = emptyImportSession();
 			resumeDialog = '';
 			clearPendingAIState();
@@ -4819,9 +4872,8 @@
 										<span><Clock size={14} />{recipe.time} min</span>{#if recipe.difficulty}<span
 												><ChefHat size={14} />{recipe.difficulty}</span
 											>{/if}<span class="pantry-match"
-											><Leaf size={13} />{recipe.ingredients.filter((i) =>
-												availablePantryNames.has(normalizeName(i.name))
-											).length} in your pantry</span
+											><Leaf size={13} />{matchRecipePantry(recipe, usablePantryIndex).matchedCount} in
+											your pantry</span
 										>
 									</div>
 								</div>
@@ -4867,6 +4919,7 @@
 						>{/if}
 				</section>
 			{:else if page === 'pantry'}
+				{@const pantryNow = currentCalendarNow()}
 				<section class="page-heading" in:revealMotion|global={{ y: 12, duration: 300 }}>
 					<div>
 						<h1>Your pantry<span class="heading-spark" aria-hidden="true">✳</span></h1>
@@ -4921,7 +4974,7 @@
 							><input type="search" placeholder="Search pantry" bind:value={pantryQuery} />
 						</label>
 						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
-							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<ToggleButton
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires, pantryNow) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires, pantryNow) === 'expired').length }] as option}<ToggleButton
 									class={{ active: pantryFilter === option.id }}
 									pressed={pantryFilter === option.id}
 									onclick={() => (pantryFilter = option.id)}
@@ -4963,7 +5016,8 @@
 						</div>
 						<div class="pantry-list" role="list" aria-label="Pantry ingredients">
 							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
-									item.expires
+									item.expires,
+									pantryNow
 								)}{@const itemDomId = encodeURIComponent(item.id)}{@const depleted =
 									Number.isFinite(item.quantity) && item.quantity <= 0}
 								<div
@@ -5577,7 +5631,8 @@
 					modal === 'pickRecipe' ||
 					modal === 'import' ||
 					modal === 'editMeal' ||
-					modal === 'cookMeal'}
+					modal === 'cookMeal' ||
+					(modal === 'pantry' && stagedScanItems.length > 0)}
 				class:capture-dialog={modal === 'import'}
 				role="dialog"
 				aria-labelledby={modal === 'import' ? 'recipe-import-title' : undefined}
@@ -5694,9 +5749,58 @@
 							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 						</div>{/if}
 					<form novalidate bind:this={dialogFormEl} onsubmit={addIngredients}>
+						{#if stagedScanItems.length > 0}<div class="staged-scan-section">
+								<div class="staged-scan-header">
+									<h3>Spotted in your photo ({stagedScanItems.length})</h3>
+									<button
+										type="button"
+										class="text-button"
+										onclick={() => {
+											stagedScanItems = [];
+										}}>Clear scanned</button
+									>
+								</div>
+								<div class="staged-scan-list">
+									{#each stagedScanItems as item (item.id)}<div class="staged-scan-row">
+											<input
+												class="staged-scan-name"
+												aria-label="Scanned ingredient name"
+												bind:value={item.name}
+												maxlength="100"
+												onblur={() => normalizeStagedScanItem(item)}
+											/><input
+												class="staged-scan-qty"
+												aria-label={`Quantity of ${item.name || 'ingredient'}`}
+												type="number"
+												min="0.01"
+												max="1000000"
+												step="any"
+												bind:value={item.quantity}
+												onblur={() => normalizeStagedScanItem(item)}
+											/><input
+												class="staged-scan-unit"
+												aria-label={`Unit for ${item.name || 'ingredient'}`}
+												bind:value={item.unit}
+												maxlength="40"
+												onblur={() => normalizeStagedScanItem(item)}
+											/><input
+												class="staged-scan-category"
+												aria-label={`Category for ${item.name || 'ingredient'}`}
+												bind:value={item.category}
+												maxlength="60"
+												onblur={() => normalizeStagedScanItem(item)}
+											/><button
+												type="button"
+												class="icon-button"
+												aria-label={`Remove ${item.name || 'ingredient'}`}
+												onclick={() => removeStagedScanItem(item.id)}><X size={16} /></button
+											>
+										</div>{/each}
+								</div>
+							</div>{/if}
 						<FormField
 							id="pantry-ingredients"
-							label="Ingredients"
+							label={stagedScanItems.length > 0 ? 'Additional ingredients' : 'Ingredients'}
 							help="Separate with commas or new lines. Add quantities and units when you know them."
 							error={pantryFieldError}
 							alert
@@ -5706,7 +5810,7 @@
 									bind:value={pantryInput}
 									maxlength="20000"
 									placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
-									rows="5"
+									rows={stagedScanItems.length > 0 ? 3 : 5}
 									{...field}></textarea>
 							{/snippet}
 						</FormField>
@@ -7171,6 +7275,56 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	.staged-scan-section {
+		margin: 18px 0 8px;
+		padding: 14px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+	}
+	.staged-scan-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		gap: 12px;
+		margin-bottom: 10px;
+	}
+	.staged-scan-header h3 {
+		margin: 0;
+		font-size: 14px;
+		font-weight: 600;
+	}
+	.staged-scan-list {
+		display: flex;
+		flex-direction: column;
+		gap: 8px;
+	}
+	.staged-scan-row {
+		display: grid;
+		grid-template-columns: minmax(0, 1.8fr) 76px 86px minmax(0, 1.2fr) 36px;
+		align-items: center;
+		gap: 8px;
+	}
+	.staged-scan-row input {
+		min-width: 0;
+		padding: 8px 10px;
+		background: var(--paper);
+		border: 1px solid var(--line);
+		font-size: 14px;
+	}
+	.staged-scan-qty {
+		text-align: right;
+	}
+	@media (max-width: 650px) {
+		.staged-scan-row {
+			grid-template-columns: minmax(0, 1fr) 72px 76px 36px;
+		}
+		.staged-scan-name {
+			grid-column: 1 / -1;
+		}
+		.staged-scan-category {
+			min-width: 0;
+		}
 	}
 	.staged-scan {
 		display: flex;

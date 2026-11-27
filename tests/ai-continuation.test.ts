@@ -35,7 +35,7 @@ import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
 import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
-import type { PantryDraft } from '../src/lib/kitchen-workflows.ts';
+import type { PantryDraft, StagedPantryItem } from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
@@ -385,6 +385,8 @@ function injectContinuationHook(svelteSource: string): string {
 		set pendingAIContinuation(value: PendingAIContinuation | null) { pendingAIContinuation = value; },
 		get stagedScanFile() { return stagedScanFile; },
 		set stagedScanFile(value: File | null) { stagedScanFile = value; },
+		get stagedScanItems() { return stagedScanItems; },
+		set stagedScanItems(value: StagedPantryItem[]) { stagedScanItems = value; },
 		get pantryInput() { return pantryInput; },
 		set pantryInput(value: string) { pantryInput = value; },
 		get pantryDraft() { return pantryDraft; },
@@ -459,6 +461,7 @@ type PageContinuationApi = {
 	apiKey: string;
 	pendingAIContinuation: PendingAIContinuation | null;
 	stagedScanFile: File | null;
+	stagedScanItems: StagedPantryItem[];
 	pantryInput: string;
 	pantryDraft: PantryDraft | null;
 	importSession: {
@@ -591,6 +594,8 @@ function createReactivePage(options?: {
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
 		'#lib/form-validation.ts': formValidationMod,
+		'#lib/components/FormField.svelte': { default: noopComponent },
+		'#lib/components/ToggleButton.svelte': { default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -833,11 +838,12 @@ test('restoreAIContinuation and closeDialog resume all five workflows when AI is
 		assert.equal(api.pendingAIContinuation, null);
 		api.butlerOpen = false;
 
-		// 4. scan continuation auto-runs vision recognition and populates pantryInput
+		// 4. scan continuation auto-runs vision recognition and stages structured items
 		const photo = new File([new Uint8Array([1, 2, 3])], 'farmers-market.jpg', {
 			type: 'image/jpeg'
 		});
 		api.stagedScanFile = photo;
+		api.stagedScanItems = [];
 		api.pantryInput = '';
 		api.pendingAIContinuation = { kind: 'scan', returnToPantryModal: false };
 		api.modal = 'settings';
@@ -847,7 +853,13 @@ test('restoreAIContinuation and closeDialog resume all five workflows when AI is
 		assert.equal(api.modal, 'pantry');
 		assert.equal(api.stagedScanFile, null);
 		assert.equal(api.pendingAIContinuation, null);
-		assert.match(api.pantryInput, /4 each Roma tomatoes \[Produce\]/);
+		assert.equal(api.pantryInput, '');
+		assert.deepEqual(
+			JSON.parse(JSON.stringify(api.stagedScanItems)).map(
+				({ id: _id, ...rest }: Record<string, unknown>) => rest
+			),
+			[{ name: 'Roma tomatoes', quantity: 4, unit: 'each', category: 'Produce' }]
+		);
 
 		// 5. nutrition continuation restores RecipeDetail on Nutrition facts tab
 		api.selected = null;
@@ -1187,6 +1199,9 @@ test('logout, deleteAccount, clearManagedIdentity, and refreshAuth identity swit
 		api.stagedScanFile = new File([new Uint8Array([1, 2])], 'private-receipt.jpg', {
 			type: 'image/jpeg'
 		});
+		api.stagedScanItems = [
+			{ id: 'scan-private', name: 'Private truffles', quantity: 2, unit: 'oz', category: 'Produce' }
+		];
 		imageInputStub.value = 'C:\\fakepath\\private-receipt.jpg';
 		api.selected = recipe;
 		api.selectedMealServings = 5;
@@ -1206,6 +1221,7 @@ test('logout, deleteAccount, clearManagedIdentity, and refreshAuth identity swit
 		assert.equal(api.apiKey, '');
 		assert.equal(api.pendingAIContinuation, null);
 		assert.equal(api.stagedScanFile, null);
+		assert.deepEqual(JSON.parse(JSON.stringify(api.stagedScanItems)), []);
 		assert.equal(imageInputStub.value, '');
 		assert.equal(api.selected, null);
 		assert.equal(api.selectedMealServings, undefined);

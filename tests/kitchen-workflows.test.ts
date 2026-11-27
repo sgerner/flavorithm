@@ -22,13 +22,17 @@ import {
 	filterPantryItems,
 	hasSampleData,
 	listPantryCategories,
+	matchRecipePantry,
+	mergePantryAdditions,
 	movePurchasesToPantry,
 	normalizeIngredientName,
 	normalizePantryDraft,
+	normalizeShoppingItem,
+	normalizeStagedScanDraft,
+	parseManualPantryInput,
 	promoteSampleBookmark,
 	promoteSampleIngredient,
 	promoteSampleMeal,
-	normalizeShoppingItem,
 	recipeForEdit,
 	recipeNeedsNutritionRefresh,
 	reconcileShoppingList,
@@ -40,6 +44,7 @@ import {
 	saveEditedRecipe,
 	shopForScope,
 	snapshotShoppingItem,
+	stageScannedIngredients,
 	transferPurchasedItemsToPantry,
 	upsertMeal,
 	upsertRecipe,
@@ -978,6 +983,179 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	);
 });
 
+test('discovery and shared matcher deduct consumed lot stock across split lines and match single-line scores', () => {
+	const now = new Date(2026, 9, 22);
+	const splitOilRecipe = recipe({
+		id: 'split-oil',
+		ingredients: [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'extra virgin olive oil', quantity: 2, unit: 'tbsp' },
+			{ name: 'lemon', quantity: 1, unit: 'whole' }
+		]
+	});
+	const singleOilRecipe = recipe({
+		id: 'single-oil',
+		ingredients: [
+			{ name: 'olive oil', quantity: 3, unit: 'tbsp' },
+			{ name: 'lemon', quantity: 1, unit: 'whole' }
+		]
+	});
+	const singleCoveredRecipe = recipe({
+		id: 'covered',
+		ingredients: [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'lemon', quantity: 1, unit: 'whole' }
+		]
+	});
+
+	const partialPantry = [pantry('olive oil', 1, 'tbsp', '2026-10-24')];
+	const splitMatch = matchRecipePantry(splitOilRecipe, partialPantry, now);
+	const singleMatch = matchRecipePantry(singleOilRecipe, partialPantry, now);
+	assert.equal(splitMatch.matchedCount, 1);
+	assert.equal(splitMatch.available, singleMatch.available);
+	assert.equal(splitMatch.expiring, singleMatch.expiring);
+
+	// Equal pantry coverage must keep original input order rather than inflating split lines.
+	assert.deepEqual(
+		rankRecipes([singleOilRecipe, splitOilRecipe], partialPantry, preferences(), now).map(
+			(item) => item.id
+		),
+		['single-oil', 'split-oil']
+	);
+	assert.deepEqual(
+		rankRecipes([splitOilRecipe, singleOilRecipe], partialPantry, preferences(), now).map(
+			(item) => item.id
+		),
+		['split-oil', 'single-oil']
+	);
+
+	// A recipe whose full oil requirement is covered outranks a split recipe whose second line starved.
+	const rankedAgainstCovered = rankRecipes(
+		[splitOilRecipe, singleCoveredRecipe],
+		partialPantry,
+		preferences(),
+		now
+	);
+	assert.equal(rankedAgainstCovered[0].id, 'covered');
+});
+
+test('meal completion deducts normalized plurals, modifiers, items, and canned stock without touching incompatible garlic heads', () => {
+	const plannedRecipe = recipe({
+		id: 'dinner-bowl',
+		servings: 2,
+		ingredients: [
+			{ name: 'salmon fillets', quantity: 10, unit: 'oz' },
+			{ name: 'minced garlic', quantity: 2, unit: 'cloves' },
+			{ name: 'fresh ginger', quantity: 1, unit: 'tbsp' },
+			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'flatbread', quantity: 2, unit: 'pieces' }
+		]
+	});
+	const input = state({
+		pantry: [
+			pantry('salmon fillet', 16, 'oz'),
+			pantry('garlic', 1, 'head'),
+			pantry('garlic', 5, 'cloves'),
+			pantry('ginger', 3, 'tsp'),
+			pantry('garbanzo beans', 2, 'cans'),
+			pantry('flatbreads', 3, 'items')
+		],
+		recipes: [plannedRecipe],
+		meals: [
+			{ id: 'dinner', date: '2026-10-22', slot: 'Dinner', recipeId: 'dinner-bowl', servings: 2 }
+		]
+	});
+	const completed = completeMeal(
+		input,
+		'dinner',
+		{ deductPantry: true, leftoverServings: 0 },
+		new Date(2026, 9, 22)
+	);
+	assert.equal(completed.pantry[0].quantity, 6);
+	assert.equal(completed.pantry[1].quantity, 1);
+	assert.equal(completed.pantry[2].quantity, 3);
+	assert.equal(completed.pantry[3].quantity, 0);
+	assert.equal(completed.pantry[4].quantity, 1);
+	assert.equal(completed.pantry[5].quantity, 1);
+});
+
+test('structured photo scan staging preserves clean names, valid units, and categories while merging compatible stock', () => {
+	let idCounter = 0;
+	const nextId = () => `scan-${++idCounter}`;
+	const firstBatch = stageScannedIngredients(
+		[],
+		[
+			{ name: 'avocado', quantity: 2, unit: 'item', category: 'Produce' },
+			{ name: 'chickpeas', quantity: 1, unit: 'can (15 oz)', category: 'Canned goods' },
+			{ name: 'fresh cilantro', quantity: 1, unit: 'bunch', category: 'Produce' }
+		],
+		nextId
+	);
+	const secondBatch = stageScannedIngredients(
+		firstBatch,
+		[{ name: 'Greek yogurt', quantity: 500, unit: 'g', category: 'Dairy & eggs' }],
+		nextId
+	);
+
+	assert.equal(secondBatch.length, 4);
+	assert.deepEqual(secondBatch[0], {
+		id: 'scan-1',
+		name: 'avocado',
+		quantity: 2,
+		unit: 'each',
+		category: 'Produce'
+	});
+	assert.deepEqual(secondBatch[1], {
+		id: 'scan-2',
+		name: 'chickpeas',
+		quantity: 1,
+		unit: 'can',
+		category: 'Canned goods'
+	});
+	assert.deepEqual(secondBatch[2], {
+		id: 'scan-3',
+		name: 'fresh cilantro',
+		quantity: 1,
+		unit: 'bunch',
+		category: 'Produce'
+	});
+
+	const manual = parseManualPantryInput('1 whole avocados, 200 g pasta');
+	const initialPantry: Ingredient[] = [
+		{
+			id: 'existing-chickpeas',
+			name: 'garbanzo beans',
+			quantity: 1,
+			unit: 'can',
+			category: 'Pantry'
+		}
+	];
+	const merged = mergePantryAdditions(initialPantry, [...secondBatch, ...manual], nextId);
+
+	const avocado = merged.find((item) => item.name === 'avocado');
+	assert.ok(avocado);
+	assert.equal(avocado.quantity, 3);
+	assert.equal(avocado.unit, 'each');
+	assert.equal(avocado.category, 'Produce');
+
+	const chickpeas = merged.find((item) => item.id === 'existing-chickpeas');
+	assert.ok(chickpeas);
+	assert.equal(chickpeas.quantity, 2);
+	assert.equal(chickpeas.unit, 'can');
+	assert.equal(chickpeas.category, 'Pantry');
+
+	const yogurt = merged.find((item) => item.name === 'Greek yogurt');
+	assert.ok(yogurt);
+	assert.equal(yogurt.unit, 'g');
+	assert.equal(yogurt.category, 'Dairy & eggs');
+
+	const pasta = merged.find((item) => item.name === 'pasta');
+	assert.ok(pasta);
+	assert.equal(pasta.quantity, 200);
+	assert.equal(pasta.unit, 'g');
+	assert.equal(pasta.category, 'Pantry');
+});
+
 test('editing a recipe refreshes scheduled weeks and existing recipe scopes independently while keeping manual and checked rows', () => {
 	const now = new Date('2026-10-22T12:00:00Z');
 	const pasta = recipe({
@@ -1648,6 +1826,16 @@ test('transferPurchasedItemsToPantry preserves categories on new lots and merges
 	assert.ok(flour);
 	assert.equal(flour.category, 'Pantry');
 	assert.equal(flour.unit, 'cup');
+
+	// Existing Pantry-categorized lots keep their existing category when purchases merge in.
+	const preservedCategory = transferPurchasedItemsToPantry(
+		[{ ...pantry('chickpeas', 1, 'can'), category: 'Pantry' }],
+		[{ ...shopping('buy-beans', 'garbanzo beans', 1, 'can', true), category: 'Canned goods' }],
+		() => 'unused'
+	);
+	assert.equal(preservedCategory.length, 1);
+	assert.equal(preservedCategory[0].quantity, 2);
+	assert.equal(preservedCategory[0].category, 'Pantry');
 });
 
 test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and guards invalid now', () => {
@@ -1962,6 +2150,318 @@ test('filterPantryItems excludes zero-quantity rows from Expiring soon while kee
 			(item) => item.id
 		),
 		['spinach-depleted', 'rice-stocked']
+	);
+});
+
+test('reconcileShoppingList replaces legacy pre-normalization generated rows without duplicates and deducts legacy checked purchases', () => {
+	const now = new Date('2026-11-24T12:00:00Z');
+	const scope = 'week:2026-11-23';
+	const legacyShopping: ShoppingItem[] = [
+		shopping(
+			'shopping-cannellini-beans-can-15-oz-',
+			'cannellini beans',
+			1,
+			'can (15 oz)',
+			false,
+			scope
+		),
+		shopping('generated-legacy-cilantro', 'fresh cilantro, for garnish', 2, 'tbsp', false, scope),
+		shopping('generated-legacy-stale', 'old removed ingredient', 1, 'cup', false, scope),
+		shopping('generated-legacy-checked', 'chickpeas (15 oz)', 1, 'can (15 oz)', true, scope),
+		shopping('manual-milk', 'oat milk', 1, 'qt', false)
+	];
+
+	const plannedRecipes = [
+		recipe({
+			id: 'beans-and-orzo',
+			servings: 2,
+			ingredients: [
+				{ name: 'cannellini beans', quantity: 2, unit: 'can' },
+				{ name: 'cilantro', quantity: 2, unit: 'tbsp' },
+				{ name: 'chickpeas', quantity: 2, unit: 'can' },
+				{ name: 'carrots, peeled and diced', quantity: 3, unit: 'whole' }
+			]
+		})
+	];
+	const freshAdditions = buildShoppingList(
+		plannedRecipes,
+		[pantry('carrot', 1, 'small')],
+		[{ id: 'm1', date: '2026-11-24', slot: 'Dinner', recipeId: 'beans-and-orzo', servings: 2 }],
+		now
+	);
+	const reconciled = reconcileShoppingList(legacyShopping, freshAdditions, scope);
+
+	// Stale generated row is dropped; manual row and checked row are preserved; zero duplicates exist.
+	assert.equal(new Set(reconciled.map((item) => item.id)).size, reconciled.length);
+	assert.equal(
+		reconciled.find((item) => item.name === 'old removed ingredient'),
+		undefined
+	);
+	assert.ok(reconciled.some((item) => item.id === 'manual-milk' && !item.checked));
+
+	// Legacy unchecked cannellini beans & cilantro IDs are reused in place rather than duplicated.
+	const uncheckedBeans = reconciled.filter(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'cannellini bean'
+	);
+	assert.equal(uncheckedBeans.length, 1);
+	assert.equal(uncheckedBeans[0].id, 'shopping-cannellini-beans-can-15-oz-');
+	assert.equal(uncheckedBeans[0].quantity, 2);
+	assert.equal(uncheckedBeans[0].unit, 'can');
+
+	const uncheckedCilantro = reconciled.filter(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'cilantro'
+	);
+	assert.equal(uncheckedCilantro.length, 1);
+	assert.equal(uncheckedCilantro[0].id, 'generated-legacy-cilantro');
+
+	// Legacy checked chickpeas (15 oz) deducts 1 can from the 2-can requirement, leaving 1 unchecked can + 1 checked can.
+	const uncheckedChickpeas = reconciled.filter(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'chickpea'
+	);
+	assert.equal(uncheckedChickpeas.length, 1);
+	assert.equal(uncheckedChickpeas[0].quantity, 1);
+	assert.equal(reconciled.find((item) => item.id === 'generated-legacy-checked')?.checked, true);
+
+	// Legacy 1 small carrot in pantry deducted from 3 whole carrots, leaving 2 each.
+	const carrots = reconciled.find(
+		(item) => !item.checked && normalizeIngredientName(item.name) === 'carrot'
+	);
+	assert.ok(carrots);
+	assert.equal(carrots.quantity, 2);
+	assert.equal(carrots.unit, 'each');
+});
+
+test('shared lot allocator keeps matchRecipePantry, rankPantryRecipes, and opt-in completeMeal deductions aligned', () => {
+	const now = new Date(2026, 10, 24, 12);
+	const splitRecipe = recipe({
+		id: 'split-curry',
+		servings: 2,
+		ingredients: [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'olive oil, divided', quantity: 1, unit: 'tbsp' },
+			{ name: 'chickpeas (15 oz)', quantity: 1, unit: 'can (15 oz)' },
+			{ name: 'fresh cilantro, for garnish', quantity: 2, unit: 'tbsp' }
+		]
+	});
+	const stock: Ingredient[] = [
+		{
+			id: 'oil-expired',
+			name: 'olive oil',
+			quantity: 4,
+			unit: 'tbsp',
+			category: 'Oils',
+			expires: '2026-11-20'
+		},
+		{
+			id: 'oil-soon',
+			name: 'extra virgin olive oil',
+			quantity: 1,
+			unit: 'tbsp',
+			category: 'Oils',
+			expires: '2026-11-25'
+		},
+		{ id: 'oil-unitless', name: 'olive oil', quantity: 4, unit: '   ', category: 'Oils' },
+		{ id: 'oil-grams', name: 'olive oil', quantity: 100, unit: 'g', category: 'Oils' },
+		{ id: 'beans-ok', name: 'garbanzo beans', quantity: 2, unit: 'can', category: 'Canned goods' }
+	];
+
+	const match = matchRecipePantry(splitRecipe, stock, now);
+	// First oil line consumes the sole usable 1 tbsp lot; second oil line starves; chickpeas matches; cilantro has no stock.
+	assert.equal(match.matchedCount, 2);
+	assert.equal(rankPantryRecipes([splitRecipe], stock, preferences(), undefined, now).length, 1);
+
+	const baseState = state({
+		pantry: stock,
+		recipes: [splitRecipe],
+		meals: [
+			{ id: 'cook-1', date: '2026-11-24', slot: 'Dinner', recipeId: 'split-curry', servings: 2 }
+		]
+	});
+
+	// Opt-out (#85 contract): deductPantry: false leaves pantry stock completely untouched.
+	const withoutDeduction = completeMeal(
+		baseState,
+		'cook-1',
+		{ deductPantry: false, leftoverServings: 1 },
+		now
+	);
+	assert.equal(withoutDeduction.pantry, baseState.pantry);
+	assert.equal(withoutDeduction.meals[0].leftoverServings, 1);
+
+	// Opt-in (#85 contract): deductPantry: true consumes the exact same usable lots matched by matchRecipePantry.
+	const withDeduction = completeMeal(
+		baseState,
+		'cook-1',
+		{ deductPantry: true, leftoverServings: 0 },
+		now
+	);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-expired')?.quantity, 4);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-soon')?.quantity, 0);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-unitless')?.quantity, 4);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'oil-grams')?.quantity, 100);
+	assert.equal(withDeduction.pantry.find((i) => i.id === 'beans-ok')?.quantity, 1);
+});
+
+test('normalizeStagedScanDraft leaves empty quantities null on blur instead of clamping to 0.01', () => {
+	const clearedNumeric = normalizeStagedScanDraft({
+		id: 'scan-empty-null',
+		name: '  avocados  ',
+		quantity: null,
+		unit: '  ',
+		category: '  '
+	});
+	assert.deepEqual(clearedNumeric, {
+		id: 'scan-empty-null',
+		name: 'avocados',
+		quantity: null,
+		unit: 'each',
+		category: 'Pantry'
+	});
+
+	const clearedString = normalizeStagedScanDraft({
+		id: 'scan-empty-str',
+		name: '   ',
+		quantity: '   ',
+		unit: 'can',
+		category: 'Canned goods'
+	});
+	assert.equal(clearedString.name, '');
+	assert.equal(clearedString.quantity, null);
+
+	const boundedPositive = normalizeStagedScanDraft({
+		id: 'scan-valid',
+		name: 'pasta',
+		quantity: 2_500_000,
+		unit: 'g',
+		category: 'Grains'
+	});
+	assert.equal(boundedPositive.quantity, 1_000_000);
+});
+
+test('legacy aliases coalesce into stored pantry lots while preserving #81 scoped checked-row retirement and meal completion rules', () => {
+	const now = new Date('2026-10-20T12:00:00.000Z');
+	const weekKey = 'week:2026-10-19';
+	const recipeKey = 'recipe:chickpea-stew';
+	const stewRecipe = recipe({
+		id: 'chickpea-stew',
+		servings: 2,
+		ingredients: [
+			{ name: 'chickpeas (15 oz)', quantity: 2, unit: 'can' },
+			{ name: 'carrots, peeled and diced', quantity: 4, unit: 'whole' },
+			{ name: 'fresh cilantro, for garnish', quantity: 1, unit: 'bunch' }
+		]
+	});
+	const meals = [
+		{ id: 'tue-stew', date: '2026-10-20', slot: 'Dinner', recipeId: 'chickpea-stew', servings: 2 },
+		{ id: 'sat-stew', date: '2026-10-24', slot: 'Dinner', recipeId: 'chickpea-stew', servings: 2 }
+	];
+
+	// 1. addPantryItems coalesces legacy aliases into existing non-sample pantry lots, preserves
+	//    existing non-blank categories, retires matching checked rows once per scope, and refreshes weekly deficits.
+	const afterAdd = addPantryItems(
+		state({
+			pantry: [
+				{
+					id: 'lot-beans',
+					name: 'chickpeas',
+					quantity: 1,
+					unit: 'can (15 oz)',
+					category: 'Legumes'
+				},
+				{ id: 'lot-carrot', name: 'carrot', quantity: 1, unit: 'medium', category: 'Produce' }
+			],
+			recipes: [stewRecipe],
+			meals,
+			shopping: [
+				shopping('week-beans-checked', 'garbanzo beans', 2, 'can (15 oz)', true, weekKey),
+				shopping('week-beans-unchecked', 'chickpeas', 1, 'can', false, weekKey),
+				shopping('week-carrot-checked', 'carrots', 3, 'large', true, weekKey),
+				shopping('recipe-beans-checked', 'chickpeas (15 oz)', 2, 'cans', true, recipeKey),
+				shopping('recipe-cilantro-unchecked', 'cilantro', 1, 'bunch', false, recipeKey)
+			]
+		}),
+		[
+			{ name: 'garbanzo beans', quantity: 1, unit: 'can', category: 'Canned goods' },
+			{ name: 'carrots, peeled and diced', quantity: 2, unit: 'items', category: 'Root veg' },
+			{ name: 'cilantro', quantity: 1, unit: 'bunches', expires: '2026-10-10' }
+		],
+		now,
+		(() => {
+			let n = 0;
+			return () => `added-${++n}`;
+		})()
+	);
+
+	// Compatible non-expired additions coalesce without splitting stored lots or overwriting existing categories.
+	assert.equal(afterAdd.pantry.filter((i) => !i.expires).length, 2);
+	const beansLot = afterAdd.pantry.find((i) => i.id === 'lot-beans')!;
+	assert.equal(beansLot.quantity, 2);
+	assert.equal(beansLot.category, 'Legumes');
+	const carrotLot = afterAdd.pantry.find((i) => i.id === 'lot-carrot')!;
+	assert.equal(carrotLot.quantity, 3);
+	assert.equal(carrotLot.category, 'Produce');
+
+	// Checked rows retired up to non-expired added amounts independently per scope; expired cilantro retires nothing.
+	assert.equal(afterAdd.shopping.find((i) => i.id === 'week-beans-checked')?.quantity, 1);
+	assert.equal(afterAdd.shopping.find((i) => i.id === 'recipe-beans-checked')?.quantity, 1);
+	assert.equal(afterAdd.shopping.find((i) => i.id === 'week-carrot-checked')?.quantity, 1);
+	assert.equal(afterAdd.shopping.find((i) => i.id === 'recipe-cilantro-unchecked')?.quantity, 1);
+	// Weekly deficit for chickpeas: 4 cans total - 2 in pantry - 1 remaining checked = 1 can unchecked.
+	const weekUncheckedBeans = afterAdd.shopping.find(
+		(i) => i.sourceKey === weekKey && !i.checked && normalizeIngredientName(i.name) === 'chickpea'
+	);
+	assert.equal(weekUncheckedBeans?.quantity, 1);
+	// Weekly deficit for carrots: 8 total - 3 in pantry - 1 remaining checked = 4 each unchecked.
+	const weekUncheckedCarrot = afterAdd.shopping.find(
+		(i) => i.sourceKey === weekKey && !i.checked && normalizeIngredientName(i.name) === 'carrot'
+	);
+	assert.equal(weekUncheckedCarrot?.quantity, 4);
+
+	// 2. completeMeal with deductPantry: false leaves both pantry stock and week checked rows intact.
+	const skippedDeduction = completeMeal(
+		afterAdd,
+		'tue-stew',
+		{ deductPantry: false, leftoverServings: 0 },
+		now
+	);
+	assert.equal(skippedDeduction.pantry.find((i) => i.id === 'lot-beans')?.quantity, 2);
+	assert.equal(skippedDeduction.shopping.find((i) => i.id === 'week-beans-checked')?.quantity, 1);
+	assert.equal(skippedDeduction.shopping.find((i) => i.id === 'week-carrot-checked')?.quantity, 1);
+
+	// 3. completeMeal with deductPantry: true consumes compatible legacy-unit pantry stock first,
+	//    retires only uncovered demand (1 carrot) from week:<startDate> checked rows, and leaves recipe:* untouched.
+	const cookedTue = completeMeal(
+		afterAdd,
+		'tue-stew',
+		{ deductPantry: true, leftoverServings: 0 },
+		now
+	);
+	// 2 cans chickpeas fully covered by lot-beans -> week-beans-checked stays at 1 can to cover half of Saturday!
+	assert.equal(cookedTue.pantry.find((i) => i.id === 'lot-beans')?.quantity, 0);
+	assert.equal(cookedTue.shopping.find((i) => i.id === 'week-beans-checked')?.quantity, 1);
+	// 4 carrots needed: 3 covered by lot-carrot (medium), 1 uncovered -> retires week-carrot-checked completely!
+	assert.equal(cookedTue.pantry.find((i) => i.id === 'lot-carrot')?.quantity, 0);
+	assert.equal(
+		cookedTue.shopping.find((i) => i.id === 'week-carrot-checked'),
+		undefined
+	);
+	// Independent recipe:* checked row stays untouched.
+	assert.equal(cookedTue.shopping.find((i) => i.id === 'recipe-beans-checked')?.quantity, 1);
+
+	// 4. movePurchasesToPantry coalesces remaining legacy-aliased checked rows into stored pantry lots.
+	const moved = movePurchasesToPantry(cookedTue, now, () => 'unused-new-id');
+	assert.equal(moved.pantry.find((i) => i.id === 'lot-beans')?.quantity, 2);
+	assert.equal(moved.pantry.find((i) => i.id === 'lot-beans')?.category, 'Legumes');
+	assert.equal(
+		moved.shopping.some((i) => i.checked),
+		false
+	);
+	// Saturday needs 2 cans chickpeas, and lot-beans now has 2 cans -> 0 chickpea deficit on week scope!
+	assert.equal(
+		moved.shopping.some(
+			(i) => i.sourceKey === weekKey && normalizeIngredientName(i.name) === 'chickpea'
+		),
+		false
 	);
 });
 
