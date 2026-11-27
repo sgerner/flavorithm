@@ -1063,6 +1063,22 @@ export function getStateEtag(user: User): string {
 	return `"${hashToken(`${user.householdId}:${user.id}:${household?.version ?? 0}:${preferences?.version ?? 0}`)}"`;
 }
 
+export function matchesStateEtag(ifMatchHeader: string, currentEtag: string): boolean {
+	if (
+		currentEtag.length < 2 ||
+		currentEtag.startsWith('W/') ||
+		!currentEtag.startsWith('"') ||
+		!currentEtag.endsWith('"')
+	) {
+		return false;
+	}
+	return ifMatchHeader.split(',').some((rawCandidate) => {
+		const candidate = rawCandidate.trim();
+		if (candidate.startsWith('W/')) return false;
+		return candidate === currentEtag;
+	});
+}
+
 export function saveState(
 	user: User,
 	value: AppState,
@@ -1092,16 +1108,16 @@ export function saveState(
 					'This kitchen has already been initialized. Reload its latest state and try again.'
 				);
 			}
-			if (!conditions.ifMatch)
-				throw new ApiError(428, 'If-Match is required to update this kitchen.');
-			if (conditions.ifMatch !== getStateEtag(user)) {
+			const ifMatch = conditions.ifMatch?.trim() || '';
+			if (!ifMatch) throw new ApiError(428, 'If-Match is required to update this kitchen.');
+			if (!matchesStateEtag(ifMatch, getStateEtag(user))) {
 				throw new ApiError(
 					412,
 					'This kitchen changed in another session. Reload its latest state and try again.'
 				);
 			}
 		} else {
-			if (conditions.ifMatch)
+			if (conditions.ifMatch?.trim())
 				throw new ApiError(
 					412,
 					'This kitchen no longer has the state you loaded. Reload before saving.'
