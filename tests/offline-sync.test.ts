@@ -921,3 +921,71 @@ test('mergePendingKitchenJournal anchors cross-tab conflict remote values to ser
 		}
 	]);
 });
+
+test('offline journal validates shopping provenance fields and merges disjoint dismissedShopping tombstones', () => {
+	const values = new Map<string, string>();
+	const storage = {
+		get length() {
+			return values.size;
+		},
+		key: (index: number) => [...values.keys()][index] ?? null,
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			values.set(key, value);
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
+		}
+	};
+	const user = { id: 'cook', householdId: 'home', name: 'Cook', email: 'cook@example.test' };
+	const base = createNewUserState();
+	const local = structuredClone(base);
+	local.shopping = [
+		{
+			id: 'generated-oil',
+			name: 'olive oil',
+			quantity: 1,
+			unit: 'cup',
+			checked: false,
+			category: 'Pantry',
+			sourceKey: 'week:2026-10-19',
+			requirementKey: 'olive oil::volume',
+			requirementQuantity: 15,
+			customized: true
+		}
+	];
+	local.dismissedShopping = {
+		'week:2026-10-19': { 'garlic::count:clove': true }
+	};
+	assert.equal(isKitchenState(local), true);
+	assert.deepEqual(validateKitchenState(local), local);
+
+	writePendingJournal(storage, {
+		userId: user.id,
+		householdId: user.householdId,
+		base,
+		local,
+		etag: 'v1',
+		createdAt: 1,
+		updatedAt: 1,
+		writerId: 'tab-provenance'
+	});
+	const journal = readPendingJournal(storage, user);
+	assert.equal(journal.error, '');
+	assert.equal(journal.records.length, 1);
+
+	const remote = structuredClone(base);
+	remote.dismissedShopping = {
+		'week:2026-10-19': { 'onion::count': true }
+	};
+	const merged = mergePendingKitchenJournal(journal.records, remote);
+	assert.deepEqual(merged.conflicts, []);
+	assert.deepEqual(merged.state.dismissedShopping, {
+		'week:2026-10-19': {
+			'garlic::count:clove': true,
+			'onion::count': true
+		}
+	});
+	assert.equal(merged.state.shopping[0]?.customized, true);
+	assert.equal(merged.state.shopping[0]?.requirementKey, 'olive oil::volume');
+});

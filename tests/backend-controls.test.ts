@@ -376,6 +376,41 @@ test('auth and household endpoints expose status, hashed invites, and one-use ve
 	}
 });
 
+test('shopping provenance and edit tracking fields persist through state validation', async () => {
+	const account = await backend.registerUser(
+		'Provenance Cook',
+		'provenance-cook@example.com',
+		'a secure provenance password'
+	);
+	const state = backend.getState(account.user)!;
+	state.shopping.push({
+		id: 'prov-item',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'cup',
+		checked: false,
+		sourceKey: 'week:2026-10-19',
+		requirementKey: 'olive oil::volume',
+		requirementQuantity: 29.5735,
+		customized: true
+	});
+	state.dismissedShopping = {
+		'week:2026-10-19': { 'onion::count': true }
+	};
+	assert.ok(backend.validateAppState(state));
+	backend.saveState(account.user, state, {
+		ifMatch: backend.getStateEtag(account.user),
+		ifNoneMatch: null
+	});
+	const saved = backend.getState(account.user)!;
+	assert.equal(saved.shopping[0]?.requirementKey, 'olive oil::volume');
+	assert.equal(saved.shopping[0]?.requirementQuantity, 29.5735);
+	assert.equal(saved.shopping[0]?.customized, true);
+	assert.deepEqual(saved.dismissedShopping, {
+		'week:2026-10-19': { 'onion::count': true }
+	});
+});
+
 test('household endpoint blocks solo leave and requires confirmReplace before replacing populated solo kitchens', async () => {
 	const host = await backend.registerUser(
 		'Shared Host',

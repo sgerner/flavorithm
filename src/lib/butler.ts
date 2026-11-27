@@ -1,8 +1,10 @@
 import { z } from 'zod';
-import type { AppState, Ingredient } from './types.ts';
+import type { AppState, Ingredient, ShoppingItem } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import {
 	activeWeeklyScopes,
+	clearScopeDismissals,
+	clearShoppingDismissal,
 	completeMeal,
 	convertCompatibleQuantity,
 	deleteMeal,
@@ -10,6 +12,7 @@ import {
 	expiryStatus,
 	normalizeName,
 	promoteSampleIngredient,
+	recordShoppingDismissal,
 	refreshRecipeShopping,
 	refreshWeekShopping,
 	retireCheckedShoppingItems,
@@ -110,7 +113,10 @@ const shopping = z.object({
 	quantity,
 	unit: z.string().max(40),
 	checked: z.boolean(),
-	sourceKey: z.string().max(200).optional()
+	sourceKey: z.string().max(200).optional(),
+	requirementKey: z.string().max(260).optional(),
+	requirementQuantity: z.number().nonnegative().max(10_000_000_000).optional(),
+	customized: z.boolean().optional()
 });
 const preferences = z
 	.object({
@@ -267,6 +273,14 @@ function reducesIngredientStock(
 	return nextInBeforeUnit + 1e-9 < before.quantity;
 }
 
+function withDismissedShopping(
+	state: AppState,
+	dismissedShopping: AppState['dismissedShopping']
+): AppState {
+	const { dismissedShopping: _prev, ...rest } = state;
+	return dismissedShopping ? { ...rest, dismissedShopping } : rest;
+}
+
 /** Validate and apply a complete proposal without mutating the caller's kitchen. */
 export function applyButlerCommands(
 	current: AppState,
@@ -280,6 +294,7 @@ export function applyButlerCommands(
 	const touchedWeeks = new Set<string>(activeWeeklyScopes(state.shopping));
 	const touchedRecipes = new Set<string>();
 	const activeRecipeScopes = new Set<string>();
+	const explicitDeletedShoppingIds = new Set<string>();
 	let pantryChanged = false;
 	const pantryMutations: PantryMutation[] = [];
 	const deductedIngredientNames = new Set<string>();
@@ -297,6 +312,31 @@ export function applyButlerCommands(
 	};
 	recordShoppingScopes(state);
 
+	const pruneExplicitDeletedShopping = () => {
+		if (explicitDeletedShoppingIds.size > 0) {
+			state = {
+				...state,
+				shopping: state.shopping.filter((item) => !explicitDeletedShoppingIds.has(item.id))
+			};
+		}
+	};
+
+	const flushPendingShoppingRefreshes = () => {
+		if (pantryChanged) {
+			recordShoppingScopes(state);
+			for (const week of touchedWeeks) state = refreshWeekShopping(state, week, safeNow);
+			for (const recipeId of touchedRecipes) {
+				if (state.recipes.some((item) => item.id === recipeId)) {
+					state = refreshRecipeShopping(state, recipeId, safeNow, {
+						force: activeRecipeScopes.has(recipeId)
+					});
+				}
+			}
+			pantryChanged = false;
+		}
+		pruneExplicitDeletedShopping();
+	};
+
 	for (const command of commands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
@@ -307,6 +347,7 @@ export function applyButlerCommands(
 				}
 				touchedRecipes.add(command.recipe.id);
 				state = upsertRecipe(state, command.recipe, safeNow);
+				pruneExplicitDeletedShopping();
 				recordShoppingScopes(state);
 				break;
 			}
@@ -319,6 +360,7 @@ export function applyButlerCommands(
 				touchedRecipes.delete(command.id);
 				activeRecipeScopes.delete(command.id);
 				state = deleteRecipe(state, command.id, safeNow);
+				pruneExplicitDeletedShopping();
 				recordShoppingScopes(state);
 				break;
 			case 'pantry.upsert': {
@@ -360,6 +402,7 @@ export function applyButlerCommands(
 					touchedWeeks.add(weekStartForDate(command.meal.date));
 				}
 				state = upsertMeal(state, command.meal, safeNow);
+				pruneExplicitDeletedShopping();
 				recordShoppingScopes(state);
 				break;
 			}
@@ -368,6 +411,7 @@ export function applyButlerCommands(
 				const removed = state.meals.find((item) => item.id === command.id);
 				if (removed) touchedWeeks.add(weekStartForDate(removed.date));
 				state = deleteMeal(state, command.id, safeNow);
+				pruneExplicitDeletedShopping();
 				recordShoppingScopes(state);
 				break;
 			}
@@ -404,14 +448,55 @@ export function applyButlerCommands(
 						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
 					}
 				}
+				pruneExplicitDeletedShopping();
 				recordShoppingScopes(state);
 				break;
 			}
-			case 'shopping.upsert':
-				state = { ...state, shopping: upsert(state.shopping, command.item) };
+			case 'shopping.upsert': {
+				flushPendingShoppingRefreshes();
+				explicitDeletedShoppingIds.delete(command.item.id);
+				const previous = state.shopping.find((value) => value.id === command.item.id);
+				const sourceKey = command.item.sourceKey ?? previous?.sourceKey;
+				const nextItem: ShoppingItem = {
+					...command.item,
+					...(sourceKey ? { sourceKey } : {}),
+					...((command.item.requirementKey ?? previous?.requirementKey)
+						? { requirementKey: command.item.requirementKey ?? previous?.requirementKey }
+						: {}),
+					...((command.item.requirementQuantity ?? previous?.requirementQuantity) !== undefined
+						? {
+								requirementQuantity:
+									command.item.requirementQuantity ?? previous?.requirementQuantity
+							}
+						: {})
+				};
+				if (
+					sourceKey &&
+					(command.item.customized ??
+						(!previous ||
+							Boolean(previous.customized) ||
+							previous.name !== nextItem.name ||
+							previous.quantity !== nextItem.quantity ||
+							previous.unit !== nextItem.unit))
+				) {
+					nextItem.customized = true;
+				}
+				let nextDismissed = state.dismissedShopping;
+				if (previous?.sourceKey) {
+					nextDismissed = clearShoppingDismissal(nextDismissed, previous);
+				}
+				if (nextItem.sourceKey) {
+					nextDismissed = clearShoppingDismissal(nextDismissed, nextItem);
+				}
+				state = withDismissedShopping(
+					{ ...state, shopping: upsert(state.shopping, nextItem) },
+					nextDismissed
+				);
 				recordShoppingScopes(state);
 				break;
+			}
 			case 'shopping.delete': {
+				flushPendingShoppingRefreshes();
 				requireId(state.shopping, command.id);
 				const removed = state.shopping.find((item) => item.id === command.id);
 				const week = removed?.checked
@@ -419,15 +504,31 @@ export function applyButlerCommands(
 					: undefined;
 				state = { ...state, shopping: state.shopping.filter((item) => item.id !== command.id) };
 				if (week) {
+					explicitDeletedShoppingIds.delete(command.id);
 					touchedWeeks.add(week);
 					state = refreshWeekShopping(state, week, safeNow);
+					pruneExplicitDeletedShopping();
+					recordShoppingScopes(state);
+				} else if (removed && !removed.checked) {
+					explicitDeletedShoppingIds.add(command.id);
+					state = withDismissedShopping(
+						state,
+						recordShoppingDismissal(state.dismissedShopping, removed)
+					);
 				}
 				break;
 			}
 			case 'shopping.generate': {
+				flushPendingShoppingRefreshes();
+				explicitDeletedShoppingIds.clear();
 				const startKey = command.weekStart ?? weekStartForDate(safeNow);
+				state = withDismissedShopping(
+					state,
+					clearScopeDismissals(state.dismissedShopping, `week:${startKey}`)
+				);
 				touchedWeeks.add(startKey);
 				state = refreshWeekShopping(state, startKey, safeNow);
+				recordShoppingScopes(state);
 				break;
 			}
 			case 'preferences.update':
@@ -476,17 +577,7 @@ export function applyButlerCommands(
 			}
 		}
 	}
-	if (pantryChanged) {
-		recordShoppingScopes(state);
-		for (const week of touchedWeeks) state = refreshWeekShopping(state, week, safeNow);
-		for (const recipeId of touchedRecipes) {
-			if (state.recipes.some((item) => item.id === recipeId)) {
-				state = refreshRecipeShopping(state, recipeId, safeNow, {
-					force: activeRecipeScopes.has(recipeId)
-				});
-			}
-		}
-	}
+	flushPendingShoppingRefreshes();
 	if (
 		state.recipes.length > MAX_RECIPES ||
 		state.pantry.length > 1000 ||

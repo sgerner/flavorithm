@@ -204,6 +204,9 @@ export function sanitizeKitchenState(state: AppState): AppState {
 		recipes: structuredClone(state.recipes),
 		meals: structuredClone(state.meals),
 		shopping: structuredClone(state.shopping),
+		...(state.dismissedShopping
+			? { dismissedShopping: structuredClone(state.dismissedShopping) }
+			: {}),
 		preferences: sanitizePreferences(state.preferences)
 	};
 }

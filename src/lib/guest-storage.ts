@@ -290,17 +290,35 @@ function sanitizeShopping(value: unknown, fallback: ShoppingItem[]): ShoppingIte
 		const quantity = clampNumber(raw.quantity, 0, 1_000_000, 0);
 		const unit = (typeof raw.unit === 'string' ? raw.unit.trim().slice(0, 40) : '') || 'piece';
 		const checked = Boolean(raw.checked);
+		const category =
+			typeof raw.category === 'string' && raw.category.trim()
+				? raw.category.trim().slice(0, 100)
+				: undefined;
 		const sourceKey =
 			typeof raw.sourceKey === 'string' && raw.sourceKey.trim()
 				? raw.sourceKey.trim().slice(0, 200)
 				: undefined;
+		const requirementKey =
+			typeof raw.requirementKey === 'string' && raw.requirementKey.trim()
+				? raw.requirementKey.trim().slice(0, 260)
+				: undefined;
+		const parsedRequirementQuantity = parseFiniteNumber(raw.requirementQuantity);
+		const requirementQuantity =
+			parsedRequirementQuantity !== undefined
+				? Math.min(10_000_000_000, Math.max(0, parsedRequirementQuantity))
+				: undefined;
+		const customized = typeof raw.customized === 'boolean' ? raw.customized : undefined;
 		result.push({
 			id,
 			name,
 			quantity,
 			unit,
 			checked,
-			...(sourceKey !== undefined ? { sourceKey } : {})
+			...(category !== undefined ? { category } : {}),
+			...(sourceKey !== undefined ? { sourceKey } : {}),
+			...(requirementKey !== undefined ? { requirementKey } : {}),
+			...(requirementQuantity !== undefined ? { requirementQuantity } : {}),
+			...(customized !== undefined ? { customized } : {})
 		});
 	}
 	return result;
@@ -390,15 +408,38 @@ function sanitizePreferences(value: unknown, fallback: Preferences): Preferences
 	};
 }
 
+function sanitizeDismissedShopping(value: unknown): AppState['dismissedShopping'] {
+	if (!isRecord(value)) return undefined;
+	const scopes: Record<string, Record<string, boolean>> = {};
+	for (const [rawScope, rawEntries] of Object.entries(value)) {
+		if (Object.keys(scopes).length >= 200) break;
+		const scope = rawScope.trim().slice(0, 200);
+		if (!scope || !isRecord(rawEntries)) continue;
+		const entries: Record<string, boolean> = {};
+		for (const [rawKey, dismissed] of Object.entries(rawEntries)) {
+			if (Object.keys(entries).length >= 1_000) break;
+			const key = rawKey.trim().slice(0, 260);
+			if (!key || dismissed !== true) continue;
+			entries[key] = true;
+		}
+		if (Object.keys(entries).length > 0) {
+			scopes[scope] = entries;
+		}
+	}
+	return Object.keys(scopes).length > 0 ? scopes : undefined;
+}
+
 /** Clamp a guest or client kitchen snapshot to match server persistence bounds. */
 export function sanitizeKitchenState(value: unknown): AppState {
 	if (!isRecord(value)) return createInitialState();
 	const defaults = createInitialState();
+	const dismissedShopping = sanitizeDismissedShopping(value.dismissedShopping);
 	return {
 		pantry: sanitizePantry(value.pantry, defaults.pantry),
 		recipes: sanitizeRecipes(value.recipes, defaults.recipes),
 		meals: sanitizeMeals(value.meals, defaults.meals),
 		shopping: sanitizeShopping(value.shopping, defaults.shopping),
+		...(dismissedShopping !== undefined ? { dismissedShopping } : {}),
 		preferences: sanitizePreferences(value.preferences, defaultPreferences)
 	};
 }

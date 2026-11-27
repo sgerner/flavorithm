@@ -44,8 +44,28 @@ function roundPantryQuantity(value: number): number {
 	return Object.is(rounded, -0) ? 0 : rounded;
 }
 
+const REQUIREMENT_KEY_SEPARATOR = '::';
+
 function bucketKey(name: string, unit: string): string {
-	return `${normalizeName(name)}\u0000${unitInfo(unit).dimension}`;
+	return `${normalizeName(name)}${REQUIREMENT_KEY_SEPARATOR}${unitInfo(unit).dimension}`;
+}
+
+function normalizeLegacyBucketKey(key: string): string {
+	const nullSep = key.indexOf('\u0000');
+	if (nullSep !== -1) {
+		return `${key.slice(0, nullSep)}${REQUIREMENT_KEY_SEPARATOR}${key.slice(nullSep + 1)}`;
+	}
+	return key;
+}
+
+function splitBucketKey(key: string): { ingredient: string; dimension: string } | undefined {
+	const normalized = normalizeLegacyBucketKey(key);
+	const sep = normalized.lastIndexOf(REQUIREMENT_KEY_SEPARATOR);
+	if (sep === -1) return undefined;
+	return {
+		ingredient: normalized.slice(0, sep),
+		dimension: normalized.slice(sep + REQUIREMENT_KEY_SEPARATOR.length)
+	};
 }
 
 function stableHash(value: string): string {
@@ -58,7 +78,9 @@ function stableHash(value: string): string {
 }
 
 function generatedShoppingId(sourceKey: string, key: string): string {
-	return `generated-${stableHash(`${sourceKey}\u0000${key}`)}`;
+	const parts = splitBucketKey(key);
+	const hashInput = parts ? `${parts.ingredient}\u0000${parts.dimension}` : key;
+	return `generated-${stableHash(`${sourceKey}\u0000${hashInput}`)}`;
 }
 
 function nextFreeGeneratedId(sourceKey: string, key: string, usedIds: Set<string>): string {
@@ -68,6 +90,91 @@ function nextFreeGeneratedId(sourceKey: string, key: string, usedIds: Set<string
 	while (usedIds.has(candidate)) candidate = `${baseId}-${suffix++}`;
 	usedIds.add(candidate);
 	return candidate;
+}
+
+function shoppingTombstoneKey(
+	item: Pick<ShoppingItem, 'name' | 'unit' | 'requirementKey'>
+): string {
+	return item.requirementKey
+		? normalizeLegacyBucketKey(item.requirementKey)
+		: bucketKey(item.name, item.unit);
+}
+
+/** Return normalized requirement keys tombstoned in a shopping scope. */
+export function dismissedKeysForScope(
+	dismissedShopping: AppState['dismissedShopping'],
+	sourceKey: string
+): string[] {
+	const scopeEntries = dismissedShopping?.[sourceKey];
+	if (!scopeEntries) return [];
+	return Object.entries(scopeEntries)
+		.filter(([, dismissed]) => dismissed === true)
+		.map(([key]) => normalizeLegacyBucketKey(key));
+}
+
+/** Record a per-scope tombstone for an unchecked generated shopping row so refreshes do not regenerate it. */
+export function recordShoppingDismissal(
+	dismissedShopping: AppState['dismissedShopping'],
+	item: Pick<ShoppingItem, 'checked' | 'sourceKey' | 'name' | 'unit' | 'requirementKey'>
+): AppState['dismissedShopping'] {
+	if (item.checked || !item.sourceKey) return dismissedShopping;
+	const scope = item.sourceKey.trim().slice(0, 200);
+	const key = shoppingTombstoneKey(item).slice(0, 260);
+	if (!scope || !key) return dismissedShopping;
+	const nextScopes: Record<string, Record<string, boolean>> = {};
+	for (const [existingScope, entries] of Object.entries(dismissedShopping ?? {})) {
+		const active = Object.fromEntries(Object.entries(entries).filter(([, v]) => v === true));
+		if (Object.keys(active).length > 0) nextScopes[existingScope] = active;
+	}
+	const existingEntries = nextScopes[scope] ?? {};
+	if (!existingEntries[key] && Object.keys(existingEntries).length >= 1_000) {
+		return dismissedShopping;
+	}
+	if (!nextScopes[scope] && Object.keys(nextScopes).length >= 200) {
+		return dismissedShopping;
+	}
+	nextScopes[scope] = { ...existingEntries, [key]: true };
+	return nextScopes;
+}
+
+/** Clear a per-scope tombstone when a dismissed shopping row is undone or explicitly upserted. */
+export function clearShoppingDismissal(
+	dismissedShopping: AppState['dismissedShopping'],
+	item: Pick<ShoppingItem, 'sourceKey' | 'name' | 'unit' | 'requirementKey'>
+): AppState['dismissedShopping'] {
+	if (!dismissedShopping || !item.sourceKey) return dismissedShopping;
+	const scope = item.sourceKey.trim();
+	if (!dismissedShopping[scope]) return dismissedShopping;
+	const targetKey = shoppingTombstoneKey(item);
+	const nextScopes: Record<string, Record<string, boolean>> = {};
+	for (const [existingScope, entries] of Object.entries(dismissedShopping)) {
+		const filtered = Object.fromEntries(
+			Object.entries(entries).filter(
+				([key, dismissed]) =>
+					dismissed === true &&
+					!(existingScope === scope && normalizeLegacyBucketKey(key) === targetKey)
+			)
+		);
+		if (Object.keys(filtered).length > 0) nextScopes[existingScope] = filtered;
+	}
+	return Object.keys(nextScopes).length > 0 ? nextScopes : undefined;
+}
+
+/** Clear all tombstones for a scope when the user explicitly rebuilds that shopping list. */
+export function clearScopeDismissals(
+	dismissedShopping: AppState['dismissedShopping'],
+	sourceKey: string
+): AppState['dismissedShopping'] {
+	if (!dismissedShopping || !dismissedShopping[sourceKey]) return dismissedShopping;
+	const nextScopes: Record<string, Record<string, boolean>> = {};
+	for (const [existingScope, entries] of Object.entries(dismissedShopping)) {
+		if (existingScope === sourceKey) continue;
+		const filtered = Object.fromEntries(
+			Object.entries(entries).filter(([, dismissed]) => dismissed === true)
+		);
+		if (Object.keys(filtered).length > 0) nextScopes[existingScope] = filtered;
+	}
+	return Object.keys(nextScopes).length > 0 ? nextScopes : undefined;
 }
 
 export type ExpiryStatus = 'expired' | 'soon' | 'fresh' | 'unknown';
@@ -168,60 +275,188 @@ export function expiryStatus(expires?: string, now: Date = new Date()): ExpirySt
 	return 'fresh';
 }
 
+function isCustomizedRow(item: ShoppingItem): boolean {
+	if (item.customized === true) return true;
+	if (!item.requirementKey) return false;
+	const expectedKey = normalizeLegacyBucketKey(item.requirementKey);
+	if (bucketKey(item.name, item.unit) !== expectedKey) return true;
+	if (
+		item.requirementQuantity !== undefined &&
+		Number.isFinite(item.requirementQuantity) &&
+		Number.isFinite(item.quantity)
+	) {
+		const expectedQuantity = Math.min(
+			MAX_SHOPPING_QUANTITY,
+			roundShoppingQuantity(item.requirementQuantity / unitInfo(item.unit).factor)
+		);
+		if (Math.abs(item.quantity - expectedQuantity) > 1e-6) return true;
+	}
+	return false;
+}
+
 /**
  * Replace one generated shopping-list scope while retaining manual entries, other scopes,
- * and checked purchases. Checked purchases reduce matching quantities in the refreshed list
- * and follow unchecked items.
+ * customized active rows, and checked purchases, and suppressing tombstoned `dismissedKeys`:
+ * - Customized unchecked rows with `requirementKey` stay in place while their ingredient bucket
+ *   still has a positive uncovered remainder (`rawRemainingBase > 0` after pantry stock and
+ *   checked purchases in the same scope), and are retired once their requirement becomes inactive
+ *   or is fully covered by checked rows in the same scope.
+ * - Legacy customized unchecked rows lacking `requirementKey` cannot be mapped reliably back to
+ *   their pre-edit ingredient bucket after a name/unit edit, so they are kept verbatim while the
+ *   scope remains active (`additionBuckets.size > 0`).
+ * - Checked purchases credit `item.requirementKey` and follow unchecked items.
  */
 export function reconcileShoppingList(
 	existing: ShoppingItem[],
 	additions: ShoppingItem[],
-	sourceKey: string
+	sourceKey: string,
+	dismissedKeys?: Iterable<string>
 ): ShoppingItem[] {
-	const checked = existing.filter((item) => item.sourceKey === sourceKey && item.checked);
-	const checkedByBucket = new Map<string, { quantityBase: number; units: UnitInfo[] }>();
-	for (const item of checked) {
-		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
-		const key = bucketKey(item.name, item.unit);
-		const unit = unitInfo(item.unit);
-		const bucket = checkedByBucket.get(key) ?? { quantityBase: 0, units: [] };
-		bucket.quantityBase += item.quantity * unit.factor;
-		bucket.units.push(unit);
-		checkedByBucket.set(key, bucket);
-	}
-	const existingUncheckedIds = new Map<string, string>();
-	for (const item of existing) {
-		if (item.sourceKey !== sourceKey || item.checked) continue;
-		const key = bucketKey(item.name, item.unit);
-		if (!existingUncheckedIds.has(key)) existingUncheckedIds.set(key, item.id);
-	}
-
-	const retained = existing.filter((item) => item.sourceKey !== sourceKey || item.checked);
-	const uncheckedRetained = retained.filter((item) => !item.checked);
-	const checkedRetained = retained.filter((item) => item.checked);
-	const usedIds = new Set(retained.map((item) => item.id));
+	const dismissedSet = new Set(Array.from(dismissedKeys ?? [], normalizeLegacyBucketKey));
 	const additionBuckets = new Map<
 		string,
-		{ item: ShoppingItem; units: UnitInfo[]; quantityBase: number }
+		{
+			item: ShoppingItem;
+			normalizedName: string;
+			units: UnitInfo[];
+			quantityBase: number;
+		}
 	>();
 	for (const addition of additions) {
 		if (!Number.isFinite(addition.quantity) || addition.quantity <= 0) continue;
+		const normalizedName = normalizeName(addition.name);
 		const key = bucketKey(addition.name, addition.unit);
 		const unit = unitInfo(addition.unit);
-		const bucket = additionBuckets.get(key) ?? { item: addition, units: [], quantityBase: 0 };
+		const bucket = additionBuckets.get(key) ?? {
+			item: addition,
+			normalizedName,
+			units: [],
+			quantityBase: 0
+		};
 		bucket.quantityBase += addition.quantity * unit.factor;
 		bucket.units.push(unit);
 		additionBuckets.set(key, bucket);
 	}
 
+	const checked = existing.filter((item) => item.sourceKey === sourceKey && item.checked);
+	const checkedByBucket = new Map<string, { quantityBase: number; units: UnitInfo[] }>();
+	for (const item of checked) {
+		if (!Number.isFinite(item.quantity) || item.quantity <= 0) continue;
+		const currentKey = bucketKey(item.name, item.unit);
+		const currentUnit = unitInfo(item.unit);
+		const targetKey = item.requirementKey
+			? normalizeLegacyBucketKey(item.requirementKey)
+			: currentKey;
+		const targetDimension = splitBucketKey(targetKey)?.dimension;
+		const checkedBucket = checkedByBucket.get(targetKey) ?? { quantityBase: 0, units: [] };
+		let creditBase: number;
+		if (targetDimension === undefined || currentUnit.dimension === targetDimension) {
+			creditBase = item.quantity * currentUnit.factor;
+			checkedBucket.units.push(currentUnit);
+		} else if (
+			item.requirementQuantity !== undefined &&
+			Number.isFinite(item.requirementQuantity) &&
+			item.requirementQuantity > 0
+		) {
+			creditBase = item.requirementQuantity;
+		} else {
+			creditBase = additionBuckets.get(targetKey)?.quantityBase ?? 0;
+		}
+		checkedBucket.quantityBase += creditBase;
+		checkedByBucket.set(targetKey, checkedBucket);
+	}
+
+	const resolveBucketRemainder = (
+		key: string,
+		bucket: { units: UnitInfo[]; quantityBase: number }
+	) => {
+		const checkedBucket = checkedByBucket.get(key);
+		const rawRemainingBase = bucket.quantityBase - (checkedBucket?.quantityBase ?? 0);
+		const resolved = resolveShoppingQuantity(rawRemainingBase, [
+			...bucket.units,
+			...(checkedBucket?.units ?? [])
+		]);
+		return resolved ? { rawRemainingBase, resolved } : undefined;
+	};
+
+	const existingUncheckedIds = new Map<string, string>();
+	const retained: ShoppingItem[] = [];
+	const coveredByCustomized = new Set<string>();
+
+	for (const item of existing) {
+		if (item.sourceKey !== sourceKey || item.checked) {
+			retained.push(item);
+			continue;
+		}
+		const origKey = item.requirementKey
+			? normalizeLegacyBucketKey(item.requirementKey)
+			: bucketKey(item.name, item.unit);
+		if (isCustomizedRow(item)) {
+			if (!item.requirementKey) {
+				// Legacy customized row without provenance: its name/unit may already reflect user edits,
+				// so keep it verbatim while the scope still has active deficits. If its current name still
+				// matches an active bucket, suppress generating a duplicate unedited row alongside it.
+				if (additionBuckets.size > 0) {
+					const currentKey = bucketKey(item.name, item.unit);
+					const currentIngredient = normalizeName(item.name);
+					if (additionBuckets.has(currentKey)) {
+						coveredByCustomized.add(currentKey);
+					} else {
+						for (const [candidateKey, candidateBucket] of additionBuckets) {
+							if (candidateBucket.normalizedName === currentIngredient) {
+								coveredByCustomized.add(candidateKey);
+								break;
+							}
+						}
+					}
+					retained.push({ ...item });
+				}
+				continue;
+			}
+
+			// Customized row with provenance: retain it while its ingredient bucket still has an
+			// uncovered deficit, and retire it when the meal requirement is removed/stocked or already
+			// satisfied by checked rows in this scope (users keep persistent items via manual rows).
+			const origIngredient = splitBucketKey(origKey)?.ingredient ?? normalizeName(item.name);
+			let matchedKey: string | undefined;
+			const origBucket = additionBuckets.get(origKey);
+			let matchedRemainder = origBucket ? resolveBucketRemainder(origKey, origBucket) : undefined;
+			if (matchedRemainder) {
+				matchedKey = origKey;
+			} else {
+				for (const [candidateKey, candidateBucket] of additionBuckets) {
+					if (candidateBucket.normalizedName !== origIngredient) continue;
+					const candidateRemainder = resolveBucketRemainder(candidateKey, candidateBucket);
+					if (candidateRemainder) {
+						matchedKey = candidateKey;
+						matchedRemainder = candidateRemainder;
+						break;
+					}
+				}
+			}
+			if (matchedKey && matchedRemainder) {
+				coveredByCustomized.add(matchedKey);
+				retained.push({
+					...item,
+					customized: true,
+					requirementKey: matchedKey,
+					requirementQuantity: matchedRemainder.rawRemainingBase
+				});
+			}
+			continue;
+		}
+		if (!existingUncheckedIds.has(origKey)) existingUncheckedIds.set(origKey, item.id);
+	}
+
+	const uncheckedRetained = retained.filter((item) => !item.checked);
+	const checkedRetained = retained.filter((item) => item.checked);
+	const usedIds = new Set(retained.map((item) => item.id));
 	const generated: ShoppingItem[] = [];
 	for (const [key, bucket] of additionBuckets) {
-		const checkedBucket = checkedByBucket.get(key);
-		const resolved = resolveShoppingQuantity(
-			bucket.quantityBase - (checkedBucket?.quantityBase ?? 0),
-			[...bucket.units, ...(checkedBucket?.units ?? [])]
-		);
-		if (!resolved) continue;
+		if (coveredByCustomized.has(key) || dismissedSet.has(key)) continue;
+		const remainder = resolveBucketRemainder(key, bucket);
+		if (!remainder) continue;
+		const { rawRemainingBase, resolved } = remainder;
 		const reusableId = existingUncheckedIds.get(key);
 		let id: string;
 		if (reusableId && !usedIds.has(reusableId)) {
@@ -230,20 +465,23 @@ export function reconcileShoppingList(
 		} else {
 			id = nextFreeGeneratedId(sourceKey, key, usedIds);
 		}
+		const { customized: _ignored, ...baseItem } = bucket.item;
 		generated.push({
-			...bucket.item,
+			...baseItem,
 			id,
 			quantity: Math.min(MAX_SHOPPING_QUANTITY, resolved.quantity),
 			unit: resolved.unit.display,
 			checked: false,
-			sourceKey
+			sourceKey,
+			requirementKey: key,
+			requirementQuantity: Math.min(rawRemainingBase, MAX_SHOPPING_QUANTITY * resolved.unit.factor)
 		});
 	}
 
 	return [...uncheckedRetained, ...generated, ...checkedRetained].slice(0, 1_000);
 }
 
-export type ShoppingItemSnapshot = Pick<ShoppingItem, 'name' | 'quantity' | 'unit'>;
+export type ShoppingItemSnapshot = Pick<ShoppingItem, 'name' | 'quantity' | 'unit' | 'customized'>;
 
 export interface ShoppingItemDraft {
 	name: string;
@@ -256,6 +494,9 @@ export function normalizeShoppingItem(
 	item: ShoppingItem,
 	draft?: ShoppingItemDraft | null
 ): ShoppingItem {
+	const prevName = item.name;
+	const prevUnit = item.unit;
+	const prevQuantity = Number(item.quantity);
 	const fallbackName = item.name.trim().slice(0, 200) || 'Shopping item';
 	const name = (draft ? draft.name : item.name).trim().slice(0, 200) || fallbackName;
 	const unit = (draft ? draft.unit : item.unit).trim().slice(0, 40) || 'piece';
@@ -275,6 +516,9 @@ export function normalizeShoppingItem(
 	const quantity = Number.isFinite(parsed)
 		? Math.max(0.01, Math.min(parsed, MAX_SHOPPING_QUANTITY))
 		: fallbackQuantity;
+	if (item.sourceKey && (name !== prevName || unit !== prevUnit || quantity !== prevQuantity)) {
+		item.customized = true;
+	}
 	item.name = name;
 	item.unit = unit;
 	item.quantity = quantity;
@@ -291,7 +535,8 @@ export function snapshotShoppingItem(item: ShoppingItem): ShoppingItemSnapshot {
 	return {
 		name: item.name,
 		quantity: item.quantity,
-		unit: item.unit
+		unit: item.unit,
+		...(item.customized !== undefined ? { customized: item.customized } : {})
 	};
 }
 
@@ -303,7 +548,10 @@ export function revertShoppingItem(
 	item.name = snapshot.name;
 	item.quantity = snapshot.quantity;
 	item.unit = snapshot.unit;
-	return normalizeShoppingItem(item);
+	normalizeShoppingItem(item);
+	if (snapshot.customized !== undefined) item.customized = snapshot.customized;
+	else delete item.customized;
+	return item;
 }
 
 const MAX_SHOPPING_ITEMS = 1_000;
@@ -384,8 +632,11 @@ export function activeWeeklyScopes(shopping: ShoppingItem[]): string[] {
 	return [...weeks];
 }
 
+export const activeShoppingWeeks = activeWeeklyScopes;
+
 function refreshWeekShoppingItems(
-	state: Pick<AppState, 'recipes' | 'pantry' | 'meals' | 'shopping'>,
+	state: Pick<AppState, 'recipes' | 'pantry' | 'meals' | 'shopping'> &
+		Partial<Pick<AppState, 'dismissedShopping'>>,
 	startDate: string | undefined,
 	now: Date = new Date()
 ): ShoppingItem[] | undefined {
@@ -395,7 +646,13 @@ function refreshWeekShoppingItems(
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const meals = state.meals.filter((meal) => !meal.completedAt && dates.has(meal.date));
 	const additions = buildShoppingList(state.recipes, state.pantry, meals, safeNow);
-	return reconcileShoppingList(state.shopping, additions, `week:${startDate}`);
+	const scopeKey = `week:${startDate}`;
+	return reconcileShoppingList(
+		state.shopping,
+		additions,
+		scopeKey,
+		dismissedKeysForScope(state.dismissedShopping, scopeKey)
+	);
 }
 
 /** Refresh one weekly shopping-list scope from incomplete planned meals in that 7-day window. */
@@ -418,7 +675,10 @@ function refreshWeeks(state: AppState, weekStarts: Iterable<string>, now: Date):
 
 function nextFreeItemId(item: ShoppingItem, usedIds: Set<string>): string {
 	if (item.sourceKey) {
-		return nextFreeGeneratedId(item.sourceKey, bucketKey(item.name, item.unit), usedIds);
+		const key = item.requirementKey
+			? normalizeLegacyBucketKey(item.requirementKey)
+			: bucketKey(item.name, item.unit);
+		return nextFreeGeneratedId(item.sourceKey, key, usedIds);
 	}
 	let suffix = 2;
 	let suffixText = `-${suffix}`;
@@ -433,7 +693,8 @@ function nextFreeItemId(item: ShoppingItem, usedIds: Set<string>): string {
 
 function reconcileWeekScope(
 	shopping: ShoppingItem[],
-	state: Pick<AppState, 'recipes' | 'pantry' | 'meals'>,
+	state: Pick<AppState, 'recipes' | 'pantry' | 'meals'> &
+		Partial<Pick<AppState, 'dismissedShopping'>>,
 	sourceKey: string | undefined,
 	now: Date
 ): ShoppingItem[] {
@@ -448,7 +709,8 @@ function reconcileWeekScope(
  * deficits do not immediately reappear.
  */
 export function deleteShoppingItem(
-	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'>,
+	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'> &
+		Partial<Pick<AppState, 'dismissedShopping'>>,
 	itemId: string,
 	now: Date = new Date()
 ): ShoppingItem[] {
@@ -461,13 +723,36 @@ export function deleteShoppingItem(
 }
 
 /**
+ * Remove one shopping row by ID and record a per-scope tombstone when an unchecked
+ * generated row is dismissed so future weekly refreshes do not regenerate it.
+ */
+export function deleteShoppingRow(
+	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'> &
+		Partial<Pick<AppState, 'dismissedShopping'>>,
+	itemId: string,
+	now: Date = new Date()
+): { shopping: ShoppingItem[]; dismissedShopping: AppState['dismissedShopping'] } {
+	const removed = state.shopping.find((item) => item.id === itemId);
+	if (!removed) {
+		return { shopping: state.shopping, dismissedShopping: state.dismissedShopping };
+	}
+	const dismissedShopping =
+		!removed.checked && removed.sourceKey
+			? recordShoppingDismissal(state.dismissedShopping, removed)
+			: state.dismissedShopping;
+	const shopping = deleteShoppingItem({ ...state, dismissedShopping }, itemId, now);
+	return { shopping, dismissedShopping };
+}
+
+/**
  * Restore a deleted shopping row while preserving unique IDs, checked purchases, and the
  * 1,000-item kitchen limit. Colliding unchecked rows in the same scope have a restored
  * checked purchase deducted or are re-keyed, and weekly scopes are reconciled so split
  * remainder rows do not duplicate deficits.
  */
 export function restoreShoppingItem(
-	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'>,
+	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'> &
+		Partial<Pick<AppState, 'dismissedShopping'>>,
 	removed: ShoppingItem,
 	now: Date = new Date()
 ): ShoppingItem[] {
@@ -511,7 +796,15 @@ export function restoreShoppingItem(
 							...colliding,
 							id: nextFreeItemId(colliding, usedIds),
 							quantity: Math.min(MAX_SHOPPING_QUANTITY, resolved.quantity),
-							unit: resolved.unit.display
+							unit: resolved.unit.display,
+							...(colliding.requirementQuantity !== undefined && !colliding.customized
+								? {
+										requirementQuantity: Math.min(
+											collidingBase - restoredBase,
+											MAX_SHOPPING_QUANTITY * resolved.unit.factor
+										)
+									}
+								: {})
 						});
 					}
 				} else {
@@ -542,6 +835,30 @@ export function restoreShoppingItem(
 }
 
 /**
+ * Restore a deleted shopping row and clear any per-scope tombstone recorded when it was dismissed.
+ */
+export function restoreShoppingRow(
+	state: Pick<AppState, 'shopping' | 'recipes' | 'pantry' | 'meals'> &
+		Partial<Pick<AppState, 'dismissedShopping'>>,
+	removed: ShoppingItem,
+	now: Date = new Date()
+): { shopping: ShoppingItem[]; dismissedShopping: AppState['dismissedShopping'] } {
+	const nextDismissed =
+		!removed.checked && removed.sourceKey
+			? clearShoppingDismissal(state.dismissedShopping, removed)
+			: state.dismissedShopping;
+	const shopping = restoreShoppingItem(
+		{ ...state, dismissedShopping: nextDismissed },
+		removed,
+		now
+	);
+	if (shopping === state.shopping) {
+		return { shopping: state.shopping, dismissedShopping: state.dismissedShopping };
+	}
+	return { shopping, dismissedShopping: nextDismissed };
+}
+
+/**
  * Reconcile explicit user shopping for a recipe or week scope.
  * Clears a recipe:<id> scope first when all of its existing rows are already checked,
  * while preserving partial mid-trip checked rows when unchecked rows remain.
@@ -549,7 +866,8 @@ export function restoreShoppingItem(
 export function shopForScope(
 	existing: ShoppingItem[],
 	additions: ShoppingItem[],
-	sourceKey: string
+	sourceKey: string,
+	dismissedKeys?: Iterable<string>
 ): { shopping: ShoppingItem[]; uncheckedCount: number } {
 	const scopeItems = existing.filter((item) => item.sourceKey === sourceKey);
 	const clearCompletedRecipeScope =
@@ -559,7 +877,7 @@ export function shopForScope(
 	const baseline = clearCompletedRecipeScope
 		? existing.filter((item) => item.sourceKey !== sourceKey)
 		: existing;
-	const shopping = reconcileShoppingList(baseline, additions, sourceKey);
+	const shopping = reconcileShoppingList(baseline, additions, sourceKey, dismissedKeys);
 	const uncheckedCount = shopping.filter(
 		(item) => item.sourceKey === sourceKey && !item.checked
 	).length;
@@ -586,22 +904,69 @@ function retireCheckedByScopeBudget(
 			result.push({ ...item });
 			continue;
 		}
-		const key = bucketKey(item.name, item.unit);
-		const availableBase = scopeBudget.get(key) ?? 0;
-		if (!(availableBase > 0)) {
+		const currentKey = bucketKey(item.name, item.unit);
+		const currentUnit = unitInfo(item.unit);
+		const provKey = item.requirementKey ? normalizeLegacyBucketKey(item.requirementKey) : undefined;
+		const matchKey =
+			(scopeBudget.get(currentKey) ?? 0) > 0
+				? currentKey
+				: provKey && (scopeBudget.get(provKey) ?? 0) > 0
+					? provKey
+					: undefined;
+		if (!matchKey) {
 			result.push({ ...item });
 			continue;
 		}
-		const unit = unitInfo(item.unit);
-		const itemBase = item.quantity * unit.factor;
-		const retiredBase = Math.min(itemBase, availableBase);
-		scopeBudget.set(key, Math.max(0, availableBase - retiredBase));
-		const remainingBase = Math.max(0, itemBase - retiredBase);
-		const remainingQuantity =
-			remainingBase > 0.00001 ? roundShoppingQuantity(remainingBase / unit.factor) : 0;
-		if (remainingQuantity > 0) {
-			result.push({ ...item, quantity: remainingQuantity });
+		const availableBase = scopeBudget.get(matchKey) ?? 0;
+		const matchDimension = splitBucketKey(matchKey)?.dimension;
+		if (matchDimension === undefined || currentUnit.dimension === matchDimension) {
+			const itemBase = item.quantity * currentUnit.factor;
+			const retiredBase = Math.min(itemBase, availableBase);
+			scopeBudget.set(matchKey, Math.max(0, availableBase - retiredBase));
+			const remainingBase = Math.max(0, itemBase - retiredBase);
+			const remainingQuantity =
+				remainingBase > 0.00001 ? roundShoppingQuantity(remainingBase / currentUnit.factor) : 0;
+			if (remainingQuantity > 0) {
+				result.push({
+					...item,
+					quantity: remainingQuantity,
+					...(item.requirementQuantity !== undefined &&
+					Number.isFinite(item.requirementQuantity) &&
+					itemBase > 0
+						? {
+								requirementQuantity: Math.max(
+									0,
+									item.requirementQuantity * (remainingBase / itemBase)
+								)
+							}
+						: {})
+				});
+			}
+			continue;
 		}
+		if (
+			item.requirementQuantity !== undefined &&
+			Number.isFinite(item.requirementQuantity) &&
+			item.requirementQuantity > 0
+		) {
+			const itemBase = item.requirementQuantity;
+			const retiredBase = Math.min(itemBase, availableBase);
+			scopeBudget.set(matchKey, Math.max(0, availableBase - retiredBase));
+			const remainingBase = Math.max(0, itemBase - retiredBase);
+			const remainingQuantity =
+				remainingBase > 0.00001
+					? roundShoppingQuantity(item.quantity * (remainingBase / itemBase))
+					: 0;
+			if (remainingQuantity > 0) {
+				result.push({
+					...item,
+					quantity: remainingQuantity,
+					requirementQuantity: remainingBase
+				});
+			}
+			continue;
+		}
+		result.push({ ...item });
 	}
 	return result;
 }
@@ -943,7 +1308,12 @@ export function refreshRecipeShopping(
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const target = state.recipes.find((recipe) => recipe.id === recipeId);
 	const additions = target ? buildShoppingList([target], state.pantry, undefined, safeNow) : [];
-	const shopping = reconcileShoppingList(state.shopping, additions, sourceKey);
+	const shopping = reconcileShoppingList(
+		state.shopping,
+		additions,
+		sourceKey,
+		dismissedKeysForScope(state.dismissedShopping, sourceKey)
+	);
 	return { ...state, shopping };
 }
 
@@ -1061,13 +1431,26 @@ export function deleteRecipe(state: AppState, recipeId: string, now: Date = new 
 	const shopping = state.shopping.filter(
 		(item) => item.sourceKey !== `recipe:${recipeId}` || item.checked
 	);
+	const dismissedShopping = clearScopeDismissals(state.dismissedShopping, `recipe:${recipeId}`);
 	let preferences = state.preferences;
 	if (state.preferences.ratings && recipeId in state.preferences.ratings) {
 		const ratings = { ...state.preferences.ratings };
 		delete ratings[recipeId];
 		preferences = { ...state.preferences, ratings };
 	}
-	return refreshWeeks({ ...state, recipes, meals, shopping, preferences }, weeksToRefresh, safeNow);
+	const { dismissedShopping: _prevDismissed, ...restState } = state;
+	return refreshWeeks(
+		{
+			...restState,
+			recipes,
+			meals,
+			shopping,
+			...(dismissedShopping ? { dismissedShopping } : {}),
+			preferences
+		},
+		weeksToRefresh,
+		safeNow
+	);
 }
 
 /**
@@ -1291,25 +1674,34 @@ export function clearSampleData(state: AppState, now: Date = new Date()): AppSta
 	});
 
 	let shopping = state.shopping.map((item) => ({ ...item }));
+	let dismissedShopping = state.dismissedShopping;
 	const weeks = new Set(
 		shopping.flatMap((item) => item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1] ?? [])
 	);
 	for (const startKey of weeks) {
 		const endKey = weekEndKey(startKey);
 		if (!endKey) continue;
+		const scopeKey = `week:${startKey}`;
 		const weekMeals = meals.filter(
 			(meal) => !meal.completedAt && meal.date >= startKey && meal.date <= endKey
 		);
 		const additions = buildShoppingList(recipes, pantry, weekMeals, now);
-		shopping = reconcileShoppingList(shopping, additions, `week:${startKey}`);
+		shopping = reconcileShoppingList(
+			shopping,
+			additions,
+			scopeKey,
+			dismissedKeysForScope(dismissedShopping, scopeKey)
+		);
 	}
 
+	const { dismissedShopping: _prevDismissed, ...restState } = state;
 	return {
-		...state,
+		...restState,
 		pantry,
 		recipes,
 		meals,
 		shopping,
+		...(dismissedShopping ? { dismissedShopping } : {}),
 		preferences: structuredClone(state.preferences)
 	};
 }

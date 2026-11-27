@@ -59,6 +59,9 @@ export type ShoppingItem = {
 	checked: boolean;
 	category?: string;
 	sourceKey?: string;
+	requirementKey?: string;
+	requirementQuantity?: number;
+	customized?: boolean;
 };
 export type Preferences = {
 	diet: string;
@@ -81,6 +84,7 @@ export type AppState = {
 	recipes: Recipe[];
 	meals: Meal[];
 	shopping: ShoppingItem[];
+	dismissedShopping?: Record<string, Record<string, boolean>>;
 	preferences: Preferences;
 };
 export type User = {

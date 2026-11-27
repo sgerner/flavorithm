@@ -110,12 +110,14 @@
 		preferenceSummary
 	} from '#lib/domain.ts';
 	import {
+		activeShoppingWeeks,
 		addPantryItems,
 		backfillSampleData,
+		clearScopeDismissals,
 		completeMeal,
 		deleteMeal,
 		deleteRecipe,
-		deleteShoppingItem,
+		deleteShoppingRow,
 		expiryStatus,
 		filterPantryItems,
 		hasSampleData,
@@ -129,7 +131,7 @@
 		recipeNeedsNutritionRefresh,
 		refreshWeekShopping,
 		restockDepletedPantryItems,
-		restoreShoppingItem,
+		restoreShoppingRow,
 		revertShoppingItem,
 		saveEditedRecipe as applyEditedRecipe,
 		shopForScope,
@@ -443,6 +445,7 @@
 		editingShoppingId = '';
 		editingShoppingDraft = null;
 		shoppingFilter = 'all';
+		trackedWeeks = [];
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 	}
 	function saveLastAccount(account: User) {
@@ -462,6 +465,7 @@
 		clearHouseholdViewState();
 		kitchenSync?.clearContext();
 		user = null;
+		trackedWeeks = [];
 		kitchen = createInitialState();
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
@@ -670,6 +674,7 @@
 	let editingShoppingId = $state('');
 	let editingShoppingDraft = $state<(ShoppingItemDraft & { id: string }) | null>(null);
 	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
+	let trackedWeeks = $state<string[]>([]);
 	let deletePassword = $state('');
 	let resetToken = $state('');
 	let mealDateError = $derived(
@@ -945,6 +950,7 @@
 		});
 		const editedId = draft.id;
 		pantryDraft = null;
+		notifyRetiredCustomized(refreshActiveWeeks());
 		if (!restoreFocus) return;
 		await tick();
 		document
@@ -974,6 +980,7 @@
 	function removePantryItem(item: AppState['pantry'][number]) {
 		if (pantryDraft?.id === item.id) pantryDraft = null;
 		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
+		notifyRetiredCustomized(refreshActiveWeeks());
 	}
 	function resetPantryFilters() {
 		pantryQuery = '';
@@ -1128,17 +1135,23 @@
 		await tick();
 		document.querySelector<HTMLButtonElement>(`[data-shopping-edit="${CSS.escape(id)}"]`)?.focus();
 	}
+	function setDismissedShopping(next: AppState['dismissedShopping']) {
+		if (next) kitchen.dismissedShopping = next;
+		else delete kitchen.dismissedShopping;
+	}
 	function removeShoppingItem(item: AppState['shopping'][number]) {
 		if (editingShoppingId === item.id) clearEditingShoppingState();
 		const removed = structuredClone($state.snapshot(item));
-		kitchen.shopping = deleteShoppingItem(kitchen, removed.id);
-		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
-			clearEditingShoppingState();
+		const next = deleteShoppingRow(kitchen, removed.id);
+		setDismissedShopping(next.dismissedShopping);
+		kitchen.shopping = next.shopping;
+		pruneEditingShoppingState();
 		notify(`${item.name} removed.`, () => {
 			if (editingShoppingId === removed.id) clearEditingShoppingState();
-			kitchen.shopping = restoreShoppingItem(kitchen, removed);
-			if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
-				clearEditingShoppingState();
+			const restored = restoreShoppingRow(kitchen, removed);
+			setDismissedShopping(restored.dismissedShopping);
+			kitchen.shopping = restored.shopping;
+			pruneEditingShoppingState();
 		});
 	}
 	function consumeLeftoverServing(meal: Meal) {
@@ -1171,14 +1184,32 @@
 	}
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
+		const previousMeals = JSON.parse(JSON.stringify(kitchen.meals)) as AppState['meals'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const previousPantry = JSON.stringify(kitchen.pantry);
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
 		kitchen = deleteMeal(kitchen, meal.id);
+		refreshActiveWeeks([weekStartForDate(meal.date)]);
 		pruneEditingShoppingState();
-		notify('Planned meal removed.', () => {
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
+		const appliedMeals = JSON.stringify(kitchen.meals);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
+		notify(`Planned meal removed${retiredCustomizedClause(retired)}.`, () => {
 			if (
 				kitchen.recipes.some((recipe) => recipe.id === removed.recipeId) &&
 				!kitchen.meals.some((entry) => entry.id === removed.id)
 			) {
-				kitchen = upsertMeal(kitchen, removed, undefined, { preserveSample: true });
+				if (
+					JSON.stringify(kitchen.meals) === appliedMeals &&
+					JSON.stringify(kitchen.shopping) === appliedShopping &&
+					JSON.stringify(kitchen.pantry) === previousPantry
+				) {
+					kitchen.meals = previousMeals;
+					kitchen.shopping = previousShopping;
+					trackedWeeks = activeShoppingWeeks(previousShopping);
+				} else {
+					kitchen = upsertMeal(kitchen, removed, undefined, { preserveSample: true });
+				}
 				pruneEditingShoppingState();
 			}
 		});
@@ -1309,7 +1340,9 @@
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
-				kitchen = sanitizeKitchenState(state);
+				const sanitized = sanitizeKitchenState(state);
+				trackedWeeks = activeShoppingWeeks(sanitized.shopping);
+				kitchen = sanitized;
 			},
 			onStatus: (status) => {
 				syncReady = status.ready;
@@ -1373,6 +1406,7 @@
 					const sanitized = sanitizeKitchenState(JSON.parse(local));
 					const loaded = started ? sanitized : backfillSampleData(sanitized);
 					if (!themes.includes(loaded.preferences.theme)) loaded.preferences.theme = 'nosh';
+					trackedWeeks = activeShoppingWeeks(loaded.shopping);
 					kitchen = loaded;
 				}
 			} catch {}
@@ -1552,6 +1586,7 @@
 	});
 	function adoptKitchen(state: AppState) {
 		const sanitized = sanitizeKitchenState(state);
+		trackedWeeks = activeShoppingWeeks(sanitized.shopping);
 		if (user && kitchenSync) {
 			const snapshotUser = $state.snapshot(user);
 			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
@@ -1629,6 +1664,7 @@
 			},
 			getKitchen: () => kitchen,
 			setKitchen: (next) => {
+				trackedWeeks = activeShoppingWeeks(next.shopping);
 				kitchen = next;
 			},
 			onCleaned: () => {
@@ -1638,6 +1674,7 @@
 			onUndoRestore: (restored) => {
 				pantryDraft = null;
 				clearEditingShoppingState();
+				trackedWeeks = activeShoppingWeeks(restored.shopping);
 				kitchen = restored;
 			},
 			getShowStarter: () => showStarter,
@@ -1677,6 +1714,9 @@
 		commitInlineEdits();
 		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
 		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const previousDismissed = kitchen.dismissedShopping
+			? (JSON.parse(JSON.stringify(kitchen.dismissedShopping)) as AppState['dismissedShopping'])
+			: undefined;
 		const existingKeys = new Set(
 			kitchen.pantry
 				.filter((item) => !item.sample && !item.expires?.trim())
@@ -1716,13 +1756,17 @@
 			);
 			return;
 		}
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
 		const updated = addPantryItems(kitchen, additions);
 		kitchen.pantry = updated.pantry;
 		kitchen.shopping = updated.shopping;
+		refreshActiveWeeks();
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 			clearEditingShoppingState();
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
+		const appliedDismissed = JSON.stringify(kitchen.dismissedShopping ?? null);
 		pantryInput = '';
 		stagedScanFile = null;
 		modal = '';
@@ -1734,19 +1778,17 @@
 					? ` (${rejectedInput} invalid ${rejectedInput === 1 ? 'entry' : 'entries'} skipped)`
 					: '';
 		notify(
-			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}.`,
+			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}${retiredCustomizedClause(retired)}.`,
 			() => {
 				if (
 					JSON.stringify(kitchen.pantry) === appliedPantry &&
-					JSON.stringify(kitchen.shopping) === appliedShopping
+					JSON.stringify(kitchen.shopping) === appliedShopping &&
+					JSON.stringify(kitchen.dismissedShopping ?? null) === appliedDismissed
 				) {
 					kitchen.pantry = previousPantry;
 					kitchen.shopping = previousShopping;
-					if (
-						editingShoppingId &&
-						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
-					)
-						clearEditingShoppingState();
+					setDismissedShopping(previousDismissed);
+					pruneEditingShoppingState();
 				} else notify('Your pantry changed again. Review the current quantities before editing.');
 			}
 		);
@@ -1789,6 +1831,7 @@
 					showStarter = false;
 					clearHouseholdViewState();
 					stateEtag = null;
+					trackedWeeks = activeShoppingWeeks(initialKitchen.shopping);
 					kitchen = initialKitchen;
 					user = nextUser;
 					kitchenSync?.prepare(nextUser);
@@ -1796,6 +1839,7 @@
 					saveLastAccount(nextUser);
 				},
 				stageGuestKitchen: (cleanedGuest) => {
+					trackedWeeks = activeShoppingWeeks(cleanedGuest.shopping);
 					kitchen = cleanedGuest;
 					kitchenSync?.stage(cleanedGuest);
 				},
@@ -1888,6 +1932,7 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
+			trackedWeeks = [];
 			clearPendingAIState();
 			resetPantryFilters();
 			kitchen = createInitialState();
@@ -2635,6 +2680,7 @@
 		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
+		trackedWeeks = activeShoppingWeeks(kitchen.shopping);
 		pruneEditingShoppingState();
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
@@ -2666,6 +2712,7 @@
 		notify('Basil’s changes applied.', () => {
 			if (JSON.stringify(kitchen) === appliedSnapshot) {
 				kitchen = previousKitchen;
+				trackedWeeks = activeShoppingWeeks(previousKitchen.shopping);
 				pruneEditingShoppingState();
 			} else notify('Your kitchen changed again. Review the current values before editing.');
 		});
@@ -3202,6 +3249,7 @@
 		if (editingRecipeMode === 'create') {
 			const saved = finalizeManualRecipe(updated);
 			kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
+			refreshActiveWeeks();
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
 			selectedMealServings = undefined;
@@ -3223,25 +3271,32 @@
 		}
 		const wasSaved = Boolean(previous?.saved);
 		const nutritionNeedsRefresh = recipeNeedsNutritionRefresh(previous, updated);
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
 		kitchen = applyEditedRecipe(kitchen, updated);
+		refreshActiveWeeks();
 		pruneEditingShoppingState();
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
 		editingRecipe = null;
 		editingRecipeMode = 'edit';
-		notify(
-			!wasSaved
-				? nutritionNeedsRefresh
-					? 'Recipe saved to your collection. Refresh its nutrition estimate.'
-					: 'Recipe saved to your collection.'
-				: nutritionNeedsRefresh
-					? 'Recipe updated. Refresh its nutrition estimate.'
-					: 'Recipe updated.'
-		);
+		const baseMessage = !wasSaved
+			? nutritionNeedsRefresh
+				? 'Recipe saved to your collection. Refresh its nutrition estimate'
+				: 'Recipe saved to your collection'
+			: nutritionNeedsRefresh
+				? 'Recipe updated. Refresh its nutrition estimate'
+				: 'Recipe updated';
+		notify(`${baseMessage}${retiredCustomizedClause(retired)}.`);
 	}
 	function askDeleteRecipe(recipe: Recipe) {
 		if (!recipe.saved) return;
 		recipeToDelete = recipe;
 		selected = null;
 		modal = 'deleteRecipe';
+	}
+	function trackShoppingWeek(startDate: string) {
+		if (/^\d{4}-\d{2}-\d{2}$/.test(startDate) && !trackedWeeks.includes(startDate)) {
+			trackedWeeks = [...trackedWeeks, startDate];
+		}
 	}
 	function weekOffsetForDate(value: string, today = new Date()) {
 		const start = weekStartForDate(value);
@@ -3304,6 +3359,58 @@
 		cookingMealId = '';
 		deductPantry = false;
 		leftoverServings = 0;
+	}
+	function customizedWeeklyIds(shopping: AppState['shopping']) {
+		return new Set(
+			shopping
+				.filter((item) => item.sourceKey?.startsWith('week:') && !item.checked && item.customized)
+				.map((item) => item.id)
+		);
+	}
+	function countRetiredIds(before: Set<string>, shopping: AppState['shopping']): number {
+		if (!before.size) return 0;
+		const remainingIds = new Set(shopping.map((item) => item.id));
+		let retired = 0;
+		for (const id of before) {
+			if (!remainingIds.has(id)) retired += 1;
+		}
+		return retired;
+	}
+	function retiredCustomizedClause(count: number) {
+		return count > 0
+			? ` · ${count} covered edited shopping ${count === 1 ? 'item' : 'items'} cleared`
+			: '';
+	}
+	function notifyRetiredCustomized(count: number) {
+		if (count <= 0) return;
+		notify(
+			`${count} edited shopping ${count === 1 ? 'item was' : 'items were'} cleared because ${count === 1 ? 'it is' : 'they are'} now covered.`
+		);
+	}
+	function refreshWeekScope(startDate: string): number {
+		if (!/^\d{4}-\d{2}-\d{2}$/.test(startDate)) return 0;
+		const scopeKey = `week:${startDate}`;
+		const customizedBefore = new Set(
+			kitchen.shopping
+				.filter((item) => item.sourceKey === scopeKey && !item.checked && item.customized)
+				.map((item) => item.id)
+		);
+		const next = refreshWeekShopping(kitchen, startDate);
+		if (next === kitchen) return 0;
+		trackShoppingWeek(startDate);
+		kitchen.shopping = next.shopping;
+		pruneEditingShoppingState();
+		return countRetiredIds(customizedBefore, next.shopping);
+	}
+	function refreshActiveWeeks(extraWeeks: Iterable<string> = []): number {
+		const weeks = new Set([
+			...activeShoppingWeeks(kitchen.shopping),
+			...trackedWeeks,
+			...extraWeeks
+		]);
+		let retired = 0;
+		for (const startDate of weeks) retired += refreshWeekScope(startDate);
+		return retired;
 	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
@@ -3401,27 +3508,32 @@
 		}
 		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
 		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const previousDismissed = kitchen.dismissedShopping
+			? (JSON.parse(JSON.stringify(kitchen.dismissedShopping)) as AppState['dismissedShopping'])
+			: undefined;
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
 		const updated = movePurchasesToPantry(kitchen);
 		kitchen.pantry = updated.pantry;
 		kitchen.shopping = updated.shopping;
+		refreshActiveWeeks();
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 			clearEditingShoppingState();
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
+		const appliedDismissed = JSON.stringify(kitchen.dismissedShopping ?? null);
 		notify(
-			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`,
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry${retiredCustomizedClause(retired)}.`,
 			() => {
 				if (
 					JSON.stringify(kitchen.pantry) === appliedPantry &&
-					JSON.stringify(kitchen.shopping) === appliedShopping
+					JSON.stringify(kitchen.shopping) === appliedShopping &&
+					JSON.stringify(kitchen.dismissedShopping ?? null) === appliedDismissed
 				) {
 					kitchen.pantry = previousPantry;
 					kitchen.shopping = previousShopping;
-					if (
-						editingShoppingId &&
-						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
-					)
-						clearEditingShoppingState();
+					setDismissedShopping(previousDismissed);
+					pruneEditingShoppingState();
 				} else {
 					notify('Your kitchen changed again. Review the current values before editing.');
 				}
@@ -3434,6 +3546,9 @@
 			return;
 		}
 		commitInlineEdits();
+		const weekMatch = sourceKey.match(/^week:(\d{4}-\d{2}-\d{2})$/);
+		if (weekMatch) trackShoppingWeek(weekMatch[1]);
+		setDismissedShopping(clearScopeDismissals(kitchen.dismissedShopping, sourceKey));
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
 		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
 		kitchen.shopping = shopping;
@@ -3534,18 +3649,21 @@
 		}
 		formSubmitted = false;
 		const updatedDate = mealDate;
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
 		kitchen = upsertMeal(kitchen, {
 			...meal,
 			date: updatedDate,
 			slot: mealSlot,
 			servings: Math.round(plannedServings)
 		});
+		refreshActiveWeeks([weekStartForDate(meal.date), weekStartForDate(updatedDate)]);
 		pruneEditingShoppingState();
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
 		modal = '';
 		void scrollCalendarToDate(updatedDate);
-		notify('Meal plan updated.');
+		notify(`Meal plan updated${retiredCustomizedClause(retired)}.`);
 	}
 	function openCookDialog(meal: Meal) {
 		if (meal.completedAt) return;
@@ -3572,18 +3690,26 @@
 		formSubmitted = false;
 		const recipeId = meal.recipeId;
 		const servingsCooked = meal.servings;
+		const startDate = weekStartForDate(meal.date);
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
+		refreshActiveWeeks([startDate]);
 		pruneEditingShoppingState();
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
 		resetMealDialogState();
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
 		selectedMealServings = servingsCooked;
 		selectedDetailTab = 'recipe';
 		if (recipe) selected = recipe;
-		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
+		notify(
+			recipe
+				? `Marked cooked. How did you like ${recipe.title}?${retiredCustomizedClause(retired)}`
+				: `Meal marked cooked${retiredCustomizedClause(retired)}.`
+		);
 	}
 	function restockPantryItems(selectedIds?: string[]) {
 		commitInlineEdits();
@@ -4058,6 +4184,9 @@
 			recipe
 		);
 		kitchen.recipes = applied.nextRecipes;
+		if (kitchen.meals.some((meal) => !meal.completedAt && meal.recipeId === applied.saved.id)) {
+			refreshActiveWeeks();
+		}
 		if (voiceTarget === 'import') clearVoiceSession();
 		importSession = applied.nextSession;
 		if (pendingAIContinuation?.kind === 'import') pendingAIContinuation = null;
@@ -4192,6 +4321,7 @@
 			resetPantryFilters();
 			deletePassword = '';
 			stateEtag = null;
+			trackedWeeks = [];
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			clearGuestData(localStorage);
@@ -4890,6 +5020,7 @@
 										kitchen.pantry = kitchen.pantry.filter(
 											(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
 										);
+										notifyRetiredCustomized(refreshActiveWeeks());
 									}}>Clear depleted items</button
 								></span
 							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
@@ -5310,8 +5441,8 @@
 					<div>
 						<h1>Shopping list<span class="heading-spark" aria-hidden="true">✴</span></h1>
 						<p>
-							Generated rows show their recipe or meal-plan source. Editing a row keeps your changes
-							visible until that source is refreshed.
+							Generated rows show their recipe or meal-plan source. Edits stay while an unpurchased
+							need remains, and deleted rows stay dismissed until you rebuild that list.
 						</p>
 					</div>
 					<button class="secondary" disabled={!kitchen.shopping.length} onclick={exportList}

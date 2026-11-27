@@ -479,6 +479,199 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 	]);
 });
 
+test('butler pantry mutations and cross-week meal moves refresh active and target weekly lists', () => {
+	const current = createInitialState();
+	const omelette = structuredClone(current.recipes[0]);
+	omelette.id = 'omelette';
+	omelette.title = 'Omelette';
+	omelette.servings = 2;
+	omelette.ingredients = [
+		{ name: 'eggs', quantity: 3, unit: 'each' },
+		{ name: 'butter', quantity: 1, unit: 'tbsp' }
+	];
+	current.recipes = [omelette];
+	current.pantry = [
+		{ id: 'pantry-eggs', name: 'eggs', quantity: 3, unit: 'whole', category: 'Dairy & eggs' }
+	];
+	current.meals = [
+		{
+			id: 'tue-breakfast',
+			date: '2026-10-20',
+			slot: 'Breakfast',
+			recipeId: 'omelette',
+			servings: 2
+		}
+	];
+	current.shopping = [];
+
+	const now = new Date('2026-10-20T09:00:00Z');
+	const initialWeek = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.deepEqual(
+		initialWeek.shopping.map((item) => item.name),
+		['butter']
+	);
+
+	// Deleting eggs from pantry immediately surfaces eggs in the active week:2026-10-19 list.
+	const afterEggDelete = applyButlerCommands(
+		initialWeek,
+		[{ type: 'pantry.delete', id: 'pantry-eggs' }],
+		now
+	).state;
+	assert.deepEqual(
+		afterEggDelete.shopping.map((item) => ({ name: item.name, quantity: item.quantity })),
+		[
+			{ name: 'butter', quantity: 1 },
+			{ name: 'eggs', quantity: 3 }
+		]
+	);
+
+	// Moving the meal to next week clears week:2026-10-19 and populates previously empty week:2026-10-26.
+	const afterMove = applyButlerCommands(
+		afterEggDelete,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'tue-breakfast',
+					date: '2026-10-27',
+					slot: 'Breakfast',
+					recipeId: 'omelette',
+					servings: 2
+				}
+			}
+		],
+		now
+	).state;
+	assert.equal(
+		afterMove.shopping.some((item) => item.sourceKey === 'week:2026-10-19'),
+		false
+	);
+	assert.deepEqual(
+		afterMove.shopping
+			.filter((item) => item.sourceKey === 'week:2026-10-26')
+			.map((item) => item.name),
+		['butter', 'eggs']
+	);
+});
+
+test('pairing meal or pantry commands with explicit shopping edits or deletions preserves tombstones and provenance', () => {
+	const current = createInitialState();
+	const pasta = structuredClone(current.recipes[0]);
+	pasta.id = 'pasta';
+	pasta.servings = 2;
+	pasta.ingredients = [
+		{ name: 'olive oil', quantity: 2, unit: 'tbsp' },
+		{ name: 'garlic', quantity: 3, unit: 'cloves' }
+	];
+	current.recipes = [pasta];
+	current.pantry = [];
+	current.meals = [];
+	current.shopping = [];
+
+	const now = new Date('2026-10-20T12:00:00Z');
+	const scheduled = applyButlerCommands(
+		current,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'wed-dinner',
+					date: '2026-10-21',
+					slot: 'Dinner',
+					recipeId: 'pasta',
+					servings: 2
+				}
+			}
+		],
+		now
+	).state;
+	const oilItem = scheduled.shopping.find((item) => item.name === 'olive oil')!;
+	const garlicItem = scheduled.shopping.find((item) => item.name === 'garlic')!;
+	assert.ok(oilItem);
+	assert.ok(garlicItem);
+
+	const paired = applyButlerCommands(
+		scheduled,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: 'fri-dinner',
+					date: '2026-10-23',
+					slot: 'Dinner',
+					recipeId: 'pasta',
+					servings: 2
+				}
+			},
+			{
+				type: 'shopping.upsert',
+				item: {
+					id: oilItem.id,
+					name: 'olive oil',
+					quantity: 1,
+					unit: 'cup',
+					checked: false,
+					sourceKey: oilItem.sourceKey
+				}
+			},
+			{
+				type: 'shopping.delete',
+				id: garlicItem.id
+			}
+		],
+		now
+	).state;
+
+	assert.equal(
+		paired.shopping.some((item) => item.id === garlicItem.id),
+		false
+	);
+	assert.deepEqual(paired.dismissedShopping, {
+		'week:2026-10-19': { 'garlic::count:clove': true }
+	});
+	const updatedOil = paired.shopping.find((item) => item.id === oilItem.id);
+	assert.ok(updatedOil);
+	assert.equal(updatedOil.quantity, 1);
+	assert.equal(updatedOil.unit, 'cup');
+	assert.equal(updatedOil.customized, true);
+
+	// A subsequent refresh triggered by a pantry mutation in a later proposal keeps garlic deleted
+	const afterLaterPantryEdit = applyButlerCommands(
+		paired,
+		[
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'pantry-salt',
+					name: 'kosher salt',
+					quantity: 1,
+					unit: 'box',
+					category: 'Spices'
+				}
+			}
+		],
+		now
+	).state;
+	assert.equal(
+		afterLaterPantryEdit.shopping.some((item) => item.name === 'garlic'),
+		false
+	);
+	assert.equal(afterLaterPantryEdit.shopping.find((item) => item.id === oilItem.id)?.quantity, 1);
+
+	// Explicit shopping.generate clears the week's tombstones and regenerates garlic
+	const regenerated = applyButlerCommands(
+		afterLaterPantryEdit,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.equal(regenerated.dismissedShopping, undefined);
+	assert.equal(regenerated.shopping.find((item) => item.name === 'garlic')?.quantity, 6);
+});
+
 test('standalone meal.upsert populates shopping for empty weeks and updates both weeks when moving a meal', () => {
 	const current = createInitialState();
 	const recipe = current.recipes[0];
@@ -1110,6 +1303,10 @@ test('recipe.delete retains checked recipe purchases and shopping.delete refresh
 	assert.equal(refreshedCarrot.checked, false);
 	assert.equal(refreshedCarrot.quantity, 4);
 	assert.equal(refreshedCarrot.sourceKey, 'week:2026-10-19');
+	assert.equal(
+		afterDeleteCheckedCarrot.shopping.some((item) => item.name === 'onion'),
+		false
+	);
 });
 
 test('pantry.upsert and pantry.delete refresh touched and existing shopping scopes regardless of command order', () => {
@@ -1255,4 +1452,118 @@ test('meal.complete rejects omitted deductPantry and keeps pantry unchanged when
 	).state;
 	assert.equal(withoutDeduction.meals[0].completedAt, now.toISOString());
 	assert.equal(withoutDeduction.pantry[0].quantity, 6);
+});
+
+test('pantry commands flush before shopping commands and recipe-scope dismissals survive recipe and pantry refreshes', () => {
+	const current = createInitialState();
+	const soup = structuredClone(current.recipes[0]);
+	soup.id = 'soup';
+	soup.servings = 2;
+	soup.ingredients = [
+		{ name: 'carrot', quantity: 4, unit: 'each' },
+		{ name: 'celery', quantity: 2, unit: 'each' }
+	];
+	current.recipes = [soup];
+	current.pantry = [
+		{ id: 'pantry-carrot', name: 'carrot', quantity: 4, unit: 'each', category: 'Produce' }
+	];
+	current.meals = [
+		{ id: 'wed', date: '2026-10-21', slot: 'Dinner', recipeId: 'soup', servings: 2 }
+	];
+	const now = new Date('2026-10-20T12:00:00Z');
+	const seeded = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.deepEqual(
+		seeded.shopping.map((item) => item.name),
+		['celery']
+	);
+
+	// Deleting pantry carrots before shopping.upsert flushes the new weekly carrot deficit first
+	const withRecipeRows: typeof seeded = {
+		...seeded,
+		shopping: [
+			...seeded.shopping,
+			{
+				id: 'recipe-celery',
+				name: 'celery',
+				quantity: 2,
+				unit: 'each',
+				checked: false,
+				sourceKey: 'recipe:soup',
+				requirementKey: 'celery::count'
+			}
+		]
+	};
+	const afterBatch = applyButlerCommands(
+		withRecipeRows,
+		[
+			{ type: 'pantry.delete', id: 'pantry-carrot' },
+			{ type: 'shopping.delete', id: 'recipe-celery' }
+		],
+		now
+	).state;
+	assert.ok(
+		afterBatch.shopping.some(
+			(item) =>
+				item.sourceKey === 'week:2026-10-19' && item.name === 'carrot' && item.quantity === 4
+		)
+	);
+	assert.equal(
+		afterBatch.shopping.some((item) => item.id === 'recipe-celery'),
+		false
+	);
+	assert.deepEqual(afterBatch.dismissedShopping, {
+		'recipe:soup': { 'celery::count': true }
+	});
+
+	// Subsequent recipe.upsert and pantry.upsert keep recipe:soup's dismissed celery tombstoned
+	const afterRecipeAndPantryRefresh = applyButlerCommands(
+		afterBatch,
+		[
+			{
+				type: 'recipe.upsert',
+				recipe: {
+					...soup,
+					ingredients: [
+						{ name: 'carrot', quantity: 6, unit: 'each' },
+						{ name: 'celery', quantity: 3, unit: 'each' }
+					]
+				}
+			},
+			{
+				type: 'pantry.upsert',
+				item: {
+					id: 'pantry-carrot',
+					name: 'carrot',
+					quantity: 1,
+					unit: 'each',
+					category: 'Produce'
+				}
+			}
+		],
+		now
+	).state;
+	assert.equal(
+		afterRecipeAndPantryRefresh.shopping.some(
+			(item) => item.sourceKey === 'recipe:soup' && item.name === 'celery'
+		),
+		false
+	);
+	assert.equal(
+		afterRecipeAndPantryRefresh.shopping.find(
+			(item) => item.sourceKey === 'recipe:soup' && item.name === 'carrot'
+		)?.quantity,
+		5
+	);
+
+	// Deleting the recipe clears its recipe:<id> dismissal tombstone cleanly
+	const afterDeleteRecipe = applyButlerCommands(
+		afterRecipeAndPantryRefresh,
+		[{ type: 'recipe.delete', id: 'soup' }],
+		now
+	).state;
+	assert.equal('dismissedShopping' in afterDeleteRecipe, false);
 });

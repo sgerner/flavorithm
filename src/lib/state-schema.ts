@@ -121,10 +121,21 @@ export const appStateSchema = z.object({
 				quantity: z.number().min(0).max(1_000_000),
 				unit: z.string().max(40),
 				checked: z.boolean(),
-				sourceKey: z.string().max(200).optional()
+				category: z.string().max(100).optional(),
+				sourceKey: z.string().max(200).optional(),
+				requirementKey: z.string().max(260).optional(),
+				requirementQuantity: z.number().min(0).max(10_000_000_000).optional(),
+				customized: z.boolean().optional()
 			})
 		)
 		.max(1_000),
+	dismissedShopping: z
+		.record(z.string().min(1).max(200), z.record(z.string().min(1).max(260), z.boolean()))
+		.refine((scopes) => Object.keys(scopes).length <= 200)
+		.refine((scopes) =>
+			Object.values(scopes).every((entries) => Object.keys(entries).length <= 1_000)
+		)
+		.optional(),
 	preferences: preferencesSchema
 });
 

@@ -252,6 +252,37 @@ test('sanitizeKitchenState preserves valid states and clamps corrupt guest field
 
 	const validated = validateAppState(sanitized);
 	assert.ok(validated, 'validateAppState should accept any state produced by sanitizeKitchenState');
+
+	const provenanceState = createNewUserState();
+	provenanceState.recipes = [
+		{
+			...createInitialState().recipes[0],
+			id: 'manual-1',
+			provenance: 'manual'
+		}
+	];
+	provenanceState.shopping = [
+		{
+			id: 'generated-oil',
+			name: 'olive oil',
+			quantity: 1,
+			unit: 'cup',
+			checked: false,
+			category: 'Pantry',
+			sourceKey: 'week:2026-10-19',
+			requirementKey: 'olive oil::volume',
+			requirementQuantity: 44.36029434,
+			customized: true
+		}
+	];
+	provenanceState.dismissedShopping = {
+		'week:2026-10-19': { 'onion::count': true }
+	};
+	const sanitizedProvenance = sanitizeKitchenState(provenanceState);
+	assert.deepEqual(sanitizedProvenance.shopping, provenanceState.shopping);
+	assert.deepEqual(sanitizedProvenance.dismissedShopping, provenanceState.dismissedShopping);
+	assert.equal(sanitizedProvenance.recipes[0].provenance, 'manual');
+	assert.ok(validateAppState(sanitizedProvenance));
 });
 
 test('signup migration sanitizes guest state for immediate sync and retains journal offline', async () => {
