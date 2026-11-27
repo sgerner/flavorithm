@@ -29,7 +29,7 @@
 </script>
 
 <script lang="ts">
-	import { prepareAIPhoto } from '#lib/cover-upload.ts';
+	import { MAX_AI_PHOTO_INPUT_BYTES, prepareAIPhoto } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
@@ -92,7 +92,17 @@
 		RefreshCw
 	} from '@lucide/svelte';
 	import type { AppState, Meal, Recipe, User } from '#lib/types.ts';
-	import { createInitialState, createNewUserState } from '#lib/data.ts';
+	import { createInitialState, createNewUserState, defaultPreferences } from '#lib/data.ts';
+	import {
+		SCAN_PHOTO_ACCEPT,
+		applyGenerateGuestFilters,
+		captureGenerateGuestFilters,
+		hasAIConnection,
+		isSupportedScanPhotoType,
+		resolvePostSetupAction,
+		shouldOpenPantryOnScanError,
+		type PendingAIContinuation
+	} from '#lib/ai-continuation.ts';
 	import {
 		buildShoppingList,
 		normalizeName,
@@ -339,13 +349,15 @@
 	let scanController: AbortController | undefined;
 	let scanGeneration = 0;
 	function cancelScan(silent = false) {
-		if (!scanBusy) return;
+		if (!scanBusy && !stagedScanFile) return;
+		const wasBusy = scanBusy;
 		scanGeneration++;
 		scanController?.abort();
 		scanController = undefined;
 		scanBusy = false;
+		stagedScanFile = null;
 		if (imageInput) imageInput.value = '';
-		if (!silent) notify('Photo scan cancelled.');
+		if (!silent && wasBusy) notify('Photo scan cancelled.');
 	}
 	let mobileNav = $state(false);
 	let mobileCalendar = $state(
@@ -427,6 +439,7 @@
 	function clearHouseholdViewState() {
 		selectedId = null;
 		selectedMealServings = undefined;
+		selectedDetailTab = 'recipe';
 		editingRecipe = null;
 		editingRecipeBase = null;
 		editingRecipeMode = 'edit';
@@ -447,7 +460,9 @@
 		cancelScan(true);
 		clearVoiceSession();
 		pantryInput = '';
+		importSession = emptyImportSession();
 		resumeDialog = '';
+		clearPendingAIState();
 		clearAIConnectionState();
 		clearHouseholdViewState();
 		kitchenSync?.clearContext();
@@ -466,7 +481,6 @@
 		inviteCode = '';
 		currentInviteId = '';
 		joinCode = '';
-		pantryDraft = null;
 		resetPantryFilters();
 	}
 	function renewManagedSession(error: unknown) {
@@ -489,7 +503,7 @@
 	}
 	function dismissOnboarding() {
 		if (!kitchen.preferences.onboardingStatus) kitchen.preferences.onboardingStatus = 'skipped';
-		modal = '';
+		completePostSetupSurface();
 	}
 	function finishOnboarding(event: SubmitEvent) {
 		event.preventDefault();
@@ -501,7 +515,7 @@
 			allergies: quizAllergies.trim(),
 			onboardingStatus: 'completed'
 		});
-		modal = '';
+		completePostSetupSurface();
 		notify('Preferences saved.');
 	}
 
@@ -509,6 +523,7 @@
 	let selected = $derived(
 		selectedId ? (kitchen.recipes.find((item) => item.id === selectedId) ?? null) : null
 	);
+	let selectedDetailTab = $state<'recipe' | 'nutrition'>('recipe');
 	let editingRecipe = $state<Recipe | null>(null);
 	let editingRecipeBase = $state<Recipe | null>(null);
 	let editingRecipeMode = $state<'create' | 'edit'>('edit');
@@ -641,6 +656,8 @@
 	let catalogVersion = 0;
 	let prompt = $state('');
 	let importSession = $state<ImportSession>(emptyImportSession());
+	let pendingAIContinuation = $state<PendingAIContinuation | null>(null);
+	let stagedScanFile = $state<File | null>(null);
 	let resumeDialog = $state<ResumeDialog>('');
 	let searchResults = $state<{ title: string; url: string; description: string }[]>([]);
 	type HouseholdMember = { id: string; name: string; email: string; role: string };
@@ -754,8 +771,14 @@
 		if (changedIdentity) {
 			cancelScan(true);
 			kitchenSync?.clearContext();
+			clearVoiceSession();
+			pantryInput = '';
+			importSession = emptyImportSession();
+			resumeDialog = '';
+			clearPendingAIState();
 			clearAIConnectionState();
 			clearHouseholdViewState();
+			resetPantryFilters();
 			stateEtag = null;
 			if (nextUser) kitchen = createNewUserState();
 		}
@@ -1296,10 +1319,30 @@
 				void retrySync();
 			}, 500);
 	});
+	function safeBrowserStorage(kind: 'localStorage' | 'sessionStorage'): Storage | null {
+		try {
+			return typeof window !== 'undefined' ? window[kind] : (globalThis[kind] ?? null);
+		} catch {
+			return null;
+		}
+	}
+	function createMemoryStorageFallback(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
+		const entries = new Map<string, string>();
+		return {
+			getItem: (key) => entries.get(key) ?? null,
+			setItem: (key, value) => {
+				entries.set(key, String(value));
+			},
+			removeItem: (key) => {
+				entries.delete(key);
+			}
+		};
+	}
 	onMount(() => {
 		online = navigator.onLine;
 		kitchenSync = createKitchenSync({
-			storage: localStorage,
+			storage: safeBrowserStorage('localStorage') ?? createMemoryStorageFallback(),
+			sessionStorage: safeBrowserStorage('sessionStorage'),
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
@@ -1718,6 +1761,7 @@
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
+		stagedScanFile = null;
 		modal = '';
 		const acceptedCount = additions.length;
 		const suffix =
@@ -1810,13 +1854,21 @@
 					kitchenSync?.failLoad(message);
 				}
 			});
+			if (!isRegister && pendingAIContinuation?.kind === 'generate') {
+				applyGenerateGuestFilters(kitchen.preferences, pendingAIContinuation.guestFilters);
+			}
 			syncing = false;
 			if (stateLoaded) {
 				await refreshConnections().catch(() =>
 					notify('Your ChatGPT connection could not be checked. Open Settings to reconnect.')
 				);
 			}
-			if (resumeDialog) {
+			const nextStep = resolvePostSetupAction(pendingAIContinuation, isAIReady());
+			if (nextStep === 'settings') {
+				await openSettings(true);
+			} else if (nextStep === 'resume') {
+				restoreAIContinuation();
+			} else if (resumeDialog) {
 				const target = resumeDialog;
 				resumeDialog = '';
 				modal = target;
@@ -1873,7 +1925,7 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
-			pantryDraft = null;
+			clearPendingAIState();
 			resetPantryFilters();
 			kitchen = createInitialState();
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
@@ -1889,6 +1941,11 @@
 		}
 	}
 
+	function clearPendingAIState() {
+		pendingAIContinuation = null;
+		stagedScanFile = null;
+		if (imageInput) imageInput.value = '';
+	}
 	function clearAIConnectionState() {
 		connectionAttempt++;
 		connectionActive = false;
@@ -1992,6 +2049,7 @@
 		mobileNav = false;
 		if (!focusTarget && modal !== 'pantry' && modal !== 'import' && modal !== 'settings') {
 			resumeDialog = '';
+			pendingAIContinuation = null;
 		}
 		modal = 'settings';
 		error = '';
@@ -2349,8 +2407,99 @@
 				: Boolean(apiKey)) && Boolean(kitchen.preferences.model)
 		);
 	}
-	function hasAIConnection() {
-		return Boolean(user) && hasPersonalAIReady();
+	function isAIReady() {
+		return hasAIConnection({
+			user,
+			preferences: kitchen.preferences,
+			apiKey,
+			activeChatGPTAccount,
+			usingHostAI
+		});
+	}
+	function recordAIContinuation(continuation: PendingAIContinuation) {
+		if (modal === 'auth' || modal === 'settings') {
+			resumeDialog = '';
+			pendingAIContinuation = continuation;
+			return true;
+		}
+		return false;
+	}
+	function restoreAIContinuation() {
+		const continuation = pendingAIContinuation;
+		pendingAIContinuation = null;
+		if (!continuation) {
+			modal = '';
+			return;
+		}
+		switch (continuation.kind) {
+			case 'import':
+				modal = 'import';
+				break;
+			case 'generate':
+				prompt = continuation.prompt;
+				modal = 'generate';
+				break;
+			case 'butler':
+				modal = '';
+				void butlerChat?.reopen(continuation.prompt);
+				break;
+			case 'scan':
+				modal = 'pantry';
+				if (stagedScanFile && isAIReady()) {
+					void scanPantryPhoto(stagedScanFile, true);
+				}
+				break;
+			case 'nutrition': {
+				const recipe = kitchen.recipes.find((item) => item.id === continuation.recipeId) ?? null;
+				selectedMealServings = recipe ? continuation.servings : undefined;
+				selectedDetailTab = recipe ? 'nutrition' : 'recipe';
+				selectedId = recipe?.id ?? null;
+				modal = '';
+				break;
+			}
+		}
+	}
+	function dismissAIContinuation() {
+		const continuation = pendingAIContinuation;
+		pendingAIContinuation = null;
+		if (!continuation) {
+			modal = '';
+			return;
+		}
+		switch (continuation.kind) {
+			case 'import':
+				modal = 'import';
+				break;
+			case 'generate':
+				prompt = continuation.prompt;
+				modal = '';
+				break;
+			case 'butler':
+				modal = '';
+				break;
+			case 'scan':
+				if (continuation.returnToPantryModal) {
+					modal = 'pantry';
+				} else {
+					stagedScanFile = null;
+					modal = '';
+				}
+				break;
+			case 'nutrition': {
+				const recipe = kitchen.recipes.find((item) => item.id === continuation.recipeId) ?? null;
+				selectedMealServings = recipe ? continuation.servings : undefined;
+				selectedDetailTab = recipe ? 'nutrition' : 'recipe';
+				selectedId = recipe?.id ?? null;
+				modal = '';
+				break;
+			}
+		}
+	}
+	function completePostSetupSurface() {
+		const next = resolvePostSetupAction(pendingAIContinuation, isAIReady());
+		if (next === 'settings') void openSettings(true);
+		else if (next === 'resume') restoreAIContinuation();
+		else modal = '';
 	}
 	async function needAI() {
 		if (!user) {
@@ -2473,6 +2622,10 @@
 		recipeDrafts: Recipe[] = []
 	) {
 		if (!(await needAI())) {
+			if (recordAIContinuation({ kind: 'butler', prompt: message })) {
+				void butlerChat?.close();
+				return null;
+			}
 			butlerChat?.close();
 			throw new Error('Sign in and connect a model in Settings to speak with Basil.');
 		}
@@ -2531,8 +2684,16 @@
 						(item) => item.recipeId === recipe.id && !item.completedAt
 					);
 					if (meal) openCookDialog(meal);
-					else selectedId = recipe.id;
-				} else selectedId = recipe?.id ?? null;
+					else {
+						selectedMealServings = undefined;
+						selectedDetailTab = 'recipe';
+						selectedId = recipe.id;
+					}
+				} else {
+					selectedMealServings = undefined;
+					selectedDetailTab = 'recipe';
+					selectedId = recipe?.id ?? null;
+				}
 			} else if (effect.type === 'ui') {
 				butlerChat?.close();
 				openButlerControl(effect.action);
@@ -2624,7 +2785,14 @@
 
 	async function generate(event?: SubmitEvent) {
 		event?.preventDefault();
-		if (!(await needAI())) return;
+		const currentPrompt = prompt;
+		const guestFilters = !user
+			? captureGenerateGuestFilters(kitchen.preferences, defaultPreferences)
+			: undefined;
+		if (!(await needAI())) {
+			recordAIContinuation({ kind: 'generate', prompt: currentPrompt, guestFilters });
+			return;
+		}
 		busy = true;
 		error = '';
 		try {
@@ -2648,7 +2816,32 @@
 		const file = input?.files?.[0];
 		if (input) input.value = '';
 		if (imageInput) imageInput.value = '';
-		if (!file || scanBusy || busy || voiceBusy || !(await needAI())) return;
+		if (!file || scanBusy || busy || voiceBusy) return;
+		if (!isSupportedScanPhotoType(file.type)) {
+			notify('Choose a JPG, PNG, or WebP photo.');
+			return;
+		}
+		if (file.size > MAX_AI_PHOTO_INPUT_BYTES) {
+			notify('Choose a photo under 20 MB.');
+			return;
+		}
+		await scanPantryPhoto(file);
+	}
+	async function scanPantryPhoto(file: File, fromContinuation = false) {
+		if (scanBusy || busy || voiceBusy) return;
+		const startedInPantryModal = modal === 'pantry';
+		stagedScanFile = file;
+		if (!(await needAI())) {
+			if (
+				!recordAIContinuation({
+					kind: 'scan',
+					returnToPantryModal: startedInPantryModal
+				})
+			) {
+				modal = 'pantry';
+			}
+			return;
+		}
 		const generation = ++scanGeneration;
 		const currentController = new AbortController();
 		scanController = currentController;
@@ -2665,6 +2858,7 @@
 				return;
 			const items = Array.isArray(result?.ingredients) ? result.ingredients : [];
 			if (!items.length) {
+				if (stagedScanFile === file) stagedScanFile = null;
 				notify('No ingredients detected in that photo.');
 				return;
 			}
@@ -2685,10 +2879,22 @@
 				})
 				.join('\n');
 			pantryInput = [pantryInput.trim(), recognized].filter(Boolean).join('\n').slice(0, 20000);
+			if (stagedScanFile === file) stagedScanFile = null;
 			modal = 'pantry';
 			notify('Review what we spotted before adding it.');
 		} catch (e) {
 			if (generation === scanGeneration) {
+				if (
+					shouldOpenPantryOnScanError({
+						aborted: currentController.signal.aborted,
+						modal,
+						page,
+						hasOverlay: Boolean(selected || editingRecipe || butlerOpen),
+						fromContinuation
+					})
+				) {
+					modal = 'pantry';
+				}
 				notify(
 					currentController.signal.aborted
 						? 'Photo scan cancelled.'
@@ -2702,7 +2908,6 @@
 				scanBusy = false;
 				scanController = undefined;
 			}
-			if (input) input.value = '';
 			if (imageInput) imageInput.value = '';
 		}
 	}
@@ -2761,6 +2966,7 @@
 		}
 	}
 	function openVoiceSettings() {
+		pendingAIContinuation = null;
 		if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
 		else if (voiceTarget === 'pantry' || voiceTarget === 'import') resumeDialog = voiceTarget;
 		else resumeDialog = '';
@@ -2781,12 +2987,14 @@
 			apiKey: voiceApiKey
 		});
 		if (plan.action === 'auth') {
+			pendingAIContinuation = null;
 			resumeDialog = plan.resumeDialog;
 			openAuthentication();
 			notify(plan.message);
 			return;
 		}
 		if (plan.action === 'settings') {
+			pendingAIContinuation = null;
 			resumeDialog = plan.resumeDialog;
 			void openSettings('voice');
 			notify(plan.message);
@@ -2831,12 +3039,14 @@
 			apiKey: voiceApiKey
 		});
 		if (plan.action === 'auth') {
+			pendingAIContinuation = null;
 			resumeDialog = plan.resumeDialog;
 			openAuthentication();
 			notify(plan.message);
 			return;
 		}
 		if (plan.action === 'settings') {
+			pendingAIContinuation = null;
 			resumeDialog = plan.resumeDialog;
 			void openSettings('voice');
 			notify(plan.message);
@@ -3029,6 +3239,7 @@
 		error = '';
 		selectedId = null;
 		selectedMealServings = undefined;
+		selectedDetailTab = 'recipe';
 		editingRecipeBase = null;
 		editingRecipeMode = 'create';
 		editingRecipe = createBlankRecipe();
@@ -3038,6 +3249,7 @@
 		if (!draft) return;
 		selectedId = null;
 		selectedMealServings = undefined;
+		selectedDetailTab = 'recipe';
 		editingRecipeMode = 'edit';
 		editingRecipeBase = cloneRecipe(draft);
 		editingRecipe = draft;
@@ -3051,6 +3263,7 @@
 				editingRecipeBase = null;
 				editingRecipeMode = 'edit';
 				selectedMealServings = undefined;
+				selectedDetailTab = 'recipe';
 				selectedId = saved.id;
 				page = 'saved';
 				priorityPantryIds = [];
@@ -3326,6 +3539,7 @@
 		resetMealDialogState();
 		selectedId = null;
 		selectedMealServings = undefined;
+		selectedDetailTab = 'recipe';
 		if (slotTarget) {
 			pickingForSlot = true;
 			mealDate = slotTarget.date;
@@ -3350,6 +3564,7 @@
 			});
 			if (result.status === 'missing-recipe') {
 				selectedMealServings = undefined;
+				selectedDetailTab = 'recipe';
 				selectedId = null;
 				resetMealDialogState();
 				modal = '';
@@ -3365,6 +3580,7 @@
 			weekOffset = weekOffsetForDate(scheduledDate);
 			if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 			selectedId = null;
 			resetMealDialogState();
 			modal = '';
@@ -3501,6 +3717,7 @@
 		resetMealDialogState();
 		modal = '';
 		selectedMealServings = result.meal.servings;
+		selectedDetailTab = 'recipe';
 		if (result.recipe) selectedId = result.recipe.id;
 		notify(
 			result.recipe
@@ -3589,6 +3806,7 @@
 		if (!selectedId || !kitchen.recipes.some((item) => item.id === selectedId)) {
 			formSubmitted = false;
 			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 			selectedId = null;
 			resetMealDialogState();
 			modal = '';
@@ -3625,6 +3843,7 @@
 		weekOffset = weekOffsetForDate(scheduledDate);
 		if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 		selectedMealServings = undefined;
+		selectedDetailTab = 'recipe';
 		selectedId = null;
 		resetMealDialogState();
 		modal = '';
@@ -3786,6 +4005,7 @@
 				onMutated: () => {
 					joinedHousehold = true;
 					kitchenSync?.clearContext();
+					clearPendingAIState();
 					clearAIConnectionState();
 					clearHouseholdViewState();
 					stateEtag = null;
@@ -3824,7 +4044,16 @@
 	async function refreshNutrition() {
 		const targetId = selectedId;
 		if (!targetId || !kitchen.recipes.some((item) => item.id === targetId)) return;
-		if (!(await needAI())) return;
+		const targetServings = selectedMealServings;
+		selectedDetailTab = 'nutrition';
+		if (!(await needAI())) {
+			recordAIContinuation({
+				kind: 'nutrition',
+				recipeId: targetId,
+				servings: targetServings
+			});
+			return;
+		}
 		const current = kitchen.recipes.find((item) => item.id === targetId);
 		if (!current) return;
 		const recipeId = current.id;
@@ -3862,6 +4091,7 @@
 		if (modal === 'plan') {
 			selectedId = null;
 			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 		}
 		if (
 			modal === 'plan' ||
@@ -3881,7 +4111,15 @@
 			clearVoiceSession();
 		}
 		if (modal === 'onboarding') dismissOnboarding();
-		else {
+		else if (pendingAIContinuation && modal === 'delete') {
+			completePostSetupSurface();
+		} else if (
+			pendingAIContinuation &&
+			(modal === 'settings' || modal === 'auth' || modal === 'recover')
+		) {
+			if (isAIReady()) restoreAIContinuation();
+			else dismissAIContinuation();
+		} else {
 			const next = resolveClosedDialog(modal, resumeDialog);
 			resumeDialog = next.resumeDialog;
 			modal = next.modal;
@@ -3890,6 +4128,7 @@
 		error = '';
 	}
 	function openImport(text?: string) {
+		if (pendingAIContinuation?.kind === 'import') pendingAIContinuation = null;
 		resumeDialog = '';
 		if (text !== undefined) {
 			if (voiceTarget === 'import') clearVoiceSession();
@@ -3941,7 +4180,7 @@
 				return null;
 			}
 			const useHost = Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI);
-			const connected = !useHost && hasAIConnection();
+			const connected = !useHost && hasPersonalAIReady();
 			return request(
 				'/api/recipe-import',
 				{
@@ -3970,7 +4209,7 @@
 			);
 		}
 		if (!(await needAI())) {
-			resumeDialog = 'import';
+			recordAIContinuation({ kind: 'import' });
 			return null;
 		}
 		return ai('capture', input, signal);
@@ -3987,8 +4226,10 @@
 		kitchen.recipes = applied.nextRecipes;
 		if (voiceTarget === 'import') clearVoiceSession();
 		importSession = applied.nextSession;
+		if (pendingAIContinuation?.kind === 'import') pendingAIContinuation = null;
 		resumeDialog = '';
 		modal = '';
+		selectedDetailTab = 'recipe';
 		selectedId = applied.saved.id;
 		page = 'saved';
 		query = '';
@@ -4008,6 +4249,7 @@
 				if (selectedId === applied.saved.id) {
 					selectedId = null;
 					selectedMealServings = undefined;
+					selectedDetailTab = 'recipe';
 				}
 				if (editingRecipeMode === 'edit' && editingRecipe?.id === applied.saved.id) {
 					editingRecipe = null;
@@ -4039,8 +4281,9 @@
 				state: currentState,
 				online: online && navigator.onLine,
 				pendingSnapshot: currentUser ? (kitchenSync?.snapshot() ?? null) : null,
+				quarantined: currentUser ? kitchenSync?.quarantined() : undefined,
 				hasPendingSync: currentUser ? pendingSync : false,
-				storage: currentUser ? localStorage : null,
+				storage: currentUser ? safeBrowserStorage('localStorage') : null,
 				fetcher: currentUser ? fetch : undefined
 			});
 			download(result.json, result.filename, 'application/json');
@@ -4078,14 +4321,29 @@
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
 			cancelScan(true);
 			if (user) {
-				for (const key of Object.keys(localStorage)) {
-					if (key.startsWith('flavorithm-') && key.includes(`:${user.id}:`))
-						localStorage.removeItem(key);
+				try {
+					const store = safeBrowserStorage('localStorage');
+					if (store) {
+						const encodedId = encodeURIComponent(user.id);
+						for (const key of Object.keys(store)) {
+							if (
+								key.startsWith('flavorithm-') &&
+								(key.includes(`:${user.id}:`) || key.includes(`:${encodedId}:`))
+							)
+								store.removeItem(key);
+						}
+					}
+				} catch {
+					// Ignore blocked browser storage when clearing account keys.
 				}
 			}
 			kitchenSync?.clearContext();
 			clearHouseholdViewState();
-			localStorage.removeItem('flavorithm-last-account');
+			try {
+				safeBrowserStorage('localStorage')?.removeItem('flavorithm-last-account');
+			} catch {
+				// Ignore blocked browser storage.
+			}
 			user = null;
 			inviteCode = '';
 			currentInviteId = '';
@@ -4097,7 +4355,9 @@
 			pantryInput = '';
 			importSession = emptyImportSession();
 			resumeDialog = '';
+			clearPendingAIState();
 			clearAIConnectionState();
+			resetPantryFilters();
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
@@ -4188,6 +4448,7 @@
 				onMutated: () => {
 					leftHousehold = true;
 					kitchenSync?.clearContext();
+					clearPendingAIState();
 					clearAIConnectionState();
 					clearHouseholdViewState();
 					stateEtag = null;
@@ -4269,6 +4530,28 @@
 			busy = false;
 		}
 	}
+	function handleWindowKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape') return;
+		const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
+		if (!overlayOpen && pantryDraft) {
+			void cancelPantryEdit();
+		}
+		mobileNav = false;
+		if (modal) closeDialog();
+		else if (editingRecipe) {
+			editingRecipe = null;
+			editingRecipeBase = null;
+			editingRecipeMode = 'edit';
+		} else if (selected) {
+			selectedId = null;
+			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
+		}
+		if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
+			e.preventDefault();
+			void cancelEditingShoppingItem();
+		}
+	}
 </script>
 
 {#snippet voiceSession()}
@@ -4341,32 +4624,13 @@
 	><title>{nav.find((item) => item.id === page)?.name || 'Discover'} · Flavorithm</title
 	></svelte:head
 >
-<svelte:window
-	onkeydown={(e) => {
-		if (e.key === 'Escape') {
-			const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
-			if (!overlayOpen && pantryDraft) {
-				void cancelPantryEdit();
-			}
-			mobileNav = false;
-			closeDialog();
-			selectedId = null;
-			editingRecipe = null;
-			editingRecipeBase = null;
-			editingRecipeMode = 'edit';
-			if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
-				e.preventDefault();
-				void cancelEditingShoppingItem();
-			}
-		}
-	}}
-/>
+<svelte:window onkeydown={handleWindowKeydown} />
 <input
 	class="visually-hidden"
 	tabindex="-1"
 	inert={(!!modal && modal !== 'pantry') || !!selected || !!editingRecipe || butlerOpen}
 	type="file"
-	accept="image/jpeg,image/png,image/webp"
+	accept={SCAN_PHOTO_ACCEPT}
 	aria-label="Scan pantry ingredients from a photo"
 	bind:this={imageInput}
 	onchange={scan}
@@ -4683,6 +4947,7 @@
 										class="image-open"
 										onclick={() => {
 											selectedMealServings = undefined;
+											selectedDetailTab = 'recipe';
 											selectedId = recipe.id;
 										}}
 										aria-label={`Open ${recipe.title}`}
@@ -4710,6 +4975,7 @@
 										class="recipe-title"
 										onclick={() => {
 											selectedMealServings = undefined;
+											selectedDetailTab = 'recipe';
 											selectedId = recipe.id;
 										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
@@ -5108,6 +5374,7 @@
 														class="meal-open"
 														onclick={() => {
 															selectedMealServings = meal.servings;
+															selectedDetailTab = 'recipe';
 															selectedId = recipe.id;
 														}}
 														>{#if !mobileCalendar}<img
@@ -5190,6 +5457,7 @@
 												class="text-button"
 												onclick={() => {
 													selectedMealServings = undefined;
+													selectedDetailTab = 'recipe';
 													selectedId = recipe.id;
 												}}
 												>{recipe.rating ? 'View rating' : 'Rate recipe'} <Star size={15} /></button
@@ -5421,6 +5689,7 @@
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
 		initialServings={selectedMealServings ?? selected.servings}
+		bind:tab={selectedDetailTab}
 		bind:completedSteps={
 			() => cookingSteps[cookingSessionKey] ?? [],
 			(steps) => {
@@ -5430,6 +5699,7 @@
 		close={() => {
 			selectedId = null;
 			selectedMealServings = undefined;
+			selectedDetailTab = 'recipe';
 		}}
 		save={() => saveRecipe(selected!)}
 		shop={(servings) => {
@@ -5604,6 +5874,23 @@
 									{...field}></textarea>
 							{/snippet}
 						</FormField>
+						{#if stagedScanFile}<div class="staged-scan" role="status">
+								<span>Photo staged: <b>{stagedScanFile.name}</b></span>
+								<div class="staged-scan-actions">
+									<button
+										class="secondary"
+										type="button"
+										disabled={scanBusy || busy || voiceBusy}
+										onclick={() => stagedScanFile && scanPantryPhoto(stagedScanFile)}
+										>{scanBusy ? 'Scanning…' : 'Scan photo'}</button
+									><button
+										class="text-button"
+										type="button"
+										disabled={scanBusy || busy || voiceBusy}
+										onclick={() => (stagedScanFile = null)}>Remove</button
+									>
+								</div>
+							</div>{/if}
 						<div class="dialog-actions">
 							<button type="button" class="secondary" disabled={voiceBusy || busy} onclick={dictate}
 								><Mic size={17} /> Use voice</button
@@ -7048,6 +7335,23 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	.staged-scan {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		flex-wrap: wrap;
+		gap: 10px;
+		margin: 12px 0;
+		padding: 10px 12px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		font-size: 14px;
+	}
+	.staged-scan-actions {
+		display: flex;
+		align-items: center;
+		gap: 8px;
 	}
 	@media (forced-colors: active) {
 		.expiry-filters :global(button.active) {

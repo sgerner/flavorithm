@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState, createNewUserState, seedRecipes } from '../src/lib/data.ts';
-import { createKitchenSync, type SyncStatus } from '../src/lib/client-sync.ts';
+import {
+	createKitchenSync,
+	MAX_SYNC_CONTINUATIONS,
+	type SyncStatus
+} from '../src/lib/client-sync.ts';
 import {
 	applyEditedRecipe,
 	applyNutritionRefresh,
@@ -9,8 +13,15 @@ import {
 	rateRecipeById,
 	toggleSavedRecipe
 } from '../src/lib/recipe-collection.ts';
+import { validateKitchenState } from '../src/lib/state-schema.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 import type { KitchenTransport } from '../src/lib/offline-sync.ts';
+
+function requireValidState(state: AppState): AppState {
+	const parsed = validateKitchenState(state);
+	assert.ok(parsed, 'Expected kitchen state to satisfy shared schema');
+	return parsed;
+}
 
 function memoryStorage() {
 	const values = new Map<string, string>();
@@ -50,6 +61,8 @@ const makeUser = (id = 'user-a', householdId = 'home-a'): User => ({
 function harness(args: {
 	user: User | null;
 	storage?: ReturnType<typeof memoryStorage>;
+	sessionStorage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null;
+	reactiveStage?: boolean;
 	transport?: (user: User) => KitchenTransport;
 	initial?: AppState;
 }) {
@@ -60,11 +73,18 @@ function harness(args: {
 	const setStates: AppState[] = [];
 	const controller = createKitchenSync({
 		storage,
+		sessionStorage: args.sessionStorage,
 		getUser: () => currentUser,
 		getState: () => currentState,
 		setState: (state) => {
 			currentState = structuredClone(state);
 			setStates.push(structuredClone(state));
+			if (args.reactiveStage) {
+				const snapshot = JSON.stringify(currentState);
+				queueMicrotask(() => {
+					if (currentUser) controller.stage(JSON.parse(snapshot));
+				});
+			}
 		},
 		onStatus: (status) => statuses.push(status),
 		transport: (user) => {
@@ -276,18 +296,25 @@ test('unresolved conflicts retain the queue until an explicit resolution is chos
 	assert.equal(sync.statuses.at(-1)?.conflicts.length, 0);
 });
 
-test('storage failure blocks network sync and reports that the edit was not saved', async () => {
+test('storage quota failure keeps edits pending in memory for backup and online sync', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
-	const local = structuredClone(base);
-	local.preferences.maxTime = 30;
+	const firstLocal = structuredClone(base);
+	firstLocal.preferences.maxTime = 30;
+	const latestLocal = structuredClone(base);
+	latestLocal.preferences.maxTime = 20;
 	const storage = memoryStorage();
 	const originalSet = storage.setItem;
+	let quotaExceeded = false;
 	storage.setItem = (key, value) => {
-		if (key.startsWith('flavorithm-pending-journal:')) throw new Error('Storage full');
+		if (quotaExceeded && key.startsWith('flavorithm-pending-journal:')) {
+			throw Object.assign(new Error('QuotaExceededError'), { name: 'QuotaExceededError' });
+		}
 		originalSet(key, value);
 	};
 	let reads = 0;
+	let writes = 0;
+	const savedStates: AppState[] = [];
 	const sync = harness({
 		user,
 		storage,
@@ -295,16 +322,46 @@ test('storage failure blocks network sync and reports that the edit was not save
 			identity: { userId: user.id, householdId: user.householdId },
 			get: async () => {
 				reads += 1;
-				return { state: base, etag: 'v1', userId: user.id, householdId: user.householdId };
+				return {
+					state: structuredClone(base),
+					etag: 'v1',
+					userId: user.id,
+					householdId: user.householdId
+				};
 			},
-			put: async (state) => ({ state, etag: 'v2' })
+			put: async (state) => {
+				writes += 1;
+				savedStates.push(structuredClone(state));
+				return { state: structuredClone(state), etag: 'v2' };
+			}
 		})
 	});
 	sync.controller.initialize(user, base, 'v1');
-	sync.controller.stage(local);
+	sync.controller.stage(firstLocal);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		1
+	);
+
+	quotaExceeded = true;
+	sync.controller.stage(latestLocal);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.match(sync.statuses.at(-1)?.error || '', /could not be saved on this device/);
+	assert.equal(sync.controller.snapshot()?.local.preferences.maxTime, 20);
+
 	await sync.controller.sync();
-	assert.equal(reads, 0);
-	assert.match(sync.statuses.at(-1)?.error || '', /could not be saved|not safely saved/);
+	assert.equal(reads, 1);
+	assert.equal(writes, 1);
+	assert.equal(savedStates.at(-1)?.preferences.maxTime, 20);
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
 });
 
 test('separate offline writers survive destroy and reload, then sync their disjoint changes', async () => {
@@ -506,6 +563,617 @@ test('an acknowledgement retires only captured journal versions, preserving a pe
 	assert.equal(storage.getItem(peerKey), null);
 });
 
+test('stage rejects malformed kitchen snapshots at the client boundary before staging or syncing', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	let requests = 0;
+	const sync = harness({
+		user,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => {
+				requests += 1;
+				return { state: base, etag: 'v1', userId: user.id, householdId: user.householdId };
+			},
+			put: async (state) => {
+				requests += 1;
+				return { state, etag: 'v2' };
+			}
+		})
+	});
+	sync.controller.initialize(user, base, 'v1');
+
+	const nullQuantity = structuredClone(base);
+	nullQuantity.pantry.push({
+		id: 'bad-qty',
+		name: 'flour',
+		quantity: null as unknown as number,
+		unit: 'cup',
+		category: 'Pantry'
+	});
+	sync.controller.stage(nullQuantity);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const longUnit = structuredClone(base);
+	longUnit.pantry.push({
+		id: 'bad-unit',
+		name: 'sugar',
+		quantity: 1,
+		unit: 'u'.repeat(41),
+		category: 'Pantry'
+	});
+	sync.controller.stage(longUnit);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const insecureImage = structuredClone(base);
+	insecureImage.recipes[0].image = 'http://example.com/insecure.jpg';
+	sync.controller.stage(insecureImage);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const badEffort = structuredClone(base);
+	badEffort.preferences.reasoning = { effort: 'x-high' };
+	sync.controller.stage(badEffort);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(
+		[...sync.storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+	await sync.controller.sync();
+	assert.equal(requests, 0);
+
+	const valid = structuredClone(base);
+	valid.pantry.push({ id: 'ok', name: 'flour', quantity: 0, unit: 'cup', category: 'Pantry' });
+	sync.controller.stage(valid);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+});
+
+test('duplicated tabs sharing one sessionStorage get distinct writer IDs and never overwrite each other', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const sharedSessionStorage = memoryStorage();
+	sharedSessionStorage.setItem('flavorithm-writer-id:v1', 'inherited-opener-writer');
+
+	const tabA = harness({ user, storage, sessionStorage: sharedSessionStorage });
+	const tabB = harness({ user, storage, sessionStorage: sharedSessionStorage });
+	assert.equal(sharedSessionStorage.getItem('flavorithm-writer-id:v1'), null);
+
+	tabA.controller.initialize(user, base, 'v1');
+	tabB.controller.initialize(user, base, 'v1');
+
+	const editA = structuredClone(base);
+	editA.pantry.push({
+		id: 'tab-a-oil',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		category: 'Pantry'
+	});
+	tabA.controller.stage(editA);
+
+	const editB = structuredClone(base);
+	editB.shopping.push({
+		id: 'tab-b-milk',
+		name: 'oat milk',
+		quantity: 2,
+		unit: 'carton',
+		category: 'Dairy',
+		checked: false
+	});
+	tabB.controller.stage(editB);
+
+	const journalKeys = [...storage.values.keys()].filter((key) =>
+		key.startsWith('flavorithm-pending-journal:')
+	);
+	assert.equal(journalKeys.length, 2);
+
+	let serverState = structuredClone(base);
+	let serverEtag = 'v1';
+	const syncTab = harness({
+		user,
+		storage,
+		sessionStorage: sharedSessionStorage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = 'v2';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+	assert.equal(syncTab.controller.restore(user), true);
+	await syncTab.controller.sync();
+	assert.deepEqual(
+		serverState.pantry.map((item) => item.id),
+		['tab-a-oil']
+	);
+	assert.deepEqual(
+		serverState.shopping.map((item) => item.id),
+		['tab-b-milk']
+	);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+});
+
+test('createKitchenSync survives SecurityError when reading blocked global sessionStorage', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const originalSessionDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+	const originalWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+	try {
+		const throwingSessionHost = {};
+		Object.defineProperty(throwingSessionHost, 'sessionStorage', {
+			configurable: true,
+			get() {
+				throw Object.assign(new Error('Access is denied for this document.'), {
+					name: 'SecurityError'
+				});
+			}
+		});
+		Object.defineProperty(globalThis, 'window', {
+			configurable: true,
+			value: throwingSessionHost
+		});
+		Object.defineProperty(globalThis, 'sessionStorage', {
+			configurable: true,
+			get() {
+				throw Object.assign(new Error('Access is denied for this document.'), {
+					name: 'SecurityError'
+				});
+			}
+		});
+
+		const savedStates: AppState[] = [];
+		const controller = createKitchenSync({
+			storage,
+			getUser: () => user,
+			getState: () => base,
+			setState: () => {},
+			onStatus: () => {},
+			transport: () => ({
+				identity: { userId: user.id, householdId: user.householdId },
+				get: async () => ({
+					state: structuredClone(base),
+					etag: 'v1',
+					userId: user.id,
+					householdId: user.householdId
+				}),
+				put: async (state) => {
+					const validated = requireValidState(state);
+					savedStates.push(validated);
+					return { state: structuredClone(validated), etag: 'v2' };
+				}
+			})
+		});
+		controller.initialize(user, base, 'v1');
+		const edited = structuredClone(base);
+		edited.preferences.maxTime = 25;
+		controller.stage(edited);
+		await controller.sync();
+		assert.equal(savedStates.at(-1)?.preferences.maxTime, 25);
+	} finally {
+		if (originalWindowDescriptor) {
+			Object.defineProperty(globalThis, 'window', originalWindowDescriptor);
+		} else {
+			Reflect.deleteProperty(globalThis, 'window');
+		}
+		if (originalSessionDescriptor) {
+			Object.defineProperty(globalThis, 'sessionStorage', originalSessionDescriptor);
+		} else {
+			Reflect.deleteProperty(globalThis, 'sessionStorage');
+		}
+	}
+});
+
+test('legacy stored recipes do not block unrelated kitchen saves while new invalid edits still fail', async () => {
+	const user = makeUser();
+	const storage = memoryStorage();
+	const legacyRemote = createInitialState();
+	legacyRemote.recipes[0].image = '/recipe-covers/legacy-cover-id';
+	legacyRemote.recipes[1].image = 'http://legacy.example/soup.jpg';
+	legacyRemote.recipes[1].importNotes = ['x'.repeat(350)];
+	(legacyRemote.preferences as Record<string, unknown>).connectionId = 'host-chatgpt';
+	legacyRemote.preferences.reasoning = { effort: 'legacy-unknown' };
+
+	let serverState = structuredClone(legacyRemote);
+	let serverEtag = 'v1';
+	const sync = harness({
+		user,
+		storage,
+		reactiveStage: true,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = 'v2';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, legacyRemote, 'v1');
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	// Even a caller still holding the raw legacy snapshot can stage multiple sequential valid edits.
+	const editOne = structuredClone(legacyRemote);
+	editOne.pantry.push({
+		id: 'garlic',
+		name: 'garlic',
+		quantity: 4,
+		unit: 'clove',
+		category: 'Produce'
+	});
+	sync.controller.stage(editOne);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	const editTwo = structuredClone(editOne);
+	editTwo.recipes[1].title = 'Updated Legacy Soup Title';
+	sync.controller.stage(editTwo);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	// Newly introduced invalid mutations on top of the legacy baseline are still rejected.
+	const newlyInvalid = structuredClone(editTwo);
+	newlyInvalid.recipes[0].image = 'http://attacker.example/new-bad.jpg';
+	sync.controller.stage(newlyInvalid);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+	assert.equal(sync.controller.snapshot()?.local.recipes[1].title, 'Updated Legacy Soup Title');
+
+	await sync.controller.sync();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	assert.equal(serverState.recipes[0].image, '');
+	assert.equal(serverState.recipes[1].image, '');
+	assert.equal(serverState.recipes[1].title, 'Updated Legacy Soup Title');
+	assert.equal(
+		serverState.pantry.some((item) => item.id === 'garlic'),
+		true
+	);
+});
+
+test('exportBackup includes quarantined journal entries alongside or after pending edits', async () => {
+	const user = makeUser('backup-u', 'backup-h');
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const sync = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => ({
+				state: requireValidState(state),
+				etag: 'v2'
+			})
+		})
+	});
+	sync.controller.initialize(user, base, 'v1');
+	assert.equal(sync.controller.exportBackup(), null);
+
+	const edited = structuredClone(base);
+	edited.pantry.push({ id: 'rice', name: 'rice', quantity: 2, unit: 'lb', category: 'Grains' });
+	sync.controller.stage(edited);
+	const plainBackup = sync.controller.exportBackup();
+	assert.ok(plainBackup && 'pantry' in plainBackup);
+	assert.equal(plainBackup.pantry[0]?.id, 'rice');
+
+	const corruptKey = `flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:lost-tab`;
+	storage.setItem(corruptKey, '{"broken":true');
+	await sync.controller.sync();
+
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.match(sync.statuses.at(-1)?.error || '', /quarantined/);
+	assert.equal(sync.controller.quarantined().length, 1);
+
+	const quarantinedOnlyBackup = sync.controller.exportBackup();
+	assert.ok(quarantinedOnlyBackup && 'quarantined' in quarantinedOnlyBackup);
+	assert.equal('pending' in quarantinedOnlyBackup, false);
+	assert.equal(quarantinedOnlyBackup.quarantined[0]?.slot, 'lost-tab');
+	assert.equal(quarantinedOnlyBackup.quarantined[0]?.raw, '{"broken":true');
+
+	const secondEdit = structuredClone(sync.state);
+	secondEdit.preferences.maxTime = 20;
+	sync.controller.stage(secondEdit);
+	const combinedBackup = sync.controller.exportBackup();
+	assert.ok(combinedBackup && 'quarantined' in combinedBackup);
+	assert.equal(combinedBackup.pending?.preferences.maxTime, 20);
+	assert.equal(combinedBackup.quarantined.length, 1);
+});
+
+test('sync bounds self-recursion and suppresses silent removeItem no-ops', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	let serverState = structuredClone(base);
+	let version = 1;
+	let puts = 0;
+
+	let controller!: ReturnType<typeof createKitchenSync>;
+	let currentState = structuredClone(base);
+	const statuses: SyncStatus[] = [];
+	let mutateInFlight = false;
+
+	controller = createKitchenSync({
+		storage: memoryStorage(),
+		getUser: () => user,
+		getState: () => currentState,
+		setState: (state) => {
+			currentState = structuredClone(state);
+		},
+		onStatus: (status) => statuses.push(status),
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: `v${version}`,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				puts += 1;
+				version += 1;
+				serverState = requireValidState(state);
+				if (mutateInFlight) {
+					const next = structuredClone(serverState);
+					next.preferences.maxTime = serverState.preferences.maxTime + 1;
+					currentState = next;
+					controller.stage(next);
+				}
+				return { state: structuredClone(serverState), etag: `v${version}` };
+			}
+		})
+	});
+
+	controller.initialize(user, base, 'v1');
+	mutateInFlight = true;
+	const first = structuredClone(base);
+	first.preferences.maxTime = 50;
+	controller.stage(first);
+	await controller.sync();
+	for (let tick = 0; tick < 40; tick += 1) {
+		await Promise.resolve();
+	}
+	mutateInFlight = false;
+
+	assert.equal(puts, MAX_SYNC_CONTINUATIONS + 1);
+	assert.equal(statuses.at(-1)?.pending, true);
+	assert.equal(
+		statuses.at(-1)?.error,
+		'Kitchen changes are updating rapidly. Retry sync to finish saving.'
+	);
+
+	// Also verify a storage implementation whose removeItem silently no-ops never loops PUTs.
+	const stickyStorage = memoryStorage();
+	stickyStorage.removeItem = () => {};
+	let stickyPuts = 0;
+	const stickySync = harness({
+		user,
+		storage: stickyStorage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				stickyPuts += 1;
+				return { state: requireValidState(state), etag: 'v2' };
+			}
+		})
+	});
+	stickySync.controller.initialize(user, base, 'v1');
+	const stickyEdit = structuredClone(base);
+	stickyEdit.preferences.maxTime = 30;
+	stickySync.controller.stage(stickyEdit);
+	await stickySync.controller.sync();
+	for (let tick = 0; tick < 10; tick += 1) {
+		await Promise.resolve();
+	}
+	assert.equal(stickyPuts, 1);
+	assert.equal(stickySync.statuses.at(-1)?.pending, false);
+	assert.equal(
+		stickySync.statuses.at(-1)?.error,
+		'The server saved these changes, but acknowledged journal entries could not be retired.'
+	);
+});
+
+test('sync writes confirmed baseline before retiring journal and retries baseline when quota frees up', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const operations: string[] = [];
+	const storage = memoryStorage();
+	const originalSet = storage.setItem;
+	const originalRemove = storage.removeItem;
+	let tightQuota = false;
+	storage.setItem = (key, value) => {
+		if (key.startsWith('flavorithm-confirmed:')) {
+			operations.push('setConfirmed');
+			const activeJournalCount = [...storage.values.keys()].filter((entry) =>
+				entry.startsWith('flavorithm-pending-journal:')
+			).length;
+			if (tightQuota && activeJournalCount > 0) {
+				throw new Error('QuotaExceededError');
+			}
+		}
+		originalSet(key, value);
+	};
+	storage.removeItem = (key) => {
+		if (key.startsWith('flavorithm-pending-journal:')) {
+			operations.push('removeJournal');
+		}
+		originalRemove(key);
+	};
+
+	let serverState = structuredClone(base);
+	let serverEtag = 'v1';
+	const sync = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = serverEtag === 'v1' ? 'v2' : 'v3';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	operations.length = 0;
+
+	const firstEdit = structuredClone(base);
+	firstEdit.preferences.maxTime = 30;
+	sync.controller.stage(firstEdit);
+	await sync.controller.sync();
+	assert.deepEqual(operations, ['setConfirmed', 'removeJournal']);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	operations.length = 0;
+	tightQuota = true;
+	const secondEdit = structuredClone(sync.state);
+	secondEdit.preferences.maxTime = 20;
+	sync.controller.stage(secondEdit);
+	await sync.controller.sync();
+	assert.deepEqual(operations, ['setConfirmed', 'removeJournal', 'setConfirmed']);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	const persistedConfirmed = JSON.parse(
+		storage.getItem(`flavorithm-confirmed:v1:${user.id}:${user.householdId}`) || 'null'
+	);
+	assert.equal(persistedConfirmed?.state.preferences.maxTime, 20);
+});
+
+test('online sync saves valid edits and quarantines a corrupt slot under isolated keys', async () => {
+	const userA = makeUser('user-a', 'home-a');
+	const userB = makeUser('user-b', 'home-b');
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const savedQuarantine: AppState[] = [];
+	const sync = harness({
+		user: userA,
+		storage,
+		transport: () => ({
+			identity: { userId: userA.id, householdId: userA.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: userA.id,
+				householdId: userA.householdId
+			}),
+			put: async (state) => {
+				savedQuarantine.push(structuredClone(state));
+				return { state: structuredClone(state), etag: 'v2' };
+			}
+		})
+	});
+	sync.controller.initialize(userA, base, 'v1');
+	const edit = structuredClone(base);
+	edit.pantry.push({ id: 'beans', name: 'beans', quantity: 2, unit: 'can', category: 'Pantry' });
+	sync.controller.stage(edit);
+
+	const corruptKeyA = `flavorithm-pending-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:corrupt-writer`;
+	const otherUserKey = `flavorithm-pending-journal:v1:${encodeURIComponent(userB.id)}:${encodeURIComponent(userB.householdId)}:peer-writer`;
+	storage.setItem(corruptKeyA, '{not-valid-json');
+	storage.setItem(otherUserKey, '{also-corrupt-for-other-user');
+
+	await sync.controller.sync();
+	assert.deepEqual(
+		savedQuarantine.at(-1)?.pantry.map((item) => item.id),
+		['beans']
+	);
+	assert.equal(storage.getItem(corruptKeyA), null);
+	assert.equal(
+		storage.getItem(
+			`flavorithm-quarantined-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:corrupt-writer`
+		),
+		'{not-valid-json'
+	);
+	assert.equal(storage.getItem(otherUserKey), '{also-corrupt-for-other-user');
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.match(sync.statuses.at(-1)?.error || '', /quarantined/);
+});
+
+test('baselineError and afterSaveError remain visible after reactive microtasks flush', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const originalSet = storage.setItem;
+	storage.setItem = (key, value) => {
+		if (key.startsWith('flavorithm-confirmed:')) {
+			throw new Error('QuotaExceededError');
+		}
+		originalSet(key, value);
+	};
+
+	const sync = harness({
+		user,
+		storage,
+		reactiveStage: true,
+		transport: () => transportFor(user, base, 'v1')
+	});
+	sync.controller.initialize(user, base, 'v1');
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(
+		sync.statuses.at(-1)?.error,
+		'The confirmed kitchen could not be saved for offline use.'
+	);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+
+	const edited = structuredClone(base);
+	edited.preferences.maxTime = 35;
+	sync.state = edited;
+	sync.controller.stage(edited);
+	await sync.controller.sync();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(
+		sync.statuses.at(-1)?.error,
+		'The server saved these changes, but the confirmed state could not be saved on this device.'
+	);
+});
+
 test('ID-keyed recipe actions and three-way editor merge persist cleanly after sync clones state', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
@@ -525,7 +1193,7 @@ test('ID-keyed recipe actions and three-way editor merge persist cleanly after s
 				householdId: user.householdId
 			}),
 			put: async (next) => {
-				server = structuredClone(next);
+				server = requireValidState(structuredClone(next));
 				etag = `${etag}-next`;
 				return { state: structuredClone(server), etag };
 			}
