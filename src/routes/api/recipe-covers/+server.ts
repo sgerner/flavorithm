@@ -6,7 +6,8 @@ import { MAX_COVER_BYTES } from '#lib/cover-upload.ts';
 export const POST: RequestHandler = async ({ request, locals }) => {
 	try {
 		assertSameOrigin(request);
-		if (!locals.user) throw new ApiError(401, 'Sign in to upload a cover photo.');
+		if (!locals.user)
+			throw new ApiError(401, 'Sign in to upload a cover photo.', 'session_expired');
 		if (request.headers.get('content-type') !== 'image/jpeg')
 			throw new ApiError(400, 'Upload a JPEG cover photo.');
 		const reader = request.body?.getReader();

@@ -1,6 +1,8 @@
 import { HOST_CONNECTION_ID } from './ai-connections.ts';
 import { COVER_PATH } from './cover-upload.ts';
-import { createInitialState, createNewUserState, defaultPreferences } from './data.ts';
+import { createInitialState, createNewUserState, defaultPreferences, themes } from './data.ts';
+import { backfillSampleData, clearSampleData } from './kitchen-workflows.ts';
+import { readPendingJournal } from './offline-sync.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import type {
 	AppState,
@@ -9,14 +11,17 @@ import type {
 	Preferences,
 	Recipe,
 	RecipeIngredient,
-	ShoppingItem
+	ShoppingItem,
+	User
 } from './types.ts';
 
-type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> &
+	Partial<Pick<Storage, 'key' | 'length'>>;
 type RemovableStorage = Pick<Storage, 'removeItem'>;
 
 const GUEST_KITCHEN_KEY = 'flavorithm-guest-kitchen';
 const GUEST_STARTED_KEY = 'flavorithm-started';
+const validThemes = new Set<string>(themes);
 
 /** Preserve ambiguous pre-isolation data without exposing it as a guest kitchen. */
 export function quarantineLegacyKitchen(storage: StorageLike): void {
@@ -53,6 +58,244 @@ export function clearGuestData(storage: RemovableStorage): void {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isObjectCollection(value: unknown): value is Record<string, unknown>[] {
+	return Array.isArray(value) && value.every(isRecord);
+}
+
+function parseGuestState(raw: string | null): AppState | null {
+	if (!raw) return null;
+	try {
+		const parsed: unknown = JSON.parse(raw);
+		if (!isRecord(parsed)) return null;
+		if (
+			!isObjectCollection(parsed.pantry) ||
+			!isObjectCollection(parsed.recipes) ||
+			!isObjectCollection(parsed.meals) ||
+			!isObjectCollection(parsed.shopping) ||
+			!isRecord(parsed.preferences)
+		) {
+			return null;
+		}
+		const sanitized = sanitizeKitchenState(parsed);
+		sanitized.preferences.theme = validThemes.has(sanitized.preferences.theme)
+			? sanitized.preferences.theme
+			: defaultPreferences.theme;
+		return sanitized;
+	} catch {
+		return null;
+	}
+}
+
+/** Restore a validated guest kitchen snapshot or fall back to a badged sample kitchen. */
+export function restoreGuestKitchen(storage: StorageLike): {
+	kitchen: AppState;
+	showStarter: boolean;
+} {
+	quarantineLegacyKitchen(storage);
+	let raw: string | null = null;
+	try {
+		raw = storage.getItem('flavorithm-guest-kitchen');
+	} catch {
+		raw = null;
+	}
+	const guest = parseGuestState(raw);
+	if (guest) {
+		let started = false;
+		try {
+			started = storage.getItem('flavorithm-started') === 'yes';
+		} catch {
+			started = false;
+		}
+		return {
+			kitchen: started ? guest : backfillSampleData(guest),
+			showStarter: !started
+		};
+	}
+	try {
+		storage.removeItem('flavorithm-started');
+	} catch {
+		// Ignore storage write errors while falling back to the sample kitchen.
+	}
+	return {
+		kitchen: createInitialState(),
+		showStarter: true
+	};
+}
+
+export function teardownToGuestKitchen(options: {
+	storage: StorageLike;
+	preserveLastAccount?: boolean;
+	clearSyncContext?: () => void;
+	clearAIConnectionState?: () => void;
+}): {
+	kitchen: AppState;
+	showStarter: boolean;
+} {
+	const guest = restoreGuestKitchen(options.storage);
+	options.clearAIConnectionState?.();
+	options.clearSyncContext?.();
+	if (!options.preserveLastAccount) {
+		try {
+			options.storage.removeItem('flavorithm-last-account');
+		} catch {
+			// Ignore storage removal failures while restoring guest state.
+		}
+	}
+	return guest;
+}
+
+export function readCachedAccount(storage: StorageLike): User | null {
+	try {
+		const parsed: unknown = JSON.parse(storage.getItem('flavorithm-last-account') || 'null');
+		if (
+			!isRecord(parsed) ||
+			typeof parsed.id !== 'string' ||
+			!parsed.id ||
+			typeof parsed.householdId !== 'string' ||
+			!parsed.householdId ||
+			typeof parsed.name !== 'string' ||
+			typeof parsed.email !== 'string'
+		) {
+			return null;
+		}
+		return {
+			id: parsed.id,
+			name: parsed.name,
+			email: parsed.email,
+			householdId: parsed.householdId,
+			...(typeof parsed.emailVerified === 'boolean' ? { emailVerified: parsed.emailVerified } : {})
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Restore the last local account in expired-session mode when unsynced journal deltas exist. */
+export function restoreExpiredSessionAccount(storage: StorageLike): User | null {
+	const cached = readCachedAccount(storage);
+	if (!cached) return null;
+	const journal = readPendingJournal(storage, cached);
+	return journal.records.length > 0 ? cached : null;
+}
+
+export function clearAccountStorage(storage: StorageLike, userId: string): void {
+	if (!userId) return;
+	const encodedId = encodeURIComponent(userId);
+	const matchesUserKey = (key: string) =>
+		key.startsWith('flavorithm-') &&
+		key !== 'flavorithm-guest-kitchen' &&
+		key !== 'flavorithm-started' &&
+		key !== 'flavorithm-legacy-kitchen-backup' &&
+		(key.includes(`:${userId}:`) ||
+			key.includes(`:${encodedId}:`) ||
+			key === `flavorithm-voice:${userId}` ||
+			key === `flavorithm-voice:${encodedId}`);
+	try {
+		if (typeof storage.length === 'number' && typeof storage.key === 'function') {
+			const toRemove: string[] = [];
+			for (let index = 0; index < storage.length; index += 1) {
+				const key = storage.key(index);
+				if (key && matchesUserKey(key)) toRemove.push(key);
+			}
+			for (const key of toRemove) storage.removeItem(key);
+			return;
+		}
+		for (const key of Object.keys(storage)) {
+			if (matchesUserKey(key)) storage.removeItem(key);
+		}
+	} catch {
+		// Best-effort local cleanup after server account deletion.
+	}
+}
+
+export const SESSION_EXPIRED_CODE = 'session_expired';
+export const SESSION_EXPIRED_MESSAGE =
+	'Your session expired. Sign in again to sync edits saved on this device.';
+
+export function isLocalSessionExpiredResponse(options: {
+	status: number;
+	managedAuth: boolean;
+	user: User | null;
+	data: unknown;
+}): boolean {
+	return (
+		options.status === 401 &&
+		!options.managedAuth &&
+		Boolean(options.user) &&
+		isRecord(options.data) &&
+		options.data.code === SESSION_EXPIRED_CODE
+	);
+}
+
+export function shouldPersistGuestKitchen(options: {
+	managedAuth: boolean;
+	user: User | null;
+	sessionExpired: boolean;
+	guestPersistenceReady: boolean;
+}): boolean {
+	return (
+		!options.managedAuth &&
+		!options.user &&
+		!options.sessionExpired &&
+		options.guestPersistenceReady
+	);
+}
+
+export function shouldScheduleAutoSync(options: {
+	user: User | null;
+	sessionExpired: boolean;
+	pendingSync: boolean;
+	syncing: boolean;
+	syncErrors: string;
+	online: boolean;
+}): boolean {
+	return (
+		Boolean(options.user) &&
+		!options.sessionExpired &&
+		options.pendingSync &&
+		!options.syncing &&
+		!options.syncErrors &&
+		options.online
+	);
+}
+
+export function resolveLocalAuthTransition(options: {
+	previousMode: string;
+	nextMode: string;
+	previousUser: User | null;
+	nextUser: User | null;
+}): {
+	managedAuth: boolean;
+	modeChanged: boolean;
+	localSessionExpired: boolean;
+	changedIdentity: boolean;
+} {
+	const managedAuth = options.nextMode !== 'local';
+	const modeChanged = options.previousMode !== options.nextMode;
+	const localSessionExpired = !managedAuth && Boolean(options.previousUser) && !options.nextUser;
+	const changedIdentity =
+		!localSessionExpired &&
+		Boolean(
+			(options.previousUser &&
+				(options.previousUser.id !== options.nextUser?.id ||
+					options.previousUser.householdId !== options.nextUser?.householdId)) ||
+			(modeChanged && managedAuth && options.nextUser)
+		);
+	return { managedAuth, modeChanged, localSessionExpired, changedIdentity };
+}
+
+export function resolveRegistrationGuestSeed(
+	storage: StorageLike,
+	currentKitchen: AppState,
+	options: { sessionExpired: boolean; user: User | null }
+): AppState {
+	const seed =
+		options.sessionExpired || options.user
+			? restoreGuestKitchen(storage).kitchen
+			: sanitizeKitchenState(currentKitchen);
+	return clearSampleData(seed);
 }
 
 function parseFiniteNumber(value: unknown): number | undefined {

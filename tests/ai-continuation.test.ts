@@ -1133,6 +1133,7 @@ test('scan staging validates MIME/size, resets file inputs immediately, and guar
 
 test('logout, deleteAccount, clearManagedIdentity, and refreshAuth identity switches wipe pending AI state and staged scans', async () => {
 	let currentAuthUser: User | null = { ...userA };
+	let currentAuthMode: 'local' | 'oidc' = 'local';
 	let logoutCalled = 0;
 	let deleteCalled = 0;
 
@@ -1143,7 +1144,7 @@ test('logout, deleteAccount, clearManagedIdentity, and refreshAuth identity swit
 				return new Response(
 					JSON.stringify({
 						user: currentAuthUser,
-						authMode: 'local',
+						authMode: currentAuthMode,
 						loginUrl: null,
 						logoutUrl: null,
 						capabilities: { emailDelivery: false, recipeSearch: false }
@@ -1266,7 +1267,23 @@ test('logout, deleteAccount, clearManagedIdentity, and refreshAuth identity swit
 		assert.equal(api.user?.householdId, 'house-shared');
 		assertClearedSessionState(api, imageInputStub);
 
-		// 6. refreshAuth() session expiry / sign-out: signed-in -> null
+		// 6. refreshAuth() local session expiry: pauses session (retaining user identity), clears staged scan, and subsequent logout clears all state
+		seedSensitiveSessionState(api, imageInputStub);
+		currentAuthUser = null;
+		await api.refreshAuth();
+		assert.equal(api.user?.id, 'user-b');
+		assert.equal(api.isAIReady(), false);
+		assert.equal(api.stagedScanFile, null);
+		assert.equal(imageInputStub.value, '');
+		await api.logout();
+		assert.equal(api.user, null);
+		assertClearedSessionState(api, imageInputStub);
+
+		// 7. refreshAuth() managed OIDC sign-out: signed-in -> null clears identity and sensitive state
+		currentAuthMode = 'oidc';
+		api.runtimeAuthMode = 'oidc';
+		api.authMetadataLoaded = true;
+		api.user = { ...userB };
 		seedSensitiveSessionState(api, imageInputStub);
 		currentAuthUser = null;
 		await api.refreshAuth();

@@ -48,7 +48,7 @@ export const POST = async (event: RequestEvent, options: RecipeImportRouteOption
 
 		const user = event.locals.user;
 		if (!user) {
-			throw new ApiError(401, 'Authentication required');
+			throw new ApiError(401, 'Authentication required', 'session_expired');
 		}
 
 		const ip = clientAddress(event);
@@ -153,7 +153,7 @@ export const POST = async (event: RequestEvent, options: RecipeImportRouteOption
 		}
 		if (error instanceof ApiError) {
 			return Response.json(
-				{ error: error.message },
+				error.code ? { error: error.message, code: error.code } : { error: error.message },
 				{ status: error.status, headers: { 'cache-control': 'no-store' } }
 			);
 		}

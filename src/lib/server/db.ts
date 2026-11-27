@@ -272,7 +272,7 @@ function getCurrentUser(userId: string): DbUserRow | undefined {
 
 function assertCurrentHousehold(user: User): DbUserRow {
 	const current = getCurrentUser(user.id);
-	if (!current) throw new ApiError(401, 'Authentication required');
+	if (!current) throw new ApiError(401, 'Authentication required', 'session_expired');
 	if (current.household_id !== user.householdId)
 		throw new ApiError(409, 'Your household changed. Reload the latest kitchen and try again.');
 	return current;
@@ -674,7 +674,7 @@ export function resolveExternalIdentity(input: {
 				'UPDATE external_identities SET email = ?, updated_at = ? WHERE issuer = ? AND subject = ?'
 			).run(email, now, issuer, subject);
 			const updated = getCurrentUser(identity.id);
-			if (!updated) throw new ApiError(401, 'Authentication required');
+			if (!updated) throw new ApiError(401, 'Authentication required', 'session_expired');
 			db.exec('COMMIT');
 			return toUser(updated);
 		}
@@ -932,7 +932,7 @@ export function issueEmailVerification(userId: string): { email: string; token: 
 		const user = db
 			.prepare('SELECT email, email_verified_at FROM users WHERE id = ?')
 			.get(userId) as { email: string; email_verified_at: number | null } | undefined;
-		if (!user) throw new ApiError(401, 'Authentication required');
+		if (!user) throw new ApiError(401, 'Authentication required', 'session_expired');
 		if (user.email_verified_at != null) {
 			db.exec('COMMIT');
 			return null;
@@ -1327,7 +1327,7 @@ export function leaveHousehold(user: User): User {
 	}
 	const row = db.prepare('SELECT household_id FROM users WHERE id = ?').get(user.id) as
 		{ household_id: string } | undefined;
-	if (!row) throw new ApiError(401, 'Authentication required');
+	if (!row) throw new ApiError(401, 'Authentication required', 'session_expired');
 	return { ...user, householdId: row.household_id };
 }
 

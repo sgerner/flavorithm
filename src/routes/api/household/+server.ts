@@ -28,7 +28,11 @@ const actionSchema = z.discriminatedUnion('action', [
 ]);
 
 export const GET: RequestHandler = async ({ locals }) => {
-	if (!locals.user) return Response.json({ error: 'Authentication required' }, { status: 401 });
+	if (!locals.user)
+		return Response.json(
+			{ error: 'Authentication required', code: 'session_expired' },
+			{ status: 401 }
+		);
 	const members = listHouseholdMembers(locals.user);
 	return Response.json({
 		members,
@@ -40,7 +44,7 @@ export const GET: RequestHandler = async ({ locals }) => {
 export const POST: RequestHandler = async (event) => {
 	try {
 		assertSameOrigin(event.request);
-		if (!event.locals.user) throw new ApiError(401, 'Authentication required');
+		if (!event.locals.user) throw new ApiError(401, 'Authentication required', 'session_expired');
 		consumeRateLimit(`household-user:${event.locals.user.id}`, 40, 60 * 60 * 1000);
 		const parsed = actionSchema.safeParse(await readJson(event.request));
 		if (!parsed.success) throw new ApiError(400, 'Please provide a valid household action');

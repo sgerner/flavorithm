@@ -7,24 +7,28 @@
 	let {
 		kitchen,
 		online,
-		ready,
+		ready = true,
 		pending,
 		syncing,
 		conflicts,
 		retry,
 		resolve,
 		exportPending,
+		sessionExpired = false,
+		signIn,
 		error = ''
 	}: {
 		kitchen: AppState;
 		online: boolean;
-		ready: boolean;
+		ready?: boolean;
 		pending: boolean;
 		syncing: boolean;
 		conflicts: SyncConflict[];
 		retry: () => void;
 		resolve: (choice: 'local' | 'remote') => void;
 		exportPending: () => void;
+		sessionExpired?: boolean;
+		signIn?: () => void;
 		error?: string;
 	} = $props();
 	const reviewPanelId = $props.id();
@@ -114,13 +118,22 @@
 	}
 </script>
 
-{#if online && ready && !pending && !syncing && !conflicts.length && !error}
+{#if online && ready && !sessionExpired && !pending && !syncing && !conflicts.length && !error}
 	<p class="muted" role="status">Kitchen saved</p>
 {:else}
 	<section class="sync-notice" aria-label="Kitchen synchronization" in:revealMotion|global>
 		<div role="status">
 			{#if !online}<CloudOff size={18} /><span
-					>Offline{pending ? ' · Changes pending on this device' : ''}</span
+					>Offline{pending
+						? ' · Changes pending on this device'
+						: sessionExpired
+							? ' · Session expired'
+							: ''}</span
+				>
+			{:else if sessionExpired}<span
+					>{pending
+						? 'Session expired. Your changes are saved on this device — sign in to sync.'
+						: 'Session expired. Sign in again to sync your kitchen.'}</span
 				>
 			{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
 			{:else if syncing}<RefreshCw size={18} /><span>Syncing your kitchen…</span>
@@ -138,8 +151,15 @@
 				>
 			{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
 		</div>
-		{#if error}<p class="error" role="alert">{error}</p>{/if}
-		{#if conflicts.length}
+		{#if error && (!sessionExpired || error !== 'Authentication required')}<p
+				class="error"
+				role="alert"
+			>
+				{error}
+			</p>{/if}
+		{#if sessionExpired && signIn}
+			<button class="primary" onclick={signIn}>Sign in</button>
+		{:else if conflicts.length}
 			<DisclosureButton
 				class="secondary"
 				expanded={reviewOpen}
