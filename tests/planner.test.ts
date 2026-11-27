@@ -9,6 +9,7 @@ import { render } from 'svelte/server';
 import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
+import * as aiContinuationMod from '../src/lib/ai-continuation.ts';
 import * as butlerActionsMod from '../src/lib/butler-actions.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
@@ -30,6 +31,7 @@ import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
+import * as stateSchemaMod from '../src/lib/state-schema.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -124,6 +126,7 @@ function injectPlannerHook(svelteSource: string): string {
 							updatedAt: '2026-11-24T12:00:00.000Z'
 						}),
 						clearContext: () => {},
+						quarantined: () => [],
 						stage: () => {},
 						flush: async () => {}
 					} as any)
@@ -246,7 +249,7 @@ type PlannerHarnessApi = {
 		history: butlerChatMod.ButlerTurn[],
 		signal?: AbortSignal,
 		recipeDrafts?: Recipe[]
-	) => Promise<butlerChatMod.ButlerChatResult>;
+	) => Promise<butlerChatMod.ButlerChatResult | null>;
 	applyButler: (commands: unknown[], expectedSnapshot: string) => string;
 	openButlerControl: (
 		target: Extract<butlerMod.ButlerCommand, { type: 'ui' }>['action']
@@ -283,7 +286,7 @@ function createModuleMap() {
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
 		'#lib/form-validation.ts': formValidationMod,
-		'#lib/components/FormField.svelte': { default: noopComponent },
+		'#lib/components/FormField.svelte': { __esModule: true, default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -292,6 +295,7 @@ function createModuleMap() {
 			motionDuration: () => 0,
 			prefersReducedMotion: () => true
 		},
+		'#lib/ai-continuation.ts': aiContinuationMod,
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
@@ -312,6 +316,7 @@ function createModuleMap() {
 		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
+		'#lib/state-schema.ts': stateSchemaMod,
 		'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },

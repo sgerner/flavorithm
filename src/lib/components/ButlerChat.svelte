@@ -17,6 +17,7 @@
 	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
+	import { transitionButlerOwner } from '#lib/ai-continuation.ts';
 	import {
 		createButlerChat,
 		type ButlerChatAction as Action,
@@ -48,7 +49,7 @@
 			history: Turn[],
 			signal?: AbortSignal,
 			recipeDrafts?: Recipe[]
-		) => Promise<ButlerChatResult>;
+		) => Promise<ButlerChatResult | null>;
 		apply: (commands: unknown[], expectedSnapshot: string) => string | Promise<string>;
 	} = $props();
 	let recipeDrafts = $state<Recipe[]>([]);
@@ -177,14 +178,24 @@
 	});
 	$effect(() => {
 		if (owner !== currentOwner) {
+			const previousOwner = currentOwner;
 			currentOwner = owner;
+			const inFlightPrompt = chat.pendingPrompt;
 			chat.cancelRequest();
-			messages = [];
-			recipeDrafts = [];
-			draft = '';
-			error = '';
-			failedPrompt = '';
-			applying = '';
+			const next = transitionButlerOwner(previousOwner, owner, {
+				messages,
+				recipeDrafts,
+				draft: draft.trim() ? draft : inFlightPrompt,
+				error,
+				failedPrompt,
+				applying
+			});
+			messages = next.messages;
+			recipeDrafts = next.recipeDrafts;
+			draft = next.draft;
+			error = next.error;
+			failedPrompt = next.failedPrompt;
+			applying = next.applying;
 			open = false;
 		}
 	});
@@ -205,7 +216,14 @@
 		resetReaction();
 		open = false;
 		await tick();
-		launcher?.focus();
+		if (!launcher?.closest('[inert]')) launcher?.focus();
+	}
+	export async function reopen(fallbackPrompt = '') {
+		await tick();
+		if (fallbackPrompt && !draft.trim()) draft = fallbackPrompt;
+		open = true;
+		await tick();
+		input?.focus();
 	}
 	async function toggle() {
 		open = !open;

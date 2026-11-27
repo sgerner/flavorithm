@@ -109,7 +109,7 @@ export function createButlerChat(options: {
 		history: ButlerTurn[],
 		signal?: AbortSignal,
 		recipeDrafts?: Recipe[]
-	) => Promise<ButlerChatResult>;
+	) => Promise<ButlerChatResult | null>;
 	timeoutMs?: number;
 	onSpeak?: (duration: number) => void;
 	onResetReaction?: () => void;
@@ -165,6 +165,13 @@ export function createButlerChat(options: {
 			currentController.signal.throwIfAborted();
 			if (!alive || token !== generation) return;
 			pendingTurn = undefined;
+			if (!result) {
+				options.setMessages(options.getMessages().filter((message) => message.id !== turnId));
+				if (shouldRestoreDraft(options.getDraft(), prompt)) {
+					options.setDraft(prompt);
+				}
+				return;
+			}
 			const messages = options.getMessages();
 			for (const message of messages) {
 				for (const action of message.actions ?? []) {
@@ -250,6 +257,9 @@ export function createButlerChat(options: {
 		},
 		get alive() {
 			return alive;
+		},
+		get pendingPrompt() {
+			return pendingTurn?.prompt ?? '';
 		},
 		cancelRequest,
 		send,
