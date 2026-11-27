@@ -1,26 +1,46 @@
-import { getHostAI, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
-import { getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
-import { listChatGPTModels, ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
+import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
+import { mapSignedInAIRouteError, sessionExpiredResponse } from '#lib/server/ai-route-errors.ts';
+import { withChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
+import { listChatGPTModels } from '#lib/server/chatgpt-inference.ts';
 import { ApiError } from '#lib/server/db.ts';
 import type { RequestHandler } from './$types';
-import { AIRequestError, getPublicModelCatalog } from '#lib/server/ai.ts';
+import { getPublicModelCatalog } from '#lib/server/ai.ts';
 
 export const GET: RequestHandler = async ({ locals, fetch, url }) => {
-	if (!locals.user) return Response.json({ error: 'Unauthorized.' }, { status: 401 });
+	if (!locals.user) return sessionExpiredResponse();
+	const currentUser = locals.user;
+	let usingHostAI = false;
+	let hostTarget: { userId: string; accountId: string } | null = null;
+	let personalAccountId = '';
+	const isChatGPTProvider = url.searchParams.get('connection') === 'chatgpt';
 
 	try {
-		if (url.searchParams.get('connection') === 'chatgpt') {
+		if (isChatGPTProvider) {
 			const accountId = url.searchParams.get('accountId');
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			const host = accountId === HOST_CONNECTION_ID ? getHostAI() : null;
+			const isHostAccount = accountId === HOST_CONNECTION_ID;
+			const host = isHostAccount ? getHostAIFor(currentUser.id) : null;
+			if (isHostAccount) {
+				if (!host) {
+					return Response.json(
+						{ providers: [{ id: 'chatgpt', name: 'ChatGPT plan', models: [] }] },
+						{ headers: { 'cache-control': 'no-store' } }
+					);
+				}
+				usingHostAI = true;
+				hostTarget = { userId: host.userId, accountId: host.accountId };
+			} else {
+				personalAccountId = accountId;
+			}
 			const catalogPromise = getPublicModelCatalog(fetch).catch(() => null);
-			const connection = await getChatGPTConnection(
-				host?.userId ?? locals.user.id,
-				host?.accountId ?? accountId,
-				fetch
-			);
 			const [result, catalogData] = await Promise.all([
-				listChatGPTModels(connection.accessToken, connection.fetcher),
+				withChatGPTConnection(
+					hostTarget?.userId ?? currentUser.id,
+					hostTarget?.accountId ?? accountId,
+					fetch,
+					(connection) => listChatGPTModels(connection.accessToken, connection.fetcher),
+					{ sharedHost: usingHostAI }
+				),
 				catalogPromise
 			]);
 			const openai = catalogData?.providers.find((provider) => provider.id === 'openai');
@@ -37,11 +57,13 @@ export const GET: RequestHandler = async ({ locals, fetch, url }) => {
 			headers: { 'cache-control': 'private, max-age=3600' }
 		});
 	} catch (error) {
-		if (error instanceof ApiError || error instanceof ChatGPTInferenceError)
-			return Response.json({ error: error.message }, { status: error.status });
-		if (error instanceof AIRequestError) {
-			return Response.json({ error: error.message }, { status: error.status });
-		}
-		return Response.json({ error: 'The model catalog could not be loaded.' }, { status: 500 });
+		return mapSignedInAIRouteError(error, {
+			userId: currentUser.id,
+			usingHostAI,
+			hostTarget,
+			personalAccountId,
+			isChatGPTProvider,
+			fallbackMessage: 'The model catalog could not be loaded.'
+		});
 	}
 };

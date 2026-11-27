@@ -9,6 +9,11 @@ import {
 	quarantineLegacyKitchen,
 	sanitizeKitchenState
 } from '../src/lib/guest-storage.ts';
+import {
+	clearSampleData,
+	hasSampleData,
+	promoteSampleIngredient
+} from '../src/lib/kitchen-workflows.ts';
 import type { AppState, User } from '../src/lib/types.ts';
 
 process.env.FLAVORITHM_DB_PATH = ':memory:';
@@ -406,4 +411,108 @@ test('signup migration sanitizes guest state for immediate sync and retains jour
 		onlineServerState.pantry.find((item) => item.id === 'oversized-sugar')?.quantity,
 		1_000_000
 	);
+});
+
+test('signup preparation sanitizes guest state while preserving sample flags for selective cleanup', async () => {
+	const guest = createInitialState();
+	guest.pantry = guest.pantry.map((item) =>
+		item.id === 'pantry-eggs' ? promoteSampleIngredient({ ...item, quantity: 6 }) : item
+	);
+	guest.pantry.push({
+		id: 'oversized-oats',
+		name: '  rolled oats  ',
+		quantity: 5_000_000,
+		unit: 'g',
+		category: 'Grains'
+	});
+
+	const sanitizedBeforeCleanup = sanitizeKitchenState(guest);
+	assert.equal(hasSampleData(sanitizedBeforeCleanup), true);
+	const prepared = clearSampleData(sanitizedBeforeCleanup);
+	assert.equal(hasSampleData(prepared), false);
+
+	let syncedState = createNewUserState();
+	const migrated = await migrateGuestKitchenOnSignup({
+		guestState: prepared,
+		loadInitialState: async () => ({ state: syncedState, etag: 'v1' }),
+		adoptBaseline: () => {},
+		stage: (next) => {
+			syncedState = next;
+		},
+		sync: async () => {},
+		hasPendingFailure: () => false
+	});
+
+	assert.equal(migrated.synced, true);
+	assert.ok(validateAppState(syncedState));
+	assert.deepEqual(
+		syncedState.pantry.map((item) => ({ id: item.id, name: item.name, quantity: item.quantity })),
+		[
+			{ id: 'pantry-eggs', name: 'eggs', quantity: 6 },
+			{ id: 'oversized-oats', name: 'rolled oats', quantity: 1_000_000 }
+		]
+	);
+	assert.deepEqual(syncedState.meals, []);
+	assert.ok(syncedState.recipes.every((recipe) => !recipe.saved && !recipe.sampleSaved));
+});
+
+test('sanitizeKitchenState preserves manual recipe provenance and sample flags on guest reload', () => {
+	const guest = createInitialState();
+	const baseRecipe = structuredClone(guest.recipes[0]);
+	guest.recipes.push(
+		{
+			...baseRecipe,
+			id: 'manual-pasta',
+			title: 'Manual Pasta',
+			provenance: 'manual',
+			saved: true,
+			sampleSaved: undefined
+		},
+		{
+			...baseRecipe,
+			id: 'imported-soup',
+			title: 'Imported Soup',
+			provenance: 'web-import',
+			saved: true,
+			sampleSaved: undefined
+		},
+		{
+			...baseRecipe,
+			id: 'ai-salad',
+			title: 'AI Salad',
+			provenance: 'ai-generated',
+			saved: true,
+			sampleSaved: undefined
+		},
+		{
+			...baseRecipe,
+			id: 'invalid-provenance',
+			title: 'Unknown Provenance',
+			provenance: 'scraped-legacy' as unknown as AppState['recipes'][number]['provenance'],
+			saved: true,
+			sampleSaved: undefined
+		}
+	);
+
+	const reloaded = sanitizeKitchenState(JSON.parse(JSON.stringify(guest)));
+	assert.ok(validateAppState(reloaded));
+	assert.equal(reloaded.recipes.find((item) => item.id === 'manual-pasta')?.provenance, 'manual');
+	assert.equal(
+		reloaded.recipes.find((item) => item.id === 'imported-soup')?.provenance,
+		'web-import'
+	);
+	assert.equal(reloaded.recipes.find((item) => item.id === 'ai-salad')?.provenance, 'ai-generated');
+	assert.equal(
+		reloaded.recipes.find((item) => item.id === 'invalid-provenance')?.provenance,
+		undefined
+	);
+	assert.equal(reloaded.pantry.filter((item) => item.sample).length, 7);
+	assert.equal(reloaded.meals.filter((meal) => meal.sample).length, 3);
+	assert.equal(reloaded.recipes.filter((recipe) => recipe.sampleSaved).length, 3);
+
+	// Manual recipe survives sample cleanup after guest reload.
+	const cleaned = clearSampleData(reloaded);
+	const manualAfterCleanup = cleaned.recipes.find((item) => item.id === 'manual-pasta');
+	assert.equal(manualAfterCleanup?.saved, true);
+	assert.equal(manualAfterCleanup?.provenance, 'manual');
 });

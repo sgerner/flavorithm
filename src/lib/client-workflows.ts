@@ -1,5 +1,14 @@
-import type { ConnectionModel, ConnectionProvider } from '#lib/ai-connections.ts';
+import {
+	HOST_CONNECTION_ID,
+	type ConnectionModel,
+	type ConnectionProvider
+} from '#lib/ai-connections.ts';
+import { createNewUserState } from '#lib/data.ts';
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
+import { clearSampleData, hasSampleData } from '#lib/kitchen-workflows.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
+
+type StarterStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 
 export type ChatGPTAccountSummary = {
 	id: string;
@@ -27,25 +36,35 @@ export function reconcileChatGPTPreferences(
 	preferences: Preferences,
 	chatGPT: ChatGPTConnectionSummary
 ): void {
-	if (chatGPT.host) {
-		preferences.provider = 'chatgpt';
-		preferences.chatgptAccountId = 'host-chatgpt';
-		preferences.model = chatGPT.host.model;
+	const personalAccounts = chatGPT.accounts.filter((account) => account.id !== HOST_CONNECTION_ID);
+	if (preferences.chatgptAccountId === HOST_CONNECTION_ID) {
+		preferences.chatgptAccountId = undefined;
+		if (preferences.provider === 'chatgpt') preferences.model = '';
 	}
-	if (!chatGPT.accounts.some((account) => account.id === preferences.chatgptAccountId)) {
+	if (
+		personalAccounts.length &&
+		(preferences.provider === 'chatgpt' || preferences.chatgptAccountId) &&
+		!personalAccounts.some((account) => account.id === preferences.chatgptAccountId)
+	) {
 		preferences.chatgptAccountId =
-			chatGPT.accounts.find((account) => account.connected && account.planEnabled)?.id ||
-			chatGPT.accounts[0]?.id;
+			personalAccounts.find((account) => account.connected && account.planEnabled)?.id ||
+			personalAccounts[0]?.id;
+	} else if (!personalAccounts.length && preferences.chatgptAccountId) {
+		preferences.chatgptAccountId = undefined;
 	}
 }
 
 /** Return the selected ChatGPT account ID only when ChatGPT plan inference is active and entitled. */
 export function entitledChatGPTAccountId(
-	preferences: Pick<Preferences, 'provider' | 'chatgptAccountId'>,
-	accounts: ChatGPTAccountSummary[]
+	preferences: Pick<Preferences, 'provider' | 'chatgptAccountId' | 'usePersonalAI'>,
+	accounts: ChatGPTAccountSummary[],
+	host?: { model: string } | null
 ): string | null {
+	if (host && !preferences.usePersonalAI) return null;
 	const accountId = preferences.chatgptAccountId;
-	if (preferences.provider !== 'chatgpt' || !accountId) return null;
+	if (preferences.provider !== 'chatgpt' || !accountId || accountId === HOST_CONNECTION_ID) {
+		return null;
+	}
 	const account = accounts.find((candidate) => candidate.id === accountId);
 	return account?.connected && account.planEnabled ? accountId : null;
 }
@@ -94,13 +113,14 @@ export async function runConcurrentModelCatalog(options: {
 	onResult: (result: {
 		catalog: SettledValue<{ providers: ConnectionProvider[] }>;
 		account: SettledValue<{ providers: Array<{ models: ConnectionModel[] }> } | null>;
-	}) => void;
+		queriedAccountId: string | null;
+	}) => void | Promise<void>;
 }): Promise<void> {
-	const initialAccountId = options.getEntitledAccountId();
+	let queriedAccountId = options.getEntitledAccountId();
 	const catalogTask = settle(options.fetchPublicCatalog());
 	let accountTask: Promise<
 		SettledValue<{ providers: Array<{ models: ConnectionModel[] }> } | null>
-	> | null = initialAccountId ? settle(options.fetchAccountCatalog(initialAccountId)) : null;
+	> | null = queriedAccountId ? settle(options.fetchAccountCatalog(queriedAccountId)) : null;
 	let connectionError: unknown = null;
 	let hasConnectionError = false;
 
@@ -112,9 +132,11 @@ export async function runConcurrentModelCatalog(options: {
 			connectionError = connResult.reason;
 		} else {
 			const nextAccountId = options.getEntitledAccountId();
-			if (nextAccountId && nextAccountId !== initialAccountId) {
+			if (nextAccountId && nextAccountId !== queriedAccountId) {
+				queriedAccountId = nextAccountId;
 				accountTask = settle(options.fetchAccountCatalog(nextAccountId));
 			} else if (!nextAccountId) {
+				queriedAccountId = null;
 				accountTask = null;
 			}
 		}
@@ -125,7 +147,7 @@ export async function runConcurrentModelCatalog(options: {
 		accountTask ?? Promise.resolve({ status: 'fulfilled' as const, value: null })
 	]);
 	if (!options.isCurrent()) return;
-	options.onResult({ catalog, account });
+	await options.onResult({ catalog, account, queriedAccountId });
 	if (hasConnectionError) throw connectionError;
 }
 
@@ -236,4 +258,131 @@ export async function runReconnectWorkflow<TState = { state?: AppState | null }>
 		options.adoptState(latest);
 	}
 	await options.retrySync();
+}
+
+/**
+ * Selectively clear untouched sample records in place and register a snapshot-guarded Undo
+ * callback that restores removed sample items and guest starter-banner state if unchanged.
+ */
+export function runSampleCleanupWorkflow(options: {
+	commitInlineEdits: () => void;
+	getKitchen: () => AppState;
+	setKitchen: (next: AppState) => void;
+	onCleaned: () => void;
+	onUndoRestore: (restored: AppState) => void;
+	getShowStarter: () => boolean;
+	setShowStarter: (show: boolean) => void;
+	isGuest: () => boolean;
+	storage: StarterStorage;
+	closeSettingsIfOpen: () => void;
+	notify: (message: string, undo?: () => void) => void;
+	now?: Date;
+}): boolean {
+	options.commitInlineEdits();
+	const current = options.getKitchen();
+	if (!hasSampleData(current)) {
+		options.setShowStarter(false);
+		if (options.isGuest()) options.storage.setItem('flavorithm-started', 'yes');
+		return false;
+	}
+	const previousKitchen = sanitizeKitchenState(JSON.parse(JSON.stringify(current)));
+	const wasShowingStarter = options.getShowStarter();
+	const previousStarted = options.isGuest() ? options.storage.getItem('flavorithm-started') : null;
+	const cleaned = clearSampleData(previousKitchen, options.now);
+	options.setKitchen(cleaned);
+	options.onCleaned();
+	const appliedSnapshot = JSON.stringify(options.getKitchen());
+	options.setShowStarter(false);
+	if (options.isGuest()) options.storage.setItem('flavorithm-started', 'yes');
+	options.closeSettingsIfOpen();
+	options.notify('Sample data cleared.', () => {
+		if (JSON.stringify(options.getKitchen()) === appliedSnapshot) {
+			options.onUndoRestore(previousKitchen);
+			if (wasShowingStarter && options.isGuest()) {
+				options.setShowStarter(true);
+				if (previousStarted === null) options.storage.removeItem('flavorithm-started');
+				else options.storage.setItem('flavorithm-started', previousStarted);
+			}
+			options.notify('Sample data restored.');
+		} else {
+			options.notify('Your kitchen changed again. Review the current values before editing.');
+		}
+	});
+	return true;
+}
+
+/**
+ * Sanitize and strip untouched sample records from a guest kitchen before local registration,
+ * or return null for sign-in so guest items never leak into an existing account.
+ */
+export function prepareGuestKitchenForAuth(
+	authMode: string,
+	kitchen: AppState,
+	now?: Date
+): AppState | null {
+	if (authMode !== 'register') return null;
+	return clearSampleData(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))), now);
+}
+
+/**
+ * Execute local sign-in or registration, stripping untouched sample data on registration while
+ * leaving the live guest kitchen untouched if /api/auth fails.
+ */
+export async function runLocalAuthenticateWorkflow(options: {
+	authMode: string;
+	getKitchen: () => AppState;
+	authenticateRequest: () => Promise<{ user: User }>;
+	onAuthenticated: (user: User, initialKitchen: AppState) => void;
+	stageGuestKitchen: (guestKitchen: AppState) => void;
+	hasSyncError: () => boolean;
+	clearGuestStorage: () => void;
+	fetchState: () => Promise<{ state?: AppState | null }>;
+	createState: (state: AppState) => Promise<{ state?: AppState | null }>;
+	adoptKitchen: (state: AppState) => void;
+	hasPendingSnapshot: () => boolean;
+	syncKitchen: () => Promise<void>;
+	isOnline: () => boolean;
+	retrySync: () => Promise<void>;
+	failStateLoad: (message: string) => void;
+	now?: Date;
+}): Promise<{ user: User; guestKitchen: AppState | null; stateLoaded: boolean }> {
+	const guestKitchen = prepareGuestKitchenForAuth(
+		options.authMode,
+		options.getKitchen(),
+		options.now
+	);
+	const result = await options.authenticateRequest();
+	const authenticatedUser = result.user;
+	options.onAuthenticated(authenticatedUser, guestKitchen ?? createNewUserState());
+	if (guestKitchen) {
+		options.stageGuestKitchen(guestKitchen);
+		if (!options.hasSyncError()) {
+			options.clearGuestStorage();
+		}
+	}
+	let stateLoaded = false;
+	try {
+		const saved = await options.fetchState();
+		if (guestKitchen) {
+			options.adoptKitchen(saved.state || createNewUserState());
+			if (!saved.state && !options.hasPendingSnapshot()) {
+				const created = await options.createState(guestKitchen);
+				options.adoptKitchen(created.state || guestKitchen);
+			} else {
+				await options.syncKitchen();
+			}
+		} else if (saved.state) {
+			options.adoptKitchen(saved.state);
+			if (options.isOnline() && options.hasPendingSnapshot()) await options.retrySync();
+		} else {
+			const initial = createNewUserState();
+			const created = await options.createState(initial);
+			options.adoptKitchen(created.state || initial);
+			if (options.isOnline() && options.hasPendingSnapshot()) await options.retrySync();
+		}
+		stateLoaded = true;
+	} catch (stateError) {
+		options.failStateLoad((stateError as Error).message);
+	}
+	return { user: authenticatedUser, guestKitchen, stateLoaded };
 }
