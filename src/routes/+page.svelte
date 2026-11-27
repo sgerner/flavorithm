@@ -5921,7 +5921,11 @@
 				save={saveEditedRecipe}
 			/>{:else}{@render lazyDialog(
 				'recipeEditor',
-				editingRecipeMode === 'create' ? 'New recipe' : 'Edit saved recipe',
+				editingRecipeMode === 'create'
+					? 'New recipe'
+					: editingRecipe.saved
+						? 'Edit saved recipe'
+						: 'Edit recipe',
 				() => {
 					editingRecipe = null;
 					editingRecipeMode = 'edit';
