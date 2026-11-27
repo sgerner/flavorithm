@@ -40,6 +40,9 @@ const { MAX_RECIPES } = recipeCollectionMod;
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
 	effect_root: (fn: () => void) => () => void;
+	flush: (fn?: () => void) => void;
+	untrack: <T>(fn: () => T) => T;
+	user_effect: (fn: () => void | (() => void)) => void;
 };
 const svelteServer = nodeRequire('svelte/internal/server') as Record<string, unknown>;
 
@@ -101,14 +104,21 @@ function injectPlannerHook(svelteSource: string): string {
 		logout,
 		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
+		adoptKitchen,
+		freshKitchen,
+		refreshAuth,
+		reconnectKitchen,
 		exportKitchen,
 		exportPendingChanges,
 		startPantryEdit,
 		setPantryDraftQuantity: (value: string) => {
 			if (pantryDraft) pantryDraft.quantity = value;
 		},
+		get pendingSync() { return pendingSync; },
+		get syncReady() { return syncReady; },
 		get toast() { return toast; },
 		get toastActionLabel() { return toastActionLabel; },
+		runToastAction: () => { toastUndo?.(); },
 		get online() { return online; },
 		set online(value: boolean) { online = value; },
 		get ready() { return ready; },
@@ -122,6 +132,7 @@ function injectPlannerHook(svelteSource: string): string {
 				getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 				setState: (state) => {
 					kitchen = sanitizeKitchenState(state);
+					markKitchenClean();
 				},
 				onStatus: (status) => {
 					syncReady = status.ready;
@@ -195,12 +206,19 @@ type PlannerHarnessApi = {
 	logout: () => Promise<void>;
 	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	adoptKitchen: (state: AppState) => void;
+	freshKitchen: () => void;
+	refreshAuth: () => Promise<{ stateLoaded?: boolean }>;
+	reconnectKitchen: () => Promise<void>;
 	exportKitchen: () => Promise<void>;
 	exportPendingChanges: () => void;
 	startPantryEdit: (item: AppState['pantry'][number]) => Promise<void>;
 	setPantryDraftQuantity: (value: string) => void;
+	readonly pendingSync: boolean;
+	readonly syncReady: boolean;
 	readonly toast: string;
 	readonly toastActionLabel: string;
+	runToastAction: () => void;
 	online: boolean;
 	ready: boolean;
 	kitchenLoaded: boolean;
@@ -273,6 +291,8 @@ function makeMemoryStorage() {
 			if (prop === 'setItem') return (key: string, value: string) => void target.set(key, value);
 			if (prop === 'removeItem') return (key: string) => void target.delete(key);
 			if (prop === 'clear') return () => target.clear();
+			if (prop === 'length') return target.size;
+			if (prop === 'key') return (index: number) => [...target.keys()][index] ?? null;
 			if (typeof prop === 'string') return target.get(prop);
 			return undefined;
 		},
@@ -332,6 +352,7 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 		Intl,
 		Map,
 		Set,
+		WeakSet,
 		Number,
 		String,
 		Boolean,
@@ -348,6 +369,7 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 		Request,
 		crypto,
 		console,
+		queueMicrotask,
 		setTimeout,
 		clearTimeout,
 		setInterval,
@@ -435,6 +457,7 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 		Intl,
 		Map,
 		Set,
+		WeakSet,
 		Number,
 		String,
 		Boolean,
@@ -456,6 +479,7 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 		Request,
 		crypto,
 		console,
+		queueMicrotask,
 		setTimeout: (fn: (...args: unknown[]) => void, ms?: number) => setTimeout(fn, ms).unref(),
 		clearTimeout,
 		setInterval,
@@ -1094,6 +1118,653 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+function createSimpleEventTarget() {
+	const listeners = new Map<string, Set<(event?: any) => void>>();
+	return {
+		addEventListener(type: string, fn: (event?: any) => void) {
+			let set = listeners.get(type);
+			if (!set) {
+				set = new Set();
+				listeners.set(type, set);
+			}
+			set.add(fn);
+		},
+		removeEventListener(type: string, fn: (event?: any) => void) {
+			listeners.get(type)?.delete(fn);
+		},
+		dispatch(type: string, event?: unknown) {
+			for (const fn of [...(listeners.get(type) ?? [])]) fn(event);
+		}
+	};
+}
+
+function createMountedPageHarness(options: {
+	fetch: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
+	online?: boolean;
+}) {
+	const modMap = createModuleMap();
+	modMap.svelte = {
+		...svelte,
+		untrack: svelteClient.untrack,
+		onMount: (fn: () => void | (() => void)) => {
+			svelteClient.user_effect(() => {
+				const cleanup = svelteClient.untrack(fn);
+				return typeof cleanup === 'function' ? cleanup : undefined;
+			});
+		}
+	};
+	const exports: { default?: any } = {};
+	let api!: PlannerHarnessApi;
+	let isOnline = options.online ?? true;
+	const storageStore = new Map<string, string>();
+	const journalWrites: string[] = [];
+	const guestWrites: string[] = [];
+	const storage = new Proxy(storageStore, {
+		get(target, prop) {
+			if (prop === 'getItem') return (key: string) => target.get(key) ?? null;
+			if (prop === 'setItem')
+				return (key: string, value: string) => {
+					if (key.startsWith('flavorithm-pending-journal:')) journalWrites.push(value);
+					if (key === 'flavorithm-guest-kitchen') guestWrites.push(value);
+					target.set(key, value);
+				};
+			if (prop === 'removeItem') return (key: string) => void target.delete(key);
+			if (prop === 'clear') return () => target.clear();
+			if (prop === 'length') return target.size;
+			if (prop === 'key') return (index: number) => [...target.keys()][index] ?? null;
+			if (typeof prop === 'string') return target.get(prop);
+			return undefined;
+		},
+		ownKeys(target) {
+			return [...target.keys()];
+		},
+		getOwnPropertyDescriptor(target, prop) {
+			if (typeof prop === 'string' && target.has(prop)) {
+				return { enumerable: true, configurable: true, value: target.get(prop) };
+			}
+			return undefined;
+		}
+	});
+	const winEvents = createSimpleEventTarget();
+	const docEvents = createSimpleEventTarget();
+	const darkClasses = new Set<string>();
+	const documentMock = {
+		visibilityState: 'visible',
+		documentElement: {
+			dataset: {} as Record<string, string>,
+			classList: {
+				toggle(cls: string, force?: boolean) {
+					const shouldHave = force === undefined ? !darkClasses.has(cls) : Boolean(force);
+					if (shouldHave) darkClasses.add(cls);
+					else darkClasses.delete(cls);
+					return shouldHave;
+				},
+				contains: (cls: string) => darkClasses.has(cls)
+			}
+		},
+		addEventListener: docEvents.addEventListener,
+		removeEventListener: docEvents.removeEventListener,
+		getElementById: () => null
+	};
+	const windowMock = {
+		localStorage: storage,
+		location: {
+			href: 'http://127.0.0.1:4173/',
+			assign: () => {},
+			reload: () => {}
+		},
+		history: {
+			replaceState: () => {}
+		},
+		scrollTo: () => {},
+		addEventListener: winEvents.addEventListener,
+		removeEventListener: winEvents.removeEventListener
+	};
+	const navigatorMock = {
+		get onLine() {
+			return isOnline;
+		}
+	};
+	const sandbox: Record<string, unknown> = {
+		exports,
+		require: (id: string) => {
+			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
+			throw new Error(`Unexpected planner dependency ${id}`);
+		},
+		Date,
+		Intl,
+		Map,
+		Set,
+		WeakSet,
+		Number,
+		String,
+		Boolean,
+		Array,
+		Object,
+		Math,
+		JSON,
+		RegExp,
+		Error,
+		TypeError,
+		RangeError,
+		DOMException,
+		AbortSignal,
+		CSS: { escape: (value: string) => value },
+		Promise,
+		URL,
+		Response,
+		Request,
+		crypto,
+		console,
+		queueMicrotask,
+		setTimeout,
+		clearTimeout,
+		setInterval,
+		clearInterval,
+		localStorage: storage,
+		navigator: navigatorMock,
+		window: windowMock,
+		document: documentMock,
+		fetch: options.fetch
+	};
+	sandbox.globalThis = sandbox;
+	sandbox.__onPlannerInit = (instance: PlannerHarnessApi) => {
+		api = instance;
+	};
+	runInNewContext(clientScriptJs, sandbox);
+	const dispose = svelteClient.effect_root(() => {
+		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
+	});
+	svelteClient.flush();
+	return {
+		api,
+		storageStore,
+		journalWrites,
+		guestWrites,
+		documentMock,
+		winEvents,
+		docEvents,
+		setOnline(next: boolean) {
+			isOnline = next;
+			winEvents.dispatch(next ? 'online' : 'offline');
+			svelteClient.flush();
+		},
+		flush() {
+			svelteClient.flush();
+		},
+		async flushTick() {
+			svelteClient.flush();
+			await Promise.resolve();
+			svelteClient.flush();
+		},
+		dispose
+	};
+}
+
+async function flushAsyncTurns(turns = 6) {
+	for (let i = 0; i < turns; i += 1) {
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		svelteClient.flush();
+		await Promise.resolve();
+	}
+}
+
+test('adoptionToken section watchers skip clean adoptions, preserve same-flush edits, coalesce multi-section completeMeal into one journal write, and coalesce network PUTs', async () => {
+	const signedInUser: User = {
+		id: 'u-sync',
+		name: 'Chef Ada',
+		email: 'ada@example.test',
+		householdId: 'h-sync'
+	};
+	const recipe = {
+		...makeRecipe('r-1', 'Lemon Chickpea Orzo'),
+		image: '',
+		servings: 2,
+		ingredients: [
+			{ name: 'chickpeas', quantity: 1, unit: 'can' },
+			{ name: 'orzo', quantity: 2, unit: 'cup' }
+		]
+	};
+	let serverState: AppState = {
+		...dataMod.createNewUserState(),
+		pantry: [{ id: 'p-1', name: 'chickpeas', quantity: 3, unit: 'can', category: 'Pantry' }],
+		recipes: [recipe],
+		meals: [
+			{
+				id: 'm-1',
+				date: '2026-11-26',
+				slot: 'Dinner',
+				recipeId: 'r-1',
+				servings: 2
+			}
+		],
+		shopping: [{ id: 's-1', name: 'parsley', quantity: 1, unit: 'bunch', checked: false }]
+	};
+	let serverEtag = 'etag-1';
+	const putPayloads: AppState[] = [];
+
+	const mounted = createMountedPageHarness({
+		fetch: async (input, init) => {
+			const url = new URL(String(input), 'http://127.0.0.1:4173');
+			const method = (init?.method ?? 'GET').toUpperCase();
+			if (url.pathname === '/api/auth') {
+				return new Response(
+					JSON.stringify({
+						user: signedInUser,
+						authMode: 'local',
+						loginUrl: null,
+						logoutUrl: null,
+						capabilities: { emailDelivery: false, recipeSearch: false }
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } }
+				);
+			}
+			if (url.pathname === '/api/state' && method === 'GET') {
+				return new Response(
+					JSON.stringify({
+						state: structuredClone(serverState),
+						userId: signedInUser.id,
+						householdId: signedInUser.householdId
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json', etag: serverEtag } }
+				);
+			}
+			if (url.pathname === '/api/state' && method === 'PUT') {
+				const body = JSON.parse(String(init?.body ?? '{}')) as { state: AppState };
+				putPayloads.push(structuredClone(body.state));
+				serverState = structuredClone(body.state);
+				serverEtag = `etag-${putPayloads.length + 1}`;
+				return new Response(JSON.stringify({ state: structuredClone(serverState) }), {
+					status: 200,
+					headers: { 'content-type': 'application/json', etag: serverEtag }
+				});
+			}
+			return new Response(
+				JSON.stringify({ configured: false, mode: 'unavailable', accounts: [] }),
+				{
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				}
+			);
+		}
+	});
+
+	try {
+		await flushAsyncTurns();
+		assert.equal(mounted.api.syncReady, true);
+		assert.equal(mounted.api.pendingSync, false);
+		assert.equal(
+			mounted.journalWrites.length,
+			0,
+			'initial hydration does not stage a dirty journal'
+		);
+		assert.equal(putPayloads.length, 0);
+
+		// 1. Adopting a remote household update without subsequent edits marks sections clean and skips staging.
+		const remoteUpdate: AppState = {
+			...structuredClone(serverState),
+			pantry: [{ id: 'p-1', name: 'chickpeas', quantity: 5, unit: 'can', category: 'Pantry' }]
+		};
+		serverState = structuredClone(remoteUpdate);
+		mounted.api.adoptKitchen(remoteUpdate);
+		await mounted.flushTick();
+		await flushAsyncTurns(2);
+		assert.equal(mounted.api.kitchen.pantry[0]?.quantity, 5);
+		assert.equal(mounted.api.pendingSync, false);
+		assert.equal(
+			mounted.journalWrites.length,
+			0,
+			'remote adoption does not schedule or write a stage'
+		);
+		assert.equal(putPayloads.length, 0);
+
+		// 2. Genuine edit landing in the EXACT SAME flush as adoptKitchen (before mounted.flush()) is NOT dropped!
+		const secondRemoteUpdate: AppState = {
+			...structuredClone(serverState),
+			pantry: [{ id: 'p-1', name: 'chickpeas', quantity: 6, unit: 'can', category: 'Pantry' }]
+		};
+		serverState = structuredClone(secondRemoteUpdate);
+		mounted.api.adoptKitchen(secondRemoteUpdate);
+		// Mutate in place before Svelte flushes the adoption effects!
+		mounted.api.kitchen.pantry[0].quantity = 9;
+		await mounted.flushTick();
+		assert.equal(
+			mounted.journalWrites.length,
+			1,
+			'genuine edit in the same flush as remote adoption is preserved and durably staged'
+		);
+		assert.equal(
+			JSON.parse(mounted.journalWrites[0])?.local?.pantry?.[0]?.quantity,
+			9,
+			'staged journal holds the post-adoption edit'
+		);
+		assert.equal(mounted.api.pendingSync, true);
+
+		// 3. Multi-section edit (completeMeal: pantry + meals + shopping) coalesces into ONE sanitize + ONE journal write per tick with zero stale sections.
+		mounted.journalWrites.length = 0;
+		const mealToCook = mounted.api.kitchen.meals[0];
+		assert.ok(mealToCook);
+		mounted.api.openCookDialog(mealToCook);
+		mounted.api.deductPantry = true;
+		await mounted.api.markMealCooked();
+		await mounted.flushTick();
+		assert.equal(
+			mounted.journalWrites.length,
+			1,
+			'completeMeal touching pantry+meals+shopping writes a single coalesced journal snapshot'
+		);
+		const cookedSnapshot = JSON.parse(mounted.journalWrites[0])?.local as AppState;
+		assert.equal(cookedSnapshot.pantry[0]?.quantity, 8, 'pantry deduction is present in snapshot');
+		assert.ok(cookedSnapshot.meals[0]?.completedAt, 'completed meal is present in snapshot');
+		assert.equal(
+			cookedSnapshot.shopping.some((item) => item.name === 'orzo'),
+			false,
+			'refreshed weekly shopping list removed completed meal shortage in the same snapshot'
+		);
+		assert.equal(
+			cookedSnapshot.recipes[0]?.id,
+			'r-1',
+			'unchanged recipes remain intact in getSanitizedKitchen cache'
+		);
+
+		// 4. Rapid typing burst writes durably on each tick and coalesces network PUTs into one request.
+		mounted.journalWrites.length = 0;
+		for (const allergy of ['s', 'se', 'ses', 'sesa', 'sesam', 'sesame']) {
+			mounted.api.kitchen.preferences.allergies = allergy;
+			await mounted.flushTick();
+		}
+		assert.equal(
+			mounted.journalWrites.length,
+			6,
+			'every keystroke tick writes durably to the journal'
+		);
+		assert.equal(putPayloads.length, 0, 'network sync remains coalesced during rapid edits');
+
+		await new Promise((resolve) => setTimeout(resolve, syncMod.DEFAULT_SYNC_COALESCE_MS + 80));
+		await flushAsyncTurns();
+		assert.equal(putPayloads.length, 1, 'rapid burst coalesces into a single PUT /api/state');
+		assert.equal(putPayloads[0]?.pantry[0]?.quantity, 8);
+		assert.ok(putPayloads[0]?.meals[0]?.completedAt);
+		assert.equal(putPayloads[0]?.preferences.allergies, 'sesame');
+		assert.equal(mounted.api.pendingSync, false);
+
+		// 5. Sample cleanup (freshKitchen + Undo) and shared auth hydration (refreshAuth) keep getSanitizedKitchen() fresh.
+		const samplePantryItem = structuredClone(dataMod.createInitialState().pantry[0]);
+		const stateWithSample: AppState = {
+			...structuredClone(serverState),
+			pantry: [...structuredClone(serverState.pantry), samplePantryItem]
+		};
+		serverState = structuredClone(stateWithSample);
+		mounted.api.adoptKitchen(stateWithSample);
+		await mounted.flushTick();
+		mounted.journalWrites.length = 0;
+
+		mounted.api.freshKitchen();
+		await mounted.flushTick();
+		assert.equal(
+			mounted.journalWrites.length,
+			1,
+			'freshKitchen sample cleanup stages a single sanitized snapshot'
+		);
+		const resetSnapshot = JSON.parse(mounted.journalWrites[0])?.local as AppState;
+		assert.equal(
+			resetSnapshot.pantry.some((item) => item.id === samplePantryItem.id),
+			false,
+			'sample pantry item removed in staged snapshot'
+		);
+		assert.equal(resetSnapshot.pantry[0]?.id, 'p-1', 'user pantry item preserved');
+
+		mounted.api.runToastAction();
+		await mounted.flushTick();
+		assert.equal(
+			mounted.api.pendingSync,
+			false,
+			'Undo restore runs stage(restored), retiring the reverted journal entry back to baseline'
+		);
+		assert.equal(
+			mounted.api.kitchen.pantry.some((item) => item.id === samplePantryItem.id),
+			true,
+			'Undo restored sample pantry item'
+		);
+
+		// Re-hydrating via refreshAuth cancels/flushes cleanly without stale cached sections leaking into the next edit.
+		serverState = {
+			...dataMod.createNewUserState(),
+			pantry: [{ id: 'p-auth', name: 'tahini', quantity: 2, unit: 'jar', category: 'Pantry' }],
+			recipes: [recipe]
+		};
+		serverEtag = 'etag-refresh';
+		mounted.api.adoptKitchen(serverState);
+		await mounted.api.refreshAuth();
+		await mounted.flushTick();
+		mounted.journalWrites.length = 0;
+		mounted.api.kitchen.shopping.push({
+			id: 's-after-refresh',
+			name: 'sumac',
+			quantity: 1,
+			unit: 'jar',
+			checked: false
+		});
+		await mounted.flushTick();
+		assert.equal(mounted.journalWrites.length, 1);
+		const postRefreshSnapshot = JSON.parse(mounted.journalWrites[0])?.local as AppState;
+		assert.equal(
+			postRefreshSnapshot.pantry[0]?.id,
+			'p-auth',
+			'sanitized cache reflects newly hydrated pantry rather than pre-refresh state'
+		);
+		assert.equal(postRefreshSnapshot.shopping.at(-1)?.id, 's-after-refresh');
+	} finally {
+		mounted.dispose();
+	}
+});
+
+test('guest edits in the initial window before /api/auth resolves persist both for guests and before local signed-in adoption', async () => {
+	// Case A: /api/auth resolves with user: null (guest).
+	let resolveGuestAuth!: (response: Response) => void;
+	const guestAuthPromise = new Promise<Response>((resolve) => {
+		resolveGuestAuth = resolve;
+	});
+	const guestHarness = createMountedPageHarness({
+		fetch: async (input) => {
+			const url = new URL(String(input), 'http://127.0.0.1:4173');
+			if (url.pathname === '/api/auth') return guestAuthPromise;
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			});
+		}
+	});
+	try {
+		guestHarness.api.kitchen.preferences.allergies = 'tree nuts';
+		guestHarness.flush();
+		assert.equal(
+			guestHarness.guestWrites.length,
+			0,
+			'waits for /api/auth before writing guest key'
+		);
+
+		resolveGuestAuth(
+			new Response(
+				JSON.stringify({
+					user: null,
+					authMode: 'local',
+					loginUrl: null,
+					logoutUrl: null,
+					capabilities: { emailDelivery: false, recipeSearch: false }
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			)
+		);
+		await flushAsyncTurns();
+		assert.equal(guestHarness.guestWrites.length, 1);
+		assert.equal(
+			JSON.parse(guestHarness.storageStore.get('flavorithm-guest-kitchen') || 'null')?.preferences
+				.allergies,
+			'tree nuts'
+		);
+	} finally {
+		guestHarness.dispose();
+	}
+
+	// Case B: /api/auth resolves with a signed-in local user; pre-auth guest edit is flushed before cancel().
+	const returningUser: User = {
+		id: 'u-local',
+		name: 'Chef Sam',
+		email: 'sam@example.test',
+		householdId: 'h-local'
+	};
+	let resolveReturningAuth!: (response: Response) => void;
+	const returningAuthPromise = new Promise<Response>((resolve) => {
+		resolveReturningAuth = resolve;
+	});
+	const switchHarness = createMountedPageHarness({
+		fetch: async (input) => {
+			const url = new URL(String(input), 'http://127.0.0.1:4173');
+			if (url.pathname === '/api/auth') return returningAuthPromise;
+			if (url.pathname === '/api/state') {
+				return new Response(
+					JSON.stringify({
+						state: dataMod.createNewUserState(),
+						userId: returningUser.id,
+						householdId: returningUser.householdId
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json', etag: 'v1' } }
+				);
+			}
+			return new Response(
+				JSON.stringify({ configured: false, mode: 'unavailable', accounts: [] }),
+				{
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				}
+			);
+		}
+	});
+	try {
+		switchHarness.api.kitchen.preferences.allergies = 'cashews';
+		switchHarness.flush();
+		assert.equal(switchHarness.guestWrites.length, 0);
+
+		resolveReturningAuth(
+			new Response(
+				JSON.stringify({
+					user: returningUser,
+					authMode: 'local',
+					loginUrl: null,
+					logoutUrl: null,
+					capabilities: { emailDelivery: false, recipeSearch: false }
+				}),
+				{ status: 200, headers: { 'content-type': 'application/json' } }
+			)
+		);
+		await flushAsyncTurns();
+		assert.equal(
+			JSON.parse(switchHarness.storageStore.get('flavorithm-guest-kitchen') || 'null')?.preferences
+				.allergies,
+			'cashews',
+			'guest edit made before /api/auth resolved is flushed before switching to signed-in user'
+		);
+	} finally {
+		switchHarness.dispose();
+	}
+});
+
+test('reconnect sync runs and uploads offline-staged edits when window online fires', async () => {
+	const signedInUser: User = {
+		id: 'u-reconnect',
+		name: 'Chef Lin',
+		email: 'lin@example.test',
+		householdId: 'h-reconnect'
+	};
+	let serverState = dataMod.createNewUserState();
+	let serverEtag = 'etag-1';
+	const putStates: AppState[] = [];
+
+	const mounted = createMountedPageHarness({
+		fetch: async (input, init) => {
+			const url = new URL(String(input), 'http://127.0.0.1:4173');
+			const method = (init?.method ?? 'GET').toUpperCase();
+			if (url.pathname === '/api/auth') {
+				return new Response(
+					JSON.stringify({
+						user: signedInUser,
+						authMode: 'local',
+						loginUrl: null,
+						logoutUrl: null,
+						capabilities: { emailDelivery: false, recipeSearch: false }
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } }
+				);
+			}
+			if (url.pathname === '/api/state' && method === 'GET') {
+				return new Response(
+					JSON.stringify({
+						state: structuredClone(serverState),
+						userId: signedInUser.id,
+						householdId: signedInUser.householdId
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json', etag: serverEtag } }
+				);
+			}
+			if (url.pathname === '/api/state' && method === 'PUT') {
+				const body = JSON.parse(String(init?.body ?? '{}')) as { state: AppState };
+				putStates.push(structuredClone(body.state));
+				serverState = structuredClone(body.state);
+				serverEtag = 'etag-2';
+				return new Response(JSON.stringify({ state: structuredClone(serverState) }), {
+					status: 200,
+					headers: { 'content-type': 'application/json', etag: serverEtag }
+				});
+			}
+			return new Response(
+				JSON.stringify({ configured: false, mode: 'unavailable', accounts: [] }),
+				{
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				}
+			);
+		}
+	});
+
+	try {
+		await flushAsyncTurns();
+		assert.equal(mounted.api.syncReady, true);
+
+		mounted.setOnline(false);
+		assert.equal(mounted.api.online, false);
+
+		mounted.api.kitchen.shopping.push({
+			id: 'offline-lemons',
+			name: 'Meyer lemons',
+			quantity: 4,
+			unit: 'piece',
+			checked: false
+		});
+		await mounted.flushTick();
+		assert.equal(mounted.api.pendingSync, true);
+		assert.equal(mounted.journalWrites.length, 1);
+
+		await new Promise((resolve) => setTimeout(resolve, syncMod.DEFAULT_SYNC_COALESCE_MS + 60));
+		assert.equal(putStates.length, 0, 'no PUT attempted while offline');
+
+		mounted.setOnline(true);
+		await flushAsyncTurns(10);
+		assert.equal(
+			putStates.length,
+			1,
+			'reconnectKitchen syncs pending journal immediately on online'
+		);
+		assert.equal(putStates[0]?.shopping[0]?.id, 'offline-lemons');
+		assert.equal(mounted.api.pendingSync, false);
+	} finally {
+		mounted.dispose();
+	}
 });
 
 test('+page.svelte exportKitchen commits inline edits, merges account state, and distinguishes 401 expiry and offline modes', async () => {

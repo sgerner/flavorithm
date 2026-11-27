@@ -54,6 +54,17 @@ type LoadedJournal = {
 	blocked: boolean;
 	error: string;
 };
+type EventTargetLike = {
+	addEventListener: (type: string, listener: () => void) => void;
+	removeEventListener: (type: string, listener: () => void) => void;
+	visibilityState?: string;
+};
+type QueuedSyncPass = {
+	prefer?: 'local' | 'remote';
+	expectedEtag?: string | null;
+	promise: Promise<void>;
+	resolve: () => void;
+};
 type ActiveContext = {
 	user: User;
 	identity: Identity;
@@ -69,6 +80,7 @@ type ActiveContext = {
 	pendingDurable: boolean;
 	blockedByStorage: boolean;
 	syncing: boolean;
+	queuedSync: QueuedSyncPass | null;
 	initializedOnline: boolean;
 	conflicts: SyncConflict[];
 	storageAlert: string;
@@ -78,6 +90,14 @@ type ActiveContext = {
 	reviewedState: AppState | null;
 	error: string;
 };
+
+export const DEFAULT_SYNC_COALESCE_MS = 250;
+const scheduleMicrotask: (callback: () => void) => void =
+	typeof queueMicrotask === 'function'
+		? queueMicrotask
+		: (callback) => {
+				void Promise.resolve().then(callback);
+			};
 
 const WRITER_STORAGE_KEY = 'flavorithm-writer-id:v1';
 const STAGE_QUOTA_ALERT =
@@ -414,6 +434,8 @@ export function createKitchenSync(options: {
 	function activate(user: User): ActiveContext | null {
 		const identity = { userId: user.id, householdId: user.householdId };
 		if (!isSameIdentity(options.getUser(), identity)) return null;
+		const previousQueued = active?.queuedSync;
+		if (active) active.queuedSync = null;
 		generation += 1;
 		const key = identityKey(identity);
 		const baseline = baselines.get(key) || readConfirmed(options.storage, identity);
@@ -432,6 +454,7 @@ export function createKitchenSync(options: {
 			pendingDurable: false,
 			blockedByStorage: false,
 			syncing: false,
+			queuedSync: null,
 			initializedOnline: false,
 			conflicts: [],
 			storageAlert: '',
@@ -442,6 +465,7 @@ export function createKitchenSync(options: {
 			error: ''
 		};
 		active = context;
+		previousQueued?.resolve();
 		return context;
 	}
 
@@ -802,10 +826,31 @@ export function createKitchenSync(options: {
 	async function runSync(
 		prefer?: 'local' | 'remote',
 		expectedEtag?: string | null,
-		continuationDepth = 0
+		continuationDepth = 0,
+		isQueuedFollowUp = false
 	): Promise<void> {
 		const context = active;
-		if (!context || !isActive(context) || context.syncing) return;
+		if (!context || !isActive(context)) return;
+		if (context.syncing) {
+			// Queue one follow-up pass whenever sync() arrives during an in-flight pass so a failed
+			// or superseded pass is never silently hidden (#77 rule).
+			if (!context.queuedSync) {
+				let resolveQueued!: () => void;
+				const promise = new Promise<void>((resolve) => {
+					resolveQueued = resolve;
+				});
+				context.queuedSync = {
+					prefer,
+					expectedEtag,
+					promise,
+					resolve: resolveQueued
+				};
+			} else if (prefer !== undefined) {
+				context.queuedSync.prefer = prefer;
+				context.queuedSync.expectedEtag = expectedEtag;
+			}
+			return context.queuedSync.promise;
+		}
 		const loaded = loadJournal(context);
 		const persistentAlert =
 			(loaded.error && loaded.error !== STAGE_QUOTA_ALERT ? loaded.error : '') ||
@@ -814,6 +859,8 @@ export function createKitchenSync(options: {
 				: '');
 		if (loaded.error) context.storageAlert ||= loaded.error;
 		if (!loaded.records.length) {
+			const preservedPostSaveError =
+				isQueuedFollowUp && context.confirmed && context.error ? context.error : '';
 			context.pending = null;
 			context.pendingDurable = false;
 			context.blockedByStorage = !!loaded.error;
@@ -821,7 +868,9 @@ export function createKitchenSync(options: {
 			context.reviewedEtag = null;
 			context.reviewedState = null;
 			context.error =
-				loaded.error || context.storageAlert || (!context.confirmed ? context.loadError : '');
+				loaded.error ||
+				context.storageAlert ||
+				(!context.confirmed ? context.loadError : preservedPostSaveError);
 			emitStatus(context);
 			return;
 		}
@@ -988,27 +1037,38 @@ export function createKitchenSync(options: {
 				context.error = error instanceof Error ? error.message : 'Could not sync offline changes.';
 			}
 		} finally {
-			if (isActive(context)) {
+			const queued = context.queuedSync;
+			context.queuedSync = null;
+			if (!isActive(context)) {
+				queued?.resolve();
+			} else {
 				if (saved) {
 					context.reviewedEtag = context.conflicts.length ? savedEtag : null;
 					context.reviewedState = context.conflicts.length && savedState ? clone(savedState) : null;
 				}
 				context.syncing = false;
 				emitStatus(context);
-				if (shouldContinue && context.pending && !context.conflicts.length) {
-					void runSync(undefined, undefined, continuationDepth + 1);
+				if (queued) {
+					void runSync(queued.prefer, queued.expectedEtag, 0, true).finally(() => {
+						queued.resolve();
+					});
+				} else if (shouldContinue && context.pending && !context.conflicts.length) {
+					void runSync(undefined, undefined, continuationDepth + 1, false);
 				}
 			}
 		}
 	}
 
 	function sync(prefer?: 'local' | 'remote', expectedEtag?: string | null): Promise<void> {
-		return runSync(prefer, expectedEtag, 0);
+		return runSync(prefer, expectedEtag, 0, false);
 	}
 
 	function clearContext(): void {
+		const previousQueued = active?.queuedSync;
+		if (active) active.queuedSync = null;
 		generation += 1;
 		active = null;
+		previousQueued?.resolve();
 		options.onStatus({
 			ready: false,
 			pending: false,
@@ -1057,5 +1117,159 @@ export function createKitchenSync(options: {
 		quarantined,
 		exportBackup,
 		clearContext
+	};
+}
+
+/**
+ * Persists reactive kitchen mutations once per tick via microtask coalescing (or immediately via
+ * `persist()`/`flush()`), staging signed-in edits durably into the offline journal and writing
+ * guest edits to localStorage once guest persistence is ready while retaining dirty state across
+ * pre-auth windows and storage quota failures.
+ */
+export function createKitchenPersistence(options: {
+	storage: StorageLike;
+	getState: (context?: { coalesced?: boolean }) => AppState;
+	getUser: () => User | null;
+	isManagedAuth?: () => boolean;
+	isGuestReady?: () => boolean;
+	isKitchenLoaded?: () => boolean;
+	sync: Pick<ReturnType<typeof createKitchenSync>, 'stage'>;
+	onGuestQuotaError?: () => void;
+	onAfterPersist?: () => void;
+	onCancelScheduled?: () => void;
+}) {
+	let guestDirty = false;
+	let scheduledPersist = false;
+	let persistEpoch = 0;
+
+	function guestReady(): boolean {
+		return options.isGuestReady ? options.isGuestReady() : true;
+	}
+
+	function writeGuest(coalesced = false): boolean {
+		if (!guestDirty || options.isManagedAuth?.()) return false;
+		try {
+			options.storage.setItem(
+				'flavorithm-guest-kitchen',
+				JSON.stringify(options.getState({ coalesced }))
+			);
+			guestDirty = false;
+		} catch {
+			options.onGuestQuotaError?.();
+			return false;
+		}
+		options.onAfterPersist?.();
+		return true;
+	}
+
+	function runPersist(coalesced: boolean): boolean {
+		const managed = Boolean(options.isManagedAuth?.());
+		const currentUser = options.getUser();
+		if (managed && (!currentUser || !(options.isKitchenLoaded?.() ?? true))) {
+			options.onCancelScheduled?.();
+			return false;
+		}
+		if (currentUser) {
+			guestDirty = false;
+			options.sync.stage(options.getState({ coalesced }));
+			options.onAfterPersist?.();
+			return true;
+		}
+		if (!managed) {
+			guestDirty = true;
+			if (guestReady()) {
+				return writeGuest(coalesced);
+			}
+		}
+		return false;
+	}
+
+	function schedule(): void {
+		if (scheduledPersist) return;
+		scheduledPersist = true;
+		const epoch = ++persistEpoch;
+		scheduleMicrotask(() => {
+			if (!scheduledPersist || epoch !== persistEpoch) return;
+			scheduledPersist = false;
+			runPersist(true);
+		});
+	}
+
+	function persist(): boolean {
+		scheduledPersist = false;
+		persistEpoch += 1;
+		return runPersist(false);
+	}
+
+	function flush(flushOptions?: { allowBeforeGuestReady?: boolean }): boolean {
+		let persistedScheduled = false;
+		if (scheduledPersist) {
+			scheduledPersist = false;
+			persistEpoch += 1;
+			persistedScheduled = runPersist(true);
+		}
+		if (options.getUser()) {
+			guestDirty = false;
+			return persistedScheduled;
+		}
+		if (
+			guestDirty &&
+			!options.isManagedAuth?.() &&
+			(guestReady() || flushOptions?.allowBeforeGuestReady)
+		) {
+			return writeGuest(false) || persistedScheduled;
+		}
+		return persistedScheduled;
+	}
+
+	function onGuestReady(): boolean {
+		return flush();
+	}
+
+	function cancelScheduled(): void {
+		scheduledPersist = false;
+		persistEpoch += 1;
+		options.onCancelScheduled?.();
+	}
+
+	function cancel(): void {
+		cancelScheduled();
+		guestDirty = false;
+	}
+
+	function hasPending(): boolean {
+		return guestDirty || scheduledPersist;
+	}
+
+	function bindLifecycle(win?: EventTargetLike | null, doc?: EventTargetLike | null): () => void {
+		const onVisibilityChange = () => {
+			if (!doc?.visibilityState || doc.visibilityState === 'hidden') {
+				flush();
+			}
+		};
+		const onLifecycleFlush = () => {
+			flush();
+		};
+		doc?.addEventListener('visibilitychange', onVisibilityChange);
+		win?.addEventListener('visibilitychange', onVisibilityChange);
+		win?.addEventListener('pagehide', onLifecycleFlush);
+		win?.addEventListener('beforeunload', onLifecycleFlush);
+		return () => {
+			doc?.removeEventListener('visibilitychange', onVisibilityChange);
+			win?.removeEventListener('visibilitychange', onVisibilityChange);
+			win?.removeEventListener('pagehide', onLifecycleFlush);
+			win?.removeEventListener('beforeunload', onLifecycleFlush);
+		};
+	}
+
+	return {
+		schedule,
+		persist,
+		flush,
+		onGuestReady,
+		cancelScheduled,
+		cancel,
+		hasPending,
+		bindLifecycle
 	};
 }
