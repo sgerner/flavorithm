@@ -17,6 +17,7 @@ import * as coverUploadMod from '../src/lib/cover-upload.ts';
 import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
+import * as formValidationMod from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
 import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
@@ -95,6 +96,7 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.recipes = [...kitchen.recipes];
 		},
 		logout,
+		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
 		exportKitchen,
 		exportPendingChanges,
@@ -187,6 +189,7 @@ type PlannerHarnessApi = {
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
 	logout: () => Promise<void>;
+	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
 	exportKitchen: () => Promise<void>;
 	exportPendingChanges: () => void;
@@ -214,6 +217,8 @@ function createModuleMap() {
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/form-validation.ts': formValidationMod,
+		'#lib/components/FormField.svelte': { default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -866,6 +871,7 @@ test('incremental history slicing reveals 20 rows per click, preserves limit acr
 			email: 'sam@example.test',
 			householdId: 'h-2'
 		};
+		api.deletePassword = 'valid-password';
 		await api.deleteAccount({ preventDefault: () => {} } as SubmitEvent);
 		assert.equal(api.cookedHistoryLimit, 20);
 	} finally {
