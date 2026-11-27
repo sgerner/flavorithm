@@ -1282,10 +1282,30 @@
 				void retrySync();
 			}, 500);
 	});
+	function safeBrowserStorage(kind: 'localStorage' | 'sessionStorage'): Storage | null {
+		try {
+			return typeof window !== 'undefined' ? window[kind] : (globalThis[kind] ?? null);
+		} catch {
+			return null;
+		}
+	}
+	function createMemoryStorageFallback(): Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> {
+		const entries = new Map<string, string>();
+		return {
+			getItem: (key) => entries.get(key) ?? null,
+			setItem: (key, value) => {
+				entries.set(key, String(value));
+			},
+			removeItem: (key) => {
+				entries.delete(key);
+			}
+		};
+	}
 	onMount(() => {
 		online = navigator.onLine;
 		kitchenSync = createKitchenSync({
-			storage: localStorage,
+			storage: safeBrowserStorage('localStorage') ?? createMemoryStorageFallback(),
+			sessionStorage: safeBrowserStorage('sessionStorage'),
 			getUser: () => user,
 			getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
 			setState: (state) => {
@@ -4093,8 +4113,9 @@
 				state: currentState,
 				online: online && navigator.onLine,
 				pendingSnapshot: currentUser ? (kitchenSync?.snapshot() ?? null) : null,
+				quarantined: currentUser ? kitchenSync?.quarantined() : undefined,
 				hasPendingSync: currentUser ? pendingSync : false,
-				storage: currentUser ? localStorage : null,
+				storage: currentUser ? safeBrowserStorage('localStorage') : null,
 				fetcher: currentUser ? fetch : undefined
 			});
 			download(result.json, result.filename, 'application/json');
@@ -4132,14 +4153,29 @@
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
 			cancelScan(true);
 			if (user) {
-				for (const key of Object.keys(localStorage)) {
-					if (key.startsWith('flavorithm-') && key.includes(`:${user.id}:`))
-						localStorage.removeItem(key);
+				try {
+					const store = safeBrowserStorage('localStorage');
+					if (store) {
+						const encodedId = encodeURIComponent(user.id);
+						for (const key of Object.keys(store)) {
+							if (
+								key.startsWith('flavorithm-') &&
+								(key.includes(`:${user.id}:`) || key.includes(`:${encodedId}:`))
+							)
+								store.removeItem(key);
+						}
+					}
+				} catch {
+					// Ignore blocked browser storage when clearing account keys.
 				}
 			}
 			kitchenSync?.clearContext();
 			clearHouseholdViewState();
-			localStorage.removeItem('flavorithm-last-account');
+			try {
+				safeBrowserStorage('localStorage')?.removeItem('flavorithm-last-account');
+			} catch {
+				// Ignore blocked browser storage.
+			}
 			user = null;
 			inviteCode = '';
 			currentInviteId = '';
