@@ -148,7 +148,7 @@
 			<span class="toast-message">{visibleToast.message}</span>
 			{#if visibleToast.undo}
 				<button type="button" class="toast-undo" onclick={() => runToastUndo(effectiveOwner)}
-					>Undo</button
+					>{visibleToast.actionLabel || 'Undo'}</button
 				>
 			{/if}
 			<button type="button" onclick={dismissToast} aria-label="Dismiss notification"

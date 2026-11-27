@@ -22,6 +22,7 @@
 		value = '',
 		fallback = '',
 		disabled = false,
+		describedBy,
 		onselect
 	}: {
 		label: string;
@@ -30,6 +31,7 @@
 		value?: string;
 		fallback?: string;
 		disabled?: boolean;
+		describedBy?: string;
 		onselect: (id: string) => void;
 	} = $props();
 	const id = $props.id();
@@ -87,6 +89,8 @@
 			aria-expanded={open && !disabled}
 			aria-controls={open && !disabled ? `${id}-list` : undefined}
 			aria-activedescendant={activeOptionId(id, open, disabled, visible, active)}
+			aria-describedby={describedBy}
+			aria-invalid="false"
 			value={resolvePickerValue({ options, value, fallback, query, filtering })}
 			{placeholder}
 			{disabled}

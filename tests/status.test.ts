@@ -244,6 +244,13 @@ test('tracks modal announcer stack and scopes active announcements to topmost op
 test('formats recipe, pantry, online search, and Undo status messages clearly', () => {
 	assert.equal(formatUndoAnnouncement('Olive oil removed.'), 'Olive oil removed. Undo available.');
 	assert.equal(formatUndoAnnouncement('Changes applied'), 'Changes applied. Undo available.');
+	assert.equal(
+		formatUndoAnnouncement(
+			'Device storage is full. Export your kitchen before leaving.',
+			'Export now'
+		),
+		'Device storage is full. Export your kitchen before leaving. Export now available.'
+	);
 
 	assert.equal(formatRecipeStatus(1, 'discover', false, false), '1 recipe shown.');
 	assert.equal(formatRecipeStatus(4, 'saved', true, false), '4 saved recipes shown.');

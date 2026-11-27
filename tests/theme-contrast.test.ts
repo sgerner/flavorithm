@@ -748,8 +748,6 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 		return props;
 	}
 
-	const unwrapSvelteGlobal = (sel: string): string =>
-		sel.trim().replace(/:global\(([^()]+)\)/g, '$1');
 	const issues: string[] = [];
 	const allForcedSelectors = new Set<string>();
 
@@ -764,7 +762,7 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 				if (!rule.media || !rule.media.includes('forced-colors: active')) continue;
 				const props = parseProps(rule.body);
 				const propMap = new Map(props.map((p) => [p.prop, p.value]));
-				const selectors = rule.selector.split(',').map(unwrapSvelteGlobal);
+				const selectors = rule.selector.split(',').map((s) => s.trim());
 				for (const sel of selectors) {
 					allForcedSelectors.add(sel);
 					if (propMap.get('box-shadow') === 'none') {
@@ -814,7 +812,7 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 			for (const rule of rules) {
 				if (rule.media) continue;
 				if (!rule.body.includes('var(--focus-inner)')) continue;
-				for (const sel of rule.selector.split(',').map(unwrapSvelteGlobal)) {
+				for (const sel of rule.selector.split(',').map((s) => s.trim())) {
 					if (!fileForcedFocusResetSelectors.has(sel)) {
 						issues.push(
 							`${rel} (${sel}): dual-ring var(--focus-inner) focus rule missing forced-colors box-shadow: none reset`
@@ -833,7 +831,7 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 		'.primary',
 		'.filter-tabs button.active',
 		'.shopping-filters button.active',
-		'.expiry-filters button.active',
+		'.expiry-filters :global(button.active)',
 		'.theme-grid button.active',
 		'.steps-list li button.done',
 		'.check-box.checked',
@@ -857,11 +855,14 @@ test('@media (forced-colors: active) uses system colors, resets dual-ring shadow
 	const hasScopedExpiryForced = pageRules.some(
 		(rule) =>
 			Boolean(rule.media && rule.media.includes('forced-colors: active')) &&
-			rule.selector.split(',').map(unwrapSvelteGlobal).includes('.expiry-filters button.active')
+			rule.selector
+				.split(',')
+				.map((s) => s.trim())
+				.includes('.expiry-filters :global(button.active)')
 	);
 	if (!hasScopedExpiryForced) {
 		issues.push(
-			'src/routes/+page.svelte must define scoped @media (forced-colors: active) override for .expiry-filters button.active'
+			'src/routes/+page.svelte must define a global @media (forced-colors: active) override for .expiry-filters button.active'
 		);
 	}
 

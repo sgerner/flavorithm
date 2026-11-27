@@ -3,6 +3,7 @@ export type ToastItem = {
 	message: string;
 	owner: string;
 	undo: (() => void) | null;
+	actionLabel: string;
 };
 
 export type StatusSnapshot = {
@@ -22,6 +23,7 @@ export type AnnounceOptions = {
 
 export type NotifyOptions = {
 	owner?: string;
+	actionLabel?: string;
 };
 
 const DEFAULT_TOAST_DURATION_MS = 4200;
@@ -31,11 +33,12 @@ export function isToastVisibleForOwner(toast: ToastItem | null, owner: string): 
 	return Boolean(toast && toast.owner === owner);
 }
 
-export function formatUndoAnnouncement(message: string): string {
+export function formatUndoAnnouncement(message: string, actionLabel = 'Undo'): string {
 	const trimmed = message.trim();
 	if (!trimmed) return '';
 	const punctuated = /[.!?…]$/.test(trimmed) ? trimmed : `${trimmed}.`;
-	return `${punctuated} Undo available.`;
+	const label = actionLabel.trim() || 'Undo';
+	return `${punctuated} ${label} available.`;
 }
 
 export function formatRecipeStatus(
@@ -249,13 +252,15 @@ export function createStatusStore(options?: { toastDurationMs?: number; initialO
 		toastHovered = false;
 		toastFocused = false;
 		const id = ++toastId;
+		const actionLabel = undo ? notifyOptions?.actionLabel?.trim() || 'Undo' : 'Undo';
 		toast = {
 			id,
 			message: trimmed,
 			owner: toastOwner,
-			undo: undo ?? null
+			undo: undo ?? null,
+			actionLabel
 		};
-		commitAnnouncement(undo ? formatUndoAnnouncement(trimmed) : trimmed);
+		commitAnnouncement(undo ? formatUndoAnnouncement(trimmed, actionLabel) : trimmed);
 		if (!undo) {
 			scheduleToastAutoHide();
 		}
