@@ -6,12 +6,7 @@
 	import { describeBy, fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
-	import {
-		clampAllergies,
-		evaluateRecipeConflicts,
-		normalizeDiet,
-		parseAllergies
-	} from '#lib/discovery.ts';
+	import { evaluateRecipeConflicts, normalizeDiet, parseAllergies } from '#lib/discovery.ts';
 	import {
 		RATING_STARS,
 		bookmarkLabel,
@@ -121,7 +116,8 @@
 		Boolean(
 			preferences &&
 			(normalizeDiet(preferences.diet) !== 'none' ||
-				parseAllergies(clampAllergies(preferences.allergies)).length > 0)
+				Boolean(conflict?.hasConflict) ||
+				parseAllergies(preferences.allergies).length > 0)
 		)
 	);
 	let recipeTabButton = $state<HTMLButtonElement | null>(null);
@@ -239,9 +235,10 @@
 						<strong>{conflict.summary}</strong>
 					</div>
 					<p>
-						Culinary guidance only — not medical certification{recipe.provenance
+						Checks ingredients and tags only — recipe steps and notes are not scanned. Culinary
+						guidance only, not medical certification{recipe.provenance
 							? ' (especially for imported or AI-generated recipes)'
-							: ''}. Always verify every ingredient, substitution, and package label before cooking.
+							: ''}; always verify every ingredient, substitution, and package label before cooking.
 					</p>
 				</div>{/if}
 			<div class="tabs" role="tablist" aria-label="Recipe details">
@@ -318,8 +315,9 @@
 								</li>{/each}
 						</ul>
 						{#if hasActiveGuidance}<p class="label-check-note">
-								Check package labels and sub-ingredients before cooking; dietary and allergy flags
-								are culinary guidance, not medical certification.
+								Checks ingredients and tags only (steps and notes are not scanned). Check package
+								labels and sub-ingredients before cooking; dietary and allergy flags are culinary
+								guidance, not medical certification.
 							</p>{/if}
 					</div>
 					<div>

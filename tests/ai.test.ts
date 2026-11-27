@@ -2355,12 +2355,19 @@ test('model endpoint fetch uses the public models.dev catalog URL', async () => 
 	]);
 });
 
-test('client AI payloads pass validation across generate, vision, nutrition, search, and import for legacy and new profiles', async () => {
+test('client AI payloads carry full untruncated 2,000-char allergies across generate, vision, nutrition, search, and import and reject over-limit inputs', async () => {
 	const previousBrave = process.env.BRAVE_SEARCH_API_KEY;
 	process.env.BRAVE_SEARCH_API_KEY = 'brave-test-key';
 	try {
 		const kitchen = createInitialState();
-		const storedAllergies = `${'soy 🥜, sesame, '.repeat(60)}tail-marker`;
+		const prefix = 'soy, sesame, ';
+		const tail = 'severe peanut allergy';
+		const storedAllergies =
+			`${prefix.repeat(Math.floor((2_000 - tail.length) / prefix.length))}`.padEnd(
+				2_000 - tail.length,
+				' '
+			) + tail;
+		assert.equal(storedAllergies.length, 2_000);
 		kitchen.preferences.diet = 'Low-Carb';
 		kitchen.preferences.allergies = storedAllergies;
 		kitchen.preferences.complexity = 'Moderate'.padEnd(95, ' ');
@@ -2368,7 +2375,8 @@ test('client AI payloads pass validation across generate, vision, nutrition, sea
 		kitchen.recipes[0].rating = 5;
 
 		let activeAction: 'generate' | 'vision' | 'nutrition' | 'search' | 'import' = 'generate';
-		const providerFetcher: typeof fetch = async (input) => {
+		const capturedProviderBodies: string[] = [];
+		const providerFetcher: typeof fetch = async (input, init) => {
 			if (new URL(String(input)).origin === 'https://api.search.brave.com') {
 				return jsonResponse({
 					web: {
@@ -2381,6 +2389,9 @@ test('client AI payloads pass validation across generate, vision, nutrition, sea
 						]
 					}
 				});
+			}
+			if (typeof init?.body === 'string') {
+				capturedProviderBodies.push(init.body);
 			}
 			const mockContent =
 				activeAction === 'vision'
@@ -2423,40 +2434,29 @@ test('client AI payloads pass validation across generate, vision, nutrition, sea
 			});
 			assert.equal(kitchen.preferences.allergies, storedAllergies);
 			const aiAllergies = (payload.preferences as { allergies: string }).allergies;
-			assert.equal(aiAllergies.isWellFormed(), true);
-			assert.ok(Array.from(aiAllergies).length <= 500);
+			assert.equal(aiAllergies, storedAllergies);
+			assert.equal(aiAllergies.length, 2_000);
 			await assert.doesNotReject(() => runAIRequest(payload, providerFetcher, pageFetcher));
 		}
 
-		activeAction = 'generate';
-		await assert.doesNotReject(() =>
+		assert.ok(
+			capturedProviderBodies.some((body) => body.includes(storedAllergies)),
+			'expected outbound AI provider prompt to carry full untruncated 2,000-character allergies text'
+		);
+
+		await assert.rejects(
 			runAIRequest(
 				{
 					action: 'generate',
 					provider: 'openai',
 					model: 'gpt-4o-mini',
 					apiKey: 'temporary-test-key',
-					preferences: { ...preferences, allergies: '🥜'.repeat(500) }
+					preferences: { ...preferences, allergies: 'x'.repeat(2_001) }
 				},
 				providerFetcher
-			)
+			),
+			(error: unknown) => error instanceof AIRequestError && error.status === 400
 		);
-
-		for (const overLimit of ['x'.repeat(501), '🥜'.repeat(501)]) {
-			await assert.rejects(
-				runAIRequest(
-					{
-						action: 'generate',
-						provider: 'openai',
-						model: 'gpt-4o-mini',
-						apiKey: 'temporary-test-key',
-						preferences: { ...preferences, allergies: overLimit }
-					},
-					providerFetcher
-				),
-				(error: unknown) => error instanceof AIRequestError && error.status === 400
-			);
-		}
 	} finally {
 		if (previousBrave === undefined) delete process.env.BRAVE_SEARCH_API_KEY;
 		else process.env.BRAVE_SEARCH_API_KEY = previousBrave;

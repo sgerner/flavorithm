@@ -1,12 +1,11 @@
 import type { AppState, Ingredient, Preferences, Recipe } from './types';
+import { seedRecipes } from './data.ts';
 import { normalizeName } from './domain.ts';
 import {
 	convertCompatibleQuantity,
 	expiryStatus,
 	normalizeIngredientName
 } from './kitchen-workflows.ts';
-
-export const MAX_ALLERGIES_LENGTH = 500;
 
 export const DIET_OPTIONS = [
 	{ value: 'none', label: 'No dietary restriction' },
@@ -29,14 +28,25 @@ export type RecipeConflictReport = {
 	dietLabel: string;
 	dietCategories: DietConflictCategory[];
 	allergenMatches: string[];
+	labelCheckItems: string[];
+	unrecognizedAllergens: string[];
 	matchingIngredientIndices: number[];
 	ingredientReasons: Record<number, string[]>;
 	badge: string;
 	summary: string;
 };
 
+function foldAscii(value: string): string {
+	return value
+		.normalize('NFD')
+		.replace(/[\u0300-\u036f]/g, '')
+		.toLowerCase()
+		.trim()
+		.replace(/\s+/g, ' ');
+}
+
 function normalized(value: string): string {
-	return value.toLowerCase().trim().replace(/\s+/g, ' ');
+	return foldAscii(value);
 }
 
 const NONE_DIET_ALIASES = new Set([
@@ -47,7 +57,26 @@ const NONE_DIET_ALIASES = new Set([
 	'no preference',
 	'no-preference',
 	'no dietary restriction',
+	'no dietary restrictions',
 	'a bit of everything'
+]);
+
+const NONE_ALLERGY_ALIASES = new Set([
+	...NONE_DIET_ALIASES,
+	'no',
+	'na',
+	'n a',
+	'n/a',
+	'nil',
+	'nothing',
+	'no allergy',
+	'no allergies',
+	'no known allergy',
+	'no known allergies',
+	'no food allergy',
+	'no food allergies',
+	'no restriction',
+	'no restrictions'
 ]);
 
 const CANONICAL_DIETS: Record<string, DietValue> = {
@@ -67,23 +96,6 @@ export function normalizeDiet(value: string | undefined | null): string {
 	const hyphenated = cleaned.replace(/[\s_]+/g, '-');
 	if (NONE_DIET_ALIASES.has(hyphenated)) return 'none';
 	return CANONICAL_DIETS[hyphenated] ?? cleaned;
-}
-
-function sliceCodePoints(value: string, maxCodePoints: number): string {
-	if (value.length <= maxCodePoints) return value;
-	let count = 0;
-	let end = 0;
-	for (const char of value) {
-		if (count >= maxCodePoints) break;
-		end += char.length;
-		count += 1;
-	}
-	return value.slice(0, end);
-}
-
-/** Clamp allergy free-text to 500 Unicode code points for matching and AI prompts without splitting surrogate pairs. */
-export function clampAllergies(value: string | undefined | null): string {
-	return typeof value === 'string' ? sliceCodePoints(value, MAX_ALLERGIES_LENGTH) : '';
 }
 
 /** Resolve a human-readable label for a saved or buffered diet value. */
@@ -106,19 +118,26 @@ const IRREGULAR_SINGULARS: Record<string, string> = {
 	raspberries: 'raspberry',
 	blackberries: 'blackberry',
 	pastries: 'pastry',
+	cookies: 'cookie',
+	brownies: 'brownie',
+	blondies: 'blondie',
+	pierogies: 'pierogi',
 	tomatoes: 'tomato',
 	potatoes: 'potato',
 	avocadoes: 'avocado',
 	mangoes: 'mango',
 	halves: 'half',
 	loaves: 'loaf',
-	leaves: 'leaf'
+	leaves: 'leaf',
+	calves: 'calf',
+	knives: 'knife'
 };
 
 const INVARIANT_S_WORDS = new Set([
 	'couscous',
 	'asparagus',
 	'hummus',
+	'houmous',
 	'molasses',
 	'swiss',
 	'bass',
@@ -146,16 +165,22 @@ function singularizeWord(word: string): string {
 }
 
 function wordTokens(value: string): string[] {
-	return value
-		.toLowerCase()
+	return foldAscii(value)
 		.split(/[^a-z0-9]+/)
 		.filter(Boolean)
 		.map(singularizeWord);
 }
 
+function phraseTokens(phrase: string): { raw: string[]; singular: string[] } {
+	const raw = foldAscii(phrase)
+		.split(/[^a-z0-9]+/)
+		.filter(Boolean);
+	return { raw, singular: raw.map(singularizeWord) };
+}
+
 function buildTokenVariants(rawText: string): { canonical: string; tokenSets: string[][] } {
-	const raw = normalized(rawText);
-	const canonical = normalizeName(rawText);
+	const raw = foldAscii(rawText);
+	const canonical = foldAscii(normalizeName(rawText));
 	const rawWords = raw.split(/[^a-z0-9]+/).filter(Boolean);
 	const canonicalWords = canonical.split(/[^a-z0-9]+/).filter(Boolean);
 	return {
@@ -169,44 +194,227 @@ function buildTokenVariants(rawText: string): { canonical: string; tokenSets: st
 	};
 }
 
-function containsWholePhrase(tokenSets: string[][], phrase: string): boolean {
-	const rawTarget = phrase
-		.toLowerCase()
-		.split(/[^a-z0-9]+/)
-		.filter(Boolean);
-	if (!rawTarget.length) return false;
-	const singularTarget = rawTarget.map(singularizeWord);
-	for (const tokens of tokenSets) {
-		for (const target of [rawTarget, singularTarget]) {
-			if (tokens.length < target.length) continue;
-			for (let index = 0; index <= tokens.length - target.length; index++) {
-				let matched = true;
-				for (let offset = 0; offset < target.length; offset++) {
-					if (tokens[index + offset] !== target[offset]) {
-						matched = false;
-						break;
-					}
-				}
-				if (matched) return true;
+function tokensContainSequence(tokens: readonly string[], target: readonly string[]): boolean {
+	if (!target.length || tokens.length < target.length) return false;
+	for (let index = 0; index <= tokens.length - target.length; index++) {
+		let matched = true;
+		for (let offset = 0; offset < target.length; offset++) {
+			if (tokens[index + offset] !== target[offset]) {
+				matched = false;
+				break;
 			}
+		}
+		if (matched) return true;
+	}
+	return false;
+}
+
+function containsWholePhrase(tokenSets: readonly (readonly string[])[], phrase: string): boolean {
+	const { raw, singular } = phraseTokens(phrase);
+	if (!raw.length) return false;
+	for (const tokens of tokenSets) {
+		if (tokensContainSequence(tokens, raw) || tokensContainSequence(tokens, singular)) {
+			return true;
 		}
 	}
 	return false;
 }
 
-function matchesAnyPhrase(tokenSets: string[][], phrases: readonly string[]): boolean {
+function matchesAnyPhrase(
+	tokenSets: readonly (readonly string[])[],
+	phrases: readonly string[]
+): boolean {
 	return phrases.some((phrase) => containsWholePhrase(tokenSets, phrase));
 }
 
-const CATEGORY_RULES: Record<
-	DietConflictCategory,
-	{
-		terms: readonly string[];
-		exemptions: readonly string[];
-		tagTerms: readonly string[];
-		tagExemptions: readonly string[];
+function stripSpanFromTokens(tokens: readonly string[], spans: readonly string[]): string[] {
+	if (!tokens.length || !spans.length) return [...tokens];
+	const parsedSpans = spans
+		.map(phraseTokens)
+		.filter((entry) => entry.raw.length > 0)
+		.sort((a, b) => b.raw.length - a.raw.length);
+	const out: string[] = [];
+	let index = 0;
+	while (index < tokens.length) {
+		let skipLength = 0;
+		for (const span of parsedSpans) {
+			const len = span.raw.length;
+			if (index + len > tokens.length) continue;
+			let rawMatch = true;
+			let singularMatch = true;
+			for (let offset = 0; offset < len; offset++) {
+				const tok = tokens[index + offset];
+				if (tok !== span.raw[offset]) rawMatch = false;
+				if (singularizeWord(tok) !== span.singular[offset]) singularMatch = false;
+				if (!rawMatch && !singularMatch) break;
+			}
+			if (rawMatch || singularMatch) {
+				skipLength = len;
+				break;
+			}
+		}
+		if (skipLength > 0) {
+			index += skipLength;
+		} else {
+			out.push(tokens[index]);
+			index += 1;
+		}
 	}
-> = {
+	return out;
+}
+
+function stripExemptSpans(
+	tokenSets: readonly (readonly string[])[],
+	spanExemptions: readonly string[]
+): string[][] {
+	return tokenSets.map((tokens) => stripSpanFromTokens(tokens, spanExemptions));
+}
+
+const FISH_TERMS = [
+	'fish',
+	'salmon',
+	'tuna',
+	'ahi',
+	'albacore',
+	'yellowfin',
+	'bluefin',
+	'cod',
+	'scrod',
+	'bacalao',
+	'black cod',
+	'sablefish',
+	'halibut',
+	'tilapia',
+	'trout',
+	'steelhead',
+	'arctic char',
+	'mackerel',
+	'sardine',
+	'pilchard',
+	'anchovy',
+	'snapper',
+	'mahimahi',
+	'mahi',
+	'dorado',
+	'haddock',
+	'catfish',
+	'swordfish',
+	'sole',
+	'flounder',
+	'plaice',
+	'turbot',
+	'pollock',
+	'walleye',
+	'whiting',
+	'hake',
+	'herring',
+	'kipper',
+	'sprat',
+	'whitebait',
+	'grouper',
+	'eel',
+	'unagi',
+	'anago',
+	'bass',
+	'sea bass',
+	'branzino',
+	'striped bass',
+	'perch',
+	'pike',
+	'carp',
+	'monkfish',
+	'anglerfish',
+	'barramundi',
+	'hamachi',
+	'yellowtail',
+	'amberjack',
+	'kampachi',
+	'wahoo',
+	'ono',
+	'cobia',
+	'pompano',
+	'mullet',
+	'bream',
+	'dorade',
+	'porgy',
+	'skate',
+	'sturgeon',
+	'orange roughy',
+	'toothfish',
+	'smelt',
+	'capelin',
+	'milkfish',
+	'fish sauce',
+	'nam pla',
+	'nuoc mam',
+	'worcestershire',
+	'dashi',
+	'bonito',
+	'katsuobushi',
+	'roe',
+	'caviar',
+	'ikura',
+	'tobiko',
+	'masago',
+	'taramasalata',
+	'surimi',
+	'imitation crab',
+	'fish stock',
+	'fish broth',
+	'fumet'
+] as const;
+
+const SHELLFISH_TERMS = [
+	'shellfish',
+	'crustacean',
+	'mollusc',
+	'mollusk',
+	'bivalve',
+	'cephalopod',
+	'shrimp',
+	'prawn',
+	'scampi',
+	'langoustine',
+	'crab',
+	'lobster',
+	'crayfish',
+	'crawfish',
+	'crawdad',
+	'krill',
+	'scallop',
+	'clam',
+	'quahog',
+	'cockle',
+	'geoduck',
+	'mussel',
+	'oyster',
+	'abalone',
+	'whelk',
+	'conch',
+	'periwinkle',
+	'escargot',
+	'snail',
+	'squid',
+	'calamari',
+	'cuttlefish',
+	'octopus',
+	'tako',
+	'uni',
+	'oyster sauce',
+	'shrimp paste',
+	'belacan',
+	'clam juice'
+] as const;
+
+type CategoryRule = {
+	terms: readonly string[];
+	labelExemptions: readonly string[];
+	spanExemptions: readonly string[];
+	tagTerms: readonly string[];
+	tagExemptions: readonly string[];
+};
+
+const CATEGORY_RULES: Record<DietConflictCategory, CategoryRule> = {
 	meat: {
 		terms: [
 			'meat',
@@ -215,7 +423,13 @@ const CATEGORY_RULES: Record<
 			'brisket',
 			'sirloin',
 			'ribeye',
+			'tenderloin',
+			'filet mignon',
+			'flank',
 			'chuck',
+			'short rib',
+			'rib',
+			'oxtail',
 			'veal',
 			'pork',
 			'bacon',
@@ -223,43 +437,120 @@ const CATEGORY_RULES: Record<
 			'prosciutto',
 			'guanciale',
 			'ham',
+			'gammon',
 			'sausage',
 			'chorizo',
 			'pepperoni',
 			'salami',
+			'soppressata',
+			'mortadella',
+			'bologna',
+			'capicola',
+			'coppa',
+			'nduja',
+			'speck',
+			'pastrami',
+			'corned beef',
+			'roast beef',
 			'lamb',
 			'mutton',
+			'goat',
+			'cabrito',
 			'venison',
+			'deer',
+			'elk',
 			'bison',
+			'buffalo meat',
 			'boar',
+			'rabbit',
+			'hare',
+			'kangaroo',
+			'liver',
+			'pate',
+			'foie gras',
+			'kidney',
+			'tripe',
+			'sweetbread',
+			'offal',
+			'giblet',
+			'tongue',
+			'bone marrow',
 			'lard',
 			'tallow',
 			'suet',
+			'dripping',
 			'gelatin',
+			'rennet',
+			'isinglass',
+			'aspic',
 			'bone broth',
 			'beef broth',
 			'beef stock',
 			'pork broth',
+			'pork stock',
+			'veal stock',
+			'demi glace',
+			'consomme',
 			'meatball',
+			'meatloaf',
 			'bratwurst',
+			'kielbasa',
+			'andouille',
+			'merguez',
+			'lap cheong',
+			'blood sausage',
+			'black pudding',
+			'haggis',
 			'hot dog',
-			'short rib'
+			'hotdog',
+			'frankfurter',
+			'wiener',
+			'jerky',
+			'biltong',
+			'mince',
+			'minced beef',
+			'minced pork',
+			'minced lamb',
+			'carnitas',
+			'barbacoa',
+			'birria',
+			'char siu',
+			'spam',
+			'pork rind',
+			'chicharron',
+			'crackling'
 		],
-		exemptions: [
-			'vegan',
-			'plant based',
-			'meatless',
-			'meat free',
-			'beyond',
-			'impossible',
+		labelExemptions: ['vegan', 'plant based', 'meatless', 'meat free', 'beyond', 'impossible'],
+		spanExemptions: [
+			'goat cheese',
+			'goat milk',
+			'goat yogurt',
+			'goat butter',
 			'beefsteak tomato',
 			'mushroom bacon',
 			'coconut bacon',
 			'tempeh bacon',
 			'soy chorizo',
-			'jackfruit'
+			'vegan mince',
+			'plant mince',
+			'soy mince',
+			'quorn mince',
+			'meatless mince',
+			'mushroom jerky',
+			'soy jerky',
+			'jackfruit',
+			'celery rib',
+			'chard rib',
+			'kale rib',
+			'cabbage rib',
+			'romaine heart',
+			'artichoke heart',
+			'heart of palm',
+			'hearts of palm',
+			'peach halve',
+			'agar'
 		],
-		tagTerms: ['meat', 'beef', 'pork', 'lamb', 'bacon', 'steak'],
+		tagTerms: ['meat', 'beef', 'pork', 'lamb', 'bacon', 'steak', 'ribs'],
 		tagExemptions: ['meat-free', 'meat free', 'meatless', 'vegan', 'vegetarian', 'plant-based']
 	},
 	poultry: {
@@ -270,76 +561,39 @@ const CATEGORY_RULES: Record<
 			'duck',
 			'goose',
 			'quail',
+			'pheasant',
+			'squab',
+			'cornish hen',
 			'hen',
+			'gizzard',
 			'chicken broth',
 			'chicken stock',
 			'turkey broth',
+			'turkey stock',
 			'duck fat',
 			'schmaltz'
 		],
-		exemptions: ['vegan', 'plant based', 'meatless', 'chicken free', 'chicken of the woods'],
+		labelExemptions: ['vegan', 'plant based', 'meatless', 'chicken free'],
+		spanExemptions: ['chicken of the woods', 'chickpea', 'gooseberry'],
 		tagTerms: ['poultry', 'chicken', 'turkey', 'duck'],
 		tagExemptions: ['chicken-free', 'vegan', 'vegetarian', 'plant-based']
 	},
 	seafood: {
-		terms: [
-			'seafood',
-			'fish',
-			'salmon',
-			'tuna',
-			'cod',
-			'halibut',
-			'tilapia',
-			'trout',
-			'mackerel',
-			'sardine',
-			'anchovy',
-			'snapper',
-			'mahimahi',
-			'mahi',
-			'haddock',
-			'catfish',
-			'swordfish',
-			'sole',
-			'flounder',
-			'pollock',
-			'herring',
-			'sea bass',
-			'fish sauce',
-			'worcestershire',
-			'dashi',
-			'bonito',
-			'katsuobushi',
-			'shellfish',
-			'shrimp',
-			'prawn',
-			'crab',
-			'lobster',
-			'scallop',
-			'clam',
-			'mussel',
-			'oyster',
-			'squid',
-			'calamari',
-			'octopus',
-			'crayfish',
-			'crawfish',
-			'roe',
-			'caviar',
-			'surimi'
-		],
-		exemptions: [
-			'vegan',
-			'plant based',
-			'fish free',
+		terms: ['seafood', ...FISH_TERMS, ...SHELLFISH_TERMS],
+		labelExemptions: ['vegan', 'plant based', 'fish free', 'seafood free'],
+		spanExemptions: [
+			'vegan fish sauce',
+			'vegan worcestershire',
+			'vegan oyster sauce',
 			'oyster mushroom',
 			'king oyster',
 			'lobster mushroom',
 			'crabapple',
-			'oyster plant'
+			'oyster plant',
+			'solely'
 		],
 		tagTerms: ['seafood', 'fish', 'shellfish', 'salmon', 'shrimp'],
-		tagExemptions: ['fish-free', 'shellfish-free', 'vegan', 'vegetarian']
+		tagExemptions: ['fish-free', 'shellfish-free', 'seafood-free', 'vegan', 'vegetarian']
 	},
 	dairy: {
 		terms: [
@@ -348,11 +602,26 @@ const CATEGORY_RULES: Record<
 			'butter',
 			'ghee',
 			'cream',
+			'creme fraiche',
+			'fraiche',
+			'sour cream',
+			'heavy cream',
+			'whipping cream',
+			'whipped cream',
+			'clotted cream',
+			'double cream',
+			'condensed milk',
+			'evaporated milk',
 			'buttermilk',
 			'half and half',
 			'yogurt',
 			'yoghurt',
 			'kefir',
+			'skyr',
+			'labneh',
+			'lassi',
+			'raita',
+			'tzatziki',
 			'cheese',
 			'feta',
 			'parmesan',
@@ -365,6 +634,7 @@ const CATEGORY_RULES: Record<
 			'brie',
 			'camembert',
 			'gruyere',
+			'emmental',
 			'swiss',
 			'provolone',
 			'monterey jack',
@@ -375,22 +645,45 @@ const CATEGORY_RULES: Record<
 			'burrata',
 			'cotija',
 			'queso',
+			'manchego',
+			'asiago',
+			'fontina',
+			'havarti',
+			'muenster',
+			'colby',
+			'gorgonzola',
+			'roquefort',
+			'stilton',
+			'blue cheese',
+			'cream cheese',
+			'cottage cheese',
+			'quark',
+			'fromage',
 			'whey',
 			'casein',
 			'lactose',
-			'custard'
+			'custard',
+			'pastry cream',
+			'creme patissiere',
+			'creme anglaise',
+			'dulce de leche',
+			'ganache',
+			'bechamel',
+			'alfredo',
+			'ice cream',
+			'gelato',
+			'brioche'
 		],
-		exemptions: [
-			'dairy free',
-			'non dairy',
-			'nondairy',
-			'vegan',
-			'plant based',
+		labelExemptions: ['dairy free', 'non dairy', 'nondairy', 'vegan', 'plant based'],
+		spanExemptions: [
+			'sunflower seed butter',
 			'coconut milk',
 			'coconut cream',
+			'cream of coconut',
 			'coconut yogurt',
 			'coconut yoghurt',
 			'almond milk',
+			'almond cream',
 			'almond yogurt',
 			'oat milk',
 			'oat cream',
@@ -400,20 +693,30 @@ const CATEGORY_RULES: Record<
 			'soy yogurt',
 			'cashew milk',
 			'cashew cream',
+			'cashew yogurt',
 			'rice milk',
 			'hemp milk',
 			'pea milk',
 			'macadamia milk',
 			'hazelnut milk',
+			'walnut milk',
+			'pistachio milk',
 			'flax milk',
+			'sesame milk',
+			'nut milk',
 			'peanut butter',
 			'almond butter',
 			'cashew butter',
+			'walnut butter',
+			'pecan butter',
+			'pistachio butter',
+			'hazelnut butter',
+			'macadamia butter',
 			'sunflower butter',
-			'sunflower seed butter',
 			'seed butter',
 			'nut butter',
 			'cocoa butter',
+			'cacao butter',
 			'shea butter',
 			'apple butter',
 			'pumpkin butter',
@@ -421,19 +724,57 @@ const CATEGORY_RULES: Record<
 			'cookie butter',
 			'butter bean',
 			'butter lettuce',
+			'butterhead',
 			'butternut',
 			'cream of tartar',
-			'cream soda'
+			'cream soda',
+			'creamed honey',
+			'creamed corn',
+			'swiss chard',
+			'milkfish'
 		],
 		tagTerms: ['dairy', 'cheese', 'creamy-dairy'],
 		tagExemptions: ['dairy-free', 'dairy free', 'non-dairy', 'vegan']
 	},
 	egg: {
-		terms: ['egg', 'mayonnaise', 'mayo', 'aioli', 'meringue', 'hollandaise'],
-		exemptions: [
-			'egg free',
-			'vegan',
-			'plant based',
+		terms: [
+			'egg',
+			'egg white',
+			'egg yolk',
+			'egg wash',
+			'egg noodle',
+			'albumen',
+			'albumin',
+			'mayonnaise',
+			'mayo',
+			'aioli',
+			'meringue',
+			'hollandaise',
+			'bearnaise',
+			'remoulade',
+			'tartar sauce',
+			'custard',
+			'lemon curd',
+			'pastry cream',
+			'creme patissiere',
+			'creme anglaise',
+			'creme brulee',
+			'quiche',
+			'frittata',
+			'omelet',
+			'omelette',
+			'souffle',
+			'zabaglione',
+			'eggnog',
+			'brioche',
+			'challah'
+		],
+		labelExemptions: ['egg free', 'vegan', 'plant based'],
+		spanExemptions: [
+			'vegan mayo',
+			'vegan mayonnaise',
+			'vegan aioli',
+			'vegan brioche',
 			'eggplant',
 			'flax egg',
 			'chia egg',
@@ -444,7 +785,8 @@ const CATEGORY_RULES: Record<
 	},
 	honey: {
 		terms: ['honey', 'honeycomb', 'bee pollen', 'royal jelly'],
-		exemptions: ['vegan honey', 'honeydew', 'honeynut', 'honeycrisp'],
+		labelExemptions: ['vegan honey', 'honey free'],
+		spanExemptions: ['honeydew', 'honeynut', 'honeycrisp', 'honeybush'],
 		tagTerms: ['honey'],
 		tagExemptions: ['honey-free', 'vegan']
 	},
@@ -458,12 +800,15 @@ const CATEGORY_RULES: Record<
 			'spelt',
 			'farro',
 			'kamut',
+			'khorasan',
 			'einkorn',
+			'emmer',
 			'barley',
 			'rye',
 			'malt',
 			'triticale',
 			'bulgur',
+			'freekeh',
 			'couscous',
 			'orzo',
 			'pasta',
@@ -477,40 +822,114 @@ const CATEGORY_RULES: Record<
 			'ravioli',
 			'tortellini',
 			'gnocchi',
+			'ditalini',
+			'farfalle',
+			'fusilli',
+			'rotini',
+			'orecchiette',
+			'cavatappi',
+			'bucatini',
+			'tagliatelle',
+			'pappardelle',
+			'ziti',
+			'manicotti',
+			'cannelloni',
 			'udon',
 			'ramen',
+			'lo mein',
+			'chow mein',
+			'yakisoba',
+			'somen',
 			'noodle',
 			'bread',
 			'sourdough',
 			'flatbread',
 			'pita',
 			'naan',
+			'paratha',
+			'roti',
+			'chapati',
 			'baguette',
 			'ciabatta',
 			'brioche',
+			'challah',
 			'focaccia',
 			'bagel',
 			'croissant',
+			'pretzel',
+			'bun',
+			'dinner roll',
+			'hoagie',
+			'english muffin',
+			'muffin',
+			'scone',
+			'biscuit',
+			'dough',
+			'pastry',
+			'phyllo',
+			'filo',
+			'puff pastry',
+			'shortcrust',
+			'pie crust',
+			'tart shell',
+			'cake',
+			'cupcake',
+			'brownie',
+			'blondie',
+			'cookie',
+			'biscotti',
+			'shortbread',
+			'wafer',
+			'cracker',
+			'graham cracker',
+			'saltine',
+			'matzo',
+			'matzah',
+			'dumpling',
+			'gyoza',
+			'potsticker',
+			'wonton',
+			'bao',
+			'pierogi',
+			'pelmeni',
+			'empanada',
+			'samosa',
+			'spring roll',
+			'egg roll',
+			'pancake',
+			'crepe',
+			'waffle',
+			'french toast',
+			'cereal',
+			'muesli',
+			'bran',
 			'tortilla',
 			'wrap',
 			'lavash',
 			'breadcrumb',
 			'panko',
 			'crouton',
+			'stuffing',
+			'roux',
+			'tempura',
 			'seitan',
 			'soy sauce',
+			'shoyu',
 			'teriyaki sauce',
 			'hoisin sauce',
-			'beer'
+			'beer',
+			'ale',
+			'lager',
+			'stout'
 		],
-		exemptions: [
-			'gluten free',
-			'gf',
+		labelExemptions: ['gluten free', 'gf'],
+		spanExemptions: [
 			'tamari',
 			'coconut amino',
 			'liquid amino',
 			'rice flour',
 			'glutinous rice',
+			'sweet rice flour',
 			'almond flour',
 			'almond meal',
 			'coconut flour',
@@ -521,28 +940,50 @@ const CATEGORY_RULES: Record<
 			'potato starch',
 			'potato flour',
 			'tapioca',
+			'tapioca flour',
 			'arrowroot',
+			'arrowroot flour',
 			'chickpea flour',
 			'besan',
 			'gram flour',
 			'sorghum flour',
-			'buckwheat',
 			'cassava flour',
 			'teff flour',
 			'quinoa flour',
+			'amaranth flour',
+			'millet flour',
+			'chestnut flour',
+			'hazelnut flour',
+			'buckwheat flour',
 			'oat flour',
+			'oat bran',
+			'rice bran',
 			'corn tortilla',
+			'cassava tortilla',
+			'almond flour tortilla',
 			'rice noodle',
+			'soba noodle',
 			'rice paper',
+			'rice wrapper',
+			'spring roll rice paper',
 			'glass noodle',
 			'mung bean noodle',
 			'cellophane noodle',
+			'sweet potato noodle',
+			'dangmyeon',
 			'shirataki',
 			'kelp noodle',
 			'zucchini noodle',
-			'lettuce wrap'
+			'cauliflower gnocchi',
+			'rice cracker',
+			'rice cake',
+			'fish cake',
+			'crab cake',
+			'lettuce wrap',
+			'ginger beer',
+			'root beer'
 		],
-		tagTerms: ['gluten', 'wheat', 'pasta', 'bread'],
+		tagTerms: ['gluten', 'wheat', 'pasta', 'bread', 'pastry'],
 		tagExemptions: ['gluten-free', 'gluten free', 'grain-free']
 	},
 	carb: {
@@ -557,6 +998,8 @@ const CATEGORY_RULES: Record<
 			'oat',
 			'oatmeal',
 			'granola',
+			'muesli',
+			'cereal',
 			'polenta',
 			'grits',
 			'cornmeal',
@@ -593,9 +1036,20 @@ const CATEGORY_RULES: Record<
 			'baguette',
 			'ciabatta',
 			'brioche',
+			'challah',
 			'focaccia',
 			'bagel',
 			'croissant',
+			'pretzel',
+			'bun',
+			'dough',
+			'pastry',
+			'pie crust',
+			'cake',
+			'cookie',
+			'dumpling',
+			'pancake',
+			'waffle',
 			'tortilla',
 			'wrap',
 			'breadcrumb',
@@ -618,12 +1072,11 @@ const CATEGORY_RULES: Record<
 			'date',
 			'raisin'
 		],
-		exemptions: [
-			'low carb',
-			'keto',
-			'sugar free',
+		labelExemptions: ['low carb', 'keto', 'sugar free'],
+		spanExemptions: [
 			'cauliflower rice',
 			'riced cauliflower',
+			'broccoli rice',
 			'zucchini noodle',
 			'shirataki',
 			'konjac',
@@ -650,6 +1103,31 @@ const CATEGORY_RULES: Record<
 	}
 };
 
+const GLUTEN_LABEL_CHECK_RULES: ReadonlyArray<{ label: string; terms: readonly string[] }> = [
+	{
+		label: 'oats',
+		terms: [
+			'oat',
+			'oats',
+			'oatmeal',
+			'oat flour',
+			'oat milk',
+			'oat cream',
+			'oat yogurt',
+			'oat bran',
+			'granola'
+		]
+	},
+	{
+		label: 'buckwheat',
+		terms: ['buckwheat', 'buckwheat flour', 'kasha']
+	},
+	{
+		label: 'soba',
+		terms: ['soba', 'soba noodle']
+	}
+];
+
 const DIET_EXCLUDED_CATEGORIES: Record<string, readonly DietConflictCategory[]> = {
 	none: [],
 	vegetarian: ['meat', 'poultry', 'seafood'],
@@ -660,10 +1138,66 @@ const DIET_EXCLUDED_CATEGORIES: Record<string, readonly DietConflictCategory[]> 
 	'low-carb': ['carb']
 };
 
-const ALLERGEN_EXPANSIONS: Record<
-	string,
-	{ terms: readonly string[]; exemptions?: readonly string[] }
-> = {
+type AllergenExpansion = {
+	terms: readonly string[];
+	labelExemptions?: readonly string[];
+	spanExemptions?: readonly string[];
+	checkGlutenLabels?: boolean;
+};
+
+const TREE_NUT_TERMS = [
+	'tree nut',
+	'nut',
+	'nut butter',
+	'nut milk',
+	'pesto',
+	'almond',
+	'walnut',
+	'pecan',
+	'cashew',
+	'pistachio',
+	'hazelnut',
+	'filbert',
+	'macadamia',
+	'pine nut',
+	'pinoli',
+	'pignoli',
+	'brazil nut',
+	'chestnut',
+	'praline',
+	'marzipan',
+	'gianduja',
+	'nougat',
+	'frangipane'
+] as const;
+
+const NUT_SPAN_EXEMPTIONS = [
+	'water chestnut',
+	'tiger nut',
+	'tigernut',
+	'butternut',
+	'coconut',
+	'nutmeg',
+	'doughnut',
+	'donut',
+	'breadnut',
+	'chufa'
+] as const;
+
+const PEANUT_TERMS = [
+	'peanut',
+	'groundnut',
+	'arachis',
+	'goober',
+	'satay',
+	'sate',
+	'pad thai',
+	'pad thai sauce',
+	'kung pao',
+	'kare kare'
+] as const;
+
+const ALLERGEN_EXPANSIONS: Record<string, AllergenExpansion> = {
 	soy: {
 		terms: [
 			'soy',
@@ -675,268 +1209,779 @@ const ALLERGEN_EXPANSIONS: Record<
 			'miso',
 			'tamari',
 			'shoyu',
-			'natto'
+			'natto',
+			'teriyaki sauce',
+			'hoisin sauce',
+			'textured vegetable protein',
+			'tvp'
 		],
-		exemptions: ['soy free']
-	},
-	soya: {
-		terms: [
-			'soy',
-			'soya',
-			'soybean',
-			'tofu',
-			'edamame',
-			'tempeh',
-			'miso',
-			'tamari',
-			'shoyu',
-			'natto'
-		],
-		exemptions: ['soy free']
+		labelExemptions: ['soy free']
 	},
 	sesame: {
-		terms: ['sesame', 'tahini', 'halva', 'gomashio'],
-		exemptions: ['sesame free']
+		terms: [
+			'sesame',
+			'tahini',
+			'tahina',
+			'halva',
+			'halvah',
+			'gomashio',
+			'gomasio',
+			'hummus',
+			'houmous',
+			'baba ganoush',
+			'baba ghanoush',
+			'zaatar'
+		],
+		labelExemptions: ['sesame free']
 	},
 	peanut: {
-		terms: ['peanut', 'groundnut'],
-		exemptions: ['peanut free']
+		terms: PEANUT_TERMS,
+		labelExemptions: ['peanut free', 'nut free']
 	},
 	nut: {
-		terms: [
-			'nut',
-			'almond',
-			'walnut',
-			'pecan',
-			'cashew',
-			'pistachio',
-			'hazelnut',
-			'macadamia',
-			'pine nut',
-			'brazil nut',
-			'chestnut',
-			'praline',
-			'marzipan'
-		],
-		exemptions: [
-			'nut free',
-			'butternut',
-			'coconut',
-			'nutmeg',
-			'water chestnut',
-			'doughnut',
-			'donut'
-		]
+		terms: [...TREE_NUT_TERMS, ...PEANUT_TERMS],
+		labelExemptions: ['nut free'],
+		spanExemptions: NUT_SPAN_EXEMPTIONS
 	},
 	'tree nut': {
-		terms: [
-			'almond',
-			'walnut',
-			'pecan',
-			'cashew',
-			'pistachio',
-			'hazelnut',
-			'macadamia',
-			'pine nut',
-			'brazil nut',
-			'chestnut',
-			'praline',
-			'marzipan'
-		],
-		exemptions: ['nut free', 'tree nut free', 'butternut', 'coconut', 'nutmeg', 'water chestnut']
+		terms: TREE_NUT_TERMS,
+		labelExemptions: ['tree nut free', 'nut free'],
+		spanExemptions: [...NUT_SPAN_EXEMPTIONS, 'peanut butter', 'peanut oil', 'peanut']
+	},
+	seafood: {
+		terms: CATEGORY_RULES.seafood.terms,
+		labelExemptions: CATEGORY_RULES.seafood.labelExemptions,
+		spanExemptions: CATEGORY_RULES.seafood.spanExemptions
 	},
 	shellfish: {
-		terms: [
-			'shellfish',
-			'shrimp',
-			'prawn',
-			'crab',
-			'lobster',
-			'scallop',
-			'clam',
-			'mussel',
-			'oyster',
-			'squid',
-			'calamari',
-			'octopus',
-			'crayfish',
-			'crawfish'
-		],
-		exemptions: [
-			'shellfish free',
+		terms: SHELLFISH_TERMS,
+		labelExemptions: ['shellfish free', 'seafood free'],
+		spanExemptions: [
+			'vegan oyster sauce',
 			'oyster mushroom',
 			'king oyster',
 			'lobster mushroom',
-			'crabapple'
+			'crabapple',
+			'oyster plant'
 		]
 	},
 	fish: {
-		terms: [
-			'fish',
-			'salmon',
-			'tuna',
-			'cod',
-			'halibut',
-			'tilapia',
-			'trout',
-			'mackerel',
-			'sardine',
-			'anchovy',
-			'snapper',
-			'mahimahi',
-			'haddock',
-			'catfish',
-			'swordfish',
-			'sole',
-			'flounder',
-			'pollock',
-			'herring',
-			'bonito',
-			'dashi'
-		],
-		exemptions: ['fish free', 'vegan fish sauce']
+		terms: FISH_TERMS,
+		labelExemptions: ['fish free', 'seafood free'],
+		spanExemptions: ['vegan fish sauce', 'vegan worcestershire', 'solely']
 	},
 	dairy: {
 		terms: CATEGORY_RULES.dairy.terms,
-		exemptions: CATEGORY_RULES.dairy.exemptions
-	},
-	milk: {
-		terms: CATEGORY_RULES.dairy.terms,
-		exemptions: CATEGORY_RULES.dairy.exemptions
-	},
-	lactose: {
-		terms: CATEGORY_RULES.dairy.terms,
-		exemptions: [...CATEGORY_RULES.dairy.exemptions, 'lactose free']
+		labelExemptions: CATEGORY_RULES.dairy.labelExemptions,
+		spanExemptions: CATEGORY_RULES.dairy.spanExemptions
 	},
 	egg: {
 		terms: CATEGORY_RULES.egg.terms,
-		exemptions: CATEGORY_RULES.egg.exemptions
+		labelExemptions: CATEGORY_RULES.egg.labelExemptions,
+		spanExemptions: CATEGORY_RULES.egg.spanExemptions
 	},
 	wheat: {
-		terms: [
-			'wheat',
-			'flour',
-			'semolina',
-			'durum',
-			'spelt',
-			'farro',
-			'kamut',
-			'einkorn',
-			'bulgur',
-			'couscous',
-			'orzo',
-			'pasta',
-			'spaghetti',
-			'penne',
-			'fettuccine',
-			'macaroni',
-			'lasagna',
-			'udon',
-			'ramen',
-			'bread',
-			'sourdough',
-			'flatbread',
-			'pita',
-			'naan',
-			'baguette',
-			'brioche',
-			'ciabatta',
-			'tortilla',
-			'breadcrumb',
-			'panko',
-			'crouton',
-			'seitan',
-			'soy sauce'
-		],
-		exemptions: CATEGORY_RULES.gluten.exemptions
+		terms: CATEGORY_RULES.gluten.terms,
+		labelExemptions: ['wheat free', 'gluten free', 'gf'],
+		spanExemptions: CATEGORY_RULES.gluten.spanExemptions,
+		checkGlutenLabels: true
 	},
 	gluten: {
 		terms: CATEGORY_RULES.gluten.terms,
-		exemptions: CATEGORY_RULES.gluten.exemptions
+		labelExemptions: CATEGORY_RULES.gluten.labelExemptions,
+		spanExemptions: CATEGORY_RULES.gluten.spanExemptions,
+		checkGlutenLabels: true
 	},
 	corn: {
 		terms: [
 			'corn',
+			'maize',
 			'cornstarch',
 			'cornmeal',
+			'corn flour',
 			'polenta',
 			'grits',
 			'hominy',
 			'masa harina',
-			'corn syrup'
+			'corn tortilla',
+			'corn syrup',
+			'popcorn'
 		],
-		exemptions: ['corn free', 'peppercorn']
+		labelExemptions: ['corn free'],
+		spanExemptions: ['peppercorn', 'corned beef', 'cornish hen', 'acorn squash']
+	},
+	nightshade: {
+		terms: [
+			'tomato',
+			'tomatillo',
+			'potato',
+			'eggplant',
+			'aubergine',
+			'bell pepper',
+			'chili',
+			'chile',
+			'jalapeno',
+			'habanero',
+			'serrano',
+			'cayenne',
+			'paprika',
+			'chipotle',
+			'goji'
+		],
+		labelExemptions: ['nightshade free'],
+		spanExemptions: ['sweet potato', 'black pepper', 'white pepper', 'sichuan pepper', 'peppercorn']
+	},
+	allium: {
+		terms: ['onion', 'garlic', 'shallot', 'scallion', 'leek', 'chive', 'ramps'],
+		labelExemptions: ['allium free', 'no onion no garlic']
+	},
+	sulfite: {
+		terms: ['sulfite', 'sulphite', 'wine', 'vinegar', 'molasses'],
+		labelExemptions: ['sulfite free', 'sulphite free', 'unsulfured', 'unsulphured']
+	},
+	mustard: {
+		terms: ['mustard', 'dijon'],
+		labelExemptions: ['mustard free']
+	},
+	lupin: {
+		terms: ['lupin', 'lupine', 'lupini'],
+		labelExemptions: ['lupin free']
+	},
+	meat: {
+		terms: CATEGORY_RULES.meat.terms,
+		labelExemptions: CATEGORY_RULES.meat.labelExemptions,
+		spanExemptions: CATEGORY_RULES.meat.spanExemptions
+	},
+	poultry: {
+		terms: CATEGORY_RULES.poultry.terms,
+		labelExemptions: CATEGORY_RULES.poultry.labelExemptions,
+		spanExemptions: CATEGORY_RULES.poultry.spanExemptions
 	}
 };
 
-function cleanAllergyToken(segment: string): string {
-	let cleaned = segment
-		.toLowerCase()
-		.trim()
-		.replace(/^[.!?()[\]"'•\-–—:\s]+|[.!?()[\]"'•\-–—:\s]+$/g, '')
-		.replace(/\s+/g, ' ');
-	let changed = true;
-	while (changed && cleaned) {
-		changed = false;
-		const next = cleaned
-			.replace(/^(?:and|or|plus)\b\s*/i, '')
-			.replace(
-				/^(?:no|avoid|avoiding|avoids|without|allergic to|allergy to|intolerant to|sensitive to|free of|free from)\b\s*/i,
-				''
-			)
-			.replace(
-				/\s+\b(?:allergy|allergies|intolerance|intolerances|sensitivity|sensitivities)$/i,
-				''
-			)
-			.trim();
-		if (next !== cleaned) {
-			cleaned = next;
-			changed = true;
+const ALLERGEN_SYNONYMS: Record<string, string> = {
+	celiac: 'gluten',
+	coeliac: 'gluten',
+	lactose: 'dairy',
+	milk: 'dairy',
+	casein: 'dairy',
+	whey: 'dairy',
+	crustacean: 'shellfish',
+	mollusc: 'shellfish',
+	mollusk: 'shellfish',
+	bivalve: 'shellfish',
+	cephalopod: 'shellfish',
+	soya: 'soy',
+	soybean: 'soy',
+	groundnut: 'peanut',
+	arachis: 'peanut',
+	goober: 'peanut',
+	treenut: 'tree nut',
+	albumen: 'egg',
+	albumin: 'egg',
+	sulphite: 'sulfite',
+	aubergine: 'eggplant',
+	courgette: 'zucchini',
+	coriander: 'cilantro',
+	garbanzo: 'chickpea',
+	prawns: 'prawn'
+};
+
+const PHRASE_SYNONYMS: Record<string, string> = {
+	'tree nut': 'tree nut',
+	'alpha gal': 'meat',
+	'celiac sprue': 'gluten',
+	'wheat gluten': 'gluten',
+	'cow milk': 'dairy',
+	'cows milk': 'dairy'
+};
+
+const KNOWN_MULTIWORD_ALLERGENS = new Set([
+	'tree nut',
+	'pine nut',
+	'brazil nut',
+	'bell pepper',
+	'black pepper',
+	'white pepper',
+	'chili pepper',
+	'cayenne pepper',
+	'hot pepper',
+	'sweet potato',
+	'green bean',
+	'string bean',
+	'fava bean',
+	'kidney bean',
+	'black bean',
+	'pinto bean',
+	'lima bean',
+	'soy sauce',
+	'fish sauce',
+	'oyster sauce',
+	'worcestershire sauce',
+	'passion fruit',
+	'dragon fruit',
+	'star fruit',
+	'star anise',
+	'brussels sprout',
+	'bok choy',
+	'spring onion',
+	'green onion',
+	'sunflower seed',
+	'pumpkin seed',
+	'poppy seed',
+	'mustard seed',
+	'celery seed',
+	'fennel seed',
+	'chia seed',
+	'flax seed',
+	'hemp seed',
+	'monosodium glutamate'
+]);
+
+const ALLERGY_STOPWORDS = new Set([
+	'i',
+	'im',
+	'am',
+	'is',
+	'are',
+	'was',
+	'were',
+	'be',
+	'been',
+	'being',
+	'me',
+	'my',
+	'mine',
+	'myself',
+	'we',
+	'us',
+	'our',
+	'have',
+	'has',
+	'had',
+	'having',
+	'do',
+	'does',
+	'did',
+	'dont',
+	'doesnt',
+	'cant',
+	'cannot',
+	'can',
+	'could',
+	'will',
+	'wont',
+	'would',
+	'must',
+	'should',
+	'not',
+	'no',
+	'never',
+	'without',
+	'avoid',
+	'avoiding',
+	'avoids',
+	'exclude',
+	'excluding',
+	'excludes',
+	'skip',
+	'hold',
+	'omit',
+	'free',
+	'of',
+	'from',
+	'to',
+	'for',
+	'with',
+	'in',
+	'on',
+	'at',
+	'by',
+	'as',
+	'the',
+	'a',
+	'an',
+	'any',
+	'all',
+	'some',
+	'eat',
+	'eating',
+	'consume',
+	'consuming',
+	'tolerate',
+	'digest',
+	'allergic',
+	'allergy',
+	'allergies',
+	'intolerant',
+	'intolerance',
+	'intolerances',
+	'sensitive',
+	'sensitivity',
+	'sensitivities',
+	'severe',
+	'severely',
+	'mild',
+	'mildly',
+	'moderate',
+	'moderately',
+	'slight',
+	'slightly',
+	'acute',
+	'chronic',
+	'deadly',
+	'fatal',
+	'life',
+	'threatening',
+	'anaphylactic',
+	'anaphylaxis',
+	'reaction',
+	'reactions',
+	'disease',
+	'syndrome',
+	'disorder',
+	'condition',
+	'issue',
+	'issues',
+	'strict',
+	'strictly',
+	'very',
+	'extremely',
+	'highly',
+	'really',
+	'super',
+	'only',
+	'also',
+	'especially',
+	'including',
+	'like',
+	'such',
+	'please',
+	'thanks',
+	'thank',
+	'you',
+	'trace',
+	'traces',
+	'cross',
+	'contact',
+	'contamination',
+	'symptom',
+	'symptoms'
+]);
+
+const SECONDARY_MODIFIER_WORDS = new Set([
+	'fresh',
+	'raw',
+	'dried',
+	'dry',
+	'roasted',
+	'toasted',
+	'cooked',
+	'fried',
+	'baked',
+	'steamed',
+	'ground',
+	'whole',
+	'crushed',
+	'chopped',
+	'minced',
+	'sliced',
+	'diced',
+	'grated',
+	'shredded',
+	'powder',
+	'powdered',
+	'extract',
+	'product',
+	'derived',
+	'based',
+	'react',
+	'reacted',
+	'badly',
+	'bad',
+	'sick',
+	'ill',
+	'make',
+	'give',
+	'gave',
+	'hive',
+	'rash'
+]);
+
+const TRAILING_FORM_WORDS = new Set(['seed', 'oil', 'paste', 'leaf', 'flake']);
+
+const KNOWN_CULINARY_TERMS: Set<string> = (() => {
+	const set = new Set<string>([
+		...Object.keys(ALLERGEN_EXPANSIONS),
+		...Object.keys(ALLERGEN_SYNONYMS),
+		...Object.values(ALLERGEN_SYNONYMS),
+		...Object.keys(PHRASE_SYNONYMS),
+		...KNOWN_MULTIWORD_ALLERGENS,
+		'pea',
+		'carrot',
+		'onion',
+		'shallot',
+		'scallion',
+		'leek',
+		'chive',
+		'garlic',
+		'ginger',
+		'turmeric',
+		'galangal',
+		'celery',
+		'celeriac',
+		'fennel',
+		'radish',
+		'daikon',
+		'turnip',
+		'parsnip',
+		'rutabaga',
+		'beet',
+		'beetroot',
+		'asparagus',
+		'artichoke',
+		'okra',
+		'broccoli',
+		'cauliflower',
+		'cabbage',
+		'kale',
+		'spinach',
+		'chard',
+		'arugula',
+		'rocket',
+		'lettuce',
+		'romaine',
+		'endive',
+		'radicchio',
+		'watercress',
+		'cucumber',
+		'zucchini',
+		'squash',
+		'pumpkin',
+		'eggplant',
+		'tomato',
+		'tomatillo',
+		'pepper',
+		'capsicum',
+		'jalapeno',
+		'habanero',
+		'serrano',
+		'poblano',
+		'chipotle',
+		'cayenne',
+		'paprika',
+		'chili',
+		'chile',
+		'mushroom',
+		'truffle',
+		'avocado',
+		'olive',
+		'caper',
+		'pickle',
+		'apple',
+		'pear',
+		'quince',
+		'peach',
+		'nectarine',
+		'plum',
+		'apricot',
+		'cherry',
+		'berry',
+		'strawberry',
+		'blueberry',
+		'raspberry',
+		'blackberry',
+		'cranberry',
+		'gooseberry',
+		'currant',
+		'grape',
+		'raisin',
+		'fig',
+		'date',
+		'prune',
+		'citrus',
+		'lemon',
+		'lime',
+		'orange',
+		'grapefruit',
+		'tangerine',
+		'mandarin',
+		'clementine',
+		'yuzu',
+		'kumquat',
+		'banana',
+		'plantain',
+		'mango',
+		'pineapple',
+		'papaya',
+		'kiwi',
+		'guava',
+		'lychee',
+		'passionfruit',
+		'pomegranate',
+		'persimmon',
+		'melon',
+		'watermelon',
+		'cantaloupe',
+		'honeydew',
+		'rhubarb',
+		'coconut',
+		'jackfruit',
+		'durian',
+		'cilantro',
+		'coriander',
+		'parsley',
+		'basil',
+		'mint',
+		'peppermint',
+		'spearmint',
+		'dill',
+		'oregano',
+		'thyme',
+		'rosemary',
+		'sage',
+		'tarragon',
+		'marjoram',
+		'bay',
+		'lemongrass',
+		'lavender',
+		'cinnamon',
+		'nutmeg',
+		'mace',
+		'clove',
+		'allspice',
+		'cardamom',
+		'cumin',
+		'caraway',
+		'anise',
+		'fenugreek',
+		'sumac',
+		'saffron',
+		'vanilla',
+		'cocoa',
+		'cacao',
+		'chocolate',
+		'coffee',
+		'caffeine',
+		'tea',
+		'matcha',
+		'alcohol',
+		'wine',
+		'beer',
+		'vinegar',
+		'yeast',
+		'msg',
+		'salt',
+		'sugar',
+		'stevia',
+		'erythritol',
+		'xylitol',
+		'aspartame',
+		'sucralose',
+		'sunflower',
+		'pepita',
+		'poppy',
+		'chia',
+		'flax',
+		'flaxseed',
+		'linseed',
+		'hemp',
+		'buckwheat',
+		'quinoa',
+		'amaranth',
+		'millet',
+		'sorghum',
+		'teff',
+		'oat',
+		'oats',
+		'rice',
+		'corn',
+		'maize',
+		'lentil',
+		'chickpea',
+		'bean',
+		'soba',
+		'seaweed',
+		'nori',
+		'kombu',
+		'wakame'
+	]);
+	for (const rule of Object.values(CATEGORY_RULES)) {
+		for (const term of rule.terms) {
+			set.add(foldAscii(term));
+			for (const word of wordTokens(term)) {
+				if (word.length >= 3) set.add(word);
+			}
 		}
 	}
-	if (!cleaned) return '';
-	const canonical = normalizeName(cleaned);
-	const words = wordTokens(canonical);
-	if (!words.length) return '';
-	const joined = words.join(' ');
-	if (
-		NONE_DIET_ALIASES.has(joined) ||
-		joined === 'nothing' ||
-		joined === 'na' ||
-		joined === 'n a'
-	) {
-		return '';
+	for (const expansion of Object.values(ALLERGEN_EXPANSIONS)) {
+		for (const term of expansion.terms) {
+			set.add(foldAscii(term));
+			for (const word of wordTokens(term)) {
+				if (word.length >= 3) set.add(word);
+			}
+		}
 	}
-	return joined;
+	for (const seed of seedRecipes) {
+		for (const item of seed.ingredients) {
+			for (const word of wordTokens(item.name)) {
+				if (word.length >= 3) set.add(word);
+			}
+		}
+	}
+	return set;
+})();
+
+const EXPLICIT_NONE_MARKERS = new Set(['no', 'none', 'nil', 'nothing', 'na', 'anything']);
+const GENERIC_NONE_WORDS = new Set([
+	...ALLERGY_STOPWORDS,
+	'none',
+	'nil',
+	'nothing',
+	'na',
+	'known',
+	'food',
+	'dietary',
+	'anything'
+]);
+
+function isExplicitNoneEntry(value: string): boolean {
+	const cleaned = foldAscii(value).replace(/^[.!?()[\]"'•\-–—:\s]+|[.!?()[\]"'•\-–—:\s]+$/g, '');
+	if (NONE_ALLERGY_ALIASES.has(cleaned)) return true;
+	const words = cleaned.split(/[^a-z0-9]+/).filter(Boolean);
+	if (NONE_ALLERGY_ALIASES.has(words.join(' '))) return true;
+	const singularWords = words.map(singularizeWord);
+	if (
+		singularWords.length > 0 &&
+		singularWords.some((word) => EXPLICIT_NONE_MARKERS.has(word)) &&
+		singularWords.every((word) => GENERIC_NONE_WORDS.has(word))
+	) {
+		return true;
+	}
+	return false;
 }
 
-/** Parse free-text allergies on commas, newlines, semicolons, slashes, and conjunctions into normalized tokens. */
-export function parseAllergies(value: string | undefined | null): string[] {
-	const bounded = clampAllergies(value);
-	if (!bounded) return [];
-	const segments = bounded.split(/(?:[,;\r\n/|•&]+|\s+\b(?:and|or|plus)\b\s+)/i);
-	const seen = new Set<string>();
-	const result: string[] = [];
-	for (const segment of segments) {
-		const token = cleanAllergyToken(segment);
-		if (token && !seen.has(token)) {
-			seen.add(token);
-			result.push(token);
+function parseClauseTokens(clause: string): string[] {
+	const rawWords = wordTokens(clause);
+	if (!rawWords.length) return [];
+	const contentWords = rawWords.filter((word) => !ALLERGY_STOPWORDS.has(word));
+	if (!contentWords.length) return [];
+
+	const rawJoined = contentWords.join(' ');
+	if (NONE_ALLERGY_ALIASES.has(rawJoined)) return [];
+	if (PHRASE_SYNONYMS[rawJoined]) return [PHRASE_SYNONYMS[rawJoined]];
+	if (KNOWN_MULTIWORD_ALLERGENS.has(rawJoined)) return [rawJoined];
+
+	let filtered = contentWords.filter((word) => !SECONDARY_MODIFIER_WORDS.has(word));
+	if (!filtered.length) filtered = contentWords;
+
+	const filteredJoined = filtered.join(' ');
+	if (PHRASE_SYNONYMS[filteredJoined]) return [PHRASE_SYNONYMS[filteredJoined]];
+	if (KNOWN_MULTIWORD_ALLERGENS.has(filteredJoined)) return [filteredJoined];
+
+	if (
+		filtered.length === 2 &&
+		TRAILING_FORM_WORDS.has(filtered[1]) &&
+		(ALLERGEN_SYNONYMS[filtered[0]] ||
+			ALLERGEN_EXPANSIONS[filtered[0]] ||
+			KNOWN_CULINARY_TERMS.has(filtered[0]))
+	) {
+		const head = ALLERGEN_SYNONYMS[filtered[0]] ?? filtered[0];
+		return [head];
+	}
+
+	const mapped: string[] = [];
+	let index = 0;
+	while (index < filtered.length) {
+		if (index + 1 < filtered.length) {
+			const twoWord = `${filtered[index]} ${filtered[index + 1]}`;
+			if (PHRASE_SYNONYMS[twoWord]) {
+				mapped.push(PHRASE_SYNONYMS[twoWord]);
+				index += 2;
+				continue;
+			}
+			if (KNOWN_MULTIWORD_ALLERGENS.has(twoWord)) {
+				mapped.push(twoWord);
+				index += 2;
+				continue;
+			}
+		}
+		const word = filtered[index];
+		const canonical = ALLERGEN_SYNONYMS[word] ?? word;
+		if (!NONE_ALLERGY_ALIASES.has(canonical)) {
+			mapped.push(canonical);
+		}
+		index += 1;
+	}
+	return mapped;
+}
+
+function parseAllergyInput(value: string | undefined | null): {
+	allergens: string[];
+	emptyStopwordSegments: string[];
+} {
+	const raw = typeof value === 'string' ? value.trim() : '';
+	if (!raw || isExplicitNoneEntry(raw)) {
+		return { allergens: [], emptyStopwordSegments: [] };
+	}
+
+	const primarySegments = raw.split(/[,;\r\n/|•&]+/);
+	const segments: string[] = [];
+	for (const piece of primarySegments) {
+		for (const part of piece.split(/\s+\b(?:and|or|plus|nor)\b\s+/i)) {
+			const trimmed = part.trim();
+			if (trimmed) segments.push(trimmed);
 		}
 	}
-	return result;
+
+	const seen = new Set<string>();
+	const allergens: string[] = [];
+	const emptyStopwordSegments: string[] = [];
+
+	for (const segment of segments) {
+		if (isExplicitNoneEntry(segment)) continue;
+		const subClauses = segment
+			.split(/[()[\]]+/)
+			.map((sub) => sub.trim())
+			.filter(Boolean);
+		let segmentProducedToken = false;
+		for (const clause of subClauses) {
+			if (isExplicitNoneEntry(clause)) {
+				segmentProducedToken = true;
+				continue;
+			}
+			const tokens = parseClauseTokens(clause);
+			if (tokens.length > 0) {
+				segmentProducedToken = true;
+				for (const token of tokens) {
+					if (token && !seen.has(token)) {
+						seen.add(token);
+						allergens.push(token);
+					}
+				}
+			}
+		}
+		if (!segmentProducedToken) {
+			emptyStopwordSegments.push(segment);
+		}
+	}
+
+	return { allergens, emptyStopwordSegments };
+}
+
+/** Parse full free-text allergies (never truncated) across delimiters, parentheticals, stopwords, and synonyms. */
+export function parseAllergies(value: string | undefined | null): string[] {
+	return parseAllergyInput(value).allergens;
 }
 
 function ingredientMatchesCategory(
 	variants: ReturnType<typeof buildTokenVariants>,
 	category: DietConflictCategory
 ): boolean {
-	if (category === 'meat' && matchesAnyPhrase(variants.tokenSets, ['goat cheese', 'goat milk'])) {
-		return false;
-	}
 	const rule = CATEGORY_RULES[category];
-	if (matchesAnyPhrase(variants.tokenSets, rule.exemptions)) return false;
-	return matchesAnyPhrase(variants.tokenSets, rule.terms);
+	if (matchesAnyPhrase(variants.tokenSets, rule.labelExemptions)) return false;
+	const strippedSets = stripExemptSpans(variants.tokenSets, rule.spanExemptions);
+	return matchesAnyPhrase(strippedSets, rule.terms);
 }
 
 function tagMatchesCategory(tag: string, category: DietConflictCategory): boolean {
@@ -944,10 +1989,9 @@ function tagMatchesCategory(tag: string, category: DietConflictCategory): boolea
 	const rule = CATEGORY_RULES[category];
 	if (rule.tagExemptions.some((exempt) => cleaned.includes(exempt))) return false;
 	const variants = buildTokenVariants(cleaned);
-	if (matchesAnyPhrase(variants.tokenSets, rule.exemptions)) return false;
-	return rule.tagTerms.some(
-		(term) => cleaned === term || containsWholePhrase(variants.tokenSets, term)
-	);
+	if (matchesAnyPhrase(variants.tokenSets, rule.labelExemptions)) return false;
+	const strippedSets = stripExemptSpans(variants.tokenSets, rule.spanExemptions);
+	return rule.tagTerms.some((term) => cleaned === term || containsWholePhrase(strippedSets, term));
 }
 
 function ingredientMatchesAllergen(
@@ -958,15 +2002,36 @@ function ingredientMatchesAllergen(
 	if (containsWholePhrase(variants.tokenSets, negated)) return false;
 	const expansion = ALLERGEN_EXPANSIONS[allergen];
 	if (expansion) {
-		if (expansion.exemptions && matchesAnyPhrase(variants.tokenSets, expansion.exemptions)) {
+		if (
+			expansion.labelExemptions &&
+			matchesAnyPhrase(variants.tokenSets, expansion.labelExemptions)
+		) {
 			return false;
 		}
-		if (matchesAnyPhrase(variants.tokenSets, expansion.terms)) return true;
+		const strippedSets = expansion.spanExemptions
+			? stripExemptSpans(variants.tokenSets, expansion.spanExemptions)
+			: variants.tokenSets;
+		if (matchesAnyPhrase(strippedSets, expansion.terms)) return true;
+		return containsWholePhrase(strippedSets, allergen);
 	}
 	return containsWholePhrase(variants.tokenSets, allergen);
 }
 
-/** Evaluate recipe ingredients and tags deterministically against active diet and allergy preferences. */
+function ingredientGlutenLabelCheck(
+	variants: ReturnType<typeof buildTokenVariants>
+): string | null {
+	if (matchesAnyPhrase(variants.tokenSets, CATEGORY_RULES.gluten.labelExemptions)) {
+		return null;
+	}
+	for (const rule of GLUTEN_LABEL_CHECK_RULES) {
+		if (matchesAnyPhrase(variants.tokenSets, rule.terms)) {
+			return rule.label;
+		}
+	}
+	return null;
+}
+
+/** Evaluate recipe ingredients and tags deterministically against active diet and full allergy preferences. */
 export function evaluateRecipeConflicts(
 	recipe: Recipe,
 	preferences: Pick<Preferences, 'diet' | 'allergies'>
@@ -974,10 +2039,17 @@ export function evaluateRecipeConflicts(
 	const diet = normalizeDiet(preferences.diet);
 	const resolvedDietLabel = dietLabel(diet);
 	const disallowedCategories = DIET_EXCLUDED_CATEGORIES[diet] ?? [];
-	const parsedAllergens = parseAllergies(clampAllergies(preferences.allergies));
+	const { allergens: parsedAllergens, emptyStopwordSegments } = parseAllergyInput(
+		preferences.allergies
+	);
+
+	const checkGlutenLabelCrossContact =
+		disallowedCategories.includes('gluten') ||
+		parsedAllergens.some((allergen) => Boolean(ALLERGEN_EXPANSIONS[allergen]?.checkGlutenLabels));
 
 	const matchedCategories = new Set<DietConflictCategory>();
 	const matchedAllergens = new Set<string>();
+	const matchedLabelChecks = new Set<string>();
 	const ingredientReasons: Record<number, string[]> = {};
 
 	const addIngredientReason = (index: number, reason: string) => {
@@ -992,16 +2064,28 @@ export function evaluateRecipeConflicts(
 
 	recipe.ingredients.forEach((ingredient, index) => {
 		const variants = buildTokenVariants(ingredient.name);
+		let matchedHardGlutenOnRow = false;
 		for (const category of disallowedCategories) {
 			if (ingredientMatchesCategory(variants, category)) {
 				matchedCategories.add(category);
 				addIngredientReason(index, category);
+				if (category === 'gluten') matchedHardGlutenOnRow = true;
 			}
 		}
 		for (const allergen of parsedAllergens) {
 			if (ingredientMatchesAllergen(variants, allergen)) {
 				matchedAllergens.add(allergen);
 				addIngredientReason(index, `avoided: ${allergen}`);
+				if (ALLERGEN_EXPANSIONS[allergen]?.checkGlutenLabels) {
+					matchedHardGlutenOnRow = true;
+				}
+			}
+		}
+		if (checkGlutenLabelCrossContact && !matchedHardGlutenOnRow) {
+			const labelCheck = ingredientGlutenLabelCheck(variants);
+			if (labelCheck) {
+				matchedLabelChecks.add(labelCheck);
+				addIngredientReason(index, `check label: ${labelCheck}`);
 			}
 		}
 	});
@@ -1024,21 +2108,43 @@ export function evaluateRecipeConflicts(
 		if (netCarbs > 30) matchedCategories.add('carb');
 	}
 
+	const unrecognizedAllergens: string[] = [...emptyStopwordSegments];
+	for (const allergen of parsedAllergens) {
+		if (!matchedAllergens.has(allergen) && !KNOWN_CULINARY_TERMS.has(allergen)) {
+			unrecognizedAllergens.push(allergen);
+		}
+	}
+
 	const dietCategories = disallowedCategories.filter((category) => matchedCategories.has(category));
 	const allergenMatches = parsedAllergens.filter((allergen) => matchedAllergens.has(allergen));
+	const labelCheckItems = [...matchedLabelChecks];
 	const matchingIngredientIndices = Object.keys(ingredientReasons)
 		.map(Number)
 		.sort((a, b) => a - b);
-	const hasConflict = dietCategories.length > 0 || allergenMatches.length > 0;
+	const hasConflict =
+		dietCategories.length > 0 ||
+		allergenMatches.length > 0 ||
+		labelCheckItems.length > 0 ||
+		unrecognizedAllergens.length > 0;
 
 	let badge = '';
 	const summaryParts: string[] = [];
-	if (dietCategories.length > 0 && allergenMatches.length > 0) {
+	const hasAllergenSignal =
+		allergenMatches.length > 0 ||
+		unrecognizedAllergens.length > 0 ||
+		(labelCheckItems.length > 0 && !disallowedCategories.includes('gluten'));
+	const hasDietSignal =
+		dietCategories.length > 0 ||
+		(labelCheckItems.length > 0 && disallowedCategories.includes('gluten'));
+
+	if (hasDietSignal && hasAllergenSignal) {
 		badge = 'Diet & allergen alert';
 	} else if (allergenMatches.length > 0) {
 		badge = 'Allergen alert';
 	} else if (dietCategories.length > 0) {
 		badge = `${resolvedDietLabel} conflict`;
+	} else if (labelCheckItems.length > 0 || unrecognizedAllergens.length > 0) {
+		badge = 'Check labels';
 	}
 
 	if (dietCategories.length > 0) {
@@ -1047,6 +2153,12 @@ export function evaluateRecipeConflicts(
 	if (allergenMatches.length > 0) {
 		summaryParts.push(`Contains avoided ${allergenMatches.join(', ')}`);
 	}
+	if (labelCheckItems.length > 0) {
+		summaryParts.push(`Check label for gluten (${labelCheckItems.join(', ')})`);
+	}
+	if (unrecognizedAllergens.length > 0) {
+		summaryParts.push('Allergy text not understood — check labels');
+	}
 
 	return {
 		hasConflict,
@@ -1054,6 +2166,8 @@ export function evaluateRecipeConflicts(
 		dietLabel: resolvedDietLabel,
 		dietCategories,
 		allergenMatches,
+		labelCheckItems,
+		unrecognizedAllergens,
 		matchingIngredientIndices,
 		ingredientReasons,
 		badge,
@@ -1061,11 +2175,11 @@ export function evaluateRecipeConflicts(
 	};
 }
 
-/** Sanitize preferences for `/api/ai` requests so legacy or buffered values always pass schema bounds. */
+/** Sanitize preferences for `/api/ai` requests without truncating stored `allergies`. */
 export function sanitizePreferencesForAI(preferences: Preferences): Preferences {
 	return {
 		diet: normalizeDiet(preferences.diet).slice(0, 200),
-		allergies: clampAllergies(preferences.allergies).trim(),
+		allergies: preferences.allergies ?? '',
 		maxTime:
 			Number.isFinite(preferences.maxTime) && preferences.maxTime >= 0
 				? Math.min(100_000, preferences.maxTime)

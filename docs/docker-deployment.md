@@ -170,14 +170,16 @@ chown 1000:1000 /home/skynet/opt/appdata/flavorithm
 ```
 
 After configuration is ready, build the app, provision local Whisper with
-`deploy/skynet/setup-whisper.sh`, and launch the GitHub updater from the
-repository root:
+`deploy/skynet/setup-whisper.sh`, initialize the updater state, and launch the
+GitHub updater from the repository root:
 
 ```sh
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml build --pull flavorithm
 ./deploy/skynet/setup-whisper.sh
 mkdir -p /home/skynet/opt/appdata/flavorithm-updater
-git rev-parse HEAD > /home/skynet/opt/appdata/flavorithm-updater/deployed-sha
+printf '%s\n%s\n' "$(git rev-parse HEAD)" "$(docker inspect --format '{{.Image}}' flavorithm)" \
+  > /home/skynet/opt/appdata/flavorithm-updater/deployed-state
+docker tag flavorithm:local flavorithm:rollback
 docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.yml up -d flavorithm-updater
 ```
 
@@ -188,11 +190,29 @@ docker compose -p flavorithm -f compose.yml -f deploy/skynet/compose.override.ym
 unreachable and keeps `Automatic` voice input on browser dictation until
 `setup-whisper.sh` completes.
 
-The updater checks the public `main` branch every 15 minutes, fast-forwards the
-checkout, rebuilds the image, and records a commit only after the health check
-passes. If an update fails its health check, it restores the previous image.
-The updater needs the Docker socket to build and replace the app container, so
-keep its compose file and host checkout writable only by trusted administrators.
+The updater copies itself into an isolated `0700` temporary directory
+(`mktemp -d`) at startup and checks the public `main` branch every 15 minutes
+without requiring GitHub credentials. Private forks (or deployments needing
+authenticated GitHub API rate limits) can optionally set
+`FLAVORITHM_GITHUB_TOKEN` in `.env` using a fine-grained token scoped to the
+repository with read-only **Checks** and **Actions** permissions (plus
+read-only **Contents** when fetching a private repository over HTTPS). When a
+new commit differs from the deployed SHA in `deployed-state` and `failed-sha`,
+it queries GitHub's Check Runs and Actions APIs and deploys only after the
+`.github/workflows/ci.yml` `verify` check-run completes with `success`. It then
+fetches and checks out the verified commit, validates Compose syntax with
+`docker compose config --quiet`, rebuilds `flavorithm:local`, and atomically
+writes both the deployed SHA and image ID to `deployed-state` (clearing
+`rollback-pending` and tagging `flavorithm:rollback` non-fatally) only after the
+health check passes, re-executing its isolated runtime copy if
+`deploy/skynet/update.sh` changed. If Compose validation, image build, or the
+health check fails, it resets `/app` to the deployed SHA before retagging
+`flavorithm:rollback` to `flavorithm:local`, recreates `flavorithm`, verifies
+recovery health, and records `failed-sha` to skip the broken commit (retrying
+recovery on subsequent polls if rollback fails, or clearing `rollback-pending`
+when no valid deployed SHA exists yet). The updater needs the Docker socket to
+build and replace the app container, so keep its compose file and host checkout
+writable only by trusted administrators.
 
 ## Acceptance checks
 

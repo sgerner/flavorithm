@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ButlerCommandSchema } from '../src/lib/butler.ts';
+import { applyButlerCommands, ButlerCommandSchema } from '../src/lib/butler.ts';
 import { createInitialState, createNewUserState, seedRecipes } from '../src/lib/data.ts';
 import {
 	DIET_OPTIONS,
-	clampAllergies,
 	evaluateRecipeConflicts,
 	normalizeDiet,
 	parseAllergies,
@@ -22,6 +21,8 @@ import {
 	clearSampleData,
 	completeMeal,
 	convertCompatibleQuantity,
+	deleteMeal,
+	deleteRecipe,
 	deleteShoppingItem,
 	expiryStatus,
 	filterPantryItems,
@@ -34,14 +35,21 @@ import {
 	promoteSampleIngredient,
 	promoteSampleMeal,
 	normalizeShoppingItem,
+	recipeForEdit,
+	recipeNeedsNutritionRefresh,
 	reconcileShoppingList,
+	refreshWeekShopping,
 	restockDepletedPantryItems,
 	restoreShoppingItem,
 	retireCheckedShoppingItems,
 	revertShoppingItem,
+	saveEditedRecipe,
 	shopForScope,
 	snapshotShoppingItem,
-	transferPurchasedItemsToPantry
+	transferPurchasedItemsToPantry,
+	upsertMeal,
+	upsertRecipe,
+	weekStartForDate
 } from '../src/lib/kitchen-workflows.ts';
 import { validateAppState } from '../src/lib/server/db.ts';
 import type { AppState, Ingredient, Preferences, Recipe, ShoppingItem } from '../src/lib/types.ts';
@@ -992,20 +1000,50 @@ test('normalizes diet values case-insensitively across all canonical lowercase o
 	assert.equal(normalizeDiet('Low_Carb'), 'low-carb');
 });
 
-test('clampAllergies truncates by Unicode code points without splitting surrogate pairs or emojis', () => {
-	const boundaryEmoji = `${'a'.repeat(499)}🥜 sesame`;
-	const clamped = clampAllergies(boundaryEmoji);
-	assert.equal(clamped, `${'a'.repeat(499)}🥜`);
-	assert.equal(Array.from(clamped).length, 500);
-	assert.equal(clamped.isWellFormed(), true);
+test('never truncates allergies at 500 characters: 300 filler entries and 2,000-char strings still flag tail peanut conflicts', () => {
+	const fillerPool = [
+		'kiwi',
+		'mango',
+		'papaya',
+		'pineapple',
+		'guava',
+		'lychee',
+		'persimmon',
+		'fig',
+		'plum',
+		'apricot'
+	];
+	const threeHundredFillers = Array.from(
+		{ length: 300 },
+		(_, index) => fillerPool[index % fillerPool.length]
+	);
+	const longAllergies = `${threeHundredFillers.join(', ')}, peanut`;
+	assert.ok(longAllergies.length > 1_800, `expected >1800 chars, got ${longAllergies.length}`);
 
-	const emojiOnly = clampAllergies('🥜'.repeat(600));
-	assert.equal(Array.from(emojiOnly).length, 500);
-	assert.equal(emojiOnly, '🥜'.repeat(500));
-	assert.equal(emojiOnly.isWellFormed(), true);
+	const paddedToTwoThousand = `${'kiwi, '.repeat(332)}peanut`;
+	assert.equal(paddedToTwoThousand.length, 1_998);
+
+	const pbRecipe = recipe({
+		id: 'pb-toast',
+		ingredients: [{ name: 'peanut butter', quantity: 2, unit: 'tbsp' }]
+	});
+	const safeCucumber = recipe({
+		id: 'cucumber-salad',
+		ingredients: [{ name: 'cucumber', quantity: 1, unit: 'whole' }]
+	});
+
+	for (const allergies of [longAllergies, paddedToTwoThousand]) {
+		const pbConflict = evaluateRecipeConflicts(pbRecipe, { diet: 'none', allergies });
+		assert.equal(pbConflict.hasConflict, true);
+		assert.deepEqual(pbConflict.allergenMatches, ['peanut']);
+		assert.deepEqual(pbConflict.matchingIngredientIndices, [0]);
+
+		const safeReport = evaluateRecipeConflicts(safeCucumber, { diet: 'none', allergies });
+		assert.equal(safeReport.hasConflict, false);
+	}
 });
 
-test('parses free-text allergies across commas, newlines, and conjunctions with whole-word matching', () => {
+test('parses conversational free-text allergies, medical synonyms, parentheticals, and flags unrecognized text', () => {
 	assert.deepEqual(parseAllergies('Avoid soy and sesame\npeanuts, tree nuts, or shellfish'), [
 		'soy',
 		'sesame',
@@ -1014,6 +1052,69 @@ test('parses free-text allergies across commas, newlines, and conjunctions with 
 		'shellfish'
 	]);
 	assert.deepEqual(parseAllergies('none'), []);
+	assert.deepEqual(parseAllergies('No known food allergies'), []);
+
+	const peanutDish = recipe({
+		id: 'peanut-noodles',
+		ingredients: [{ name: 'peanut butter', quantity: 2, unit: 'tbsp' }]
+	});
+	for (const phrase of [
+		'I am allergic to peanuts',
+		'severe peanut allergy',
+		'peanuts (severe)',
+		'deadly anaphylactic reaction to groundnuts'
+	]) {
+		const report = evaluateRecipeConflicts(peanutDish, { diet: 'none', allergies: phrase });
+		assert.equal(report.hasConflict, true, `expected conflict for "${phrase}"`);
+		assert.deepEqual(report.allergenMatches, ['peanut']);
+		assert.equal(report.unrecognizedAllergens.length, 0);
+	}
+
+	const wheatBread = recipe({
+		id: 'wheat-bread',
+		ingredients: [{ name: 'all-purpose flour', quantity: 2, unit: 'cup' }]
+	});
+	for (const celiacInput of ['celiac', 'coeliac disease', 'severe celiac']) {
+		const report = evaluateRecipeConflicts(wheatBread, { diet: 'none', allergies: celiacInput });
+		assert.equal(report.hasConflict, true, `expected gluten conflict for "${celiacInput}"`);
+		assert.deepEqual(report.allergenMatches, ['gluten']);
+	}
+
+	const creamySoup = recipe({
+		id: 'creamy-soup',
+		ingredients: [{ name: 'heavy cream', quantity: 1, unit: 'cup' }]
+	});
+	const lactoseReport = evaluateRecipeConflicts(creamySoup, {
+		diet: 'none',
+		allergies: 'lactose intolerant'
+	});
+	assert.equal(lactoseReport.hasConflict, true);
+	assert.deepEqual(lactoseReport.allergenMatches, ['dairy']);
+
+	const prawnBowl = recipe({
+		id: 'prawn-bowl',
+		ingredients: [{ name: 'tiger shrimp', quantity: 8, unit: 'oz' }]
+	});
+	for (const shellfishSynonym of ['crustaceans', 'molluscs', 'mollusk allergy']) {
+		const report = evaluateRecipeConflicts(prawnBowl, {
+			diet: 'none',
+			allergies: shellfishSynonym
+		});
+		assert.equal(report.hasConflict, true, `expected shellfish conflict for "${shellfishSynonym}"`);
+		assert.deepEqual(report.allergenMatches, ['shellfish']);
+	}
+
+	// Unrecognized / unparsed text must warn to check labels rather than silently reporting safe.
+	const plainWater = recipe({
+		id: 'plain-water',
+		ingredients: [{ name: 'water', quantity: 1, unit: 'cup' }]
+	});
+	for (const unknownText of ['peantus', 'low histamine protocol', 'severe allergy']) {
+		const report = evaluateRecipeConflicts(plainWater, { diet: 'none', allergies: unknownText });
+		assert.equal(report.hasConflict, true, `expected warning for "${unknownText}"`);
+		assert.equal(report.badge, 'Check labels');
+		assert.match(report.summary, /allergy text not understood — check labels/i);
+	}
 
 	const peaSafe = recipe({
 		id: 'pea-safe',
@@ -1043,6 +1144,252 @@ test('parses free-text allergies across commas, newlines, and conjunctions with 
 			diet: 'vegan',
 			allergies: 'tree nuts, dairy, eggs, and shellfish'
 		}).hasConflict,
+		false
+	);
+});
+
+test('covers nut/peanut expansions, span-scoped exemptions, seafood/fish species, dairy/egg/gluten/meat gaps, prepared foods, and oats/buckwheat/soba label checks', () => {
+	// `nuts` includes peanuts & groundnuts; both `nuts` and `tree nuts` catch bare nuts, nut butter, nut milk, and pesto.
+	for (const peanutIngredient of ['peanut butter', 'groundnut oil']) {
+		const item = recipe({
+			id: 'nut-peanut',
+			ingredients: [{ name: peanutIngredient, quantity: 1, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(item, { diet: 'none', allergies: 'nuts' }).hasConflict,
+			true,
+			`expected "nuts" to flag "${peanutIngredient}"`
+		);
+	}
+	for (const sharedNutIngredient of [
+		'chopped nuts',
+		'mixed nut butter',
+		'nut milk',
+		'basil pesto'
+	]) {
+		const item = recipe({
+			id: 'shared-nut',
+			ingredients: [{ name: sharedNutIngredient, quantity: 2, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(item, { diet: 'none', allergies: 'nuts' }).hasConflict,
+			true,
+			`expected "nuts" to flag "${sharedNutIngredient}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(item, { diet: 'none', allergies: 'tree nuts' }).hasConflict,
+			true,
+			`expected "tree nuts" to flag "${sharedNutIngredient}"`
+		);
+	}
+
+	// Span-scoped exemptions strip only the exempt span ("coconut") and still catch remaining allergens ("almond").
+	const coconutAlmondGranola = recipe({
+		id: 'coconut-almond',
+		ingredients: [{ name: 'coconut almond granola', quantity: 0.5, unit: 'cup' }]
+	});
+	const granolaTreeNutReport = evaluateRecipeConflicts(coconutAlmondGranola, {
+		diet: 'none',
+		allergies: 'tree nuts'
+	});
+	assert.equal(granolaTreeNutReport.hasConflict, true);
+	assert.deepEqual(granolaTreeNutReport.allergenMatches, ['tree nut']);
+
+	const coconutAndHeavyCream = recipe({
+		id: 'coconut-heavy-cream',
+		ingredients: [{ name: 'coconut milk and heavy cream', quantity: 1, unit: 'cup' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(coconutAndHeavyCream, { diet: 'dairy-free', allergies: '' })
+			.hasConflict,
+		true
+	);
+
+	// `seafood` maps to fish + shellfish, and expanded fish species flag under fish allergy & vegetarian.
+	for (const marineIngredient of [
+		'salmon fillet',
+		'jumbo shrimp',
+		'grouper',
+		'grilled eel',
+		'sea bass',
+		'yellow perch',
+		'northern pike',
+		'carp',
+		'monkfish tail',
+		'mahi-mahi'
+	]) {
+		const dish = recipe({
+			id: `seafood-${marineIngredient}`,
+			ingredients: [{ name: marineIngredient, quantity: 6, unit: 'oz' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'seafood' }).hasConflict,
+			true,
+			`expected seafood allergy to flag "${marineIngredient}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'vegetarian', allergies: '' }).hasConflict,
+			true,
+			`expected vegetarian diet to flag "${marineIngredient}"`
+		);
+		if (marineIngredient !== 'jumbo shrimp') {
+			assert.equal(
+				evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'fish' }).hasConflict,
+				true,
+				`expected fish allergy to flag "${marineIngredient}"`
+			);
+		}
+	}
+
+	// Dairy & egg culinary gaps (including accented crème fraîche).
+	for (const dairyItem of ['crème fraîche', 'creme fraiche', 'brioche buns', 'vanilla custard']) {
+		const dish = recipe({
+			id: `dairy-${dairyItem}`,
+			ingredients: [{ name: dairyItem, quantity: 2, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'dairy-free', allergies: '' }).hasConflict,
+			true,
+			`expected dairy-free to flag "${dairyItem}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'dairy' }).hasConflict,
+			true,
+			`expected dairy allergy to flag "${dairyItem}"`
+		);
+	}
+	for (const eggItem of ['brioche', 'challah bread', 'pastry custard']) {
+		const dish = recipe({
+			id: `egg-${eggItem}`,
+			ingredients: [{ name: eggItem, quantity: 1, unit: 'slice' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'vegan', allergies: '' }).dietCategories.includes(
+				'egg'
+			),
+			true,
+			`expected vegan egg rule to flag "${eggItem}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'eggs' }).hasConflict,
+			true,
+			`expected egg allergy to flag "${eggItem}"`
+		);
+	}
+
+	// Gluten baked-goods / dough / batter gaps.
+	for (const glutenItem of [
+		'pizza dough',
+		'burger bun',
+		'soft pretzel',
+		'puff pastry',
+		'sponge cake',
+		'chocolate chip cookies',
+		'water crackers',
+		'pie crust',
+		'pork dumplings',
+		'buttermilk pancakes',
+		'belgian waffles',
+		'breakfast cereal'
+	]) {
+		const dish = recipe({
+			id: `gluten-${glutenItem}`,
+			ingredients: [{ name: glutenItem, quantity: 1, unit: 'serving' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'gluten-free', allergies: '' }).hasConflict,
+			true,
+			`expected gluten-free to flag "${glutenItem}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'gluten' }).hasConflict,
+			true,
+			`expected gluten allergy to flag "${glutenItem}"`
+		);
+	}
+
+	// Oats, buckwheat, and soba require checking labels unless explicitly certified gluten-free.
+	for (const [itemName, expectedLabel] of [
+		['rolled oats', 'oats'],
+		['oat flour', 'oats'],
+		['toasted buckwheat', 'buckwheat'],
+		['soba noodles', 'soba']
+	] as const) {
+		const unlabeled = recipe({
+			id: `check-${itemName}`,
+			ingredients: [{ name: itemName, quantity: 1, unit: 'cup' }]
+		});
+		const gfReport = evaluateRecipeConflicts(unlabeled, { diet: 'gluten-free', allergies: '' });
+		assert.equal(gfReport.hasConflict, true, `expected check-label conflict for "${itemName}"`);
+		assert.deepEqual(gfReport.labelCheckItems, [expectedLabel]);
+		assert.match(gfReport.summary, /check label for gluten/i);
+
+		const celiacReport = evaluateRecipeConflicts(unlabeled, {
+			diet: 'none',
+			allergies: 'celiac'
+		});
+		assert.equal(celiacReport.hasConflict, true);
+		assert.deepEqual(celiacReport.labelCheckItems, [expectedLabel]);
+
+		const certifiedGf = recipe({
+			id: `certified-${itemName}`,
+			ingredients: [{ name: `gluten-free ${itemName}`, quantity: 1, unit: 'cup' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(certifiedGf, { diet: 'gluten-free', allergies: 'celiac' })
+				.hasConflict,
+			false,
+			`expected gluten-free "${itemName}" to pass`
+		);
+	}
+
+	// Prepared foods with hidden allergens: satay / pad thai sauce (peanut) and hummus (sesame).
+	for (const peanutSauce of ['chicken satay', 'satay sauce', 'pad thai sauce']) {
+		const dish = recipe({
+			id: `prep-${peanutSauce}`,
+			ingredients: [{ name: peanutSauce, quantity: 2, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'peanuts' }).hasConflict,
+			true,
+			`expected peanut allergy to flag "${peanutSauce}"`
+		);
+	}
+	const hummusPlate = recipe({
+		id: 'hummus-plate',
+		ingredients: [{ name: 'classic hummus', quantity: 0.5, unit: 'cup' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(hummusPlate, { diet: 'none', allergies: 'sesame' }).hasConflict,
+		true
+	);
+
+	// Vegetarian meat gaps (while keeping plant "celery ribs" safe).
+	for (const meatItem of [
+		'baby back ribs',
+		'chicken liver',
+		'braised oxtail',
+		'roast rabbit',
+		'beef hotdog',
+		'beef jerky',
+		'lamb mince'
+	]) {
+		const dish = recipe({
+			id: `meat-${meatItem}`,
+			ingredients: [{ name: meatItem, quantity: 6, unit: 'oz' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'vegetarian', allergies: '' }).hasConflict,
+			true,
+			`expected vegetarian to flag "${meatItem}"`
+		);
+	}
+	const celerySnack = recipe({
+		id: 'celery-ribs',
+		ingredients: [{ name: 'celery ribs', quantity: 3, unit: 'stalk' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(celerySnack, { diet: 'vegetarian', allergies: '' }).hasConflict,
 		false
 	);
 });
@@ -1141,6 +1488,229 @@ test('avoiding soy and sesame excludes maple-chili-tofu and sesame-salmon-bowls 
 	assert.equal(tofuReport.hasConflict, true);
 	assert.deepEqual(tofuReport.allergenMatches, ['soy', 'sesame']);
 	assert.deepEqual(tofuReport.matchingIngredientIndices, [0, 4, 8]);
+});
+
+test('editing a recipe refreshes scheduled weeks and existing recipe scopes independently while keeping manual and checked rows', () => {
+	const now = new Date('2026-10-22T12:00:00Z');
+	const pasta = recipe({
+		id: 'pasta',
+		servings: 2,
+		saved: true,
+		ingredients: [{ name: 'olive oil', quantity: 2, unit: 'tbsp' }]
+	});
+	const initial = state({
+		pantry: [pantry('olive oil', 1, 'tbsp')],
+		recipes: [pasta],
+		meals: [{ id: 'dinner', date: '2026-10-23', slot: 'Dinner', recipeId: 'pasta', servings: 4 }],
+		shopping: [
+			shopping('manual-salt', 'kosher salt', 1, 'box', false),
+			shopping('other-recipe', 'lemon', 2, 'each', false, 'recipe:other'),
+			shopping('week-bought', 'olive oil', 1, 'tbsp', true, 'week:2026-10-19'),
+			shopping('week-open', 'olive oil', 2, 'tbsp', false, 'week:2026-10-19'),
+			shopping('recipe-bought', 'olive oil', 1, 'tbsp', true, 'recipe:pasta')
+		]
+	});
+
+	const edited = saveEditedRecipe(
+		initial,
+		{
+			...pasta,
+			servings: 4,
+			rating: 5,
+			ingredients: [
+				{ name: 'olive oil', quantity: 6, unit: 'tbsp' },
+				{ name: 'garlic', quantity: 4, unit: 'clove' }
+			]
+		},
+		now
+	);
+
+	const updatedRecipe = edited.recipes[0];
+	assert.equal(updatedRecipe.nutritionStale, true);
+	assert.equal(updatedRecipe.saved, true);
+	assert.equal(edited.preferences.ratings?.pasta, 5);
+
+	// Planned meal for 4 servings needs 6 tbsp oil - 1 tbsp pantry - 1 tbsp checked = 4 tbsp, plus 4 garlic cloves.
+	const weekItems = edited.shopping.filter((item) => item.sourceKey === 'week:2026-10-19');
+	assert.equal(weekItems.find((item) => item.checked && item.name === 'olive oil')?.quantity, 1);
+	assert.equal(weekItems.find((item) => !item.checked && item.name === 'olive oil')?.quantity, 4);
+	assert.equal(weekItems.find((item) => !item.checked && item.name === 'garlic')?.quantity, 4);
+
+	// Existing recipe:pasta scope uses edited recipe.servings (4) independently without cross-scope deduplication.
+	const recipeItems = edited.shopping.filter((item) => item.sourceKey === 'recipe:pasta');
+	assert.equal(recipeItems.find((item) => item.checked && item.name === 'olive oil')?.quantity, 1);
+	assert.equal(recipeItems.find((item) => !item.checked && item.name === 'olive oil')?.quantity, 4);
+	assert.equal(recipeItems.find((item) => !item.checked && item.name === 'garlic')?.quantity, 4);
+
+	// Manual and other recipe scopes remain untouched.
+	assert.ok(edited.shopping.some((item) => item.id === 'manual-salt'));
+	assert.ok(edited.shopping.some((item) => item.id === 'other-recipe'));
+
+	// Editing a recipe with no existing recipe:<id> scope does not create recipe:<id> rows.
+	const withoutRecipeScope = upsertRecipe(
+		state({ recipes: [pasta] }),
+		{ ...pasta, servings: 4 },
+		now
+	);
+	assert.equal(withoutRecipeScope.shopping.length, 0);
+	assert.equal(recipeNeedsNutritionRefresh(pasta, { ...pasta, title: 'Renamed' }), false);
+	assert.equal(recipeNeedsNutritionRefresh(pasta, { ...pasta, servings: 4 }), true);
+});
+
+test('unsaved recipes open for manual editing and save cleanly to the collection', () => {
+	const unsaved = recipe({
+		id: 'draft-risotto',
+		title: 'Mushroom risotto',
+		saved: false,
+		ingredients: [{ name: 'arborio rice', quantity: 1, unit: 'cup' }],
+		steps: ['Toast rice', 'Simmer with stock']
+	});
+	const initial = state({ recipes: [unsaved] });
+
+	const draft = recipeForEdit(initial, 'draft-risotto');
+	assert.ok(draft);
+	assert.equal(draft.saved, false);
+	draft.title = 'Herbed mushroom risotto';
+	draft.ingredients[0].quantity = 2;
+	assert.equal(initial.recipes[0].title, 'Mushroom risotto');
+	assert.equal(initial.recipes[0].ingredients[0].quantity, 1);
+
+	const savedState = saveEditedRecipe(initial, draft, new Date('2026-10-22T12:00:00Z'));
+	assert.equal(savedState.recipes[0].saved, true);
+	assert.equal(savedState.recipes[0].title, 'Herbed mushroom risotto');
+	assert.equal(savedState.recipes[0].nutritionStale, true);
+	assert.equal(recipeForEdit(initial, 'missing'), null);
+});
+
+test('UI workflows and Basil commands produce identical shopping and kitchen state across recipe and meal lifecycles', () => {
+	const now = new Date('2026-10-22T12:00:00Z');
+	const stew = recipe({
+		id: 'stew',
+		title: 'Bean stew',
+		servings: 2,
+		saved: true,
+		ingredients: [
+			{ name: 'carrot', quantity: 4, unit: 'each' },
+			{ name: 'onion', quantity: 2, unit: 'each' }
+		],
+		steps: ['Simmer']
+	});
+	const base = state({
+		pantry: [pantry('carrot', 1, 'each')],
+		recipes: [stew],
+		shopping: [
+			shopping('manual', 'bread', 1, 'loaf', false),
+			shopping('recipe-stew', 'carrot', 3, 'each', false, 'recipe:stew')
+		]
+	});
+
+	// 1. Schedule a meal into an empty week.
+	const scheduledMeal = {
+		id: 'dinner-1',
+		date: '2026-10-23',
+		slot: 'Dinner' as const,
+		recipeId: 'stew',
+		servings: 2
+	};
+	const uiScheduled = upsertMeal(base, scheduledMeal, now);
+	const basilScheduled = applyButlerCommands(
+		base,
+		[{ type: 'meal.upsert', meal: scheduledMeal }],
+		now
+	).state;
+	assert.deepEqual(uiScheduled, basilScheduled);
+	assert.equal(weekStartForDate('2026-10-23'), '2026-10-19');
+	assert.ok(uiScheduled.shopping.some((item) => item.sourceKey === 'week:2026-10-19'));
+
+	// 2. Edit the recipe (updates both week:2026-10-19 and recipe:stew).
+	const revisedStew = {
+		...stew,
+		servings: 4,
+		ingredients: [
+			{ name: 'carrot', quantity: 6, unit: 'each' },
+			{ name: 'celery', quantity: 2, unit: 'each' }
+		]
+	};
+	const uiEdited = saveEditedRecipe(uiScheduled, revisedStew, now);
+	const basilEdited = applyButlerCommands(
+		basilScheduled,
+		[{ type: 'recipe.upsert', recipe: { ...revisedStew, saved: true } }],
+		now
+	).state;
+	assert.deepEqual(uiEdited, basilEdited);
+
+	// 3. Move the planned meal to next week (clears old week, populates new week).
+	const movedMeal = { ...scheduledMeal, date: '2026-10-28', servings: 4 };
+	const uiMoved = upsertMeal(uiEdited, movedMeal, now);
+	const basilMoved = applyButlerCommands(
+		basilEdited,
+		[{ type: 'meal.upsert', meal: movedMeal }],
+		now
+	).state;
+	assert.deepEqual(uiMoved, basilMoved);
+	assert.equal(
+		uiMoved.shopping.some((item) => item.sourceKey === 'week:2026-10-19'),
+		false
+	);
+	assert.ok(uiMoved.shopping.some((item) => item.sourceKey === 'week:2026-10-26'));
+
+	// 4. Complete the meal (preserves completion if re-upserted, clears completed week's shopping).
+	const uiCompleted = completeMeal(
+		uiMoved,
+		movedMeal.id,
+		{ deductPantry: true, leftoverServings: 1 },
+		now
+	);
+	const basilCompleted = applyButlerCommands(
+		basilMoved,
+		[{ type: 'meal.complete', id: movedMeal.id, deductPantry: true, leftoverServings: 1 }],
+		now
+	).state;
+	assert.deepEqual(uiCompleted, basilCompleted);
+	assert.equal(
+		uiCompleted.shopping.some((item) => item.sourceKey === 'week:2026-10-26'),
+		false
+	);
+	const preservedCompletion = upsertMeal(uiCompleted, { ...movedMeal, slot: 'Lunch' }, now);
+	assert.equal(preservedCompletion.meals[0].completedAt, now.toISOString());
+	assert.equal(preservedCompletion.meals[0].leftoverServings, 1);
+	const clampedLeftovers = upsertMeal(
+		preservedCompletion,
+		{ ...preservedCompletion.meals[0], servings: 3, leftoverServings: 9 },
+		now
+	);
+	assert.deepEqual(
+		clampedLeftovers,
+		applyButlerCommands(
+			preservedCompletion,
+			[
+				{
+					type: 'meal.upsert',
+					meal: { ...preservedCompletion.meals[0], servings: 3, leftoverServings: 9 }
+				}
+			],
+			now
+		).state
+	);
+	assert.equal(clampedLeftovers.meals[0].leftoverServings, 3);
+
+	// 5. Add another meal then delete it vs delete the recipe.
+	const secondMeal = {
+		id: 'dinner-2',
+		date: '2026-11-04',
+		slot: 'Dinner' as const,
+		recipeId: 'stew',
+		servings: 4
+	};
+	const withSecond = upsertMeal(uiCompleted, secondMeal, now);
+	assert.deepEqual(
+		deleteMeal(withSecond, secondMeal.id, now),
+		applyButlerCommands(withSecond, [{ type: 'meal.delete', id: secondMeal.id }], now).state
+	);
+	assert.deepEqual(
+		deleteRecipe(withSecond, 'stew', now),
+		applyButlerCommands(withSecond, [{ type: 'recipe.delete', id: 'stew' }], now).state
+	);
 });
 
 test('user purchases never merge into sample pantry lots and merge into user-owned lots', () => {
@@ -1905,4 +2475,19 @@ test('filterPantryItems excludes zero-quantity rows from Expiring soon while kee
 		),
 		['spinach-depleted', 'rice-stocked']
 	);
+});
+
+test('weekStartForDate and refreshWeekShopping handle undefined and Date/string inputs safely', () => {
+	assert.equal(weekStartForDate(undefined), '');
+	assert.equal(weekStartForDate('2026-10-23'), '2026-10-19');
+	assert.equal(weekStartForDate(new Date(2026, 9, 25, 12, 0, 0)), '2026-10-19');
+
+	const initial = state({
+		recipes: [recipe({ id: 'soup', ingredients: [{ name: 'carrot', quantity: 2, unit: 'each' }] })],
+		meals: [{ id: 'm1', date: '2026-10-23', slot: 'Dinner', recipeId: 'soup', servings: 2 }]
+	});
+	assert.equal(refreshWeekShopping(initial, undefined), initial);
+	const refreshed = refreshWeekShopping(initial, '2026-10-19', new Date('2026-10-20T12:00:00Z'));
+	assert.equal(refreshed.shopping.length, 1);
+	assert.equal(refreshed.shopping[0].sourceKey, 'week:2026-10-19');
 });
