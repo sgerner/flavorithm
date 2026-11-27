@@ -2,7 +2,7 @@
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { tick, untrack } from 'svelte';
-	import ModalDialog from './ModalDialog.svelte';
+	import ModalDialog from '#lib/components/ModalDialog.svelte';
 	import {
 		describeInvalidControl,
 		hasRecipeEditorChanges,

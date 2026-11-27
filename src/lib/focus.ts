@@ -3,12 +3,14 @@ export type FocusTrapOptions = {
 	enabled?: boolean;
 	key?: unknown;
 	returnFocus?: HTMLElement | (() => HTMLElement | null | undefined) | null;
+	fallbackFocus?: HTMLElement | (() => HTMLElement | null | undefined) | null;
 };
 
 type ResolvedOptions = {
 	enabled: boolean;
 	key: unknown;
 	returnFocus?: HTMLElement | (() => HTMLElement | null | undefined) | null;
+	fallbackFocus?: HTMLElement | (() => HTMLElement | null | undefined) | null;
 };
 
 type TrapEntry = {
@@ -34,7 +36,8 @@ function resolveOptions(param?: FocusTrapOptions | boolean): ResolvedOptions {
 	return {
 		enabled: param?.enabled ?? true,
 		key: param?.key,
-		returnFocus: param?.returnFocus
+		returnFocus: param?.returnFocus,
+		fallbackFocus: param?.fallbackFocus
 	};
 }
 
@@ -86,36 +89,75 @@ export function focusableControls(node: HTMLElement): HTMLElement[] {
 	);
 }
 
-function hasExternalActiveFocus(target: HTMLElement, closingNode: HTMLElement): boolean {
-	const active = document.activeElement as HTMLElement | null;
+function isUsableFocusTarget(
+	el: HTMLElement | null | undefined,
+	closingNode: HTMLElement
+): el is HTMLElement {
+	if (!el) return false;
+	const doc = closingNode.ownerDocument ?? (typeof document !== 'undefined' ? document : null);
+	if (doc && (el === doc.body || el === doc.documentElement)) return false;
+	if (!el.isConnected || closingNode.contains(el)) return false;
+	if ((el as { disabled?: boolean }).disabled) return false;
+	return !isHiddenWithoutInert(el);
+}
+
+function resolveFallbackTarget(
+	fallbackFocus: ResolvedOptions['fallbackFocus'],
+	closingNode: HTMLElement
+): HTMLElement | null {
+	const explicit = typeof fallbackFocus === 'function' ? fallbackFocus() : fallbackFocus;
+	if (isUsableFocusTarget(explicit, closingNode)) return explicit;
+	const doc = closingNode.ownerDocument ?? (typeof document !== 'undefined' ? document : null);
+	if (!doc || typeof doc.querySelector !== 'function') return null;
+	const mainTarget = doc.querySelector<HTMLElement>('#kitchen-content, main, [role="main"]');
+	return isUsableFocusTarget(mainTarget, closingNode) ? mainTarget : null;
+}
+
+function hasExternalActiveFocus(
+	targets: Array<HTMLElement | null>,
+	closingNode: HTMLElement
+): boolean {
+	const doc = closingNode.ownerDocument ?? (typeof document !== 'undefined' ? document : null);
+	const active = (doc?.activeElement ?? null) as HTMLElement | null;
 	return Boolean(
 		active &&
-		active !== document.body &&
-		active !== document.documentElement &&
-		active !== target &&
+		active !== doc?.body &&
+		active !== doc?.documentElement &&
+		!targets.includes(active) &&
+		active.isConnected &&
 		!closingNode.contains(active) &&
 		!active.closest('[inert], [hidden], [data-focus-backdrop]')
 	);
 }
 
-function scheduleFocusRestore(returnTarget: HTMLElement | null, closingNode: HTMLElement) {
+function scheduleFocusRestore(
+	returnTarget: HTMLElement | null,
+	fallbackFocus: ResolvedOptions['fallbackFocus'],
+	closingNode: HTMLElement
+) {
 	cancelPendingRestore?.();
 	const token = ++restoreGeneration;
-	if (!returnTarget) {
-		queueMicrotask(() => {
-			if (token !== restoreGeneration || activeTraps.length !== 0) return;
-			handoffFocus = null;
-			handoffOverflow = null;
-		});
-		return;
-	}
+	const doc = closingNode.ownerDocument ?? (typeof document !== 'undefined' ? document : null);
 
 	let restoreObserver: MutationObserver | null = null;
+	let observedCandidate: HTMLElement | null = null;
 	let rafId: number | null = null;
 	let cleaned = false;
+	let retries = 0;
+
+	const clearClosingNodeFocus = () => {
+		const active = (doc?.activeElement ?? null) as HTMLElement | null;
+		if (
+			active &&
+			(closingNode.contains(active) || !active.isConnected || active.closest('[inert]'))
+		) {
+			active.blur?.();
+		}
+	};
 
 	const onExternalFocusIn = () => {
-		if (hasExternalActiveFocus(returnTarget, closingNode)) cleanup();
+		const fallback = resolveFallbackTarget(fallbackFocus, closingNode);
+		if (hasExternalActiveFocus([returnTarget, fallback], closingNode)) cleanup();
 	};
 
 	const cleanup = () => {
@@ -123,16 +165,35 @@ function scheduleFocusRestore(returnTarget: HTMLElement | null, closingNode: HTM
 		cleaned = true;
 		restoreObserver?.disconnect();
 		restoreObserver = null;
+		observedCandidate = null;
 		if (rafId !== null && typeof cancelAnimationFrame === 'function') {
 			cancelAnimationFrame(rafId);
 		}
 		rafId = null;
-		if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
-			document.removeEventListener('focusin', onExternalFocusIn);
+		if (doc && typeof doc.removeEventListener === 'function') {
+			doc.removeEventListener('focusin', onExternalFocusIn);
 		}
 		if (cancelPendingRestore === cleanup) cancelPendingRestore = null;
 	};
 	cancelPendingRestore = cleanup;
+
+	const observeInertAncestors = (candidate: HTMLElement) => {
+		if (typeof MutationObserver === 'undefined') return;
+		if (restoreObserver && observedCandidate === candidate) return;
+		restoreObserver?.disconnect();
+		restoreObserver = new MutationObserver(() => {
+			attempt();
+		});
+		observedCandidate = candidate;
+		let current: HTMLElement | null = candidate;
+		while (current) {
+			restoreObserver.observe(current, { attributes: true, attributeFilter: ['inert'] });
+			current = current.parentElement;
+		}
+		if (doc && typeof doc.addEventListener === 'function') {
+			doc.addEventListener('focusin', onExternalFocusIn);
+		}
+	};
 
 	const attempt = (): 'done' | 'inert' => {
 		if (cleaned || token !== restoreGeneration || activeTraps.length !== 0) {
@@ -141,38 +202,48 @@ function scheduleFocusRestore(returnTarget: HTMLElement | null, closingNode: HTM
 		}
 		handoffFocus = null;
 		handoffOverflow = null;
-		if (
-			!returnTarget.isConnected ||
-			isHiddenWithoutInert(returnTarget) ||
-			hasExternalActiveFocus(returnTarget, closingNode)
-		) {
+
+		const fallback = resolveFallbackTarget(fallbackFocus, closingNode);
+		if (hasExternalActiveFocus([returnTarget, fallback], closingNode)) {
 			cleanup();
 			return 'done';
 		}
-		if (returnTarget.closest('[inert]')) {
+
+		const primary = isUsableFocusTarget(returnTarget, closingNode) ? returnTarget : null;
+		if (primary) {
+			if (!primary.closest('[inert]')) {
+				primary.focus({ preventScroll: true });
+				cleanup();
+				return 'done';
+			}
+			if (retries >= MAX_RESTORE_MICROTASK_RETRIES && fallback && !fallback.closest('[inert]')) {
+				fallback.focus({ preventScroll: true });
+				cleanup();
+				return 'done';
+			}
+			clearClosingNodeFocus();
+			observeInertAncestors(primary);
 			return 'inert';
 		}
-		returnTarget.focus({ preventScroll: true });
+
+		if (fallback) {
+			if (!fallback.closest('[inert]')) {
+				fallback.focus({ preventScroll: true });
+				cleanup();
+				return 'done';
+			}
+			clearClosingNodeFocus();
+			observeInertAncestors(fallback);
+			return 'inert';
+		}
+
+		clearClosingNodeFocus();
 		cleanup();
 		return 'done';
 	};
 
-	let retries = 0;
 	const pollMicrotask = () => {
 		if (attempt() !== 'inert') return;
-		if (restoreObserver === null && typeof MutationObserver !== 'undefined') {
-			restoreObserver = new MutationObserver(() => {
-				attempt();
-			});
-			let current: HTMLElement | null = returnTarget;
-			while (current) {
-				restoreObserver.observe(current, { attributes: true, attributeFilter: ['inert'] });
-				current = current.parentElement;
-			}
-			if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
-				document.addEventListener('focusin', onExternalFocusIn);
-			}
-		}
 		if (rafId === null && typeof requestAnimationFrame === 'function') {
 			rafId = requestAnimationFrame(() => {
 				rafId = null;
@@ -271,7 +342,7 @@ export function focusTrap(node: HTMLElement, param?: FocusTrapOptions | boolean)
 			handoffFocus = returnTarget;
 			handoffOverflow = originalOverflow;
 			originalFocus = null;
-			scheduleFocusRestore(returnTarget, node);
+			scheduleFocusRestore(returnTarget, options.fallbackFocus, node);
 		}
 	}
 

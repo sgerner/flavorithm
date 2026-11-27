@@ -6,13 +6,18 @@ import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { compile } from 'svelte/compiler';
 import * as focusMod from '../src/lib/focus.ts';
+import * as coverMod from '../src/lib/recipe-cover.ts';
+import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
+import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
+import type { Recipe } from '../src/lib/types.ts';
 
 const { focusableControls, focusTrap } = focusMod;
 const nodeRequire = createRequire(import.meta.url);
 const svelteInternalClient = nodeRequire('svelte/internal/client');
-const { createRawSnippet, flushSync, mount, unmount } = nodeRequire(
+const svelteClientIndex = nodeRequire(
 	'../node_modules/svelte/src/index-client.js'
 ) as typeof import('svelte');
+const { createRawSnippet, flushSync, mount, unmount } = svelteClientIndex;
 
 type ListenerEntry = {
 	listener: (event: any) => void;
@@ -201,6 +206,16 @@ class MockNode extends MockEventTarget {
 			cur = cur.parentNode;
 		}
 		return false;
+	}
+
+	get nodeValue(): string | null {
+		return this.nodeType === 3 || this.nodeType === 8 ? this.data : null;
+	}
+
+	set nodeValue(value: string | null) {
+		if (this.nodeType === 3 || this.nodeType === 8) {
+			this.data = value ?? '';
+		}
 	}
 
 	get textContent(): string {
@@ -446,6 +461,12 @@ class MockElement extends MockNode {
 		dispatchBubbling(this, { type: 'focusin', bubbles: true });
 	}
 
+	blur() {
+		if (this.ownerDocument.activeElement === this) {
+			this.ownerDocument.activeElement = this.ownerDocument.body;
+		}
+	}
+
 	closest(selector: string): MockElement | null {
 		const parts = selector.split(',').map((s) => s.trim());
 		let cur: MockElement | null = this;
@@ -463,6 +484,7 @@ class MockElement extends MockNode {
 		if (selector === '[data-focus-backdrop]') return this.attributes.has('data-focus-backdrop');
 		if (selector === '[aria-modal="true"]') return this.attributes.get('aria-modal') === 'true';
 		if (selector === '[role="dialog"]') return this.attributes.get('role') === 'dialog';
+		if (selector === '[role="main"]') return this.attributes.get('role') === 'main';
 		if (selector.startsWith('.')) return this.classList.contains(selector.slice(1));
 		if (selector.startsWith('#')) return this.attributes.get('id') === selector.slice(1);
 		if (selector === 'button:not([disabled])') return this.tagName === 'BUTTON' && !this.disabled;
@@ -870,7 +892,7 @@ function installGlobalDOM() {
 
 installGlobalDOM();
 
-function compileClientComponent(filePath: string) {
+function compileClientComponent(filePath: string, extraMods: Record<string, unknown> = {}) {
 	const source = readFileSync(filePath, 'utf8');
 	const compiled = compile(source, { filename: filePath, generate: 'client' }).js.code;
 	const cjs = ts.transpileModule(compiled, {
@@ -880,14 +902,18 @@ function compileClientComponent(filePath: string) {
 	const noopIcon = () => {};
 	const iconProxy = new Proxy({}, { get: () => noopIcon });
 	const modMap: Record<string, unknown> = {
+		svelte: svelteClientIndex,
 		'svelte/internal/disclose-version': {},
 		'svelte/internal/client': svelteInternalClient,
 		'@lucide/svelte': iconProxy,
 		'#lib/focus.ts': focusMod,
 		'#lib/motion.ts': {
 			backdropMotion: () => ({ duration: 0 }),
-			dialogMotion: () => ({ duration: 0 })
-		}
+			dialogMotion: () => ({ duration: 0 }),
+			fadeMotion: () => ({ duration: 0 }),
+			revealMotion: () => ({ duration: 0 })
+		},
+		...extraMods
 	};
 
 	const exports: { default?: any } = {};
@@ -898,6 +924,13 @@ function compileClientComponent(filePath: string) {
 			if (id in modMap) return modMap[id];
 			throw new Error(`Unexpected dependency ${id} in ${filePath}`);
 		},
+		JSON,
+		Array,
+		Object,
+		String,
+		Number,
+		Boolean,
+		Math,
 		window: mockWin,
 		document: mockDoc,
 		MutationObserver: MockMutationObserver,
@@ -914,6 +947,14 @@ function compileClientComponent(filePath: string) {
 
 const ModalDialog = compileClientComponent('src/lib/components/ModalDialog.svelte');
 const MobileDrawer = compileClientComponent('src/lib/components/MobileDrawer.svelte');
+const ToggleButton = compileClientComponent('src/lib/components/ToggleButton.svelte');
+const RecipeDetail = compileClientComponent('src/lib/components/RecipeDetail.svelte', {
+	'#lib/components/ModalDialog.svelte': { __esModule: true, default: ModalDialog },
+	'#lib/components/ToggleButton.svelte': { __esModule: true, default: ToggleButton },
+	'#lib/recipe-cover.ts': coverMod,
+	'#lib/recipe-draft.ts': recipeDraftMod,
+	'#lib/recipe-detail.ts': recipeDetailMod
+});
 
 async function flushMicrotasks(turns = 4) {
 	for (let i = 0; i < turns; i++) {
@@ -1408,6 +1449,215 @@ test(
 		await flushMicrotasks(4);
 		assert.equal(main.inert, false);
 		assert.equal(doc.activeElement, menuBtn);
+
+		await unmount(instance);
+	})
+);
+
+test(
+	'focusTrap falls back to #kitchen-content when trigger unmounts or stays inside a separate inert subtree',
+	withMockDOM(async (doc) => {
+		const shell = doc.el('div', { class: 'app-shell' });
+		const closedSidebar = doc.el('aside', { id: 'kitchen-sidebar' });
+		const sidebarTrigger = doc.el('button', { class: 'sidebar-settings' });
+		closedSidebar.append(sidebarTrigger);
+
+		const main = doc.el('main', { id: 'kitchen-content', tabindex: '-1' });
+		const cardTrigger = doc.el('button', { class: 'recipe-card-open' });
+		main.append(cardTrigger);
+		shell.append(closedSidebar, main);
+		doc.body.append(shell);
+
+		// 1. Trigger unmounts while RecipeDetail/ModalDialog is open (e.g. Hide or Delete) and .app-shell clears inert asynchronously
+		cardTrigger.focus();
+		assert.equal(doc.activeElement, cardTrigger);
+
+		const detailDialog = doc.el('div', { role: 'dialog', 'aria-modal': 'true' });
+		const hideBtn = doc.el('button', { class: 'hide-recipe' });
+		detailDialog.append(hideBtn);
+		doc.body.append(detailDialog);
+
+		shell.inert = true;
+		const detailTrap = focusTrap(detailDialog as unknown as HTMLElement);
+		await flushMicrotasks();
+		assert.equal(doc.activeElement, hideBtn);
+
+		// Trigger unmounts while dialog is closing and .app-shell is still inert on initial microtask
+		cardTrigger.remove();
+		assert.equal(cardTrigger.isConnected, false);
+		detailDialog.dispatchEvent({ type: 'outrostart', target: detailDialog });
+		queueMicrotask(() => {
+			queueMicrotask(() => {
+				shell.inert = false;
+			});
+		});
+
+		await Promise.resolve();
+		// Focus must never remain trapped inside the closing dialog while waiting for shell.inert to clear
+		assert.equal(detailDialog.contains(doc.activeElement), false);
+
+		await flushMicrotasks(8);
+		assert.equal(shell.inert, false);
+		assert.equal(doc.activeElement, main);
+		assert.deepEqual(main.lastFocusOptions, { preventScroll: true });
+		detailTrap.destroy();
+
+		// 2. Trigger disconnects mid-restore (after initial microtask saw it connected inside inert .app-shell)
+		const transientTrigger = doc.el('button', { class: 'shopping-handoff' });
+		main.append(transientTrigger);
+		transientTrigger.focus();
+
+		const detailDialog2 = doc.el('div', { role: 'dialog', 'aria-modal': 'true' });
+		const shopBtn = doc.el('button');
+		detailDialog2.append(shopBtn);
+		doc.body.append(detailDialog2);
+
+		shell.inert = true;
+		const detailTrap2 = focusTrap(detailDialog2 as unknown as HTMLElement);
+		await flushMicrotasks();
+		assert.equal(doc.activeElement, shopBtn);
+
+		detailDialog2.dispatchEvent({ type: 'outrostart', target: detailDialog2 });
+		setTimeout(() => {
+			transientTrigger.remove();
+			shell.inert = false;
+		}, 0);
+
+		await flushMicrotasks(8);
+		assert.equal(shell.inert, true);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		await flushMicrotasks(4);
+		assert.equal(shell.inert, false);
+		assert.equal(doc.activeElement, main);
+		detailTrap2.destroy();
+
+		// 3. Trigger remains inside a permanently inert ancestor (closed mobile sidebar) while #kitchen-content is interactive
+		closedSidebar.inert = false;
+		sidebarTrigger.focus();
+		assert.equal(doc.activeElement, sidebarTrigger);
+
+		const settingsModal = doc.el('div', { role: 'dialog', 'aria-modal': 'true' });
+		const doneBtn = doc.el('button');
+		settingsModal.append(doneBtn);
+		doc.body.append(settingsModal);
+
+		closedSidebar.inert = true;
+		shell.inert = true;
+		const settingsTrap = focusTrap(settingsModal as unknown as HTMLElement);
+		await flushMicrotasks();
+		assert.equal(doc.activeElement, doneBtn);
+
+		shell.inert = false;
+		settingsModal.dispatchEvent({ type: 'outrostart', target: settingsModal });
+		await flushMicrotasks(12);
+		assert.equal(closedSidebar.inert, true);
+		assert.equal(doc.activeElement, main);
+		settingsTrap.destroy();
+	})
+);
+
+test(
+	'RecipeDetail combines ModalDialog focus trap with ToggleButton step state and restores focus to #kitchen-content when Hide unmounts trigger',
+	withMockDOM(async (doc) => {
+		const shell = doc.el('div', { class: 'app-shell' });
+		const main = doc.el('main', { id: 'kitchen-content', tabindex: '-1' });
+		const cardTrigger = doc.el('button', { class: 'recipe-card-button' });
+		main.append(cardTrigger);
+		const detailRoot = doc.el('div');
+		shell.append(main);
+		doc.body.append(shell, detailRoot);
+
+		cardTrigger.focus();
+		assert.equal(doc.activeElement, cardTrigger);
+
+		const sampleRecipe: Recipe = {
+			id: 'focaccia-detail',
+			title: 'Rosemary Focaccia',
+			description: 'Crisp olive oil bread.',
+			image: '/covers/focaccia.jpg',
+			time: 45,
+			servings: 4,
+			difficulty: 'Easy',
+			cuisine: 'Italian',
+			tags: ['Bread'],
+			ingredients: [{ name: 'Bread flour', quantity: 500, unit: 'g' }],
+			steps: ['Mix dough.', 'Bake until golden.'],
+			nutrition: {
+				calories: 310,
+				fat: 9,
+				saturatedFat: 1,
+				sodium: 410,
+				carbs: 49,
+				fiber: 2,
+				sugar: 1,
+				protein: 8
+			}
+		};
+
+		let hiddenToggled = false;
+		const detailProps = svelteInternalClient.proxy({
+			recipe: sampleRecipe,
+			close: () => {},
+			save: () => {},
+			shop: () => {},
+			plan: () => {},
+			rate: () => {},
+			nutrition: () => {},
+			edit: () => {},
+			remove: () => {},
+			toggleHidden: () => {
+				hiddenToggled = true;
+				cardTrigger.remove();
+			},
+			busy: false,
+			completedSteps: [] as number[]
+		});
+
+		shell.inert = true;
+		const instance = mount(RecipeDetail, {
+			target: detailRoot as unknown as Element,
+			props: detailProps
+		});
+		flushSync();
+		await flushMicrotasks();
+
+		const dialog = detailRoot.querySelector('[role="dialog"]')!;
+		assert.ok(dialog);
+		assert.equal(dialog.getAttribute('aria-modal'), 'true');
+		assert.equal(dialog.getAttribute('aria-label'), 'Rosemary Focaccia');
+		assert.equal(doc.activeElement, dialog.querySelector('.close-detail'));
+
+		const stepsList = dialog.querySelector('.steps-list')!;
+		const stepButtons = stepsList.querySelectorAll('button');
+		assert.equal(stepButtons.length, 2);
+		assert.equal(stepButtons[0]!.getAttribute('aria-pressed'), 'false');
+		assert.equal(stepButtons[0]!.querySelector('.visually-hidden')?.textContent, 'Step 01');
+
+		stepButtons[0]!.dispatchEvent({ type: 'click', bubbles: true });
+		flushSync();
+		assert.equal(stepButtons[0]!.getAttribute('aria-pressed'), 'true');
+		assert.equal(stepButtons[0]!.classList.contains('done'), true);
+		assert.equal(stepButtons[0]!.querySelector('.visually-hidden')?.textContent, 'Step 01');
+
+		// Clicking Hide unmounts cardTrigger in main and starts closing RecipeDetail while shell clears inert asynchronously
+		const manageButtons = dialog.querySelectorAll('.recipe-manage-button');
+		const hideButton = manageButtons.find((btn) => btn.textContent.trim() === 'Hide')!;
+		assert.ok(hideButton);
+		hideButton.focus();
+		hideButton.dispatchEvent({ type: 'click', bubbles: true });
+		assert.equal(hiddenToggled, true);
+		assert.equal(cardTrigger.isConnected, false);
+
+		dialog.dispatchEvent({ type: 'outrostart', target: dialog });
+		queueMicrotask(() => {
+			shell.inert = false;
+		});
+		await flushMicrotasks(8);
+
+		assert.equal(dialog.getAttribute('aria-modal'), null);
+		assert.equal(shell.inert, false);
+		assert.equal(doc.activeElement, main);
+		assert.deepEqual(main.lastFocusOptions, { preventScroll: true });
 
 		await unmount(instance);
 	})

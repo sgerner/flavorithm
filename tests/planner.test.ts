@@ -10,6 +10,7 @@ import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
@@ -18,6 +19,7 @@ import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
+import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import { calendarDayScrollLeft, weekOffsetFromStarts } from '../src/lib/planner.ts';
@@ -127,7 +129,58 @@ function injectPlannerHook(svelteSource: string): string {
 		closeDialog,
 		handleWindowKeydown,
 		planRecipe,
-		askDeleteRecipe
+		askDeleteRecipe,
+		scheduleVoiceIdleFocus,
+		setVoiceStateForTest: (next: {
+			target?: 'pantry' | 'import' | 'shopping' | '';
+			starting?: boolean;
+			retained?: boolean;
+		}) => {
+			if (next.target !== undefined) voiceTarget = next.target;
+			if (next.starting !== undefined) voiceStarting = next.starting;
+			if (next.retained !== undefined) voiceRetained = next.retained;
+		},
+		get voiceTarget() { return voiceTarget; },
+		get voiceBusy() { return voiceBusy; },
+		setPantryVoiceButton: (el: HTMLButtonElement | undefined) => {
+			pantryVoiceButton = el;
+		},
+		exportKitchen,
+		exportPendingChanges,
+		startPantryEdit,
+		setPantryDraftQuantity: (value: string) => {
+			if (pantryDraft) pantryDraft.quantity = value;
+		},
+		get toast() { return toast; },
+		get toastActionLabel() { return toastActionLabel; },
+		get online() { return online; },
+		set online(value: boolean) { online = value; },
+		get ready() { return ready; },
+		set ready(value: boolean) { ready = value; },
+		get kitchenLoaded() { return kitchenLoaded; },
+		set kitchenLoaded(value: boolean) { kitchenLoaded = value; },
+		initKitchenSyncForTest: (initialUser: User, baseline: AppState, etag = 'etag-test') => {
+			kitchenSync = createKitchenSync({
+				storage: localStorage,
+				getUser: () => user,
+				getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
+				setState: (state) => {
+					kitchen = sanitizeKitchenState(state);
+				},
+				onStatus: (status) => {
+					syncReady = status.ready;
+					pendingSync = status.pending;
+					sendingSync = status.syncing;
+					conflicts = status.conflicts;
+					reviewedEtag = status.reviewedEtag;
+					syncErrors = status.error;
+				},
+				transport: () => {
+					throw new Error('Unused transport in export test');
+				}
+			});
+			kitchenSync.initialize(initialUser, baseline, etag);
+		}
 	});
 `;
 	return svelteSource.slice(0, instanceEnd) + hook + svelteSource.slice(instanceEnd);
@@ -204,6 +257,28 @@ type PlannerHarnessApi = {
 	handleWindowKeydown: (event: KeyboardEvent) => void;
 	planRecipe: (recipe: Recipe, servings?: number) => void;
 	askDeleteRecipe: (recipe: Recipe) => void;
+	scheduleVoiceIdleFocus: (
+		endedTarget: 'pantry' | 'import' | 'shopping' | '',
+		restoreEl: HTMLElement | null
+	) => void;
+	setVoiceStateForTest: (next: {
+		target?: 'pantry' | 'import' | 'shopping' | '';
+		starting?: boolean;
+		retained?: boolean;
+	}) => void;
+	readonly voiceTarget: 'pantry' | 'import' | 'shopping' | '';
+	readonly voiceBusy: boolean;
+	setPantryVoiceButton: (el: HTMLButtonElement | undefined) => void;
+	exportKitchen: () => Promise<void>;
+	exportPendingChanges: () => void;
+	startPantryEdit: (item: AppState['pantry'][number]) => Promise<void>;
+	setPantryDraftQuantity: (value: string) => void;
+	readonly toast: string;
+	readonly toastActionLabel: string;
+	online: boolean;
+	ready: boolean;
+	kitchenLoaded: boolean;
+	initKitchenSyncForTest: (initialUser: User, baseline: AppState, etag?: string) => void;
 };
 
 const noopComponent = () => {};
@@ -242,15 +317,19 @@ function createModuleMap() {
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
+		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/components/ModalDialog.svelte': noopComponentModule,
 		'#lib/components/MobileDrawer.svelte': noopComponentModule,
+		'#lib/components/ToggleButton.svelte': noopComponentModule,
+		'#lib/components/DisclosureButton.svelte': noopComponentModule,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
@@ -322,6 +401,9 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date: customDate ?? Date,
@@ -365,16 +447,66 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 	return { html: rendered.body, api: captured };
 }
 
-function createReactivePlanner() {
+function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolean }) {
 	const modMap = createModuleMap();
 	const exports: { default?: any } = {};
 	let api!: PlannerHarnessApi;
 	const assignedUrls: string[] = [];
+	const downloads: Array<{ filename: string; content: string; type: string }> = [];
+	const blobUrls = new Map<string, { content: string; type: string }>();
 	const storage = makeMemoryStorage();
+	const navigatorState = { onLine: options?.onLine ?? true };
+	let fetchImpl: typeof fetch =
+		options?.fetch ??
+		(async () =>
+			new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			}));
+	const customUrl = Object.assign(
+		function URLProxy(input: string | URL, base?: string | URL) {
+			return new URL(input, base);
+		},
+		{
+			createObjectURL: (blob: Blob) => {
+				const token = `blob:test-${blobUrls.size + 1}`;
+				blobUrls.set(token, { content: '', type: blob.type });
+				void blob.text().then((text) => {
+					const existing = blobUrls.get(token);
+					if (existing) existing.content = text;
+				});
+				return token;
+			},
+			revokeObjectURL: () => {}
+		}
+	);
+	class RecordedBlob {
+		readonly textContent: string;
+		readonly type: string;
+		constructor(parts: Array<string>, init?: { type?: string }) {
+			this.textContent = parts.join('');
+			this.type = init?.type ?? '';
+		}
+		async text() {
+			return this.textContent;
+		}
+	}
+	customUrl.createObjectURL = (blob: unknown) => {
+		const token = `blob:test-${blobUrls.size + 1}`;
+		const recorded = blob as RecordedBlob;
+		blobUrls.set(token, {
+			content: typeof recorded?.textContent === 'string' ? recorded.textContent : '',
+			type: typeof recorded?.type === 'string' ? recorded.type : ''
+		});
+		return token;
+	};
 	const sandbox: Record<string, unknown> = {
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date,
@@ -390,23 +522,47 @@ function createReactivePlanner() {
 		JSON,
 		RegExp,
 		Error,
+		TypeError,
 		RangeError,
+		DOMException,
+		AbortSignal,
+		Blob: RecordedBlob,
+		CSS: { escape: (value: string) => value },
 		Promise,
-		URL,
+		URL: customUrl,
 		Response,
 		Request,
 		crypto,
 		console,
-		setTimeout,
+		setTimeout: (fn: (...args: unknown[]) => void, ms?: number) => setTimeout(fn, ms).unref(),
 		clearTimeout,
 		setInterval,
 		clearInterval,
 		localStorage: storage,
-		navigator: { onLine: true },
-		CSS: { escape: (value: string) => value },
+		navigator: navigatorState,
 		document: {
+			documentElement: {
+				dataset: {},
+				classList: { toggle: () => {} }
+			},
 			querySelector: () => null,
-			getElementById: () => null
+			getElementById: () => null,
+			createElement: (tag: string) => {
+				const anchor = {
+					tag,
+					href: '',
+					download: '',
+					click: () => {
+						const payload = blobUrls.get(anchor.href);
+						downloads.push({
+							filename: anchor.download,
+							content: payload?.content ?? '',
+							type: payload?.type ?? ''
+						});
+					}
+				};
+				return anchor;
+			}
 		},
 		window: {
 			location: {
@@ -415,11 +571,7 @@ function createReactivePlanner() {
 			},
 			scrollTo: () => {}
 		},
-		fetch: async () =>
-			new Response(JSON.stringify({ ok: true }), {
-				status: 200,
-				headers: { 'content-type': 'application/json' }
-			})
+		fetch: (...args: Parameters<typeof fetch>) => fetchImpl(...args)
 	};
 	sandbox.globalThis = sandbox;
 	sandbox.__onPlannerInit = (instance: PlannerHarnessApi) => {
@@ -429,7 +581,17 @@ function createReactivePlanner() {
 	const dispose = svelteClient.effect_root(() => {
 		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
 	});
-	return { api, assignedUrls, storage, dispose };
+	return {
+		api,
+		assignedUrls,
+		downloads,
+		navigatorState,
+		setFetch: (next: typeof fetch) => {
+			fetchImpl = next;
+		},
+		storage,
+		dispose
+	};
 }
 
 test('unmodified +page.svelte compiles cleanly and avoids linear recipe scans and per-item toLocaleDateString in planner', () => {
@@ -1137,11 +1299,22 @@ test('handleWindowKeydown dismisses one Escape layer at a time in strict precede
 		api.kitchen.shopping[0].name = 'Edited lemons';
 		assert.equal(api.editingShoppingId, api.kitchen.shopping[0].id);
 
-		// 6. Closes mobileNav drawer before inline row edits
+		// 6. Closes mobileNav drawer before inline voice or row edits
 		const esc6 = makeKeyEvent('Escape');
 		api.handleWindowKeydown(esc6);
 		assert.equal(esc6.defaultPrevented, true);
 		assert.equal(api.mobileNav, false);
+		assert.equal(api.editingShoppingId, api.kitchen.shopping[0].id);
+		assert.ok(api.pantryDraft);
+
+		// 6b. Cancels active inline shopping voice session before cancelling shopping row edit
+		api.setVoiceStateForTest({ target: 'shopping', starting: true });
+		assert.equal(api.voiceBusy, true);
+		const escVoice = makeKeyEvent('Escape');
+		api.handleWindowKeydown(escVoice);
+		assert.equal(escVoice.defaultPrevented, true);
+		assert.equal(api.voiceTarget, '');
+		assert.equal(api.voiceBusy, false);
 		assert.equal(api.editingShoppingId, api.kitchen.shopping[0].id);
 		assert.ok(api.pantryDraft);
 
@@ -1174,7 +1347,165 @@ test('handleWindowKeydown dismisses one Escape layer at a time in strict precede
 		assert.equal(escGuard.defaultPrevented, true);
 		assert.equal(requestCancelCalls, 1);
 		assert.equal(api.editingRecipe?.id, draftRecipe.id);
+		api.editingRecipe = null;
+
+		// scheduleVoiceIdleFocus skips inert/disconnected background triggers when dictation opened modal='pantry'
+		api.modal = 'pantry';
+		let inertFocusCalls = 0;
+		let modalVoiceFocusCalls = 0;
+		const inertDiscoverTrigger = {
+			isConnected: true,
+			disabled: false,
+			closest: (selector: string) => (selector.includes('[inert]') ? ({} as Element) : null),
+			focus: () => {
+				inertFocusCalls += 1;
+			}
+		} as unknown as HTMLElement;
+		const modalVoiceBtn = {
+			isConnected: true,
+			disabled: false,
+			closest: () => null,
+			focus: () => {
+				modalVoiceFocusCalls += 1;
+			}
+		} as unknown as HTMLButtonElement;
+		api.setPantryVoiceButton(modalVoiceBtn);
+		api.scheduleVoiceIdleFocus('pantry', inertDiscoverTrigger);
+		await Promise.resolve();
+		await Promise.resolve();
+		assert.equal(inertFocusCalls, 0);
+		assert.equal(modalVoiceFocusCalls, 1);
 	} finally {
 		dispose();
+	}
+});
+
+test('+page.svelte exportKitchen commits inline edits, merges account state, and distinguishes 401 expiry and offline modes', async () => {
+	let fetchCalls = 0;
+	const harness = createReactivePlanner({
+		fetch: (async () => {
+			fetchCalls += 1;
+			throw new Error('Guest export must not call fetch');
+		}) as typeof fetch
+	});
+
+	try {
+		const { api, downloads, navigatorState, setFetch } = harness;
+
+		// 1. Guest export: zero network calls, source='guest', guest toast.
+		api.user = null;
+		const guestState = dataMod.createInitialState();
+		guestState.pantry = [
+			{ id: 'mint', name: 'Mint', quantity: 1, unit: 'bunch', category: 'Produce' }
+		];
+		api.kitchen = guestState;
+		await api.exportKitchen();
+
+		assert.equal(fetchCalls, 0);
+		assert.equal(downloads.length, 1);
+		assert.equal(downloads[0].filename, 'flavorithm-kitchen.json');
+		const guestEnvelope = JSON.parse(downloads[0].content);
+		assert.equal(guestEnvelope.source, 'guest');
+		assert.equal(guestEnvelope.hasPendingChanges, false);
+		assert.equal(guestEnvelope.state.pantry[0]?.id, 'mint');
+		assert.match(api.toast, /guest kitchen data exported/i);
+
+		// 2. Signed-in online export with uncommitted inline pantry draft: commits draft, stages, merges with /api/export.
+		const signedInUser: User = {
+			id: 'page-cook',
+			name: 'Page Cook',
+			email: 'page@example.test',
+			householdId: 'page-home'
+		};
+		const baseline = dataMod.createNewUserState();
+		baseline.pantry = [
+			{ id: 'beans', name: 'Black beans', quantity: 2, unit: 'can', category: 'Canned goods' }
+		];
+		api.user = signedInUser;
+		api.online = true;
+		navigatorState.onLine = true;
+		api.kitchenLoaded = true;
+		api.initKitchenSyncForTest(signedInUser, baseline, 'etag-page-1');
+		api.ready = true;
+
+		await api.startPantryEdit(api.kitchen.pantry[0]);
+		api.setPantryDraftQuantity('9');
+
+		const serverState = structuredClone(baseline);
+		serverState.shopping = [
+			{ id: 'cilantro', name: 'Cilantro', quantity: 1, unit: 'bunch', checked: false }
+		];
+		let exportCalls = 0;
+		setFetch((async (input, init) => {
+			if (input !== '/api/export') {
+				return Response.json({ ok: true });
+			}
+			exportCalls += 1;
+			assert.equal(init?.redirect, 'manual');
+			return Response.json({
+				exportedAt: '2026-11-24T18:00:00.000Z',
+				user: { ...signedInUser, emailVerified: true },
+				state: serverState
+			});
+		}) as typeof fetch);
+
+		await api.exportKitchen();
+		assert.equal(exportCalls, 1);
+		assert.equal(downloads.length, 2);
+		const accountEnvelope = JSON.parse(downloads[1].content);
+		assert.equal(accountEnvelope.source, 'account');
+		assert.equal(accountEnvelope.hasPendingChanges, true);
+		assert.equal(accountEnvelope.state.pantry[0]?.quantity, 9);
+		assert.equal(accountEnvelope.state.shopping[0]?.id, 'cilantro');
+		assert.match(api.toast, /merged account and kitchen data exported/i);
+
+		// 3. Expired session (401) while online via exportPendingChanges: no retry, distinct session-expired toast.
+		let auth401Calls = 0;
+		setFetch((async () => {
+			auth401Calls += 1;
+			return Response.json({ error: 'Authentication required' }, { status: 401 });
+		}) as typeof fetch);
+
+		api.exportPendingChanges();
+		// Wait for async exportKitchen triggered by exportPendingChanges.
+		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(auth401Calls, 1);
+		assert.equal(downloads.length, 3);
+		const expiredEnvelope = JSON.parse(downloads[2].content);
+		assert.equal(expiredEnvelope.source, 'offline');
+		assert.match(api.toast, /session expired/i);
+		assert.doesNotMatch(api.toast, /offline device kitchen data/i);
+
+		// 4. Slow/timed-out /api/export retries once and shows distinct timeout toast on fallback.
+		let timeoutAttempts = 0;
+		setFetch((async (input) => {
+			if (input !== '/api/export') return Response.json({ ok: true });
+			timeoutAttempts += 1;
+			throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+		}) as typeof fetch);
+
+		await api.exportKitchen();
+		assert.equal(timeoutAttempts, 2);
+		assert.equal(downloads.length, 4);
+		assert.equal(JSON.parse(downloads[3].content).source, 'offline');
+		assert.match(api.toast, /took too long/i);
+
+		// 5. Offline mode skips network calls and shows offline backup toast.
+		navigatorState.onLine = false;
+		let offlineCalls = 0;
+		setFetch((async () => {
+			offlineCalls += 1;
+			throw new Error('Offline mode must not call fetch');
+		}) as typeof fetch);
+
+		await api.exportKitchen();
+		assert.equal(offlineCalls, 0);
+		assert.equal(downloads.length, 5);
+		assert.equal(JSON.parse(downloads[4].content).source, 'offline');
+		assert.match(api.toast, /offline device kitchen data/i);
+	} finally {
+		harness.dispose();
 	}
 });
