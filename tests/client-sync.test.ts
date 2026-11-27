@@ -1188,9 +1188,33 @@ function eventBus() {
 	};
 }
 
-test('rapid edits stage synchronously per edit with immediate pending status and monotonic timestamps, including provisional contexts', () => {
+test('rapid edits stage durably per tick, coalesce multi-section schedule() calls within a tick, and flush pending microtasks synchronously', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
+	base.recipes.push({
+		id: 'r-1',
+		title: 'Pasta Pomodoro',
+		description: 'Simple tomato pasta',
+		image: '',
+		time: 20,
+		servings: 2,
+		difficulty: 'Easy',
+		cuisine: 'Italian',
+		tags: [],
+		ingredients: [{ name: 'pasta', quantity: 200, unit: 'g' }],
+		steps: ['Boil pasta.'],
+		nutrition: {
+			calories: 400,
+			fat: 8,
+			saturatedFat: 1,
+			sodium: 200,
+			carbs: 70,
+			fiber: 4,
+			sugar: 5,
+			protein: 12
+		},
+		saved: true
+	});
 	base.shopping.push({
 		id: 'item-1',
 		name: '',
@@ -1206,6 +1230,7 @@ test('rapid edits stage synchronously per edit with immediate pending status and
 		originalSet(key, value);
 	};
 	let currentState = structuredClone(base);
+	let coalescedReads = 0;
 	const statuses: Array<{ ready: boolean; pending: boolean }> = [];
 	let syncScheduled = 0;
 	const controller = createKitchenSync({
@@ -1220,7 +1245,10 @@ test('rapid edits stage synchronously per edit with immediate pending status and
 	});
 	const persistence = createKitchenPersistence({
 		storage,
-		getState: () => currentState,
+		getState: (context) => {
+			if (context?.coalesced) coalescedReads += 1;
+			return currentState;
+		},
 		getUser: () => user,
 		sync: controller,
 		onAfterPersist: () => {
@@ -1243,29 +1271,73 @@ test('rapid edits stage synchronously per edit with immediate pending status and
 	assert.equal(statuses.at(-1)?.pending, true);
 	assert.equal(controller.snapshot()?.local.shopping.at(-1)?.name, 'Blueberries');
 
-	// Initialize onto confirmed baseline and run a 12-edit typing burst.
+	// Multi-section edits in the same tick coalesce via schedule() into one sanitize + one journal write.
 	currentState = structuredClone(base);
 	controller.initialize(user, structuredClone(base), 'v1');
 	journalWrites = 0;
+	coalescedReads = 0;
+	syncScheduled = 0;
+
+	currentState.pantry.push({
+		id: 'pantry-1',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		category: 'Pantry'
+	});
+	persistence.schedule();
+	currentState.meals.push({
+		id: 'meal-1',
+		date: '2026-11-26',
+		slot: 'Dinner',
+		recipeId: 'r-1',
+		servings: 2,
+		completedAt: '2026-11-26T18:00:00.000Z'
+	});
+	persistence.schedule();
+	currentState.shopping[0].name = 'Fresh basil';
+	persistence.schedule();
+	assert.equal(persistence.hasPending(), true);
+	assert.equal(journalWrites, 0, 'awaits microtask end-of-tick so sibling sections settle first');
+
+	await Promise.resolve();
+	assert.equal(persistence.hasPending(), false);
+	assert.equal(coalescedReads, 1, 'sanitizes/reads state once per tick across 3 section updates');
+	assert.equal(
+		journalWrites,
+		1,
+		'writes a single consistent journal snapshot for the multi-section tick'
+	);
+	assert.equal(controller.snapshot()?.local.pantry[0]?.name, 'olive oil');
+	assert.equal(controller.snapshot()?.local.meals[0]?.id, 'meal-1');
+	assert.equal(controller.snapshot()?.local.shopping[0]?.name, 'Fresh basil');
+
+	// Lifecycle / boundary flush() drains a scheduled microtask synchronously before unload/switch.
+	journalWrites = 0;
+	currentState.shopping[0].name = 'Heirloom tomatoes';
+	persistence.schedule();
+	assert.equal(persistence.flush(), true);
+	assert.equal(journalWrites, 1, 'flush() drains scheduled microtask synchronously');
+	await Promise.resolve();
+	assert.equal(journalWrites, 1, 'drained microtask does not double-write');
+
+	// 12-keystroke burst across 12 ticks writes durably on every tick and recovers on hard crash.
+	journalWrites = 0;
 	syncScheduled = 0;
 	statuses.length = 0;
-
 	const typed = 'Strawberries';
 	assert.equal(typed.length, 12);
-	let previousUpdatedAt = 0;
 	for (let index = 1; index <= typed.length; index += 1) {
 		currentState.shopping[0].name = typed.slice(0, index);
-		assert.equal(persistence.persist(), true);
+		persistence.schedule();
+		await Promise.resolve();
 		assert.equal(
 			journalWrites,
 			index,
-			'each edit writes synchronously to the durable journal with zero crash loss window'
+			'each keystroke tick writes durably to the journal without a 250 ms debounce window'
 		);
 		assert.equal(statuses.at(-1)?.pending, true);
-		const snap = controller.snapshot();
-		assert.equal(snap?.local.shopping[0].name, typed.slice(0, index));
-		assert.ok((snap?.updatedAt ?? 0) > previousUpdatedAt);
-		previousUpdatedAt = snap?.updatedAt ?? 0;
+		assert.equal(controller.snapshot()?.local.shopping[0].name, typed.slice(0, index));
 	}
 	assert.equal(syncScheduled, typed.length);
 
@@ -1304,7 +1376,7 @@ test('pre-auth guest edits flush on onGuestReady or pre-switch boundary, and quo
 		unit: 'pinch',
 		category: 'Spices'
 	});
-	assert.equal(preAuthPersistence.persist(), false);
+	preAuthPersistence.schedule();
 	assert.equal(preAuthPersistence.hasPending(), true);
 	assert.equal(preAuthStorage.getItem('flavorithm-guest-kitchen'), null);
 
@@ -1328,7 +1400,7 @@ test('pre-auth guest edits flush on onGuestReady or pre-switch boundary, and quo
 		sync: noopSync
 	});
 	switchState.preferences.allergies = 'lupin';
-	switchPersistence.persist();
+	switchPersistence.schedule();
 	assert.equal(switchPersistence.hasPending(), true);
 	assert.equal(switchPersistence.flush({ allowBeforeGuestReady: true }), true);
 	switchPersistence.cancel();
@@ -1410,7 +1482,7 @@ test('pre-auth guest edits flush on onGuestReady or pre-switch boundary, and quo
 	}
 });
 
-test('stage reads peer journal storage once and isolates rememberRecord, viewState, snapshot, and setState boundaries from caller mutation', async () => {
+test('stage isolates rememberRecord, viewState, snapshot, and setState boundaries from caller mutation', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
 	const peerStorage = memoryStorage();
@@ -1425,13 +1497,6 @@ test('stage reads peer journal storage once and isolates rememberRecord, viewSta
 		checked: false
 	});
 	peer.controller.stage(peerEdit);
-
-	let peerJournalReads = 0;
-	const originalGetItem = peerStorage.getItem;
-	peerStorage.getItem = (key) => {
-		if (key.startsWith('flavorithm-pending-journal:')) peerJournalReads += 1;
-		return originalGetItem(key);
-	};
 
 	let currentState = structuredClone(base);
 	const receivedSetStates: AppState[] = [];
@@ -1469,14 +1534,7 @@ test('stage reads peer journal storage once and isolates rememberRecord, viewSta
 		unit: 'can',
 		category: 'Pantry'
 	});
-
-	peerJournalReads = 0;
 	controller.stage(callerState);
-	assert.equal(
-		peerJournalReads,
-		1,
-		'stored peer journal entries are read once during stage rather than twice'
-	);
 
 	// Mutate caller input, snapshot() output, and setState() input after staging; internal journal must stay intact.
 	callerState.pantry[0].quantity = 999;
@@ -1497,15 +1555,88 @@ test('stage reads peer journal storage once and isolates rememberRecord, viewSta
 	assert.equal(server.shopping[0]?.id, 'peer-item');
 });
 
-test('finishing sync skips setState when server state matches active kitchen and rebases synchronous in-flight stage edits', async () => {
+test('sync() arriving during an in-flight pass queues one follow-up pass so failed or superseded passes are never hidden (#77 rule)', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
-	const firstEdit = structuredClone(base);
-	firstEdit.preferences.maxTime = 25;
+
+	// 1. In-flight pass fails while two sync() calls arrive: queues exactly ONE follow-up pass and surfaces failure if still failing.
+	const pass1Entered = deferred<void>();
+	const pass1Gate = deferred<never>();
+	let putAttempts = 0;
+	let failPut = true;
 	let server = structuredClone(base);
-	const syncMatching = harness({
-		user,
-		initial: base,
+	const statuses: SyncStatus[] = [];
+	let liveState = structuredClone(base);
+	const controller = createKitchenSync({
+		storage: memoryStorage(),
+		getUser: () => user,
+		getState: () => liveState,
+		setState: (next) => {
+			liveState = structuredClone(next);
+		},
+		onStatus: (status) => statuses.push(structuredClone(status)),
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(server),
+				etag: `v${putAttempts + 1}`,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				putAttempts += 1;
+				if (putAttempts === 1) {
+					pass1Entered.resolve();
+					return pass1Gate.promise;
+				}
+				if (failPut) {
+					throw new Error('503 Service Unavailable');
+				}
+				server = structuredClone(state);
+				return { state: structuredClone(server), etag: `v${putAttempts + 1}` };
+			}
+		})
+	});
+	controller.initialize(user, base, 'v1');
+	liveState.preferences.allergies = 'almonds';
+	controller.stage(liveState);
+
+	const firstSync = controller.sync();
+	await pass1Entered.promise;
+
+	// Multiple sync() calls during Pass #1 coalesce into a single follow-up pass.
+	let queuedResolved = false;
+	const secondSync = controller.sync().then(() => {
+		queuedResolved = true;
+	});
+	const thirdSync = controller.sync();
+	assert.equal(queuedResolved, false, 'queued sync() waits until follow-up pass completes');
+
+	pass1Gate.reject(new Error('Initial socket reset'));
+	await firstSync;
+	await Promise.all([secondSync, thirdSync]);
+
+	assert.equal(putAttempts, 2, 'exactly one queued follow-up pass ran after in-flight failure');
+	assert.equal(
+		statuses.at(-1)?.error,
+		'503 Service Unavailable',
+		'failed pass is never silently hidden'
+	);
+	assert.equal(statuses.at(-1)?.pending, true);
+	assert.ok(controller.snapshot());
+
+	// 2. When transport recovers during a failing in-flight pass, the queued follow-up pass saves latest edits.
+	const failEntered = deferred<void>();
+	const failGate = deferred<never>();
+	let recoverAttempt = 0;
+	const recoverHarness = createKitchenSync({
+		storage: memoryStorage(),
+		getUser: () => user,
+		getState: () => liveState,
+		setState: (next) => {
+			liveState = structuredClone(next);
+		},
+		onStatus: (status) => statuses.push(structuredClone(status)),
 		transport: () => ({
 			identity: { userId: user.id, householdId: user.householdId },
 			get: async () => ({
@@ -1515,101 +1646,90 @@ test('finishing sync skips setState when server state matches active kitchen and
 				householdId: user.householdId
 			}),
 			put: async (state) => {
+				recoverAttempt += 1;
+				if (recoverAttempt === 1) {
+					failEntered.resolve();
+					return failGate.promise;
+				}
 				server = structuredClone(state);
 				return { state: structuredClone(server), etag: 'v2' };
 			}
 		})
 	});
-	syncMatching.controller.initialize(user, base, 'v1');
-	syncMatching.setStates.length = 0;
-	syncMatching.state = firstEdit;
-	syncMatching.controller.stage(firstEdit);
-	await syncMatching.controller.sync();
-	assert.equal(
-		syncMatching.setStates.length,
-		0,
-		'setState is skipped when synced state already matches active kitchen'
-	);
+	recoverHarness.initialize(user, base, 'v1');
+	liveState.preferences.allergies = 'pecans';
+	recoverHarness.stage(liveState);
+	const failingPass = recoverHarness.sync();
+	await failEntered.promise;
 
-	// Verify setState IS called when the server has an independent remote delta.
-	server.shopping.push({
-		id: 'remote-item',
-		name: 'milk',
-		quantity: 1,
-		unit: 'carton',
-		checked: false
+	liveState.preferences.allergies = 'pecans & walnuts';
+	recoverHarness.stage(liveState);
+	const queuedRecovery = recoverHarness.sync();
+	failGate.reject(new Error('Stale offline socket'));
+	await Promise.all([failingPass, queuedRecovery]);
+
+	assert.equal(recoverAttempt, 2);
+	assert.equal(server.preferences.allergies, 'pecans & walnuts');
+	assert.equal(recoverHarness.snapshot(), null);
+	assert.equal(statuses.at(-1)?.error, '');
+
+	// 3. Explicit conflict-resolution sync(prefer, expectedEtag) arriving during an automatic sync() runs with its pinned arguments.
+	const conflictBase = createNewUserState();
+	conflictBase.pantry.push({
+		id: 'flour',
+		name: 'flour',
+		quantity: 4,
+		unit: 'cup',
+		category: 'Baking'
 	});
-	const secondLocal = structuredClone(syncMatching.state);
-	secondLocal.preferences.allergies = 'hazelnuts';
-	syncMatching.state = secondLocal;
-	syncMatching.controller.stage(secondLocal);
-	await syncMatching.controller.sync();
-	assert.equal(syncMatching.setStates.length, 1);
-	assert.equal(syncMatching.state.shopping[0]?.id, 'remote-item');
-	assert.equal(syncMatching.state.preferences.allergies, 'hazelnuts');
-
-	// Verify a synchronous edit staged while PUT #1 is in flight is rebased and synced without overwriting liveState.
-	const firstPutEntered = deferred<void>();
-	const firstPut = deferred<{ state: AppState; etag: string }>();
-	const secondPut = deferred<void>();
-	let putCount = 0;
-	let inFlightServer = structuredClone(base);
-	let liveState = structuredClone(base);
-	const setStateCalls: AppState[] = [];
-	const controller = createKitchenSync({
+	let conflictServer = structuredClone(conflictBase);
+	conflictServer.pantry[0].quantity = 1;
+	const getEntered = deferred<void>();
+	const getGate = deferred<void>();
+	let getCount = 0;
+	const conflictStatuses: SyncStatus[] = [];
+	let conflictState = structuredClone(conflictBase);
+	const conflictController = createKitchenSync({
 		storage: memoryStorage(),
 		getUser: () => user,
-		getState: () => liveState,
+		getState: () => conflictState,
 		setState: (next) => {
-			liveState = structuredClone(next);
-			setStateCalls.push(structuredClone(next));
+			conflictState = structuredClone(next);
 		},
-		onStatus: () => {},
+		onStatus: (status) => conflictStatuses.push(structuredClone(status)),
 		transport: () => ({
 			identity: { userId: user.id, householdId: user.householdId },
-			get: async () => ({
-				state: structuredClone(inFlightServer),
-				etag: putCount === 0 ? 'v1' : 'v2',
-				userId: user.id,
-				householdId: user.householdId
-			}),
-			put: async (state) => {
-				putCount += 1;
-				inFlightServer = structuredClone(state);
-				if (putCount === 1) {
-					firstPutEntered.resolve();
-					return firstPut.promise;
+			get: async () => {
+				getCount += 1;
+				if (getCount === 1) {
+					getEntered.resolve();
+					await getGate.promise;
 				}
-				secondPut.resolve();
-				return { state: structuredClone(inFlightServer), etag: 'v3' };
+				return {
+					state: structuredClone(conflictServer),
+					etag: 'etag-conflict',
+					userId: user.id,
+					householdId: user.householdId
+				};
+			},
+			put: async (state, etag) => {
+				assert.equal(etag, 'etag-conflict');
+				conflictServer = structuredClone(state);
+				return { state: structuredClone(conflictServer), etag: 'etag-resolved' };
 			}
 		})
 	});
-	controller.initialize(user, base, 'v1');
-	setStateCalls.length = 0;
-	liveState.preferences.maxTime = 30;
-	controller.stage(liveState);
-	const activeSync = controller.sync();
-	await firstPutEntered.promise;
+	conflictController.initialize(user, conflictBase, 'etag-0');
+	conflictState.pantry[0].quantity = 8;
+	conflictController.stage(conflictState);
 
-	// User types while PUT #1 is in flight; stage() persists immediately to the journal.
-	liveState.preferences.allergies = 'pistachios';
-	controller.stage(liveState);
-	assert.equal(controller.snapshot()?.local.preferences.allergies, 'pistachios');
+	const autoPass = conflictController.sync();
+	await getEntered.promise;
+	const resolvePass = conflictController.sync('local', 'etag-conflict');
+	getGate.resolve();
+	await Promise.all([autoPass, resolvePass]);
 
-	firstPut.resolve({ state: structuredClone(inFlightServer), etag: 'v2' });
-	await activeSync;
-	await secondPut.promise;
-	for (let attempt = 0; attempt < 10 && controller.snapshot(); attempt += 1) {
-		await new Promise((resolve) => setTimeout(resolve, 0));
-	}
-	assert.equal(putCount, 2);
-	assert.equal(liveState.preferences.maxTime, 30);
-	assert.equal(liveState.preferences.allergies, 'pistachios');
-	assert.equal(inFlightServer.preferences.allergies, 'pistachios');
-	assert.equal(
-		setStateCalls.length,
-		0,
-		'live kitchen proxy was never overwritten during rebase or completion'
-	);
+	assert.equal(conflictServer.pantry[0].quantity, 8);
+	assert.equal(conflictController.snapshot(), null);
+	assert.equal(conflictStatuses.at(-1)?.conflicts.length, 0);
 });

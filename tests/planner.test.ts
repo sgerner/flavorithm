@@ -103,6 +103,7 @@ function injectPlannerHook(svelteSource: string): string {
 		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
 		adoptKitchen,
+		freshKitchen,
 		refreshAuth,
 		reconnectKitchen,
 		exportKitchen,
@@ -115,6 +116,7 @@ function injectPlannerHook(svelteSource: string): string {
 		get syncReady() { return syncReady; },
 		get toast() { return toast; },
 		get toastActionLabel() { return toastActionLabel; },
+		runToastAction: () => { toastUndo?.(); },
 		get online() { return online; },
 		set online(value: boolean) { online = value; },
 		get ready() { return ready; },
@@ -203,6 +205,7 @@ type PlannerHarnessApi = {
 	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
 	adoptKitchen: (state: AppState) => void;
+	freshKitchen: () => void;
 	refreshAuth: () => Promise<{ stateLoaded?: boolean }>;
 	reconnectKitchen: () => Promise<void>;
 	exportKitchen: () => Promise<void>;
@@ -213,6 +216,7 @@ type PlannerHarnessApi = {
 	readonly syncReady: boolean;
 	readonly toast: string;
 	readonly toastActionLabel: string;
+	runToastAction: () => void;
 	online: boolean;
 	ready: boolean;
 	kitchenLoaded: boolean;
@@ -361,6 +365,7 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 		Request,
 		crypto,
 		console,
+		queueMicrotask,
 		setTimeout,
 		clearTimeout,
 		setInterval,
@@ -470,6 +475,7 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 		Request,
 		crypto,
 		console,
+		queueMicrotask,
 		setTimeout: (fn: (...args: unknown[]) => void, ms?: number) => setTimeout(fn, ms).unref(),
 		clearTimeout,
 		setInterval,
@@ -1250,6 +1256,7 @@ function createMountedPageHarness(options: {
 		Request,
 		crypto,
 		console,
+		queueMicrotask,
 		setTimeout,
 		clearTimeout,
 		setInterval,
@@ -1285,6 +1292,11 @@ function createMountedPageHarness(options: {
 		flush() {
 			svelteClient.flush();
 		},
+		async flushTick() {
+			svelteClient.flush();
+			await Promise.resolve();
+			svelteClient.flush();
+		},
 		dispose
 	};
 }
@@ -1293,20 +1305,39 @@ async function flushAsyncTurns(turns = 6) {
 	for (let i = 0; i < turns; i += 1) {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		svelteClient.flush();
+		await Promise.resolve();
 	}
 }
 
-test('cleanSections and observeState skip staging on remote adoption, stage synchronously on in-place edits, and coalesce network PUTs', async () => {
+test('adoptionToken section watchers skip clean adoptions, preserve same-flush edits, coalesce multi-section completeMeal into one journal write, and coalesce network PUTs', async () => {
 	const signedInUser: User = {
 		id: 'u-sync',
 		name: 'Chef Ada',
 		email: 'ada@example.test',
 		householdId: 'h-sync'
 	};
+	const recipe = {
+		...makeRecipe('r-1', 'Lemon Chickpea Orzo'),
+		image: '',
+		servings: 2,
+		ingredients: [
+			{ name: 'chickpeas', quantity: 1, unit: 'can' },
+			{ name: 'orzo', quantity: 2, unit: 'cup' }
+		]
+	};
 	let serverState: AppState = {
 		...dataMod.createNewUserState(),
-		pantry: [{ id: 'p-1', name: 'chickpeas', quantity: 2, unit: 'can', category: 'Pantry' }],
-		recipes: [makeRecipe('r-1', 'Lemon Chickpea Orzo')],
+		pantry: [{ id: 'p-1', name: 'chickpeas', quantity: 3, unit: 'can', category: 'Pantry' }],
+		recipes: [recipe],
+		meals: [
+			{
+				id: 'm-1',
+				date: '2026-11-26',
+				slot: 'Dinner',
+				recipeId: 'r-1',
+				servings: 2
+			}
+		],
 		shopping: [{ id: 's-1', name: 'parsley', quantity: 1, unit: 'bunch', checked: false }]
 	};
 	let serverEtag = 'etag-1';
@@ -1369,14 +1400,14 @@ test('cleanSections and observeState skip staging on remote adoption, stage sync
 		);
 		assert.equal(putPayloads.length, 0);
 
-		// Adopting a remote household update must mark sections clean and NOT stage a journal write.
+		// 1. Adopting a remote household update without subsequent edits marks sections clean and skips staging.
 		const remoteUpdate: AppState = {
 			...structuredClone(serverState),
 			pantry: [{ id: 'p-1', name: 'chickpeas', quantity: 5, unit: 'can', category: 'Pantry' }]
 		};
 		serverState = structuredClone(remoteUpdate);
 		mounted.api.adoptKitchen(remoteUpdate);
-		mounted.flush();
+		await mounted.flushTick();
 		await flushAsyncTurns(2);
 		assert.equal(mounted.api.kitchen.pantry[0]?.quantity, 5);
 		assert.equal(mounted.api.pendingSync, false);
@@ -1387,30 +1418,142 @@ test('cleanSections and observeState skip staging on remote adoption, stage sync
 		);
 		assert.equal(putPayloads.length, 0);
 
-		// In-place nested edit immediately stages to the journal synchronously on flush, and rapid edits coalesce into one PUT.
+		// 2. Genuine edit landing in the EXACT SAME flush as adoptKitchen (before mounted.flush()) is NOT dropped!
+		const secondRemoteUpdate: AppState = {
+			...structuredClone(serverState),
+			pantry: [{ id: 'p-1', name: 'chickpeas', quantity: 6, unit: 'can', category: 'Pantry' }]
+		};
+		serverState = structuredClone(secondRemoteUpdate);
+		mounted.api.adoptKitchen(secondRemoteUpdate);
+		// Mutate in place before Svelte flushes the adoption effects!
 		mounted.api.kitchen.pantry[0].quantity = 9;
-		mounted.flush();
-		assert.equal(mounted.journalWrites.length, 1, 'in-place pantry mutation stages synchronously');
+		await mounted.flushTick();
+		assert.equal(
+			mounted.journalWrites.length,
+			1,
+			'genuine edit in the same flush as remote adoption is preserved and durably staged'
+		);
+		assert.equal(
+			JSON.parse(mounted.journalWrites[0])?.local?.pantry?.[0]?.quantity,
+			9,
+			'staged journal holds the post-adoption edit'
+		);
 		assert.equal(mounted.api.pendingSync, true);
-		assert.equal(putPayloads.length, 0);
 
+		// 3. Multi-section edit (completeMeal: pantry + meals + shopping) coalesces into ONE sanitize + ONE journal write per tick with zero stale sections.
+		mounted.journalWrites.length = 0;
+		const mealToCook = mounted.api.kitchen.meals[0];
+		assert.ok(mealToCook);
+		mounted.api.openCookDialog(mealToCook);
+		mounted.api.deductPantry = true;
+		await mounted.api.markMealCooked();
+		await mounted.flushTick();
+		assert.equal(
+			mounted.journalWrites.length,
+			1,
+			'completeMeal touching pantry+meals+shopping writes a single coalesced journal snapshot'
+		);
+		const cookedSnapshot = JSON.parse(mounted.journalWrites[0])?.local as AppState;
+		assert.equal(cookedSnapshot.pantry[0]?.quantity, 8, 'pantry deduction is present in snapshot');
+		assert.ok(cookedSnapshot.meals[0]?.completedAt, 'completed meal is present in snapshot');
+		assert.equal(
+			cookedSnapshot.shopping.some((item) => item.name === 'orzo'),
+			false,
+			'refreshed weekly shopping list removed completed meal shortage in the same snapshot'
+		);
+		assert.equal(
+			cookedSnapshot.recipes[0]?.id,
+			'r-1',
+			'unchanged recipes remain intact in getSanitizedKitchen cache'
+		);
+
+		// 4. Rapid typing burst writes durably on each tick and coalesces network PUTs into one request.
+		mounted.journalWrites.length = 0;
 		for (const allergy of ['s', 'se', 'ses', 'sesa', 'sesam', 'sesame']) {
 			mounted.api.kitchen.preferences.allergies = allergy;
-			mounted.flush();
+			await mounted.flushTick();
 		}
 		assert.equal(
 			mounted.journalWrites.length,
-			7,
-			'every in-place keystroke writes synchronously to the journal'
+			6,
+			'every keystroke tick writes durably to the journal'
 		);
 		assert.equal(putPayloads.length, 0, 'network sync remains coalesced during rapid edits');
 
 		await new Promise((resolve) => setTimeout(resolve, syncMod.DEFAULT_SYNC_COALESCE_MS + 80));
 		await flushAsyncTurns();
 		assert.equal(putPayloads.length, 1, 'rapid burst coalesces into a single PUT /api/state');
-		assert.equal(putPayloads[0]?.pantry[0]?.quantity, 9);
+		assert.equal(putPayloads[0]?.pantry[0]?.quantity, 8);
+		assert.ok(putPayloads[0]?.meals[0]?.completedAt);
 		assert.equal(putPayloads[0]?.preferences.allergies, 'sesame');
 		assert.equal(mounted.api.pendingSync, false);
+
+		// 5. Sample cleanup (freshKitchen + Undo) and shared auth hydration (refreshAuth) keep getSanitizedKitchen() fresh.
+		const samplePantryItem = structuredClone(dataMod.createInitialState().pantry[0]);
+		const stateWithSample: AppState = {
+			...structuredClone(serverState),
+			pantry: [...structuredClone(serverState.pantry), samplePantryItem]
+		};
+		serverState = structuredClone(stateWithSample);
+		mounted.api.adoptKitchen(stateWithSample);
+		await mounted.flushTick();
+		mounted.journalWrites.length = 0;
+
+		mounted.api.freshKitchen();
+		await mounted.flushTick();
+		assert.equal(
+			mounted.journalWrites.length,
+			1,
+			'freshKitchen sample cleanup stages a single sanitized snapshot'
+		);
+		const resetSnapshot = JSON.parse(mounted.journalWrites[0])?.local as AppState;
+		assert.equal(
+			resetSnapshot.pantry.some((item) => item.id === samplePantryItem.id),
+			false,
+			'sample pantry item removed in staged snapshot'
+		);
+		assert.equal(resetSnapshot.pantry[0]?.id, 'p-1', 'user pantry item preserved');
+
+		mounted.api.runToastAction();
+		await mounted.flushTick();
+		assert.equal(
+			mounted.api.pendingSync,
+			false,
+			'Undo restore runs stage(restored), retiring the reverted journal entry back to baseline'
+		);
+		assert.equal(
+			mounted.api.kitchen.pantry.some((item) => item.id === samplePantryItem.id),
+			true,
+			'Undo restored sample pantry item'
+		);
+
+		// Re-hydrating via refreshAuth cancels/flushes cleanly without stale cached sections leaking into the next edit.
+		serverState = {
+			...dataMod.createNewUserState(),
+			pantry: [{ id: 'p-auth', name: 'tahini', quantity: 2, unit: 'jar', category: 'Pantry' }],
+			recipes: [recipe]
+		};
+		serverEtag = 'etag-refresh';
+		mounted.api.adoptKitchen(serverState);
+		await mounted.api.refreshAuth();
+		await mounted.flushTick();
+		mounted.journalWrites.length = 0;
+		mounted.api.kitchen.shopping.push({
+			id: 's-after-refresh',
+			name: 'sumac',
+			quantity: 1,
+			unit: 'jar',
+			checked: false
+		});
+		await mounted.flushTick();
+		assert.equal(mounted.journalWrites.length, 1);
+		const postRefreshSnapshot = JSON.parse(mounted.journalWrites[0])?.local as AppState;
+		assert.equal(
+			postRefreshSnapshot.pantry[0]?.id,
+			'p-auth',
+			'sanitized cache reflects newly hydrated pantry rather than pre-refresh state'
+		);
+		assert.equal(postRefreshSnapshot.shopping.at(-1)?.id, 's-after-refresh');
 	} finally {
 		mounted.dispose();
 	}
@@ -1598,7 +1741,7 @@ test('reconnect sync runs and uploads offline-staged edits when window online fi
 			unit: 'piece',
 			checked: false
 		});
-		mounted.flush();
+		await mounted.flushTick();
 		assert.equal(mounted.api.pendingSync, true);
 		assert.equal(mounted.journalWrites.length, 1);
 

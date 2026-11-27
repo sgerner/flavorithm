@@ -240,37 +240,58 @@
 	let conflicts = $state<SyncConflict[]>([]);
 	let reviewedEtag = $state<string | null>(null);
 	let kitchenSync: ReturnType<typeof createKitchenSync> | undefined;
+	type KitchenSectionKey = keyof AppState;
 	let kitchenPersistence: ReturnType<typeof createKitchenPersistence> | undefined;
-	const cleanSections = new WeakSet<object>();
+	const dirtySections = new Set<KitchenSectionKey>();
 	let cachedSanitizedKitchen: AppState | null = null;
-	let activeSectionKey: keyof AppState | null = null;
+	let adoptionToken = 0;
+	let adoptedSections: {
+		token: number;
+		serialized: Record<KitchenSectionKey, string>;
+	} | null = null;
 	function markKitchenClean() {
 		cachedSanitizedKitchen = null;
-		cleanSections.add(kitchen.pantry);
-		cleanSections.add(kitchen.recipes);
-		cleanSections.add(kitchen.meals);
-		cleanSections.add(kitchen.shopping);
-		cleanSections.add(kitchen.preferences);
+		dirtySections.clear();
+		kitchenPersistence?.cancelScheduled();
+		adoptionToken += 1;
+		adoptedSections = {
+			token: adoptionToken,
+			serialized: {
+				pantry: JSON.stringify(kitchen.pantry),
+				recipes: JSON.stringify(kitchen.recipes),
+				meals: JSON.stringify(kitchen.meals),
+				shopping: JSON.stringify(kitchen.shopping),
+				preferences: JSON.stringify(kitchen.preferences)
+			}
+		};
 	}
-	function getSanitizedKitchen(): AppState {
-		if (activeSectionKey !== null && cachedSanitizedKitchen !== null) {
+	markKitchenClean();
+	function getSanitizedKitchen(coalesced = false): AppState {
+		if (coalesced && cachedSanitizedKitchen !== null && dirtySections.size > 0) {
+			const refreshPantry = dirtySections.has('pantry');
+			const refreshRecipes = dirtySections.has('recipes');
+			const refreshMeals = dirtySections.has('meals');
+			const refreshShopping = dirtySections.has('shopping');
+			const refreshPreferences = dirtySections.has('preferences');
 			const partial = sanitizeKitchenState({
-				pantry: activeSectionKey === 'pantry' ? kitchen.pantry : [],
-				recipes: activeSectionKey === 'recipes' ? kitchen.recipes : [],
-				meals: activeSectionKey === 'meals' ? kitchen.meals : [],
-				shopping: activeSectionKey === 'shopping' ? kitchen.shopping : [],
-				preferences:
-					activeSectionKey === 'preferences'
-						? kitchen.preferences
-						: cachedSanitizedKitchen.preferences
+				pantry: refreshPantry ? kitchen.pantry : [],
+				recipes: refreshRecipes ? kitchen.recipes : [],
+				meals: refreshMeals ? kitchen.meals : [],
+				shopping: refreshShopping ? kitchen.shopping : [],
+				preferences: refreshPreferences ? kitchen.preferences : cachedSanitizedKitchen.preferences
 			});
 			cachedSanitizedKitchen = {
-				...cachedSanitizedKitchen,
-				[activeSectionKey]: partial[activeSectionKey]
+				pantry: refreshPantry ? partial.pantry : cachedSanitizedKitchen.pantry,
+				recipes: refreshRecipes ? partial.recipes : cachedSanitizedKitchen.recipes,
+				meals: refreshMeals ? partial.meals : cachedSanitizedKitchen.meals,
+				shopping: refreshShopping ? partial.shopping : cachedSanitizedKitchen.shopping,
+				preferences: refreshPreferences ? partial.preferences : cachedSanitizedKitchen.preferences
 			};
+			dirtySections.clear();
 			return cachedSanitizedKitchen;
 		}
 		const full = sanitizeKitchenState(kitchen);
+		dirtySections.clear();
 		cachedSanitizedKitchen = full;
 		return full;
 	}
@@ -823,6 +844,8 @@
 			} else if (managedAuth) {
 				clearManagedIdentity();
 			} else {
+				clearTimeout(saveTimer);
+				kitchenPersistence?.cancel();
 				kitchen = createInitialState();
 				markKitchenClean();
 				localStorage.removeItem('flavorithm-last-account');
@@ -1313,29 +1336,24 @@
 		if (!ready) return;
 		scheduleSyncRetry();
 	});
-	function watchKitchenSection(sectionKey: keyof AppState, getSection: () => object) {
-		let initializedSection: object | null = null;
+	function watchKitchenSection(sectionKey: KitchenSectionKey, getSection: () => object) {
+		const currentSection = $derived(getSection());
+		let handledAdoptionToken = 0;
 		$effect(() => {
-			const section = getSection();
+			const section = currentSection;
 			observeState(section);
-			if (initializedSection === null) {
-				initializedSection = section;
-				cleanSections.delete(section);
-				return;
-			}
-			if (cleanSections.has(section) && initializedSection !== section) {
-				initializedSection = section;
-				cleanSections.delete(section);
-				return;
-			}
-			initializedSection = section;
-			untrack(() => {
-				activeSectionKey = sectionKey;
-				try {
-					kitchenPersistence?.persist();
-				} finally {
-					activeSectionKey = null;
+			if (handledAdoptionToken !== adoptionToken) {
+				handledAdoptionToken = adoptionToken;
+				if (
+					adoptedSections?.token === adoptionToken &&
+					JSON.stringify(section) === adoptedSections.serialized[sectionKey]
+				) {
+					return;
 				}
+			}
+			untrack(() => {
+				dirtySections.add(sectionKey);
+				kitchenPersistence?.schedule();
 			});
 		});
 	}
@@ -1402,7 +1420,7 @@
 		});
 		kitchenPersistence = createKitchenPersistence({
 			storage: localStorage,
-			getState: () => getSanitizedKitchen(),
+			getState: (context) => getSanitizedKitchen(Boolean(context?.coalesced)),
 			getUser: () => user,
 			isManagedAuth: () => managedAuth,
 			isGuestReady: () => guestPersistenceReady,
@@ -1419,10 +1437,14 @@
 			},
 			onAfterPersist: () => {
 				if (user) scheduleSyncRetry();
+			},
+			onCancelScheduled: () => {
+				dirtySections.clear();
 			}
 		});
 		const unbindLifecycle = kitchenPersistence.bindLifecycle(window, document);
 		if (managedAuth) {
+			kitchenPersistence.cancel();
 			localStorage.removeItem('flavorithm-last-account');
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
@@ -1439,6 +1461,7 @@
 					const sanitized = sanitizeKitchenState(JSON.parse(local));
 					const loaded = started ? sanitized : backfillSampleData(sanitized);
 					if (!themes.includes(loaded.preferences.theme)) loaded.preferences.theme = 'nosh';
+					kitchenPersistence.cancel();
 					kitchen = loaded;
 					markKitchenClean();
 				}
@@ -1468,6 +1491,7 @@
 			.then(async (data) => {
 				updateAuthMetadata(data);
 				if (managedAuth) {
+					kitchenPersistence?.cancel();
 					localStorage.removeItem('flavorithm-last-account');
 					clearGuestData(localStorage);
 					quarantineLegacyKitchen(localStorage);
@@ -1637,6 +1661,7 @@
 			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
 			saveLastAccount(snapshotUser);
 		} else {
+			kitchenPersistence?.cancel();
 			kitchen = sanitized;
 			markKitchenClean();
 		}
@@ -1889,6 +1914,7 @@
 					saveLastAccount(nextUser);
 				},
 				stageGuestKitchen: (cleanedGuest) => {
+					kitchenPersistence?.cancel();
 					kitchen = cleanedGuest;
 					markKitchenClean();
 					kitchenSync?.stage(cleanedGuest);
@@ -3775,6 +3801,7 @@
 					}),
 				onMutated: () => {
 					joinedHousehold = true;
+					clearTimeout(saveTimer);
 					kitchenPersistence?.cancel();
 					kitchenSync?.clearContext();
 					clearAIConnectionState();
@@ -4057,6 +4084,8 @@
 			kitchenPersistence?.cancel();
 			await writeChain;
 			await request('/api/auth', { action: 'deleteAccount', password: deletePassword });
+			clearTimeout(saveTimer);
+			kitchenPersistence?.cancel();
 			cancelScan(true);
 			if (user) {
 				for (const key of Object.keys(localStorage)) {
@@ -4171,6 +4200,7 @@
 				mutateHousehold: () => request('/api/household', { action: 'leave' }),
 				onMutated: () => {
 					leftHousehold = true;
+					clearTimeout(saveTimer);
 					kitchenPersistence?.cancel();
 					kitchenSync?.clearContext();
 					clearAIConnectionState();

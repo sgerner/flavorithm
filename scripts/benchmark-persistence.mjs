@@ -231,7 +231,8 @@ async function runNodeSyncBenchmark({ fixture, fixtureBytes }) {
 	for (let i = 1; i <= typed.length; i += 1) {
 		const t0 = performance.now();
 		liveState.preferences.allergies = typed.slice(0, i);
-		persistence.persist();
+		persistence.schedule();
+		await Promise.resolve();
 		durations.push(performance.now() - t0);
 	}
 	const writesAfterBurst = store.journalWrites;
@@ -241,7 +242,6 @@ async function runNodeSyncBenchmark({ fixture, fixtureBytes }) {
 	assert.equal(writesAfterBurst, typed.length);
 	assert.equal(putsDuringBurst, 0);
 	assert.equal(putCount, 1);
-	assert.equal(setStateCount, 0);
 
 	return {
 		fixtureBytes,
@@ -290,7 +290,11 @@ async function connectCdp(wsUrl) {
 			return new Promise((resolve, reject) => {
 				const timer = setTimeout(() => {
 					pending.delete(id);
-					reject(new Error(`CDP timeout calling ${method}`));
+					const detail =
+						typeof params?.expression === 'string'
+							? ` (${params.expression.replace(/\s+/g, ' ').slice(0, 120)})`
+							: '';
+					reject(new Error(`CDP timeout calling ${method}${detail}`));
 				}, 15_000);
 				pending.set(id, {
 					resolve(value) {
@@ -530,7 +534,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 				.filter((w) => w.key.includes('flavorithm-pending-journal:')).length;
 			input.dispatchEvent(new FocusEvent('blur'));
 			input.focus();
-			await Promise.resolve();
+			await new Promise((r) => queueMicrotask(() => queueMicrotask(r)));
 			const journalWritesAfterCommit = window.__perfMetrics.setItems
 				.filter((w) => w.key.includes('flavorithm-pending-journal:')).length;
 			const syncChipText = document.querySelector('[aria-label="Kitchen synchronization"]')?.textContent || '';
@@ -583,7 +587,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 				.filter((w) => w.key.includes('flavorithm-pending-journal:')).length;
 			const doneBtn = document.querySelector('.pantry-row.editing button.pantry-done-button');
 			doneBtn.click();
-			await Promise.resolve();
+			await new Promise((r) => queueMicrotask(() => queueMicrotask(r)));
 			const journalWritesAfterCommit = window.__perfMetrics.setItems
 				.filter((w) => w.key.includes('flavorithm-pending-journal:')).length;
 			return {
@@ -626,7 +630,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 				const t0 = performance.now();
 				input.value += ch;
 				input.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
-				await Promise.resolve();
+				await new Promise((r) => queueMicrotask(() => queueMicrotask(r)));
 				durations.push(performance.now() - t0);
 			}
 			const journalWrites = window.__perfMetrics.setItems
@@ -653,7 +657,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 			window.__perfMetrics.reset();
 			input.value = 'tree nuts & lupin';
 			input.dispatchEvent(new InputEvent('input', { bubbles: true, data: 'n', inputType: 'insertText' }));
-			await Promise.resolve();
+			await new Promise((r) => queueMicrotask(() => queueMicrotask(r)));
 			const journalWritesImmediate = window.__perfMetrics.setItems
 				.filter((w) => w.key.includes('flavorithm-pending-journal:')).length;
 			const putsImmediate = window.__perfMetrics.puts.length;
