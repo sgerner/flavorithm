@@ -411,7 +411,7 @@ export function mergeEditedRecipe(
 	if (nutritionStale !== undefined) merged.nutritionStale = nutritionStale;
 	else delete merged.nutritionStale;
 
-	if (!live.saved && !resolved.resave) {
+	if (base.saved && !live.saved && !resolved.resave) {
 		return {
 			status: 'unsaved',
 			recipe: merged,
@@ -448,10 +448,9 @@ export function applyEditedRecipe(
 	if (result.status !== 'merged') {
 		return { ...result, recipes };
 	}
-	const nextRecipes =
-		!live || !live.saved
-			? insertRecipes(recipes, [result.recipe])
-			: recipes.map((item) => (item.id === result.recipe.id ? result.recipe : item));
+	const nextRecipes = !live
+		? insertRecipes(recipes, [result.recipe])
+		: recipes.map((item) => (item.id === result.recipe.id ? result.recipe : item));
 	return { ...result, recipes: nextRecipes };
 }
 

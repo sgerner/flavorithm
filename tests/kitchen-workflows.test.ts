@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { ButlerCommandSchema } from '../src/lib/butler.ts';
 import { createInitialState, createNewUserState } from '../src/lib/data.ts';
 import { rankPantryRecipes, rankRecipes } from '../src/lib/discovery.ts';
+import { applyButlerCommands } from '../src/lib/butler.ts';
 import {
 	buildShoppingList,
 	normalizeName as normalizeDomainName,
@@ -15,6 +16,8 @@ import {
 	completeMeal,
 	convertCompatibleQuantity,
 	cookPlannedMeal,
+	deleteMeal,
+	deleteRecipe,
 	deleteShoppingItem,
 	expiryStatus,
 	filterPantryItems,
@@ -27,17 +30,22 @@ import {
 	promoteSampleIngredient,
 	promoteSampleMeal,
 	normalizeShoppingItem,
+	recipeForEdit,
+	recipeNeedsNutritionRefresh,
 	reconcileShoppingList,
 	refreshWeekShopping,
 	restockDepletedPantryItems,
 	restoreShoppingItem,
 	retireCheckedShoppingItems,
 	revertShoppingItem,
+	saveEditedRecipe,
 	savePlannedMealChanges,
 	schedulePlannedMeal,
 	shopForScope,
 	snapshotShoppingItem,
 	transferPurchasedItemsToPantry,
+	upsertMeal,
+	upsertRecipe,
 	weekStartForDate
 } from '../src/lib/kitchen-workflows.ts';
 import { validateAppState } from '../src/lib/server/db.ts';
@@ -1093,6 +1101,229 @@ test('savePlannedMealChanges and cookPlannedMeal guard concurrently completed or
 	assert.equal(rescheduled.state.meals[0].servings, 4);
 });
 
+test('editing a recipe refreshes scheduled weeks and existing recipe scopes independently while keeping manual and checked rows', () => {
+	const now = new Date('2026-10-22T12:00:00Z');
+	const pasta = recipe({
+		id: 'pasta',
+		servings: 2,
+		saved: true,
+		ingredients: [{ name: 'olive oil', quantity: 2, unit: 'tbsp' }]
+	});
+	const initial = state({
+		pantry: [pantry('olive oil', 1, 'tbsp')],
+		recipes: [pasta],
+		meals: [{ id: 'dinner', date: '2026-10-23', slot: 'Dinner', recipeId: 'pasta', servings: 4 }],
+		shopping: [
+			shopping('manual-salt', 'kosher salt', 1, 'box', false),
+			shopping('other-recipe', 'lemon', 2, 'each', false, 'recipe:other'),
+			shopping('week-bought', 'olive oil', 1, 'tbsp', true, 'week:2026-10-19'),
+			shopping('week-open', 'olive oil', 2, 'tbsp', false, 'week:2026-10-19'),
+			shopping('recipe-bought', 'olive oil', 1, 'tbsp', true, 'recipe:pasta')
+		]
+	});
+
+	const edited = saveEditedRecipe(
+		initial,
+		{
+			...pasta,
+			servings: 4,
+			rating: 5,
+			ingredients: [
+				{ name: 'olive oil', quantity: 6, unit: 'tbsp' },
+				{ name: 'garlic', quantity: 4, unit: 'clove' }
+			]
+		},
+		now
+	);
+
+	const updatedRecipe = edited.recipes[0];
+	assert.equal(updatedRecipe.nutritionStale, true);
+	assert.equal(updatedRecipe.saved, true);
+	assert.equal(edited.preferences.ratings?.pasta, 5);
+
+	// Planned meal for 4 servings needs 6 tbsp oil - 1 tbsp pantry - 1 tbsp checked = 4 tbsp, plus 4 garlic cloves.
+	const weekItems = edited.shopping.filter((item) => item.sourceKey === 'week:2026-10-19');
+	assert.equal(weekItems.find((item) => item.checked && item.name === 'olive oil')?.quantity, 1);
+	assert.equal(weekItems.find((item) => !item.checked && item.name === 'olive oil')?.quantity, 4);
+	assert.equal(weekItems.find((item) => !item.checked && item.name === 'garlic')?.quantity, 4);
+
+	// Existing recipe:pasta scope uses edited recipe.servings (4) independently without cross-scope deduplication.
+	const recipeItems = edited.shopping.filter((item) => item.sourceKey === 'recipe:pasta');
+	assert.equal(recipeItems.find((item) => item.checked && item.name === 'olive oil')?.quantity, 1);
+	assert.equal(recipeItems.find((item) => !item.checked && item.name === 'olive oil')?.quantity, 4);
+	assert.equal(recipeItems.find((item) => !item.checked && item.name === 'garlic')?.quantity, 4);
+
+	// Manual and other recipe scopes remain untouched.
+	assert.ok(edited.shopping.some((item) => item.id === 'manual-salt'));
+	assert.ok(edited.shopping.some((item) => item.id === 'other-recipe'));
+
+	// Editing a recipe with no existing recipe:<id> scope does not create recipe:<id> rows.
+	const withoutRecipeScope = upsertRecipe(
+		state({ recipes: [pasta] }),
+		{ ...pasta, servings: 4 },
+		now
+	);
+	assert.equal(withoutRecipeScope.shopping.length, 0);
+	assert.equal(recipeNeedsNutritionRefresh(pasta, { ...pasta, title: 'Renamed' }), false);
+	assert.equal(recipeNeedsNutritionRefresh(pasta, { ...pasta, servings: 4 }), true);
+});
+
+test('unsaved recipes open for manual editing and save cleanly to the collection', () => {
+	const unsaved = recipe({
+		id: 'draft-risotto',
+		title: 'Mushroom risotto',
+		saved: false,
+		ingredients: [{ name: 'arborio rice', quantity: 1, unit: 'cup' }],
+		steps: ['Toast rice', 'Simmer with stock']
+	});
+	const initial = state({ recipes: [unsaved] });
+
+	const draft = recipeForEdit(initial, 'draft-risotto');
+	assert.ok(draft);
+	assert.equal(draft.saved, false);
+	draft.title = 'Herbed mushroom risotto';
+	draft.ingredients[0].quantity = 2;
+	assert.equal(initial.recipes[0].title, 'Mushroom risotto');
+	assert.equal(initial.recipes[0].ingredients[0].quantity, 1);
+
+	const savedState = saveEditedRecipe(initial, draft, new Date('2026-10-22T12:00:00Z'));
+	assert.equal(savedState.recipes[0].saved, true);
+	assert.equal(savedState.recipes[0].title, 'Herbed mushroom risotto');
+	assert.equal(savedState.recipes[0].nutritionStale, true);
+	assert.equal(recipeForEdit(initial, 'missing'), null);
+});
+
+test('UI workflows and Basil commands produce identical shopping and kitchen state across recipe and meal lifecycles', () => {
+	const now = new Date('2026-10-22T12:00:00Z');
+	const stew = recipe({
+		id: 'stew',
+		title: 'Bean stew',
+		servings: 2,
+		saved: true,
+		ingredients: [
+			{ name: 'carrot', quantity: 4, unit: 'each' },
+			{ name: 'onion', quantity: 2, unit: 'each' }
+		],
+		steps: ['Simmer']
+	});
+	const base = state({
+		pantry: [pantry('carrot', 1, 'each')],
+		recipes: [stew],
+		shopping: [
+			shopping('manual', 'bread', 1, 'loaf', false),
+			shopping('recipe-stew', 'carrot', 3, 'each', false, 'recipe:stew')
+		]
+	});
+
+	// 1. Schedule a meal into an empty week.
+	const scheduledMeal = {
+		id: 'dinner-1',
+		date: '2026-10-23',
+		slot: 'Dinner' as const,
+		recipeId: 'stew',
+		servings: 2
+	};
+	const uiScheduled = upsertMeal(base, scheduledMeal, now);
+	const basilScheduled = applyButlerCommands(
+		base,
+		[{ type: 'meal.upsert', meal: scheduledMeal }],
+		now
+	).state;
+	assert.deepEqual(uiScheduled, basilScheduled);
+	assert.equal(weekStartForDate('2026-10-23'), '2026-10-19');
+	assert.ok(uiScheduled.shopping.some((item) => item.sourceKey === 'week:2026-10-19'));
+
+	// 2. Edit the recipe (updates both week:2026-10-19 and recipe:stew).
+	const revisedStew = {
+		...stew,
+		servings: 4,
+		ingredients: [
+			{ name: 'carrot', quantity: 6, unit: 'each' },
+			{ name: 'celery', quantity: 2, unit: 'each' }
+		]
+	};
+	const uiEdited = saveEditedRecipe(uiScheduled, revisedStew, now);
+	const basilEdited = applyButlerCommands(
+		basilScheduled,
+		[{ type: 'recipe.upsert', recipe: { ...revisedStew, saved: true } }],
+		now
+	).state;
+	assert.deepEqual(uiEdited, basilEdited);
+
+	// 3. Move the planned meal to next week (clears old week, populates new week).
+	const movedMeal = { ...scheduledMeal, date: '2026-10-28', servings: 4 };
+	const uiMoved = upsertMeal(uiEdited, movedMeal, now);
+	const basilMoved = applyButlerCommands(
+		basilEdited,
+		[{ type: 'meal.upsert', meal: movedMeal }],
+		now
+	).state;
+	assert.deepEqual(uiMoved, basilMoved);
+	assert.equal(
+		uiMoved.shopping.some((item) => item.sourceKey === 'week:2026-10-19'),
+		false
+	);
+	assert.ok(uiMoved.shopping.some((item) => item.sourceKey === 'week:2026-10-26'));
+
+	// 4. Complete the meal (preserves completion if re-upserted, clears completed week's shopping).
+	const uiCompleted = completeMeal(
+		uiMoved,
+		movedMeal.id,
+		{ deductPantry: true, leftoverServings: 1 },
+		now
+	);
+	const basilCompleted = applyButlerCommands(
+		basilMoved,
+		[{ type: 'meal.complete', id: movedMeal.id, deductPantry: true, leftoverServings: 1 }],
+		now
+	).state;
+	assert.deepEqual(uiCompleted, basilCompleted);
+	assert.equal(
+		uiCompleted.shopping.some((item) => item.sourceKey === 'week:2026-10-26'),
+		false
+	);
+	const preservedCompletion = upsertMeal(uiCompleted, { ...movedMeal, slot: 'Lunch' }, now);
+	assert.equal(preservedCompletion.meals[0].completedAt, now.toISOString());
+	assert.equal(preservedCompletion.meals[0].leftoverServings, 1);
+	const clampedLeftovers = upsertMeal(
+		preservedCompletion,
+		{ ...preservedCompletion.meals[0], servings: 3, leftoverServings: 9 },
+		now
+	);
+	assert.deepEqual(
+		clampedLeftovers,
+		applyButlerCommands(
+			preservedCompletion,
+			[
+				{
+					type: 'meal.upsert',
+					meal: { ...preservedCompletion.meals[0], servings: 3, leftoverServings: 9 }
+				}
+			],
+			now
+		).state
+	);
+	assert.equal(clampedLeftovers.meals[0].leftoverServings, 3);
+
+	// 5. Add another meal then delete it vs delete the recipe.
+	const secondMeal = {
+		id: 'dinner-2',
+		date: '2026-11-04',
+		slot: 'Dinner' as const,
+		recipeId: 'stew',
+		servings: 4
+	};
+	const withSecond = upsertMeal(uiCompleted, secondMeal, now);
+	assert.deepEqual(
+		deleteMeal(withSecond, secondMeal.id, now),
+		applyButlerCommands(withSecond, [{ type: 'meal.delete', id: secondMeal.id }], now).state
+	);
+	assert.deepEqual(
+		deleteRecipe(withSecond, 'stew', now),
+		applyButlerCommands(withSecond, [{ type: 'recipe.delete', id: 'stew' }], now).state
+	);
+});
+
 test('user purchases never merge into sample pantry lots and merge into user-owned lots', () => {
 	const initial = createInitialState();
 	let nextId = 0;
@@ -1857,13 +2088,13 @@ test('filterPantryItems excludes zero-quantity rows from Expiring soon while kee
 	);
 });
 
-test('weekStartForDate accepts strict YYYY-MM-DD strings, Dates, and undefined and returns undefined for malformed dates', () => {
+test('weekStartForDate accepts strict YYYY-MM-DD strings, Dates, and undefined and returns empty string for malformed dates', () => {
 	assert.equal(weekStartForDate('2026-10-19'), '2026-10-19');
 	assert.equal(weekStartForDate('2026-10-22'), '2026-10-19');
 	assert.equal(weekStartForDate('2026-10-25'), '2026-10-19');
 	assert.equal(weekStartForDate(new Date(2026, 9, 25, 23, 30)), '2026-10-19');
 	assert.equal(weekStartForDate('2024-02-29'), '2024-02-26');
-	assert.equal(weekStartForDate(undefined), undefined);
+	assert.equal(weekStartForDate(undefined), '');
 
 	for (const malformed of [
 		'',
@@ -1880,9 +2111,9 @@ test('weekStartForDate accepts strict YYYY-MM-DD strings, Dates, and undefined a
 		'2026/10/22',
 		'2026-10-22T00:00:00Z'
 	]) {
-		assert.equal(weekStartForDate(malformed), undefined, `expected undefined for "${malformed}"`);
+		assert.equal(weekStartForDate(malformed), '', `expected '' for "${malformed}"`);
 	}
-	assert.equal(weekStartForDate(new Date(Number.NaN)), undefined);
+	assert.equal(weekStartForDate(new Date(Number.NaN)), '');
 });
 
 test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar dates without mutating state', () => {
@@ -1972,6 +2203,21 @@ test('schedulePlannedMeal and savePlannedMealChanges reject malformed calendar d
 		assert.equal(editAttempt.state.meals[0].servings, 2);
 	}
 
-	assert.equal(refreshWeekShopping(scheduled.state, '2026-02-30'), scheduled.state.shopping);
-	assert.equal(refreshWeekShopping(scheduled.state, undefined), scheduled.state.shopping);
+	assert.equal(refreshWeekShopping(scheduled.state, '2026-02-30'), scheduled.state);
+	assert.equal(refreshWeekShopping(scheduled.state, undefined), scheduled.state);
+});
+
+test('weekStartForDate and refreshWeekShopping handle undefined and Date/string inputs safely', () => {
+	assert.equal(weekStartForDate(undefined), '');
+	assert.equal(weekStartForDate('2026-10-23'), '2026-10-19');
+	assert.equal(weekStartForDate(new Date(2026, 9, 25, 12, 0, 0)), '2026-10-19');
+
+	const initial = state({
+		recipes: [recipe({ id: 'soup', ingredients: [{ name: 'carrot', quantity: 2, unit: 'each' }] })],
+		meals: [{ id: 'm1', date: '2026-10-23', slot: 'Dinner', recipeId: 'soup', servings: 2 }]
+	});
+	assert.equal(refreshWeekShopping(initial, undefined), initial);
+	const refreshed = refreshWeekShopping(initial, '2026-10-19', new Date('2026-10-20T12:00:00Z'));
+	assert.equal(refreshed.shopping.length, 1);
+	assert.equal(refreshed.shopping[0].sourceKey, 'week:2026-10-19');
 });

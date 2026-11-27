@@ -101,7 +101,8 @@ function injectPlannerHook(svelteSource: string): string {
 		logout,
 		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
-		editSavedRecipe,
+		openRecipeEditor,
+		editSavedRecipe: openRecipeEditor,
 		saveEditedRecipe,
 		clearEditingBaseline: () => {
 			editingRecipeBase = null;
@@ -202,6 +203,7 @@ type PlannerHarnessApi = {
 	logout: () => Promise<void>;
 	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	openRecipeEditor: (recipe: Recipe) => void;
 	editSavedRecipe: (recipe: Recipe) => void;
 	saveEditedRecipe: (
 		updated: Recipe,
@@ -954,27 +956,71 @@ test('choosing a recipe for a planner slot keeps valid servings above 24', () =>
 	}
 });
 
-test('marking a meal cooked keeps pantry deduction opt-in', () => {
+test('marking a meal cooked keeps pantry deduction opt-in', async () => {
 	const harness = createReactivePlanner();
 	try {
 		const { api } = harness;
 		const recipe = makeRecipe('r-cook', 'Weeknight Pasta');
-		const meal: Meal = {
-			id: 'meal-cook',
+		recipe.ingredients = [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'garlic', quantity: 2, unit: 'clove' }
+		];
+		const firstMeal: Meal = {
+			id: 'meal-cook-1',
 			date: '2026-11-23',
 			slot: 'Dinner',
 			recipeId: recipe.id,
 			servings: recipe.servings
 		};
-		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
+		const secondMeal: Meal = {
+			id: 'meal-cook-2',
+			date: '2026-11-24',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: recipe.servings
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			pantry: [{ id: 'p-oil', name: 'olive oil', quantity: 4, unit: 'tbsp', category: 'Pantry' }],
+			recipes: [recipe],
+			meals: [firstMeal, secondMeal],
+			shopping: [
+				{
+					id: 'checked-garlic',
+					name: 'garlic',
+					quantity: 2,
+					unit: 'clove',
+					checked: true,
+					sourceKey: 'week:2026-11-23'
+				}
+			]
+		};
 
-		api.openCookDialog(meal);
+		api.openCookDialog(firstMeal);
 		assert.equal(api.deductPantry, false);
 
+		await api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === firstMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 4);
+		assert.equal(api.kitchen.shopping.find((item) => item.id === 'checked-garlic')?.quantity, 2);
+		assert.equal(api.deductPantry, false);
+
+		api.openCookDialog(secondMeal);
+		assert.equal(api.deductPantry, false);
 		api.deductPantry = true;
 		assert.equal(api.deductPantry, true);
 
-		api.openCookDialog(meal);
+		api.openCookDialog(secondMeal);
+		assert.equal(api.deductPantry, false);
+
+		api.deductPantry = true;
+		await api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === secondMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 3);
+		assert.equal(
+			api.kitchen.shopping.some((item) => item.id === 'checked-garlic'),
+			false
+		);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
@@ -1078,6 +1124,40 @@ test('saveEditedRecipe refuses to downgrade to a 2-way merge when editingRecipeB
 		assert.equal(result.status, 'error');
 		assert.match(result.error ?? '', /original recipe baseline/i);
 		assert.equal(api.kitchen.recipes[0].title, 'Original Title');
+
+		// Unsaved recipes opened via openRecipeEditor save cleanly and refresh scheduled weekly shopping:
+		const unsaved = {
+			...makeRecipe('r-unsaved', 'Draft Stew'),
+			saved: false,
+			servings: 2,
+			ingredients: [{ name: 'carrot', quantity: 2, unit: 'each' }]
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [unsaved],
+			meals: [
+				{
+					id: 'm-unsaved',
+					date: '2026-11-24',
+					slot: 'Dinner',
+					recipeId: unsaved.id,
+					servings: 2
+				}
+			]
+		};
+		api.openRecipeEditor(unsaved);
+		const savedResult = api.saveEditedRecipe({
+			...unsaved,
+			title: 'Saved Stew',
+			ingredients: [{ name: 'carrot', quantity: 5, unit: 'each' }]
+		});
+		assert.equal(savedResult.status, 'saved');
+		assert.equal(api.kitchen.recipes[0].saved, true);
+		assert.equal(api.kitchen.recipes[0].title, 'Saved Stew');
+		assert.equal(
+			api.kitchen.shopping.find((item) => item.sourceKey === 'week:2026-11-23')?.quantity,
+			5
+		);
 	} finally {
 		harness.dispose();
 	}
