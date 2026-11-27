@@ -1,4 +1,4 @@
-import type { AppState, Ingredient, Meal, Recipe, ShoppingItem } from './types';
+import type { AppState, Ingredient, Meal, PantryDeduction, Recipe, ShoppingItem } from './types.ts';
 import {
 	buildShoppingList,
 	dateOrdinal,
@@ -652,9 +652,9 @@ export function transferPurchasedItemsToPantry(
 	for (const item of purchases) {
 		if (
 			!item.checked ||
+			!item.name.trim() ||
 			!Number.isFinite(item.quantity) ||
 			!(item.quantity > 0) ||
-			!item.name.trim() ||
 			!item.unit.trim()
 		)
 			continue;
@@ -854,12 +854,12 @@ function consumePantry(
 	recipe: Recipe,
 	servings: number,
 	now: Date
-): { pantry: Ingredient[]; uncoveredByBucket: Map<string, number> } {
+): { pantry: Ingredient[]; deductions: PantryDeduction[]; uncoveredByBucket: Map<string, number> } {
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const remaining = pantry.map((item) => ({ ...item }));
 	const uncoveredByBucket = new Map<string, number>();
 	if (!Number.isFinite(servings) || !(servings > 0)) {
-		return { pantry: remaining, uncoveredByBucket };
+		return { pantry: remaining, deductions: [], uncoveredByBucket };
 	}
 	const scale =
 		Number.isFinite(recipe.servings) && recipe.servings > 0 ? servings / recipe.servings : 1;
@@ -911,7 +911,33 @@ function consumePantry(
 		}
 	}
 
-	return { pantry: remaining, uncoveredByBucket };
+	const deductions: PantryDeduction[] = [];
+	for (let index = 0; index < pantry.length; index += 1) {
+		const before = pantry[index];
+		const after = remaining[index];
+		const deducted = roundPantryQuantity(before.quantity - after.quantity);
+		if (Number.isFinite(deducted) && deducted > 0) {
+			deductions.push({
+				pantryId: before.id,
+				name: before.name,
+				quantity: deducted,
+				unit: before.unit
+			});
+		}
+	}
+
+	return { pantry: remaining, deductions, uncoveredByBucket };
+}
+
+/** Clamp leftover servings between 0 and the meal's valid serving count. */
+export function clampLeftoverServings(
+	leftoverServings: number | undefined,
+	servings: number
+): number {
+	const servingsLimit = Number.isFinite(servings) ? Math.max(0, servings) : 0;
+	return Number.isFinite(leftoverServings)
+		? roundQuantity(Math.min(servingsLimit, Math.max(0, leftoverServings as number)))
+		: 0;
 }
 
 function affectedWeekStarts(shopping: ShoppingItem[], dates: Iterable<string>): string[] {
@@ -1087,19 +1113,20 @@ export function upsertMeal(
 	const {
 		completedAt: _completedAt,
 		leftoverServings: requestedLeftovers,
+		pantryDeductions: _pantryDeductions,
 		...baseMeal
 	} = sourceMeal;
 	if (previous?.completedAt) {
 		const rawLeftovers = requestedLeftovers ?? previous.leftoverServings;
-		const servingsLimit = Number.isFinite(baseMeal.servings) ? Math.max(0, baseMeal.servings) : 0;
 		const leftoverServings =
 			rawLeftovers === undefined || !Number.isFinite(rawLeftovers)
 				? undefined
-				: roundQuantity(Math.min(servingsLimit, Math.max(0, rawLeftovers)));
+				: clampLeftoverServings(rawLeftovers, baseMeal.servings);
 		const nextMeal: Meal = {
 			...baseMeal,
 			completedAt: previous.completedAt,
-			...(leftoverServings !== undefined ? { leftoverServings } : {})
+			...(leftoverServings !== undefined ? { leftoverServings } : {}),
+			...(previous.pantryDeductions ? { pantryDeductions: previous.pantryDeductions } : {})
 		};
 		const meals = state.meals.map((item) => (item.id === nextMeal.id ? nextMeal : item));
 		return { ...state, meals };
@@ -1143,15 +1170,7 @@ export function completeMeal(
 
 	const recipe = recipeForMeal(state, target);
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
-	const servingsLimit = Number.isFinite(target.servings) ? Math.max(0, target.servings) : 0;
-	const leftoverServings = Number.isFinite(options.leftoverServings)
-		? roundQuantity(Math.min(servingsLimit, Math.max(0, options.leftoverServings)))
-		: 0;
-	const meals = state.meals.map((meal) => {
-		if (meal.id !== mealId) return meal;
-		const { sample: _sample, ...userMeal } = meal;
-		return { ...userMeal, completedAt: safeNow.toISOString(), leftoverServings };
-	});
+	const leftoverServings = clampLeftoverServings(options.leftoverServings, target.servings);
 
 	const weekStart = parseCalendarKey(target.date) ? weekStartForDate(target.date) : '';
 	const weekSourceKey = weekStart ? `week:${weekStart}` : undefined;
@@ -1162,6 +1181,7 @@ export function completeMeal(
 
 	let pantry = state.pantry;
 	let shopping = state.shopping;
+	let deductions: PantryDeduction[] = [];
 
 	// Intentionally gate weekly checked-row retirement alongside pantry deduction:
 	// checked rows represent unconsumed groceries on hand, and uncovered demand is only
@@ -1170,6 +1190,7 @@ export function completeMeal(
 	if (options.deductPantry && recipe) {
 		const consumed = consumePantry(state.pantry, recipe, target.servings, safeNow);
 		pantry = consumed.pantry;
+		deductions = consumed.deductions;
 		if (weekSourceKey && consumed.uncoveredByBucket.size > 0) {
 			const weekBudget = new Map(consumed.uncoveredByBucket);
 			shopping = retireCheckedByScopeBudget(shopping, (scopeKey) =>
@@ -1177,6 +1198,17 @@ export function completeMeal(
 			);
 		}
 	}
+
+	const meals = state.meals.map((meal) => {
+		if (meal.id !== mealId) return meal;
+		const { sample: _sample, pantryDeductions: _pantryDeductions, ...userMeal } = meal;
+		return {
+			...userMeal,
+			completedAt: safeNow.toISOString(),
+			leftoverServings,
+			...(options.deductPantry && deductions.length ? { pantryDeductions: deductions } : {})
+		};
+	});
 
 	return refreshWeeks({ ...state, meals, pantry, shopping }, weeksToRefresh, safeNow);
 }

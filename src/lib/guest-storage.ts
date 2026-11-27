@@ -6,6 +6,7 @@ import type {
 	AppState,
 	Ingredient,
 	Meal,
+	PantryDeduction,
 	Preferences,
 	Recipe,
 	RecipeIngredient,
@@ -243,6 +244,19 @@ function sanitizeRecipes(value: unknown, fallback: Recipe[]): Recipe[] {
 	return result;
 }
 
+function sanitizePantryDeduction(value: unknown): PantryDeduction | null {
+	if (!isRecord(value)) return null;
+	const pantryId = typeof value.pantryId === 'string' ? value.pantryId.trim().slice(0, 100) : '';
+	const name = typeof value.name === 'string' ? value.name.trim().slice(0, 200) : '';
+	if (!pantryId || !name) return null;
+	return {
+		pantryId,
+		name,
+		quantity: clampNumber(value.quantity, 0, 1_000_000, 0),
+		unit: clampString(value.unit, 40)
+	};
+}
+
 function sanitizeMeals(value: unknown, fallback: Meal[]): Meal[] {
 	if (!Array.isArray(value)) return structuredClone(fallback);
 	const result: Meal[] = [];
@@ -262,6 +276,16 @@ function sanitizeMeals(value: unknown, fallback: Meal[]): Meal[] {
 		const parsedLeftovers = parseFiniteNumber(raw.leftoverServings);
 		const leftoverServings =
 			parsedLeftovers !== undefined ? Math.min(10_000, Math.max(0, parsedLeftovers)) : undefined;
+		let pantryDeductions: PantryDeduction[] | undefined;
+		if (completedAt !== undefined && Array.isArray(raw.pantryDeductions)) {
+			pantryDeductions = [];
+			for (const entry of raw.pantryDeductions) {
+				if (pantryDeductions.length >= 250) break;
+				const deduction = sanitizePantryDeduction(entry);
+				if (deduction) pantryDeductions.push(deduction);
+			}
+			if (!pantryDeductions.length) pantryDeductions = undefined;
+		}
 		const sample = typeof raw.sample === 'boolean' ? raw.sample : undefined;
 		result.push({
 			id,
@@ -271,6 +295,7 @@ function sanitizeMeals(value: unknown, fallback: Meal[]): Meal[] {
 			servings,
 			...(completedAt !== undefined ? { completedAt } : {}),
 			...(leftoverServings !== undefined ? { leftoverServings } : {}),
+			...(pantryDeductions !== undefined ? { pantryDeductions } : {}),
 			...(sample !== undefined ? { sample } : {})
 		});
 	}

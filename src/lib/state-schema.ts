@@ -109,6 +109,17 @@ export const appStateSchema = z.object({
 				servings: z.number().finite().min(1).max(10_000),
 				completedAt: z.string().max(50).optional(),
 				leftoverServings: z.number().finite().min(0).max(10_000).optional(),
+				pantryDeductions: z
+					.array(
+						z.object({
+							pantryId: z.string().min(1).max(100),
+							name: z.string().trim().min(1).max(200),
+							quantity: z.number().finite().min(0).max(1_000_000),
+							unit: z.string().max(40)
+						})
+					)
+					.max(250)
+					.optional(),
 				sample: z.boolean().optional()
 			})
 		)

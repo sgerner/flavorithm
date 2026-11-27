@@ -1256,3 +1256,56 @@ test('meal.complete rejects omitted deductPantry and keeps pantry unchanged when
 	assert.equal(withoutDeduction.meals[0].completedAt, now.toISOString());
 	assert.equal(withoutDeduction.pantry[0].quantity, 6);
 });
+
+test('meal.complete keeps deductPantry explicit and meal.upsert preserves pantryDeductions on cooked meals', () => {
+	const now = new Date('2026-10-23T18:00:00Z');
+	const current = createInitialState();
+	const meal = current.meals[0];
+	const recipe = current.recipes.find((item) => item.id === meal.recipeId)!;
+	recipe.servings = 2;
+	recipe.ingredients = [{ name: 'garlic', quantity: 2, unit: 'clove' }];
+	current.pantry = [
+		{ id: 'garlic', name: 'garlic', quantity: 6, unit: 'clove', category: 'Produce' }
+	];
+
+	assert.throws(() => applyButlerCommands(current, [{ type: 'meal.complete', id: meal.id }], now));
+
+	const cookedNoDeduct = applyButlerCommands(
+		current,
+		[{ type: 'meal.complete', id: meal.id, deductPantry: false, leftoverServings: 1 }],
+		now
+	).state;
+	assert.equal(cookedNoDeduct.meals[0].pantryDeductions, undefined);
+
+	const cookedWithDeduct = applyButlerCommands(
+		current,
+		[{ type: 'meal.complete', id: meal.id, deductPantry: true, leftoverServings: 1 }],
+		now
+	).state;
+	assert.deepEqual(cookedWithDeduct.meals[0].pantryDeductions, [
+		{ pantryId: 'garlic', name: 'garlic', quantity: 2, unit: 'clove' }
+	]);
+
+	const afterUpsert = applyButlerCommands(
+		cookedWithDeduct,
+		[
+			{
+				type: 'meal.upsert',
+				meal: {
+					id: meal.id,
+					date: meal.date,
+					slot: 'Lunch',
+					recipeId: meal.recipeId,
+					servings: 2,
+					leftoverServings: 5
+				}
+			}
+		],
+		now
+	).state;
+	assert.equal(afterUpsert.meals[0].completedAt, now.toISOString());
+	assert.equal(afterUpsert.meals[0].leftoverServings, 2);
+	assert.deepEqual(afterUpsert.meals[0].pantryDeductions, [
+		{ pantryId: 'garlic', name: 'garlic', quantity: 2, unit: 'clove' }
+	]);
+});

@@ -1,6 +1,12 @@
+import { buildShoppingList } from '#lib/domain.ts';
 import { sanitizeKitchenState } from '#lib/guest-storage.ts';
+import {
+	clampLeftoverServings,
+	convertCompatibleQuantity,
+	reconcileShoppingList
+} from '#lib/kitchen-workflows.ts';
 import { isKitchenState, isKitchenStateShape } from '#lib/state-schema.ts';
-import type { AppState, User } from '#lib/types.ts';
+import type { AppState, Ingredient, Meal, ShoppingItem, User } from '#lib/types.ts';
 
 export { isKitchenState, isKitchenStateShape };
 
@@ -418,6 +424,84 @@ function describeMealRecipe(snapshot: AppState, mealId: string, recipeId: string
 	return `${mealExists ? 'Meal planned' : 'Meal not planned'}; ${recipe ? `recipe available: ${recipe.title}` : 'recipe removed'}`;
 }
 
+function roundPantryQuantity(value: number): number {
+	const rounded = Math.round(value * 1_000_000) / 1_000_000;
+	return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function newlyCompletedMeals(base: AppState, snapshot: AppState): Meal[] {
+	const baseById = new Map(base.meals.map((meal) => [meal.id, meal]));
+	return snapshot.meals.filter(
+		(meal) =>
+			Boolean(meal.completedAt) &&
+			!baseById.get(meal.id)?.completedAt &&
+			Boolean(meal.pantryDeductions?.length)
+	);
+}
+
+function restoreMealPantryDeductions(base: AppState, snapshot: AppState): AppState {
+	const completed = newlyCompletedMeals(base, snapshot);
+	if (!completed.length) return snapshot;
+	const restored = structuredClone(snapshot);
+	const pantryById = new Map(restored.pantry.map((item) => [item.id, item]));
+	for (const meal of completed) {
+		for (const deduction of meal.pantryDeductions ?? []) {
+			if (!Number.isFinite(deduction.quantity) || !(deduction.quantity > 0)) continue;
+			const target = pantryById.get(deduction.pantryId);
+			if (!target) continue;
+			const delta = convertCompatibleQuantity(deduction.quantity, deduction.unit, target.unit);
+			if (delta === undefined) continue;
+			target.quantity = roundPantryQuantity(target.quantity + delta);
+		}
+	}
+	return restored;
+}
+
+const isWeekScope = (sourceKey: unknown): sourceKey is string =>
+	typeof sourceKey === 'string' && sourceKey.startsWith('week:');
+
+function formatDateKey(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function parseWeekScopeDate(sourceKey: unknown): string | null {
+	if (typeof sourceKey !== 'string') return null;
+	const match = /^week:(\d{4}-\d{2}-\d{2})$/.exec(sourceKey);
+	if (!match) return null;
+	const parsed = new Date(`${match[1]}T12:00:00`);
+	return Number.isFinite(parsed.getTime()) && formatDateKey(parsed) === match[1] ? match[1] : null;
+}
+
+function weekStartForDate(value: string): string | null {
+	const cleaned = value.trim();
+	if (!/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) return null;
+	const date = new Date(`${cleaned}T12:00:00`);
+	if (!Number.isFinite(date.getTime()) || formatDateKey(date) !== cleaned) return null;
+	date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
+	return formatDateKey(date);
+}
+
+function refreshWeeklyScope(state: AppState, startDate: string): void {
+	const start = new Date(`${startDate}T12:00:00`);
+	if (!Number.isFinite(start.getTime()) || formatDateKey(start) !== startDate) return;
+	const dates = new Set(
+		Array.from({ length: 7 }, (_, index) => {
+			const day = new Date(start);
+			day.setDate(day.getDate() + index);
+			return formatDateKey(day);
+		})
+	);
+	const meals = state.meals.filter((meal) => !meal.completedAt && dates.has(meal.date));
+	const recipes = state.recipes.filter((recipe) =>
+		meals.some((meal) => meal.recipeId === recipe.id)
+	);
+	const additions = buildShoppingList(recipes, state.pantry, meals);
+	state.shopping = reconcileShoppingList(state.shopping, additions, `week:${startDate}`);
+}
+
+const isShoppingEntityPath = /^kitchen\.shopping\[[^\]]+\]$/;
+const isMealEntityPath = /^kitchen\.meals\[[^\]]+\]$/;
+
 type PathSegment = { kind: 'prop'; key: string } | { kind: 'id'; id: string };
 type DetailedConflict = SyncConflict & {
 	segments: PathSegment[];
@@ -504,6 +588,181 @@ function segmentsStartWith(prefix: PathSegment[], full: PathSegment[]): boolean 
 	});
 }
 
+function reconcileOrphanedMeals(
+	state: AppState,
+	localBranch: AppState,
+	remoteBranch: AppState,
+	conflicts: DetailedConflict[],
+	prefer?: 'local' | 'remote'
+): void {
+	// Deleting a recipe while someone plans it must never create an orphaned meal.
+	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
+	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
+		conflicts.push({
+			path: `kitchen.meals[${meal.id}].recipeId`,
+			local: describeMealRecipe(localBranch, meal.id, meal.recipeId),
+			remote: describeMealRecipe(remoteBranch, meal.id, meal.recipeId),
+			segments: [
+				{ kind: 'prop', key: 'meals' },
+				{ kind: 'id', id: meal.id },
+				{ kind: 'prop', key: 'recipeId' }
+			],
+			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
+		});
+		// Keep the complete proposed meal available for review and backup until a choice is made.
+		const candidates = prefer
+			? (prefer === 'local' ? localBranch : remoteBranch).recipes
+			: [...localBranch.recipes, ...remoteBranch.recipes];
+		const recipe = candidates.find((item) => item.id === meal.recipeId);
+		if (recipe) {
+			state.recipes.push(structuredClone(recipe));
+			recipeIds.add(recipe.id);
+		}
+	}
+	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+}
+
+function applyMealPantryDeductions(
+	pantry: Ingredient[],
+	meals: Meal[],
+	options?: {
+		base: AppState;
+		local: AppState;
+		remote: AppState;
+		prefer?: 'local' | 'remote';
+		conflicts: DetailedConflict[];
+	}
+): Ingredient[] {
+	if (!meals.length) return pantry;
+	const result = pantry.map((item) => ({ ...item }));
+	const pantryById = new Map(result.map((item) => [item.id, item]));
+	const rawQuantityById = new Map(result.map((item) => [item.id, item.quantity]));
+	const clampedIds = new Set<string>();
+	const incompatibleIds = new Set<string>();
+	const missingIds = new Set<string>();
+
+	for (const meal of meals) {
+		for (const deduction of meal.pantryDeductions ?? []) {
+			if (!Number.isFinite(deduction.quantity) || !(deduction.quantity > 0)) continue;
+			const target = pantryById.get(deduction.pantryId);
+			if (!target) {
+				missingIds.add(deduction.pantryId);
+				continue;
+			}
+			const delta = convertCompatibleQuantity(deduction.quantity, deduction.unit, target.unit);
+			if (delta === undefined) {
+				incompatibleIds.add(target.id);
+				continue;
+			}
+			const previousRaw = rawQuantityById.get(target.id) ?? target.quantity;
+			const rawDiff = previousRaw - delta;
+			const nextRaw = Math.abs(rawDiff) <= 1e-9 ? 0 : roundPantryQuantity(rawDiff);
+			rawQuantityById.set(target.id, nextRaw);
+			const nextClamped = roundPantryQuantity(Math.max(0, nextRaw));
+			target.quantity = nextClamped;
+			if (nextClamped !== nextRaw) {
+				clampedIds.add(target.id);
+			}
+		}
+	}
+
+	if (!options || equal(options.local, options.remote)) {
+		return result;
+	}
+
+	const { base, local, remote, prefer, conflicts } = options;
+	const localById = new Map(local.pantry.map((item) => [item.id, item]));
+	const remoteById = new Map(remote.pantry.map((item) => [item.id, item]));
+	const bothBranchesDiverged = !equal(local, base) && !equal(remote, base);
+
+	for (const pantryId of missingIds) {
+		const localItem = localById.get(pantryId);
+		const remoteItem = remoteById.get(pantryId);
+		if (!bothBranchesDiverged || Boolean(localItem) === Boolean(remoteItem)) continue;
+		const itemSegments: PathSegment[] = [
+			{ kind: 'prop', key: 'pantry' },
+			{ kind: 'id', id: pantryId }
+		];
+		if (!conflicts.some((entry) => segmentsStartWith(entry.segments, itemSegments))) {
+			conflicts.push({
+				path: `kitchen.pantry[${pantryId}]`,
+				local: localItem ? structuredClone(localItem) : undefined,
+				remote: remoteItem ? structuredClone(remoteItem) : undefined,
+				segments: itemSegments
+			});
+		}
+		const chosen = prefer === 'local' ? localItem : remoteItem;
+		if (chosen && !pantryById.has(pantryId)) {
+			const cloned = structuredClone(chosen);
+			result.push(cloned);
+			pantryById.set(pantryId, cloned);
+		}
+	}
+
+	for (const pantryId of incompatibleIds) {
+		const localItem = localById.get(pantryId);
+		const remoteItem = remoteById.get(pantryId);
+		if (!bothBranchesDiverged) continue;
+		const itemSegments: PathSegment[] = [
+			{ kind: 'prop', key: 'pantry' },
+			{ kind: 'id', id: pantryId }
+		];
+		for (let index = conflicts.length - 1; index >= 0; index -= 1) {
+			if (
+				!equal(conflicts[index].segments, itemSegments) &&
+				segmentsStartWith(itemSegments, conflicts[index].segments)
+			) {
+				conflicts.splice(index, 1);
+			}
+		}
+		if (!conflicts.some((entry) => segmentsStartWith(entry.segments, itemSegments))) {
+			conflicts.push({
+				path: `kitchen.pantry[${pantryId}]`,
+				local: localItem ? structuredClone(localItem) : undefined,
+				remote: remoteItem ? structuredClone(remoteItem) : undefined,
+				segments: itemSegments
+			});
+		}
+		const chosen = prefer === 'local' ? localItem : remoteItem;
+		const index = result.findIndex((item) => item.id === pantryId);
+		if (chosen && index !== -1) {
+			const cloned = structuredClone(chosen);
+			result[index] = cloned;
+			pantryById.set(pantryId, cloned);
+		} else if (!chosen && index !== -1) {
+			result.splice(index, 1);
+			pantryById.delete(pantryId);
+		}
+	}
+
+	for (const pantryId of clampedIds) {
+		const target = pantryById.get(pantryId);
+		if (!target) continue;
+		const quantitySegments: PathSegment[] = [
+			{ kind: 'prop', key: 'pantry' },
+			{ kind: 'id', id: pantryId },
+			{ kind: 'prop', key: 'quantity' }
+		];
+		const localQuantity = localById.get(pantryId)?.quantity;
+		const remoteQuantity = remoteById.get(pantryId)?.quantity;
+		if (!conflicts.some((entry) => segmentsStartWith(entry.segments, quantitySegments))) {
+			conflicts.push({
+				path: `kitchen.pantry[${pantryId}].quantity`,
+				local: localQuantity,
+				remote: remoteQuantity,
+				segments: quantitySegments
+			});
+		}
+		if (prefer === 'local' && typeof localQuantity === 'number') {
+			target.quantity = localQuantity;
+		} else if (prefer === 'remote' && typeof remoteQuantity === 'number') {
+			target.quantity = remoteQuantity;
+		}
+	}
+
+	return result;
+}
+
 function mergeKitchenStatesDetailed(
 	base: AppState,
 	local: AppState,
@@ -520,6 +779,17 @@ function mergeKitchenStatesDetailed(
 		});
 		return prefer === 'local' ? mine : theirs;
 	};
+	const localNormalized = restoreMealPantryDeductions(base, local);
+	const remoteNormalized = restoreMealPantryDeductions(base, remote);
+	const planningInputsChanged =
+		!equal(local.meals, base.meals) ||
+		!equal(remote.meals, base.meals) ||
+		!equal(local.pantry, base.pantry) ||
+		!equal(remote.pantry, base.pantry) ||
+		!equal(local.recipes, base.recipes) ||
+		!equal(remote.recipes, base.recipes);
+	const refreshedWeekScopes = new Map<string, 'local' | 'remote'>();
+
 	const merge = (
 		old: unknown,
 		mine: unknown,
@@ -527,6 +797,52 @@ function mergeKitchenStatesDetailed(
 		path: string,
 		segments: PathSegment[]
 	): unknown => {
+		if (isShoppingEntityPath.test(path)) {
+			const oldItem = old as ShoppingItem | undefined;
+			const localItem = mine as ShoppingItem | undefined;
+			const remoteItem = theirs as ShoppingItem | undefined;
+			if (equal(localItem, remoteItem)) return localItem;
+			if (!oldItem?.checked) {
+				if (localItem?.checked && isWeekScope(localItem.sourceKey)) {
+					if (equal(remoteItem, oldItem)) return localItem;
+					if (
+						!remoteItem ||
+						(!remoteItem.checked && remoteItem.sourceKey === localItem.sourceKey)
+					) {
+						refreshedWeekScopes.set(localItem.sourceKey, 'remote');
+						return localItem;
+					}
+				}
+				if (remoteItem?.checked && isWeekScope(remoteItem.sourceKey)) {
+					if (equal(localItem, oldItem)) return remoteItem;
+					if (!localItem || (!localItem.checked && localItem.sourceKey === remoteItem.sourceKey)) {
+						refreshedWeekScopes.set(remoteItem.sourceKey, 'local');
+						return remoteItem;
+					}
+				}
+			}
+			if (equal(localItem, oldItem)) return remoteItem;
+			if (equal(remoteItem, oldItem)) return localItem;
+			if (
+				planningInputsChanged &&
+				!oldItem?.checked &&
+				(!localItem || (!localItem.checked && Boolean(parseWeekScopeDate(localItem.sourceKey)))) &&
+				(!remoteItem ||
+					(!remoteItem.checked && Boolean(parseWeekScopeDate(remoteItem.sourceKey)))) &&
+				Boolean(
+					parseWeekScopeDate(localItem?.sourceKey ?? remoteItem?.sourceKey ?? oldItem?.sourceKey)
+				)
+			) {
+				return prefer === 'local' ? localItem : (remoteItem ?? localItem);
+			}
+			return conflict(path, segments, localItem, remoteItem);
+		}
+		if (isMealEntityPath.test(path)) {
+			if (equal(mine, theirs)) return mine;
+			if (equal(mine, old)) return theirs;
+			if (equal(theirs, old)) return mine;
+			return conflict(path, segments, mine, theirs);
+		}
 		const descendIntoEqualPantry =
 			path === 'kitchen.pantry' &&
 			equal(mine, theirs) &&
@@ -595,34 +911,101 @@ function mergeKitchenStatesDetailed(
 		}
 		return conflict(path, segments, mine, theirs);
 	};
-	const state = structuredClone(merge(base, local, remote, 'kitchen', [])) as AppState;
-	// Deleting a recipe while someone plans it must never create an orphaned meal.
-	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
-	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
-		conflicts.push({
-			path: `kitchen.meals[${meal.id}].recipeId`,
-			local: describeMealRecipe(local, meal.id, meal.recipeId),
-			remote: describeMealRecipe(remote, meal.id, meal.recipeId),
-			segments: [
-				{ kind: 'prop', key: 'meals' },
-				{ kind: 'id', id: meal.id },
-				{ kind: 'prop', key: 'recipeId' }
-			],
-			orphanedMeal: { mealId: meal.id, recipeId: meal.recipeId }
-		});
-		{
-			// Keep the complete proposed meal available for review and backup until a choice is made.
-			const candidates = prefer
-				? (prefer === 'local' ? local : remote).recipes
-				: [...local.recipes, ...remote.recipes];
-			const recipe = candidates.find((recipe) => recipe.id === meal.recipeId);
-			if (recipe) {
-				state.recipes.push(structuredClone(recipe));
-				recipeIds.add(recipe.id);
+	const state = structuredClone(
+		merge(base, localNormalized, remoteNormalized, 'kitchen', [])
+	) as AppState;
+	reconcileOrphanedMeals(state, local, remote, conflicts, prefer);
+	state.meals = state.meals.map((meal) => {
+		if (!meal.completedAt) {
+			if (meal.leftoverServings === undefined && meal.pantryDeductions === undefined) {
+				return meal;
 			}
+			const next = { ...meal };
+			delete next.leftoverServings;
+			delete next.pantryDeductions;
+			return next;
+		}
+		if (meal.leftoverServings === undefined) {
+			if (!('leftoverServings' in meal)) return meal;
+			const next = { ...meal };
+			delete next.leftoverServings;
+			return next;
+		}
+		const normalizedLeftovers = clampLeftoverServings(meal.leftoverServings, meal.servings);
+		return normalizedLeftovers === meal.leftoverServings
+			? meal
+			: {
+					...meal,
+					leftoverServings: normalizedLeftovers
+				};
+	});
+
+	const baseMealsById = new Map(base.meals.map((meal) => [meal.id, meal]));
+	const acceptedNewCompletions = state.meals.filter(
+		(meal) =>
+			Boolean(meal.completedAt) &&
+			!baseMealsById.get(meal.id)?.completedAt &&
+			Boolean(meal.pantryDeductions?.length)
+	);
+	state.pantry = applyMealPantryDeductions(state.pantry, acceptedNewCompletions, {
+		base,
+		local,
+		remote,
+		prefer,
+		conflicts
+	});
+	for (const entry of conflicts) {
+		if (entry.path === 'kitchen.pantry' || entry.path.startsWith('kitchen.pantry[')) {
+			entry.local = getAtSegments(local, entry.segments);
+			entry.remote = getAtSegments(remote, entry.segments);
 		}
 	}
-	state.meals = state.meals.filter((meal) => recipeIds.has(meal.recipeId));
+
+	if (!equal(local, remote)) {
+		const reconciledScopes = new Set<string>();
+		const stateInputsChanged =
+			!equal(state.meals, base.meals) ||
+			!equal(state.pantry, base.pantry) ||
+			!equal(state.recipes, base.recipes);
+		const bothBranchesDiverged = !equal(local, base) && !equal(remote, base);
+		if ((stateInputsChanged || planningInputsChanged) && bothBranchesDiverged) {
+			const affectedWeeks = new Set<string>();
+			for (const item of [...base.shopping, ...local.shopping, ...remote.shopping]) {
+				const startDate = parseWeekScopeDate(item.sourceKey);
+				if (startDate) affectedWeeks.add(startDate);
+			}
+			const localPlanningChanged =
+				!equal(local.meals, base.meals) ||
+				!equal(local.pantry, base.pantry) ||
+				!equal(local.recipes, base.recipes);
+			const remotePlanningChanged =
+				!equal(remote.meals, base.meals) ||
+				!equal(remote.pantry, base.pantry) ||
+				!equal(remote.recipes, base.recipes);
+			if (localPlanningChanged && remotePlanningChanged) {
+				for (const meal of state.meals) {
+					if (meal.completedAt) continue;
+					const previous = baseMealsById.get(meal.id);
+					if (!previous || !equal(previous, meal)) {
+						const startDate = weekStartForDate(meal.date);
+						if (startDate) affectedWeeks.add(startDate);
+					}
+				}
+			}
+			for (const startDate of [...affectedWeeks].sort()) {
+				refreshWeeklyScope(state, startDate);
+				reconciledScopes.add(`week:${startDate}`);
+			}
+		}
+		for (const [sourceKey, branch] of refreshedWeekScopes) {
+			if (reconciledScopes.has(sourceKey)) continue;
+			const sourceItems = (branch === 'local' ? local : remote).shopping.filter(
+				(item) => item.sourceKey === sourceKey
+			);
+			state.shopping = reconcileShoppingList(state.shopping, sourceItems, sourceKey);
+		}
+	}
+
 	return { state, conflicts };
 }
 

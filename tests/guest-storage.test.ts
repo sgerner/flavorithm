@@ -252,6 +252,33 @@ test('sanitizeKitchenState preserves valid states and clamps corrupt guest field
 
 	const validated = validateAppState(sanitized);
 	assert.ok(validated, 'validateAppState should accept any state produced by sanitizeKitchenState');
+
+	const withCompletedMealAndManualRecipe = createInitialState();
+	withCompletedMealAndManualRecipe.recipes[0].provenance = 'manual';
+	withCompletedMealAndManualRecipe.meals.push({
+		id: 'cooked-meal',
+		date: '2026-11-22',
+		slot: 'Dinner',
+		recipeId: withCompletedMealAndManualRecipe.recipes[0].id,
+		servings: 2,
+		completedAt: '2026-11-22T18:30:00.000Z',
+		leftoverServings: 1,
+		pantryDeductions: [
+			{
+				pantryId: withCompletedMealAndManualRecipe.pantry[0].id,
+				name: withCompletedMealAndManualRecipe.pantry[0].name,
+				quantity: 0.5,
+				unit: withCompletedMealAndManualRecipe.pantry[0].unit
+			}
+		]
+	});
+	const sanitizedCompleted = sanitizeKitchenState(withCompletedMealAndManualRecipe);
+	assert.deepEqual(sanitizedCompleted, withCompletedMealAndManualRecipe);
+	assert.equal(
+		JSON.stringify(sanitizeKitchenState(sanitizedCompleted)),
+		JSON.stringify(sanitizedCompleted)
+	);
+	assert.ok(validateAppState(sanitizedCompleted));
 });
 
 test('signup migration sanitizes guest state for immediate sync and retains journal offline', async () => {
