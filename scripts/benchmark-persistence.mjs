@@ -442,6 +442,9 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 			return out.result?.value;
 		};
 
+		/**
+		 * @param {number} expected
+		 */
 		const waitForPutCount = async (expected) => {
 			await pause(300);
 			for (let i = 0; i < 30; i += 1) {
