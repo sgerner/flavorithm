@@ -5,6 +5,7 @@
 	import { focusTrap } from '#lib/focus.ts';
 	import { describeBy, fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
+	import StatusRegion from '#lib/components/StatusRegion.svelte';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import {
 		RATING_STARS,
@@ -425,6 +426,7 @@
 					rel="noreferrer">View original recipe <ArrowUpRight size={15} /></a
 				>{/if}
 		</div>
+		<StatusRegion modal />
 	</div>
 </div>
 

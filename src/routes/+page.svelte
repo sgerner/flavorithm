@@ -164,9 +164,20 @@
 	} from '#lib/butler-chat.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
+	import StatusRegion from '#lib/components/StatusRegion.svelte';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
+	import {
+		announce,
+		announceDeferred,
+		formatPantryStatus,
+		formatRecipeStatus,
+		formatShoppingStatus,
+		formatWebSearchStatus,
+		notifyStatus,
+		statusStore
+	} from '#lib/status.ts';
 	import {
 		appendDictatedText,
 		isVoiceTargetActive,
@@ -252,6 +263,7 @@
 	let priorityPantryIds = $state<string[]>([]);
 	let query = $state('');
 	let showHiddenRecipes = $state(false);
+	let hasSearchedOnline = $state(false);
 	let lastActivePill = $state<'filter' | 'hidden'>('filter');
 	let filterTabs = $state<HTMLDivElement | null>(null);
 	let filterOverflow = $state({ left: false, right: false });
@@ -274,6 +286,7 @@
 		filter = next.filter;
 		query = next.query;
 		showHiddenRecipes = next.showHiddenRecipes;
+		announceRecipeFilter(false);
 	}
 	$effect(() => {
 		const currentPage = page;
@@ -334,10 +347,6 @@
 			window.removeEventListener('resize', syncFilterOverflow);
 		};
 	});
-	let toast = $state('');
-	let toastUndo = $state<(() => void) | null>(null);
-	let toastActionLabel = $state('Undo');
-	let toastVersion = 0;
 	let exporting = $state(false);
 	let busy = $state(false);
 	let scanBusy = $state(false);
@@ -462,6 +471,9 @@
 		clearHouseholdViewState();
 		kitchenSync?.clearContext();
 		user = null;
+		syncStatusOwner(true);
+		editingRecipe = null;
+		editingRecipeMode = 'edit';
 		kitchen = createInitialState();
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
@@ -530,6 +542,7 @@
 	let voiceModel = $state('');
 	let voiceApiKey = $state('');
 	let localVoiceAvailable = $state(false);
+	let localVoiceChecking = $state(false);
 	let voiceState = $state<VoiceState>('idle');
 	let voiceStarting = $state(false);
 	let voiceRetained = $state(false);
@@ -546,6 +559,22 @@
 	let voiceCapture: VoiceCapture | undefined;
 	let activeVoiceImportSession: ImportSession | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
+	async function checkVoiceAvailability(owner = user?.id ?? '') {
+		if (!owner) {
+			localVoiceChecking = false;
+			return;
+		}
+		localVoiceChecking = true;
+		try {
+			const r = await fetch('/api/voice');
+			const data = r.ok ? await r.json() : null;
+			if (user?.id === owner) localVoiceAvailable = Boolean(data?.localAvailable);
+		} catch {
+			// Keep previous availability state when offline.
+		} finally {
+			if (user?.id === owner || !user) localVoiceChecking = false;
+		}
+	}
 	$effect(() => {
 		const owner = voiceOwner;
 		if (typeof window === 'undefined') return;
@@ -556,6 +585,7 @@
 			voiceProvider = 'auto';
 			voiceModel = '';
 			localVoiceAvailable = false;
+			localVoiceChecking = false;
 		});
 		if (owner) {
 			try {
@@ -571,12 +601,7 @@
 							: '';
 				}
 			} catch {}
-			fetch('/api/voice')
-				.then((r) => (r.ok ? r.json() : null))
-				.then((data) => {
-					if (user?.id === owner) localVoiceAvailable = Boolean(data?.localAvailable);
-				})
-				.catch(() => {});
+			void checkVoiceAvailability(owner);
 		}
 		return () => untrack(() => clearVoiceSession(false));
 	});
@@ -760,6 +785,7 @@
 			if (nextUser) kitchen = createNewUserState();
 		}
 		user = nextUser;
+		if (changedIdentity) syncStatusOwner(true);
 		if (managedAuth && !user) {
 			clearManagedIdentity();
 			renewManagedSession({ status: 401 });
@@ -946,6 +972,7 @@
 		const editedId = draft.id;
 		pantryDraft = null;
 		if (!restoreFocus) return;
+		if (!visiblePantry.length) announcePantryFilter();
 		await tick();
 		document
 			.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
@@ -974,6 +1001,7 @@
 	function removePantryItem(item: AppState['pantry'][number]) {
 		if (pantryDraft?.id === item.id) pantryDraft = null;
 		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
+		if (!visiblePantry.length) announcePantryFilter();
 	}
 	function resetPantryFilters() {
 		pantryQuery = '';
@@ -1003,12 +1031,46 @@
 				.filter(Boolean)
 		)
 	);
+	function currentRecipeStatus() {
+		const hasSavedRecipes = kitchen.recipes.some(
+			(r) => r.saved && (showHiddenRecipes || !r.hidden)
+		);
+		return formatRecipeStatus(recipes.length, page, hasSavedRecipes, activeRecipeFilters);
+	}
+	function announceRecipeFilter(debounced = false) {
+		if (debounced) announceDeferred(() => currentRecipeStatus(), 300);
+		else announce(currentRecipeStatus());
+	}
+	function currentPantryStatus() {
+		const hasSearchOrCategory =
+			pantryQuery.trim().length > 0 || pantryCategory.trim().toLowerCase() !== 'all';
+		return formatPantryStatus(
+			visiblePantry.length,
+			kitchen.pantry.length,
+			pantryFilter,
+			hasSearchOrCategory
+		);
+	}
+	function announcePantryFilter(debounced = false) {
+		if (debounced) announceDeferred(() => currentPantryStatus(), 300);
+		else announce(currentPantryStatus());
+	}
 	let checkedCount = $derived(kitchen.shopping.filter((item) => item.checked).length);
 	let visibleShopping = $derived(
 		shoppingFilter === 'unpurchased'
 			? kitchen.shopping.filter((item) => !item.checked)
 			: kitchen.shopping
 	);
+	function announceShoppingFilter() {
+		announce(
+			formatShoppingStatus(
+				visibleShopping.length,
+				kitchen.shopping.length,
+				checkedCount,
+				shoppingFilter
+			)
+		);
+	}
 	let week = $derived.by(() => {
 		const d = new Date();
 		d.setHours(12, 0, 0, 0);
@@ -1058,28 +1120,36 @@
 	function dateKey(date: Date) {
 		return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 	}
-	function notify(message: string, undo?: () => void, actionLabel = 'Undo') {
-		toast = message;
-		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
-		toastActionLabel = undo ? actionLabel : 'Undo';
-		toastUndo = undo
-			? () => {
-					toastUndo = null;
-					toastActionLabel = 'Undo';
-					toast = '';
-					if (owner === `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`) undo();
-				}
-			: null;
-		const version = ++toastVersion;
-		setTimeout(
-			() => {
-				if (toastVersion === version) {
-					toast = '';
-					toastUndo = null;
-					toastActionLabel = 'Undo';
-				}
-			},
-			undo ? 10000 : 4200
+	let statusOwner = $derived(`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`);
+	function syncStatusOwner(resetState = false) {
+		if (resetState) statusStore.reset();
+		statusStore.setOwner(statusOwner);
+	}
+	$effect.pre(() => {
+		statusStore.setOwner(statusOwner);
+	});
+	function notify(
+		message: string,
+		undo?: () => void,
+		actionLabelOrOptions: string | { actionLabel?: string; owner?: string } = 'Undo'
+	) {
+		const actionLabel =
+			typeof actionLabelOrOptions === 'string'
+				? actionLabelOrOptions
+				: (actionLabelOrOptions.actionLabel ?? 'Undo');
+		const owner =
+			typeof actionLabelOrOptions === 'string'
+				? statusOwner
+				: (actionLabelOrOptions.owner ?? statusOwner);
+		if (owner === statusOwner) statusStore.setOwner(statusOwner);
+		notifyStatus(
+			message,
+			undo
+				? () => {
+						if (owner === statusOwner) undo();
+					}
+				: undefined,
+			{ owner, actionLabel }
 		);
 	}
 	function applyShoppingEdit(item: AppState['shopping'][number]) {
@@ -1416,6 +1486,7 @@
 				const nextUser: User | null = data.user ?? null;
 				if (!nextUser) {
 					user = null;
+					syncStatusOwner();
 					kitchenSync?.clearContext();
 					localStorage.removeItem('flavorithm-last-account');
 					if (managedAuth) {
@@ -1427,6 +1498,7 @@
 					clearHouseholdViewState();
 					kitchen = createNewUserState();
 					user = nextUser;
+					syncStatusOwner(true);
 					showStarter = false;
 					kitchenSync?.prepare(nextUser);
 					kitchenLoaded = true;
@@ -1498,6 +1570,7 @@
 							clearHouseholdViewState();
 							kitchen = createNewUserState();
 							user = cached;
+							syncStatusOwner(true);
 							showStarter = false;
 							kitchenLoaded = true;
 							kitchenSync?.restore(cached);
@@ -1656,6 +1729,11 @@
 		commitInlineEdits();
 		page = id;
 		mobileNav = false;
+		if ((id === 'discover' || id === 'saved') && recipes.length === 0) {
+			announceRecipeFilter(false);
+		} else if (id === 'pantry' && visiblePantry.length === 0) {
+			announcePantryFilter();
+		}
 	}
 	async function addIngredients(event?: SubmitEvent) {
 		event?.preventDefault();
@@ -1791,6 +1869,7 @@
 					stateEtag = null;
 					kitchen = initialKitchen;
 					user = nextUser;
+					syncStatusOwner(true);
 					kitchenSync?.prepare(nextUser);
 					kitchenLoaded = true;
 					saveLastAccount(nextUser);
@@ -1878,6 +1957,9 @@
 			clearHouseholdViewState();
 			localStorage.removeItem('flavorithm-last-account');
 			user = null;
+			syncStatusOwner(true);
+			editingRecipe = null;
+			editingRecipeMode = 'edit';
 			inviteCode = '';
 			currentInviteId = '';
 			joinCode = '';
@@ -2026,7 +2108,10 @@
 			initialUserId: user?.id ?? null,
 			getCurrentUserId: () => user?.id ?? null,
 			refreshAuth,
-			loadConnectionsAndCatalog: () => loadModelCatalog(refreshConnections()),
+			loadConnectionsAndCatalog: () => {
+				if (user) void checkVoiceAvailability(user.id);
+				return loadModelCatalog(refreshConnections());
+			},
 			onReadyToFocus: headingId
 				? async () => {
 						if (modal !== 'settings') return;
@@ -2734,6 +2819,7 @@
 				break;
 			case 'search':
 				if (capabilities.recipeSearch) {
+					if (!searchResults.length) hasSearchedOnline = false;
 					modal = 'search';
 					error = '';
 				} else {
@@ -2810,6 +2896,7 @@
 		scanController = currentController;
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
 		scanBusy = true;
+		announce('Scanning photo for ingredients…');
 		try {
 			const image = await prepareAIPhoto(file, { signal: currentController.signal });
 			const result = await ai('vision', { image }, currentController.signal);
@@ -3848,6 +3935,7 @@
 					}),
 				onMutated: () => {
 					joinedHousehold = true;
+					statusStore.reset();
 					kitchenSync?.clearContext();
 					clearPendingAIState();
 					clearAIConnectionState();
@@ -4177,6 +4265,9 @@
 				// Ignore blocked browser storage.
 			}
 			user = null;
+			syncStatusOwner(true);
+			editingRecipe = null;
+			editingRecipeMode = 'edit';
 			inviteCode = '';
 			currentInviteId = '';
 			joinCode = '';
@@ -4279,6 +4370,7 @@
 				mutateHousehold: () => request('/api/household', { action: 'leave' }),
 				onMutated: () => {
 					leftHousehold = true;
+					statusStore.reset();
 					kitchenSync?.clearContext();
 					clearPendingAIState();
 					clearAIConnectionState();
@@ -4351,9 +4443,12 @@
 		}
 		busy = true;
 		error = '';
+		announce('Searching for recipes online…');
 		try {
 			searchResults = (await ai('search', { prompt: prompt || 'seasonal weeknight recipes' }))
 				.results;
+			hasSearchedOnline = true;
+			announce(formatWebSearchStatus(searchResults.length));
 		} catch (e) {
 			error = (e as Error).message;
 			await tick();
@@ -4657,7 +4752,7 @@
 							/><span class="visual-spark">✳</span>
 						</div>
 					</section>
-					{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
+					{#if scanBusy}<div class="scan-status" in:revealMotion>
 							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
 							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 						</div>{/if}{/if}
@@ -4707,6 +4802,7 @@
 											lastActivePill = 'filter';
 											priorityPantryIds = [];
 											filter = item;
+											announceRecipeFilter(false);
 										}}
 										>{#if item === 'For you'}<Sparkles
 												size={14}
@@ -4723,6 +4819,7 @@
 									onclick={() => {
 										lastActivePill = 'hidden';
 										showHiddenRecipes = !showHiddenRecipes;
+										announceRecipeFilter(false);
 									}}>Hidden recipes</ToggleButton
 								>
 							</div>
@@ -4733,11 +4830,15 @@
 								aria-label="Search recipes"
 								placeholder="Search recipes"
 								bind:value={query}
+								oninput={() => announceRecipeFilter(true)}
 							/>{#if query}<button
 									type="button"
 									class="search-clear"
 									aria-label="Clear search"
-									onclick={() => (query = '')}><X size={16} aria-hidden="true" /></button
+									onclick={() => {
+										query = '';
+										announceRecipeFilter(false);
+									}}><X size={16} aria-hidden="true" /></button
 								>{/if}
 						</div>
 					</div>
@@ -4755,7 +4856,10 @@
 							<div class="discover-pantry-actions">
 								{#if activePriorityPantry.length}<button
 										class="text-button"
-										onclick={() => (priorityPantryIds = [])}>All pantry matches</button
+										onclick={() => {
+											priorityPantryIds = [];
+											announceRecipeFilter(false);
+										}}>All pantry matches</button
 									>{/if}
 								<button
 									class="secondary"
@@ -4861,6 +4965,7 @@
 							</div>{/if}{/if}{#if capabilities.recipeSearch}<button
 							class="browse-link"
 							onclick={() => {
+								if (!searchResults.length) hasSearchedOnline = false;
 								modal = 'search';
 								error = '';
 							}}>Find recipes online <ArrowUpRight size={16} /></button
@@ -4890,6 +4995,7 @@
 										kitchen.pantry = kitchen.pantry.filter(
 											(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
 										);
+										announcePantryFilter();
 									}}>Clear depleted items</button
 								></span
 							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
@@ -4909,7 +5015,7 @@
 						>
 					</div>
 				</div>
-				{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
+				{#if scanBusy}<div class="scan-status" in:revealMotion>
 						<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
 						<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 					</div>{/if}
@@ -4918,13 +5024,21 @@
 						<label class="search-box pantry-search">
 							<Search size={17} aria-hidden="true" /><span class="visually-hidden"
 								>Search pantry</span
-							><input type="search" placeholder="Search pantry" bind:value={pantryQuery} />
+							><input
+								type="search"
+								placeholder="Search pantry"
+								bind:value={pantryQuery}
+								oninput={() => announcePantryFilter(true)}
+							/>
 						</label>
 						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
 							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<ToggleButton
 									class={{ active: pantryFilter === option.id }}
 									pressed={pantryFilter === option.id}
-									onclick={() => (pantryFilter = option.id)}
+									onclick={() => {
+										pantryFilter = option.id;
+										announcePantryFilter();
+									}}
 									><span>{option.label}</span><span class="visually-hidden">{', '}</span><span
 										class="expiry-count"
 										>{option.count}<span class="visually-hidden"
@@ -4942,14 +5056,18 @@
 							<ToggleButton
 								class={{ active: pantryCategory === 'all' }}
 								pressed={pantryCategory === 'all'}
-								onclick={() => (pantryCategory = 'all')}>All categories</ToggleButton
+								onclick={() => {
+									pantryCategory = 'all';
+									announcePantryFilter();
+								}}>All categories</ToggleButton
 							>{#each pantryCategories as category (category.key)}<ToggleButton
 									class={{ active: pantryCategory.toLowerCase() === category.key }}
 									pressed={pantryCategory.toLowerCase() === category.key}
-									onclick={() =>
-										(pantryCategory =
-											pantryCategory.toLowerCase() === category.key ? 'all' : category.label)}
-									>{category.label}</ToggleButton
+									onclick={() => {
+										pantryCategory =
+											pantryCategory.toLowerCase() === category.key ? 'all' : category.label;
+										announcePantryFilter();
+									}}>{category.label}</ToggleButton
 								>{/each}
 						</div>{/if}
 				</div>
@@ -5131,8 +5249,13 @@
 						<Carrot size={34} />
 						<h2>No matching ingredients</h2>
 						<p>Try another search, category, or expiry filter.</p>
-						<button type="button" class="secondary" onclick={resetPantryFilters}
-							>Reset filters</button
+						<button
+							type="button"
+							class="secondary"
+							onclick={() => {
+								resetPantryFilters();
+								announcePantryFilter();
+							}}>Reset filters</button
 						>
 					</div>{/if}
 				<div class="pantry-footer">
@@ -5352,6 +5475,7 @@
 											}
 										}
 										shoppingFilter = option.id;
+										announceShoppingFilter();
 									}}>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
@@ -5502,21 +5626,10 @@
 		</div>
 	</main>
 </div>
-<div class="visually-hidden" role="status" aria-live="polite" aria-atomic="true">
-	{scanBusy ? 'Scanning photo for ingredients…' : toast}
-</div>
-{#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}
-				>{toastActionLabel}</button
-			>{/if}<button
-			onclick={() => {
-				toast = '';
-				toastUndo = null;
-				toastActionLabel = 'Undo';
-			}}
-			aria-label="Dismiss notification"><X size={16} /></button
-		>
-	</div>{/if}
+<StatusRegion
+	owner={statusOwner}
+	muted={Boolean(modal || selected || editingRecipe || butlerOpen)}
+/>
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
 		initialServings={selectedMealServings ?? selected.servings}
@@ -5689,7 +5802,7 @@
 					</form>
 				{:else if modal === 'pantry'}<span class="dialog-spark">✳</span>
 					<h2>Add ingredients</h2>
-					{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
+					{#if scanBusy}<div class="scan-status" in:revealMotion>
 							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
 							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 						</div>{/if}
@@ -5960,6 +6073,7 @@
 							bind:model={voiceModel}
 							bind:apiKey={voiceApiKey}
 							localAvailable={localVoiceAvailable}
+							checking={localVoiceChecking}
 							userId={user?.id}
 						/>
 					</div>
@@ -6505,7 +6619,11 @@
 								<input bind:value={prompt} placeholder="Lemony weeknight pasta…" {...field} />
 							{/snippet}
 						</FormField>
-						<button type="submit" class="primary full" disabled={busy || !capabilities.recipeSearch}
+						<button
+							type="submit"
+							class="primary full"
+							disabled={busy || !capabilities.recipeSearch}
+							aria-busy={busy}
 							><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 						>{#if error}<p class="error" id="search-form-error" role="alert">{error}</p>{/if}
 					</form>
@@ -6521,8 +6639,14 @@
 									><Plus size={16} /> Import recipe</button
 								>
 							</div>{/each}
+						{#if hasSearchedOnline && !busy && !error && !searchResults.length}
+							<p class="field-help">
+								No online recipes found. Try another search or import a link directly.
+							</p>
+						{/if}
 					</div>
 				{/if}
+				<StatusRegion modal open={Boolean(modal)} owner={statusOwner} />
 			</div>
 		{/key}
 	</div>{/if}

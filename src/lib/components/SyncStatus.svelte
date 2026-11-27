@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { CloudOff, RefreshCw, Download } from '@lucide/svelte';
-	import { revealMotion } from '#lib/motion.ts';
 	import DisclosureButton from '#lib/components/DisclosureButton.svelte';
 	import type { AppState } from '#lib/types.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
@@ -29,6 +28,7 @@
 	} = $props();
 	const reviewPanelId = $props.id();
 	let review = $state(false);
+	let saved = $derived(online && ready && !pending && !syncing && !conflicts.length && !error);
 	let reviewOpen = $derived(review && conflicts.length > 0);
 	let conflictLabels = $derived.by(() => {
 		const counts = new Map<string, number>();
@@ -114,30 +114,40 @@
 	}
 </script>
 
-{#if online && ready && !pending && !syncing && !conflicts.length && !error}
-	<p class="muted" role="status">Kitchen saved</p>
-{:else}
-	<section class="sync-notice" aria-label="Kitchen synchronization" in:revealMotion|global>
-		<div role="status">
-			{#if !online}<CloudOff size={18} /><span
-					>Offline{pending ? ' · Changes pending on this device' : ''}</span
-				>
-			{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
-			{:else if syncing}<RefreshCw size={18} /><span>Syncing your kitchen…</span>
-			{:else if pending}<span
-					>{error
-						? 'Kitchen sync failed. Your changes are pending.'
-						: 'Changes pending on this device. Waiting to sync.'}</span
-				>
-			{:else if error}<span
-					>{error.includes('invalid')
-						? 'That kitchen change was rejected. No pending changes are queued.'
-						: !ready
-							? 'Kitchen sync failed. No pending changes are queued.'
-							: 'Kitchen storage or sync needs attention. No pending changes are queued.'}</span
-				>
-			{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
-		</div>
+<div
+	class:sync-notice={!saved}
+	role={saved ? undefined : 'region'}
+	aria-label={saved ? undefined : 'Kitchen synchronization'}
+>
+	<div
+		class="sync-status-line"
+		class:muted={saved}
+		role="status"
+		aria-live="polite"
+		aria-atomic="true"
+	>
+		{#if saved}
+			<span>Kitchen saved</span>
+		{:else if !online}<CloudOff size={18} aria-hidden="true" /><span
+				>Offline{pending ? ' · Changes pending on this device' : ''}</span
+			>
+		{:else if conflicts.length}<span>Some kitchen changes need your review.</span>
+		{:else if syncing}<RefreshCw size={18} aria-hidden="true" /><span>Syncing your kitchen…</span>
+		{:else if pending}<span
+				>{error
+					? 'Kitchen sync failed. Your changes are pending.'
+					: 'Changes pending on this device. Waiting to sync.'}</span
+			>
+		{:else if error}<span
+				>{error.includes('invalid')
+					? 'That kitchen change was rejected. No pending changes are queued.'
+					: !ready
+						? 'Kitchen sync failed. No pending changes are queued.'
+						: 'Kitchen storage or sync needs attention. No pending changes are queued.'}</span
+			>
+		{:else}<span>Kitchen sync has not finished. Retry sync to load your kitchen.</span>{/if}
+	</div>
+	{#if !saved}
 		{#if error}<p class="error" role="alert">{error}</p>{/if}
 		{#if conflicts.length}
 			<DisclosureButton
@@ -213,8 +223,8 @@
 				</div>
 			</div>
 		{/if}
-	</section>
-{/if}
+	{/if}
+</div>
 
 <style>
 	.sync-notice {
@@ -227,7 +237,10 @@
 		flex-wrap: wrap;
 		gap: 0.75rem;
 	}
-	.sync-notice > div:first-child {
+	.sync-status-line.muted {
+		line-height: 1.7;
+	}
+	.sync-notice > .sync-status-line {
 		display: flex;
 		gap: 0.5rem;
 		align-items: center;

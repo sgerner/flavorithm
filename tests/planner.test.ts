@@ -31,6 +31,7 @@ import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import * as stateSchemaMod from '../src/lib/state-schema.ts';
+import * as statusMod from '../src/lib/status.ts';
 import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -40,6 +41,7 @@ const { MAX_RECIPES } = recipeCollectionMod;
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
 	effect_root: (fn: () => void) => () => void;
+	flush: () => void;
 };
 const svelteServer = nodeRequire('svelte/internal/server') as Record<string, unknown>;
 
@@ -98,6 +100,8 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [recipe.id]: rating };
 			kitchen.recipes = [...kitchen.recipes];
 		},
+		get statusOwner() { return statusOwner; },
+		notify,
 		logout,
 		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
@@ -107,8 +111,8 @@ function injectPlannerHook(svelteSource: string): string {
 		setPantryDraftQuantity: (value: string) => {
 			if (pantryDraft) pantryDraft.quantity = value;
 		},
-		get toast() { return toast; },
-		get toastActionLabel() { return toastActionLabel; },
+		get toast() { return statusStore.state.toast?.message ?? ''; },
+		get toastActionLabel() { return statusStore.state.toast?.actionLabel ?? 'Undo'; },
 		get online() { return online; },
 		set online(value: boolean) { online = value; },
 		get ready() { return ready; },
@@ -192,6 +196,12 @@ type PlannerHarnessApi = {
 	setPlannedDraft: (date: string, slot: string, servings: number) => void;
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
+	readonly statusOwner: string;
+	notify: (
+		message: string,
+		undo?: () => void,
+		actionLabelOrOptions?: string | { actionLabel?: string; owner?: string }
+	) => void;
 	logout: () => Promise<void>;
 	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
@@ -243,6 +253,7 @@ function createModuleMap() {
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
+		'#lib/status.ts': statusMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
@@ -252,13 +263,16 @@ function createModuleMap() {
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/state-schema.ts': stateSchemaMod,
-		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
-		'#lib/components/ButlerChat.svelte': { default: noopComponent },
-		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
-		'#lib/components/SyncStatus.svelte': { default: noopComponent },
-		'#lib/components/AIConnection.svelte': { default: noopComponent },
-		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
+		'#lib/components/ToggleButton.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/SyncStatus.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/StatusRegion.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/AIConnection.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/VoiceSettings.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
+			__esModule: true,
 			default: noopComponent,
 			emptyImportSession: importSessionMod.emptyImportSession
 		}
@@ -1096,7 +1110,108 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 	);
 });
 
+test('page notify scopes undo toasts to userId:householdId and suppresses undo across account, household, logout, and deleteAccount changes', async () => {
+	statusMod.resetStatus();
+	const currentToast = () => statusMod.statusStore.state.toast;
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		api.user = {
+			id: 'u-alpha',
+			name: 'Alpha',
+			email: 'alpha@example.test',
+			householdId: 'house-1'
+		};
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'u-alpha:house-1');
+
+		let alphaUndoCalls = 0;
+		api.notify(
+			'Device storage is full. Export your kitchen before leaving.',
+			() => {
+				alphaUndoCalls += 1;
+			},
+			'Export now'
+		);
+		assert.equal(currentToast()?.owner, 'u-alpha:house-1');
+		assert.equal(api.toastActionLabel, 'Export now');
+
+		// Household change clears/hides the previous household toast and blocks old undo callbacks.
+		api.user = {
+			...api.user,
+			householdId: 'house-2'
+		};
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'u-alpha:house-2');
+		assert.equal(currentToast(), null);
+		assert.equal(api.toastActionLabel, 'Undo');
+		assert.equal(statusMod.runToastUndo('u-alpha:house-1'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(alphaUndoCalls, 0);
+
+		// Account switch clears/hides the previous account toast and blocks old undo callbacks.
+		let house2UndoCalls = 0;
+		api.notify('Removed tomatoes', () => {
+			house2UndoCalls += 1;
+		});
+		assert.equal(currentToast()?.owner, 'u-alpha:house-2');
+
+		api.user = {
+			id: 'u-beta',
+			name: 'Beta',
+			email: 'beta@example.test',
+			householdId: 'house-2'
+		};
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'u-beta:house-2');
+		assert.equal(currentToast(), null);
+		assert.equal(statusMod.runToastUndo('u-alpha:house-2'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(house2UndoCalls, 0);
+
+		// Logout clears untimed undo toast and blocks old undo callbacks.
+		let betaUndoCalls = 0;
+		api.notify('Removed olive oil', () => {
+			betaUndoCalls += 1;
+		});
+		assert.equal(currentToast()?.owner, 'u-beta:house-2');
+		await api.logout();
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'guest:');
+		assert.equal(currentToast()?.undo ?? null, null);
+		assert.equal(statusMod.runToastUndo('u-beta:house-2'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(betaUndoCalls, 0);
+
+		// deleteAccount clears untimed undo toast and blocks old undo callbacks.
+		api.user = {
+			id: 'u-gamma',
+			name: 'Gamma',
+			email: 'gamma@example.test',
+			householdId: 'house-3'
+		};
+		svelteClient.flush();
+		api.deletePassword = 'valid-delete-password';
+		let gammaUndoCalls = 0;
+		api.notify('Removed garlic', () => {
+			gammaUndoCalls += 1;
+		});
+		assert.equal(currentToast()?.owner, 'u-gamma:house-3');
+		await api.deleteAccount({ preventDefault: () => {} } as SubmitEvent);
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'guest:');
+		assert.equal(currentToast()?.undo ?? null, null);
+		assert.equal(statusMod.runToastUndo('u-gamma:house-3'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(gammaUndoCalls, 0);
+	} finally {
+		harness.dispose();
+		statusMod.resetStatus();
+	}
+});
+
 test('+page.svelte exportKitchen commits inline edits, merges account state, and distinguishes 401 expiry and offline modes', async () => {
+	statusMod.resetStatus();
 	let fetchCalls = 0;
 	const harness = createReactivePlanner({
 		fetch: (async () => {
@@ -1223,5 +1338,6 @@ test('+page.svelte exportKitchen commits inline edits, merges account state, and
 		assert.match(api.toast, /offline device kitchen data/i);
 	} finally {
 		harness.dispose();
+		statusMod.resetStatus();
 	}
 });

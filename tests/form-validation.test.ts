@@ -48,6 +48,7 @@ import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
 import * as searchPickerMod from '../src/lib/search-picker.ts';
+import * as statusMod from '../src/lib/status.ts';
 import type { AppState, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -250,7 +251,10 @@ test('focusFirstInvalid expands closed ancestor details disclosures, scrolls the
 
 // --- SSR compilation & DOM/ARIA resolution helpers ---
 
-const noopComponent = () => {};
+const noopComponent = Object.assign(() => {}, {
+	__esModule: true,
+	default: () => {}
+});
 const iconProxy = new Proxy({}, { get: () => noopComponent });
 
 function injectScriptHook(svelteSource: string, hookCode: string): string {
@@ -278,8 +282,10 @@ function compileServerModule(
 		'svelte/internal/server': svelteServer,
 		'@lucide/svelte': iconProxy,
 		'./ToggleButton.svelte': noopComponent,
+		'./StatusRegion.svelte': noopComponent,
 		'#lib/components/ToggleButton.svelte': noopComponent,
 		'#lib/components/DisclosureButton.svelte': noopComponent,
+		'#lib/components/StatusRegion.svelte': noopComponent,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
@@ -304,6 +310,7 @@ function compileServerModule(
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/search-picker.ts': searchPickerMod,
+		'#lib/status.ts': statusMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
@@ -1184,6 +1191,7 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
+		'#lib/status.ts': statusMod,
 		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
@@ -1196,6 +1204,7 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/components/ButlerChat.svelte': { default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
 		'#lib/components/SyncStatus.svelte': { default: noopComponent },
+		'#lib/components/StatusRegion.svelte': { default: noopComponent },
 		'#lib/components/AIConnection.svelte': { default: noopComponent },
 		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {

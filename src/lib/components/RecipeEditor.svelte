@@ -11,6 +11,7 @@
 		validateRecipeDraftFields
 	} from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion } from '#lib/motion.ts';
+	import StatusRegion from './StatusRegion.svelte';
 	import {
 		hasRecipeEditorChanges,
 		insertDraftItem,
@@ -618,6 +619,7 @@
 				{/if}
 			</div>
 		</form>
+		<StatusRegion modal />
 	</div>
 </div>
 

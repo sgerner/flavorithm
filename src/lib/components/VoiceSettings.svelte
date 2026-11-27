@@ -7,12 +7,14 @@
 		model = $bindable(''),
 		apiKey = $bindable(''),
 		localAvailable,
+		checking = false,
 		userId
 	}: {
 		provider: VoiceProvider;
 		model: string;
 		apiKey: string;
 		localAvailable: boolean;
+		checking?: boolean;
 		userId?: string;
 	} = $props();
 	let selected = $derived(voiceProviders.find((item) => item.id === provider)!);
@@ -52,18 +54,36 @@
 {#if !userId}<p class="field-help" id="voice-signin-help">
 		Sign in to configure voice transcription. Browser dictation remains available.
 	</p>{/if}
-{#if provider === 'auto'}<p class="field-help" id="voice-auto-help">
+<p
+	id={provider === 'auto'
+		? 'voice-auto-help'
+		: showLocalMissing
+			? 'voice-local-help'
+			: 'voice-status-help'}
+	class="field-help"
+	class:visually-hidden={provider !== 'auto' && !showLocalMissing}
+	role="status"
+	aria-live="polite"
+	aria-atomic="true"
+>
+	{#if checking && (provider === 'auto' || provider === 'local')}
+		Checking local Whisper availability…
+	{:else if provider === 'auto'}
 		{localAvailable
 			? 'Local Whisper is available and will be used.'
 			: 'No local service configured. Select Groq or Deepgram to use voice in Firefox.'}
-	</p>{/if}
-{#if showLocalMissing}<p class="field-help" id="voice-local-help" role="status">
+	{:else if showLocalMissing}
 		Ask the server operator to configure a Whisper endpoint. <a
 			href="https://github.com/sgerner/flavorithm/blob/main/docs/voice-input.md"
 			target="_blank"
 			rel="noopener noreferrer">Setup guide</a
 		>
-	</p>{/if}
+	{:else if provider === 'local'}
+		Local Whisper is available and selected.
+	{:else}
+		{selected.name} transcription selected.
+	{/if}
+</p>
 {#if 'models' in selected}<div in:revealMotion>
 		<FormField id="voice-model" label="Voice model">
 			{#snippet children(field)}

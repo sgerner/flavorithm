@@ -67,6 +67,10 @@
 		onoverride?: (enabled: boolean) => void;
 	} = $props();
 	let hostError = $state('');
+	let sawCatalogLoading = $state(false);
+	$effect(() => {
+		if (loading) sawCatalogLoading = true;
+	});
 	async function setHost(enabled: boolean) {
 		hostError = '';
 		try {
@@ -167,9 +171,9 @@
 {/if}
 {#if chatGPT.host}
 	<div class="host-default-banner">
-		<div class="plan-status">
+		<div class="plan-status" role="status" aria-live="polite" aria-atomic="true">
 			<span class="connection-status" class:connected={usingHost}>
-				{#if usingHost}<Check size={16} /> Host ChatGPT connection active by default{:else}Personal
+				{#if usingHost}<Check size={16} aria-hidden="true" /> Host ChatGPT connection active by default{:else}Personal
 					AI override active{/if}
 			</span>
 		</div>
@@ -242,27 +246,65 @@
 		<button class="text-button" onclick={onrefresh}
 			><RefreshCw size={15} /> Retry model catalog</button
 		>{/if}
-	{#if loading}<p class="field-help" id="ai-catalog-loading-help" role="status">
-			Loading model catalog…
-		</p>{/if}
+{/if}
+<p
+	id="ai-catalog-loading-help"
+	class="field-help"
+	class:visually-hidden={usingHost || !loading}
+	role="status"
+	aria-live="polite"
+	aria-atomic="true"
+>
+	{usingHost
+		? ''
+		: loading
+			? 'Loading model catalog…'
+			: sawCatalogLoading && !catalogError
+				? 'Model catalog ready.'
+				: ''}
+</p>
 
+<div
+	class="plan-status"
+	class:visually-hidden={usingHost || !subscription}
+	role="status"
+	aria-live="polite"
+	aria-atomic="true"
+>
+	<span
+		class="connection-status"
+		class:connected={!usingHost &&
+			subscription &&
+			Boolean(activeAccount?.connected && activeAccount?.planEnabled && models.length > 0)}
+	>
+		{#if !usingHost}
+			{#if subscription}
+				{#if device}Waiting for approval<span class="visually-hidden">
+						· Enter code {device.userCode} in ChatGPT</span
+					>
+				{:else if busy}Connecting…
+				{:else if !chatGPT.configured && signedIn}Not connected<span class="visually-hidden">
+						· {chatGPT.safeReason ||
+							'Unable to load authorization options. Retry the connection settings.'}</span
+					>
+				{:else if activeAccount?.connected && activeAccount.planEnabled}
+					{#if models.length > 0}<Check size={16} aria-hidden="true" /> Connected
+					{:else if loading}Checking connection…
+					{:else}Model catalog unavailable{/if}
+				{:else if activeAccount?.connected}Plan access needed{:else}Not connected{/if}
+			{:else if provider?.supported}
+				{provider.name} selected. Enter an API key and model.
+			{:else if provider}
+				{provider.name} integration is not yet supported.
+			{/if}
+		{/if}
+	</span>
+</div>
+
+{#if !usingHost}
 	{#key preferences.provider}
 		<div class="connection-setup" in:revealMotion>
 			{#if subscription}
-				<div class="plan-status">
-					<span
-						class="connection-status"
-						class:connected={activeAccount?.connected &&
-							activeAccount?.planEnabled &&
-							models.length > 0}
-					>
-						{#if activeAccount?.connected && activeAccount.planEnabled}
-							{#if models.length > 0}<Check size={16} /> Connected
-							{:else if loading}Checking connection…
-							{:else}Model catalog unavailable{/if}
-						{:else if activeAccount?.connected}Plan access needed{:else}Not connected{/if}
-					</span>
-				</div>
 				{#if personalAccounts.length}
 					<FormField id="ai-chatgpt-account" label="ChatGPT account">
 						{#snippet children(field)}
@@ -288,6 +330,7 @@
 						<button
 							class="primary"
 							disabled={busy || !signedIn || !chatGPT.configured}
+							aria-busy={busy}
 							onclick={() => onconnect(activeAccount?.id)}
 						>
 							{busy
@@ -309,7 +352,7 @@
 					</div>
 				{/if}
 				{#if device}
-					<div class="device-login" in:revealMotion role="status">
+					<div class="device-login" in:revealMotion>
 						<p>Open ChatGPT and enter this code:</p>
 						<div class="device-code-row">
 							<code>{device.userCode}</code><button
@@ -336,11 +379,7 @@
 				{#if chatGPT.mode === 'local'}<p class="field-help" id="ai-local-mode-help">
 						Complete ChatGPT authorization in your browser. Flavorithm handles the connection.
 					</p>
-				{:else if !chatGPT.configured && signedIn}<p
-						class="field-help"
-						id="ai-unconfigured-help"
-						role="status"
-					>
+				{:else if !chatGPT.configured && signedIn}<p class="field-help" id="ai-unconfigured-help">
 						{chatGPT.safeReason ||
 							'Unable to load authorization options. Retry the connection settings.'}
 					</p>{/if}
@@ -418,8 +457,11 @@
 		onselect={selectModel}
 		disabled={!signedIn || !models.length}
 	/>
-	{#if subscription}<button class="text-button" disabled={loading || busy} onclick={onrefresh}
-			><RefreshCw size={15} /> Refresh account models</button
+	{#if subscription}<button
+			class="text-button"
+			disabled={loading || busy}
+			aria-busy={loading}
+			onclick={onrefresh}><RefreshCw size={15} /> Refresh account models</button
 		>{/if}
 	{#if selectedModel && !selectedModel.vision}<p class="field-help" id="ai-model-vision-help">
 			This model accepts text only. Choose a model with image input to import photos.

@@ -1564,19 +1564,32 @@ textarea[aria-invalid='true'] {
 	width: max-content;
 	max-width: calc(100vw - 40px);
 }
-.toast > span {
+.toast > span:first-child {
 	color: var(--paper);
 	font-size: 23px;
+}
+.toast.modal-toast {
+	left: 50%;
 }
 .toast button {
 	display: grid;
 	place-items: center;
 	margin-left: 10px;
 }
-.toast .toast-undo {
+.toast button.toast-undo {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 6px 10px;
 	font-weight: 600;
 	text-decoration: underline;
 	text-underline-offset: 3px;
+	white-space: nowrap;
+}
+.toast button:focus-visible {
+	outline-color: var(--focus-inner);
+	outline-offset: 2px;
+	box-shadow: 0 0 0 2px var(--focus-outer);
 }
 .recipe-dialog {
 	max-width: 980px;
@@ -3321,6 +3334,10 @@ textarea[aria-invalid='true'] {
 		min-height: 44px;
 		flex: 0 0 auto;
 	}
+	.toast button.toast-undo {
+		flex: 0 0 auto;
+		width: auto;
+	}
 
 	.onboarding-intro {
 		font-size: 16px;
@@ -4575,6 +4592,7 @@ textarea[aria-invalid='true'] {
 	textarea:focus,
 	select:focus,
 	.skip-link:focus,
+	.toast button:focus-visible,
 	.recipe-image:has(.image-open:focus-visible),
 	.image-open:focus-visible,
 	.quiz-options.quiz-time .quiz-option:focus-within,

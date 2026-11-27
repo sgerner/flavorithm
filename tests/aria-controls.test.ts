@@ -10,6 +10,7 @@ import { render } from 'svelte/server';
 import ts from 'typescript';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
@@ -26,6 +27,7 @@ import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
+import * as statusMod from '../src/lib/status.ts';
 import type { AppState, Recipe } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import * as voiceConfigMod from '../src/lib/voice-config.ts';
@@ -517,6 +519,7 @@ test('RecipeDetail renders ToggleButton cooking steps with invariant zero-padded
 			'#lib/recipe-cover.ts': coverMod,
 			'#lib/recipe-draft.ts': recipeDraftMod,
 			'#lib/recipe-detail.ts': recipeDetailMod,
+			'#lib/components/StatusRegion.svelte': { __esModule: true, default: noopComponent },
 			'#lib/components/ToggleButton.svelte': { __esModule: true, default: ToggleButtonServer }
 		}
 	);
@@ -758,6 +761,8 @@ test('+page.svelte renders unique ids, valid aria-labelledby groups, explicit pa
 				'#lib/recipe-draft.ts': recipeDraftMod,
 				'#lib/recipe-scraper.ts': scraperMod,
 				'#lib/butler.ts': butlerMod,
+				'#lib/butler-chat.ts': butlerChatMod,
+				'#lib/status.ts': statusMod,
 				'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 				'#lib/voice-config.ts': voiceConfigMod,
 				'#lib/ai-connections.ts': aiConnectionsMod,
@@ -773,6 +778,7 @@ test('+page.svelte renders unique ids, valid aria-labelledby groups, explicit pa
 				'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
 				'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
 				'#lib/components/SyncStatus.svelte': { __esModule: true, default: noopComponent },
+				'#lib/components/StatusRegion.svelte': { __esModule: true, default: noopComponent },
 				'#lib/components/AIConnection.svelte': { __esModule: true, default: noopComponent },
 				'#lib/components/VoiceSettings.svelte': { __esModule: true, default: noopComponent },
 				'#lib/components/RecipeImport.svelte': {

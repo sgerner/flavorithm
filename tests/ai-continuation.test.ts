@@ -42,6 +42,7 @@ import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import * as scraperMod from '../src/lib/recipe-scraper.ts';
+import * as statusMod from '../src/lib/status.ts';
 import type { AppState, Recipe, User } from '../src/lib/types.ts';
 import * as voiceCaptureMod from '../src/lib/voice-capture.ts';
 import type { ResumeDialog } from '../src/lib/voice-capture.ts';
@@ -413,7 +414,7 @@ function injectContinuationHook(svelteSource: string): string {
 		set runtimeLogoutUrl(value: string | null) { runtimeLogoutUrl = value; },
 		get authMetadataLoaded() { return authMetadataLoaded; },
 		set authMetadataLoaded(value: boolean) { authMetadataLoaded = value; },
-		get toastMessage() { return toast; },
+		get toastMessage() { return statusStore.state.toast?.message ?? ''; },
 		isAIReady,
 		restoreAIContinuation,
 		dismissAIContinuation,
@@ -591,6 +592,8 @@ function createReactivePage(options?: {
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
 		'#lib/form-validation.ts': formValidationMod,
+		'#lib/components/FormField.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ToggleButton.svelte': { __esModule: true, default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -611,6 +614,7 @@ function createReactivePage(options?: {
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
+		'#lib/status.ts': statusMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
@@ -619,13 +623,15 @@ function createReactivePage(options?: {
 		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
-		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
-		'#lib/components/ButlerChat.svelte': { default: noopComponent },
-		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
-		'#lib/components/SyncStatus.svelte': { default: noopComponent },
-		'#lib/components/AIConnection.svelte': { default: noopComponent },
-		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
+		'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/SyncStatus.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/StatusRegion.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/AIConnection.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/VoiceSettings.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
+			__esModule: true,
 			default: noopComponent,
 			emptyImportSession: importSessionMod.emptyImportSession
 		}
