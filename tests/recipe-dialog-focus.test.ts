@@ -60,6 +60,14 @@ class MockElement {
 		return this.attributes.get(name) ?? null;
 	}
 
+	hasAttribute(name: string): boolean {
+		if (name === 'tabindex' && this.hasExplicitTabIndex) return true;
+		if (name === 'open' && this.open) return true;
+		if (name === 'hidden' && this.hidden) return true;
+		if (name === 'inert' && this.inert) return true;
+		return this.attributes.has(name);
+	}
+
 	removeAttribute(name: string) {
 		this.attributes.delete(name);
 	}
@@ -515,12 +523,14 @@ test('supports { enabled, key } updates, closed details/summary, fixed controls,
 	const skippedBtn = doc.el('button', 'skipped-btn', { tabIndex: -1 });
 	const details = doc.el('details', 'nutrition-details', { open: false });
 	const summary = doc.el('summary', 'nutrition-summary');
+	const secondarySummary = doc.el('summary', 'secondary-summary');
 	const hiddenInsideDetails = doc.el('button', 'inside-closed-details');
-	details.append(summary, hiddenInsideDetails);
+	details.append(summary, secondarySummary, hiddenInsideDetails);
+	const bareSummary = doc.el('summary', 'bare-summary');
 	const fixedAction = doc.el('button', 'fixed-action');
 	fixedAction.style.position = 'fixed';
 	const scrollRegion = doc.el('div', 'transcript-region', { tabIndex: 0 });
-	dialog.append(closeBtn, skippedNote, skippedBtn, details, fixedAction, scrollRegion);
+	dialog.append(closeBtn, skippedNote, skippedBtn, details, bareSummary, fixedAction, scrollRegion);
 	doc.body.append(opener, dialog);
 	opener.focus();
 

@@ -53,6 +53,7 @@
 		busy,
 		initialServings,
 		returnFocus = null,
+		fallbackFocus = null,
 		completedSteps = $bindable<number[]>([]),
 		tab = $bindable<RecipeTab>('recipe')
 	}: {
@@ -69,6 +70,7 @@
 		busy: boolean;
 		initialServings?: number;
 		returnFocus?: FocusTrapOptions['returnFocus'];
+		fallbackFocus?: FocusTrapOptions['fallbackFocus'];
 		completedSteps?: number[];
 		tab?: RecipeTab;
 	} = $props();
@@ -142,7 +144,7 @@
 	<div
 		class="recipe-dialog"
 		transition:dialogMotion|global
-		use:focusTrap={{ returnFocus }}
+		use:focusTrap={{ returnFocus, fallbackFocus }}
 		role="dialog"
 		aria-modal="true"
 		aria-label={recipe.title}

@@ -33,6 +33,7 @@ export type EscapeLayerState<
 > = ModalDialogState<TMember> & {
 	editingRecipe: Recipe | null;
 	editingRecipeMode?: 'create' | 'edit';
+	butlerOpen?: boolean;
 	mobileNav: boolean;
 	pantryDraft?: TPantryDraft | null;
 };
@@ -326,7 +327,8 @@ export function dismissEscapeLayer<TMember = unknown, TPantryDraft = unknown>(
 	event: { key: string; defaultPrevented?: boolean },
 	state: EscapeLayerState<TMember, TPantryDraft>
 ): {
-	dismissed: 'none' | 'modal' | 'editingRecipe' | 'selected' | 'mobileNav' | 'pantryDraft';
+	dismissed:
+		'none' | 'modal' | 'editingRecipe' | 'selected' | 'butler' | 'mobileNav' | 'pantryDraft';
 	state: EscapeLayerState<TMember, TPantryDraft>;
 } {
 	if (event.key !== 'Escape' || event.defaultPrevented) {
@@ -358,6 +360,15 @@ export function dismissEscapeLayer<TMember = unknown, TPantryDraft = unknown>(
 				...state,
 				selectedId: null,
 				selectedMealServings: undefined
+			}
+		};
+	}
+	if (state.butlerOpen) {
+		return {
+			dismissed: 'butler',
+			state: {
+				...state,
+				butlerOpen: false
 			}
 		};
 	}

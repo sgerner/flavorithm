@@ -27,6 +27,7 @@
 		mode = 'edit',
 		canUploadCover = false,
 		returnFocus = null,
+		fallbackFocus = null,
 		cancel,
 		save
 	}: {
@@ -34,6 +35,7 @@
 		mode?: 'create' | 'edit';
 		canUploadCover?: boolean;
 		returnFocus?: FocusTrapOptions['returnFocus'];
+		fallbackFocus?: FocusTrapOptions['fallbackFocus'];
 		cancel: () => void;
 		save: (recipe: Recipe) => void;
 	} = $props();
@@ -170,7 +172,7 @@
 				?.focus({ preventScroll: true });
 		}
 	}
-	async function requestCancel() {
+	export async function requestCancel() {
 		if (
 			!hasRecipeEditorChanges(
 				{ draft: initialDraft, tagsText: initialTagsText },
@@ -273,7 +275,7 @@
 <div class="modal-backdrop" transition:backdropMotion|global>
 	<div
 		class="flavor-dialog wide capture-dialog recipe-editor-dialog"
-		use:focusTrap={{ returnFocus }}
+		use:focusTrap={{ returnFocus, fallbackFocus }}
 		role="dialog"
 		aria-modal="true"
 		aria-labelledby="recipe-editor-title"

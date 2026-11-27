@@ -443,14 +443,16 @@
 		editingRecipe = null;
 		editingRecipeMode = 'edit';
 	}
-	function openOnboarding() {
+	function openOnboarding(eventOrTrigger?: Event | HTMLElement | null) {
+		const trigger =
+			eventOrTrigger && 'focus' in eventOrTrigger ? eventOrTrigger : activeFocusedElement();
 		quizTime = kitchen.preferences.maxTime;
 		quizComplexity = kitchen.preferences.complexity;
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
 		quizDiet = kitchen.preferences.diet;
 		quizAllergies = kitchen.preferences.allergies;
 		formSubmitted = false;
-		openModal('onboarding');
+		openModal('onboarding', trigger);
 	}
 	function openAuthentication(eventOrTrigger?: Event | HTMLElement | null) {
 		const trigger =
@@ -595,6 +597,7 @@
 	let selectedDetailTab = $state<'recipe' | 'nutrition'>('recipe');
 	let editingRecipe = $state<Recipe | null>(null);
 	let editingRecipeMode = $state<'create' | 'edit'>('edit');
+	let recipeEditor = $state<RecipeEditor>();
 	let recipeToDeleteId = $state<string | null>(null);
 	let plannedRecipeId = $state<string | null>(null);
 	let pantryInput = $state('');
@@ -1941,8 +1944,10 @@
 				resumeDialog = '';
 				openModal(target);
 			} else {
+				const authTrigger = modalReturnFocus;
 				openModal('');
-				if (isRegister && stateLoaded && !kitchen.preferences.onboardingStatus) openOnboarding();
+				if (isRegister && stateLoaded && !kitchen.preferences.onboardingStatus)
+					openOnboarding(authTrigger);
 			}
 			const syncedCleanly =
 				stateLoaded && !(guestKitchen && (syncErrors || kitchenSync?.snapshot()));
@@ -3296,6 +3301,7 @@
 	function openRecipeEditor(recipe: Recipe) {
 		const draft = recipeForEdit(kitchen, recipe.id);
 		if (!draft) return;
+		if (selectedId && selectedId !== recipe.id) openRecipeDetail(null);
 		startRecipeEditor(draft, 'edit');
 	}
 	function editSavedRecipe(recipe: Recipe) {
@@ -3575,8 +3581,7 @@
 			mealDate = dateKey(new Date());
 			mealSlot = 'Dinner';
 		}
-		if (!modal) modalReturnFocus = trigger;
-		modal = 'pickRecipe';
+		openModal('pickRecipe', trigger);
 	}
 	function choosePickedRecipe(recipe: Recipe) {
 		if (pickingForSlot && mealDate && ['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) {
@@ -3937,16 +3942,13 @@
 		try {
 			const data = await refreshHousehold();
 			if ((data.members ?? []).length <= 1) {
-				if (!modal) modalReturnFocus = trigger;
-				modal = 'household';
+				openModal('household', trigger);
 				notify('You already have your own personal kitchen.');
 			} else {
-				if (!modal) modalReturnFocus = trigger;
-				modal = 'leave';
+				openModal('leave', trigger);
 			}
 		} catch (e) {
-			if (!modal) modalReturnFocus = trigger;
-			modal = 'household';
+			openModal('household', trigger);
 			error = (e as Error).message;
 		} finally {
 			householdBusy = false;
@@ -4077,7 +4079,7 @@
 			resetMealDialogState();
 		}
 		if ((closingModal === 'pantry' || closingModal === 'import') && voiceTarget === closingModal) {
-			clearVoiceSession();
+			clearVoiceSession(false);
 		}
 		plannedRecipeId = next.plannedRecipeId;
 		editingMealId = next.editingMealId;
@@ -4131,6 +4133,7 @@
 			editingRecipeMode,
 			selectedId,
 			selectedMealServings,
+			butlerOpen,
 			mobileNav,
 			pantryDraft,
 			plannedRecipeId,
@@ -4144,25 +4147,32 @@
 			onboardingStatus: kitchen.preferences.onboardingStatus
 		});
 		if (result.dismissed === 'modal') {
+			e.preventDefault?.();
 			applyClosedModalState(result.state);
 		} else if (result.dismissed === 'editingRecipe') {
-			closeRecipeEditor();
+			e.preventDefault?.();
+			if (typeof recipeEditor?.requestCancel === 'function') void recipeEditor.requestCancel();
+			else closeRecipeEditor();
 		} else if (result.dismissed === 'selected') {
+			e.preventDefault?.();
 			openRecipeDetail(result.state.selectedId, result.state.selectedMealServings);
+		} else if (result.dismissed === 'butler') {
+			e.preventDefault?.();
+			void butlerChat?.close();
 		} else if (result.dismissed === 'mobileNav') {
+			e.preventDefault?.();
 			mobileNav = result.state.mobileNav;
-		} else if (result.dismissed === 'pantryDraft') {
-			void cancelPantryEdit();
 		} else if (
-			result.dismissed === 'none' &&
-			e.key === 'Escape' &&
-			!e.defaultPrevented &&
-			!butlerOpen &&
-			page === 'shopping' &&
-			editingShoppingId
+			result.dismissed === 'pantryDraft' ||
+			(result.dismissed === 'none' &&
+				e.key === 'Escape' &&
+				!e.defaultPrevented &&
+				page === 'shopping' &&
+				editingShoppingId)
 		) {
 			e.preventDefault?.();
-			void cancelEditingShoppingItem();
+			if (page === 'shopping' && editingShoppingId) void cancelEditingShoppingItem();
+			else void cancelPantryEdit();
 		}
 	}
 	function openImport(text?: string) {
@@ -5706,7 +5716,7 @@
 				)}
 			plan={(servings) => planRecipe(selected!, servings)}
 			nutrition={refreshNutrition}
-			edit={() => editSavedRecipe(selected!)}
+			edit={() => openRecipeEditor(selected!)}
 			remove={() => askDeleteRecipe(selected!)}
 			toggleHidden={() => toggleRecipeHidden(selected!)}
 			{busy}
@@ -5723,6 +5733,7 @@
 		/>
 	</div>{/if}
 {#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
+			bind:this={recipeEditor}
 			recipe={editingRecipe}
 			mode={editingRecipeMode}
 			canUploadCover={Boolean(user) && online}
