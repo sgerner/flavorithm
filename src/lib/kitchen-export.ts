@@ -4,7 +4,9 @@ import {
 	mergeKitchenStates,
 	mergePendingKitchenJournal,
 	readPendingJournal,
-	type PendingKitchen
+	readQuarantinedJournal,
+	type PendingKitchen,
+	type QuarantinedJournalEntry
 } from '#lib/offline-sync.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
 
@@ -34,6 +36,7 @@ export type KitchenExportEnvelope = {
 	hasPendingChanges: boolean;
 	user?: User;
 	state: AppState;
+	quarantined?: QuarantinedJournalEntry[];
 };
 
 export type ServerExportPayload = {
@@ -47,6 +50,7 @@ export type KitchenExportOptions = {
 	user?: User | null;
 	online?: boolean;
 	pendingSnapshot?: PendingKitchen | null;
+	quarantined?: QuarantinedJournalEntry[];
 	hasPendingSync?: boolean;
 	storage?: StorageReader | null;
 	fetcher?: typeof fetch;
@@ -230,6 +234,27 @@ function safeReadPendingJournal(storage: StorageReader | null | undefined, user:
 	}
 }
 
+function collectQuarantinedEntries(
+	storage: StorageReader | null | undefined,
+	user: User,
+	provided?: QuarantinedJournalEntry[]
+): QuarantinedJournalEntry[] {
+	const merged = new Map<string, QuarantinedJournalEntry>();
+	for (const entry of provided ?? []) {
+		if (entry && typeof entry.key === 'string') merged.set(entry.key, entry);
+	}
+	if (storage) {
+		try {
+			for (const entry of readQuarantinedJournal(storage, user)) {
+				merged.set(entry.key, entry);
+			}
+		} catch {
+			// Ignore blocked or unreadable storage while assembling backups.
+		}
+	}
+	return [...merged.values()];
+}
+
 export function resolveClientKitchenState(options: {
 	state: AppState;
 	user?: User | null;
@@ -340,7 +365,8 @@ export function serializeKitchenExport(
 		source: envelope.source,
 		hasPendingChanges: Boolean(envelope.hasPendingChanges),
 		...(sanitizedUser ? { user: sanitizedUser } : {}),
-		state: sanitizeKitchenState(envelope.state)
+		state: sanitizeKitchenState(envelope.state),
+		...(envelope.quarantined?.length ? { quarantined: envelope.quarantined } : {})
 	};
 	return {
 		envelope: normalized,
@@ -411,65 +437,78 @@ export async function fetchAccountExportPayload(
 	let lastError: KitchenExportError | null = null;
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		const signal = AbortSignal.timeout(timeoutMs);
-		let response: Response;
+		const controller = new AbortController();
+		const timeout = setTimeout(() => {
+			controller.abort(
+				new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+			);
+		}, timeoutMs);
+		const { signal } = controller;
 		try {
-			response = await fetcher('/api/export', {
-				headers: { Accept: 'application/json' },
-				redirect: 'manual',
-				signal
-			});
-		} catch (error) {
-			const timedOut = isTimeoutError(error, signal);
-			lastError = new KitchenExportError(
-				timedOut ? 'timeout' : 'network-error',
-				timedOut ? 'Account export request timed out' : 'Could not reach account export endpoint'
-			);
-			if (attempt < maxAttempts) continue;
-			throw lastError;
-		}
-
-		if (
-			response.status === 401 ||
-			response.status === 403 ||
-			response.type === 'opaqueredirect' ||
-			response.redirected ||
-			(response.status >= 300 && response.status < 400)
-		) {
-			throw new KitchenExportError(
-				'session-expired',
-				`Authentication required (${response.status || 401})`,
-				response.status || 401
-			);
-		}
-
-		if (response.status === 408 || response.status === 429 || response.status >= 500) {
-			lastError = new KitchenExportError(
-				response.status === 408 ? 'timeout' : 'network-error',
-				`Export endpoint returned ${response.status}`,
-				response.status
-			);
-			if (attempt < maxAttempts) continue;
-			throw lastError;
-		}
-
-		if (!response.ok) {
-			throw new KitchenExportError(
-				'network-error',
-				`Export endpoint returned ${response.status}`,
-				response.status
-			);
-		}
-
-		try {
-			return (await response.json()) as ServerExportPayload;
-		} catch (error) {
-			if (isTimeoutError(error, signal)) {
-				lastError = new KitchenExportError('timeout', 'Reading account export timed out');
+			let response: Response;
+			try {
+				response = await fetcher('/api/export', {
+					headers: { Accept: 'application/json' },
+					redirect: 'manual',
+					signal
+				});
+			} catch (error) {
+				const timedOut = isTimeoutError(error, signal);
+				lastError = new KitchenExportError(
+					timedOut ? 'timeout' : 'network-error',
+					timedOut ? 'Account export request timed out' : 'Could not reach account export endpoint'
+				);
 				if (attempt < maxAttempts) continue;
 				throw lastError;
 			}
-			throw new KitchenExportError('invalid-server-state', 'Account export returned invalid JSON');
+
+			if (
+				response.status === 401 ||
+				response.status === 403 ||
+				response.type === 'opaqueredirect' ||
+				response.redirected ||
+				(response.status >= 300 && response.status < 400)
+			) {
+				throw new KitchenExportError(
+					'session-expired',
+					`Authentication required (${response.status || 401})`,
+					response.status || 401
+				);
+			}
+
+			if (response.status === 408 || response.status === 429 || response.status >= 500) {
+				lastError = new KitchenExportError(
+					response.status === 408 ? 'timeout' : 'network-error',
+					`Export endpoint returned ${response.status}`,
+					response.status
+				);
+				if (attempt < maxAttempts) continue;
+				throw lastError;
+			}
+
+			if (!response.ok) {
+				throw new KitchenExportError(
+					'network-error',
+					`Export endpoint returned ${response.status}`,
+					response.status
+				);
+			}
+
+			try {
+				return (await response.json()) as ServerExportPayload;
+			} catch (error) {
+				if (isTimeoutError(error, signal)) {
+					lastError = new KitchenExportError('timeout', 'Reading account export timed out');
+					if (attempt < maxAttempts) continue;
+					throw lastError;
+				}
+				throw new KitchenExportError(
+					'invalid-server-state',
+					'Account export returned invalid JSON'
+				);
+			}
+		} finally {
+			clearTimeout(timeout);
 		}
 	}
 
@@ -501,6 +540,11 @@ export async function exportKitchenArchive(
 		hasPendingSync: options.hasPendingSync,
 		storage: options.storage
 	});
+	const quarantinedEntries = collectQuarantinedEntries(
+		options.storage,
+		clientUser,
+		options.quarantined
+	);
 
 	const isOnline =
 		options.online ?? (typeof navigator === 'undefined' ? true : Boolean(navigator.onLine));
@@ -522,7 +566,8 @@ export async function exportKitchenArchive(
 				source: 'offline',
 				hasPendingChanges: resolved.hasQueuedChanges,
 				user: clientUser,
-				state: resolved.state
+				state: resolved.state,
+				...(quarantinedEntries.length ? { quarantined: quarantinedEntries } : {})
 			},
 			'offline'
 		);
@@ -593,7 +638,8 @@ export async function exportKitchenArchive(
 			source: 'account',
 			hasPendingChanges: resolved.hasQueuedChanges,
 			user: confirmedUser,
-			state: mergedState
+			state: mergedState,
+			...(quarantinedEntries.length ? { quarantined: quarantinedEntries } : {})
 		});
 	} catch (error) {
 		const fallbackReason = classifyExportError(error);
@@ -603,7 +649,8 @@ export async function exportKitchenArchive(
 				source: 'offline',
 				hasPendingChanges: resolved.hasQueuedChanges,
 				user: clientUser,
-				state: resolved.state
+				state: resolved.state,
+				...(quarantinedEntries.length ? { quarantined: quarantinedEntries } : {})
 			},
 			fallbackReason
 		);
