@@ -10,6 +10,7 @@ import {
 	type UnitInfo
 } from './domain.ts';
 import { MAX_SHOPPING_QUANTITY } from './recipe-draft.ts';
+import { hasZeroNutrition } from './recipe-collection.ts';
 import { seedPantry, seedRecipes } from './data.ts';
 export {
 	normalizeName,
@@ -307,16 +308,31 @@ export function revertShoppingItem(
 
 const MAX_SHOPPING_ITEMS = 1_000;
 
+function parseCalendarKey(value: string): { year: number; month: number; day: number } | undefined {
+	const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value.trim());
+	if (!match) return undefined;
+	const year = Number(match[1]);
+	const month = Number(match[2]) - 1;
+	const day = Number(match[3]);
+	const parsed = new Date(0);
+	parsed.setUTCFullYear(year, month, day);
+	parsed.setUTCHours(0, 0, 0, 0);
+	if (
+		parsed.getUTCFullYear() !== year ||
+		parsed.getUTCMonth() !== month ||
+		parsed.getUTCDate() !== day
+	)
+		return undefined;
+	return { year, month, day };
+}
+
 function formatCalendarKey(date: { year: number; month: number; day: number }): string {
 	return `${date.year}-${String(date.month + 1).padStart(2, '0')}-${String(date.day).padStart(2, '0')}`;
 }
 
-/** Compute the Monday YYYY-MM-DD start key for a calendar date string, or undefined if invalid. */
-export function weekStartForDate(value: string): string | undefined {
-	const parsed = parseCalendarDate(value);
-	if (!parsed) return undefined;
+function mondayKeyForParts(parts: { year: number; month: number; day: number }): string {
 	const day = new Date(0);
-	day.setUTCFullYear(parsed.year, parsed.month, parsed.day);
+	day.setUTCFullYear(parts.year, parts.month, parts.day);
 	day.setUTCHours(12, 0, 0, 0);
 	day.setUTCDate(day.getUTCDate() - ((day.getUTCDay() + 6) % 7));
 	return formatCalendarKey({
@@ -326,8 +342,21 @@ export function weekStartForDate(value: string): string | undefined {
 	});
 }
 
+/** Return the Monday YYYY-MM-DD calendar key for a local date string or Date instance. */
+export function weekStartForDate(value: string | Date | undefined): string {
+	if (!value) return '';
+	if (typeof value === 'string') {
+		const parsed = parseCalendarKey(value);
+		if (!parsed) return value;
+		return mondayKeyForParts(parsed);
+	}
+	const parts = calendarDate(value);
+	if (!parts) return '';
+	return mondayKeyForParts(parts);
+}
+
 function weekDatesForStart(startDate: string): Set<string> | undefined {
-	const parsed = parseCalendarDate(startDate);
+	const parsed = parseCalendarKey(startDate);
 	if (!parsed) return undefined;
 	const dates = new Set<string>();
 	for (let offset = 0; offset < 7; offset++) {
@@ -350,23 +379,41 @@ export function activeWeeklyScopes(shopping: ShoppingItem[]): string[] {
 	const weeks = new Set<string>();
 	for (const item of shopping) {
 		const match = item.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/);
-		if (match && parseCalendarDate(match[1])) weeks.add(match[1]);
+		if (match && parseCalendarKey(match[1])) weeks.add(match[1]);
 	}
 	return [...weeks];
 }
 
-/** Reconcile one weekly shopping scope against incomplete meals in that 7-day window. */
-export function refreshWeekShopping(
+function refreshWeekShoppingItems(
 	state: Pick<AppState, 'recipes' | 'pantry' | 'meals' | 'shopping'>,
-	startDate: string,
+	startDate: string | undefined,
 	now: Date = new Date()
-): ShoppingItem[] {
+): ShoppingItem[] | undefined {
+	if (!startDate) return undefined;
 	const dates = weekDatesForStart(startDate);
-	if (!dates) return state.shopping;
+	if (!dates) return undefined;
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const meals = state.meals.filter((meal) => !meal.completedAt && dates.has(meal.date));
 	const additions = buildShoppingList(state.recipes, state.pantry, meals, safeNow);
 	return reconcileShoppingList(state.shopping, additions, `week:${startDate}`);
+}
+
+/** Refresh one weekly shopping-list scope from incomplete planned meals in that 7-day window. */
+export function refreshWeekShopping(
+	state: AppState,
+	startDate: string | undefined,
+	now: Date = new Date()
+): AppState {
+	const shopping = refreshWeekShoppingItems(state, startDate, now);
+	return shopping ? { ...state, shopping } : state;
+}
+
+function refreshWeeks(state: AppState, weekStarts: Iterable<string>, now: Date): AppState {
+	let next = state;
+	for (const startDate of new Set(weekStarts)) {
+		next = refreshWeekShopping(next, startDate, now);
+	}
+	return next;
 }
 
 function nextFreeItemId(item: ShoppingItem, usedIds: Set<string>): string {
@@ -392,7 +439,7 @@ function reconcileWeekScope(
 ): ShoppingItem[] {
 	const match = /^week:(\d{4}-\d{2}-\d{2})$/.exec(sourceKey ?? '');
 	if (!match) return shopping;
-	return refreshWeekShopping({ ...state, shopping }, match[1], now);
+	return refreshWeekShoppingItems({ ...state, shopping }, match[1], now) ?? shopping;
 }
 
 /**
@@ -678,11 +725,8 @@ export function addPantryItems(
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const weeks = activeWeeklyScopes(state.shopping);
 	const pantry = transferPurchasedItemsToPantry(state.pantry, additions, createId);
-	let shopping = retireCheckedShoppingItems(state.shopping, additions, safeNow);
-	for (const week of weeks) {
-		shopping = refreshWeekShopping({ ...state, pantry, shopping }, week, safeNow);
-	}
-	return { ...state, pantry, shopping };
+	const shopping = retireCheckedShoppingItems(state.shopping, additions, safeNow);
+	return refreshWeeks({ ...state, pantry, shopping }, weeks, safeNow);
 }
 
 /**
@@ -724,11 +768,8 @@ export function movePurchasesToPantry(
 	}
 	const weeks = activeWeeklyScopes(state.shopping);
 	const pantry = transferPurchasedItemsToPantry(state.pantry, accepted, createId);
-	let shopping = state.shopping.filter((item) => !acceptedIds.has(item.id));
-	for (const week of weeks) {
-		shopping = refreshWeekShopping({ ...state, pantry, shopping }, week, safeNow);
-	}
-	return { ...state, pantry, shopping };
+	const shopping = state.shopping.filter((item) => !acceptedIds.has(item.id));
+	return refreshWeeks({ ...state, pantry, shopping }, weeks, safeNow);
 }
 
 /** Move selected or all depleted pantry items into the shopping list without duplicating compatible unchecked entries. */
@@ -899,13 +940,224 @@ export function clampLeftoverServings(
 		: 0;
 }
 
+function affectedWeekStarts(shopping: ShoppingItem[], dates: Iterable<string>): string[] {
+	const targetDates = [...new Set([...dates].filter((date) => Boolean(parseCalendarKey(date))))];
+	const weeks = new Set<string>();
+	for (const date of targetDates) {
+		const start = weekStartForDate(date);
+		if (parseCalendarKey(start)) weeks.add(start);
+	}
+	for (const existingWeek of activeWeeklyScopes(shopping)) {
+		const window = weekDatesForStart(existingWeek);
+		if (window && targetDates.some((date) => window.has(date))) weeks.add(existingWeek);
+	}
+	return [...weeks];
+}
+
 /**
- * Mark a planned meal complete. When `options.deductPantry` is opted in (`true`), consumes
- * non-expired pantry stock first (soonest-expiry order) and retires only any uncovered demand
- * in place from the meal's `week:<startDate>` checked rows. When `options.deductPantry` is
- * `false` (e.g., takeout, dining out, or leaving stock untouched), both pantry quantities and
- * weekly checked purchases stay intact so unconsumed groceries continue to cover later planned
- * meals when active weekly scopes refresh.
+ * Refresh a single-recipe shopping scope when that recipe already has generated items in the list,
+ * scaling from the recipe's current servings baseline while preserving manual and checked rows.
+ */
+export function refreshRecipeShopping(
+	state: AppState,
+	recipeId: string,
+	now: Date = new Date(),
+	options?: { force?: boolean }
+): AppState {
+	const sourceKey = `recipe:${recipeId}`;
+	if (!options?.force && !state.shopping.some((item) => item.sourceKey === sourceKey)) return state;
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const target = state.recipes.find((recipe) => recipe.id === recipeId);
+	const additions = target ? buildShoppingList([target], state.pantry, undefined, safeNow) : [];
+	const shopping = reconcileShoppingList(state.shopping, additions, sourceKey);
+	return { ...state, shopping };
+}
+
+function cloneRecipe(recipe: Recipe): Recipe {
+	return {
+		...recipe,
+		tags: [...recipe.tags],
+		ingredients: recipe.ingredients.map((item) => ({ ...item })),
+		steps: [...recipe.steps],
+		nutrition: { ...recipe.nutrition },
+		...(recipe.importNotes ? { importNotes: [...recipe.importNotes] } : {})
+	};
+}
+
+/** Return true when servings or ingredient entries changed compared to the previous recipe. */
+export function recipeNeedsNutritionRefresh(
+	previous: Recipe | undefined,
+	updated: Recipe
+): boolean {
+	if (!previous) return false;
+	if (previous.servings !== updated.servings) return true;
+	if (previous.ingredients.length !== updated.ingredients.length) return true;
+	return previous.ingredients.some((item, index) => {
+		const next = updated.ingredients[index];
+		return item.name !== next.name || item.quantity !== next.quantity || item.unit !== next.unit;
+	});
+}
+
+/** Clone a saved or unsaved recipe from state for manual editing. */
+export function recipeForEdit(state: AppState, recipeId: string): Recipe | null {
+	const target = state.recipes.find((recipe) => recipe.id === recipeId);
+	return target ? cloneRecipe(target) : null;
+}
+
+const NUTRITION_KEYS: (keyof Recipe['nutrition'])[] = [
+	'calories',
+	'fat',
+	'saturatedFat',
+	'sodium',
+	'carbs',
+	'fiber',
+	'sugar',
+	'protein'
+];
+
+/**
+ * Insert or update a recipe, track provenance, nutrition staleness, and ratings, and refresh
+ * affected weekly and existing single-recipe shopping scopes.
+ */
+export function upsertRecipe(state: AppState, recipe: Recipe, now: Date = new Date()): AppState {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const previous = state.recipes.find((item) => item.id === recipe.id);
+	const updated = promoteSampleBookmark(cloneRecipe(recipe));
+	if (previous?.provenance === 'manual') updated.provenance = 'manual';
+	else if (updated.provenance === undefined && previous?.provenance) {
+		updated.provenance = previous.provenance;
+	}
+	const nutritionNeedsRefresh = recipeNeedsNutritionRefresh(previous, updated);
+	const nutritionChanged = Boolean(
+		previous && NUTRITION_KEYS.some((key) => previous.nutrition[key] !== updated.nutrition[key])
+	);
+	const zeroNutrition = hasZeroNutrition(updated.nutrition);
+	if (nutritionNeedsRefresh) {
+		updated.nutritionStale = true;
+	} else if (updated.provenance === 'manual' && zeroNutrition) {
+		updated.nutritionStale = true;
+	} else if (nutritionChanged && !zeroNutrition) {
+		updated.nutritionStale = false;
+	} else if (previous?.nutritionStale) {
+		updated.nutritionStale = true;
+	}
+	const recipes = previous
+		? state.recipes.map((item) => (item.id === updated.id ? updated : item))
+		: [...state.recipes, updated];
+	const preferences =
+		updated.rating !== undefined
+			? {
+					...state.preferences,
+					ratings: {
+						...state.preferences.ratings,
+						[updated.id]: updated.rating
+					}
+				}
+			: state.preferences;
+
+	let next: AppState = { ...state, recipes, preferences };
+	const plannedMealDates = next.meals
+		.filter((meal) => !meal.completedAt && meal.recipeId === updated.id)
+		.map((meal) => meal.date);
+	next = refreshWeeks(next, affectedWeekStarts(next.shopping, plannedMealDates), safeNow);
+	next = refreshRecipeShopping(next, updated.id, safeNow);
+	return next;
+}
+
+/** Save an edited recipe (whether previously saved or unsaved) into the recipe collection. */
+export function saveEditedRecipe(
+	state: AppState,
+	updated: Recipe,
+	now: Date = new Date()
+): AppState {
+	return upsertRecipe(state, { ...updated, saved: true }, now);
+}
+
+/** Delete a recipe, its scheduled/completed meals, rating, and recipe shopping scope, then refresh weeks. */
+export function deleteRecipe(state: AppState, recipeId: string, now: Date = new Date()): AppState {
+	if (!state.recipes.some((recipe) => recipe.id === recipeId)) return state;
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const impactedMeals = state.meals.filter((meal) => meal.recipeId === recipeId);
+	const weeksToRefresh = affectedWeekStarts(
+		state.shopping,
+		impactedMeals.map((meal) => meal.date)
+	);
+	const recipes = state.recipes.filter((recipe) => recipe.id !== recipeId);
+	const meals = state.meals.filter((meal) => meal.recipeId !== recipeId);
+	const shopping = state.shopping.filter(
+		(item) => item.sourceKey !== `recipe:${recipeId}` || item.checked
+	);
+	let preferences = state.preferences;
+	if (state.preferences.ratings && recipeId in state.preferences.ratings) {
+		const ratings = { ...state.preferences.ratings };
+		delete ratings[recipeId];
+		preferences = { ...state.preferences, ratings };
+	}
+	return refreshWeeks({ ...state, recipes, meals, shopping, preferences }, weeksToRefresh, safeNow);
+}
+
+/**
+ * Add or update a meal (preserving completion metadata on already-cooked meals, clamping
+ * leftover updates, and stripping completion fields on uncompleted meals) and refresh both
+ * previous and target weeks when planned meals change.
+ */
+export function upsertMeal(
+	state: AppState,
+	meal: Meal,
+	now: Date = new Date(),
+	options?: { preserveSample?: boolean }
+): AppState {
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const previous = state.meals.find((item) => item.id === meal.id);
+	const sourceMeal = options?.preserveSample ? meal : promoteSampleMeal(meal);
+	const {
+		completedAt: _completedAt,
+		leftoverServings: requestedLeftovers,
+		pantryDeductions: _pantryDeductions,
+		...baseMeal
+	} = sourceMeal;
+	if (previous?.completedAt) {
+		const rawLeftovers = requestedLeftovers ?? previous.leftoverServings;
+		const leftoverServings =
+			rawLeftovers === undefined || !Number.isFinite(rawLeftovers)
+				? undefined
+				: clampLeftoverServings(rawLeftovers, baseMeal.servings);
+		const nextMeal: Meal = {
+			...baseMeal,
+			completedAt: previous.completedAt,
+			...(leftoverServings !== undefined ? { leftoverServings } : {}),
+			...(previous.pantryDeductions ? { pantryDeductions: previous.pantryDeductions } : {})
+		};
+		const meals = state.meals.map((item) => (item.id === nextMeal.id ? nextMeal : item));
+		return { ...state, meals };
+	}
+	const nextMeal: Meal = { ...baseMeal };
+	const meals = previous
+		? state.meals.map((item) => (item.id === nextMeal.id ? nextMeal : item))
+		: [...state.meals, nextMeal];
+	const dates = previous ? [previous.date, nextMeal.date] : [nextMeal.date];
+	const weeksToRefresh = affectedWeekStarts(state.shopping, dates);
+	return refreshWeeks({ ...state, meals }, weeksToRefresh, safeNow);
+}
+
+/** Remove a planned or completed meal and refresh its weekly shopping scope. */
+export function deleteMeal(state: AppState, mealId: string, now: Date = new Date()): AppState {
+	const removed = state.meals.find((meal) => meal.id === mealId);
+	if (!removed) return state;
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const meals = state.meals.filter((meal) => meal.id !== mealId);
+	const weeksToRefresh = affectedWeekStarts(state.shopping, [removed.date]);
+	return refreshWeeks({ ...state, meals }, weeksToRefresh, safeNow);
+}
+
+/**
+ * Mark a planned meal complete and refresh affected weekly shopping scopes. When
+ * `options.deductPantry` is opted in (`true`), consumes non-expired pantry stock first
+ * (soonest-expiry order) and retires only any uncovered demand in place from the meal's
+ * `week:<startDate>` checked rows, refreshing active weekly scopes for updated pantry stock.
+ * When `options.deductPantry` is `false` (e.g., takeout, dining out, or leaving stock
+ * untouched), both pantry quantities and weekly checked purchases stay intact so unconsumed
+ * groceries continue to cover later planned meals when weekly scopes refresh.
  */
 export function completeMeal(
 	state: AppState,
@@ -920,11 +1172,12 @@ export function completeMeal(
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const leftoverServings = clampLeftoverServings(options.leftoverServings, target.servings);
 
-	const weekStart = weekStartForDate(target.date);
+	const weekStart = parseCalendarKey(target.date) ? weekStartForDate(target.date) : '';
 	const weekSourceKey = weekStart ? `week:${weekStart}` : undefined;
-	const hadWeekScope = weekSourceKey
-		? state.shopping.some((item) => item.sourceKey === weekSourceKey)
-		: false;
+	const weeksToRefresh = [
+		...affectedWeekStarts(state.shopping, [target.date]),
+		...(options.deductPantry && recipe ? activeWeeklyScopes(state.shopping) : [])
+	];
 
 	let pantry = state.pantry;
 	let shopping = state.shopping;
@@ -957,11 +1210,7 @@ export function completeMeal(
 		};
 	});
 
-	if (hadWeekScope && weekStart) {
-		shopping = refreshWeekShopping({ ...state, meals, pantry, shopping }, weekStart, safeNow);
-	}
-
-	return { ...state, meals, pantry, shopping };
+	return refreshWeeks({ ...state, meals, pantry, shopping }, weeksToRefresh, safeNow);
 }
 
 const seedPantryById = new Map(seedPantry.map((item) => [item.id, item]));
@@ -970,10 +1219,13 @@ const seedSavedRecipesById = new Map(
 );
 
 /** Check whether the kitchen currently contains any untouched sample staples, meals, or bookmarks. */
-export function hasSampleData(state: Pick<AppState, 'pantry' | 'meals' | 'recipes'>): boolean {
+export function hasSampleData(
+	state: Pick<AppState, 'pantry' | 'meals' | 'recipes'>,
+	hasSampleMeal?: boolean
+): boolean {
 	return (
 		state.pantry.some((item) => Boolean(item.sample)) ||
-		state.meals.some((meal) => Boolean(meal.sample)) ||
+		(hasSampleMeal ?? state.meals.some((meal) => Boolean(meal.sample))) ||
 		state.recipes.some((recipe) => Boolean(recipe.saved && recipe.sampleSaved))
 	);
 }
