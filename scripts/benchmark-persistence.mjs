@@ -442,6 +442,15 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 			return out.result?.value;
 		};
 
+		const waitForPutCount = async (expected) => {
+			await pause(300);
+			for (let i = 0; i < 30; i += 1) {
+				const count = await evaluate(`window.__perfMetrics.puts.length`);
+				if (count >= expected) return;
+				await pause(100);
+			}
+		};
+
 		await cdp.send('Page.navigate', { url: baseUrl });
 		await pause(1200);
 
@@ -550,7 +559,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 		assert.equal(shoppingDraftBurst.journalWritesWhileTypingDraft, 0);
 		assert.equal(shoppingDraftBurst.journalWritesAfterCommit, 1);
 		assert.match(shoppingDraftBurst.syncChipImmediate, /Changes pending on this device/);
-		await pause(650);
+		await waitForPutCount(1);
 		const shoppingAfterSync = await evaluate(`(() => ({
 			puts: window.__perfMetrics.puts.length,
 			activeStillInput: document.activeElement === document.querySelector('input[aria-label="Shopping item name"]')
@@ -599,7 +608,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 		})()`);
 		assert.equal(pantryDraftBurst.journalWritesWhileTypingDraft, 0);
 		assert.equal(pantryDraftBurst.journalWritesAfterCommit, 1);
-		await pause(650);
+		await waitForPutCount(1);
 		const pantryAfterSync = await evaluate(`(() => ({
 			puts: window.__perfMetrics.puts.length
 		}))()`);
@@ -645,7 +654,7 @@ async function runChromeBenchmark({ fixture, fixtureBytes }) {
 		})()`);
 		assert.equal(preferenceLiveBurst.synchronousJournalWrites, 12);
 		assert.equal(preferenceLiveBurst.putsDuringBurst, 0);
-		await pause(650);
+		await waitForPutCount(1);
 		const preferenceAfterSync = await evaluate(`(() => ({
 			putsAfterPause: window.__perfMetrics.puts.length
 		}))()`);
