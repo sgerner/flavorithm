@@ -1,17 +1,20 @@
 <script lang="ts">
 	import { Check } from '@lucide/svelte';
+	import FormField from './FormField.svelte';
 
 	let {
 		host,
 		signedIn,
 		usingHost,
 		usePersonalAI,
+		signinHelpId,
 		ontoggle
 	}: {
 		host?: { model: string } | null;
 		signedIn: boolean;
 		usingHost: boolean;
 		usePersonalAI: boolean;
+		signinHelpId?: string;
 		ontoggle: (enabled: boolean) => void;
 	} = $props();
 </script>
@@ -24,7 +27,7 @@
 					AI override active{/if}
 			</span>
 		</div>
-		<p class="field-help">
+		<p class="field-help" id="ai-host-help">
 			{#if usingHost}
 				AI is provided by this host by default. Your saved personal connection and reasoning
 				settings remain unchanged.
@@ -33,15 +36,18 @@
 			{/if}
 		</p>
 		{#if signedIn}
-			<label class="host-override">
+			<label class="host-override" for="ai-host-override">
 				<input
+					id="ai-host-override"
 					type="checkbox"
+					aria-describedby="ai-host-override-help"
+					aria-invalid="false"
 					checked={usePersonalAI}
 					onchange={(event) => ontoggle(event.currentTarget.checked)}
 				/>
 				<span>
 					<b>Use a personal AI connection instead</b>
-					<small
+					<small id="ai-host-override-help"
 						>Unlock your own API key or ChatGPT subscription without changing shared host settings.</small
 					>
 				</span>
@@ -49,21 +55,26 @@
 		{/if}
 	</div>
 	{#if usingHost}
-		<label class="field"
-			>Connection<input
-				type="text"
-				class="readonly-input"
-				value="Host ChatGPT connection"
-				readonly
-			/></label
+		<FormField id="ai-host-connection" label="Connection" helpIds={[signinHelpId, 'ai-host-help']}>
+			{#snippet children(field)}
+				<input
+					type="text"
+					class="readonly-input"
+					value="Host ChatGPT connection"
+					readonly
+					{...field}
+				/>
+			{/snippet}
+		</FormField>
+		<FormField
+			id="ai-host-model"
+			label="Model"
+			help="Managed by the host administrator. Turn on a personal AI connection above to choose your own model or reasoning settings."
 		>
-		<label class="field"
-			>Model<input type="text" class="readonly-input" value={host.model} readonly /></label
-		>
-		<p class="field-help">
-			Managed by the host administrator. Turn on a personal AI connection above to choose your own
-			model or reasoning settings.
-		</p>
+			{#snippet children(field)}
+				<input type="text" class="readonly-input" value={host.model} readonly {...field} />
+			{/snippet}
+		</FormField>
 	{/if}
 {/if}
 

@@ -35,6 +35,18 @@
 	import type { PageData } from './$types';
 	import { focusTrap } from '#lib/focus.ts';
 	import {
+		focusFirstInvalid,
+		validateEmail,
+		validateInviteCode,
+		validateLeftoverServings,
+		validateMealDate,
+		validatePantryInput,
+		validatePassword,
+		validatePlannedServings,
+		validateRegistrationName
+	} from '#lib/form-validation.ts';
+	import FormField from '#lib/components/FormField.svelte';
+	import {
 		backdropMotion,
 		dialogMotion,
 		revealMotion,
@@ -88,6 +100,7 @@
 		preferenceSummary
 	} from '#lib/domain.ts';
 	import {
+		addPantryItems,
 		backfillSampleData,
 		clearSampleData,
 		completeMeal,
@@ -96,16 +109,17 @@
 		filterPantryItems,
 		hasSampleData,
 		listPantryCategories,
+		movePurchasesToPantry,
 		normalizeIngredientName,
 		normalizePantryDraft,
 		promoteSampleIngredient,
 		normalizeShoppingItem,
-		reconcileShoppingList,
+		refreshWeekShopping as refreshWeekShoppingItems,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
 		revertShoppingItem,
+		shopForScope,
 		snapshotShoppingItem,
-		transferPurchasedItemsToPantry,
 		unitInfo,
 		type PantryDraft,
 		type ShoppingItemDraft,
@@ -127,19 +141,27 @@
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
 	import { applyButlerCommands } from '#lib/butler.ts';
+	import {
+		BUTLER_HISTORY_LIMIT,
+		pairButlerHistory,
+		type ButlerChatResult
+	} from '#lib/butler-chat.ts';
 	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
+	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import AIConnection from '#lib/components/AIConnection.svelte';
 	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
 	import {
-		VoiceCapture,
 		appendDictatedText,
+		isVoiceTargetActive,
+		parseQuickShoppingItems,
 		planVoiceRetry,
 		planVoiceStart,
 		resolveClosedDialog,
+		VoiceCapture,
 		type ResumeDialog,
-		type VoiceDialog,
-		type VoiceState
+		type VoiceState,
+		type VoiceTarget
 	} from '#lib/voice-capture.ts';
 	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
 	import {
@@ -167,6 +189,7 @@
 		quarantineLegacyKitchen,
 		sanitizeKitchenState
 	} from '#lib/guest-storage.ts';
+	import { exportKitchenArchive } from '#lib/kitchen-export.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
 	import RecipeImport, {
@@ -298,6 +321,7 @@
 	let toastUndo = $state<(() => void) | null>(null);
 	let toastActionLabel = $state('Undo');
 	let toastVersion = 0;
+	let exporting = $state(false);
 	let busy = $state(false);
 	let scanBusy = $state(false);
 	let scanController: AbortController | undefined;
@@ -345,6 +369,15 @@
 	let quizCuisines = $state<string[]>([]);
 	let quizDiet = $state('none');
 	let quizAllergies = $state('');
+	let dialogFormEl = $state<HTMLFormElement>();
+	let formSubmitted = $state(false);
+	let lastModal = '';
+	$effect(() => {
+		if (modal !== lastModal) {
+			lastModal = modal;
+			formSubmitted = false;
+		}
+	});
 	const cuisineChoices = [
 		'Mediterranean',
 		'Italian',
@@ -361,6 +394,7 @@
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
 		quizDiet = kitchen.preferences.diet;
 		quizAllergies = kitchen.preferences.allergies;
+		formSubmitted = false;
 		modal = 'onboarding';
 	}
 	function openAuthentication() {
@@ -482,18 +516,28 @@
 	let voiceRetained = $state(false);
 	let voiceError = $state('');
 	let voiceBusy = $derived(voiceStarting || voiceState !== 'idle');
-	let voiceTarget = $state<'' | VoiceDialog>('');
+	let voiceTarget = $state<VoiceTarget | ''>('');
+	let shoppingVoiceInput = $state(false);
+	let shoppingMicButton = $state<HTMLButtonElement>();
+	let voiceSessionEl = $state<HTMLDivElement>();
+	let voiceStopButton = $state<HTMLButtonElement>();
+	let voiceCancelButton = $state<HTMLButtonElement>();
+	let voiceRetryButton = $state<HTMLButtonElement>();
+	let voiceReturnFocus: HTMLElement | null = null;
 	let voiceCapture: VoiceCapture | undefined;
 	let activeVoiceImportSession: ImportSession | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
 		const owner = voiceOwner;
 		if (typeof window === 'undefined') return;
-		clearVoiceSession();
-		voiceApiKey = '';
-		voiceProvider = 'auto';
-		voiceModel = '';
-		localVoiceAvailable = false;
+		untrack(() => {
+			clearVoiceSession(false);
+			shoppingVoiceInput = false;
+			voiceApiKey = '';
+			voiceProvider = 'auto';
+			voiceModel = '';
+			localVoiceAvailable = false;
+		});
 		if (owner) {
 			try {
 				const saved = JSON.parse(localStorage.getItem(`flavorithm-voice:${owner}`) || '{}');
@@ -515,16 +559,7 @@
 				})
 				.catch(() => {});
 		}
-		return () => clearVoiceSession();
-	});
-	$effect(() => {
-		if (
-			voiceTarget &&
-			(voiceStarting || voiceState !== 'idle') &&
-			(modal !== voiceTarget || (voiceTarget === 'import' && isReviewingImportDraft(importSession)))
-		) {
-			clearVoiceSession();
-		}
+		return () => untrack(() => clearVoiceSession(false));
 	});
 	type AccountCapabilities = { emailDelivery: boolean; recipeSearch: boolean };
 	let capabilities = $state<AccountCapabilities>({ emailDelivery: false, recipeSearch: false });
@@ -599,12 +634,12 @@
 	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
-	let plannedServings = $state(2);
+	let plannedServings = $state<number | null>(2);
 	let pickingForSlot = $state(false);
 	let editingMealId = $state('');
 	let cookingMealId = $state('');
 	let deductPantry = $state(false);
-	let leftoverServings = $state(0);
+	let leftoverServings = $state<number | null>(0);
 	let pantryFilter = $state('all');
 	let pantryQuery = $state('');
 	let pantryCategory = $state('all');
@@ -616,6 +651,55 @@
 	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
+	let mealDateError = $derived(
+		formSubmitted && (modal === 'plan' || modal === 'editMeal') ? validateMealDate(mealDate) : ''
+	);
+	let mealServingsError = $derived(
+		formSubmitted && (modal === 'plan' || modal === 'editMeal')
+			? validatePlannedServings(plannedServings)
+			: ''
+	);
+	let activeCookingMeal = $derived(kitchen.meals.find((item) => item.id === cookingMealId));
+	let leftoverError = $derived(
+		formSubmitted && modal === 'cookMeal'
+			? validateLeftoverServings(leftoverServings, activeCookingMeal?.servings ?? MAX_SERVINGS)
+			: ''
+	);
+	let pantryFieldError = $derived(
+		formSubmitted && modal === 'pantry' ? validatePantryInput(pantryInput) : ''
+	);
+	let authNameError = $derived(
+		formSubmitted && modal === 'auth' && authMode === 'register'
+			? validateRegistrationName(name)
+			: ''
+	);
+	let authEmailError = $derived(
+		formSubmitted && modal === 'auth'
+			? validateEmail(email, authMode === 'register' ? 'register' : 'login')
+			: ''
+	);
+	let authPasswordError = $derived(
+		formSubmitted && modal === 'auth'
+			? validatePassword(password, authMode === 'register' ? 'register' : 'login')
+			: ''
+	);
+	let authValidationSummary = $derived(
+		authNameError || authEmailError || authPasswordError
+			? 'Fix the highlighted account fields before continuing.'
+			: ''
+	);
+	let deletePasswordError = $derived(
+		formSubmitted && modal === 'delete' ? validatePassword(deletePassword, 'delete') : ''
+	);
+	let recoverEmailError = $derived(
+		formSubmitted && modal === 'recover' ? validateEmail(email, 'recover') : ''
+	);
+	let resetPasswordError = $derived(
+		formSubmitted && modal === 'reset' ? validatePassword(password, 'reset') : ''
+	);
+	let joinCodeError = $derived(
+		formSubmitted && modal === 'household' ? validateInviteCode(joinCode) : ''
+	);
 	let showStarter = $state(true);
 	let imageInput: HTMLInputElement;
 	let deferredInstall = $state<any>(null);
@@ -947,8 +1031,8 @@
 	}
 	function notify(message: string, undo?: () => void, actionLabel = 'Undo') {
 		toast = message;
-		toastActionLabel = undo ? actionLabel : 'Undo';
 		const owner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+		toastActionLabel = undo ? actionLabel : 'Undo';
 		toastUndo = undo
 			? () => {
 					toastUndo = null;
@@ -1147,7 +1231,13 @@
 			try {
 				localStorage.setItem('flavorithm-guest-kitchen', JSON.stringify(sanitized));
 			} catch {
-				notify('Device storage is full. Export your kitchen before leaving.');
+				notify(
+					'Device storage is full. Export your kitchen before leaving.',
+					() => {
+						void exportKitchen();
+					},
+					'Export now'
+				);
 			}
 		}
 		if (user) kitchenSync?.stage(sanitized);
@@ -1467,13 +1557,7 @@
 		}
 	}
 	function exportPendingChanges() {
-		const snapshot = kitchenSync?.snapshot();
-		if (snapshot)
-			download(
-				JSON.stringify(snapshot.local, null, 2),
-				'flavorithm-pending-kitchen.json',
-				'application/json'
-			);
+		void exportKitchen();
 	}
 	async function flushKitchen() {
 		commitInlineEdits();
@@ -1531,8 +1615,16 @@
 		page = id;
 		mobileNav = false;
 	}
-	function addIngredients() {
+	async function addIngredients(event?: SubmitEvent) {
+		event?.preventDefault();
 		if (voiceBusy || busy) return;
+		if (validatePantryInput(pantryInput)) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
 		const boundedInput = pantryInput.slice(0, 20_000);
 		const segments = boundedInput
 			.split(/[,;\r\n]+(?![^\[\]]*\])/)
@@ -1541,7 +1633,8 @@
 		const parsed = parseIngredientLines(boundedInput);
 		const rejectedInput = Math.max(0, segments.length - parsed.length);
 		commitInlineEdits();
-		const previous = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
 		const existingKeys = new Set(
 			kitchen.pantry
 				.filter((item) => !item.sample && !item.expires?.trim())
@@ -1581,8 +1674,13 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
-		const applied = JSON.stringify(kitchen.pantry);
+		const updated = addPantryItems(kitchen, additions);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		pantryInput = '';
 		modal = '';
 		const acceptedCount = additions.length;
@@ -1595,8 +1693,18 @@
 		notify(
 			`${acceptedCount} ingredient${acceptedCount === 1 ? '' : 's'} added to your pantry${suffix}.`,
 			() => {
-				if (JSON.stringify(kitchen.pantry) === applied) kitchen.pantry = previous;
-				else notify('Your pantry changed again. Review the current quantities before editing.');
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else notify('Your pantry changed again. Review the current quantities before editing.');
 			}
 		);
 	}
@@ -1607,8 +1715,18 @@
 			openAuthentication();
 			return;
 		}
-		busy = true;
 		error = '';
+		const nameErr = authMode === 'register' ? validateRegistrationName(name) : '';
+		const emailErr = validateEmail(email, authMode === 'register' ? 'register' : 'login');
+		const passErr = validatePassword(password, authMode === 'register' ? 'register' : 'login');
+		if (nameErr || emailErr || passErr) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		busy = true;
 		try {
 			syncing = true;
 			commitInlineEdits();
@@ -1686,6 +1804,8 @@
 			);
 		} catch (e) {
 			error = (e as Error).message;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 			syncing = false;
@@ -2257,6 +2377,25 @@
 	}
 	let butlerChat = $state<ButlerChat>();
 	let butlerOpen = $state(false);
+	let voiceOverlay = $derived(
+		Boolean(butlerOpen || editingRecipe || (!modal && (selected || mobileNav)))
+	);
+	$effect(() => {
+		if (!voiceTarget) return;
+		if (
+			voiceBusy &&
+			!isVoiceTargetActive(voiceTarget, {
+				modal,
+				page,
+				overlay: voiceOverlay,
+				reviewingDraft: isReviewingImportDraft(importSession)
+			})
+		) {
+			clearVoiceSession();
+		} else if (voiceTarget === 'shopping' && page !== 'shopping') {
+			clearVoiceSession();
+		}
+	});
 	let cookingSteps = $state<Record<string, number[]>>({});
 	let selectedMealServings = $state<number | undefined>();
 	let cookingSessionKey = $derived(
@@ -2294,7 +2433,11 @@
 			{
 				prompt: message,
 				messages: [
-					...history.map((turn) => ({ ...turn, content: turn.content.slice(0, 8000) })),
+					...pairButlerHistory(
+						history,
+						(turn) => turn.content.slice(0, 8000),
+						BUTLER_HISTORY_LIMIT
+					),
 					{ role: 'user', content: message }
 				],
 				context
@@ -2303,7 +2446,7 @@
 		);
 		if (owner !== `${user?.id}:${user?.householdId}`)
 			throw new Error('The active kitchen changed. Ask Basil again.');
-		return result as { reply: string; commands: unknown[] };
+		return result as ButlerChatResult;
 	}
 	function applyButler(commands: unknown[], expectedSnapshot: string) {
 		if (JSON.stringify(kitchen) !== expectedSnapshot) {
@@ -2417,7 +2560,8 @@
 		}
 	}
 
-	async function generate() {
+	async function generate(event?: SubmitEvent) {
+		event?.preventDefault();
 		if (!(await needAI())) return;
 		busy = true;
 		error = '';
@@ -2431,6 +2575,8 @@
 		} catch (e) {
 			error = (e as Error).message;
 			notify(error);
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
@@ -2498,19 +2644,64 @@
 			if (imageInput) imageInput.value = '';
 		}
 	}
-	function clearVoiceSession() {
-		voiceCapture?.cancel();
+	function isFocusManagedByVoice(): boolean {
+		if (typeof document === 'undefined') return false;
+		const active = document.activeElement;
+		return (
+			!active ||
+			active === document.body ||
+			active === voiceReturnFocus ||
+			active === shoppingMicButton ||
+			Boolean(voiceSessionEl?.contains(active))
+		);
+	}
+	function scheduleVoiceIdleFocus(endedTarget: VoiceTarget | '', restoreEl: HTMLElement | null) {
+		if (!endedTarget || !restoreEl) return;
+		void tick().then(() => {
+			if (
+				!voiceBusy &&
+				!voiceRetained &&
+				isVoiceTargetActive(endedTarget, {
+					modal,
+					page,
+					overlay: voiceOverlay,
+					reviewingDraft: isReviewingImportDraft(importSession)
+				}) &&
+				restoreEl.isConnected &&
+				!(restoreEl as HTMLButtonElement).disabled
+			) {
+				restoreEl.focus();
+			}
+		});
+	}
+	function clearVoiceSession(restoreFocus = true) {
+		const { endedTarget, restoreEl, shouldRestore } = untrack(() => {
+			const target = voiceTarget;
+			const el = target === 'shopping' ? (shoppingMicButton ?? voiceReturnFocus) : voiceReturnFocus;
+			return {
+				endedTarget: target,
+				restoreEl: el,
+				shouldRestore: restoreFocus && Boolean(target) && isFocusManagedByVoice()
+			};
+		});
+		const current = voiceCapture;
 		voiceCapture = undefined;
+		current?.cancel();
 		voiceStarting = false;
 		voiceState = 'idle';
 		voiceRetained = false;
 		voiceError = '';
 		voiceTarget = '';
+		voiceReturnFocus = null;
 		activeVoiceImportSession = undefined;
+		if (shouldRestore) {
+			scheduleVoiceIdleFocus(endedTarget, restoreEl);
+		}
 	}
 	function openVoiceSettings() {
 		if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
 		else if (voiceTarget === 'pantry' || voiceTarget === 'import') resumeDialog = voiceTarget;
+		else resumeDialog = '';
 		void openSettings('voice');
 	}
 	function discardVoiceRecording() {
@@ -2556,23 +2747,21 @@
 		});
 	}
 	function dictate() {
-		void startDictation(false);
+		if (voiceBusy) return;
+		void startDictation('pantry');
 	}
 	function dictateRecipe() {
-		void startDictation(true);
-	}
-	async function startDictation(forRecipe: boolean) {
 		if (voiceBusy) return;
-		if (forRecipe) {
-			importSession.reviewingDraft = false;
-			if (!modal) {
-				mobileNav = false;
-				error = '';
-				modal = 'import';
-			}
-		}
+		void startDictation('import');
+	}
+	function dictateShopping() {
+		if (voiceBusy) return;
+		void startDictation('shopping');
+	}
+	async function startDictation(target: VoiceTarget) {
+		if (voiceBusy) return;
 		const plan = planVoiceStart({
-			forRecipe,
+			target,
 			modal,
 			provider: voiceProvider,
 			localAvailable: localVoiceAvailable,
@@ -2591,31 +2780,91 @@
 			notify(plan.message);
 			return;
 		}
-		clearVoiceSession();
+		const activeEl =
+			typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+				? document.activeElement
+				: null;
+		clearVoiceSession(false);
 		resumeDialog = '';
-		voiceStarting = true;
-		voiceTarget = plan.targetDialog;
-		if (plan.targetDialog === 'import') {
+		voiceReturnFocus = target === 'shopping' ? (shoppingMicButton ?? activeEl) : activeEl;
+		if (target === 'import') {
 			importSession.reviewingDraft = false;
-		}
-		if (modal !== plan.targetDialog) {
+			if (modal !== 'import') openImport();
+		} else if (target === 'pantry') {
 			mobileNav = false;
 			error = '';
-			modal = plan.targetDialog;
+			modal = 'pantry';
+		} else {
+			mobileNav = false;
+			error = '';
+			modal = '';
+			if (page !== 'shopping') navigate('shopping');
 		}
+		voiceStarting = true;
+		voiceTarget = target;
 		activeVoiceImportSession = importSession;
 		const owner = user?.id;
-		const targetDialog = plan.targetDialog;
 		const capture = new VoiceCapture({
 			state: (value) => {
-				if (voiceCapture === capture) voiceState = value;
+				if (voiceCapture !== capture) return;
+				const focusInVoiceUi = isFocusManagedByVoice();
+				voiceState = value;
+				if (value === 'recording') {
+					if (focusInVoiceUi) {
+						void tick().then(() => {
+							if (voiceCapture === capture && voiceState === 'recording') {
+								voiceStopButton?.focus();
+							}
+						});
+					}
+				} else if (value === 'transcribing') {
+					if (focusInVoiceUi) {
+						void tick().then(() => {
+							if (voiceCapture === capture && voiceState === 'transcribing') {
+								voiceCancelButton?.focus();
+							}
+						});
+					}
+				} else if (value === 'idle') {
+					voiceStarting = false;
+					if (capture.hasRetainedAudio) {
+						if (focusInVoiceUi) {
+							void tick().then(() => {
+								if (voiceCapture === capture && voiceRetained) {
+									voiceRetryButton?.focus();
+								}
+							});
+						}
+					} else {
+						const endedTarget = voiceTarget;
+						const restoreEl =
+							endedTarget === 'shopping'
+								? (shoppingMicButton ?? voiceReturnFocus)
+								: voiceReturnFocus;
+						voiceTarget = '';
+						voiceReturnFocus = null;
+						if (focusInVoiceUi) {
+							scheduleVoiceIdleFocus(endedTarget, restoreEl);
+						}
+					}
+				}
 			},
 			retained: (value) => {
 				if (voiceCapture === capture) voiceRetained = value;
 			},
 			text: (text) => {
-				if (voiceCapture !== capture) return;
-				if (targetDialog === 'import') {
+				if (
+					voiceCapture !== capture ||
+					voiceTarget !== target ||
+					!isVoiceTargetActive(target, {
+						modal,
+						page,
+						overlay: voiceOverlay,
+						reviewingDraft: isReviewingImportDraft(importSession)
+					})
+				)
+					return;
+				if (target === 'import') {
 					if (
 						!activeVoiceImportSession ||
 						!canAppendImportTranscript({
@@ -2629,11 +2878,17 @@
 						return;
 					voiceError = '';
 					importSession.text = appendDictatedText('import', importSession.text, text);
-				} else {
-					if (user?.id !== owner || modal !== 'pantry') return;
+				} else if (target === 'pantry') {
+					if (user?.id !== owner) return;
 					voiceError = '';
 					pantryInput = appendDictatedText('pantry', pantryInput, text).slice(0, 20000);
 					notify('Review your ingredients, then add them.');
+				} else {
+					if (user?.id !== owner) return;
+					voiceError = '';
+					shoppingText = appendDictatedText('shopping', shoppingText, text);
+					shoppingVoiceInput = true;
+					notify('Review your items, then add them.');
 				}
 			},
 			error: (message) => {
@@ -2644,10 +2899,29 @@
 			}
 		});
 		voiceCapture = capture;
+		void tick().then(() => {
+			if (voiceCapture === capture && isFocusManagedByVoice()) {
+				if (voiceState === 'recording') voiceStopButton?.focus();
+				else if (voiceStarting) voiceCancelButton?.focus();
+			}
+		});
 		try {
 			await capture.start({ provider: plan.provider, model: voiceModel, apiKey: voiceApiKey });
 		} finally {
-			if (voiceCapture === capture) voiceStarting = false;
+			if (voiceCapture === capture) {
+				const focusInVoiceUi = isFocusManagedByVoice();
+				voiceStarting = false;
+				if (voiceState === 'idle' && !capture.hasRetainedAudio) {
+					const endedTarget = voiceTarget;
+					const restoreEl =
+						endedTarget === 'shopping' ? (shoppingMicButton ?? voiceReturnFocus) : voiceReturnFocus;
+					voiceTarget = '';
+					voiceReturnFocus = null;
+					if (focusInVoiceUi) {
+						scheduleVoiceIdleFocus(endedTarget, restoreEl);
+					}
+				}
+			}
 		}
 	}
 
@@ -2814,19 +3088,7 @@
 		leftoverServings = 0;
 	}
 	function refreshWeekShopping(startDate: string) {
-		const start = new Date(`${startDate}T12:00:00`);
-		if (Number.isNaN(start.getTime())) return;
-		const dates = Array.from({ length: 7 }, (_, index) => {
-			const day = new Date(start);
-			day.setDate(day.getDate() + index);
-			return dateKey(day);
-		});
-		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
-		const recipes = kitchen.recipes.filter((recipe) =>
-			meals.some((meal) => meal.recipeId === recipe.id)
-		);
-		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, `week:${startDate}`);
+		kitchen.shopping = refreshWeekShoppingItems(kitchen, startDate);
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 			clearEditingShoppingState();
 	}
@@ -2871,35 +3133,30 @@
 	function addShoppingQuickItem() {
 		const raw = shoppingText.trim();
 		if (!raw) return;
-		const match = raw.match(
-			/^(\d+(?:\.\d+)?)\s*(g|kg|oz|lbs?|ml|l|cups?|tbsp|tsp|pieces?|whole|each|cans?|cloves?|bunch)?\s+(.+)$/i
-		);
-		const quantity = match ? Number(match[1]) : 1;
-		if (!Number.isFinite(quantity) || quantity <= 0) {
-			notify('Enter a quantity above zero.');
+		const parsed = parseQuickShoppingItems(raw, { split: shoppingVoiceInput });
+		if (parsed.error) {
+			notify(parsed.error);
 			return;
 		}
-		const name = (match ? match[3] : raw).trim().slice(0, 200);
-		if (!name) return;
+		const additions = parsed.items;
+		if (!additions.length) return;
 		if (kitchen.shopping.length >= 1_000) {
 			notify('Your shopping list can hold up to 1,000 items.');
 			return;
 		}
-		const unit = (match?.[2] || 'piece').trim().slice(0, 40) || 'piece';
-		const newItem = {
-			id: crypto.randomUUID(),
-			name,
-			quantity: Math.min(1_000_000, quantity),
-			unit,
-			checked: false
-		};
+		const available = 1_000 - kitchen.shopping.length;
+		const accepted = additions.slice(0, available);
 		const firstCheckedIndex = kitchen.shopping.findIndex((item) => item.checked);
 		if (firstCheckedIndex === -1) {
-			kitchen.shopping.push(newItem);
+			kitchen.shopping.push(...accepted);
 		} else {
-			kitchen.shopping.splice(firstCheckedIndex, 0, newItem);
+			kitchen.shopping.splice(firstCheckedIndex, 0, ...accepted);
 		}
 		shoppingText = '';
+		shoppingVoiceInput = false;
+		if (accepted.length < additions.length) {
+			notify('Your shopping list can hold up to 1,000 items.');
+		}
 	}
 	function movePurchasedToPantry() {
 		commitInlineEdits();
@@ -2917,7 +3174,6 @@
 		);
 		let lotCount = kitchen.pantry.length;
 		const accepted: AppState['shopping'] = [];
-		const acceptedIds = new Set<string>();
 		for (const item of checked) {
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40);
@@ -2934,7 +3190,6 @@
 				unit,
 				quantity: Math.min(1_000_000, item.quantity)
 			});
-			acceptedIds.add(item.id);
 		}
 		if (!accepted.length) {
 			notify(
@@ -2944,10 +3199,33 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, accepted);
-		kitchen.shopping = kitchen.shopping.filter((i) => !acceptedIds.has(i.id));
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const updated = movePurchasesToPantry(kitchen);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
 		notify(
-			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry.`,
+			() => {
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else {
+					notify('Your kitchen changed again. Review the current values before editing.');
+				}
+			}
 		);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
@@ -2957,11 +3235,14 @@
 		}
 		commitInlineEdits();
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
+		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
+		kitchen.shopping = shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		selected = null;
 		page = 'shopping';
 		notify(
-			additions.length
+			uncheckedCount
 				? 'Shopping list ready. Your pantry is already accounted for.'
 				: 'You have everything you need. Happy cooking!'
 		);
@@ -3021,6 +3302,7 @@
 		selected = r;
 		mealDate = dateKey(new Date());
 		mealSlot = 'Dinner';
+		formSubmitted = false;
 		modal = 'plan';
 	}
 	function editPlannedMeal(meal: Meal) {
@@ -3030,16 +3312,24 @@
 		mealDate = meal.date;
 		mealSlot = meal.slot;
 		plannedServings = meal.servings;
+		formSubmitted = false;
 		modal = 'editMeal';
 	}
-	function saveMealChanges(event?: SubmitEvent) {
+	async function saveMealChanges(event?: SubmitEvent) {
 		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === editingMealId);
-		if (!meal || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
-		if (!isValidServings(plannedServings)) {
-			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
+		if (!meal || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
+		if (
+			validateMealDate(mealDate) ||
+			validatePlannedServings(plannedServings) ||
+			typeof plannedServings !== 'number'
+		) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
+		formSubmitted = false;
 		const previousWeek = weekStartForDate(meal.date);
 		const updatedDate = mealDate;
 		meal.date = updatedDate;
@@ -3061,20 +3351,23 @@
 		cookingMealId = meal.id;
 		deductPantry = false;
 		leftoverServings = 0;
+		formSubmitted = false;
 		modal = 'cookMeal';
 	}
-	function markMealCooked(event?: SubmitEvent) {
+	async function markMealCooked(event?: SubmitEvent) {
 		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === cookingMealId);
 		if (!meal) return;
 		if (
-			!Number.isInteger(leftoverServings) ||
-			leftoverServings < 0 ||
-			leftoverServings > meal.servings
+			validateLeftoverServings(leftoverServings, meal.servings) ||
+			typeof leftoverServings !== 'number'
 		) {
-			notify(`Enter whole leftovers between 0 and ${meal.servings} servings.`);
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
+		formSubmitted = false;
 		const recipeId = meal.recipeId;
 		const servingsCooked = meal.servings;
 		const startDate = weekStartForDate(meal.date);
@@ -3169,20 +3462,27 @@
 		filter = PANTRY_FILTER;
 		navigate('discover');
 	}
-	function addMeal(event?: SubmitEvent) {
+	async function addMeal(event?: SubmitEvent) {
 		event?.preventDefault();
-		if (!selected || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
-		if (!isValidServings(plannedServings)) {
-			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
+		if (!selected || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
+		if (
+			validateMealDate(mealDate) ||
+			validatePlannedServings(plannedServings) ||
+			typeof plannedServings !== 'number'
+		) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
+		formSubmitted = false;
 		const scheduledDate = mealDate;
 		kitchen.meals.push({
 			id: crypto.randomUUID(),
 			date: scheduledDate,
 			slot: mealSlot,
 			recipeId: selected.id,
-			servings: plannedServings
+			servings: Math.round(plannedServings)
 		});
 		refreshWeekShopping(weekStartForDate(scheduledDate));
 		weekOffset = weekOffsetForDate(scheduledDate);
@@ -3315,10 +3615,25 @@
 			householdBusy = false;
 		}
 	}
-	async function join(confirmReplace = false) {
-		const confirmed = confirmReplace === true;
-		householdBusy = true;
+	async function join(eventOrConfirm?: SubmitEvent | boolean) {
+		if (
+			eventOrConfirm &&
+			typeof eventOrConfirm === 'object' &&
+			'preventDefault' in eventOrConfirm
+		) {
+			eventOrConfirm.preventDefault();
+		}
+		const confirmed = eventOrConfirm === true;
 		error = '';
+		if (validateInviteCode(joinCode)) {
+			if (modal !== 'household') modal = 'household';
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		householdBusy = true;
 		let joinedHousehold = false;
 		try {
 			syncing = true;
@@ -3361,6 +3676,10 @@
 			}
 			if (joinedHousehold) modal = 'household';
 			error = err.message;
+			if (modal === 'household') {
+				await tick();
+				focusFirstInvalid(dialogFormEl);
+			}
 		} finally {
 			syncing = false;
 			householdBusy = false;
@@ -3410,12 +3729,16 @@
 			inviteCode = '';
 			currentInviteId = '';
 		}
+		if ((modal === 'pantry' || modal === 'import') && voiceTarget === modal) {
+			clearVoiceSession();
+		}
 		if (modal === 'onboarding') dismissOnboarding();
 		else {
 			const next = resolveClosedDialog(modal, resumeDialog);
 			resumeDialog = next.resumeDialog;
 			modal = next.modal;
 		}
+		formSubmitted = false;
 		error = '';
 	}
 	function openImport(text?: string) {
@@ -3534,11 +3857,30 @@
 		);
 	}
 	async function exportKitchen() {
+		if (exporting) return;
+		exporting = true;
 		try {
-			const data = await request('/api/export');
-			download(JSON.stringify(data, null, 2), 'flavorithm-kitchen.json', 'application/json');
+			commitInlineEdits();
+			const currentUser = user ? ($state.snapshot(user) as User) : null;
+			const currentState = $state.snapshot(kitchen) as AppState;
+			if (ready && currentUser && (!managedAuth || kitchenLoaded)) {
+				kitchenSync?.stage(sanitizeKitchenState(currentState));
+			}
+			const result = await exportKitchenArchive({
+				user: currentUser,
+				state: currentState,
+				online: online && navigator.onLine,
+				pendingSnapshot: currentUser ? (kitchenSync?.snapshot() ?? null) : null,
+				hasPendingSync: currentUser ? pendingSync : false,
+				storage: currentUser ? localStorage : null,
+				fetcher: currentUser ? fetch : undefined
+			});
+			download(result.json, result.filename, 'application/json');
+			notify(result.notice);
 		} catch (e) {
-			notify((e as Error).message);
+			notify((e as Error).message || 'Could not export your kitchen.');
+		} finally {
+			exporting = false;
 		}
 	}
 	function download(content: string, filename: string, type: string) {
@@ -3552,8 +3894,15 @@
 	async function deleteAccount(event: SubmitEvent) {
 		event.preventDefault();
 		if (managedAuth) return;
-		busy = true;
 		error = '';
+		if (validatePassword(deletePassword, 'delete')) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		busy = true;
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -3596,6 +3945,8 @@
 		} catch (e) {
 			error = (e as Error).message;
 			syncing = false;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
@@ -3625,8 +3976,17 @@
 				'Password recovery is unavailable. Ask the server operator to configure email delivery.';
 			return;
 		}
-		busy = true;
 		error = '';
+		const fieldErr =
+			modal === 'reset' ? validatePassword(password, 'reset') : validateEmail(email, 'recover');
+		if (fieldErr) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		busy = true;
 		try {
 			if (modal === 'reset') {
 				await request('/api/auth', { action: 'resetPassword', token: resetToken, password });
@@ -3643,6 +4003,8 @@
 			}
 		} catch (e) {
 			error = (e as Error).message;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
@@ -3718,9 +4080,12 @@
 		}
 		download(text, 'flavorithm-shopping.txt', 'text/plain');
 	}
-	async function internetSearch() {
+	async function internetSearch(event?: SubmitEvent) {
+		event?.preventDefault();
 		if (!capabilities.recipeSearch) {
 			error = 'Web recipe search is not configured for this kitchen.';
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
 		if (!user) {
@@ -3734,11 +4099,63 @@
 				.results;
 		} catch (e) {
 			error = (e as Error).message;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
 	}
 </script>
+
+{#snippet voiceSession()}
+	{#if voiceBusy}<div class="voice-session" bind:this={voiceSessionEl} in:revealMotion>
+			<p role="status" aria-live="polite">
+				{voiceStarting
+					? 'Opening microphone…'
+					: voiceState === 'recording'
+						? 'Listening… up to 2 minutes'
+						: 'Transcribing…'}
+			</p>
+			<div class="dialog-actions">
+				{#if voiceState === 'recording'}<button
+						bind:this={voiceStopButton}
+						type="button"
+						class="primary"
+						onclick={() => voiceCapture?.stop()}>Stop recording</button
+					>{/if}<button
+					bind:this={voiceCancelButton}
+					type="button"
+					class="secondary"
+					onclick={() => clearVoiceSession()}>Cancel voice</button
+				>
+			</div>
+		</div>{:else if voiceRetained}<div
+			class="voice-session voice-recovery"
+			bind:this={voiceSessionEl}
+			in:revealMotion
+		>
+			<p class="voice-error-copy" role="alert">
+				{voiceError || 'Voice transcription failed. Your recording is ready to retry.'}
+			</p>
+			<p class="voice-recovery-note">
+				Your recording is kept in this tab so you can retry without speaking again.
+			</p>
+			<div class="dialog-actions voice-recovery-actions">
+				<button
+					bind:this={voiceRetryButton}
+					class="primary"
+					type="button"
+					onclick={() => {
+						void retryVoiceTranscription();
+					}}><RefreshCw size={16} /> Retry transcription</button
+				><button class="secondary" type="button" onclick={openVoiceSettings}
+					><Settings size={16} /> Open Settings</button
+				><button class="text-button" type="button" onclick={discardVoiceRecording}
+					>Discard recording</button
+				>
+			</div>
+		</div>{/if}
+{/snippet}
 
 {#if ready}
 	<div inert={!!modal || !!selected || !!editingRecipe}>
@@ -3825,15 +4242,19 @@
 		<div class="bottom-nav">
 			<button onclick={household}><Users size={18} /> My household <Plus size={15} /></button
 			><button onclick={() => openSettings()}><Settings size={18} /> Settings & themes</button
-			><button
+			><ToggleButton
+				pressed={kitchen.preferences.dark}
 				onclick={() => {
 					kitchen.preferences.dark = !kitchen.preferences.dark;
 				}}
-				>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}{kitchen
-					.preferences.dark
-					? 'Light mode'
-					: 'Dark mode'}<span class="mode-toggle" class:on={kitchen.preferences.dark}
-				></span></button
+				>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+						size={18}
+						aria-hidden="true"
+					/>{/if}Dark mode<span
+					class="mode-toggle"
+					class:on={kitchen.preferences.dark}
+					aria-hidden="true"
+				></span></ToggleButton
 			>
 		</div>
 		<button class="profile-button" onclick={() => (user ? openSettings() : openAuthentication())}
@@ -3859,16 +4280,20 @@
 				<b>{nav.find((n) => n.id === page)?.name || 'Discover'}</b>
 			</div>
 			<div class="topbar-actions">
-				<button
+				<ToggleButton
 					class="icon-button"
-					aria-label="Switch color mode"
+					label="Dark color mode"
+					pressed={kitchen.preferences.dark}
 					onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-					>{#if kitchen.preferences.dark}<Sun size={18} />{:else}<Moon size={18} />{/if}</button
+					>{#if kitchen.preferences.dark}<Sun size={18} aria-hidden="true" />{:else}<Moon
+							size={18}
+							aria-hidden="true"
+						/>{/if}</ToggleButton
 				><button
 					class="top-avatar"
 					aria-label={user ? 'Open household and account' : 'Sign in or create an account'}
 					onclick={() => (user ? household() : openAuthentication())}
-					>{user?.name.slice(0, 1) || 'Y'}</button
+					><span aria-hidden="true">{user?.name.slice(0, 1) || 'Y'}</span></button
 				>
 			</div>
 		</header>
@@ -4007,12 +4432,17 @@
 							class:can-scroll-left={filterOverflow.left}
 							class:can-scroll-right={filterOverflow.right}
 						>
-							<div class="filter-tabs" bind:this={filterTabs} onscroll={syncFilterOverflow}>
-								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<button
-										type="button"
+							<div
+								class="filter-tabs"
+								role="group"
+								aria-label="Filter recipes"
+								bind:this={filterTabs}
+								onscroll={syncFilterOverflow}
+							>
+								{#each ['For you', PANTRY_FILTER, 'Quick & easy', 'Plant-powered', 'Comfort food', 'High protein'] as item}<ToggleButton
 										data-filter={item}
-										class:active={filter === item}
-										aria-pressed={filter === item}
+										class={{ active: filter === item }}
+										pressed={filter === item}
 										onclick={() => {
 											lastActivePill = 'filter';
 											priorityPantryIds = [];
@@ -4020,17 +4450,20 @@
 										}}
 										>{#if item === 'For you'}<Sparkles
 												size={14}
-											/>{:else if item === PANTRY_FILTER}<Carrot size={14} />{/if}{item}</button
+												aria-hidden="true"
+											/>{:else if item === PANTRY_FILTER}<Carrot
+												size={14}
+												aria-hidden="true"
+											/>{/if}{item}</ToggleButton
 									>{/each}
-								<button
-									type="button"
+								<ToggleButton
 									data-filter="hidden"
-									class:active={showHiddenRecipes}
-									aria-pressed={showHiddenRecipes}
+									class={{ active: showHiddenRecipes }}
+									pressed={showHiddenRecipes}
 									onclick={() => {
 										lastActivePill = 'hidden';
 										showHiddenRecipes = !showHiddenRecipes;
-									}}>{showHiddenRecipes ? 'Hide hidden recipes' : 'Show hidden recipes'}</button
+									}}>Hidden recipes</ToggleButton
 								>
 							</div>
 						</div>
@@ -4222,19 +4655,21 @@
 				<div class="pantry-controls">
 					<div class="pantry-filter-bar">
 						<label class="search-box pantry-search">
-							<Search size={17} /><span class="visually-hidden">Search pantry</span><input
-								type="search"
-								placeholder="Search pantry"
-								bind:value={pantryQuery}
-							/>
+							<Search size={17} aria-hidden="true" /><span class="visually-hidden"
+								>Search pantry</span
+							><input type="search" placeholder="Search pantry" bind:value={pantryQuery} />
 						</label>
 						<div class="expiry-filters" role="group" aria-label="Filter pantry by expiry">
-							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<button
-									type="button"
-									class:active={pantryFilter === option.id}
-									aria-pressed={pantryFilter === option.id}
+							{#each [{ id: 'all', label: 'All ingredients', count: kitchen.pantry.length }, { id: 'soon', label: 'Expiring soon', count: kitchen.pantry.filter((item) => item.quantity > 0 && expiryStatus(item.expires) === 'soon').length }, { id: 'expired', label: 'Expired', count: kitchen.pantry.filter((item) => expiryStatus(item.expires) === 'expired').length }] as option}<ToggleButton
+									class={{ active: pantryFilter === option.id }}
+									pressed={pantryFilter === option.id}
 									onclick={() => (pantryFilter = option.id)}
-									>{option.label}<span>{option.count}</span></button
+									><span>{option.label}</span><span class="visually-hidden">{', '}</span><span
+										class="expiry-count"
+										>{option.count}<span class="visually-hidden"
+											>{` ${option.count === 1 ? 'item' : 'items'}`}</span
+										></span
+									></ToggleButton
 								>{/each}
 						</div>
 					</div>
@@ -4243,19 +4678,17 @@
 							role="group"
 							aria-label="Filter pantry by category"
 						>
-							<button
-								type="button"
-								class:active={pantryCategory === 'all'}
-								aria-pressed={pantryCategory === 'all'}
-								onclick={() => (pantryCategory = 'all')}>All categories</button
-							>{#each pantryCategories as category (category.key)}<button
-									type="button"
-									class:active={pantryCategory.toLowerCase() === category.key}
-									aria-pressed={pantryCategory.toLowerCase() === category.key}
+							<ToggleButton
+								class={{ active: pantryCategory === 'all' }}
+								pressed={pantryCategory === 'all'}
+								onclick={() => (pantryCategory = 'all')}>All categories</ToggleButton
+							>{#each pantryCategories as category (category.key)}<ToggleButton
+									class={{ active: pantryCategory.toLowerCase() === category.key }}
+									pressed={pantryCategory.toLowerCase() === category.key}
 									onclick={() =>
 										(pantryCategory =
 											pantryCategory.toLowerCase() === category.key ? 'all' : category.label)}
-									>{category.label}</button
+									>{category.label}</ToggleButton
 								>{/each}
 						</div>{/if}
 				</div>
@@ -4270,7 +4703,8 @@
 						<div class="pantry-list" role="list" aria-label="Pantry ingredients">
 							{#each visiblePantry as item (item.id)}{@const expiry = expiryStatus(
 									item.expires
-								)}{@const depleted = Number.isFinite(item.quantity) && item.quantity <= 0}
+								)}{@const itemDomId = encodeURIComponent(item.id)}{@const depleted =
+									Number.isFinite(item.quantity) && item.quantity <= 0}
 								<div
 									class="pantry-row"
 									class:editing={pantryDraft?.id === item.id}
@@ -4292,9 +4726,8 @@
 													<span class="ingredient-symbol" aria-hidden="true"
 														>{ingredientEmoji(item.name)}</span
 													><span class="ingredient-title-line"
-														><b class="pantry-name">{item.name}</b>{#if item.sample}<small
-																class="sample-badge">Sample</small
-															>{/if}</span
+														><b id={`pantry-item-${itemDomId}`} class="pantry-name">{item.name}</b
+														>{#if item.sample}<small class="sample-badge">Sample</small>{/if}</span
 													>
 												</span>
 												<div class="pantry-edit-actions">
@@ -4307,51 +4740,78 @@
 														type="button"
 														class="icon-button pantry-remove-button"
 														aria-label={`Remove ${item.name}`}
-														onclick={() => removePantryItem(item)}><X size={16} /></button
+														onclick={() => removePantryItem(item)}
+														><X size={16} aria-hidden="true" /></button
 													>
 												</div>
 											</div>
-											<div class="pantry-edit-fields">
-												<label class="pantry-field"
-													><span>Quantity</span><input
+											<div
+												class="pantry-edit-fields"
+												role="group"
+												aria-labelledby={`pantry-item-${itemDomId}`}
+											>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-amount-${itemDomId}`}
+														><span>Amount</span><span class="visually-hidden"
+															>{` of ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-amount-${itemDomId}`}
 														type="number"
 														min="0"
 														max="1000000"
 														step="any"
 														bind:value={pantryDraft.quantity}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Unit</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-unit-${itemDomId}`}
+														><span>Unit</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-unit-${itemDomId}`}
 														type="text"
 														maxlength="40"
 														bind:value={pantryDraft.unit}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Category</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-category-${itemDomId}`}
+														><span>Category</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-category-${itemDomId}`}
 														type="text"
 														maxlength="100"
 														list="pantry-category-suggestions"
 														bind:value={pantryDraft.category}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												><label class="pantry-field"
-													><span>Best before</span><input
+													/>
+												</div>
+												<div class="pantry-field">
+													<label class="pantry-field-label" for={`pantry-expiry-${itemDomId}`}
+														><span>Best before</span><span class="visually-hidden"
+															>{` for ${item.name}`}</span
+														></label
+													><input
+														id={`pantry-expiry-${itemDomId}`}
 														type="date"
 														bind:value={pantryDraft.expires}
 														onkeydown={handlePantryInputKeydown}
-													/></label
-												>
+													/>
+												</div>
 											</div>
 										</form>{:else}<span class="pantry-ingredient">
 											<span class="ingredient-symbol" aria-hidden="true"
 												>{ingredientEmoji(item.name)}</span
 											><span class="ingredient-meta"
 												><span class="ingredient-title-line"
-													><b class="pantry-name">{item.name}</b>{#if item.sample}<small
-															class="sample-badge">Sample</small
-														>{/if}</span
+													><b id={`pantry-item-${itemDomId}`} class="pantry-name">{item.name}</b
+													>{#if item.sample}<small class="sample-badge">Sample</small>{/if}</span
 												><span class="ingredient-tags"
 													><span class="category-badge">{item.category.trim() || 'Pantry'}</span
 													>{#if depleted}<button
@@ -4364,7 +4824,7 @@
 															type="button"
 															class="text-button use-first"
 															onclick={() => useFirstIngredients([item])}
-															><Sparkles size={14} />Use first</button
+															><Sparkles size={14} aria-hidden="true" />Use first</button
 														>{/if}</span
 												></span
 											>
@@ -4380,7 +4840,11 @@
 											>{#if item.expires}<small class="pantry-date">{item.expires}</small
 												>{/if}</span
 										>
-										<div class="pantry-row-actions">
+										<div
+											class="pantry-row-actions"
+											role="group"
+											aria-labelledby={`pantry-item-${itemDomId}`}
+										>
 											<button
 												type="button"
 												class="text-button pantry-edit-button"
@@ -4391,7 +4855,8 @@
 												type="button"
 												class="icon-button pantry-remove-button"
 												aria-label={`Remove ${item.name}`}
-												onclick={() => removePantryItem(item)}><X size={16} /></button
+												onclick={() => removePantryItem(item)}
+												><X size={16} aria-hidden="true" /></button
 											>
 										</div>{/if}
 								</div>{/each}
@@ -4627,6 +5092,7 @@
 									}}>{option.label}<span>{option.count}</span></button
 								>{/each}
 						</div>
+						{#if voiceTarget === 'shopping' && !modal && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
 						<form
 							class="inline-add"
 							onsubmit={(e) => {
@@ -4637,9 +5103,19 @@
 							<Plus size={18} /><input
 								aria-label="Add shopping item"
 								placeholder="Anything else for the basket?"
-								maxlength="200"
+								maxlength="2000"
 								bind:value={shoppingText}
-							/><button class="text-button">Add</button>
+								oninput={() => {
+									if (!shoppingText.trim()) shoppingVoiceInput = false;
+								}}
+							/><button
+								bind:this={shoppingMicButton}
+								type="button"
+								class="icon-button"
+								aria-label="Dictate shopping items"
+								aria-disabled={voiceBusy || undefined}
+								onclick={dictateShopping}><Mic size={18} /></button
+							><button type="submit" class="text-button">Add</button>
 						</form>
 						{#each visibleShopping as item (item.id)}<div
 								class:checked={item.checked}
@@ -4845,50 +5321,7 @@
 				tabindex="-1"
 				transition:dialogMotion|global
 			>
-				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceBusy}<div
-						class="voice-session"
-						in:revealMotion
-					>
-						<p role="status" aria-live="polite">
-							{voiceStarting
-								? 'Opening microphone…'
-								: voiceState === 'recording'
-									? 'Listening… up to 2 minutes'
-									: 'Transcribing…'}
-						</p>
-						<div class="dialog-actions">
-							{#if voiceState === 'recording'}<button
-									class="primary"
-									type="button"
-									onclick={() => voiceCapture?.stop()}>Stop recording</button
-								>{/if}<button class="secondary" type="button" onclick={clearVoiceSession}
-								>Cancel voice</button
-							>
-						</div>
-					</div>{:else if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && voiceRetained}<div
-						class="voice-session voice-recovery"
-						in:revealMotion
-					>
-						<p class="voice-error-copy" role="alert">
-							{voiceError || 'Voice transcription failed. Your recording is ready to retry.'}
-						</p>
-						<p class="voice-recovery-note">
-							Your recording is kept in this tab so you can retry without speaking again.
-						</p>
-						<div class="dialog-actions voice-recovery-actions">
-							<button
-								class="primary"
-								type="button"
-								onclick={() => {
-									void retryVoiceTranscription();
-								}}><RefreshCw size={16} /> Retry transcription</button
-							><button class="secondary" type="button" onclick={openVoiceSettings}
-								><Settings size={16} /> Open Settings</button
-							><button class="text-button" type="button" onclick={discardVoiceRecording}
-								>Discard recording</button
-							>
-						</div>
-					</div>{/if}
+				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
 
 				<button
 					class="icon-button dialog-close"
@@ -4909,7 +5342,7 @@
 					<p class="muted onboarding-intro">
 						Optional. Change these preferences anytime in Settings.
 					</p>
-					<form onsubmit={finishOnboarding}>
+					<form novalidate bind:this={dialogFormEl} onsubmit={finishOnboarding}>
 						<fieldset class="quiz-group">
 							<legend>Preferred cooking time</legend>
 							<div class="quiz-options quiz-time">
@@ -4923,14 +5356,19 @@
 									>{/each}
 							</div>
 						</fieldset>
-						<fieldset class="quiz-group">
+						<fieldset class="quiz-group" aria-describedby="quiz-cuisines-help">
 							<legend>Favorite cuisines</legend>
-							<p class="quiz-help">Choose any, or leave blank for all cuisines.</p>
+							<p class="quiz-help" id="quiz-cuisines-help">
+								Choose any, or leave blank for all cuisines.
+							</p>
 							<div class="quiz-options quiz-cuisines">
 								{#each cuisineChoices as cuisine}<label class="quiz-option"
-										><input type="checkbox" value={cuisine} bind:group={quizCuisines} /><span
-											>{cuisine}</span
-										></label
+										><input
+											type="checkbox"
+											value={cuisine}
+											aria-invalid="false"
+											bind:group={quizCuisines}
+										/><span>{cuisine}</span></label
 									>{/each}
 							</div>
 						</fieldset>
@@ -4949,27 +5387,33 @@
 						</fieldset>
 						<details class="quiz-dietary">
 							<summary>Any dietary preferences or allergies? <span>Optional</span></summary>
-							<label class="field"
-								>Dietary style<select bind:value={quizDiet}
-									><option value="none">No dietary restriction</option><option value="vegetarian"
-										>Vegetarian</option
-									><option value="vegan">Vegan</option><option value="pescatarian"
-										>Pescatarian</option
-									><option value="gluten-free">Gluten-free</option><option value="dairy-free"
-										>Dairy-free</option
-									></select
-								></label
+							<FormField id="onboarding-diet" label="Dietary style">
+								{#snippet children(field)}
+									<select bind:value={quizDiet} {...field}
+										><option value="none">No dietary restriction</option><option value="vegetarian"
+											>Vegetarian</option
+										><option value="vegan">Vegan</option><option value="pescatarian"
+											>Pescatarian</option
+										><option value="gluten-free">Gluten-free</option><option value="dairy-free"
+											>Dairy-free</option
+										></select
+									>
+								{/snippet}
+							</FormField>
+							<FormField
+								id="onboarding-allergies"
+								label="Allergies or ingredients to avoid"
+								help="These guide generation. Check ingredients and labels before cooking."
 							>
-							<label class="field"
-								>Allergies or ingredients to avoid<input
-									bind:value={quizAllergies}
-									maxlength="500"
-									placeholder="e.g. peanuts, shellfish"
-								/></label
-							>
-							<p class="field-help">
-								These guide generation. Check ingredients and labels before cooking.
-							</p>
+								{#snippet children(field)}
+									<input
+										bind:value={quizAllergies}
+										maxlength="2000"
+										placeholder="e.g. peanuts, shellfish"
+										{...field}
+									/>
+								{/snippet}
+							</FormField>
 						</details>
 						<div class="dialog-actions quiz-actions">
 							<button class="primary" type="submit">Save preferences <Check size={17} /></button
@@ -4984,34 +5428,38 @@
 							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
 							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 						</div>{/if}
-
-					<label class="field"
-						>Ingredients<textarea
-							bind:value={pantryInput}
-							maxlength="20000"
-							placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
-							rows="5"></textarea></label
-					>
-					<p class="field-help">
-						Separate with commas or new lines. Add quantities and units when you know them.
-					</p>
-					<div class="dialog-actions">
-						<button class="secondary" type="button" disabled={voiceBusy || busy} onclick={dictate}
-							><Mic size={17} /> Use voice</button
-						><button
-							class="secondary"
-							type="button"
-							aria-busy={scanBusy}
-							onclick={() => imageInput.click()}
-							disabled={scanBusy || busy || voiceBusy}
-							><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
-						><button
-							class="primary"
-							type="button"
-							disabled={voiceBusy || busy || !pantryInput.trim()}
-							onclick={addIngredients}>Add ingredients <ArrowRight size={17} /></button
+					<form novalidate bind:this={dialogFormEl} onsubmit={addIngredients}>
+						<FormField
+							id="pantry-ingredients"
+							label="Ingredients"
+							help="Separate with commas or new lines. Add quantities and units when you know them."
+							error={pantryFieldError}
+							alert
 						>
-					</div>
+							{#snippet children(field)}
+								<textarea
+									bind:value={pantryInput}
+									maxlength="20000"
+									placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
+									rows="5"
+									{...field}></textarea>
+							{/snippet}
+						</FormField>
+						<div class="dialog-actions">
+							<button type="button" class="secondary" disabled={voiceBusy || busy} onclick={dictate}
+								><Mic size={17} /> Use voice</button
+							><button
+								type="button"
+								class="secondary"
+								aria-busy={scanBusy}
+								onclick={() => imageInput.click()}
+								disabled={scanBusy || busy || voiceBusy}
+								><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
+							><button type="submit" class="primary" disabled={voiceBusy || busy}
+								>Add ingredients <ArrowRight size={17} /></button
+							>
+						</div>
+					</form>
 				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
 					<h2>Managed by your organization</h2>
 					<p class="muted">
@@ -5019,49 +5467,69 @@
 					</p>
 					{#if providerLoginUrl}<a class="primary full" href={providerLoginUrl}
 							>Continue with organization sign-in <ArrowRight size={17} /></a
-						>{:else}<p class="field-help">
+						>{:else}<p class="muted">
 							Sign in through your organization's access proxy, then reload Flavorithm.
 						</p>{/if}
 				{:else if modal === 'auth'}<span class="dialog-spark">✳</span>
 					<h2>{authMode === 'register' ? 'Create an account' : 'Sign in'}</h2>
 					<p class="muted">Sync your pantry, recipes, and household.</p>
-					<form onsubmit={authenticate}>
-						{#if authMode === 'register'}<label class="field"
-								>Your name<input
-									required
-									minlength="2"
-									maxlength="80"
-									autocomplete="name"
-									bind:value={name}
-								/></label
-							>{/if}<label class="field"
-							>Email address<input
-								type="email"
-								required
-								autocomplete="email"
-								bind:value={email}
-							/></label
-						><label class="field"
-							>Password<input
-								type="password"
-								required
-								minlength="10"
-								maxlength="128"
-								autocomplete={authMode === 'register' ? 'new-password' : 'current-password'}
-								bind:value={password}
-							/></label
+					<form novalidate bind:this={dialogFormEl} onsubmit={authenticate}>
+						{#if authMode === 'register'}<FormField
+								id="auth-name"
+								label="Your name"
+								help="Use 2 to 80 characters."
+								error={authNameError}
+							>
+								{#snippet children(field)}
+									<input maxlength="80" autocomplete="name" bind:value={name} {...field} />
+								{/snippet}
+							</FormField>{/if}
+						<FormField
+							id="auth-email"
+							label="Email address"
+							error={authEmailError}
+							errorId={error ? 'auth-form-error' : undefined}
+							invalid={Boolean(authEmailError || error)}
 						>
-						<p class="field-help">Use at least 10 characters.</p>
+							{#snippet children(field)}
+								<input type="email" autocomplete="email" bind:value={email} {...field} />
+							{/snippet}
+						</FormField>
+						<FormField
+							id="auth-password"
+							label="Password"
+							help={authMode === 'register'
+								? 'Use 10 to 128 characters.'
+								: 'Enter your account password.'}
+							error={authPasswordError}
+							errorId={error && authMode === 'login' ? 'auth-form-error' : undefined}
+							invalid={Boolean(authPasswordError || (error && authMode === 'login'))}
+						>
+							{#snippet children(field)}
+								<input
+									type="password"
+									maxlength="128"
+									autocomplete={authMode === 'register' ? 'new-password' : 'current-password'}
+									bind:value={password}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
 						{#if authMode === 'login' && capabilities.emailDelivery}<button
 								type="button"
 								class="text-button"
 								onclick={() => {
 									modal = 'recover';
+									formSubmitted = false;
 									error = '';
 								}}>Forgot your password?</button
-							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-							class="primary full"
-							disabled={busy}
+							>{/if}{#if error || authValidationSummary}<p
+								class="error"
+								id="auth-form-error"
+								role="alert"
+							>
+								{error || authValidationSummary}
+							</p>{/if}<button type="submit" class="primary full" disabled={busy}
 							>{busy
 								? 'Opening your kitchen…'
 								: authMode === 'register'
@@ -5073,6 +5541,7 @@
 						class="text-button full"
 						onclick={() => {
 							authMode = authMode === 'register' ? 'login' : 'register';
+							formSubmitted = false;
 							error = '';
 						}}
 						>{authMode === 'register'
@@ -5084,62 +5553,84 @@
 					<p class="muted">
 						Uses your pantry and preferences. Recipes may include additional ingredients.
 					</p>
-					<label class="field"
-						>What are you in the mood for?<textarea
-							rows="3"
-							bind:value={prompt}
-							placeholder="e.g. a spicy vegetarian dinner in 30 minutes"></textarea></label
-					>
-					<div class="two-fields">
-						<label class="field"
-							>Time to cook<select bind:value={kitchen.preferences.maxTime}
-								><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option
-									value={45}>45 minutes</option
-								><option value={60}>An hour</option><option value={120}>A slow afternoon</option
-								></select
-							></label
-						><label class="field"
-							>Dietary style<select bind:value={kitchen.preferences.diet}
-								><option value="none">A bit of everything</option><option>Vegetarian</option><option
-									>Vegan</option
-								><option>Pescatarian</option><option>Gluten-free</option><option>Low-carb</option
-								></select
-							></label
+					<form novalidate bind:this={dialogFormEl} onsubmit={generate}>
+						<FormField
+							id="generate-prompt"
+							label="What are you in the mood for?"
+							errorId={error ? 'generate-form-error' : undefined}
+							invalid={Boolean(error)}
 						>
-					</div>
-					<label class="field"
-						>Allergies & ingredients to avoid<input
-							bind:value={kitchen.preferences.allergies}
-							maxlength="2000"
-							placeholder="e.g. peanuts, shellfish"
-						/></label
-					>
-					<p class="field-help">
-						Check all ingredients and substitutions against your allergies before cooking.
-					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-						class="primary full"
-						disabled={busy}
-						onclick={generate}
-						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
-					>
+							{#snippet children(field)}
+								<textarea
+									rows="3"
+									bind:value={prompt}
+									placeholder="e.g. a spicy vegetarian dinner in 30 minutes"
+									{...field}></textarea>
+							{/snippet}
+						</FormField>
+						<div class="two-fields">
+							<FormField id="generate-time" label="Time to cook">
+								{#snippet children(field)}
+									<select bind:value={kitchen.preferences.maxTime} {...field}
+										><option value={15}>15 minutes</option><option value={30}>30 minutes</option
+										><option value={45}>45 minutes</option><option value={60}>An hour</option
+										><option value={120}>A slow afternoon</option></select
+									>
+								{/snippet}
+							</FormField>
+							<FormField id="generate-diet" label="Dietary style">
+								{#snippet children(field)}
+									<select bind:value={kitchen.preferences.diet} {...field}
+										><option value="none">A bit of everything</option><option>Vegetarian</option
+										><option>Vegan</option><option>Pescatarian</option><option>Gluten-free</option
+										><option>Low-carb</option></select
+									>
+								{/snippet}
+							</FormField>
+						</div>
+						<FormField
+							id="generate-allergies"
+							label="Allergies & ingredients to avoid"
+							help="Check all ingredients and substitutions against your allergies before cooking."
+						>
+							{#snippet children(field)}
+								<input
+									bind:value={kitchen.preferences.allergies}
+									maxlength="2000"
+									placeholder="e.g. peanuts, shellfish"
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
+						{#if error}<p class="error" id="generate-form-error" role="alert">
+								{error}
+							</p>{/if}<button type="submit" class="primary full" disabled={busy}
+							><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
+						>
+					</form>
 				{:else if modal === 'settings'}
 					<h2>Settings</h2>
 					<div class="settings-section">
 						<h3>Appearance</h3>
-						<div class="theme-grid">
-							{#each themes as theme}<button
-									class:active={kitchen.preferences.theme === theme}
-									aria-pressed={kitchen.preferences.theme === theme}
+						<div class="theme-grid" role="group" aria-label="Color theme">
+							{#each themes as theme}<ToggleButton
+									class={{ active: kitchen.preferences.theme === theme }}
+									pressed={kitchen.preferences.theme === theme}
 									onclick={() => (kitchen.preferences.theme = theme)}
-									>{theme}{#if kitchen.preferences.theme === theme}<Check size={13} />{/if}</button
+									>{theme}{#if kitchen.preferences.theme === theme}<Check
+											size={13}
+											aria-hidden="true"
+										/>{/if}</ToggleButton
 								>{/each}
 						</div>
-						<button
-							class="secondary"
+						<ToggleButton
+							class={{ secondary: true, active: kitchen.preferences.dark }}
+							pressed={kitchen.preferences.dark}
 							onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-							>{#if kitchen.preferences.dark}<Sun size={16} />{:else}<Moon size={16} />{/if}Switch
-							to {kitchen.preferences.dark ? 'light' : 'dark'} mode</button
+							>{#if kitchen.preferences.dark}<Sun size={16} aria-hidden="true" />{:else}<Moon
+									size={16}
+									aria-hidden="true"
+								/>{/if}Dark appearance</ToggleButton
 						>
 					</div>
 
@@ -5162,14 +5653,20 @@
 									: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
 							</p>
 							{#if !managedAuth}
-								{#if user.emailVerified}<p class="field-help">
+								{#if user.emailVerified}<p class="muted">
 										Email verification is optional for using your kitchen.
 									</p>{:else}<button
 										class="secondary"
+										aria-describedby={!capabilities.emailDelivery
+											? 'settings-email-delivery-help'
+											: undefined}
 										disabled={!capabilities.emailDelivery || verificationBusy}
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
-									>{#if !capabilities.emailDelivery}<p class="field-help">
+									>{#if !capabilities.emailDelivery}<p
+											class="field-help"
+											id="settings-email-delivery-help"
+										>
 											Email delivery is unavailable. Ask the server operator to configure email
 											delivery.
 										</p>{/if}{/if}
@@ -5222,30 +5719,36 @@
 							<div class="dialog-actions">
 								<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
 							</div>
-						</div>{/if}{#if user}<div class="settings-section">
-							<h3>Your data</h3>
-							<p class="muted">
-								{managedAuth
-									? 'Export your account and shared kitchen.'
-									: 'Export your account and shared kitchen, or permanently remove your account.'}
-							</p>
-							<div class="dialog-actions">
-								<button class="secondary" onclick={exportKitchen}
-									><Download size={16} /> Export my data</button
-								>{#if !managedAuth}<button
-										class="text-button danger"
-										onclick={() => {
-											modal = 'delete';
-											error = '';
-										}}>Delete account</button
-									>{/if}
-							</div>
-						</div>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}
+						</div>{/if}
+					<div class="settings-section">
+						<h3>Your data</h3>
+						<p class="muted">
+							{#if !user}
+								Export the kitchen saved in this browser as JSON.
+							{:else if managedAuth}
+								Export your account and shared kitchen.
+							{:else}
+								Export your account and shared kitchen, or permanently remove your account.
+							{/if}
+						</p>
+						<div class="dialog-actions">
+							<button class="secondary" onclick={exportKitchen}
+								><Download size={16} /> Export my data</button
+							>{#if user && !managedAuth}<button
+									class="text-button danger"
+									onclick={() => {
+										modal = 'delete';
+										error = '';
+									}}>Delete account</button
+								>{/if}
+						</div>
+					</div>
+					{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<div class="dialog-actions">
 						{#if user && (!managedAuth || providerLogoutUrl)}<button
 								class="text-button"
 								onclick={logout}><LogOut size={16} /> Sign out</button
-							>{:else if user && managedAuth}<span class="field-help"
+							>{:else if user && managedAuth}<span class="muted"
 								>Sign-out is managed by your access proxy.</span
 							>{:else if !user && !managedAuth}<button
 								class="text-button"
@@ -5263,10 +5766,13 @@
 							}}>Done <Check size={17} /></button
 						>
 					</div>
-				{:else if modal === 'household'}<span class="dialog-spark">✳</span>
+				{:else if modal === 'household'}
+					{@const showSoloHouseholdHelp =
+						members.length <= 1 && (members.length === 1 || !householdBusy)}
+					<span class="dialog-spark">✳</span>
 					<h2>Your household</h2>
 					<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
-					{#if householdBusy}<p class="field-help" role="status">Updating household…</p>{/if}
+					{#if householdBusy}<p class="muted" role="status">Updating household…</p>{/if}
 					<div class="household-members">
 						{#each members as member (member.id)}<div class="member-row">
 								<span class="profile-avatar"
@@ -5302,7 +5808,7 @@
 												onclick={() => revokeInvite(invite.inviteId)}>Revoke</button
 											>
 										</div>{/each}
-								</div>{:else}<p class="field-help">No active invitations.</p>{/if}
+								</div>{:else}<p class="muted">No active invitations.</p>{/if}
 							<button class="primary full" disabled={householdBusy} onclick={invite}
 								><Plus size={17} /> Create invitation</button
 							>
@@ -5310,6 +5816,7 @@
 									<code>{inviteCode}</code><button
 										class="icon-button"
 										aria-label="Copy invitation"
+										aria-describedby="household-invite-help"
 										onclick={() =>
 											navigator.clipboard
 												.writeText(inviteCode)
@@ -5318,25 +5825,39 @@
 										><Copy size={17} /></button
 									>
 								</div>
-								<p class="field-help">Share privately. This code works once.</p>{/if}
-						</section>{:else}<p class="field-help">
+								<p class="field-help" id="household-invite-help">
+									Share privately. This code works once.
+								</p>{/if}
+						</section>{:else}<p class="muted">
 							Only the household owner can manage invitations or remove members.
 						</p>{/if}
 					<hr />
 					<h3>Have an invitation?</h3>
-					<label class="field"
-						>Invite code<input
-							bind:value={joinCode}
-							placeholder="Paste invitation code"
-							autocomplete="off"
-						/></label
-					>
-					<button
-						class="secondary full"
-						disabled={householdBusy || !joinCode.trim()}
-						onclick={() => join()}>Join household <ArrowRight size={17} /></button
-					>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<form novalidate bind:this={dialogFormEl} onsubmit={join}>
+						<FormField
+							id="household-join-code"
+							label="Invite code"
+							help="Paste the one-time invitation code shared by your household owner."
+							helpIds={showSoloHouseholdHelp ? ['household-solo-help'] : []}
+							error={joinCodeError}
+							errorId={error ? 'household-form-error' : undefined}
+							invalid={Boolean(joinCodeError || error)}
+							alert={!error}
+						>
+							{#snippet children(field)}
+								<input
+									bind:value={joinCode}
+									placeholder="Paste invitation code"
+									autocomplete="off"
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
+						<button type="submit" class="secondary full" disabled={householdBusy}
+							>Join household <ArrowRight size={17} /></button
+						>
+					</form>
+					{#if error}<p class="error" id="household-form-error" role="alert">{error}</p>{/if}
 					{#if members.length > 1}
 						<button
 							class="text-button danger full"
@@ -5346,8 +5867,8 @@
 								error = '';
 							}}>Leave this household</button
 						>
-					{:else if members.length === 1 || !householdBusy}
-						<p class="field-help">
+					{:else if showSoloHouseholdHelp}
+						<p class="field-help" id="household-solo-help">
 							You already have your own personal kitchen. Invite someone above to share it, or enter
 							an invite code to join another household.
 						</p>
@@ -5409,7 +5930,7 @@
 						household. You can rejoin with a new invitation.
 					</p>
 					{#if nextHouseholdOwner}
-						<p class="field-help">
+						<p class="field-help" id="leave-owner-help">
 							Ownership of this household will transfer to <b>{nextHouseholdOwner.name}</b>.
 						</p>
 					{/if}
@@ -5424,6 +5945,7 @@
 							}}>Stay in household</button
 						><button
 							class="primary danger-action"
+							aria-describedby={nextHouseholdOwner ? 'leave-owner-help' : undefined}
 							disabled={busy || householdBusy}
 							onclick={leaveHousehold}
 							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
@@ -5436,17 +5958,29 @@
 						remains for other members; a household with no members is deleted. This cannot be
 						undone.
 					</p>
-					<form onsubmit={deleteAccount}>
-						<label class="field"
-							>Confirm with your password<input
-								type="password"
-								required
-								autocomplete="current-password"
-								bind:value={deletePassword}
-							/></label
-						>{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-							class="primary danger-button full"
-							disabled={busy}>Permanently delete my account</button
+					<form novalidate bind:this={dialogFormEl} onsubmit={deleteAccount}>
+						<FormField
+							id="delete-password"
+							label="Confirm with your password"
+							help="Enter your current password to confirm permanent deletion."
+							error={deletePasswordError}
+							errorId={error ? 'delete-form-error' : undefined}
+							invalid={Boolean(deletePasswordError || error)}
+							alert={!error}
+						>
+							{#snippet children(field)}
+								<input
+									type="password"
+									maxlength="128"
+									autocomplete="current-password"
+									bind:value={deletePassword}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>{#if error}<p class="error" id="delete-form-error" role="alert">
+								{error}
+							</p>{/if}<button type="submit" class="primary danger-button full" disabled={busy}
+							>Permanently delete my account</button
 						>
 					</form>
 				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
@@ -5458,26 +5992,40 @@
 							? 'Choose a new password to open your kitchen again.'
 							: 'We’ll email a link to reset your password.'}
 					</p>
-					<form onsubmit={recover}>
-						{#if modal === 'reset'}<label class="field"
-								>New password<input
-									type="password"
-									required
-									minlength="10"
-									maxlength="128"
-									autocomplete="new-password"
-									bind:value={password}
-								/></label
-							>{:else}<label class="field"
-								>Email address<input
-									type="email"
-									required
-									autocomplete="email"
-									bind:value={email}
-								/></label
-							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-							class="primary full"
-							disabled={busy}
+					<form novalidate bind:this={dialogFormEl} onsubmit={recover}>
+						{#if modal === 'reset'}<FormField
+								id="reset-password"
+								label="New password"
+								help="Use 10 to 128 characters."
+								error={resetPasswordError}
+								errorId={error ? 'recover-form-error' : undefined}
+								invalid={Boolean(resetPasswordError || error)}
+								alert={!error}
+							>
+								{#snippet children(field)}
+									<input
+										type="password"
+										maxlength="128"
+										autocomplete="new-password"
+										bind:value={password}
+										{...field}
+									/>
+								{/snippet}
+							</FormField>{:else}<FormField
+								id="recover-email"
+								label="Email address"
+								help="We’ll send a reset link if an account matches this email."
+								error={recoverEmailError}
+								errorId={error ? 'recover-form-error' : undefined}
+								invalid={Boolean(recoverEmailError || error)}
+								alert={!error}
+							>
+								{#snippet children(field)}
+									<input type="email" autocomplete="email" bind:value={email} {...field} />
+								{/snippet}
+							</FormField>{/if}{#if error}<p class="error" id="recover-form-error" role="alert">
+								{error}
+							</p>{/if}<button type="submit" class="primary full" disabled={busy}
 							>{busy
 								? 'One moment…'
 								: modal === 'reset'
@@ -5505,29 +6053,41 @@
 					)}
 					<h2>Edit planned meal</h2>
 					<p class="muted">{editingMealRecipe?.title}</p>
-					<form onsubmit={saveMealChanges}>
-						<label class="field"
-							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
+					<form novalidate bind:this={dialogFormEl} onsubmit={saveMealChanges}>
+						<FormField id="edit-meal-date" label="When are we cooking?" error={mealDateError} alert>
+							{#snippet children(field)}
+								<input type="date" bind:value={mealDate} {...field} />
+							{/snippet}
+						</FormField>
+						<FormField id="edit-meal-slot" label="Meal">
+							{#snippet children(field)}
+								<select bind:value={mealSlot} {...field}
+									><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+								>
+							{/snippet}
+						</FormField>
+						<FormField
+							id="edit-meal-servings"
+							label="Servings"
+							help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
+							error={mealServingsError}
+							alert={!mealDateError}
 						>
-						<label class="field"
-							>Meal<select required bind:value={mealSlot}
-								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-							></label
-						>
-						<label class="field"
-							>Servings<input
-								type="number"
-								min="1"
-								max={MAX_SERVINGS}
-								step="1"
-								required
-								bind:value={plannedServings}
-							/></label
-						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="1"
+									max={MAX_SERVINGS}
+									step="1"
+									bind:value={plannedServings}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
 						<div class="dialog-actions">
-							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
-								class="primary"
-								type="submit">Save meal</button
+							<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
+								type="submit"
+								class="primary">Save meal</button
 							>
 						</div>
 					</form>
@@ -5536,51 +6096,80 @@
 					{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
 					<h2>Mark meal cooked</h2>
 					<p class="muted">{cookingRecipe?.title}</p>
-					<form onsubmit={markMealCooked}>
-						<label class="cook-option"
-							><input type="checkbox" bind:checked={deductPantry} /><span
-								><b>Deduct ingredients from pantry</b><small
+					<form novalidate bind:this={dialogFormEl} onsubmit={markMealCooked}>
+						<label class="cook-option" for="cook-deduct"
+							><input
+								id="cook-deduct"
+								type="checkbox"
+								aria-describedby="cook-deduct-help"
+								aria-invalid="false"
+								bind:checked={deductPantry}
+							/><span
+								><b>Deduct ingredients from pantry</b><small id="cook-deduct-help"
 									>Uses the planned serving amount and available matching stock.</small
 								></span
 							></label
 						>
-						<label class="field"
-							>Leftover servings<input
-								type="number"
-								min="0"
-								max={cookingMeal?.servings ?? MAX_SERVINGS}
-								step="1"
-								required
-								bind:value={leftoverServings}
-							/><small class="field-help">Enter 0 if there are no leftovers.</small></label
+						<FormField
+							id="cook-leftovers"
+							label="Leftover servings"
+							help={`Enter a whole number from 0 to ${(cookingMeal?.servings ?? MAX_SERVINGS).toLocaleString('en-US')} servings. Enter 0 if there are no leftovers.`}
+							error={leftoverError}
+							alert
 						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="0"
+									max={cookingMeal?.servings ?? MAX_SERVINGS}
+									step="1"
+									bind:value={leftoverServings}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
 						<div class="dialog-actions">
-							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
-								class="primary"
-								type="submit"><Check size={17} /> Mark cooked</button
+							<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
+								type="submit"
+								class="primary"><Check size={17} /> Mark cooked</button
 							>
 						</div>
 					</form>
 				{:else if modal === 'plan'}
 					<h2>Schedule a recipe</h2>
 					<p class="muted">{selected?.title}</p>
-					<form onsubmit={addMeal}>
-						<label class="field"
-							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
-						><label class="field"
-							>Meal<select required bind:value={mealSlot}
-								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-							></label
-						><label class="field"
-							>Servings<input
-								type="number"
-								min="1"
-								max={MAX_SERVINGS}
-								step="1"
-								required
-								bind:value={plannedServings}
-							/></label
-						><button class="primary full" type="submit"
+					<form novalidate bind:this={dialogFormEl} onsubmit={addMeal}>
+						<FormField id="plan-date" label="When are we cooking?" error={mealDateError} alert>
+							{#snippet children(field)}
+								<input type="date" bind:value={mealDate} {...field} />
+							{/snippet}
+						</FormField>
+						<FormField id="plan-slot" label="Meal">
+							{#snippet children(field)}
+								<select bind:value={mealSlot} {...field}
+									><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+								>
+							{/snippet}
+						</FormField>
+						<FormField
+							id="plan-servings"
+							label="Servings"
+							help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
+							error={mealServingsError}
+							alert={!mealDateError}
+						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="1"
+									max={MAX_SERVINGS}
+									step="1"
+									bind:value={plannedServings}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
+						<button type="submit" class="primary full"
 							><CalendarDays size={17} /> Put it on the calendar</button
 						>
 					</form>
@@ -5618,21 +6207,27 @@
 					<p class="muted">
 						Search real recipes across the web, with links to the original creators.
 					</p>
-					{#if !capabilities.recipeSearch}<p class="field-help">
-							Web search is unavailable. Ask the server operator to enable online recipe search.
-						</p>{/if}
-					<label class="field"
-						>What are you craving?<input
-							bind:value={prompt}
-							placeholder="Lemony weeknight pasta…"
-						/></label
-					><button
-						class="primary full"
-						disabled={busy || !capabilities.recipeSearch}
-						onclick={internetSearch}
-						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
-					>{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<button class="secondary full" onclick={() => openImport()}
+					<form novalidate bind:this={dialogFormEl} onsubmit={internetSearch}>
+						{#if !capabilities.recipeSearch}<p class="field-help" id="search-unavailable-help">
+								Web search is unavailable. Ask the server operator to enable online recipe search.
+							</p>{/if}
+						<FormField
+							id="search-query"
+							label="What are you craving?"
+							help="Search by dish, ingredient, or cuisine, or leave blank for seasonal ideas."
+							helpIds={[!capabilities.recipeSearch ? 'search-unavailable-help' : undefined]}
+							errorId={error ? 'search-form-error' : undefined}
+							invalid={Boolean(error)}
+						>
+							{#snippet children(field)}
+								<input bind:value={prompt} placeholder="Lemony weeknight pasta…" {...field} />
+							{/snippet}
+						</FormField>
+						<button type="submit" class="primary full" disabled={busy || !capabilities.recipeSearch}
+							><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
+						>{#if error}<p class="error" id="search-form-error" role="alert">{error}</p>{/if}
+					</form>
+					<button type="button" class="secondary full" onclick={() => openImport()}
 						><Plus size={17} />Import text, a link, or a photo</button
 					>
 					<div class="web-results">
@@ -5661,14 +6256,14 @@
 		border-bottom: 2px solid var(--accent);
 	}
 	.voice-session.voice-recovery {
-		border-bottom-color: #b55439;
+		border-bottom-color: var(--danger-ink);
 	}
 	.voice-session p {
 		font-size: 16px;
 		margin: 0 0 10px;
 	}
 	.voice-session .voice-error-copy {
-		color: #b55439;
+		color: var(--danger-ink);
 		font-weight: 500;
 	}
 	.voice-session .voice-recovery-note {
@@ -5751,7 +6346,7 @@
 		flex-wrap: wrap;
 		margin: 0;
 	}
-	.expiry-filters button {
+	.expiry-filters :global(button) {
 		min-height: 44px;
 		display: inline-flex;
 		align-items: center;
@@ -5761,14 +6356,14 @@
 		background: var(--surface);
 		font-size: 14px;
 	}
-	.expiry-filters button.active {
+	.expiry-filters :global(button.active) {
 		padding: 7px 11px;
 		background: var(--chip-active-bg);
 		color: var(--ink);
 		border: 2px solid var(--chip-active-border);
 		font-weight: 700;
 	}
-	.expiry-filters button span {
+	.expiry-filters .expiry-count {
 		min-width: 22px;
 		padding: 2px 5px;
 		background: color-mix(in srgb, currentColor 12%, transparent);
@@ -5842,24 +6437,6 @@
 	.pantry-date {
 		font-size: 12px;
 		color: var(--muted);
-	}
-	.expiry-badge {
-		font-size: 12px;
-		color: var(--muted);
-	}
-	.expiry-badge.depleted {
-		background: var(--wash);
-		color: var(--ink);
-		padding: 2px 6px;
-		font-weight: 600;
-	}
-	.expiry-badge.expired {
-		color: #a43f36;
-		font-weight: 600;
-	}
-	.expiry-badge.soon {
-		color: #926b17;
-		font-weight: 600;
 	}
 	.use-first,
 	.restock-item {
@@ -6155,13 +6732,6 @@
 		color: var(--muted);
 		line-height: 1.5;
 	}
-	.danger-action {
-		background: #a43f36;
-		color: white;
-	}
-	.dialog-actions .danger-action:hover {
-		background: #87332c;
-	}
 	@media (max-width: 650px) {
 		.pantry-controls {
 			gap: 8px;
@@ -6185,13 +6755,13 @@
 			grid-template-columns: repeat(3, minmax(0, 1fr));
 			width: 100%;
 		}
-		.expiry-filters button {
+		.expiry-filters :global(button) {
 			justify-content: center;
 			gap: 5px;
 			padding-inline: 6px;
 			font-size: 12px;
 		}
-		.expiry-filters button.active {
+		.expiry-filters :global(button.active) {
 			padding-inline: 5px;
 		}
 		.ingredient-meta {
@@ -6291,16 +6861,6 @@
 		color: var(--muted);
 		overflow-wrap: anywhere;
 	}
-	.member-role {
-		padding: 4px 7px;
-		background: var(--wash);
-		color: var(--muted);
-		font-size: 12px;
-	}
-	.member-role.owner-role {
-		background: var(--accent);
-		color: var(--ink);
-	}
 	.member-remove {
 		min-height: 40px;
 		padding-inline: 6px;
@@ -6329,5 +6889,13 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	@media (forced-colors: active) {
+		.expiry-filters :global(button.active) {
+			background: Highlight;
+			color: HighlightText;
+			border: 1px solid Highlight;
+			forced-color-adjust: none;
+		}
 	}
 </style>

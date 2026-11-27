@@ -1,7 +1,9 @@
 <script lang="ts">
 	import { ArrowUpRight, RefreshCw, Check, Copy } from '@lucide/svelte';
+	import FormField from './FormField.svelte';
 	import HostAIDefault from './HostAIDefault.svelte';
 	import SearchPicker from './SearchPicker.svelte';
+	import { describeBy } from '#lib/form-validation.ts';
 	import { revealMotion } from '#lib/motion.ts';
 	import type { Preferences } from '#lib/types.ts';
 	import {
@@ -133,7 +135,7 @@
 <h3 id="ai-connection-heading" tabindex="-1">AI connection</h3>
 <p class="muted">Choose what powers your recipes.</p>
 {#if !signedIn}
-	<p class="field-help">
+	<p class="field-help" id="ai-signin-help">
 		{managedAuth
 			? 'Sign in through your organization to connect a model.'
 			: 'Sign in to save a ChatGPT connection or use an API key.'}
@@ -143,13 +145,13 @@
 {#if chatGPT.hostAdmin}
 	<div class="device-login">
 		<h4>Host AI administration</h4>
-		<p class="field-help">
+		<p class="muted">
 			Use one Codex connection and model for this admin account, or for every signed-in account when
 			<code>FLAVORITHM_HOST_AI_SHARED=true</code>.
 		</p>
 		{#if chatGPT.host}<p>Host connection enabled · {chatGPT.host.model}</p>
 			<button class="secondary" onclick={() => setHost(false)}>Disable host connection</button>
-		{:else}<p class="field-help">
+		{:else}<p class="muted">
 				Connect ChatGPT with a device code below and choose its model, then enable sharing.
 			</p>
 			<button
@@ -169,6 +171,7 @@
 	{signedIn}
 	{usingHost}
 	usePersonalAI={Boolean(preferences.usePersonalAI)}
+	signinHelpId={!signedIn ? 'ai-signin-help' : undefined}
 	ontoggle={togglePersonalOverride}
 />
 {#if !usingHost}
@@ -178,143 +181,168 @@
 		{options}
 		value={preferences.provider}
 		fallback={preferences.provider === 'chatgpt' ? 'ChatGPT subscription' : preferences.provider}
+		describedBy={describeBy(
+			!signedIn ? 'ai-signin-help' : undefined,
+			chatGPT.host ? 'ai-host-help' : undefined,
+			loading ? 'ai-catalog-loading-help' : undefined,
+			subscription && !device && chatGPT.mode === 'device' ? 'ai-device-mode-help' : undefined,
+			subscription && chatGPT.mode === 'local' ? 'ai-local-mode-help' : undefined,
+			subscription && chatGPT.mode !== 'local' && !chatGPT.configured && signedIn
+				? 'ai-unconfigured-help'
+				: undefined,
+			!subscription && provider && !provider.supported ? 'ai-unsupported-provider-help' : undefined
+		)}
 		{onselect}
 	/>
 	{#if catalogError}<p class="error" role="alert">{catalogError}</p>
 		<button class="text-button" onclick={onrefresh}
 			><RefreshCw size={15} /> Retry model catalog</button
 		>{/if}
-	{#if loading}<p class="field-help" role="status">Loading model catalog…</p>{/if}
-{/if}
+	{#if loading}<p class="field-help" id="ai-catalog-loading-help" role="status">
+			Loading model catalog…
+		</p>{/if}
 
-{#key preferences.provider}
-	<div class="connection-setup" hidden={usingHost} in:revealMotion>
-		{#if !usingHost && subscription}
-			<div class="plan-status">
-				<span
-					class="connection-status"
-					class:connected={activeAccount?.connected && activeAccount?.planEnabled}
-				>
-					{#if activeAccount?.connected && activeAccount.planEnabled}<Check size={16} /> Connected
-					{:else if activeAccount?.connected}Plan access needed{:else}Not connected{/if}
-				</span>
-			</div>
-			{#if personalAccounts.length}
-				<label class="field"
-					>ChatGPT account<select
-						bind:value={preferences.chatgptAccountId}
-						onchange={onaccount}
-						disabled={busy}
+	{#key preferences.provider}
+		<div class="connection-setup" in:revealMotion>
+			{#if subscription}
+				<div class="plan-status">
+					<span
+						class="connection-status"
+						class:connected={activeAccount?.connected && activeAccount?.planEnabled}
 					>
-						{#each personalAccounts as account}<option value={account.id}
-								>{account.label}{!account.connected
-									? ' · reconnect'
-									: !account.planEnabled
-										? ' · plan disabled'
-										: ''}</option
-							>{/each}
-					</select></label
-				>
-			{/if}
-			{#if activeAccount?.id !== HOST_CONNECTION_ID}
-				<div class="connection-actions">
-					<button
-						class="primary"
-						disabled={busy || !signedIn || !chatGPT.configured}
-						onclick={() => onconnect(activeAccount?.id)}
-					>
-						{busy
-							? 'Connecting…'
-							: activeAccount
-								? 'Reconnect with ChatGPT'
-								: 'Continue with ChatGPT'}<ArrowUpRight size={17} />
-					</button>
-					{#if activeAccount}<button
-							class="secondary"
-							disabled={busy || !signedIn || !chatGPT.configured}
-							onclick={() => onconnect()}>Add account</button
-						>{/if}
-					{#if activeAccount?.connected && !activeAccount.planEnabled}<button
-							class="secondary"
-							disabled={busy || !chatGPT.configured}
-							onclick={() => onconnect(activeAccount?.id, true)}>Enable plan usage</button
-						>{/if}
+						{#if activeAccount?.connected && activeAccount.planEnabled}<Check size={16} /> Connected
+						{:else if activeAccount?.connected}Plan access needed{:else}Not connected{/if}
+					</span>
 				</div>
-			{/if}
-			{#if device}
-				<div class="device-login" in:revealMotion role="status">
-					<p>Open ChatGPT and enter this code:</p>
-					<div class="device-code-row">
-						<code>{device.userCode}</code><button
-							class="text-button"
-							onclick={oncopycode}
-							aria-label="Copy ChatGPT authorization code"><Copy size={18} /></button
+				{#if personalAccounts.length}
+					<FormField id="ai-chatgpt-account" label="ChatGPT account">
+						{#snippet children(field)}
+							<select
+								bind:value={preferences.chatgptAccountId}
+								onchange={onaccount}
+								disabled={busy}
+								{...field}
+							>
+								{#each personalAccounts as account}<option value={account.id}
+										>{account.label}{!account.connected
+											? ' · reconnect'
+											: !account.planEnabled
+												? ' · plan disabled'
+												: ''}</option
+									>{/each}
+							</select>
+						{/snippet}
+					</FormField>
+				{/if}
+				{#if activeAccount?.id !== HOST_CONNECTION_ID}
+					<div class="connection-actions">
+						<button
+							class="primary"
+							disabled={busy || !signedIn || !chatGPT.configured}
+							onclick={() => onconnect(activeAccount?.id)}
 						>
+							{busy
+								? 'Connecting…'
+								: activeAccount
+									? 'Reconnect with ChatGPT'
+									: 'Continue with ChatGPT'}<ArrowUpRight size={17} />
+						</button>
+						{#if activeAccount}<button
+								class="secondary"
+								disabled={busy || !signedIn || !chatGPT.configured}
+								onclick={() => onconnect()}>Add account</button
+							>{/if}
+						{#if activeAccount?.connected && !activeAccount.planEnabled}<button
+								class="secondary"
+								disabled={busy || !chatGPT.configured}
+								onclick={() => onconnect(activeAccount?.id, true)}>Enable plan usage</button
+							>{/if}
 					</div>
+				{/if}
+				{#if device}
+					<div class="device-login" in:revealMotion role="status">
+						<p>Open ChatGPT and enter this code:</p>
+						<div class="device-code-row">
+							<code>{device.userCode}</code><button
+								class="text-button"
+								onclick={oncopycode}
+								aria-label="Copy ChatGPT authorization code"><Copy size={18} /></button
+							>
+						</div>
+						<div class="connection-actions">
+							<a
+								class="primary"
+								href={device.verificationUrl}
+								target="_blank"
+								rel="noopener noreferrer">Open ChatGPT <ArrowUpRight size={17} /></a
+							><button class="secondary" onclick={oncancel}>Cancel</button>
+						</div>
+						<p class="muted">Waiting for approval. This code expires in 15 minutes.</p>
+					</div>
+				{:else if chatGPT.mode === 'device'}
+					<p class="field-help" id="ai-device-mode-help">
+						Connect in your browser with a one-time code. No API key or installation needed.
+					</p>
+				{/if}
+				{#if chatGPT.mode === 'local'}<p class="field-help" id="ai-local-mode-help">
+						Complete ChatGPT authorization in your browser. Flavorithm handles the connection.
+					</p>
+				{:else if !chatGPT.configured && signedIn}<p
+						class="field-help"
+						id="ai-unconfigured-help"
+						role="status"
+					>
+						{chatGPT.safeReason ||
+							'Unable to load authorization options. Retry the connection settings.'}
+					</p>{/if}
+				{#if authorizationUrl}<a
+						class="text-button auth-fallback"
+						href={authorizationUrl}
+						target="_blank"
+						rel="noreferrer noopener">Open ChatGPT authorization <ArrowUpRight size={16} /></a
+					>{/if}
+				{#if activeAccount?.connected && activeAccount.id !== HOST_CONNECTION_ID}
 					<div class="connection-actions">
 						<a
-							class="primary"
-							href={device.verificationUrl}
+							class="text-button"
+							href="https://chatgpt.com/settings/usage"
 							target="_blank"
-							rel="noopener noreferrer">Open ChatGPT <ArrowUpRight size={17} /></a
-						><button class="secondary" onclick={oncancel}>Cancel</button>
+							rel="noreferrer">Manage plan usage <ArrowUpRight size={15} /></a
+						>
+						<button class="text-button danger" disabled={busy} onclick={ondisconnect}
+							>Disconnect</button
+						>
 					</div>
-					<p class="field-help">Waiting for approval. This code expires in 15 minutes.</p>
-				</div>
-			{:else if chatGPT.mode === 'device'}
-				<p class="field-help">
-					Connect in your browser with a one-time code. No API key or installation needed.
-				</p>
-			{/if}
-			{#if chatGPT.mode === 'local'}<p class="field-help">
-					Complete ChatGPT authorization in your browser. Flavorithm handles the connection.
-				</p>
-			{:else if !chatGPT.configured && signedIn}<p class="field-help" role="status">
-					{chatGPT.safeReason ||
-						'Unable to load authorization options. Retry the connection settings.'}
+				{/if}
+			{:else if provider?.supported}
+				<FormField id="ai-provider-api-key" label={`${provider.name} API key`}>
+					{#snippet children(field)}
+						<input
+							type="password"
+							autocomplete="off"
+							spellcheck="false"
+							placeholder={provider.apiKeyHint || 'Your provider API key'}
+							bind:value={apiKey}
+							disabled={!signedIn}
+							{...field}
+						/>
+					{/snippet}
+					{#snippet helpSnippet(helpId)}
+						<p class="field-help" id={helpId}>
+							Kept in memory for this tab. Uses {provider.name} API billing.{#if provider.documentation}
+								<a href={provider.documentation} target="_blank" rel="noreferrer"
+									>Provider setup <ArrowUpRight size={13} /></a
+								>{/if}
+						</p>
+					{/snippet}
+				</FormField>
+			{:else if provider}<p class="field-help" id="ai-unsupported-provider-help">
+					This provider requires an integration Flavorithm does not support yet. Choose another
+					connection.
 				</p>{/if}
-			{#if authorizationUrl}<a
-					class="text-button auth-fallback"
-					href={authorizationUrl}
-					target="_blank"
-					rel="noreferrer noopener">Open ChatGPT authorization <ArrowUpRight size={16} /></a
-				>{/if}
-			{#if activeAccount?.connected && activeAccount.id !== HOST_CONNECTION_ID}
-				<div class="connection-actions">
-					<a
-						class="text-button"
-						href="https://chatgpt.com/settings/usage"
-						target="_blank"
-						rel="noreferrer">Manage plan usage <ArrowUpRight size={15} /></a
-					>
-					<button class="text-button danger" disabled={busy} onclick={ondisconnect}
-						>Disconnect</button
-					>
-				</div>
-			{/if}
-		{:else if !usingHost && provider?.supported}
-			<label class="field"
-				>{provider.name} API key<input
-					type="password"
-					autocomplete="off"
-					spellcheck="false"
-					placeholder={provider.apiKeyHint || 'Your provider API key'}
-					bind:value={apiKey}
-					disabled={!signedIn}
-				/></label
-			>
-			<p class="field-help">
-				Kept in memory for this tab. Uses {provider.name} API billing.{#if provider.documentation}
-					<a href={provider.documentation} target="_blank" rel="noreferrer"
-						>Provider setup <ArrowUpRight size={13} /></a
-					>{/if}
-			</p>
-		{:else if !usingHost && provider}<p class="field-help">
-				This provider requires an integration Flavorithm does not support yet. Choose another
-				connection.
-			</p>{/if}
-	</div>
-{/key}
+		</div>
+	{/key}
+{/if}
 
 {#if !usingHost && ((subscription && activeAccount?.connected && activeAccount.planEnabled) || (!subscription && provider?.supported))}
 	<SearchPicker
@@ -327,55 +355,68 @@
 		}))}
 		value={preferences.model}
 		fallback={preferences.model}
+		describedBy={selectedModel && !selectedModel.vision ? 'ai-model-vision-help' : undefined}
 		onselect={selectModel}
 		disabled={!signedIn || !models.length}
 	/>
 	{#if subscription}<button class="text-button" disabled={loading || busy} onclick={onrefresh}
 			><RefreshCw size={15} /> Refresh account models</button
 		>{/if}
-	{#if selectedModel && !selectedModel.vision}<p class="field-help">
+	{#if selectedModel && !selectedModel.vision}<p class="field-help" id="ai-model-vision-help">
 			This model accepts text only. Choose a model with image input to import photos.
 		</p>{/if}
 	{#if reasoning}
 		<div class="reasoning-fields" in:revealMotion>
-			{#if reasoning.toggle}<label class="field"
-					>Thinking<select
-						value={preferences.reasoning?.enabled === undefined
-							? ''
-							: preferences.reasoning.enabled
-								? 'on'
-								: 'off'}
-						onchange={(event) => setThinking(event.currentTarget.value)}
-						><option value="">Model default</option><option value="on">On</option><option
-							value="off">Off</option
-						></select
-					></label
-				>{/if}
-			{#if reasoning.efforts.length}<label class="field"
-					>Reasoning level<select
-						value={preferences.reasoning?.effort || ''}
-						disabled={preferences.reasoning?.enabled === false}
-						onchange={(event) => setEffort(event.currentTarget.value)}
-						><option value="">Model default</option>{#each reasoning.efforts as effort}<option
-								value={effort}
-								>{effort === 'xhigh'
-									? 'Extra high'
-									: effort.charAt(0).toUpperCase() + effort.slice(1)}</option
-							>{/each}</select
-					></label
-				>{/if}
-			{#if reasoning.budgetMin !== undefined}<label class="field"
-					>Thinking budget (tokens)<input
-						type="number"
-						min={reasoning.budgetMin}
-						max={reasoning.budgetMax}
-						step="1"
-						placeholder="Model default"
-						value={preferences.reasoning?.budgetTokens ?? ''}
-						disabled={preferences.reasoning?.enabled === false}
-						onchange={(event) => setBudget(event.currentTarget.value)}
-					/></label
-				>{/if}
+			{#if reasoning.toggle}<FormField id="ai-thinking" label="Thinking">
+					{#snippet children(field)}
+						<select
+							value={preferences.reasoning?.enabled === undefined
+								? ''
+								: preferences.reasoning.enabled
+									? 'on'
+									: 'off'}
+							onchange={(event) => setThinking(event.currentTarget.value)}
+							{...field}
+							><option value="">Model default</option><option value="on">On</option><option
+								value="off">Off</option
+							></select
+						>
+					{/snippet}
+				</FormField>{/if}
+			{#if reasoning.efforts.length}<FormField id="ai-reasoning-level" label="Reasoning level">
+					{#snippet children(field)}
+						<select
+							value={preferences.reasoning?.effort || ''}
+							disabled={preferences.reasoning?.enabled === false}
+							onchange={(event) => setEffort(event.currentTarget.value)}
+							{...field}
+							><option value="">Model default</option>{#each reasoning.efforts as effort}<option
+									value={effort}
+									>{effort === 'xhigh'
+										? 'Extra high'
+										: effort.charAt(0).toUpperCase() + effort.slice(1)}</option
+								>{/each}</select
+						>
+					{/snippet}
+				</FormField>{/if}
+			{#if reasoning.budgetMin !== undefined}<FormField
+					id="ai-thinking-budget"
+					label="Thinking budget (tokens)"
+				>
+					{#snippet children(field)}
+						<input
+							type="number"
+							min={reasoning.budgetMin}
+							max={reasoning.budgetMax}
+							step="1"
+							placeholder="Model default"
+							value={preferences.reasoning?.budgetTokens ?? ''}
+							disabled={preferences.reasoning?.enabled === false}
+							onchange={(event) => setBudget(event.currentTarget.value)}
+							{...field}
+						/>
+					{/snippet}
+				</FormField>{/if}
 		</div>
 	{/if}
 {/if}

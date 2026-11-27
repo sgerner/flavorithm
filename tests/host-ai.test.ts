@@ -673,6 +673,11 @@ test('client workflow reconciliation and kitchen state sanitization preserve per
 	assert.equal(sanitizedOverride.preferences.model, 'claude-sonnet-4');
 	assert.deepEqual(sanitizedOverride.preferences.reasoning, { enabled: true, budgetTokens: 4096 });
 
+	const explicitHostChoiceState = structuredClone(overrideState);
+	explicitHostChoiceState.preferences.usePersonalAI = false;
+	const sanitizedExplicitHost = sanitizeKitchenState(explicitHostChoiceState);
+	assert.equal(sanitizedExplicitHost.preferences.usePersonalAI, false);
+
 	const legacyHostState = createNewUserState();
 	legacyHostState.preferences = {
 		...defaultPreferences,
