@@ -813,7 +813,12 @@ test('marking a meal cooked keeps pantry deduction opt-in', () => {
 		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
 
 		api.openCookDialog(meal);
+		assert.equal(api.deductPantry, false);
 
+		api.deductPantry = true;
+		assert.equal(api.deductPantry, true);
+
+		api.openCookDialog(meal);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
