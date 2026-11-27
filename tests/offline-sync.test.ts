@@ -1,16 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createNewUserState } from '../src/lib/data.ts';
+import { createInitialState, createNewUserState } from '../src/lib/data.ts';
 import { completeMeal } from '../src/lib/kitchen-workflows.ts';
 import {
 	clearPendingJournalRecords,
+	isKitchenState,
+	MAX_QUARANTINED_JOURNAL_ENTRIES,
 	mergeKitchenStates,
 	mergePendingKitchenJournal,
 	readPendingJournal,
+	readQuarantinedJournal,
 	syncPendingKitchenJournal,
 	type PendingJournalRecord,
-	writePending
+	writePending,
+	writePendingJournal
 } from '../src/lib/offline-sync.ts';
+import { validateKitchenState } from '../src/lib/state-schema.ts';
 
 test('offline snapshots are isolated by both account and household', () => {
 	const values = new Map<string, string>();
@@ -374,6 +379,318 @@ test('sync rechecks its identity after GET before PUT', async () => {
 		{ status: 409 }
 	);
 	assert.equal(writes, 0);
+});
+
+test('readPendingJournal quarantines unreadable or invalid slots under isolated keys and keeps valid edits', () => {
+	const values = new Map<string, string>();
+	const storage = {
+		get length() {
+			return values.size;
+		},
+		key: (index: number) => [...values.keys()][index] ?? null,
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			values.set(key, value);
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
+		}
+	};
+	const userA = { id: 'user:a', householdId: 'home:a', name: 'A', email: 'a@example.test' };
+	const userOtherHome = { ...userA, householdId: 'home:b' };
+	const base = createNewUserState();
+	const validLocal = structuredClone(base);
+	validLocal.pantry.push({
+		id: 'olive-oil',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		category: 'Pantry'
+	});
+	writePendingJournal(storage, {
+		userId: userA.id,
+		householdId: userA.householdId,
+		base,
+		local: validLocal,
+		etag: 'v1',
+		createdAt: 10,
+		updatedAt: 20,
+		writerId: 'tab-valid',
+		writeId: 'w1'
+	});
+	writePendingJournal(storage, {
+		userId: userOtherHome.id,
+		householdId: userOtherHome.householdId,
+		base,
+		local: validLocal,
+		etag: 'v1',
+		createdAt: 10,
+		updatedAt: 20,
+		writerId: 'tab-other-home',
+		writeId: 'w2'
+	});
+
+	const prefixA = `flavorithm-pending-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:`;
+	const quarantineA = `flavorithm-quarantined-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:`;
+	storage.setItem(`${prefixA}tab-corrupt`, '{broken-json');
+
+	const invalidLocal = structuredClone(base);
+	(invalidLocal.pantry as unknown[]).push({
+		id: 'bad',
+		name: 'salt',
+		quantity: null,
+		unit: 'tsp',
+		category: 'Spices'
+	});
+	storage.setItem(
+		`${prefixA}tab-invalid`,
+		JSON.stringify({
+			userId: userA.id,
+			householdId: userA.householdId,
+			base,
+			local: invalidLocal,
+			etag: 'v1',
+			updatedAt: 25,
+			writerId: 'tab-invalid'
+		})
+	);
+	storage.setItem(
+		`${prefixA}tab-mismatch`,
+		JSON.stringify({
+			userId: userA.id,
+			householdId: userA.householdId,
+			base,
+			local: validLocal,
+			etag: 'v1',
+			updatedAt: 30,
+			writerId: 'different-writer'
+		})
+	);
+
+	const loaded = readPendingJournal(storage, userA);
+	assert.equal(loaded.records.length, 1);
+	assert.equal(loaded.records[0].writerId, 'tab-valid');
+	assert.match(loaded.error, /quarantined/);
+	assert.equal(storage.getItem(`${prefixA}tab-corrupt`), null);
+	assert.equal(storage.getItem(`${prefixA}tab-invalid`), null);
+	assert.equal(storage.getItem(`${prefixA}tab-mismatch`), null);
+	assert.equal(storage.getItem(`${quarantineA}tab-corrupt`), '{broken-json');
+	assert.ok(storage.getItem(`${quarantineA}tab-invalid`)?.includes('"quantity":null'));
+	assert.ok(storage.getItem(`${quarantineA}tab-mismatch`)?.includes('different-writer'));
+
+	const otherHomeLoaded = readPendingJournal(storage, userOtherHome);
+	assert.equal(otherHomeLoaded.records.length, 1);
+	assert.equal(otherHomeLoaded.error, '');
+	assert.equal(
+		[...values.keys()].some((k) =>
+			k.startsWith(
+				`flavorithm-quarantined-journal:v1:${encodeURIComponent(userOtherHome.id)}:${encodeURIComponent(userOtherHome.householdId)}:`
+			)
+		),
+		false
+	);
+});
+
+test('isKitchenState shares the server appState schema without drift', async () => {
+	process.env.FLAVORITHM_DB_PATH ??= ':memory:';
+	const { validateAppState } = await import('../src/lib/server/db.ts');
+
+	const starter = createInitialState();
+	starter.recipes[0].sampleSaved = true;
+	starter.preferences.usePersonalAI = true;
+	assert.equal(isKitchenState(starter), true);
+	assert.deepEqual(validateAppState(starter), starter);
+
+	const valid = createNewUserState();
+	valid.recipes.push({
+		...starter.recipes[0],
+		id: 'cover-recipe',
+		image: `/api/recipe-covers/${'a'.repeat(64)}`,
+		importNotes: ['a'.repeat(300)],
+		sampleSaved: false
+	});
+	valid.pantry.push({
+		id: 'sample-pantry',
+		name: 'garlic',
+		quantity: 3,
+		unit: 'clove',
+		category: 'Produce',
+		sample: true
+	});
+	valid.shopping.push({
+		id: 'sample-shop',
+		name: 'lemons',
+		quantity: 2,
+		unit: 'piece',
+		checked: false
+	});
+	valid.meals.push({
+		id: 'sample-meal',
+		date: '2026-04-01',
+		slot: 'Dinner',
+		recipeId: 'cover-recipe',
+		servings: 2,
+		sample: true
+	});
+	valid.preferences.reasoning = { effort: 'xhigh', enabled: true, budgetTokens: 1024 };
+	assert.equal(isKitchenState(valid), true);
+	assert.deepEqual(validateAppState(valid), valid);
+	assert.deepEqual(validateKitchenState(valid), valid);
+
+	const badCover = structuredClone(valid);
+	badCover.recipes[0].image = `/recipe-covers/${'a'.repeat(64)}`;
+	assert.equal(isKitchenState(badCover), false);
+	assert.equal(validateAppState(badCover), null);
+
+	const badNote = structuredClone(valid);
+	badNote.recipes[0].importNotes = ['a'.repeat(301)];
+	assert.equal(isKitchenState(badNote), false);
+	assert.equal(validateAppState(badNote), null);
+
+	const badEffort = structuredClone(valid);
+	badEffort.preferences.reasoning = { effort: 'x-high' };
+	assert.equal(isKitchenState(badEffort), false);
+	assert.equal(validateAppState(badEffort), null);
+
+	for (const nonFinite of [Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+		const badNumber = structuredClone(valid);
+		badNumber.recipes[0].nutrition.calories = nonFinite;
+		assert.equal(isKitchenState(badNumber), false);
+		assert.equal(validateAppState(badNumber), null);
+	}
+});
+
+test('quarantine slots bound suffix and payload growth and expose entries for backup recovery', () => {
+	const values = new Map<string, string>();
+	const storage = {
+		get length() {
+			return values.size;
+		},
+		key: (index: number) => [...values.keys()][index] ?? null,
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			values.set(key, value);
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
+		}
+	};
+	const user = { id: 'user-q', householdId: 'home-q', name: 'Q', email: 'q@example.test' };
+	const pendingPrefix = `flavorithm-pending-journal:v1:${user.id}:${user.householdId}:`;
+	const quarantinePrefix = `flavorithm-quarantined-journal:v1:${user.id}:${user.householdId}:`;
+
+	for (let round = 1; round <= MAX_QUARANTINED_JOURNAL_ENTRIES + 4; round += 1) {
+		storage.setItem(`${pendingPrefix}same-slot`, JSON.stringify({ round, broken: true }));
+		const loaded = readPendingJournal(storage, user);
+		assert.match(loaded.error, /quarantined/);
+	}
+
+	const oversizedPayload = `{"corrupt":"${'x'.repeat(300_000)}"}`;
+	storage.setItem(`${pendingPrefix}huge-slot`, oversizedPayload);
+	readPendingJournal(storage, user);
+
+	const quarantinedKeys = [...values.keys()].filter((entry) => entry.startsWith(quarantinePrefix));
+	assert.ok(quarantinedKeys.length <= MAX_QUARANTINED_JOURNAL_ENTRIES);
+	for (const keyName of quarantinedKeys) {
+		const suffix = keyName.slice(quarantinePrefix.length);
+		assert.doesNotMatch(suffix, /:\d{10,}$/);
+	}
+
+	const entries = readQuarantinedJournal(storage, user);
+	assert.equal(entries.length, quarantinedKeys.length);
+	const huge = entries.find((entry) => entry.slot.startsWith('huge-slot'));
+	assert.ok(huge);
+	assert.equal(huge.raw, oversizedPayload);
+	assert.equal(storage.getItem(`${pendingPrefix}huge-slot`), null);
+	assert.deepEqual(huge.parsed, JSON.parse(oversizedPayload));
+	const parsedEntry = entries.find((entry) => entry.parsed !== undefined);
+	assert.ok(parsedEntry);
+});
+
+test('legacy stored recipes in journal base or server state heal without blocking valid edits', async () => {
+	const values = new Map<string, string>();
+	const storage = {
+		get length() {
+			return values.size;
+		},
+		key: (index: number) => [...values.keys()][index] ?? null,
+		getItem: (key: string) => values.get(key) ?? null,
+		setItem: (key: string, value: string) => {
+			values.set(key, value);
+		},
+		removeItem: (key: string) => {
+			values.delete(key);
+		}
+	};
+	const user = { id: 'legacy-u', householdId: 'legacy-h', name: 'L', email: 'l@example.test' };
+	const legacyBase = createInitialState();
+	legacyBase.recipes[0].image = 'http://legacy.example/soup.jpg';
+	legacyBase.recipes[0].importNotes = ['n'.repeat(340)];
+	(legacyBase.preferences as Record<string, unknown>).connectionId = 'host-chatgpt';
+	legacyBase.preferences.reasoning = { effort: 'invalid-legacy' };
+
+	const validLocal = structuredClone(legacyBase);
+	validLocal.pantry.push({
+		id: 'chickpeas',
+		name: 'chickpeas',
+		quantity: 2,
+		unit: 'can',
+		category: 'Pantry'
+	});
+	writePendingJournal(storage, {
+		userId: user.id,
+		householdId: user.householdId,
+		base: legacyBase,
+		local: validLocal,
+		etag: 'v1',
+		createdAt: 1,
+		updatedAt: 2,
+		writerId: 'tab-legacy',
+		writeId: 'w-legacy'
+	});
+
+	const loaded = readPendingJournal(storage, user);
+	assert.equal(loaded.error, '');
+	assert.equal(loaded.records.length, 1);
+	assert.equal(isKitchenState(loaded.records[0].pending.local), true);
+
+	const remoteWithLegacy = structuredClone(legacyBase);
+	remoteWithLegacy.shopping.push({
+		id: 'bread',
+		name: 'sourdough',
+		quantity: 1,
+		unit: 'loaf',
+		checked: false
+	});
+
+	let uploaded: unknown = null;
+	const synced = await syncPendingKitchenJournal(loaded.records, {
+		identity: { userId: user.id, householdId: user.householdId },
+		get: async () => ({
+			state: remoteWithLegacy,
+			etag: 'v2',
+			userId: user.id,
+			householdId: user.householdId
+		}),
+		put: async (state) => {
+			const validated = validateKitchenState(state);
+			assert.ok(validated);
+			uploaded = validated;
+			return { state: validated, etag: 'v3' };
+		}
+	});
+	assert.equal(synced.saved, true);
+	assert.ok(uploaded);
+	assert.equal(synced.state.recipes[0].image, '');
+	assert.equal(synced.state.recipes[0].importNotes?.[0].length, 300);
+	assert.equal(
+		synced.state.pantry.some((item) => item.id === 'chickpeas'),
+		true
+	);
+	assert.equal(
+		synced.state.shopping.some((item) => item.id === 'bread'),
+		true
+	);
 });
 
 test('prefer syncs pin If-Match to reviewedEtag and halt without PUT when GET returns a newer ETag', async () => {
