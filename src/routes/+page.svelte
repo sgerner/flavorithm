@@ -5914,14 +5914,27 @@
 									<button
 										class="secondary"
 										type="button"
-										disabled={scanBusy || busy || voiceBusy}
-										onclick={() => stagedScanFile && scanPantryPhoto(stagedScanFile)}
-										>{scanBusy ? 'Scanning…' : 'Scan photo'}</button
+										use:busyAction={scanBusy || busy || voiceBusy}
+										use:focusHandoff={{
+											target: '#pantry-ingredients',
+											fallback: '.dialog-actions button'
+										}}
+										onclick={() => {
+											if (!scanBusy && !busy && !voiceBusy && stagedScanFile) {
+												void scanPantryPhoto(stagedScanFile);
+											}
+										}}>{scanBusy ? 'Scanning…' : 'Scan photo'}</button
 									><button
 										class="text-button"
 										type="button"
-										disabled={scanBusy || busy || voiceBusy}
-										onclick={() => (stagedScanFile = null)}>Remove</button
+										use:busyAction={scanBusy || busy || voiceBusy}
+										use:focusHandoff={{
+											target: '#pantry-ingredients',
+											fallback: '.dialog-actions button'
+										}}
+										onclick={() => {
+											if (!scanBusy && !busy && !voiceBusy) stagedScanFile = null;
+										}}>Remove</button
 									>
 								</div>
 							</div>{/if}

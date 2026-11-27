@@ -349,10 +349,12 @@ function resolveLazyNeighborRow(snapshot: HandoffSnapshot): HTMLElement | null {
 		}
 		return null;
 	}
-	if (rowNextSibling && rowNextSibling.parentElement === rowContainer) {
-		split = Array.prototype.indexOf.call(siblings, rowNextSibling);
-	} else if (rowPrevSibling && rowPrevSibling.parentElement === rowContainer) {
+	if (rowPrevSibling && rowPrevSibling.parentElement === rowContainer) {
 		split = Array.prototype.indexOf.call(siblings, rowPrevSibling) + 1;
+	} else if (rowRawIndex === 0) {
+		split = 0;
+	} else if (rowNextSibling && rowNextSibling.parentElement === rowContainer) {
+		split = Array.prototype.indexOf.call(siblings, rowNextSibling);
 	}
 	for (let i = split; i < siblings.length; i++) {
 		if (isMatchingActiveRow(siblings[i], rowContainer, rowSelector)) {
@@ -414,10 +416,12 @@ function resolveLazyDomNeighbor(snapshot: HandoffSnapshot): HTMLElement | null {
 		let startIdx: number;
 		if (link.el.parentElement === link.parent) {
 			startIdx = Array.prototype.indexOf.call(siblings, link.el) + 1;
-		} else if (link.nextSibling && link.nextSibling.parentElement === link.parent) {
-			startIdx = Array.prototype.indexOf.call(siblings, link.nextSibling);
 		} else if (link.prevSibling && link.prevSibling.parentElement === link.parent) {
 			startIdx = Array.prototype.indexOf.call(siblings, link.prevSibling) + 1;
+		} else if (link.childIndex === 0) {
+			startIdx = 0;
+		} else if (link.nextSibling && link.nextSibling.parentElement === link.parent) {
+			startIdx = Array.prototype.indexOf.call(siblings, link.nextSibling);
 		} else {
 			startIdx = Math.min(link.childIndex, siblings.length);
 		}

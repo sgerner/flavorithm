@@ -307,10 +307,10 @@
 		tabindex="-1"
 		aria-label="Chat with Basil"
 		onkeydown={(event) => {
-			if (event.key === 'Escape') {
+			if (event.key === 'Escape' && !event.defaultPrevented) {
 				event.stopPropagation();
 				event.preventDefault();
-				close();
+				void close();
 			}
 		}}
 	>

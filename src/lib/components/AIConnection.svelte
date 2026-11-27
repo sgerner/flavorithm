@@ -523,8 +523,13 @@
 		</div>
 	{/if}
 {:else if subscription && activeAccount?.connected && activeAccount.planEnabled && !catalogError}
-	<button class="text-button" disabled={loading || busy} onclick={onrefresh}
-		><RefreshCw size={15} /> Refresh account models</button
+	<button
+		class="text-button"
+		use:busyAction={loading || busy}
+		use:focusHandoff={{ fallback: '#ai-connection-heading' }}
+		onclick={() => {
+			if (!loading && !busy) onrefresh();
+		}}><RefreshCw size={15} /> Refresh account models</button
 	>
 {/if}
 <p class="catalog-credit">

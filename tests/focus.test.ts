@@ -694,6 +694,21 @@ test('focusHandoff computes neighbors lazily at unmount with zero getComputedSty
 	await flushMicrotasks();
 	assert.equal(doc.activeElement, afterBtn);
 
+	const midBtn = doc.el('button', { classList: ['mid-btn'] });
+	toolbar.children.splice(1, 0, midBtn);
+	midBtn.parentElement = toolbar;
+	const midHandoff = focusHandoff(midBtn as unknown as HTMLElement);
+	midBtn.focus();
+	midBtn.dispatch({ type: 'click', bubbles: true });
+	const replacementBtn = doc.el('button', { classList: ['replacement-btn'] });
+	const midIdx = toolbar.children.indexOf(midBtn);
+	midBtn.remove();
+	midHandoff.destroy();
+	toolbar.children.splice(midIdx, 0, replacementBtn);
+	replacementBtn.parentElement = toolbar;
+	await flushMicrotasks();
+	assert.equal(doc.activeElement, replacementBtn);
+
 	for (const h of handoffs) h.destroy();
 });
 
