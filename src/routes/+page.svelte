@@ -113,6 +113,7 @@
 		addPantryItems,
 		backfillSampleData,
 		completeMeal,
+		completeRecipe,
 		deleteMeal,
 		deleteRecipe,
 		deleteShoppingItem,
@@ -659,6 +660,9 @@
 	let pickingForSlot = $state(false);
 	let editingMealId = $state('');
 	let cookingMealId = $state('');
+	let cookingRecipeId = $state('');
+	let cookingServings = $state<number | null>(2);
+	let completeTodaysPlan = $state(false);
 	let deductPantry = $state(false);
 	let leftoverServings = $state<number | null>(0);
 	let pantryFilter = $state('all');
@@ -680,10 +684,24 @@
 			? validatePlannedServings(plannedServings)
 			: ''
 	);
-	let activeCookingMeal = $derived(kitchen.meals.find((item) => item.id === cookingMealId));
+	let activeCookingMeal = $derived(
+		cookingMealId ? kitchen.meals.find((item) => item.id === cookingMealId) : undefined
+	);
+	let cookingServingsError = $derived(
+		formSubmitted && modal === 'cookMeal' && !activeCookingMeal
+			? validatePlannedServings(cookingServings)
+			: ''
+	);
+	let effectiveCookMaxServings = $derived(
+		activeCookingMeal
+			? activeCookingMeal.servings
+			: typeof cookingServings === 'number' && isValidServings(cookingServings)
+				? cookingServings
+				: MAX_SERVINGS
+	);
 	let leftoverError = $derived(
 		formSubmitted && modal === 'cookMeal'
-			? validateLeftoverServings(leftoverServings, activeCookingMeal?.servings ?? MAX_SERVINGS)
+			? validateLeftoverServings(leftoverServings, effectiveCookMaxServings)
 			: ''
 	);
 	let pantryFieldError = $derived(
@@ -2572,9 +2590,10 @@
 	});
 	let cookingSteps = $state<Record<string, number[]>>({});
 	let selectedMealServings = $state<number | undefined>();
-	let cookingSessionKey = $derived(
-		`${user?.id ?? 'guest'}:${user?.householdId ?? ''}:${selected?.id ?? ''}`
-	);
+	function sessionKeyForRecipe(recipeId: string) {
+		return `${user?.id ?? 'guest'}:${user?.householdId ?? ''}:${recipeId}`;
+	}
+	let cookingSessionKey = $derived(sessionKeyForRecipe(selected?.id ?? ''));
 	$effect(() => {
 		if (selected && !cookingSteps[cookingSessionKey]) cookingSteps[cookingSessionKey] = [];
 	});
@@ -2643,15 +2662,16 @@
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
 				if (recipe && effect.mode === 'edit') openRecipeEditor(recipe);
 				else if (recipe && effect.mode === 'cook') {
-					const meal = kitchen.meals.find(
-						(item) => item.recipeId === recipe.id && !item.completedAt
+					const todaysMeal = kitchen.meals.find(
+						(item) =>
+							item.recipeId === recipe.id && !item.completedAt && item.date === dateKey(new Date())
 					);
-					if (meal) openCookDialog(meal);
-					else {
-						selectedMealServings = undefined;
-						selectedDetailTab = 'recipe';
-						selected = recipe;
-					}
+					const meal =
+						todaysMeal ??
+						kitchen.meals.find((item) => item.recipeId === recipe.id && !item.completedAt);
+					if (todaysMeal) openRecipeCookDialog(recipe, todaysMeal.servings);
+					else if (meal) openCookDialog(meal);
+					else openRecipeCookDialog(recipe, recipe.servings);
 				} else {
 					selectedMealServings = undefined;
 					selectedDetailTab = 'recipe';
@@ -3302,6 +3322,9 @@
 		plannedServings = 2;
 		editingMealId = '';
 		cookingMealId = '';
+		cookingRecipeId = '';
+		cookingServings = 2;
+		completeTodaysPlan = false;
 		deductPantry = false;
 		leftoverServings = 0;
 	}
@@ -3551,17 +3574,52 @@
 		if (meal.completedAt) return;
 		resetMealDialogState();
 		cookingMealId = meal.id;
+		cookingRecipeId = meal.recipeId;
+		cookingServings = meal.servings;
 		deductPantry = false;
 		leftoverServings = 0;
 		formSubmitted = false;
 		modal = 'cookMeal';
 	}
+	function openRecipeCookDialog(recipe: Recipe, servings = recipe.servings) {
+		const normalizedServings = isValidServings(servings)
+			? servings
+			: Math.min(MAX_SERVINGS, Math.max(1, Math.round(recipe.servings || 1)));
+		const todaysMeal = kitchen.meals.find(
+			(item) =>
+				item.recipeId === recipe.id && !item.completedAt && item.date === dateKey(new Date())
+		);
+		resetMealDialogState();
+		cookingRecipeId = recipe.id;
+		cookingServings = normalizedServings;
+		completeTodaysPlan = Boolean(todaysMeal);
+		deductPantry = false;
+		leftoverServings = 0;
+		formSubmitted = false;
+		selectedMealServings = normalizedServings;
+		modal = 'cookMeal';
+	}
 	async function markMealCooked(event?: SubmitEvent) {
 		event?.preventDefault();
-		const meal = kitchen.meals.find((item) => item.id === cookingMealId);
-		if (!meal) return;
+		const scheduledMeal = cookingMealId
+			? kitchen.meals.find((item) => item.id === cookingMealId)
+			: undefined;
+		if (cookingMealId && !scheduledMeal) return;
+
+		const recipeId = scheduledMeal?.recipeId ?? cookingRecipeId;
+		if (!recipeId) return;
+
 		if (
-			validateLeftoverServings(leftoverServings, meal.servings) ||
+			(!scheduledMeal &&
+				(validatePlannedServings(cookingServings) || typeof cookingServings !== 'number')) ||
+			validateLeftoverServings(
+				leftoverServings,
+				scheduledMeal
+					? scheduledMeal.servings
+					: typeof cookingServings === 'number' && isValidServings(cookingServings)
+						? cookingServings
+						: MAX_SERVINGS
+			) ||
 			typeof leftoverServings !== 'number'
 		) {
 			formSubmitted = true;
@@ -3570,17 +3628,49 @@
 			return;
 		}
 		formSubmitted = false;
-		const recipeId = meal.recipeId;
-		const servingsCooked = meal.servings;
-		kitchen = completeMeal(kitchen, meal.id, {
-			deductPantry,
-			leftoverServings: Math.round(leftoverServings)
-		});
+		const targetServings = scheduledMeal ? scheduledMeal.servings : Math.round(cookingServings!);
+		const todaysPlannedMeal =
+			!scheduledMeal && completeTodaysPlan
+				? kitchen.meals.find(
+						(item) =>
+							item.recipeId === recipeId && !item.completedAt && item.date === dateKey(new Date())
+					)
+				: undefined;
+		const mealToComplete = scheduledMeal ?? todaysPlannedMeal;
+
+		if (mealToComplete) {
+			let nextKitchen = kitchen;
+			if (!scheduledMeal && mealToComplete.servings !== targetServings) {
+				nextKitchen = upsertMeal(
+					nextKitchen,
+					{ ...mealToComplete, servings: targetServings },
+					undefined,
+					{ preserveSample: Boolean(mealToComplete.sample) }
+				);
+			}
+			kitchen = completeMeal(nextKitchen, mealToComplete.id, {
+				deductPantry,
+				leftoverServings: Math.round(leftoverServings)
+			});
+		} else {
+			try {
+				kitchen = completeRecipe(kitchen, recipeId, {
+					servings: targetServings,
+					deductPantry,
+					leftoverServings: Math.round(leftoverServings)
+				});
+			} catch (e) {
+				notify((e as Error).message);
+				return;
+			}
+		}
+
 		pruneEditingShoppingState();
+		cookingSteps[sessionKeyForRecipe(recipeId)] = [];
 		resetMealDialogState();
 		modal = '';
-		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
-		selectedMealServings = servingsCooked;
+		const recipe = recipesById.get(recipeId);
+		selectedMealServings = targetServings;
 		selectedDetailTab = 'recipe';
 		if (recipe) selected = recipe;
 		notify(recipe ? `Marked cooked. How did you like ${recipe.title}?` : 'Meal marked cooked.');
@@ -3672,6 +3762,10 @@
 			formSubmitted = true;
 			await tick();
 			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		if (kitchen.meals.length >= 1000) {
+			notify('This proposal exceeds the kitchen storage limit. Please make room first.');
 			return;
 		}
 		formSubmitted = false;
@@ -5540,6 +5634,7 @@
 				`recipe:${selected!.id}`
 			)}
 		plan={(servings) => planRecipe(selected!, servings)}
+		cook={(servings) => openRecipeCookDialog(selected!, servings)}
 		nutrition={refreshNutrition}
 		edit={() => openRecipeEditor(selected!)}
 		remove={() => askDeleteRecipe(selected!)}
@@ -6374,11 +6469,58 @@
 						</div>
 					</form>
 				{:else if modal === 'cookMeal'}
-					{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
-					{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
+					{@const cookingMeal = cookingMealId
+						? kitchen.meals.find((meal) => meal.id === cookingMealId)
+						: undefined}
+					{@const targetRecipeId = cookingMeal?.recipeId ?? cookingRecipeId}
+					{@const cookingRecipe = targetRecipeId ? recipesById.get(targetRecipeId) : undefined}
+					{@const todaysPlannedMeal = !cookingMeal
+						? kitchen.meals.find(
+								(meal) =>
+									meal.recipeId === cookingRecipe?.id &&
+									!meal.completedAt &&
+									meal.date === dateKey(new Date())
+							)
+						: undefined}
+					{@const displayCookServings =
+						typeof cookingServings === 'number' && isValidServings(cookingServings)
+							? cookingServings
+							: (cookingRecipe?.servings ?? 1)}
 					<h2>Mark meal cooked</h2>
 					<p class="muted">{cookingRecipe?.title}</p>
 					<form novalidate bind:this={dialogFormEl} onsubmit={markMealCooked}>
+						{#if !cookingMeal}<FormField
+								id="cook-servings"
+								label="Servings cooked"
+								help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
+								error={cookingServingsError}
+								alert
+							>
+								{#snippet children(field)}
+									<input
+										type="number"
+										min="1"
+										max={MAX_SERVINGS}
+										step="1"
+										bind:value={cookingServings}
+										{...field}
+									/>
+								{/snippet}
+							</FormField>{/if}
+						{#if todaysPlannedMeal}<label class="cook-option" for="cook-todays-plan"
+								><input
+									id="cook-todays-plan"
+									type="checkbox"
+									aria-describedby="cook-todays-plan-help"
+									aria-invalid="false"
+									bind:checked={completeTodaysPlan}
+								/><span
+									><b>Complete today’s planned {todaysPlannedMeal.slot.toLowerCase()}</b><small
+										id="cook-todays-plan-help"
+										>Marks your scheduled meal cooked instead of adding a duplicate history entry.</small
+									></span
+								></label
+							>{/if}
 						<label class="cook-option" for="cook-deduct"
 							><input
 								id="cook-deduct"
@@ -6388,14 +6530,17 @@
 								bind:checked={deductPantry}
 							/><span
 								><b>Deduct ingredients from pantry</b><small id="cook-deduct-help"
-									>Uses the planned serving amount and available matching stock.</small
+									>Uses {cookingMeal
+										? 'the planned serving amount'
+										: `${displayCookServings} cooked ${displayCookServings === 1 ? 'serving' : 'servings'}`}
+									and available matching stock.</small
 								></span
 							></label
 						>
 						<FormField
 							id="cook-leftovers"
 							label="Leftover servings"
-							help={`Enter a whole number from 0 to ${(cookingMeal?.servings ?? MAX_SERVINGS).toLocaleString('en-US')} servings. Enter 0 if there are no leftovers.`}
+							help={`Enter a whole number from 0 to ${effectiveCookMaxServings.toLocaleString('en-US')} servings. Enter 0 if there are no leftovers.`}
 							error={leftoverError}
 							alert
 						>
@@ -6403,7 +6548,7 @@
 								<input
 									type="number"
 									min="0"
-									max={cookingMeal?.servings ?? MAX_SERVINGS}
+									max={effectiveCookMaxServings}
 									step="1"
 									bind:value={leftoverServings}
 									{...field}

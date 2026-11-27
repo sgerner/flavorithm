@@ -251,6 +251,61 @@ test('Basil can revise an unsaved recipe card in the same conversation', async (
 	assert.equal(updated.recipes.find((recipe) => recipe.id === draft.id)?.servings, 6);
 });
 
+test('Basil can propose recipe.complete with explicit deductPantry and rejects omitted deductPantry', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const { applyButlerCommands } = await import('../src/lib/butler.ts');
+	const kitchen = createInitialState();
+	const result = (await runAIRequest(
+		{
+			...request,
+			messages: [
+				{
+					role: 'user',
+					content: 'I just cooked the tomato butter beans for four without using pantry stock.'
+				}
+			],
+			context: JSON.stringify(kitchen)
+		},
+		provider(
+			{
+				reply: 'Logged and ready for your review.',
+				commands: [
+					{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 4, deductPantry: false }
+				]
+			},
+			(body) => {
+				const system = String(body.messages[0].content);
+				assert.match(system, /recipe\.complete/);
+				assert.match(system, /always setting deductPantry explicitly/);
+				assert.match(system, /recipe\.open with mode set to cook/);
+			}
+		)
+	)) as { reply: string; commands: unknown[] };
+	const updated = applyButlerCommands(kitchen, result.commands).state;
+	assert.ok(
+		updated.meals.some(
+			(meal) =>
+				meal.recipeId === 'tomato-butter-beans' &&
+				meal.slot === 'Unscheduled' &&
+				meal.servings === 4
+		)
+	);
+	assert.deepEqual(updated.pantry, kitchen.pantry);
+
+	const missingRecipeDeductFlag = await runAIRequest(
+		request,
+		provider({
+			reply: 'Missing deduction flag on recipe.',
+			commands: [{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 4 }]
+		})
+	);
+	assert.deepEqual(missingRecipeDeductFlag, {
+		reply: 'Missing deduction flag on recipe.',
+		commands: [],
+		droppedCommands: 1
+	});
+});
+
 test('butler chat prompt and schema require explicit deductPantry and forbid duplicate deductions', async () => {
 	await runAIRequest(
 		request,

@@ -14,6 +14,8 @@ import {
 	backfillSampleData,
 	clearSampleData,
 	completeMeal,
+	completeRecipe,
+	consumePantry,
 	convertCompatibleQuantity,
 	deleteMeal,
 	deleteRecipe,
@@ -1199,6 +1201,29 @@ test('UI workflows and Basil commands produce identical shopping and kitchen sta
 		deleteRecipe(withSecond, 'stew', now),
 		applyButlerCommands(withSecond, [{ type: 'recipe.delete', id: 'stew' }], now).state
 	);
+
+	// 6. Direct recipe completion via UI and Basil produces identical shopping and pantry state.
+	const uiRecipeCompleted = completeRecipe(
+		withSecond,
+		'stew',
+		{ servings: 4, deductPantry: true, leftoverServings: 2 },
+		now
+	);
+	const basilRecipeCompleted = applyButlerCommands(
+		withSecond,
+		[{ type: 'recipe.complete', id: 'stew', servings: 4, deductPantry: true, leftoverServings: 2 }],
+		now
+	).state;
+	assert.deepEqual(
+		{
+			...uiRecipeCompleted,
+			meals: uiRecipeCompleted.meals.map(({ id: _id, ...rest }) => rest)
+		},
+		{
+			...basilRecipeCompleted,
+			meals: basilRecipeCompleted.meals.map(({ id: _id, ...rest }) => rest)
+		}
+	);
 });
 
 test('user purchases never merge into sample pantry lots and merge into user-owned lots', () => {
@@ -1688,6 +1713,123 @@ test('recipe ranking skips malformed expiry dates, keeps blank lots usable, and 
 	assert.deepEqual(
 		fallbackRanked.map((item) => item.id),
 		['blank-lot', 'invalid-lot']
+	);
+});
+
+test('consumePantry scales by servings while skipping expired stock and incompatible units', () => {
+	const initial = createInitialState();
+	const beans = initial.recipes.find((item) => item.id === 'tomato-butter-beans')!;
+	const now = new Date('2026-10-22T18:30:00.000Z');
+	const pantryWithExpired = [...initial.pantry, pantry('baby spinach', 5, 'cups', '2026-10-20')];
+	const remaining = consumePantry(pantryWithExpired, beans, 4, now);
+	// 4 servings of 2-serving recipe => 2 tbsp olive oil (0.125 cup) deducted from 0.5 cup -> 0.375 cup
+	assert.equal(remaining.find((item) => item.id === 'pantry-olive-oil')?.quantity, 0.375);
+	// 4 cups needed; non-expired 2 cups consumed to 0 while expired 5 cups untouched
+	assert.equal(remaining.find((item) => item.id === 'pantry-spinach')?.quantity, 0);
+	assert.equal(remaining.find((item) => item.expires === '2026-10-20')?.quantity, 5);
+	// garlic in pantry is 'head' vs recipe 'cloves' (incompatible dimension), so untouched
+	assert.equal(remaining.find((item) => item.id === 'pantry-garlic')?.quantity, 1);
+	assert.deepEqual(consumePantry(initial.pantry, beans, 0, now), initial.pantry);
+});
+
+test('completeRecipe records an Unscheduled completed meal, deducts stock, and respects the 1,000-meal limit', () => {
+	const initial = createInitialState();
+	const now = new Date(2026, 9, 22, 19, 15, 0);
+	const completed = completeRecipe(
+		initial,
+		'tomato-butter-beans',
+		{
+			servings: 4,
+			deductPantry: true,
+			leftoverServings: 6,
+			createId: () => 'spontaneous-beans'
+		},
+		now
+	);
+	assert.equal(completed.meals.length, initial.meals.length + 1);
+	const entry = completed.meals.find((meal) => meal.id === 'spontaneous-beans');
+	assert.ok(entry);
+	assert.equal(entry.slot, 'Unscheduled');
+	assert.equal(entry.date, '2026-10-22');
+	assert.equal(entry.recipeId, 'tomato-butter-beans');
+	assert.equal(entry.servings, 4);
+	assert.equal(entry.leftoverServings, 4);
+	assert.equal(entry.completedAt, now.toISOString());
+	assert.equal(completed.pantry.find((item) => item.id === 'pantry-olive-oil')?.quantity, 0.375);
+	assert.equal(completed.pantry.find((item) => item.id === 'pantry-spinach')?.quantity, 0);
+	assert.ok(validateAppState(completed));
+
+	const omittedDeduction = completeRecipe(initial, 'tomato-butter-beans', {}, now);
+	assert.equal(omittedDeduction.meals.length, initial.meals.length + 1);
+	assert.equal(omittedDeduction.meals.at(-1)?.slot, 'Unscheduled');
+	assert.deepEqual(omittedDeduction.pantry, initial.pantry);
+
+	const withoutDeduction = completeRecipe(
+		initial,
+		'tomato-butter-beans',
+		{ deductPantry: false, leftoverServings: 1 },
+		now
+	);
+	assert.deepEqual(withoutDeduction.pantry, initial.pantry);
+	assert.equal(completeRecipe(initial, 'missing-recipe', {}, now), initial);
+	assert.equal(completeRecipe(initial, 'tomato-butter-beans', { servings: 0 }, now), initial);
+
+	const scopedKitchen = state({
+		pantry: [pantry('baby spinach', 1, 'cups')],
+		recipes: initial.recipes,
+		meals: [
+			{
+				id: 'saturday-beans',
+				date: '2026-10-24',
+				slot: 'Dinner',
+				recipeId: 'tomato-butter-beans',
+				servings: 2
+			}
+		],
+		shopping: [
+			shopping('recipe-checked', 'baby spinach', 2, 'cups', true, 'recipe:tomato-butter-beans'),
+			shopping('week-checked', 'baby spinach', 1, 'cups', true, 'week:2026-10-19')
+		]
+	});
+	const skippedScoped = completeRecipe(
+		scopedKitchen,
+		'tomato-butter-beans',
+		{ servings: 2, deductPantry: false },
+		now
+	);
+	assert.equal(skippedScoped.pantry[0].quantity, 1);
+	assert.deepEqual(skippedScoped.shopping, scopedKitchen.shopping);
+
+	const deductedScoped = completeRecipe(
+		scopedKitchen,
+		'tomato-butter-beans',
+		{ servings: 2, deductPantry: true },
+		now
+	);
+	assert.equal(deductedScoped.pantry[0].quantity, 0);
+	// 2 cups needed - 1 cup pantry = 1 cup uncovered retired from recipe:tomato-butter-beans checked row
+	assert.equal(deductedScoped.shopping.find((item) => item.id === 'recipe-checked')?.quantity, 1);
+	// week:2026-10-19 checked row stays intact (1 cup) and Saturday's remaining 1 cup deficit is added unchecked
+	assert.equal(deductedScoped.shopping.find((item) => item.id === 'week-checked')?.quantity, 1);
+	assert.equal(
+		deductedScoped.shopping.find((item) => item.sourceKey === 'week:2026-10-19' && !item.checked)
+			?.quantity,
+		1
+	);
+
+	const fullMeals = state({
+		recipes: initial.recipes,
+		meals: Array.from({ length: 1_000 }, (_, index) => ({
+			id: `meal-${index}`,
+			date: '2026-10-22',
+			slot: 'Dinner',
+			recipeId: 'tomato-butter-beans',
+			servings: 2
+		}))
+	});
+	assert.throws(
+		() => completeRecipe(fullMeals, 'tomato-butter-beans', { deductPantry: true }, now),
+		/storage limit/
 	);
 });
 

@@ -83,6 +83,7 @@ function injectPlannerHook(svelteSource: string): string {
 		openRecipePicker,
 		choosePickedRecipe,
 		openCookDialog,
+		openRecipeCookDialog,
 		markMealCooked,
 		showMoreHistory: () => { cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE; },
 		editPlannedMeal,
@@ -185,6 +186,7 @@ type PlannerHarnessApi = {
 	openRecipePicker: (slotTarget?: { date: string; slot: string }) => void;
 	choosePickedRecipe: (recipe: Recipe) => void;
 	openCookDialog: (meal: Meal) => void;
+	openRecipeCookDialog: (recipe: Recipe, servings?: number) => void;
 	markMealCooked: (event?: SubmitEvent) => Promise<void>;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
@@ -1009,6 +1011,39 @@ test('marking a meal cooked keeps pantry deduction opt-in', async () => {
 			false
 		);
 		assert.equal(api.deductPantry, false);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test('direct recipe cook completion keeps pantry deduction opt-in and records Unscheduled history', async () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		const recipe = makeRecipe('r-direct-cook', 'Spontaneous Skillet');
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [recipe],
+			pantry: [{ id: 'p-oil', name: 'olive oil', quantity: 4, unit: 'tbsp', category: 'Pantry' }],
+			meals: []
+		};
+
+		api.openRecipeCookDialog(recipe, 4);
+		assert.equal(api.deductPantry, false);
+
+		await api.markMealCooked();
+		assert.equal(api.kitchen.meals.length, 1);
+		assert.equal(api.kitchen.meals[0].slot, 'Unscheduled');
+		assert.equal(api.kitchen.meals[0].servings, 4);
+		assert.ok(api.kitchen.meals[0].completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 4);
+
+		api.openRecipeCookDialog(recipe, 4);
+		assert.equal(api.deductPantry, false);
+		api.deductPantry = true;
+		await api.markMealCooked();
+		assert.equal(api.kitchen.meals.length, 2);
+		assert.equal(api.kitchen.pantry[0].quantity, 3);
 	} finally {
 		harness.dispose();
 	}

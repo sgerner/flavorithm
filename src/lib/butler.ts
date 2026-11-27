@@ -1,9 +1,11 @@
 import { z } from 'zod';
 import type { AppState, Ingredient } from './types.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
+import { MAX_SERVINGS } from './recipe-draft.ts';
 import {
 	activeWeeklyScopes,
 	completeMeal,
+	completeRecipe,
 	convertCompatibleQuantity,
 	deleteMeal,
 	deleteRecipe,
@@ -138,6 +140,31 @@ const preferences = z
 export const ButlerCommandSchema = z.discriminatedUnion('type', [
 	z.object({ type: z.literal('recipe.upsert'), recipe }),
 	z.object({ type: z.literal('recipe.delete'), id }),
+	z
+		.object({
+			type: z.literal('recipe.complete'),
+			id: id.describe('ID of the recipe in kitchen.recipes to mark cooked.'),
+			servings: z
+				.number()
+				.int()
+				.min(1)
+				.max(MAX_SERVINGS)
+				.optional()
+				.describe('Cooked whole servings; defaults to the recipe servings.'),
+			leftoverServings: z
+				.number()
+				.int()
+				.nonnegative()
+				.max(MAX_SERVINGS)
+				.optional()
+				.describe('Portions saved as leftovers from 0 up to cooked servings; defaults to 0.'),
+			deductPantry: z
+				.boolean()
+				.describe(
+					'Required: true to automatically deduct recipe ingredients from pantry stock, or false to leave pantry stock unchanged.'
+				)
+		})
+		.describe('Record an unscheduled cooked recipe and optionally deduct pantry stock.'),
 	z.object({ type: z.literal('pantry.upsert'), item: pantry }),
 	z.object({ type: z.literal('pantry.delete'), id }),
 	z.object({ type: z.literal('meal.upsert'), meal }),
@@ -321,6 +348,42 @@ export function applyButlerCommands(
 				state = deleteRecipe(state, command.id, safeNow);
 				recordShoppingScopes(state);
 				break;
+			case 'recipe.complete': {
+				requireId(state.recipes, command.id);
+				recordShoppingScopes(state);
+				const beforePantry = state.pantry;
+				if (command.deductPantry) {
+					const recipe = state.recipes.find((item) => item.id === command.id);
+					for (const ingredient of recipe?.ingredients ?? []) {
+						if (
+							Number.isFinite(ingredient.quantity) &&
+							ingredient.quantity > 0 &&
+							ingredient.unit.trim()
+						) {
+							deductedIngredientNames.add(normalizeName(ingredient.name));
+						}
+					}
+				}
+				state = completeRecipe(
+					state,
+					command.id,
+					{
+						servings: command.servings,
+						deductPantry: command.deductPantry,
+						leftoverServings: command.leftoverServings ?? 0
+					},
+					safeNow
+				);
+				if (state.pantry !== beforePantry) {
+					for (const item of state.pantry) {
+						const prev = beforePantry.find((entry) => entry.id === item.id);
+						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
+					}
+					for (const week of touchedWeeks) state = refreshWeekShopping(state, week, safeNow);
+				}
+				recordShoppingScopes(state);
+				break;
+			}
 			case 'pantry.upsert': {
 				recordShoppingScopes(state);
 				const promoted = promoteSampleIngredient(command.item);
@@ -403,6 +466,7 @@ export function applyButlerCommands(
 						const prev = beforePantry.find((entry) => entry.id === item.id);
 						if (prev && item.quantity < prev.quantity) deductedPantryIds.add(item.id);
 					}
+					for (const week of touchedWeeks) state = refreshWeekShopping(state, week, safeNow);
 				}
 				recordShoppingScopes(state);
 				break;

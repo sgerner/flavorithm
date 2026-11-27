@@ -947,6 +947,10 @@ const pageHookCode = `
 		set plannedServings(value: number | null) { plannedServings = value; },
 		get cookingMealId() { return cookingMealId; },
 		set cookingMealId(value: string) { cookingMealId = value; },
+		get cookingRecipeId() { return cookingRecipeId; },
+		set cookingRecipeId(value: string) { cookingRecipeId = value; },
+		get cookingServings() { return cookingServings; },
+		set cookingServings(value: number | null) { cookingServings = value; },
 		get leftoverServings() { return leftoverServings; },
 		set leftoverServings(value: number | null) { leftoverServings = value; },
 		get capabilities() { return capabilities; },
@@ -998,6 +1002,8 @@ type PageFormApi = {
 	mealDate: string;
 	plannedServings: number | null;
 	cookingMealId: string;
+	cookingRecipeId: string;
+	cookingServings: number | null;
 	leftoverServings: number | null;
 	capabilities: { emailDelivery: boolean; recipeSearch: boolean };
 	dialogFormEl: HTMLFormElement;
@@ -1100,6 +1106,28 @@ test('rendered +page.svelte modals resolve aria-describedby and keep unique IDs 
 		getTagById(cookTags, 'cook-leftovers')?.attrs['aria-describedby'],
 		'cook-leftovers-help cook-leftovers-error'
 	);
+
+	const directCookInvalidHtml = renderPageModal((api) => {
+		const todayMeal = api.kitchen.meals[0];
+		const now = new Date();
+		todayMeal.date = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+		api.cookingMealId = '';
+		api.cookingRecipeId = todayMeal.recipeId;
+		api.cookingServings = 0;
+		api.leftoverServings = 5;
+		api.modal = 'cookMeal';
+		api.formSubmitted = true;
+	});
+	const directCookTags = assertValidRenderedAccessibility(
+		directCookInvalidHtml,
+		'+page direct recipe cookMeal invalid'
+	);
+	assert.equal(
+		getTagById(directCookTags, 'cook-servings')?.attrs['aria-describedby'],
+		'cook-servings-help cook-servings-error'
+	);
+	assert.equal(getTagById(directCookTags, 'cook-todays-plan')?.attrs['aria-invalid'], 'false');
+	assert.equal(getTagById(directCookTags, 'cook-deduct')?.attrs['aria-invalid'], 'false');
 
 	const householdHtml = renderPageModal((api) => {
 		api.modal = 'household';

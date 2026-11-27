@@ -45,6 +45,7 @@
 		save,
 		shop,
 		plan,
+		cook = () => {},
 		rate,
 		nutrition,
 		edit,
@@ -60,6 +61,7 @@
 		save: () => void;
 		shop: (servings: number) => void;
 		plan: (servings: number) => void;
+		cook?: (servings: number) => void;
 		rate: (n: number | undefined) => void;
 		nutrition: () => void;
 		edit: () => void;
@@ -183,6 +185,15 @@
 						? describeBy('servings-help', servingsError ? servingsAria.errorId : undefined)
 						: undefined}
 					onclick={() => {
+						if (isValidServings(servingCount)) cook(servingCount);
+					}}><Check size={17} /> Mark cooked</button
+				><button
+					class="secondary"
+					disabled={!validServings}
+					aria-describedby={!validServings
+						? describeBy('servings-help', servingsError ? servingsAria.errorId : undefined)
+						: undefined}
+					onclick={() => {
 						if (isValidServings(servingCount)) plan(servingCount);
 					}}><CalendarPlus size={17} /> Plan a meal</button
 				><button
@@ -209,7 +220,8 @@
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
 			<p class="field-help" id="servings-help">
-				Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} whole servings to scale ingredients, plan, or shop.
+				Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} whole servings to scale ingredients, cook, plan,
+				or shop.
 			</p>
 			{#if servingsError}<p class="error" id={servingsAria.errorId} role="alert">
 					{servingsError}
@@ -429,6 +441,10 @@
 </div>
 
 <style>
+	.detail-actions {
+		flex-wrap: wrap;
+		align-items: center;
+	}
 	.recipe-manage-button {
 		min-height: 44px;
 		padding-inline: 12px;

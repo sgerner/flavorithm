@@ -849,11 +849,17 @@ function expiryPriority(expires: string | undefined, now: Date): number {
 	return dateOrdinal(expiry) - dateOrdinal(today);
 }
 
-function consumePantry(
+const MAX_MEALS = 1_000;
+
+function localCalendarKey(date: Date): string {
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function consumePantryDetailed(
 	pantry: Ingredient[],
 	recipe: Recipe,
 	servings: number,
-	now: Date
+	now: Date = new Date()
 ): { pantry: Ingredient[]; uncoveredByBucket: Map<string, number> } {
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	const remaining = pantry.map((item) => ({ ...item }));
@@ -912,6 +918,16 @@ function consumePantry(
 	}
 
 	return { pantry: remaining, uncoveredByBucket };
+}
+
+/** Deduct compatible non-expired pantry stock for a recipe scaled to cooked servings. */
+export function consumePantry(
+	pantry: Ingredient[],
+	recipe: Recipe,
+	servings: number,
+	now: Date = new Date()
+): Ingredient[] {
+	return consumePantryDetailed(pantry, recipe, servings, now).pantry;
 }
 
 function affectedWeekStarts(shopping: ShoppingItem[], dates: Iterable<string>): string[] {
@@ -1168,7 +1184,7 @@ export function completeMeal(
 	// defined after deducting pantry stock. When deductPantry is false, neither pantry
 	// stock nor checked groceries were consumed by this meal.
 	if (options.deductPantry && recipe) {
-		const consumed = consumePantry(state.pantry, recipe, target.servings, safeNow);
+		const consumed = consumePantryDetailed(state.pantry, recipe, target.servings, safeNow);
 		pantry = consumed.pantry;
 		if (weekSourceKey && consumed.uncoveredByBucket.size > 0) {
 			const weekBudget = new Map(consumed.uncoveredByBucket);
@@ -1179,6 +1195,76 @@ export function completeMeal(
 	}
 
 	return refreshWeeks({ ...state, meals, pantry, shopping }, weeksToRefresh, safeNow);
+}
+
+/** Record an unscheduled cooked recipe and optionally deduct its ingredient quantities from pantry. */
+export function completeRecipe(
+	state: AppState,
+	recipeId: string,
+	options: {
+		servings?: number;
+		deductPantry?: boolean;
+		leftoverServings?: number;
+		createId?: () => string;
+	} = {},
+	now: Date = new Date()
+): AppState {
+	const recipe = state.recipes.find((item) => item.id === recipeId);
+	if (!recipe) return state;
+	if (
+		options.servings !== undefined &&
+		(!Number.isFinite(options.servings) || options.servings < 1)
+	) {
+		return state;
+	}
+	if (state.meals.length >= MAX_MEALS) {
+		throw new Error('This proposal exceeds the kitchen storage limit. Please make room first.');
+	}
+
+	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
+	const rawServings = options.servings ?? recipe.servings;
+	const servings =
+		Number.isFinite(rawServings) && rawServings >= 1
+			? roundQuantity(Math.min(10_000, rawServings))
+			: 1;
+	const leftoverServings = Number.isFinite(options.leftoverServings)
+		? roundQuantity(Math.min(servings, Math.max(0, options.leftoverServings!)))
+		: 0;
+	const deductPantry = options.deductPantry ?? false;
+	const createId = options.createId ?? (() => globalThis.crypto.randomUUID());
+
+	const usedIds = new Set(state.meals.map((meal) => meal.id));
+	const baseId = (createId().trim() || globalThis.crypto.randomUUID()).slice(0, 90);
+	let id = baseId;
+	let suffix = 2;
+	while (usedIds.has(id)) id = `${baseId}-${suffix++}`;
+
+	const completedMeal: Meal = {
+		id,
+		date: localCalendarKey(safeNow),
+		slot: 'Unscheduled',
+		recipeId: recipe.id,
+		servings,
+		completedAt: safeNow.toISOString(),
+		leftoverServings
+	};
+	const meals = [...state.meals, completedMeal];
+	if (!deductPantry) {
+		return { ...state, meals };
+	}
+
+	const weeks = activeWeeklyScopes(state.shopping);
+	const recipeScopeKey = `recipe:${recipe.id}`;
+	const consumed = consumePantryDetailed(state.pantry, recipe, servings, safeNow);
+	const pantry = consumed.pantry;
+	let shopping = state.shopping;
+	if (consumed.uncoveredByBucket.size > 0) {
+		const recipeBudget = new Map(consumed.uncoveredByBucket);
+		shopping = retireCheckedByScopeBudget(shopping, (scopeKey) =>
+			scopeKey === recipeScopeKey ? recipeBudget : undefined
+		);
+	}
+	return refreshWeeks({ ...state, meals, pantry, shopping }, weeks, safeNow);
 }
 
 const seedPantryById = new Map(seedPantry.map((item) => [item.id, item]));

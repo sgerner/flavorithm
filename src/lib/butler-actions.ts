@@ -50,6 +50,16 @@ export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerA
 			case 'recipe.open':
 				share(index, `recipe:${command.id}`);
 				break;
+			case 'recipe.complete':
+				share(index, `recipe:${command.id}`);
+				recipeChanges.set(command.id, [...(recipeChanges.get(command.id) ?? []), index]);
+				if (command.deductPantry) {
+					commands.forEach((candidate, candidateIndex) => {
+						if (candidate.type === 'pantry.upsert' || candidate.type === 'pantry.delete')
+							join(index, candidateIndex);
+					});
+				}
+				break;
 			case 'pantry.upsert':
 				share(index, `pantry:${command.item.id}`);
 				break;
@@ -240,6 +250,26 @@ export function previewButlerCommand(
 
 	const record = command as Record<string, unknown> | undefined;
 	const type = record?.type;
+	if (type === 'recipe.complete') {
+		const recipeId = typeof record?.id === 'string' ? record.id : undefined;
+		const recipe = findRecipe(recipeId, kitchen, batch);
+		const title = recipe?.title ?? 'Recipe';
+		const servings = typeof record?.servings === 'number' ? record.servings : recipe?.servings;
+		const deductPantry = record?.deductPantry === true;
+		const leftovers =
+			clampLeftovers(
+				typeof record?.leftoverServings === 'number' ? record.leftoverServings : 0,
+				servings
+			) ?? 0;
+		return [
+			title,
+			servings !== undefined ? `Servings: ${servings}` : '',
+			`Pantry deduction: ${deductPantry ? 'Deducts pantry stock' : 'Pantry stock unchanged'}`,
+			`Leftover servings: ${leftovers}`
+		]
+			.filter(Boolean)
+			.join('\n');
+	}
 	if (type === 'meal.complete') {
 		const mealId = typeof record?.id === 'string' ? record.id : undefined;
 		const meal = findMeal(mealId, kitchen, batch);
@@ -323,6 +353,17 @@ function describe(
 				summary: 'Remove this recipe and its scheduled meals.'
 			};
 		}
+		case 'recipe.complete': {
+			const recipe = findRecipe(command.id, kitchen, batch);
+			const servings = command.servings ?? recipe?.servings;
+			const deduction = command.deductPantry ? 'Deducts pantry stock' : 'Pantry stock unchanged';
+			const leftovers = clampLeftovers(command.leftoverServings ?? 0, servings) ?? 0;
+			return {
+				label: 'Mark cooked',
+				title: recipe?.title ?? 'Recipe',
+				summary: `${servings ? `${servings} ${servings === 1 ? 'serving' : 'servings'}` : 'Unscheduled'} · ${deduction} · ${formatLeftovers(leftovers)}`
+			};
+		}
 		case 'pantry.upsert': {
 			const item = command.item;
 			const exists = kitchen.pantry.some((value) => value.id === item.id);
@@ -399,12 +440,26 @@ function describe(
 				title: 'Kitchen preferences',
 				summary: `${Object.keys(command.preferences).length} preference${Object.keys(command.preferences).length === 1 ? '' : 's'} changed`
 			};
-		case 'recipe.open':
+		case 'recipe.open': {
+			const title = kitchen.recipes.find((item) => item.id === command.id)?.title ?? 'Recipe';
+			if (command.mode === 'cook') {
+				const meal = kitchen.meals.find(
+					(item) => item.recipeId === command.id && !item.completedAt
+				);
+				return {
+					label: 'Cook recipe',
+					title,
+					summary: meal
+						? `Complete ${meal.slot.toLowerCase()} (${meal.date})`
+						: 'Open cook completion'
+				};
+			}
 			return {
 				label: 'Open recipe',
-				title: kitchen.recipes.find((item) => item.id === command.id)?.title ?? 'Recipe',
+				title,
 				summary: `${command.mode ?? 'detail'} view`
 			};
+		}
 		case 'navigate': {
 			const title = (
 				{

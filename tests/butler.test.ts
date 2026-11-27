@@ -197,7 +197,12 @@ test('ButlerResponseSchema produces expected JSON Schema and rejects non-finite 
 	assert.equal(schema.properties.commands.maxItems, 50);
 
 	const variants = schema.properties.commands.items.oneOf as Array<Record<string, any>>;
-	assert.equal(variants.length, 14);
+	assert.equal(variants.length, 15);
+
+	const recipeComplete = variants.find((item) => item.properties.type.const === 'recipe.complete')!;
+	assert.ok(recipeComplete);
+	assert.equal(recipeComplete.properties.servings.minimum, 1);
+	assert.equal(recipeComplete.properties.servings.maximum, 10000);
 
 	const recipeUpsert = variants.find((item) => item.properties.type.const === 'recipe.upsert')!;
 	assert.deepEqual(recipeUpsert.properties.recipe.properties.servings, {
@@ -477,6 +482,155 @@ test('recipe deletion refreshes generated shopping while retaining manual items'
 	assert.deepEqual(result.state.shopping, [
 		{ id: 'manual', name: 'tea', quantity: 1, unit: 'box', checked: false }
 	]);
+});
+
+test('butler completes unscheduled recipes, refreshes active week:* shopping scopes, and emits cook effects', () => {
+	const current = createInitialState();
+	const now = new Date('2026-10-23T18:00:00Z');
+	const weekStart = current.meals[0].date;
+	const monday = new Date(`${weekStart}T12:00:00`);
+	monday.setDate(monday.getDate() - ((monday.getDay() + 6) % 7));
+	const mondayKey = `${monday.getFullYear()}-${String(monday.getMonth() + 1).padStart(2, '0')}-${String(monday.getDate()).padStart(2, '0')}`;
+
+	const withShopping = applyButlerCommands(
+		current,
+		[{ type: 'shopping.generate', weekStart: mondayKey }],
+		now
+	).state;
+	const spinachBefore =
+		withShopping.shopping.find(
+			(item) => item.sourceKey === `week:${mondayKey}` && item.name === 'baby spinach'
+		)?.quantity ?? 0;
+
+	const opened = applyButlerCommands(
+		withShopping,
+		[{ type: 'recipe.open', id: 'tomato-butter-beans', mode: 'cook' }],
+		now
+	);
+	assert.deepEqual(opened.effects, [
+		{ type: 'recipe.open', id: 'tomato-butter-beans', mode: 'cook' }
+	]);
+
+	const completed = applyButlerCommands(
+		withShopping,
+		[
+			{
+				type: 'recipe.complete',
+				id: 'tomato-butter-beans',
+				servings: 2,
+				deductPantry: true,
+				leftoverServings: 1
+			}
+		],
+		now
+	);
+	const spontaneous = completed.state.meals.find((meal) => meal.recipeId === 'tomato-butter-beans');
+	assert.ok(spontaneous);
+	assert.equal(spontaneous.slot, 'Unscheduled');
+	assert.equal(spontaneous.servings, 2);
+	assert.equal(spontaneous.leftoverServings, 1);
+	assert.equal(spontaneous.completedAt, now.toISOString());
+	assert.equal(
+		completed.state.pantry.find((item) => item.id === 'pantry-olive-oil')?.quantity,
+		0.4375
+	);
+	assert.equal(completed.state.pantry.find((item) => item.id === 'pantry-spinach')?.quantity, 0);
+	const spinachAfter =
+		completed.state.shopping.find(
+			(item) => item.sourceKey === `week:${mondayKey}` && item.name === 'baby spinach'
+		)?.quantity ?? 0;
+	assert.ok(spinachAfter > spinachBefore);
+
+	const withoutDeduction = applyButlerCommands(
+		current,
+		[{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2, deductPantry: false }],
+		now
+	);
+	assert.equal(
+		withoutDeduction.state.meals.find((meal) => meal.recipeId === 'tomato-butter-beans')?.slot,
+		'Unscheduled'
+	);
+	assert.deepEqual(withoutDeduction.state.pantry, current.pantry);
+
+	const batchCompleted = applyButlerCommands(
+		current,
+		[
+			{
+				type: 'recipe.complete',
+				id: 'tomato-butter-beans',
+				servings: 36,
+				deductPantry: false,
+				leftoverServings: 12
+			}
+		],
+		now
+	);
+	assert.equal(
+		batchCompleted.state.meals.find((meal) => meal.recipeId === 'tomato-butter-beans')?.servings,
+		36
+	);
+
+	assert.throws(
+		() =>
+			applyButlerCommands(current, [
+				{
+					type: 'pantry.upsert',
+					item: {
+						id: 'pantry-spinach',
+						name: 'baby spinach',
+						quantity: 1,
+						unit: 'cups',
+						category: 'Produce'
+					}
+				},
+				{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2, deductPantry: true }
+			]),
+		/already deducts recipe ingredients/
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 2 }
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 1.5, deductPantry: false }
+		])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [
+			{ type: 'recipe.complete', id: 'nonexistent-recipe', deductPantry: false }
+		])
+	);
+
+	// Multi-command batch with meal.upsert into an initially covered week refreshes shopping regardless of order
+	const orderBase = structuredClone(current);
+	orderBase.meals = [];
+	orderBase.shopping = [];
+	const mealCmd = {
+		type: 'meal.upsert' as const,
+		meal: {
+			id: 'friday-beans',
+			date: '2026-10-23',
+			slot: 'Dinner' as const,
+			recipeId: 'tomato-butter-beans',
+			servings: 2
+		}
+	};
+	const completeCmd = {
+		type: 'recipe.complete' as const,
+		id: 'tomato-butter-beans',
+		servings: 2,
+		deductPantry: true
+	};
+	const mealThenComplete = applyButlerCommands(orderBase, [mealCmd, completeCmd], now).state;
+	const completeThenMeal = applyButlerCommands(orderBase, [completeCmd, mealCmd], now).state;
+	assert.deepEqual(mealThenComplete.shopping, completeThenMeal.shopping);
+	assert.ok(
+		mealThenComplete.shopping.some(
+			(item) => item.sourceKey === 'week:2026-10-19' && item.name === 'baby spinach'
+		)
+	);
 });
 
 test('standalone meal.upsert populates shopping for empty weeks and updates both weeks when moving a meal', () => {
@@ -784,9 +938,22 @@ test('ButlerResponseSchema JSON schema requires deductPantry on meal.complete an
 		/leftover/i
 	);
 
+	const recipeCompleteVariant = variants.find(
+		(variant) => variant.properties?.type?.const === 'recipe.complete'
+	);
+	assert.ok(recipeCompleteVariant);
+	assert.ok(recipeCompleteVariant.required?.includes('deductPantry'));
+	assert.match(
+		String(recipeCompleteVariant.properties?.deductPantry?.description ?? ''),
+		/pantry/i
+	);
+
 	const current = createInitialState();
 	assert.throws(() =>
 		applyButlerCommands(current, [{ type: 'meal.complete', id: current.meals[0].id }])
+	);
+	assert.throws(() =>
+		applyButlerCommands(current, [{ type: 'recipe.complete', id: current.recipes[0].id }])
 	);
 });
 
