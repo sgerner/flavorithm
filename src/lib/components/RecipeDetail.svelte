@@ -3,7 +3,9 @@
 	import { MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
 	import { focusTrap } from '#lib/focus.ts';
+	import { describeBy, fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
+	import ToggleButton from '#lib/components/ToggleButton.svelte';
 	import {
 		clampAllergies,
 		evaluateRecipeConflicts,
@@ -105,7 +107,11 @@
 			lastValidServings = servingCount;
 		}
 	});
+	let servingsError = $derived(validatePlannedServings(servingCount));
 	let validServings = $derived(isValidServings(servingCount));
+	let servingsAria = $derived(
+		fieldAria('recipe-servings', { helpIds: ['servings-help'], error: servingsError })
+	);
 	let activeServings = $derived(resolveActiveServings(servingCount, lastValidServings));
 	let nutritionMultiplier = $derived(
 		nutritionMultiplierFor(nutritionMode, recipe.servings, activeServings)
@@ -188,14 +194,18 @@
 				<button
 					class="primary"
 					disabled={!validServings}
-					aria-describedby={!validServings ? 'servings-help' : undefined}
+					aria-describedby={!validServings
+						? describeBy('servings-help', servingsError ? servingsAria.errorId : undefined)
+						: undefined}
 					onclick={() => {
 						if (isValidServings(servingCount)) plan(servingCount);
 					}}><CalendarPlus size={17} /> Plan a meal</button
 				><button
 					class="secondary"
 					disabled={!validServings}
-					aria-describedby={!validServings ? 'servings-help' : undefined}
+					aria-describedby={!validServings
+						? describeBy('servings-help', servingsError ? servingsAria.errorId : undefined)
+						: undefined}
 					onclick={() => {
 						if (isValidServings(servingCount)) shop(servingCount);
 					}}><ShoppingBasket size={17} /> Shopping list</button
@@ -213,6 +223,12 @@
 				{#if recipe.saved}<button class="secondary recipe-manage-button" onclick={edit}>Edit</button
 					><button class="text-button recipe-manage-button" onclick={remove}>Delete</button>{/if}
 			</div>
+			<p class="field-help" id="servings-help">
+				Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} whole servings to scale ingredients, plan, or shop.
+			</p>
+			{#if servingsError}<p class="error" id={servingsAria.errorId} role="alert">
+					{servingsError}
+				</p>{/if}
 			{#if conflict?.hasConflict}<div
 					class="conflict-banner"
 					role="region"
@@ -264,20 +280,18 @@
 						<div class="section-line">
 							<h3>Ingredients</h3>
 							<div class="servings" role="group" aria-label="Adjust servings">
-								<label for="recipe-servings">Servings</label><button
+								<label for={servingsAria.id}>Servings</label><button
 									type="button"
 									aria-label="Decrease servings"
 									onclick={() => adjustServings(-1)}>-</button
 								><input
-									id="recipe-servings"
 									type="number"
 									inputmode="numeric"
 									min="1"
 									max={MAX_SERVINGS}
 									step="1"
-									aria-invalid={!validServings}
-									aria-describedby={!validServings ? 'servings-help' : undefined}
 									bind:value={servingCount}
+									{...servingsAria.props}
 								/><button
 									type="button"
 									aria-label="Increase servings"
@@ -285,9 +299,6 @@
 								>
 							</div>
 						</div>
-						<p class="servings-help" id="servings-help" aria-live="polite">
-							{#if !validServings}Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.{/if}
-						</p>
 						<ul class="ingredients-list">
 							{#each recipe.ingredients as item, idx}{@const reasons =
 									conflict?.ingredientReasons[idx]}
@@ -314,21 +325,25 @@
 					<div>
 						<h3>Let's make it</h3>
 						<ol class="steps-list">
-							{#each recipe.steps as step, i}<li>
-									<button
-										class:done={completed.includes(i)}
-										aria-pressed={completed.includes(i)}
-										aria-label={`Mark step ${i + 1} ${completed.includes(i) ? 'incomplete' : 'complete'}`}
+							{#each recipe.steps as step, i}{@const stepNumber = String(i + 1).padStart(
+									2,
+									'0'
+								)}{@const isDone = completed.includes(i)}
+								<li>
+									<ToggleButton
+										class={{ done: isDone }}
+										pressed={isDone}
 										onclick={() =>
-											(completedSteps = completed.includes(i)
+											(completedSteps = isDone
 												? completed.filter((n) => n !== i)
 												: [...completed, i])}
-										>{#if completed.includes(i)}<span transition:fadeMotion
-												><Check size={16} /></span
-											>{:else}<span transition:fadeMotion>{String(i + 1).padStart(2, '0')}</span
-											>{/if}</button
+										><span class="visually-hidden">{`Step ${stepNumber}`}</span>{#if isDone}<span
+												transition:fadeMotion
+												aria-hidden="true"><Check size={16} /></span
+											>{:else}<span transition:fadeMotion aria-hidden="true">{stepNumber}</span
+											>{/if}</ToggleButton
 									>
-									<p class:muted={completed.includes(i)}>{step}</p>
+									<p class:muted={isDone}>{step}</p>
 								</li>{/each}
 						</ol>
 					</div>
@@ -340,16 +355,16 @@
 					class="nutrition-panel"
 					in:revealMotion|global
 				>
-					<p class="visually-hidden" id="servings-help">
-						Enter 1–{MAX_SERVINGS.toLocaleString('en-US')} servings to plan or shop.
-					</p>
 					{#if recipe.nutritionStale}<p class="nutrition-stale" role="status">
 							{Object.values(recipe.nutrition).every((value) => value === 0)
 								? 'Nutrition values have not been entered yet. Edit the recipe or refresh this estimate before relying on it.'
 								: 'Ingredients or servings changed. Refresh this estimate before relying on it.'}
 						</p>{/if}
-					<label class="servings nutrition-selector"
-						>Show nutrition for<select bind:value={nutritionMode}
+					<label class="servings nutrition-selector" for="recipe-nutrition-mode"
+						>Show nutrition for<select
+							id="recipe-nutrition-mode"
+							aria-invalid="false"
+							bind:value={nutritionMode}
 							><option value="serving">One serving</option><option value="scaled"
 								>Scaled servings</option
 							><option value="recipe">Whole recipe</option></select
@@ -472,15 +487,10 @@
 	.conflict-banner {
 		padding: 14px 16px;
 		margin: 0 0 22px;
-		background: #b94e311c;
-		border-left: 3px solid #8f3b26;
-		color: #8f3b26;
+		background: var(--danger-surface);
+		border-left: 3px solid var(--danger-ink);
+		color: var(--danger-ink);
 		font-size: 14px;
-	}
-	:global(.dark) .conflict-banner {
-		background: #b94e312b;
-		border-left-color: #ffb4a2;
-		color: #ffb4a2;
 	}
 	.conflict-banner-header {
 		display: flex;
@@ -491,16 +501,12 @@
 	}
 	.conflict-banner-badge {
 		padding: 2px 7px;
-		background: #8f3b26;
-		color: #fffefa;
+		background: var(--danger-fill);
+		color: var(--on-danger-fill);
 		font-size: 11px;
 		font-weight: 700;
 		letter-spacing: 0.6px;
 		text-transform: uppercase;
-	}
-	:global(.dark) .conflict-banner-badge {
-		background: #ffb4a2;
-		color: #2b1410;
 	}
 	.conflict-banner p {
 		font-size: 13px;
@@ -508,36 +514,38 @@
 	}
 	.ingredients-list li.conflict-ingredient {
 		padding-inline: 8px;
-		background: #b94e3114;
-		border-left: 2px solid #8f3b26;
+		background: var(--danger-surface);
+		border-left: 2px solid var(--danger-ink);
 	}
-	:global(.dark) .ingredients-list li.conflict-ingredient {
-		background: #b94e3126;
-		border-left-color: #ffb4a2;
+	.ingredients-list li.conflict-ingredient span {
+		color: var(--ink);
 	}
-	.ingredient-line-name {
+	.ingredients-list li span.ingredient-line-name {
 		display: flex;
 		flex-wrap: wrap;
 		align-items: center;
 		gap: 6px;
-		color: var(--ink) !important;
-		min-width: 0 !important;
+		color: var(--ink);
+		min-width: 0;
 	}
 	.ingredient-conflict-tag {
 		padding: 1px 6px;
-		background: #b94e3120;
-		color: #8f3b26;
+		background: var(--danger-fill);
+		color: var(--on-danger-fill);
 		font-size: 12px;
 		font-weight: 600;
-	}
-	:global(.dark) .ingredient-conflict-tag {
-		background: #b94e3138;
-		color: #ffb4a2;
 	}
 	.label-check-note {
 		margin-top: 10px;
 		font-size: 13px;
 		line-height: 1.6;
 		color: var(--muted);
+	}
+	@media (forced-colors: active) {
+		.conflict-banner,
+		.conflict-banner-badge,
+		.ingredient-conflict-tag {
+			border: 1px solid CanvasText;
+		}
 	}
 </style>
