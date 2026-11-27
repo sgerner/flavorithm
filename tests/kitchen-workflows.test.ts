@@ -1386,10 +1386,101 @@ test('covers nut/peanut expansions, span-scoped exemptions, seafood/fish species
 	}
 	const celerySnack = recipe({
 		id: 'celery-ribs',
-		ingredients: [{ name: 'celery ribs', quantity: 3, unit: 'stalk' }]
+		ingredients: [
+			{ name: 'celery ribs', quantity: 3, unit: 'stalk' },
+			{ name: '2 ribs of celery', quantity: 2, unit: 'stalk' }
+		]
 	});
 	assert.equal(
 		evaluateRecipeConflicts(celerySnack, { diet: 'vegetarian', allergies: '' }).hasConflict,
+		false
+	);
+
+	// Contractions, curly apostrophes, possessives, and framing stopwords must not leak unrecognized tokens.
+	const plainCucumber = recipe({
+		id: 'plain-cucumber',
+		ingredients: [{ name: 'cucumber', quantity: 1, unit: 'whole' }]
+	});
+	for (const [input, expected] of [
+		["I'm allergic to peanuts", ['peanut']],
+		['I\u2019m allergic to peanuts', ['peanut']],
+		["can't eat dairy", ['dairy']],
+		["don't eat shell-fish", ['shellfish']],
+		['sea food allergy', ['seafood']],
+		["cow's milk allergy", ['dairy']],
+		['severe food allergy to tree nuts', ['tree nut']],
+		['non-celiac gluten sensitivity', ['gluten']],
+		['diagnosed with celiac', ['gluten']]
+	] as const) {
+		assert.deepEqual(parseAllergies(input), [...expected]);
+		assert.equal(
+			evaluateRecipeConflicts(plainCucumber, { diet: 'none', allergies: input }).hasConflict,
+			false,
+			`expected safe cucumber recipe to stay safe for "${input}"`
+		);
+	}
+
+	// Compound forms & punctuation: mustard seeds -> dijon mustard, peanut butter != dairy butter, egg whites != white wine, za'atar -> sesame.
+	const dijonDressing = recipe({
+		id: 'dijon-dressing',
+		ingredients: [{ name: 'dijon mustard', quantity: 1, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(dijonDressing, { diet: 'none', allergies: 'mustard seeds' })
+			.hasConflict,
+		true
+	);
+	const butteredToast = recipe({
+		id: 'buttered-toast',
+		ingredients: [{ name: 'unsalted butter', quantity: 1, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(butteredToast, { diet: 'none', allergies: 'peanut butter' })
+			.hasConflict,
+		false
+	);
+	const whiteWinePan = recipe({
+		id: 'white-wine-pan',
+		ingredients: [{ name: 'white wine', quantity: 0.5, unit: 'cup' }]
+	});
+	const mayoDip = recipe({
+		id: 'mayo-dip',
+		ingredients: [{ name: 'mayonnaise', quantity: 2, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(whiteWinePan, { diet: 'none', allergies: 'egg whites' }).hasConflict,
+		false
+	);
+	assert.equal(
+		evaluateRecipeConflicts(mayoDip, { diet: 'none', allergies: 'egg whites' }).hasConflict,
+		true
+	);
+	const zaatarFlatbread = recipe({
+		id: 'zaatar',
+		ingredients: [{ name: "za'atar spice blend", quantity: 1, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(zaatarFlatbread, { diet: 'none', allergies: 'sesame' }).hasConflict,
+		true
+	);
+
+	// Recipe tags are scanned for allergens while honoring *-free tags.
+	const taggedPeanut = recipe({
+		id: 'tagged-peanut',
+		tags: ['thai', 'contains-peanuts'],
+		ingredients: [{ name: 'rice noodles', quantity: 4, unit: 'oz' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(taggedPeanut, { diet: 'none', allergies: 'peanuts' }).hasConflict,
+		true
+	);
+	const taggedPeanutFree = recipe({
+		id: 'tagged-peanut-free',
+		tags: ['peanut-free', 'nut-free'],
+		ingredients: [{ name: 'rice noodles', quantity: 4, unit: 'oz' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(taggedPeanutFree, { diet: 'none', allergies: 'peanuts' }).hasConflict,
 		false
 	);
 });

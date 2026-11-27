@@ -4789,6 +4789,12 @@
 							</div>
 						</div>
 					{/if}
+					{#if normalizeDiet(kitchen.preferences.diet) !== 'none' || Boolean(kitchen.preferences.allergies.trim())}
+						<p class="discover-scope-note">
+							Dietary and allergy filtering scans ingredients and tags only — recipe steps and notes
+							are not scanned. Always check package labels before cooking.
+						</p>
+					{/if}
 					<div class="recipe-grid">
 						{#each recipes as recipe, i (recipe.id)}{@const conflict = evaluateRecipeConflicts(
 								recipe,
@@ -6794,6 +6800,15 @@
 		background: var(--wash);
 		border: 1px solid var(--line);
 		font-size: 14px;
+	}
+	.discover-scope-note {
+		padding: 10px 14px;
+		margin: 0 0 18px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		color: var(--ink);
+		font-size: 13px;
+		line-height: 1.5;
 	}
 	.discover-pantry-actions {
 		display: flex;

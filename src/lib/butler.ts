@@ -115,12 +115,12 @@ const shopping = z.object({
 const preferences = z
 	.object({
 		diet: z.string().max(200),
-		allergies: z.string().max(500),
+		allergies: z.string().max(2000),
 		maxTime: z.number().nonnegative().max(100000),
-		complexity: z.string().max(80),
+		complexity: z.string().max(100),
 		cuisines: z.array(z.string().max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
-		theme: z.string().max(80),
+		theme: z.string().max(100),
 		dark: z.boolean(),
 		provider: z.string().max(100),
 		model: z.string().max(200),

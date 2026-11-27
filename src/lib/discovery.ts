@@ -41,6 +41,10 @@ function foldAscii(value: string): string {
 		.normalize('NFD')
 		.replace(/[\u0300-\u036f]/g, '')
 		.toLowerCase()
+		.replace(/[\u2018\u2019\u02bc\u2032]/g, "'")
+		.replace(/\bza'atar\b/g, 'zaatar')
+		.replace(/\b([a-z]+)'s\b/g, '$1')
+		.replace(/\b([a-z]+)'(m|re|ve|ll|d|t)\b/g, '$1$2')
 		.trim()
 		.replace(/\s+/g, ' ');
 }
@@ -540,9 +544,13 @@ const CATEGORY_RULES: Record<DietConflictCategory, CategoryRule> = {
 			'soy jerky',
 			'jackfruit',
 			'celery rib',
+			'rib of celery',
 			'chard rib',
+			'rib of chard',
 			'kale rib',
+			'rib of kale',
 			'cabbage rib',
+			'rib of cabbage',
 			'romaine heart',
 			'artichoke heart',
 			'heart of palm',
@@ -1168,7 +1176,8 @@ const TREE_NUT_TERMS = [
 	'marzipan',
 	'gianduja',
 	'nougat',
-	'frangipane'
+	'frangipane',
+	'nutella'
 ] as const;
 
 const NUT_SPAN_EXEMPTIONS = [
@@ -1230,7 +1239,8 @@ const ALLERGEN_EXPANSIONS: Record<string, AllergenExpansion> = {
 			'houmous',
 			'baba ganoush',
 			'baba ghanoush',
-			'zaatar'
+			'zaatar',
+			'za atar'
 		],
 		labelExemptions: ['sesame free']
 	},
@@ -1347,6 +1357,10 @@ const ALLERGEN_EXPANSIONS: Record<string, AllergenExpansion> = {
 		terms: ['lupin', 'lupine', 'lupini'],
 		labelExemptions: ['lupin free']
 	},
+	celery: {
+		terms: ['celery', 'celeriac', 'celery seed', 'celery salt'],
+		labelExemptions: ['celery free']
+	},
 	meat: {
 		terms: CATEGORY_RULES.meat.terms,
 		labelExemptions: CATEGORY_RULES.meat.labelExemptions,
@@ -1389,11 +1403,37 @@ const ALLERGEN_SYNONYMS: Record<string, string> = {
 
 const PHRASE_SYNONYMS: Record<string, string> = {
 	'tree nut': 'tree nut',
+	'shell fish': 'shellfish',
+	'sea food': 'seafood',
 	'alpha gal': 'meat',
 	'celiac sprue': 'gluten',
 	'wheat gluten': 'gluten',
+	'gluten grain': 'gluten',
 	'cow milk': 'dairy',
-	'cows milk': 'dairy'
+	'cows milk': 'dairy',
+	'goat milk': 'dairy',
+	'sheep milk': 'dairy',
+	'buffalo milk': 'dairy',
+	'mustard seed': 'mustard',
+	'mustard oil': 'mustard',
+	'sesame seed': 'sesame',
+	'sesame oil': 'sesame',
+	'sesame paste': 'sesame',
+	'peanut butter': 'peanut',
+	'peanut oil': 'peanut',
+	'peanut flour': 'peanut',
+	'peanut sauce': 'peanut',
+	'almond butter': 'almond',
+	'almond milk': 'almond',
+	'almond flour': 'almond',
+	'almond extract': 'almond',
+	'cashew butter': 'cashew',
+	'cashew milk': 'cashew',
+	'cashew cream': 'cashew',
+	'walnut oil': 'walnut',
+	'hazelnut butter': 'hazelnut',
+	'egg white': 'egg',
+	'egg yolk': 'egg'
 };
 
 const KNOWN_MULTIWORD_ALLERGENS = new Set([
@@ -1429,7 +1469,6 @@ const KNOWN_MULTIWORD_ALLERGENS = new Set([
 	'sunflower seed',
 	'pumpkin seed',
 	'poppy seed',
-	'mustard seed',
 	'celery seed',
 	'fennel seed',
 	'chia seed',
@@ -1441,11 +1480,17 @@ const KNOWN_MULTIWORD_ALLERGENS = new Set([
 const ALLERGY_STOPWORDS = new Set([
 	'i',
 	'im',
+	'ive',
+	'id',
 	'am',
 	'is',
+	'isnt',
 	'are',
+	'arent',
 	'was',
+	'wasnt',
 	'were',
+	'werent',
 	'be',
 	'been',
 	'being',
@@ -1456,26 +1501,50 @@ const ALLERGY_STOPWORDS = new Set([
 	'we',
 	'us',
 	'our',
+	'youre',
+	'theyre',
+	'it',
+	'its',
+	'that',
+	'this',
+	'these',
+	'those',
+	'what',
+	'which',
+	'who',
+	'where',
+	'when',
+	'there',
+	'here',
 	'have',
+	'havent',
 	'has',
+	'hasnt',
 	'had',
+	'hadnt',
 	'having',
 	'do',
 	'does',
 	'did',
 	'dont',
 	'doesnt',
+	'didnt',
 	'cant',
 	'cannot',
 	'can',
 	'could',
+	'couldnt',
 	'will',
 	'wont',
 	'would',
+	'wouldnt',
 	'must',
+	'mustnt',
 	'should',
+	'shouldnt',
 	'not',
 	'no',
+	'non',
 	'never',
 	'without',
 	'avoid',
@@ -1566,10 +1635,33 @@ const ALLERGY_STOPWORDS = new Set([
 	'contact',
 	'contamination',
 	'symptom',
-	'symptoms'
+	'symptoms',
+	'if',
+	'because',
+	'since',
+	'due',
+	'about',
+	'into',
+	'over',
+	'under',
+	'after',
+	'before',
+	'contain',
+	'contains',
+	'containing',
+	'diagnosed',
+	'medical'
 ]);
 
 const SECONDARY_MODIFIER_WORDS = new Set([
+	'food',
+	'diet',
+	'dietary',
+	'ingredient',
+	'item',
+	'dish',
+	'meal',
+	'recipe',
 	'fresh',
 	'raw',
 	'dried',
@@ -1593,6 +1685,7 @@ const SECONDARY_MODIFIER_WORDS = new Set([
 	'powdered',
 	'extract',
 	'product',
+	'protein',
 	'derived',
 	'based',
 	'react',
@@ -1905,6 +1998,16 @@ function parseClauseTokens(clause: string): string[] {
 				index += 2;
 				continue;
 			}
+			if (
+				TRAILING_FORM_WORDS.has(filtered[index + 1]) &&
+				(ALLERGEN_SYNONYMS[filtered[index]] ||
+					ALLERGEN_EXPANSIONS[filtered[index]] ||
+					KNOWN_CULINARY_TERMS.has(filtered[index]))
+			) {
+				mapped.push(ALLERGEN_SYNONYMS[filtered[index]] ?? filtered[index]);
+				index += 2;
+				continue;
+			}
 		}
 		const word = filtered[index];
 		const canonical = ALLERGEN_SYNONYMS[word] ?? word;
@@ -2017,6 +2120,22 @@ function ingredientMatchesAllergen(
 	return containsWholePhrase(variants.tokenSets, allergen);
 }
 
+function tagMatchesAllergen(tag: string, allergen: string): boolean {
+	const cleaned = normalized(tag);
+	if (!cleaned) return false;
+	const variants = buildTokenVariants(cleaned);
+	if (
+		containsWholePhrase(variants.tokenSets, 'free') ||
+		cleaned.startsWith('no-') ||
+		cleaned.startsWith('no ') ||
+		cleaned.startsWith('without-') ||
+		cleaned.startsWith('without ')
+	) {
+		return false;
+	}
+	return ingredientMatchesAllergen(variants, allergen);
+}
+
 function ingredientGlutenLabelCheck(
 	variants: ReturnType<typeof buildTokenVariants>
 ): string | null {
@@ -2096,6 +2215,14 @@ export function evaluateRecipeConflicts(
 		if (category === 'carb' && recipeHasLowCarbTag) continue;
 		if (recipe.tags.some((tag) => tagMatchesCategory(tag, category))) {
 			matchedCategories.add(category);
+		}
+	}
+
+	for (const allergen of parsedAllergens) {
+		if (ALLERGEN_EXPANSIONS[allergen]?.checkGlutenLabels && recipeHasGlutenFreeTag) continue;
+		if (allergen === 'dairy' && recipeHasDairyFreeTag) continue;
+		if (recipe.tags.some((tag) => tagMatchesAllergen(tag, allergen))) {
+			matchedAllergens.add(allergen);
 		}
 	}
 

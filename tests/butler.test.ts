@@ -226,12 +226,29 @@ test('ButlerResponseSchema produces expected JSON Schema and rejects non-finite 
 	const preferencesUpdate = variants.find(
 		(item) => item.properties.type.const === 'preferences.update'
 	)!;
+	assert.deepEqual(preferencesUpdate.properties.preferences.properties.allergies, {
+		type: 'string',
+		maxLength: 2000
+	});
 	assert.deepEqual(preferencesUpdate.properties.preferences.properties.maxTime, {
 		type: 'number',
 		minimum: 0,
 		maximum: 100000
 	});
 	assert.equal(preferencesUpdate.properties.preferences.additionalProperties, false);
+
+	const full2000Allergies = `${'kiwi, '.repeat(332)}peanut`;
+	assert.equal(full2000Allergies.length, 1998);
+	const exact2000Allergies = full2000Allergies.padEnd(2000, ' ');
+	const updated2000 = applyButlerCommands(createInitialState(), [
+		{ type: 'preferences.update', preferences: { allergies: exact2000Allergies } }
+	]);
+	assert.equal(updated2000.state.preferences.allergies, exact2000Allergies);
+	assert.throws(() =>
+		applyButlerCommands(createInitialState(), [
+			{ type: 'preferences.update', preferences: { allergies: 'x'.repeat(2001) } }
+		])
+	);
 
 	assert.equal(
 		ButlerResponseSchema.safeParse({
