@@ -1577,6 +1577,9 @@ export type RecipeUrlImportFallback = {
 	reasoning?: ReasoningSettings;
 	connection?: { accessToken: string; codex?: boolean };
 	fetcher?: Fetcher;
+	runWithConnection?: <T>(
+		operation: (resolved: { accessToken: string; codex?: boolean; fetcher: Fetcher }) => Promise<T>
+	) => Promise<T>;
 };
 
 function extractHtmlCharset(rawBytes: Uint8Array, contentType: string): string {
@@ -1684,34 +1687,47 @@ export async function importRecipeFromUrl(
 	}
 
 	assertRequestActive(requestSignal);
-	const requestFetcher = withRequestSignal(fallback.fetcher ?? fetch, requestSignal);
-	const { provider, selectedModel, selectedApiKey, reasoning } = await validateProviderAndReasoning(
-		{
-			provider: fallback.provider,
-			model: fallback.model,
-			apiKey: fallback.apiKey,
-			reasoning: fallback.reasoning
-		},
-		fallback.connection,
-		requestFetcher
-	);
-
 	const prompt = buildCapturePrompt({
 		userText: '',
 		pageText,
 		sourceUrl
 	});
-	assertRequestActive(requestSignal);
-	const modelResult = await callProvider(
-		provider,
-		selectedModel,
-		selectedApiKey,
-		'capture',
-		prompt,
-		undefined,
-		requestFetcher,
-		reasoning
-	);
+	const executeFallback = async (
+		connection: { accessToken: string; codex?: boolean } | undefined,
+		baseFetcher: Fetcher | undefined
+	) => {
+		const requestFetcher = withRequestSignal(baseFetcher ?? fetch, requestSignal);
+		const { provider, selectedModel, selectedApiKey, reasoning } =
+			await validateProviderAndReasoning(
+				{
+					provider: fallback.provider,
+					model: fallback.model,
+					apiKey: fallback.apiKey,
+					reasoning: fallback.reasoning
+				},
+				connection,
+				requestFetcher
+			);
+		assertRequestActive(requestSignal);
+		return callProvider(
+			provider,
+			selectedModel,
+			selectedApiKey,
+			'capture',
+			prompt,
+			undefined,
+			requestFetcher,
+			reasoning
+		);
+	};
+	const modelResult = fallback.runWithConnection
+		? await fallback.runWithConnection((resolved) =>
+				executeFallback(
+					{ accessToken: resolved.accessToken, codex: resolved.codex },
+					resolved.fetcher
+				)
+			)
+		: await executeFallback(fallback.connection, fallback.fetcher);
 	const parsed = CapturedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
 	const { assumptions: modelAssumptions, ...draft } = parsed.data;

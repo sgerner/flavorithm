@@ -36,7 +36,7 @@ export function hostUnavailableResponse(): Response {
 }
 
 /**
- * Unified signed-in provider-error contract (401 / 409 / 503) shared across `/api/ai` and `/api/models`:
+ * Unified signed-in provider-error contract (401 / 409 / 503) shared across `/api/ai`, `/api/models`, and `/api/recipe-import`:
  * - Reserves HTTP 401 (`code: 'session_expired'`) strictly for unauthenticated Flavorithm sessions.
  * - Maps shared Host AI credential/grant failures to HTTP 503 (`host_ai_unavailable`), clearing
  *   host credentials only on a terminal OAuth refresh code via a lease-taking helper.

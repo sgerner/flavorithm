@@ -3780,12 +3780,11 @@
 				return null;
 			}
 			const useHost = Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI);
-			const connected = !useHost && hasAIConnection();
-			return request(
-				'/api/recipe-import',
-				{
+			const buildImportPayload = (hostMode: boolean) => {
+				const connected = !hostMode && hasAIConnection();
+				return {
 					url: standaloneUrl,
-					...(useHost && chatGPT.host
+					...(hostMode && chatGPT.host
 						? {
 								usePersonalAI: false,
 								provider: 'chatgpt',
@@ -3803,10 +3802,27 @@
 									reasoning: kitchen.preferences.reasoning
 								}
 							: { usePersonalAI: true })
-				},
-				'POST',
-				signal
-			);
+				};
+			};
+			try {
+				return await request('/api/recipe-import', buildImportPayload(useHost), 'POST', signal);
+			} catch (err) {
+				const status = (err as { status?: number })?.status;
+				const code = (err as { code?: string })?.code;
+				if (useHost && (status === 400 || code === 'host_ai_unavailable')) {
+					await refreshConnections().catch(() => {});
+					if (!chatGPT.host && hasPersonalAIReady()) {
+						return await request('/api/recipe-import', buildImportPayload(false), 'POST', signal);
+					}
+				} else if (
+					code === 'chatgpt_reauth_required' ||
+					code === 'provider_auth' ||
+					code === 'host_ai_unavailable'
+				) {
+					await refreshConnections().catch(() => {});
+				}
+				throw err;
+			}
 		}
 		if (!(await needAI())) {
 			resumeDialog = 'import';

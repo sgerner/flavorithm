@@ -1179,3 +1179,278 @@ test('importRecipeFromUrl skips unsupported per-100g nutrition and coerces zero-
 	assert.ok(fallback.recipe.ingredients.every((item) => item.quantity > 0));
 	assert.ok(fallback.assumptions.some((note) => /kosher salt/i.test(note)));
 });
+
+test('POST /api/recipe-import enforces the 401/409/503 provider-error contract and refreshes mid-TTL ChatGPT tokens without refetching HTML', async (t) => {
+	const unstructuredHtml =
+		'<!doctype html><html><body><article><h1>Olive Oil Cake</h1><p>Whisk 1 cup flour, 2 eggs, and 0.5 cup olive oil, then bake 35 minutes.</p></article></body></html>';
+	let pageFetches = 0;
+	const countingPageFetcher: SecureRecipePageFetcher = async () => {
+		pageFetches += 1;
+		return new Response(unstructuredHtml, {
+			status: 200,
+			headers: { 'content-type': 'text/html; charset=utf-8' }
+		});
+	};
+
+	// Unauthenticated direct POST returns 401 with code: 'session_expired'.
+	const unauthRes = await recipeImportRoute.POST(
+		createRouteEvent({
+			ip: '198.51.100.201',
+			body: { url: 'https://recipes.example.com/olive-oil-cake' }
+		}) as never,
+		{ pageFetcher: countingPageFetcher }
+	);
+	assert.equal(unauthRes.status, 401);
+	assert.deepEqual(await unauthRes.json(), {
+		error: 'Authentication required',
+		code: 'session_expired'
+	});
+	assert.equal(pageFetches, 0);
+
+	const importUser = await backend.registerUser(
+		'Import OAuth User',
+		'import-oauth-user@example.test',
+		'a strong import oauth password'
+	);
+	const personalGrant = storage.saveChatGPTAccount({
+		userId: importUser.user.id,
+		mode: 'local',
+		clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+		subject: 'personal-import-subject',
+		email: 'import-oauth-user@example.test',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'stale-personal-token',
+			refreshToken: 'valid-personal-refresh',
+			idToken: 'personal-id-token',
+			codexAccountId: 'acct-personal-import'
+		},
+		expiresAt: Date.now() + 3600_000,
+		earliestRefreshAt: 0
+	});
+
+	// Mid-TTL 401 on Codex refreshes once and succeeds without fetching the recipe HTML page twice.
+	let codexCalls = 0;
+	let tokenRefreshes = 0;
+	t.mock.method(globalThis, 'fetch', async () => {
+		tokenRefreshes += 1;
+		return Response.json({
+			access_token: 'fresh-personal-token',
+			refresh_token: 'rotated-personal-refresh',
+			expires_in: 3600
+		});
+	});
+	const refreshedRes = await recipeImportRoute.POST(
+		createRouteEvent({
+			ip: '198.51.100.202',
+			user: importUser.user,
+			body: {
+				url: 'https://recipes.example.com/olive-oil-cake',
+				usePersonalAI: true,
+				provider: 'chatgpt',
+				model: 'gpt-4o-mini',
+				connectionId: personalGrant.id
+			},
+			fetcher: async (_input, init) => {
+				codexCalls += 1;
+				const authHeader = new Headers(init?.headers).get('authorization');
+				if (codexCalls === 1) {
+					assert.equal(authHeader, 'Bearer stale-personal-token');
+					return Response.json({ error: { message: 'Expired token' } }, { status: 401 });
+				}
+				assert.equal(authHeader, 'Bearer fresh-personal-token');
+				const draftJson = JSON.stringify({
+					title: 'Olive Oil Cake',
+					description: 'Tender citrus olive oil cake.',
+					image: '',
+					time: 40,
+					servings: 8,
+					difficulty: 'Easy',
+					cuisine: 'Mediterranean',
+					tags: ['Dessert'],
+					ingredients: [
+						{ name: 'flour', quantity: 1, unit: 'cup' },
+						{ name: 'eggs', quantity: 2, unit: 'each' },
+						{ name: 'olive oil', quantity: 0.5, unit: 'cup' }
+					],
+					steps: ['Whisk wet and dry ingredients.', 'Bake 35 minutes.'],
+					nutrition: {
+						calories: 290,
+						fat: 15,
+						saturatedFat: 2,
+						sodium: 140,
+						carbs: 32,
+						fiber: 1,
+						sugar: 16,
+						protein: 5
+					},
+					assumptions: []
+				});
+				const sse =
+					`data: ${JSON.stringify({ type: 'response.output_text.delta', delta: draftJson })}\r\n\r\n` +
+					`data: ${JSON.stringify({ type: 'response.completed', response: { status: 'completed' } })}\r\n\r\n` +
+					'data: [DONE]\r\n\r\n';
+				return new Response(sse, {
+					status: 200,
+					headers: { 'content-type': 'text/event-stream' }
+				});
+			}
+		}) as never,
+		{ pageFetcher: countingPageFetcher }
+	);
+	assert.equal(refreshedRes.status, 200);
+	assert.equal(pageFetches, 1);
+	assert.equal(tokenRefreshes, 1);
+	assert.equal(codexCalls, 2);
+
+	// Terminal personal ChatGPT refresh rejection maps to 409 chatgpt_reauth_required (never 401).
+	t.mock.method(globalThis, 'fetch', async () =>
+		Response.json(
+			{ error: { code: 'invalid_grant', message: 'Refresh token revoked' } },
+			{ status: 400 }
+		)
+	);
+	const terminalPersonalRes = await recipeImportRoute.POST(
+		createRouteEvent({
+			ip: '198.51.100.203',
+			user: importUser.user,
+			body: {
+				url: 'https://recipes.example.com/olive-oil-cake',
+				usePersonalAI: true,
+				provider: 'chatgpt',
+				model: 'gpt-4o-mini',
+				connectionId: personalGrant.id
+			},
+			fetcher: async () => Response.json({ error: { message: 'Unauthorized' } }, { status: 401 })
+		}) as never,
+		{ pageFetcher: countingPageFetcher }
+	);
+	assert.equal(terminalPersonalRes.status, 409);
+	assert.equal((await terminalPersonalRes.json()).code, 'chatgpt_reauth_required');
+
+	// Non-ChatGPT upstream 401 maps to 502 and AIRequestError(401) maps to 409 provider_auth (never 401).
+	const upstreamOpenAi401Res = await recipeImportRoute.POST(
+		createRouteEvent({
+			ip: '198.51.100.204',
+			user: importUser.user,
+			body: {
+				url: 'https://recipes.example.com/olive-oil-cake',
+				usePersonalAI: true,
+				provider: 'openai',
+				model: 'gpt-4o-mini',
+				apiKey: 'sk-invalid-key'
+			},
+			fetcher: async () =>
+				Response.json({ error: { message: 'Incorrect API key provided' } }, { status: 401 })
+		}) as never,
+		{ pageFetcher: countingPageFetcher }
+	);
+	assert.equal(upstreamOpenAi401Res.status, 502);
+
+	const providerAuthErrorRes = await recipeImportRoute.POST(
+		createRouteEvent({
+			ip: '198.51.100.207',
+			user: importUser.user,
+			body: {
+				url: 'https://recipes.example.com/olive-oil-cake',
+				usePersonalAI: true,
+				provider: 'openai',
+				model: 'gpt-4o-mini',
+				apiKey: 'sk-invalid-key'
+			}
+		}) as never,
+		{
+			pageFetcher: async () => {
+				throw new AIRequestError('Provider rejected API key.', 401);
+			}
+		}
+	);
+	assert.equal(providerAuthErrorRes.status, 409);
+	assert.equal((await providerAuthErrorRes.json()).code, 'provider_auth');
+
+	// Shared Host AI upstream 401 + bare 401 token refresh retains host credentials and maps to 502; terminal invalid_grant maps to 503 host_ai_unavailable and clears host credentials.
+	const hostOwner = await backend.registerUser(
+		'Host Import Admin',
+		'host-import-admin-contract@example.test',
+		'a strong host import admin password'
+	);
+	const prevHostAdmin = process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+	const prevHostShared = process.env.FLAVORITHM_HOST_AI_SHARED;
+	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = hostOwner.user.id;
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
+	try {
+		const hostGrant = storage.saveChatGPTAccount({
+			userId: hostOwner.user.id,
+			mode: 'local',
+			clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+			subject: 'host-import-contract-subject',
+			email: 'host-import-admin-contract@example.test',
+			scopes: ['codex.subscription'],
+			credentials: {
+				accessToken: 'host-token-1',
+				refreshToken: 'host-refresh-1',
+				idToken: 'host-id-1',
+				codexAccountId: 'acct-host-contract'
+			},
+			expiresAt: Date.now() - 5_000,
+			earliestRefreshAt: 0
+		});
+		host.configureHostAI(hostOwner.user.id, hostGrant.id, 'gpt-4o-mini');
+
+		t.mock.method(globalThis, 'fetch', async () => new Response('Unauthorized', { status: 401 }));
+		const bare401HostRes = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: '198.51.100.205',
+				user: importUser.user,
+				body: { url: 'https://recipes.example.com/olive-oil-cake' },
+				fetcher: async () => new Response('Unauthorized', { status: 401 })
+			}) as never,
+			{ pageFetcher: countingPageFetcher }
+		);
+		assert.equal(bare401HostRes.status, 502);
+		assert.ok(storage.getChatGPTAccount(hostOwner.user.id, hostGrant.id)?.credentialEnvelope);
+
+		const terminalHostGrant = storage.saveChatGPTAccount({
+			userId: hostOwner.user.id,
+			mode: 'local',
+			clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+			subject: 'host-import-terminal-subject',
+			email: 'host-import-terminal@example.test',
+			scopes: ['codex.subscription'],
+			credentials: {
+				accessToken: 'host-token-2',
+				refreshToken: 'host-refresh-2',
+				idToken: 'host-id-2',
+				codexAccountId: 'acct-host-terminal'
+			},
+			expiresAt: Date.now() + 3600_000,
+			earliestRefreshAt: 0
+		});
+		host.configureHostAI(hostOwner.user.id, terminalHostGrant.id, 'gpt-4o-mini');
+
+		t.mock.method(globalThis, 'fetch', async () =>
+			Response.json({ error: { code: 'invalid_grant', message: 'Revoked' } }, { status: 400 })
+		);
+		const terminalHostRes = await recipeImportRoute.POST(
+			createRouteEvent({
+				ip: '198.51.100.206',
+				user: importUser.user,
+				body: { url: 'https://recipes.example.com/olive-oil-cake' },
+				fetcher: async () => Response.json({ error: { message: 'Unauthorized' } }, { status: 401 })
+			}) as never,
+			{ pageFetcher: countingPageFetcher }
+		);
+		assert.equal(terminalHostRes.status, 503);
+		assert.equal((await terminalHostRes.json()).code, 'host_ai_unavailable');
+		assert.equal(
+			storage.getChatGPTAccount(hostOwner.user.id, terminalHostGrant.id)?.credentialEnvelope,
+			null
+		);
+	} finally {
+		host.configureHostAI(hostOwner.user.id);
+		if (prevHostAdmin === undefined) delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+		else process.env.FLAVORITHM_HOST_ADMIN_USER_ID = prevHostAdmin;
+		if (prevHostShared === undefined) delete process.env.FLAVORITHM_HOST_AI_SHARED;
+		else process.env.FLAVORITHM_HOST_AI_SHARED = prevHostShared;
+	}
+});
