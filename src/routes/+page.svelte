@@ -89,26 +89,27 @@
 	} from '#lib/domain.ts';
 	import {
 		activeShoppingWeeks,
+		addPantryItems,
 		backfillSampleData,
 		clearSampleData,
 		clearScopeDismissals,
 		completeMeal,
 		deleteShoppingRow,
-		dismissedKeysForScope,
 		expiryStatus,
 		filterPantryItems,
 		hasSampleData,
 		listPantryCategories,
+		movePurchasesToPantry,
 		normalizeIngredientName,
 		normalizePantryDraft,
 		promoteSampleIngredient,
 		normalizeShoppingItem,
-		reconcileShoppingList,
+		refreshWeekShopping as refreshWeekShoppingItems,
 		restockDepletedPantryItems,
 		restoreShoppingRow,
 		revertShoppingItem,
+		shopForScope,
 		snapshotShoppingItem,
-		transferPurchasedItemsToPantry,
 		unitInfo,
 		type PantryDraft,
 		type ShoppingItemDraft,
@@ -1596,9 +1597,14 @@
 			);
 			return;
 		}
-		const activeWeeks = activeShoppingWeeks(kitchen.shopping);
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, additions);
-		const retired = refreshActiveWeeks(activeWeeks);
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
+		const updated = addPantryItems(kitchen, additions);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		refreshActiveWeeks();
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
 		const appliedDismissed = JSON.stringify(kitchen.dismissedShopping ?? null);
@@ -1622,6 +1628,11 @@
 					kitchen.pantry = previousPantry;
 					kitchen.shopping = previousShopping;
 					kitchen.dismissedShopping = previousDismissed;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
 				} else notify('Your pantry changed again. Review the current quantities before editing.');
 			}
 		);
@@ -2826,6 +2837,22 @@
 		deductPantry = false;
 		leftoverServings = 0;
 	}
+	function customizedWeeklyIds(shopping: AppState['shopping']) {
+		return new Set(
+			shopping
+				.filter((item) => item.sourceKey?.startsWith('week:') && !item.checked && item.customized)
+				.map((item) => item.id)
+		);
+	}
+	function countRetiredIds(before: Set<string>, shopping: AppState['shopping']): number {
+		if (!before.size) return 0;
+		const remainingIds = new Set(shopping.map((item) => item.id));
+		let retired = 0;
+		for (const id of before) {
+			if (!remainingIds.has(id)) retired += 1;
+		}
+		return retired;
+	}
 	function retiredCustomizedClause(count: number) {
 		return count > 0
 			? ` · ${count} covered edited shopping ${count === 1 ? 'item' : 'items'} cleared`
@@ -2841,38 +2868,17 @@
 		const start = new Date(`${startDate}T12:00:00`);
 		if (Number.isNaN(start.getTime())) return 0;
 		trackShoppingWeek(startDate);
-		const dates = Array.from({ length: 7 }, (_, index) => {
-			const day = new Date(start);
-			day.setDate(day.getDate() + index);
-			return dateKey(day);
-		});
-		const meals = kitchen.meals.filter((meal) => dates.includes(meal.date) && !meal.completedAt);
-		const recipes = kitchen.recipes.filter((recipe) =>
-			meals.some((meal) => meal.recipeId === recipe.id)
-		);
 		const scopeKey = `week:${startDate}`;
 		const customizedBefore = new Set(
 			kitchen.shopping
 				.filter((item) => item.sourceKey === scopeKey && !item.checked && item.customized)
 				.map((item) => item.id)
 		);
-		const additions = buildShoppingList(recipes, kitchen.pantry, meals);
-		const nextShopping = reconcileShoppingList(
-			kitchen.shopping,
-			additions,
-			scopeKey,
-			dismissedKeysForScope(kitchen.dismissedShopping, scopeKey)
-		);
+		const nextShopping = refreshWeekShoppingItems(kitchen, startDate);
 		kitchen.shopping = nextShopping;
 		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 			clearEditingShoppingState();
-		if (!customizedBefore.size) return 0;
-		const remainingIds = new Set(nextShopping.map((item) => item.id));
-		let retired = 0;
-		for (const id of customizedBefore) {
-			if (!remainingIds.has(id)) retired += 1;
-		}
-		return retired;
+		return countRetiredIds(customizedBefore, nextShopping);
 	}
 	function refreshActiveWeeks(extraWeeks: Iterable<string> = []): number {
 		const weeks = new Set([
@@ -2962,7 +2968,6 @@
 			notify('Mark items purchased first to move them to your pantry.');
 			return;
 		}
-		const activeWeeks = activeShoppingWeeks(kitchen.shopping);
 		const existingKeys = new Set(
 			kitchen.pantry
 				.filter((item) => !item.sample && !item.expires?.trim())
@@ -2972,7 +2977,6 @@
 		);
 		let lotCount = kitchen.pantry.length;
 		const accepted: AppState['shopping'] = [];
-		const acceptedIds = new Set<string>();
 		for (const item of checked) {
 			const name = item.name.trim().slice(0, 200);
 			const unit = item.unit.trim().slice(0, 40);
@@ -2989,7 +2993,6 @@
 				unit,
 				quantity: Math.min(1_000_000, item.quantity)
 			});
-			acceptedIds.add(item.id);
 		}
 		if (!accepted.length) {
 			notify(
@@ -2999,11 +3002,42 @@
 			);
 			return;
 		}
-		kitchen.pantry = transferPurchasedItemsToPantry(kitchen.pantry, accepted);
-		kitchen.shopping = kitchen.shopping.filter((i) => !acceptedIds.has(i.id));
-		const retired = refreshActiveWeeks(activeWeeks);
+		const previousPantry = JSON.parse(JSON.stringify(kitchen.pantry)) as AppState['pantry'];
+		const previousShopping = JSON.parse(JSON.stringify(kitchen.shopping)) as AppState['shopping'];
+		const previousDismissed = kitchen.dismissedShopping
+			? (JSON.parse(JSON.stringify(kitchen.dismissedShopping)) as AppState['dismissedShopping'])
+			: undefined;
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
+		const updated = movePurchasesToPantry(kitchen);
+		kitchen.pantry = updated.pantry;
+		kitchen.shopping = updated.shopping;
+		refreshActiveWeeks();
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
+		const appliedPantry = JSON.stringify(kitchen.pantry);
+		const appliedShopping = JSON.stringify(kitchen.shopping);
+		const appliedDismissed = JSON.stringify(kitchen.dismissedShopping ?? null);
 		notify(
-			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry${retiredCustomizedClause(retired)}.`
+			`${accepted.length} purchased item${accepted.length === 1 ? '' : 's'} moved to your pantry${retiredCustomizedClause(retired)}.`,
+			() => {
+				if (
+					JSON.stringify(kitchen.pantry) === appliedPantry &&
+					JSON.stringify(kitchen.shopping) === appliedShopping &&
+					JSON.stringify(kitchen.dismissedShopping ?? null) === appliedDismissed
+				) {
+					kitchen.pantry = previousPantry;
+					kitchen.shopping = previousShopping;
+					kitchen.dismissedShopping = previousDismissed;
+					if (
+						editingShoppingId &&
+						!kitchen.shopping.some((entry) => entry.id === editingShoppingId)
+					)
+						clearEditingShoppingState();
+				} else {
+					notify('Your kitchen changed again. Review the current values before editing.');
+				}
+			}
 		);
 	}
 	function shoppingFor(items: Recipe[], meals: AppState['meals'] | undefined, sourceKey: string) {
@@ -3016,11 +3050,14 @@
 		if (weekMatch) trackShoppingWeek(weekMatch[1]);
 		kitchen.dismissedShopping = clearScopeDismissals(kitchen.dismissedShopping, sourceKey);
 		const additions = buildShoppingList(items, kitchen.pantry, meals);
-		kitchen.shopping = reconcileShoppingList(kitchen.shopping, additions, sourceKey);
+		const { shopping, uncheckedCount } = shopForScope(kitchen.shopping, additions, sourceKey);
+		kitchen.shopping = shopping;
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 		selected = null;
 		page = 'shopping';
 		notify(
-			additions.length
+			uncheckedCount
 				? 'Shopping list ready. Your pantry is already accounted for.'
 				: 'You have everything you need. Happy cooking!'
 		);
@@ -3137,12 +3174,14 @@
 		const recipeId = meal.recipeId;
 		const servingsCooked = meal.servings;
 		const startDate = weekStartForDate(meal.date);
+		const customizedBefore = customizedWeeklyIds(kitchen.shopping);
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
 		hasSampleRecords = hasSampleData(kitchen);
-		const retired = refreshActiveWeeks([startDate]);
+		refreshActiveWeeks([startDate]);
+		const retired = countRetiredIds(customizedBefore, kitchen.shopping);
 		resetMealDialogState();
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
