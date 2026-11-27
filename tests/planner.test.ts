@@ -1286,6 +1286,20 @@ test('Butler sign-out modal, export confirmation modal, and undo-toast presence 
 	assert.equal(activePendingDialog.includes('<button class="primary" disabled'), false);
 	assert.equal(activePendingDialog.includes('Export pending changes</button>'), true);
 
+	const snapshotPendingExport = renderPlannerHtml((planner) => {
+		planner.pendingSync = false;
+		planner.setPendingSyncSnapshot(planner.kitchen);
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-pending' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	const snapshotPendingDialog = snapshotPendingExport.html.slice(
+		snapshotPendingExport.html.indexOf('aria-label="Export data"')
+	);
+	assert.equal(snapshotPendingDialog.includes('<button class="primary" disabled'), false);
+	assert.equal(snapshotPendingDialog.includes('Export pending changes</button>'), true);
+
 	// 4. Undo-toast presence: mutation shows Undo button, navigation omits Undo button
 	const mutationRender = renderPlannerHtml((planner) => {
 		planner.applyButler(

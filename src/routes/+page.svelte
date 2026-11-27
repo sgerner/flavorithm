@@ -2800,6 +2800,14 @@
 		}
 		return false;
 	}
+	function hasPendingExportData(): boolean {
+		return (
+			pendingSync ||
+			conflicts.length > 0 ||
+			Boolean(kitchenSync?.snapshot()) ||
+			Boolean(kitchenSync?.quarantined().length)
+		);
+	}
 	async function confirmPendingExport() {
 		const kind = pendingExport;
 		if (!kind) return;
@@ -2809,12 +2817,7 @@
 		if (kind === 'kitchen') await exportKitchen();
 		else if (kind === 'shopping') downloadShoppingList();
 		else if (kind === 'pending') {
-			const hasPending =
-				pendingSync ||
-				conflicts.length > 0 ||
-				Boolean(kitchenSync?.snapshot()) ||
-				Boolean(kitchenSync?.quarantined().length);
-			if (hasPending) await exportKitchen();
+			if (hasPendingExportData()) await exportKitchen();
 			else notify('There are no pending changes to export.');
 		}
 	}
@@ -6339,7 +6342,7 @@
 						</div>
 					{/if}
 				{:else if modal === 'export'}
-					{@const hasPendingChanges = pendingSync || conflicts.length > 0}
+					{@const hasPendingChanges = hasPendingExportData()}
 					<h2>
 						{pendingExport === 'shopping'
 							? 'Export shopping list?'
