@@ -29,7 +29,6 @@ const quarantinePrefix = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-quarantined-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
 export const MAX_PENDING_JOURNAL_ENTRIES = 64;
 export const MAX_QUARANTINED_JOURNAL_ENTRIES = 8;
-export const MAX_QUARANTINED_ENTRY_CHARS = 262_144;
 
 export type PendingJournalRecord = {
 	writerId: string;
@@ -87,8 +86,8 @@ function quarantineSlot(
 ): void {
 	const safeSlot = (slotId ? encodeURIComponent(slotId) : 'corrupt').slice(0, 120) || 'corrupt';
 	const baseKey = `${quarantinePrefix(user)}${safeSlot}`;
-	const boundedRaw =
-		raw.length > MAX_QUARANTINED_ENTRY_CHARS ? raw.slice(0, MAX_QUARANTINED_ENTRY_CHARS) : raw;
+	// Never truncate: a quarantined entry is the only copy of the user's unsynced edits.
+	const boundedRaw = raw;
 	try {
 		const existingKeys = listQuarantinedKeys(storage, user);
 		for (const existingKey of existingKeys) {

@@ -5,7 +5,6 @@ import { completeMeal } from '../src/lib/kitchen-workflows.ts';
 import {
 	clearPendingJournalRecords,
 	isKitchenState,
-	MAX_QUARANTINED_ENTRY_CHARS,
 	MAX_QUARANTINED_JOURNAL_ENTRIES,
 	mergeKitchenStates,
 	mergePendingKitchenJournal,
@@ -586,7 +585,7 @@ test('quarantine slots bound suffix and payload growth and expose entries for ba
 		assert.match(loaded.error, /quarantined/);
 	}
 
-	const oversizedPayload = `{"corrupt":"${'x'.repeat(MAX_QUARANTINED_ENTRY_CHARS + 5000)}"}`;
+	const oversizedPayload = `{"corrupt":"${'x'.repeat(300_000)}"}`;
 	storage.setItem(`${pendingPrefix}huge-slot`, oversizedPayload);
 	readPendingJournal(storage, user);
 
@@ -595,15 +594,15 @@ test('quarantine slots bound suffix and payload growth and expose entries for ba
 	for (const keyName of quarantinedKeys) {
 		const suffix = keyName.slice(quarantinePrefix.length);
 		assert.doesNotMatch(suffix, /:\d{10,}$/);
-		assert.ok((storage.getItem(keyName)?.length ?? 0) <= MAX_QUARANTINED_ENTRY_CHARS);
 	}
 
 	const entries = readQuarantinedJournal(storage, user);
 	assert.equal(entries.length, quarantinedKeys.length);
 	const huge = entries.find((entry) => entry.slot.startsWith('huge-slot'));
 	assert.ok(huge);
-	assert.equal(huge.raw.length, MAX_QUARANTINED_ENTRY_CHARS);
-	assert.equal(huge.parsed, undefined);
+	assert.equal(huge.raw, oversizedPayload);
+	assert.equal(storage.getItem(`${pendingPrefix}huge-slot`), null);
+	assert.deepEqual(huge.parsed, JSON.parse(oversizedPayload));
 	const parsedEntry = entries.find((entry) => entry.parsed !== undefined);
 	assert.ok(parsedEntry);
 });
