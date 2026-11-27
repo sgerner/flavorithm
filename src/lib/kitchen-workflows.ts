@@ -638,16 +638,41 @@ export function retireCheckedShoppingItems(
 	});
 }
 
+/** Find an existing user-owned, non-expiring pantry row matching an ingredient's normalized name and unit dimension. */
+export function findPantryMergeDestination(
+	pantry: Ingredient[],
+	name: string,
+	unit: string
+): Ingredient | undefined {
+	if (!name.trim() || !unit.trim()) return undefined;
+	const normalizedName = normalizeName(name);
+	const dimension = unitInfo(unit).dimension;
+	return pantry.find(
+		(item) =>
+			!item.sample &&
+			normalizeName(item.name) === normalizedName &&
+			unitInfo(item.unit).dimension === dimension &&
+			!item.expires?.trim()
+	);
+}
+
 /** Move checked purchases into pantry stock, merging aliases and compatible units safely. */
 export function transferPurchasedItemsToPantry(
 	pantry: Ingredient[],
-	purchases: ShoppingItem[],
+	purchases: Array<ShoppingItem & { category?: string }>,
 	createId: () => string = () => globalThis.crypto.randomUUID()
 ): Ingredient[] {
 	const result = pantry.map((item) => ({ ...item }));
 	const buckets = new Map<
 		string,
-		{ name: string; unit: ReturnType<typeof unitInfo>; quantityBase: number; category?: string }
+		{
+			rawName: string;
+			rawUnit: string;
+			name: string;
+			unit: ReturnType<typeof unitInfo>;
+			quantityBase: number;
+			category?: string;
+		}
 	>();
 	for (const item of purchases) {
 		if (
@@ -662,6 +687,8 @@ export function transferPurchasedItemsToPantry(
 		const unit = unitInfo(item.unit);
 		const key = `${normalizedName}\u0000${unit.dimension}`;
 		const bucket = buckets.get(key) ?? {
+			rawName: item.name,
+			rawUnit: item.unit,
 			name: item.name.trim().slice(0, 200),
 			unit,
 			quantityBase: 0
@@ -675,15 +702,8 @@ export function transferPurchasedItemsToPantry(
 	}
 
 	const usedIds = new Set(result.map((item) => item.id));
-	for (const [key, bucket] of buckets) {
-		const [normalizedName] = key.split('\u0000');
-		const destination = result.find(
-			(item) =>
-				!item.sample &&
-				normalizeName(item.name) === normalizedName &&
-				unitInfo(item.unit).dimension === bucket.unit.dimension &&
-				!item.expires?.trim()
-		);
+	for (const [, bucket] of buckets) {
+		const destination = findPantryMergeDestination(result, bucket.rawName, bucket.rawUnit);
 		if (destination) {
 			const baseline = Number.isFinite(destination.quantity)
 				? Math.max(0, destination.quantity)

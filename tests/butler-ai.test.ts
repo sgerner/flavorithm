@@ -251,6 +251,77 @@ test('Basil can revise an unsaved recipe card in the same conversation', async (
 	assert.equal(updated.recipes.find((recipe) => recipe.id === draft.id)?.servings, 6);
 });
 
+test('butler prompt contract enforces saved recipes, importNotes attribution, and Settings-only AI connections', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const { applyButlerCommands } = await import('../src/lib/butler.ts');
+	const kitchen = createInitialState();
+	kitchen.preferences = {
+		...kitchen.preferences,
+		provider: 'openai',
+		model: 'gpt-4o-mini',
+		usePersonalAI: false
+	};
+	await runAIRequest(
+		request,
+		provider({ reply: 'All in order.', commands: [] }, (body) => {
+			const systemPrompt = String(body.messages[0].content);
+			assert.match(systemPrompt, /saved: true/);
+			assert.match(systemPrompt, /whole-number servings between 1 and 24/);
+			assert.match(systemPrompt, /importNotes/);
+			assert.match(systemPrompt, /rather than in source/);
+			assert.match(systemPrompt, /ai-settings/);
+			assert.match(systemPrompt, /grouped in one action card/);
+		})
+	);
+
+	const validSibling = {
+		type: 'preferences.update' as const,
+		preferences: { diet: 'mediterranean' }
+	};
+
+	for (const badCommand of [
+		{ type: 'preferences.update', preferences: { provider: 'anthropic', model: 'claude' } },
+		{ type: 'preferences.update', preferences: { usePersonalAI: true } },
+		{
+			type: 'recipe.upsert',
+			recipe: { ...kitchen.recipes[0], id: 'bad-source', source: 'Inspired by a local bistro' }
+		},
+		{
+			type: 'recipe.upsert',
+			recipe: { ...kitchen.recipes[0], id: 'bad-servings', servings: 30 }
+		}
+	]) {
+		const soloResult = await runAIRequest(
+			request,
+			provider({ reply: 'Ready.', commands: [badCommand] })
+		);
+		assert.deepEqual(soloResult, {
+			reply: 'Ready.',
+			commands: [],
+			droppedCommands: 1
+		});
+
+		const mixedResult = (await runAIRequest(
+			request,
+			provider({ reply: 'Ready.', commands: [badCommand, validSibling] })
+		)) as { reply: string; commands: unknown[]; droppedCommands?: number };
+		assert.deepEqual(mixedResult, {
+			reply: 'Ready.',
+			commands: [validSibling],
+			droppedCommands: 1
+		});
+		const applied = applyButlerCommands(kitchen, mixedResult.commands).state;
+		assert.equal(applied.preferences.diet, 'mediterranean');
+		assert.equal(applied.preferences.provider, 'openai');
+		assert.equal(applied.preferences.model, 'gpt-4o-mini');
+		assert.equal(applied.preferences.usePersonalAI, false);
+		assert.equal(
+			applied.recipes.some((recipe) => recipe.id === 'bad-source' || recipe.id === 'bad-servings'),
+			false
+		);
+	}
+});
+
 test('butler chat prompt and schema require explicit deductPantry and forbid duplicate deductions', async () => {
 	await runAIRequest(
 		request,

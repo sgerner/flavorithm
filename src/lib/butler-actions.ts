@@ -1,5 +1,7 @@
 import { z } from 'zod';
-import { ButlerCommandSchema, type ButlerCommand } from './butler.ts';
+import { ButlerCommandSchema, resolvePantryUpsertTargetId, type ButlerCommand } from './butler.ts';
+import { normalizeName } from './domain.ts';
+import { convertCompatibleQuantity } from './kitchen-workflows.ts';
 import type { AppState } from './types.ts';
 
 export type ButlerAction = {
@@ -10,6 +12,15 @@ export type ButlerAction = {
 	commands: ButlerCommand[];
 	destructive: boolean;
 };
+
+function dateInWeek(date: string | undefined, weekStart: string): boolean {
+	if (!date) return false;
+	const end = new Date(`${weekStart}T12:00:00Z`);
+	if (Number.isNaN(end.getTime())) return false;
+	end.setUTCDate(end.getUTCDate() + 6);
+	const endKey = `${end.getUTCFullYear()}-${String(end.getUTCMonth() + 1).padStart(2, '0')}-${String(end.getUTCDate()).padStart(2, '0')}`;
+	return date >= weekStart && date <= endKey;
+}
 
 /** Turn validated Butler commands into stable, readable action cards. */
 export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerAction[] {
@@ -51,7 +62,7 @@ export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerA
 				share(index, `recipe:${command.id}`);
 				break;
 			case 'pantry.upsert':
-				share(index, `pantry:${command.item.id}`);
+				share(index, `pantry:${resolvePantryUpsertTargetId(kitchen.pantry, command.item)}`);
 				break;
 			case 'pantry.delete':
 				share(index, `pantry:${command.id}`);
@@ -118,6 +129,176 @@ export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerA
 			for (const recipeIndex of recipeChanges.get(meal.recipeId) ?? []) join(index, recipeIndex);
 		}
 	}
+
+	const allowPantryMealBridge =
+		planIndex !== undefined ||
+		commands.some((candidate) => candidate.type === 'meal.complete' && candidate.deductPantry);
+	const componentHas = (root: number, predicate: (command: ButlerCommand) => boolean) =>
+		commands.some((candidate, idx) => find(idx) === root && predicate(candidate));
+	const joinDependent = (left: number, right: number) => {
+		const a = find(left);
+		const b = find(right);
+		if (a === b) return;
+		if (!allowPantryMealBridge) {
+			const isOptOutMeal = (candidate: ButlerCommand) =>
+				candidate.type === 'meal.complete' && !candidate.deductPantry;
+			const isPantry = (candidate: ButlerCommand) =>
+				candidate.type === 'pantry.upsert' || candidate.type === 'pantry.delete';
+			if (
+				(componentHas(a, isOptOutMeal) && componentHas(b, isPantry)) ||
+				(componentHas(b, isOptOutMeal) && componentHas(a, isPantry))
+			) {
+				return;
+			}
+		}
+		join(a, b);
+	};
+
+	// Removals of generated shopping items stay with related meal, recipe, or pantry mutations.
+	commands.forEach((command, index) => {
+		if (command.type !== 'shopping.delete') return;
+		const shoppingItem = kitchen.shopping.find((item) => item.id === command.id);
+		const sourceKey = shoppingItem?.sourceKey?.trim();
+		if (!shoppingItem || !sourceKey) return;
+		const normalizedTarget = normalizeName(shoppingItem.name);
+
+		if (shoppingItem.checked) {
+			if (sourceKey.startsWith('week:')) {
+				const weekStart = sourceKey.slice('week:'.length);
+				commands.forEach((candidate, candidateIndex) => {
+					if (candidate.type !== 'meal.complete' || !candidate.deductPantry) return;
+					const existing = findMeal(candidate.id, kitchen, commands);
+					if (!dateInWeek(existing?.date, weekStart)) return;
+					const recipe = findRecipe(existing?.recipeId, kitchen, commands);
+					if (
+						recipe?.ingredients.some(
+							(ingredient) => normalizeName(ingredient.name) === normalizedTarget
+						)
+					) {
+						joinDependent(index, candidateIndex);
+					}
+				});
+			}
+			commands.forEach((candidate, candidateIndex) => {
+				if (
+					candidate.type !== 'pantry.upsert' ||
+					!(candidate.item.quantity > 0) ||
+					!candidate.item.unit.trim()
+				) {
+					return;
+				}
+				const existingPantry = kitchen.pantry.find((item) => item.id === candidate.item.id);
+				const previousInNextUnit = existingPantry
+					? convertCompatibleQuantity(
+							existingPantry.quantity,
+							existingPantry.unit,
+							candidate.item.unit
+						)
+					: 0;
+				if (
+					previousInNextUnit !== undefined &&
+					!(candidate.item.quantity > Math.max(0, previousInNextUnit))
+				) {
+					return;
+				}
+				if (
+					normalizeName(candidate.item.name) === normalizedTarget ||
+					(existingPantry && normalizeName(existingPantry.name) === normalizedTarget)
+				) {
+					joinDependent(index, candidateIndex);
+				}
+			});
+			return;
+		}
+
+		if (sourceKey.startsWith('recipe:')) {
+			const recipeId = sourceKey.slice('recipe:'.length);
+			for (const recipeIndex of recipeChanges.get(recipeId) ?? [])
+				joinDependent(index, recipeIndex);
+			commands.forEach((candidate, candidateIndex) => {
+				if (candidate.type === 'meal.upsert' && candidate.meal.recipeId === recipeId) {
+					joinDependent(index, candidateIndex);
+				} else if (
+					candidate.type === 'meal.upsert' ||
+					candidate.type === 'meal.delete' ||
+					candidate.type === 'meal.complete'
+				) {
+					const mealId = candidate.type === 'meal.upsert' ? candidate.meal.id : candidate.id;
+					if (kitchen.meals.find((meal) => meal.id === mealId)?.recipeId === recipeId)
+						joinDependent(index, candidateIndex);
+				}
+			});
+		} else if (sourceKey.startsWith('week:')) {
+			const weekStart = sourceKey.slice('week:'.length);
+			const weekRecipeIds = new Set<string>();
+			for (const meal of kitchen.meals) {
+				if (dateInWeek(meal.date, weekStart)) weekRecipeIds.add(meal.recipeId);
+			}
+			commands.forEach((candidate, candidateIndex) => {
+				if (candidate.type === 'meal.upsert') {
+					const existing = kitchen.meals.find((meal) => meal.id === candidate.meal.id);
+					if (dateInWeek(candidate.meal.date, weekStart) || dateInWeek(existing?.date, weekStart)) {
+						joinDependent(index, candidateIndex);
+						weekRecipeIds.add(candidate.meal.recipeId);
+						if (existing) weekRecipeIds.add(existing.recipeId);
+					}
+				} else if (candidate.type === 'meal.delete' || candidate.type === 'meal.complete') {
+					const existing = kitchen.meals.find((meal) => meal.id === candidate.id);
+					if (dateInWeek(existing?.date, weekStart)) {
+						joinDependent(index, candidateIndex);
+						if (existing) weekRecipeIds.add(existing.recipeId);
+					}
+				}
+			});
+			for (const [recipeId, indices] of recipeChanges) {
+				const existingRecipe = kitchen.recipes.find((recipe) => recipe.id === recipeId);
+				const upsertedRecipe = commands.find(
+					(c): c is Extract<ButlerCommand, { type: 'recipe.upsert' }> =>
+						c.type === 'recipe.upsert' && c.recipe.id === recipeId
+				)?.recipe;
+				const touchesIngredient = [
+					...(existingRecipe?.ingredients ?? []),
+					...(upsertedRecipe?.ingredients ?? [])
+				].some((ingredient) => normalizeName(ingredient.name) === normalizedTarget);
+				if (weekRecipeIds.has(recipeId) || touchesIngredient) {
+					for (const recipeIndex of indices) joinDependent(index, recipeIndex);
+				}
+			}
+		} else if (sourceKey.startsWith('meal:')) {
+			const mealId = sourceKey.split(':')[1] ?? '';
+			const existingMeal = kitchen.meals.find((meal) => meal.id === mealId);
+			if (existingMeal) {
+				for (const recipeIndex of recipeChanges.get(existingMeal.recipeId) ?? [])
+					joinDependent(index, recipeIndex);
+			}
+			commands.forEach((candidate, candidateIndex) => {
+				if (
+					(candidate.type === 'meal.upsert' && candidate.meal.id === mealId) ||
+					((candidate.type === 'meal.delete' || candidate.type === 'meal.complete') &&
+						candidate.id === mealId)
+				) {
+					joinDependent(index, candidateIndex);
+				}
+			});
+		}
+
+		commands.forEach((candidate, candidateIndex) => {
+			if (candidate.type === 'pantry.upsert') {
+				const existingPantry = kitchen.pantry.find((item) => item.id === candidate.item.id);
+				if (
+					normalizeName(candidate.item.name) === normalizedTarget ||
+					(existingPantry && normalizeName(existingPantry.name) === normalizedTarget)
+				) {
+					joinDependent(index, candidateIndex);
+				}
+			} else if (candidate.type === 'pantry.delete') {
+				const existingPantry = kitchen.pantry.find((item) => item.id === candidate.id);
+				if (existingPantry && normalizeName(existingPantry.name) === normalizedTarget) {
+					joinDependent(index, candidateIndex);
+				}
+			}
+		});
+	});
 
 	const groups = new Map<number, { index: number; command: ButlerCommand }[]>();
 	commands.forEach((command, index) => {

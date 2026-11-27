@@ -2648,11 +2648,13 @@
 					);
 					if (meal) openCookDialog(meal);
 					else {
+						modal = '';
 						selectedMealServings = undefined;
 						selectedDetailTab = 'recipe';
 						selected = recipe;
 					}
 				} else {
+					modal = '';
 					selectedMealServings = undefined;
 					selectedDetailTab = 'recipe';
 					selected = recipe ?? null;
@@ -3195,6 +3197,7 @@
 		if (!draft) return;
 		selected = null;
 		selectedMealServings = undefined;
+		modal = '';
 		editingRecipeMode = 'edit';
 		editingRecipe = draft;
 	}

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState } from '../src/lib/data.ts';
-import { applyButlerCommands } from '../src/lib/butler.ts';
+import { applyButlerCommands, resolvePantryUpsertTargetId } from '../src/lib/butler.ts';
 import { buildButlerActions, previewButlerCommand } from '../src/lib/butler-actions.ts';
 
 test('independent recipe and pantry changes become readable individual cards', () => {
@@ -340,4 +340,414 @@ test('meal completion and leftover cards and previews show recipe title, deducti
 	const deletePreview = previewButlerCommand({ type: 'meal.delete', id: meal.id }, kitchen);
 	assert.match(deletePreview, new RegExp(recipe.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
 	assert.doesNotMatch(deletePreview, /Kitchen update/);
+});
+
+test('cancelling a planned meal groups with its generated weekly shopping removals into one card', () => {
+	const kitchen = createInitialState();
+	const recipe = kitchen.recipes[0];
+	kitchen.pantry = [];
+	kitchen.meals = [
+		{ id: 'wed-dinner', date: '2026-10-21', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+	const now = new Date('2026-10-20T12:00:00Z');
+	const populated = applyButlerCommands(
+		kitchen,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	assert.ok(populated.shopping.length >= 2);
+
+	const commands = [
+		{ type: 'meal.delete', id: 'wed-dinner' },
+		...populated.shopping.slice(0, 2).map((item) => ({ type: 'shopping.delete', id: item.id }))
+	];
+	for (const ordered of [commands, [...commands].reverse()]) {
+		const actions = buildButlerActions(ordered, populated);
+		assert.equal(actions.length, 1);
+		assert.equal(actions[0].destructive, true);
+
+		const applied = applyButlerCommands(populated, actions[0].commands, now).state;
+		assert.equal(applied.meals.length, 0);
+		assert.equal(applied.shopping.length, 0);
+	}
+});
+
+test('deleting a recipe groups with recipe-scoped and weekly generated shopping removals without missing-item errors', () => {
+	const kitchen = createInitialState();
+	const recipe = kitchen.recipes[0];
+	recipe.ingredients = [{ name: 'green beans', quantity: 8, unit: 'oz' }];
+	kitchen.pantry = [];
+	kitchen.meals = [
+		{ id: 'thu-dinner', date: '2026-10-22', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+	const now = new Date('2026-10-20T12:00:00Z');
+	const populated = applyButlerCommands(
+		kitchen,
+		[{ type: 'shopping.generate', weekStart: '2026-10-19' }],
+		now
+	).state;
+	const weeklyId = populated.shopping[0].id;
+	populated.shopping.push({
+		id: 'generated-recipe-beans',
+		name: 'green beans',
+		quantity: 8,
+		unit: 'oz',
+		checked: false,
+		sourceKey: `recipe:${recipe.id}`
+	});
+
+	const forward = [
+		{ type: 'recipe.delete', id: recipe.id },
+		{ type: 'shopping.delete', id: 'generated-recipe-beans' },
+		{ type: 'shopping.delete', id: weeklyId }
+	];
+	for (const ordered of [forward, [...forward].reverse()]) {
+		const actions = buildButlerActions(ordered, populated);
+		assert.equal(actions.length, 1);
+		assert.equal(actions[0].destructive, true);
+
+		const applied = applyButlerCommands(populated, actions[0].commands, now).state;
+		assert.equal(
+			applied.recipes.some((item) => item.id === recipe.id),
+			false
+		);
+		assert.equal(applied.shopping.length, 0);
+	}
+});
+
+test('pantry changes group with matching generated shopping removals while manual shopping removals stay separate', () => {
+	const kitchen = createInitialState();
+	kitchen.shopping = [
+		{
+			id: 'generated-oil',
+			name: 'olive oil',
+			quantity: 2,
+			unit: 'tbsp',
+			checked: false,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'manual-napkins',
+			name: 'paper napkins',
+			quantity: 1,
+			unit: 'pack',
+			checked: false
+		}
+	];
+
+	const pantryCommand = {
+		type: 'pantry.upsert' as const,
+		item: {
+			id: 'bought-ev-oil',
+			name: 'extra virgin olive oil',
+			quantity: 1,
+			unit: 'cup',
+			category: 'Oils & condiments'
+		}
+	};
+	for (const ordered of [
+		[
+			pantryCommand,
+			{ type: 'shopping.delete', id: 'generated-oil' },
+			{ type: 'shopping.delete', id: 'manual-napkins' }
+		],
+		[
+			{ type: 'shopping.delete', id: 'generated-oil' },
+			pantryCommand,
+			{ type: 'shopping.delete', id: 'manual-napkins' }
+		]
+	]) {
+		const actions = buildButlerActions(ordered, kitchen);
+		assert.equal(actions.length, 2);
+		assert.equal(actions[0].commands.length, 2);
+		assert.equal(actions[1].commands.length, 1);
+		assert.equal(actions[1].title, 'paper napkins');
+	}
+});
+
+test('dependent shopping removals preserve meal.complete opt-out isolation and checked shopping rows across command orders', () => {
+	const kitchen = createInitialState();
+	const recipe = {
+		...kitchen.recipes[0],
+		id: 'spinach-pasta',
+		servings: 2,
+		ingredients: [{ name: 'spinach', quantity: 2, unit: 'cup' }]
+	};
+	kitchen.recipes = [recipe];
+	kitchen.pantry = [];
+	kitchen.meals = [
+		{
+			id: 'thu-dinner',
+			date: '2026-10-22',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: 2
+		},
+		{
+			id: 'sat-dinner',
+			date: '2026-10-24',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: 2
+		}
+	];
+	kitchen.shopping = [
+		{
+			id: 'checked-week-spinach',
+			name: 'spinach',
+			quantity: 2,
+			unit: 'cup',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'unchecked-week-spinach',
+			name: 'spinach',
+			quantity: 2,
+			unit: 'cup',
+			checked: false,
+			sourceKey: 'week:2026-10-19'
+		}
+	];
+	const now = new Date('2026-10-22T18:00:00Z');
+
+	// Opt-out meal.complete (deductPantry: false) never pulls a checked-row shopping.delete into its card in either order.
+	for (const ordered of [
+		[
+			{ type: 'meal.complete', id: 'thu-dinner', deductPantry: false },
+			{ type: 'shopping.delete', id: 'checked-week-spinach' }
+		],
+		[
+			{ type: 'shopping.delete', id: 'checked-week-spinach' },
+			{ type: 'meal.complete', id: 'thu-dinner', deductPantry: false }
+		]
+	]) {
+		const actions = buildButlerActions(ordered, kitchen);
+		assert.equal(actions.length, 2);
+		const mealAction = actions.find((action) =>
+			action.commands.some((command) => command.type === 'meal.complete')
+		)!;
+		assert.equal(mealAction.commands.length, 1);
+		const appliedMealOnly = applyButlerCommands(kitchen, mealAction.commands, now).state;
+		assert.deepEqual(appliedMealOnly.shopping, [
+			{
+				id: 'checked-week-spinach',
+				name: 'spinach',
+				quantity: 2,
+				unit: 'cup',
+				checked: true,
+				sourceKey: 'week:2026-10-19'
+			}
+		]);
+	}
+
+	// Unchecked weekly removal groups with opt-out meal.complete in both orders without retiring checked rows or bridging pantry.upsert.
+	const pantryAdd = {
+		type: 'pantry.upsert' as const,
+		item: { id: 'fresh-spinach', name: 'spinach', quantity: 2, unit: 'cup', category: 'Produce' }
+	};
+	const optOutComplete = { type: 'meal.complete' as const, id: 'thu-dinner', deductPantry: false };
+	const deleteUnchecked = { type: 'shopping.delete' as const, id: 'unchecked-week-spinach' };
+
+	for (const permutation of [
+		[pantryAdd, optOutComplete, deleteUnchecked],
+		[optOutComplete, pantryAdd, deleteUnchecked],
+		[deleteUnchecked, pantryAdd, optOutComplete],
+		[deleteUnchecked, optOutComplete, pantryAdd]
+	]) {
+		const actions = buildButlerActions(permutation, kitchen);
+		assert.equal(actions.length, 2);
+		const mealCard = actions.find((action) =>
+			action.commands.some((command) => command.type === 'meal.complete')
+		)!;
+		const pantryCard = actions.find((action) =>
+			action.commands.some((command) => command.type === 'pantry.upsert')
+		)!;
+		assert.equal(mealCard.commands.length, 2);
+		assert.equal(pantryCard.commands.length, 1);
+
+		const afterOptOutCard = applyButlerCommands(kitchen, mealCard.commands, now).state;
+		assert.equal(afterOptOutCard.pantry.length, 0);
+		assert.deepEqual(afterOptOutCard.shopping, [
+			{
+				id: 'checked-week-spinach',
+				name: 'spinach',
+				quantity: 2,
+				unit: 'cup',
+				checked: true,
+				sourceKey: 'week:2026-10-19'
+			}
+		]);
+	}
+});
+
+test('pantry merge target helper keeps card grouping and applied pantry merges identical across all cases', () => {
+	const kitchen = createInitialState();
+	kitchen.pantry = [
+		{ id: 'oil-stock', name: 'olive oil', quantity: 0.5, unit: 'cup', category: 'Oils' },
+		{
+			id: 'sample-rice',
+			name: 'jasmine rice',
+			quantity: 2,
+			unit: 'cups',
+			category: 'Grains',
+			sample: true
+		},
+		{
+			id: 'expiring-milk',
+			name: 'milk',
+			quantity: 1,
+			unit: 'l',
+			category: 'Dairy',
+			expires: '2026-10-28'
+		}
+	];
+	kitchen.shopping = [];
+
+	const cases: Array<{
+		label: string;
+		item: {
+			id: string;
+			name: string;
+			quantity: number;
+			unit: string;
+			category: string;
+			expires?: string;
+		};
+		expectedTargetId: string;
+		probeExistingId: string;
+	}> = [
+		{
+			label: 'alias + compatible unit merges into user-owned non-expiring stock',
+			item: {
+				id: 'new-ev-oil',
+				name: 'extra virgin olive oil',
+				quantity: 4,
+				unit: 'tbsp',
+				category: 'Oils'
+			},
+			expectedTargetId: 'oil-stock',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'zero-quantity compatible upsert targets existing non-expiring stock',
+			item: {
+				id: 'zero-ev-oil',
+				name: 'extra virgin olive oil',
+				quantity: 0,
+				unit: 'tbsp',
+				category: 'Oils'
+			},
+			expectedTargetId: 'oil-stock',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'incompatible unit dimension creates a separate pantry row',
+			item: {
+				id: 'oil-grams',
+				name: 'olive oil',
+				quantity: 100,
+				unit: 'g',
+				category: 'Oils'
+			},
+			expectedTargetId: 'oil-grams',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'incoming expiring lot stays separate from non-expiring stock',
+			item: {
+				id: 'oil-expiring-lot',
+				name: 'olive oil',
+				quantity: 0.25,
+				unit: 'cup',
+				category: 'Oils',
+				expires: '2026-10-30'
+			},
+			expectedTargetId: 'oil-expiring-lot',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'existing expiring lot is not merged into by new non-expiring stock',
+			item: {
+				id: 'fresh-milk',
+				name: 'milk',
+				quantity: 500,
+				unit: 'ml',
+				category: 'Dairy'
+			},
+			expectedTargetId: 'fresh-milk',
+			probeExistingId: 'expiring-milk'
+		},
+		{
+			label: 'sample-tagged starter stock is not merged into by new user groceries',
+			item: {
+				id: 'bought-rice',
+				name: 'jasmine rice',
+				quantity: 1,
+				unit: 'cup',
+				category: 'Grains'
+			},
+			expectedTargetId: 'bought-rice',
+			probeExistingId: 'sample-rice'
+		},
+		{
+			label: 'blank unit stays separate',
+			item: {
+				id: 'blank-unit-oil',
+				name: 'olive oil',
+				quantity: 1,
+				unit: '',
+				category: 'Oils'
+			},
+			expectedTargetId: 'blank-unit-oil',
+			probeExistingId: 'oil-stock'
+		},
+		{
+			label: 'existing ID updates that row in place',
+			item: {
+				id: 'sample-rice',
+				name: 'jasmine rice',
+				quantity: 3,
+				unit: 'cups',
+				category: 'Grains'
+			},
+			expectedTargetId: 'sample-rice',
+			probeExistingId: 'sample-rice'
+		}
+	];
+
+	for (const testCase of cases) {
+		const targetId = resolvePantryUpsertTargetId(kitchen.pantry, testCase.item);
+		assert.equal(targetId, testCase.expectedTargetId, testCase.label);
+
+		// Card grouping joins with pantry.delete(probeExistingId) iff targetId === probeExistingId.
+		const grouped = buildButlerActions(
+			[
+				{ type: 'pantry.upsert', item: testCase.item },
+				{ type: 'pantry.delete', id: testCase.probeExistingId }
+			],
+			kitchen
+		);
+		assert.equal(
+			grouped.length,
+			targetId === testCase.probeExistingId ? 1 : 2,
+			`${testCase.label}: card grouping`
+		);
+
+		// Applied state mutates or creates exclusively targetId.
+		const applied = applyButlerCommands(kitchen, [
+			{ type: 'pantry.upsert', item: testCase.item }
+		]).state;
+		assert.ok(
+			applied.pantry.some((entry) => entry.id === targetId),
+			`${testCase.label}: target row exists`
+		);
+		if (targetId !== testCase.item.id) {
+			assert.equal(
+				applied.pantry.some((entry) => entry.id === testCase.item.id),
+				false,
+				`${testCase.label}: merged item does not create duplicate row`
+			);
+		}
+	}
 });

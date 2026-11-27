@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import type { AppState, Ingredient } from './types.ts';
+import type { AppState, Ingredient, ShoppingItem } from './types.ts';
+import { COVER_PATH } from './cover-upload.ts';
 import { MAX_RECIPES } from './recipe-collection.ts';
 import {
 	activeWeeklyScopes,
@@ -8,11 +9,13 @@ import {
 	deleteMeal,
 	deleteRecipe,
 	expiryStatus,
+	findPantryMergeDestination,
 	normalizeName,
 	promoteSampleIngredient,
 	refreshRecipeShopping,
 	refreshWeekShopping,
 	retireCheckedShoppingItems,
+	transferPurchasedItemsToPantry,
 	unitInfo,
 	upsertMeal,
 	upsertRecipe,
@@ -22,6 +25,21 @@ import {
 const id = z.string().trim().min(1).max(100);
 const text = z.string().max(10000);
 const quantity = z.number().nonnegative().max(1000000);
+const cookingTime = z.number().nonnegative().max(100000);
+const servings = z.number().int().min(1).max(24);
+const leftoverServings = z.number().finite().nonnegative().max(10000);
+const publicUrl = z
+	.string()
+	.max(4000)
+	.refine((value) => {
+		if (!value) return true;
+		try {
+			const url = new URL(value);
+			return url.protocol === 'https:' && !url.username && !url.password;
+		} catch {
+			return false;
+		}
+	}, 'Use a public HTTPS URL.');
 const nutrition = z.object({
 	calories: quantity,
 	fat: quantity,
@@ -36,19 +54,9 @@ const recipe = z.object({
 	id,
 	title: z.string().trim().min(1).max(200),
 	description: text,
-	image: z
-		.string()
-		.max(4000)
-		.refine(
-			(value) =>
-				!value ||
-				value.startsWith('/recipe-covers/') ||
-				value.startsWith('/api/recipe-covers/') ||
-				/^https?:\/\//.test(value),
-			'Use an HTTP image URL or a recipe cover.'
-		),
-	time: quantity,
-	servings: z.number().min(1).max(10000),
+	image: z.union([publicUrl, z.string().regex(COVER_PATH)]),
+	time: cookingTime,
+	servings,
 	difficulty: z.string().max(80),
 	cuisine: z.string().max(100),
 	tags: z.array(z.string().max(100)).max(100),
@@ -59,9 +67,9 @@ const recipe = z.object({
 		.max(250),
 	steps: z.array(text).max(200),
 	nutrition,
-	source: z.string().max(4000).optional(),
+	source: publicUrl.optional(),
 	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
-	importNotes: z.array(z.string().max(1000)).max(50).optional(),
+	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
 	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
 	saved: z.boolean().optional(),
@@ -89,15 +97,15 @@ const meal = z.object({
 	date,
 	slot: z.enum(['Breakfast', 'Lunch', 'Dinner']),
 	recipeId: id,
-	servings: z.number().finite().min(1).max(10000),
+	servings,
 	completedAt: z.iso
 		.datetime()
+		.max(50)
 		.optional()
 		.describe(
 			'Read-only ISO completion timestamp preserved on already-cooked meals and ignored on uncompleted meals; use meal.complete to finish a planned meal.'
 		),
-	leftoverServings: quantity
-		.finite()
+	leftoverServings: leftoverServings
 		.optional()
 		.describe(
 			'Remaining leftover servings on an already-cooked meal (clamped between 0 and servings); ignored on uncompleted meals.'
@@ -116,22 +124,13 @@ const preferences = z
 	.object({
 		diet: z.string().max(200),
 		allergies: z.string().max(500),
-		maxTime: z.number().nonnegative().max(100000),
+		maxTime: cookingTime,
 		complexity: z.string().max(80),
-		cuisines: z.array(z.string().max(80)).max(8),
+		cuisines: z.array(z.string().trim().min(1).max(80)).max(8),
 		onboardingStatus: z.enum(['completed', 'skipped']),
 		theme: z.string().max(80),
 		dark: z.boolean(),
-		provider: z.string().max(100),
-		model: z.string().max(200),
-		reasoning: z.object({
-			effort: z.string().max(24).optional(),
-			enabled: z.boolean().optional(),
-			budgetTokens: z.number().int().min(0).max(32768).optional()
-		}),
-		ratings: z.record(id, z.number().min(0).max(5)),
-		chatgptAccountId: z.string().max(100),
-		usePersonalAI: z.boolean()
+		ratings: z.record(id, z.number().min(0).max(5))
 	})
 	.partial()
 	.strict();
@@ -146,7 +145,7 @@ export const ButlerCommandSchema = z.discriminatedUnion('type', [
 		.object({
 			type: z.literal('meal.complete'),
 			id: id.describe('ID of the planned meal in kitchen.meals to mark cooked.'),
-			leftoverServings: quantity
+			leftoverServings: leftoverServings
 				.optional()
 				.describe('Portions saved as leftovers from 0 up to the meal servings; defaults to 0.'),
 			deductPantry: z
@@ -217,6 +216,180 @@ function requireId(items: { id: string }[], target: string) {
 		);
 }
 
+/** Resolve the pantry row ID that a `pantry.upsert` command updates in place, merges into, or creates. */
+export function resolvePantryUpsertTargetId(
+	pantryItems: Ingredient[],
+	item: Pick<Ingredient, 'id' | 'name' | 'unit' | 'expires'>
+): string {
+	if (pantryItems.some((existing) => existing.id === item.id)) return item.id;
+	if (item.expires?.trim() || !item.unit.trim()) return item.id;
+	return findPantryMergeDestination(pantryItems, item.name, item.unit)?.id ?? item.id;
+}
+
+function upsertPantryItem(pantryItems: Ingredient[], item: Ingredient): Ingredient[] {
+	if (pantryItems.some((value) => value.id === item.id)) return upsert(pantryItems, item);
+	if (item.expires?.trim() || !item.unit.trim()) return [...pantryItems, item];
+	const destination = findPantryMergeDestination(pantryItems, item.name, item.unit);
+	if (item.quantity === 0) {
+		if (destination) return pantryItems;
+		return [...pantryItems, item];
+	}
+	const createdItem = {
+		id: item.id,
+		name: item.name,
+		quantity: item.quantity,
+		unit: item.unit,
+		checked: true,
+		category: item.category
+	};
+	const withExplicitExpires = (items: Ingredient[]) =>
+		item.expires !== undefined
+			? items.map((entry) => (entry.id === item.id ? { ...entry, expires: item.expires } : entry))
+			: items;
+	if (destination) {
+		const unit = unitInfo(item.unit);
+		const baseline = Number.isFinite(destination.quantity) ? Math.max(0, destination.quantity) : 0;
+		const merged =
+			Math.round(
+				(baseline + (item.quantity * unit.factor) / unitInfo(destination.unit).factor) * 1_000_000
+			) / 1_000_000;
+		if (merged > 1_000_000) {
+			throw new Error('This proposal exceeds the kitchen storage limit. Please make room first.');
+		}
+		return transferPurchasedItemsToPantry(pantryItems, [createdItem], () => item.id);
+	}
+	if (pantryItems.length >= 1_000) {
+		return [
+			...pantryItems,
+			...withExplicitExpires(transferPurchasedItemsToPantry([], [createdItem], () => item.id))
+		];
+	}
+	return withExplicitExpires(
+		transferPurchasedItemsToPantry(pantryItems, [createdItem], () => item.id)
+	);
+}
+
+function recordGeneratedShoppingIds(items: ShoppingItem[], knownGeneratedIds: Set<string>) {
+	for (const item of items) {
+		if (item.sourceKey?.trim()) knownGeneratedIds.add(item.id);
+	}
+}
+
+function orderBatchCommands(
+	commands: ButlerCommand[],
+	initialGeneratedIds: ReadonlySet<string>
+): { orderedCommands: ButlerCommand[]; deferredDeleteIds: Set<string> } {
+	const hasNonShoppingKitchenMutation = commands.some(
+		(command) =>
+			(command.type.startsWith('recipe.') && command.type !== 'recipe.open') ||
+			command.type.startsWith('meal.') ||
+			command.type.startsWith('pantry.')
+	);
+	const upsertedShoppingIds = new Set<string>();
+	const generatedIdsInBatch = new Set(initialGeneratedIds);
+	for (const command of commands) {
+		if (command.type === 'shopping.upsert') {
+			upsertedShoppingIds.add(command.item.id);
+			if (command.item.sourceKey?.trim()) generatedIdsInBatch.add(command.item.id);
+		}
+	}
+
+	// Hoist recipe.upsert only when an earlier meal.upsert, meal.complete, or recipe.open
+	// references that recipe ID without an intervening recipe.delete on the same ID.
+	const deletedRecipeIds = new Set<string>();
+	const referencedBeforeUpsert = new Set<string>();
+	const seenRecipeUpserts = new Set<string>();
+	for (const command of commands) {
+		if (command.type === 'recipe.delete') {
+			deletedRecipeIds.add(command.id);
+		} else if (command.type === 'recipe.upsert') {
+			seenRecipeUpserts.add(command.recipe.id);
+		} else if (command.type === 'meal.upsert') {
+			if (!seenRecipeUpserts.has(command.meal.recipeId)) {
+				referencedBeforeUpsert.add(command.meal.recipeId);
+			}
+		} else if (command.type === 'recipe.open') {
+			if (!seenRecipeUpserts.has(command.id)) {
+				referencedBeforeUpsert.add(command.id);
+			}
+		} else if (command.type === 'meal.complete') {
+			referencedBeforeUpsert.add('*');
+		}
+	}
+
+	const hoistedRecipes: ButlerCommand[] = [];
+	const mainCommands: ButlerCommand[] = [];
+	const deferredShoppingDeletes: ButlerCommand[] = [];
+	const deferredDeleteIds = new Set<string>();
+
+	for (const command of commands) {
+		if (
+			command.type === 'recipe.upsert' &&
+			!deletedRecipeIds.has(command.recipe.id) &&
+			(referencedBeforeUpsert.has(command.recipe.id) || referencedBeforeUpsert.has('*'))
+		) {
+			hoistedRecipes.push(command);
+			continue;
+		}
+		if (
+			hasNonShoppingKitchenMutation &&
+			command.type === 'shopping.delete' &&
+			generatedIdsInBatch.has(command.id) &&
+			!upsertedShoppingIds.has(command.id)
+		) {
+			deferredShoppingDeletes.push(command);
+			deferredDeleteIds.add(command.id);
+			continue;
+		}
+		mainCommands.push(command);
+	}
+
+	return {
+		orderedCommands: [...hoistedRecipes, ...mainCommands, ...deferredShoppingDeletes],
+		deferredDeleteIds
+	};
+}
+
+function withPrioritizedCheckedShopping<T>(
+	shopping: ShoppingItem[],
+	prioritizedIds: ReadonlySet<string>,
+	run: (reordered: ShoppingItem[]) => T,
+	extractShopping: (result: T) => ShoppingItem[],
+	replaceShopping: (result: T, nextShopping: ShoppingItem[]) => T
+): T {
+	if (
+		prioritizedIds.size === 0 ||
+		!shopping.some((item) => item.checked && prioritizedIds.has(item.id))
+	) {
+		return run(shopping);
+	}
+	const originalCheckedRank = new Map<string, number>();
+	shopping.forEach((item, idx) => {
+		if (item.checked) originalCheckedRank.set(item.id, idx);
+	});
+	const prioritizedChecked = [
+		...shopping.filter((item) => item.checked && prioritizedIds.has(item.id)),
+		...shopping.filter((item) => item.checked && !prioritizedIds.has(item.id))
+	];
+	let inCheckedIdx = 0;
+	const prioritized = shopping.map((item) =>
+		item.checked ? prioritizedChecked[inCheckedIdx++] : item
+	);
+	const result = run(prioritized);
+	const outShopping = extractShopping(result);
+	const checkedSorted = outShopping
+		.filter((item) => item.checked)
+		.sort(
+			(a, b) =>
+				(originalCheckedRank.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+				(originalCheckedRank.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+		);
+	let outCheckedIdx = 0;
+	const restored = outShopping.map((item) =>
+		item.checked ? checkedSorted[outCheckedIdx++] : item
+	);
+	return replaceShopping(result, restored);
+}
 function isUsablePantryExpiry(expires: string | undefined, now: Date): boolean {
 	const status = expiryStatus(expires, now);
 	return status !== 'expired' && (!expires?.trim() || status !== 'unknown');
@@ -276,16 +449,41 @@ export function applyButlerCommands(
 	const commands = z.array(ButlerCommandSchema).max(50).parse(input);
 	const safeNow = Number.isFinite(now.getTime()) ? now : new Date();
 	let state = structuredClone(current);
+	const knownGeneratedIds = new Set<string>();
+	recordGeneratedShoppingIds(state.shopping, knownGeneratedIds);
+	const { orderedCommands, deferredDeleteIds } = orderBatchCommands(commands, knownGeneratedIds);
 	const effects: ButlerEffect[] = [];
 	const touchedWeeks = new Set<string>(activeWeeklyScopes(state.shopping));
+	const mutatedWeeks = new Set<string>();
 	const touchedRecipes = new Set<string>();
+	const mutatedRecipes = new Set<string>();
 	const activeRecipeScopes = new Set<string>();
 	let pantryChanged = false;
 	const pantryMutations: PantryMutation[] = [];
 	const deductedIngredientNames = new Set<string>();
 	const deductedPantryIds = new Set<string>();
 
+	const markMutatedDate = (currentState: AppState, dateStr: string | undefined) => {
+		if (!dateStr) return;
+		const monday = weekStartForDate(dateStr);
+		if (monday) {
+			touchedWeeks.add(monday);
+			mutatedWeeks.add(monday);
+		}
+		for (const week of activeWeeklyScopes(currentState.shopping)) {
+			const end = new Date(`${week}T12:00:00Z`);
+			if (Number.isNaN(end.getTime())) continue;
+			end.setUTCDate(end.getUTCDate() + 6);
+			const endKey = end.toISOString().slice(0, 10);
+			if (dateStr >= week && dateStr <= endKey) {
+				touchedWeeks.add(week);
+				mutatedWeeks.add(week);
+			}
+		}
+	};
+
 	const recordShoppingScopes = (nextState: AppState) => {
+		recordGeneratedShoppingIds(nextState.shopping, knownGeneratedIds);
 		for (const week of activeWeeklyScopes(nextState.shopping)) touchedWeeks.add(week);
 		for (const item of nextState.shopping) {
 			const recipeId = item.sourceKey?.match(/^recipe:(.+)$/)?.[1];
@@ -297,16 +495,26 @@ export function applyButlerCommands(
 	};
 	recordShoppingScopes(state);
 
-	for (const command of commands) {
+	for (const command of orderedCommands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
+				const previous = state.recipes.find((item) => item.id === command.recipe.id);
+				const saved = command.recipe.saved ?? (previous ? previous.saved : true);
 				for (const meal of state.meals) {
 					if (!meal.completedAt && meal.recipeId === command.recipe.id) {
-						touchedWeeks.add(weekStartForDate(meal.date));
+						markMutatedDate(state, meal.date);
 					}
 				}
 				touchedRecipes.add(command.recipe.id);
-				state = upsertRecipe(state, command.recipe, safeNow);
+				mutatedRecipes.add(command.recipe.id);
+				state = upsertRecipe(
+					state,
+					{
+						...command.recipe,
+						...(saved !== undefined ? { saved } : {})
+					},
+					safeNow
+				);
 				recordShoppingScopes(state);
 				break;
 			}
@@ -314,9 +522,12 @@ export function applyButlerCommands(
 				recordShoppingScopes(state);
 				requireId(state.recipes, command.id);
 				for (const meal of state.meals) {
-					if (meal.recipeId === command.id) touchedWeeks.add(weekStartForDate(meal.date));
+					if (meal.recipeId === command.id) {
+						markMutatedDate(state, meal.date);
+					}
 				}
 				touchedRecipes.delete(command.id);
+				mutatedRecipes.delete(command.id);
 				activeRecipeScopes.delete(command.id);
 				state = deleteRecipe(state, command.id, safeNow);
 				recordShoppingScopes(state);
@@ -324,18 +535,28 @@ export function applyButlerCommands(
 			case 'pantry.upsert': {
 				recordShoppingScopes(state);
 				const promoted = promoteSampleIngredient(command.item);
-				const previous = state.pantry.find((item) => item.id === promoted.id);
-				const added = addedNonExpiredPantryItem(previous, promoted, safeNow);
+				const previousById = state.pantry.find((item) => item.id === promoted.id);
+				const added = addedNonExpiredPantryItem(previousById, promoted, safeNow);
+				const targetId = resolvePantryUpsertTargetId(state.pantry, promoted);
+				const beforeCurrent = current.pantry.find((item) => item.id === targetId);
+				const beforeStep = state.pantry.find((item) => item.id === targetId);
+				const nextPantry = upsertPantryItem(state.pantry, promoted);
+				const afterEntry = nextPantry.find((item) => item.id === targetId) ?? promoted;
 				pantryMutations.push({
 					kind: 'upsert',
-					beforeCurrent: current.pantry.find((item) => item.id === promoted.id),
-					beforeStep: previous,
-					after: promoted,
-					afterDeduction: deductedPantryIds.has(promoted.id)
+					beforeCurrent,
+					beforeStep,
+					after: afterEntry,
+					afterDeduction: deductedPantryIds.has(promoted.id) || deductedPantryIds.has(targetId)
 				});
-				const nextPantry = upsert(state.pantry, promoted);
 				const nextShopping = added
-					? retireCheckedShoppingItems(state.shopping, [added], safeNow)
+					? withPrioritizedCheckedShopping(
+							state.shopping,
+							deferredDeleteIds,
+							(reordered) => retireCheckedShoppingItems(reordered, [added], safeNow),
+							(items) => items,
+							(_items, restored) => restored
+						)
 					: state.shopping;
 				state = { ...state, pantry: nextPantry, shopping: nextShopping };
 				pantryChanged = true;
@@ -356,8 +577,8 @@ export function applyButlerCommands(
 				requireId(state.recipes, command.meal.recipeId);
 				const previous = state.meals.find((item) => item.id === command.meal.id);
 				if (!previous?.completedAt) {
-					if (previous) touchedWeeks.add(weekStartForDate(previous.date));
-					touchedWeeks.add(weekStartForDate(command.meal.date));
+					if (previous) markMutatedDate(state, previous.date);
+					markMutatedDate(state, command.meal.date);
 				}
 				state = upsertMeal(state, command.meal, safeNow);
 				recordShoppingScopes(state);
@@ -366,7 +587,7 @@ export function applyButlerCommands(
 			case 'meal.delete': {
 				requireId(state.meals, command.id);
 				const removed = state.meals.find((item) => item.id === command.id);
-				if (removed) touchedWeeks.add(weekStartForDate(removed.date));
+				if (removed) markMutatedDate(state, removed.date);
 				state = deleteMeal(state, command.id, safeNow);
 				recordShoppingScopes(state);
 				break;
@@ -375,7 +596,7 @@ export function applyButlerCommands(
 				requireId(state.meals, command.id);
 				recordShoppingScopes(state);
 				const targetMeal = state.meals.find((item) => item.id === command.id);
-				if (targetMeal) touchedWeeks.add(weekStartForDate(targetMeal.date));
+				if (targetMeal) markMutatedDate(state, targetMeal.date);
 				const beforePantry = state.pantry;
 				if (command.deductPantry && targetMeal && !targetMeal.completedAt) {
 					const recipe = state.recipes.find((item) => item.id === targetMeal.recipeId);
@@ -389,14 +610,21 @@ export function applyButlerCommands(
 						}
 					}
 				}
-				state = completeMeal(
-					state,
-					command.id,
-					{
-						deductPantry: command.deductPantry,
-						leftoverServings: command.leftoverServings ?? 0
-					},
-					safeNow
+				state = withPrioritizedCheckedShopping(
+					state.shopping,
+					deferredDeleteIds,
+					(reordered) =>
+						completeMeal(
+							{ ...state, shopping: reordered },
+							command.id,
+							{
+								deductPantry: command.deductPantry,
+								leftoverServings: command.leftoverServings ?? 0
+							},
+							safeNow
+						),
+					(nextState) => nextState.shopping,
+					(nextState, restored) => ({ ...nextState, shopping: restored })
 				);
 				if (state.pantry !== beforePantry) {
 					for (const item of state.pantry) {
@@ -412,26 +640,48 @@ export function applyButlerCommands(
 				recordShoppingScopes(state);
 				break;
 			case 'shopping.delete': {
-				requireId(state.shopping, command.id);
 				const removed = state.shopping.find((item) => item.id === command.id);
-				const week = removed?.checked
-					? removed.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1]
-					: undefined;
-				state = { ...state, shopping: state.shopping.filter((item) => item.id !== command.id) };
-				if (week) {
-					touchedWeeks.add(week);
-					state = refreshWeekShopping(state, week, safeNow);
+				if (removed) {
+					const week = removed.sourceKey?.match(/^week:(\d{4}-\d{2}-\d{2})$/)?.[1];
+					const recipeId = removed.sourceKey?.match(/^recipe:(.+)$/)?.[1];
+					state = { ...state, shopping: state.shopping.filter((item) => item.id !== command.id) };
+					if (week && (removed.checked || mutatedWeeks.has(week))) {
+						touchedWeeks.add(week);
+						state = refreshWeekShopping(state, week, safeNow);
+						recordShoppingScopes(state);
+					} else if (
+						recipeId &&
+						!removed.checked &&
+						mutatedRecipes.has(recipeId) &&
+						state.recipes.some((recipe) => recipe.id === recipeId)
+					) {
+						state = refreshRecipeShopping(state, recipeId, safeNow, { force: true });
+						recordShoppingScopes(state);
+					}
+				} else if (!knownGeneratedIds.has(command.id)) {
+					requireId(state.shopping, command.id);
 				}
 				break;
 			}
 			case 'shopping.generate': {
 				const startKey = command.weekStart ?? weekStartForDate(safeNow);
 				touchedWeeks.add(startKey);
+				mutatedWeeks.add(startKey);
 				state = refreshWeekShopping(state, startKey, safeNow);
+				recordShoppingScopes(state);
 				break;
 			}
 			case 'preferences.update':
-				state = { ...state, preferences: { ...state.preferences, ...command.preferences } };
+				state = {
+					...state,
+					preferences: {
+						...state.preferences,
+						...command.preferences,
+						...(command.preferences.ratings !== undefined
+							? { ratings: { ...state.preferences.ratings, ...command.preferences.ratings } }
+							: {})
+					}
+				};
 				break;
 			case 'recipe.open':
 				requireId(state.recipes, command.id);
@@ -491,7 +741,9 @@ export function applyButlerCommands(
 		state.recipes.length > MAX_RECIPES ||
 		state.pantry.length > 1000 ||
 		state.meals.length > 1000 ||
-		state.shopping.length > 1000
+		state.shopping.length > 1000 ||
+		state.pantry.some((item) => item.quantity > 1000000) ||
+		state.shopping.some((item) => item.quantity > 1000000)
 	)
 		throw new Error('This proposal exceeds the kitchen storage limit. Please make room first.');
 	return { state, effects };
