@@ -53,7 +53,8 @@
 		toggleHidden,
 		busy,
 		initialServings,
-		completedSteps = $bindable<number[]>([])
+		completedSteps = $bindable<number[]>([]),
+		tab = $bindable<RecipeTab>('recipe')
 	}: {
 		recipe: Recipe;
 		close: () => void;
@@ -69,9 +70,9 @@
 		busy: boolean;
 		initialServings?: number;
 		completedSteps?: number[];
+		tab?: RecipeTab;
 	} = $props();
 	let nutritionMode = $state<NutritionMode>('serving');
-	let tab = $state<RecipeTab>('recipe');
 	let completed = $derived(
 		completedSteps.filter(
 			(step) => Number.isInteger(step) && step >= 0 && step < recipe.steps.length

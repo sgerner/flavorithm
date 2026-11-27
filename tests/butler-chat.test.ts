@@ -33,7 +33,7 @@ function createHarness(options: {
 		history: ButlerTurn[],
 		signal?: AbortSignal,
 		recipeDrafts?: Recipe[]
-	) => Promise<ButlerChatResult>;
+	) => Promise<ButlerChatResult | null>;
 }) {
 	let kitchen: AppState = createInitialState();
 	let owner = options.owner ?? 'user-1:house-1';
@@ -381,4 +381,44 @@ test('assistant messages record droppedCommands warnings while keeping valid act
 	assert.equal(harness.messages.length, 2);
 	assert.equal(harness.messages[1].actions?.length, 1);
 	assert.equal(harness.messages[1].warning, '2 invalid actions were omitted from this reply.');
+});
+
+test('null request result from AI setup detour rolls back unanswered turn, restores draft, and leaves error empty', async () => {
+	let divertToSetup = false;
+	const harness = createHarness({
+		request: async (prompt) => {
+			if (divertToSetup) return null;
+			return {
+				reply: `Prepared: ${prompt}`,
+				commands: [
+					{
+						type: 'pantry.upsert',
+						item: {
+							id: 'garlic-1',
+							name: 'Garlic',
+							quantity: 3,
+							unit: 'clove',
+							category: 'Produce'
+						}
+					}
+				]
+			};
+		}
+	});
+
+	harness.draft = 'Stock garlic';
+	await harness.chat.send();
+	assert.equal(harness.messages.length, 2);
+	assert.equal(harness.messages[1].actions?.[0]?.status, 'pending');
+
+	divertToSetup = true;
+	harness.draft = 'Plan dinners for the week using my pantry.';
+	await harness.chat.send();
+
+	assert.equal(harness.busy, false);
+	assert.equal(harness.error, '');
+	assert.equal(harness.failedPrompt, '');
+	assert.equal(harness.draft, 'Plan dinners for the week using my pantry.');
+	assert.equal(harness.messages.length, 2);
+	assert.equal(harness.messages[1].actions?.[0]?.status, 'pending');
 });
