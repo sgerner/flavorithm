@@ -35,6 +35,18 @@
 	import type { PageData } from './$types';
 	import { activeFocusedElement, focusTrap } from '#lib/focus.ts';
 	import {
+		focusFirstInvalid,
+		validateEmail,
+		validateInviteCode,
+		validateLeftoverServings,
+		validateMealDate,
+		validatePantryInput,
+		validatePassword,
+		validatePlannedServings,
+		validateRegistrationName
+	} from '#lib/form-validation.ts';
+	import FormField from '#lib/components/FormField.svelte';
+	import {
 		backdropMotion,
 		dialogMotion,
 		revealMotion,
@@ -90,8 +102,9 @@
 	import {
 		addPantryItems,
 		backfillSampleData,
-		clearSampleData,
 		completeMeal,
+		deleteMeal,
+		deleteRecipe,
 		deleteShoppingItem,
 		expiryStatus,
 		filterPantryItems,
@@ -102,13 +115,18 @@
 		normalizePantryDraft,
 		promoteSampleIngredient,
 		normalizeShoppingItem,
-		refreshWeekShopping as refreshWeekShoppingItems,
+		recipeForEdit,
+		recipeNeedsNutritionRefresh,
+		refreshWeekShopping,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
 		revertShoppingItem,
+		saveEditedRecipe as applyEditedRecipe,
 		shopForScope,
 		snapshotShoppingItem,
 		unitInfo,
+		upsertMeal,
+		weekStartForDate,
 		type PantryDraft,
 		type ShoppingItemDraft,
 		type ShoppingItemSnapshot
@@ -122,18 +140,15 @@
 		finalizeManualRecipe,
 		hasActiveRecipeFilters,
 		insertRecipes,
+		MAX_RECIPES,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
 	import {
-		applyEditedRecipe,
 		beginDeleteSavedRecipe,
-		beginEditSavedRecipe,
 		beginPlanRecipe,
 		cancelEditSavedRecipe,
 		clearRecipeSubflowState,
 		closeModalDialog,
-		completePlanMeal,
-		confirmDeleteSavedRecipe,
 		dismissEscapeLayer,
 		isRecipeDetailInert,
 		pickRecipeForPlan
@@ -168,6 +183,7 @@
 		CHATGPT_OAUTH_POLL_INTERVAL_MS,
 		CHATGPT_OAUTH_TTL_MS,
 		HOST_CONNECTION_ID,
+		reconcileModelPreferences,
 		startConnectionPoll,
 		type ConnectionModel,
 		type ConnectionPollHandle,
@@ -178,8 +194,10 @@
 		reconcileChatGPTPreferences,
 		runConcurrentModelCatalog,
 		runHouseholdTransition,
+		runLocalAuthenticateWorkflow,
 		runOpenSettingsWorkflow,
 		runReconnectWorkflow,
+		runSampleCleanupWorkflow,
 		runSignedInHydration
 	} from '#lib/client-workflows.ts';
 	import {
@@ -207,7 +225,6 @@
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
 	let kitchen = $state<AppState>(createInitialState());
-	let hasSampleRecords = $state(true);
 	let user = $state<User | null>(null);
 	let ready = $state(false);
 	let kitchenLoaded = $state(false);
@@ -368,6 +385,15 @@
 	let quizCuisines = $state<string[]>([]);
 	let quizDiet = $state('none');
 	let quizAllergies = $state('');
+	let dialogFormEl = $state<HTMLFormElement>();
+	let formSubmitted = $state(false);
+	let lastModal = '';
+	$effect(() => {
+		if (modal !== lastModal) {
+			lastModal = modal;
+			formSubmitted = false;
+		}
+	});
 	const cuisineChoices = [
 		'Mediterranean',
 		'Italian',
@@ -381,6 +407,7 @@
 	function openModal(nextModal: string, trigger: HTMLElement | null = activeFocusedElement()) {
 		if (nextModal && !modal) modalReturnFocus = trigger;
 		else if (!nextModal) modalReturnFocus = null;
+		if (nextModal !== modal) formSubmitted = false;
 		modal = nextModal;
 	}
 	function openRecipeDetail(id: string | null, servings?: number) {
@@ -389,7 +416,7 @@
 		selectedMealServings = id ? servings : undefined;
 		selectedId = id;
 	}
-	function openRecipeEditor(draft: Recipe, mode: 'create' | 'edit') {
+	function startRecipeEditor(draft: Recipe, mode: 'create' | 'edit') {
 		if (!editingRecipe) editorReturnFocus = activeFocusedElement();
 		editingRecipeMode = mode;
 		editingRecipe = draft;
@@ -405,6 +432,7 @@
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
 		quizDiet = kitchen.preferences.diet;
 		quizAllergies = kitchen.preferences.allergies;
+		formSubmitted = false;
 		openModal('onboarding');
 	}
 	function openAuthentication(eventOrTrigger?: Event | HTMLElement | null) {
@@ -463,13 +491,13 @@
 				openModal('');
 			}
 		}
-		if (editingRecipeMode === 'edit' && editingRecipe && !byId.get(editingRecipe.id)?.saved) {
+		if (editingRecipeMode === 'edit' && editingRecipe && !byId.has(editingRecipe.id)) {
 			closeRecipeEditor();
 		}
 	}
 	function replaceKitchen(nextKitchen: AppState) {
 		kitchen = nextKitchen;
-		hasSampleRecords = hasSampleData(nextKitchen);
+		pruneEditingShoppingState();
 		reconcileRecipeSelection(nextKitchen.recipes);
 	}
 	function saveLastAccount(account: User) {
@@ -488,7 +516,6 @@
 		kitchenSync?.clearContext();
 		user = null;
 		kitchen = createInitialState();
-		hasSampleRecords = true;
 		cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 		kitchenLoaded = false;
 		showStarter = false;
@@ -683,12 +710,12 @@
 	let cookedHistoryLimit = $state(COOKED_HISTORY_PAGE_SIZE);
 	let mealDate = $state('');
 	let mealSlot = $state('Dinner');
-	let plannedServings = $state(2);
+	let plannedServings = $state<number | null>(2);
 	let pickingForSlot = $state(false);
 	let editingMealId = $state('');
 	let cookingMealId = $state('');
 	let deductPantry = $state(false);
-	let leftoverServings = $state(0);
+	let leftoverServings = $state<number | null>(0);
 	let pantryFilter = $state('all');
 	let pantryQuery = $state('');
 	let pantryCategory = $state('all');
@@ -700,6 +727,55 @@
 	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
 	let resetToken = $state('');
+	let mealDateError = $derived(
+		formSubmitted && (modal === 'plan' || modal === 'editMeal') ? validateMealDate(mealDate) : ''
+	);
+	let mealServingsError = $derived(
+		formSubmitted && (modal === 'plan' || modal === 'editMeal')
+			? validatePlannedServings(plannedServings)
+			: ''
+	);
+	let activeCookingMeal = $derived(kitchen.meals.find((item) => item.id === cookingMealId));
+	let leftoverError = $derived(
+		formSubmitted && modal === 'cookMeal'
+			? validateLeftoverServings(leftoverServings, activeCookingMeal?.servings ?? MAX_SERVINGS)
+			: ''
+	);
+	let pantryFieldError = $derived(
+		formSubmitted && modal === 'pantry' ? validatePantryInput(pantryInput) : ''
+	);
+	let authNameError = $derived(
+		formSubmitted && modal === 'auth' && authMode === 'register'
+			? validateRegistrationName(name)
+			: ''
+	);
+	let authEmailError = $derived(
+		formSubmitted && modal === 'auth'
+			? validateEmail(email, authMode === 'register' ? 'register' : 'login')
+			: ''
+	);
+	let authPasswordError = $derived(
+		formSubmitted && modal === 'auth'
+			? validatePassword(password, authMode === 'register' ? 'register' : 'login')
+			: ''
+	);
+	let authValidationSummary = $derived(
+		authNameError || authEmailError || authPasswordError
+			? 'Fix the highlighted account fields before continuing.'
+			: ''
+	);
+	let deletePasswordError = $derived(
+		formSubmitted && modal === 'delete' ? validatePassword(deletePassword, 'delete') : ''
+	);
+	let recoverEmailError = $derived(
+		formSubmitted && modal === 'recover' ? validateEmail(email, 'recover') : ''
+	);
+	let resetPasswordError = $derived(
+		formSubmitted && modal === 'reset' ? validatePassword(password, 'reset') : ''
+	);
+	let joinCodeError = $derived(
+		formSubmitted && modal === 'household' ? validateInviteCode(joinCode) : ''
+	);
 	let showStarter = $state(true);
 	let imageInput: HTMLInputElement;
 	let deferredInstall = $state<any>(null);
@@ -759,7 +835,6 @@
 				clearManagedIdentity();
 			} else {
 				kitchen = createInitialState();
-				hasSampleRecords = true;
 				localStorage.removeItem('flavorithm-last-account');
 				kitchenLoaded = true;
 			}
@@ -917,7 +992,6 @@
 			else delete updated.expires;
 			return updated;
 		});
-		hasSampleRecords = hasSampleData(kitchen);
 		const editedId = draft.id;
 		pantryDraft = null;
 		if (!restoreFocus) return;
@@ -949,7 +1023,6 @@
 	function removePantryItem(item: AppState['pantry'][number]) {
 		if (pantryDraft?.id === item.id) pantryDraft = null;
 		kitchen.pantry = kitchen.pantry.filter((entry) => entry.id !== item.id);
-		hasSampleRecords = hasSampleData(kitchen);
 	}
 	function resetPantryFilters() {
 		pantryQuery = '';
@@ -1018,18 +1091,16 @@
 				openModal('');
 			}
 		}
-		if (
-			editingRecipeMode === 'edit' &&
-			editingRecipe &&
-			!recipesById.get(editingRecipe.id)?.saved
-		) {
+		if (editingRecipeMode === 'edit' && editingRecipe && !recipesById.has(editingRecipe.id)) {
 			closeRecipeEditor();
 		}
 	});
 	let plannerMeals = $derived.by(() => {
 		const byDateSlot = new Map<string, Meal[]>();
 		const completed: Meal[] = [];
+		let hasSampleMeal = false;
 		for (const meal of kitchen.meals) {
+			if (meal.sample) hasSampleMeal = true;
 			const slotKey = mealSlotKey(meal.date, meal.slot);
 			const bucket = byDateSlot.get(slotKey);
 			if (bucket) bucket.push(meal);
@@ -1037,8 +1108,11 @@
 			if (meal.completedAt) completed.push(meal);
 		}
 		completed.sort((a, b) => (b.completedAt ?? '').localeCompare(a.completedAt ?? ''));
-		return { mealsByDateSlot: byDateSlot, completedMeals: completed };
+		return { mealsByDateSlot: byDateSlot, completedMeals: completed, hasSampleMeal };
 	});
+	let hasSampleRecords = $derived(
+		page === 'planner' ? hasSampleData(kitchen, plannerMeals.hasSampleMeal) : hasSampleData(kitchen)
+	);
 	let mealsByDateSlot = $derived(plannerMeals.mealsByDateSlot);
 	let completedMeals = $derived(plannerMeals.completedMeals);
 	let renderableCompletedMeals = $derived(
@@ -1090,6 +1164,10 @@
 		editingShoppingId = '';
 		editingShoppingDraft = null;
 		editingShoppingSnapshot = null;
+	}
+	function pruneEditingShoppingState() {
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
 	}
 	async function startEditingShoppingItem(item: AppState['shopping'][number]) {
 		if (editingShoppingId && editingShoppingId !== item.id) {
@@ -1168,17 +1246,15 @@
 	}
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
-		kitchen.meals = kitchen.meals.filter((entry) => entry.id !== meal.id);
-		hasSampleRecords = hasSampleData(kitchen);
-		refreshWeekShopping(weekStartForDate(meal.date));
+		kitchen = deleteMeal(kitchen, meal.id);
+		pruneEditingShoppingState();
 		notify('Planned meal removed.', () => {
 			if (
 				kitchen.recipes.some((recipe) => recipe.id === removed.recipeId) &&
 				!kitchen.meals.some((entry) => entry.id === removed.id)
 			) {
-				kitchen.meals.push(removed);
-				hasSampleRecords = hasSampleData(kitchen);
-				refreshWeekShopping(weekStartForDate(removed.date));
+				kitchen = upsertMeal(kitchen, removed, undefined, { preserveSample: true });
+				pruneEditingShoppingState();
 			}
 		});
 	}
@@ -1211,7 +1287,11 @@
 			throw error;
 		}
 		if (!response.ok) {
-			if (response.status === 401 && managedAuth) {
+			if (
+				response.status === 401 &&
+				managedAuth &&
+				(data?.code === 'session_expired' || data?.error === 'Authentication required')
+			) {
 				clearManagedIdentity();
 				renewManagedSession({ status: 401 });
 			}
@@ -1222,7 +1302,7 @@
 			}
 			throw Object.assign(new Error(data.error || 'Something went wrong. Please try again.'), {
 				status: response.status,
-				code: data.code
+				...(typeof data?.code === 'string' ? { code: data.code } : {})
 			});
 		}
 		if (url === '/api/state') stateEtag = data.state ? response.headers.get('etag') : null;
@@ -1337,7 +1417,6 @@
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
 			kitchen = createInitialState();
-			hasSampleRecords = true;
 			showStarter = false;
 		} else {
 			const started = localStorage.getItem('flavorithm-started') === 'yes';
@@ -1381,7 +1460,6 @@
 					clearGuestData(localStorage);
 					quarantineLegacyKitchen(localStorage);
 					kitchen = createInitialState();
-					hasSampleRecords = true;
 					kitchenLoaded = false;
 					showStarter = false;
 				}
@@ -1529,7 +1607,6 @@
 	});
 	function adoptKitchen(state: AppState) {
 		const sanitized = sanitizeKitchenState(state);
-		hasSampleRecords = hasSampleData(sanitized);
 		if (user && kitchenSync) {
 			const snapshotUser = $state.snapshot(user);
 			kitchenSync.initialize(snapshotUser, sanitized, stateEtag || '');
@@ -1600,38 +1677,34 @@
 	}
 
 	function freshKitchen() {
-		clearEditingShoppingState();
-		if (!hasSampleData(kitchen)) {
-			hasSampleRecords = false;
-			showStarter = false;
-			if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
-			return;
-		}
-		const previousKitchen = sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen)));
-		const wasShowingStarter = showStarter;
-		const previousStarted =
-			!user && !managedAuth ? localStorage.getItem('flavorithm-started') : null;
-		replaceKitchen(clearSampleData(previousKitchen));
-		pantryDraft = null;
-		resetPantryFilters();
-		const appliedSnapshot = JSON.stringify(kitchen);
-		showStarter = false;
-		if (!user && !managedAuth) localStorage.setItem('flavorithm-started', 'yes');
-		if (modal === 'settings') closeDialog();
-		notify('Sample data cleared.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) {
+		runSampleCleanupWorkflow({
+			commitInlineEdits: () => {
+				commitInlineEdits();
+				clearEditingShoppingState();
+			},
+			getKitchen: () => kitchen,
+			setKitchen: (next) => {
+				replaceKitchen(next);
+			},
+			onCleaned: () => {
+				pantryDraft = null;
+				resetPantryFilters();
+			},
+			onUndoRestore: (restored) => {
 				pantryDraft = null;
 				clearEditingShoppingState();
-				replaceKitchen(previousKitchen);
-				if (wasShowingStarter && !user && !managedAuth) {
-					showStarter = true;
-					if (previousStarted === null) localStorage.removeItem('flavorithm-started');
-					else localStorage.setItem('flavorithm-started', previousStarted);
-				}
-				notify('Sample data restored.');
-			} else {
-				notify('Your kitchen changed again. Review the current values before editing.');
-			}
+				replaceKitchen(restored);
+			},
+			getShowStarter: () => showStarter,
+			setShowStarter: (show) => {
+				showStarter = show;
+			},
+			isGuest: () => !user && !managedAuth,
+			storage: localStorage,
+			closeSettingsIfOpen: () => {
+				if (modal === 'settings') closeDialog();
+			},
+			notify
 		});
 	}
 	function navigate(id: string) {
@@ -1639,8 +1712,16 @@
 		page = id;
 		mobileNav = false;
 	}
-	function addIngredients() {
+	async function addIngredients(event?: SubmitEvent) {
+		event?.preventDefault();
 		if (voiceBusy || busy) return;
+		if (validatePantryInput(pantryInput)) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
 		const boundedInput = pantryInput.slice(0, 20_000);
 		const segments = boundedInput
 			.split(/[,;\r\n]+(?![^\[\]]*\])/)
@@ -1731,66 +1812,65 @@
 			openAuthentication();
 			return;
 		}
-		busy = true;
 		error = '';
+		const nameErr = authMode === 'register' ? validateRegistrationName(name) : '';
+		const emailErr = validateEmail(email, authMode === 'register' ? 'register' : 'login');
+		const passErr = validatePassword(password, authMode === 'register' ? 'register' : 'login');
+		if (nameErr || emailErr || passErr) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		busy = true;
 		try {
 			syncing = true;
 			commitInlineEdits();
 			clearTimeout(saveTimer);
 			const isRegister = authMode === 'register';
-			const guestKitchen = isRegister
-				? clearSampleData(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))))
-				: null;
-			const result = await request('/api/auth', { action: authMode, name, email, password });
-			const authenticatedUser: User = result.user;
-			password = '';
-			showStarter = false;
-			clearHouseholdViewState(isRegister);
-			stateEtag = null;
-			kitchen = guestKitchen ?? createNewUserState();
-			hasSampleRecords = hasSampleData(kitchen);
-			user = authenticatedUser;
-			kitchenSync?.prepare(authenticatedUser);
-			kitchenLoaded = true;
-			saveLastAccount(authenticatedUser);
-			if (guestKitchen) {
-				kitchen = guestKitchen;
-				hasSampleRecords = hasSampleData(guestKitchen);
-				kitchenSync?.stage(guestKitchen);
-				if (!syncErrors) {
+			const {
+				user: authenticatedUser,
+				guestKitchen,
+				stateLoaded
+			} = await runLocalAuthenticateWorkflow({
+				authMode,
+				getKitchen: () => kitchen,
+				authenticateRequest: () =>
+					request('/api/auth', { action: authMode, name, email, password }),
+				onAuthenticated: (nextUser, initialKitchen) => {
+					password = '';
+					showStarter = false;
+					clearHouseholdViewState();
+					stateEtag = null;
+					kitchen = initialKitchen;
+					user = nextUser;
+					kitchenSync?.prepare(nextUser);
+					kitchenLoaded = true;
+					saveLastAccount(nextUser);
+				},
+				stageGuestKitchen: (cleanedGuest) => {
+					kitchen = cleanedGuest;
+					kitchenSync?.stage(cleanedGuest);
+				},
+				hasSyncError: () => Boolean(syncErrors),
+				clearGuestStorage: () => {
 					clearGuestKitchen(localStorage);
 					clearGuestData(localStorage);
+				},
+				fetchState: () => request('/api/state'),
+				createState: (state) => request('/api/state', { state }, 'PUT'),
+				adoptKitchen,
+				hasPendingSnapshot: () => Boolean(kitchenSync?.snapshot()),
+				syncKitchen: async () => {
+					await kitchenSync?.sync();
+				},
+				isOnline: () => online,
+				retrySync: () => retrySync(),
+				failStateLoad: (message) => {
+					kitchenSync?.failLoad(message);
 				}
-			}
-			let stateLoaded = false;
-			try {
-				const saved = await request('/api/state');
-				if (guestKitchen) {
-					adoptKitchen(saved.state || createNewUserState());
-					if (!saved.state && !kitchenSync?.snapshot()) {
-						const created = await request('/api/state', { state: guestKitchen }, 'PUT');
-						adoptKitchen(created.state || guestKitchen);
-					} else {
-						await kitchenSync?.sync();
-					}
-				} else if (saved.state) {
-					adoptKitchen(saved.state);
-					if (online && kitchenSync?.snapshot()) await retrySync();
-				} else {
-					const initial = createNewUserState();
-					const created = await request('/api/state', { state: initial }, 'PUT');
-					adoptKitchen(created.state || initial);
-					if (online && kitchenSync?.snapshot()) await retrySync();
-				}
-				stateLoaded = true;
-			} catch (stateError) {
-				kitchenSync?.failLoad((stateError as Error).message);
-			}
-			if (isRegister && selectedId && !recipesById.has(selectedId)) {
-				detailReturnFocus = null;
-				selectedId = null;
-				selectedMealServings = undefined;
-			}
+			});
 			syncing = false;
 			if (stateLoaded) {
 				await refreshConnections().catch(() =>
@@ -1815,6 +1895,8 @@
 			);
 		} catch (e) {
 			error = (e as Error).message;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 			syncing = false;
@@ -1855,7 +1937,6 @@
 			pantryDraft = null;
 			resetPantryFilters();
 			kitchen = createInitialState();
-			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
@@ -1901,7 +1982,7 @@
 			fetchPublicCatalog: () => request('/api/models'),
 			fetchAccountCatalog: (accountId) =>
 				request(`/api/models?connection=chatgpt&accountId=${encodeURIComponent(accountId)}`),
-			onResult: ({ catalog, account }) => {
+			onResult: async ({ catalog, account, queriedAccountId }) => {
 				if (catalog.status === 'fulfilled') providers = catalog.value.providers;
 				else
 					catalogError =
@@ -1910,8 +1991,42 @@
 					accountModels = account.value?.providers[0]?.models || [];
 				else {
 					accountModels = [];
-					catalogError =
-						(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+					const code = (account.reason as { code?: string })?.code;
+					if (
+						code === 'chatgpt_reauth_required' ||
+						code === 'provider_auth' ||
+						code === 'host_ai_unavailable'
+					) {
+						await refreshConnections().catch(() => {});
+						if (version !== catalogVersion || user?.id !== owner) return;
+						const fallbackAccountId = entitledChatGPTAccountId(
+							kitchen.preferences,
+							chatGPT.accounts,
+							chatGPT.host
+						);
+						if (fallbackAccountId && fallbackAccountId !== queriedAccountId) {
+							try {
+								const fallback = await request(
+									`/api/models?connection=chatgpt&accountId=${encodeURIComponent(fallbackAccountId)}`
+								);
+								if (version !== catalogVersion || user?.id !== owner) return;
+								accountModels = fallback?.providers[0]?.models || [];
+							} catch (fallbackError) {
+								if (version !== catalogVersion || user?.id !== owner) return;
+								catalogError =
+									(fallbackError as Error)?.message || 'ChatGPT models could not be loaded.';
+							}
+						}
+						if (code === 'host_ai_unavailable') {
+							notify((account.reason as Error)?.message || 'Host AI is currently unavailable.');
+						} else if (activeChatGPTAccount?.connected && !accountModels.length && !catalogError) {
+							catalogError =
+								(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+						}
+					} else {
+						catalogError =
+							(account.reason as Error)?.message || 'ChatGPT models could not be loaded.';
+					}
 				}
 				catalogLoading = false;
 			}
@@ -2010,6 +2125,34 @@
 		const currentDevice = chatGPTDevice;
 		const attempt = ++connectionAttempt;
 		const owner = user.id;
+		const previousAccountId = kitchen.preferences.chatgptAccountId;
+		const previousModel = kitchen.preferences.model;
+		const previousReasoning = kitchen.preferences.reasoning
+			? { ...kitchen.preferences.reasoning }
+			: undefined;
+		const applyConnectedPreferences = async (reconnectedAccountId: string) => {
+			const sameAccount = Boolean(
+				reconnectedAccountId && reconnectedAccountId === (accountId ?? previousAccountId)
+			);
+			kitchen.preferences.chatgptAccountId = reconnectedAccountId;
+			kitchen.preferences.provider = 'chatgpt';
+			if (!sameAccount) {
+				kitchen.preferences.model = '';
+				kitchen.preferences.reasoning = undefined;
+			}
+			await loadModelCatalog();
+			if (attempt !== connectionAttempt || user?.id !== owner) return false;
+			if (sameAccount) {
+				const reconciled = reconcileModelPreferences(
+					accountModels,
+					previousModel,
+					previousReasoning
+				);
+				kitchen.preferences.model = reconciled.model;
+				kitchen.preferences.reasoning = reconciled.reasoning;
+			}
+			return true;
+		};
 		connectionPoll?.stop();
 		connectionPoll = undefined;
 		connectionPopup?.close();
@@ -2078,12 +2221,12 @@
 								chatGPTDevice = null;
 								await refreshConnections();
 								if (attempt !== connectionAttempt || user?.id !== owner) return false;
-								kitchen.preferences.chatgptAccountId = connected.accountId;
-								kitchen.preferences.provider = 'chatgpt';
-								kitchen.preferences.model = '';
-								kitchen.preferences.reasoning = undefined;
-								await loadModelCatalog();
-								notify('ChatGPT connected. Choose a model.');
+								if (!(await applyConnectedPreferences(connected.accountId))) return false;
+								notify(
+									kitchen.preferences.model
+										? 'ChatGPT reconnected.'
+										: 'ChatGPT connected. Choose a model.'
+								);
 								return false;
 							}
 							if (expired) {
@@ -2122,18 +2265,6 @@
 
 			chatGPTAuthorizationUrl = result.authorizationUrl;
 			if (connectionPopup) connectionPopup.location.href = result.authorizationUrl;
-			else if (
-				importSession.url ||
-				importSession.text ||
-				importSession.photo ||
-				importSession.draft
-			) {
-				chatGPTAuthorizationUrl = result.authorizationUrl;
-			} else {
-				connectionActive = false;
-				window.location.assign(result.authorizationUrl);
-				return;
-			}
 			const expiresAt =
 				typeof result.expiresAt === 'number' ? result.expiresAt : Date.now() + CHATGPT_OAUTH_TTL_MS;
 			connectionPoll = startConnectionPoll({
@@ -2169,15 +2300,13 @@
 							if (account && connectionChanged) {
 								connectionPopup?.close();
 								connectionPopup = null;
-								kitchen.preferences.chatgptAccountId = account.id;
-								kitchen.preferences.provider = 'chatgpt';
-								kitchen.preferences.model = '';
-								kitchen.preferences.reasoning = undefined;
-								await loadModelCatalog();
+								if (!(await applyConnectedPreferences(account.id))) return false;
 								notify(
-									account.planEnabled
-										? 'ChatGPT connected. Choose a model to cook with your plan.'
-										: 'ChatGPT signed in. Enable plan usage to generate recipes.'
+									!account.planEnabled
+										? 'ChatGPT signed in. Enable plan usage to generate recipes.'
+										: kitchen.preferences.model
+											? 'ChatGPT reconnected.'
+											: 'ChatGPT connected. Choose a model to cook with your plan.'
 								);
 							} else if (!connectionChanged) {
 								connectionPopup = null;
@@ -2353,7 +2482,9 @@
 		try {
 			return await request('/api/ai', buildPayload(useHost), 'POST', signal);
 		} catch (err) {
-			if (useHost && (err as { status?: number })?.status === 400) {
+			const status = (err as { status?: number })?.status;
+			const code = (err as { code?: string })?.code;
+			if (useHost && (status === 400 || code === 'host_ai_unavailable')) {
 				await refreshConnections().catch(() => {});
 				if (!chatGPT.host) {
 					if (hasPersonalAIReady()) {
@@ -2361,6 +2492,12 @@
 					}
 					void openSettings(true);
 				}
+			} else if (
+				code === 'chatgpt_reauth_required' ||
+				code === 'provider_auth' ||
+				code === 'host_ai_unavailable'
+			) {
+				await refreshConnections().catch(() => {});
 			}
 			throw err;
 		}
@@ -2452,7 +2589,7 @@
 			else if (effect.type === 'recipe.open') {
 				butlerChat?.close();
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
-				if (recipe && effect.mode === 'edit') editSavedRecipe(recipe);
+				if (recipe && effect.mode === 'edit') openRecipeEditor(recipe);
 				else if (recipe && effect.mode === 'cook') {
 					const meal = kitchen.meals.find(
 						(item) => item.recipeId === recipe.id && !item.completedAt
@@ -2467,8 +2604,9 @@
 		}
 		const appliedSnapshot = JSON.stringify(kitchen);
 		notify('Basil’s changes applied.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) replaceKitchen(previousKitchen);
-			else notify('Your kitchen changed again. Review the current values before editing.');
+			if (JSON.stringify(kitchen) === appliedSnapshot) {
+				replaceKitchen(previousKitchen);
+			} else notify('Your kitchen changed again. Review the current values before editing.');
 		});
 		return appliedSnapshot;
 	}
@@ -2547,7 +2685,8 @@
 		}
 	}
 
-	async function generate() {
+	async function generate(event?: SubmitEvent) {
+		event?.preventDefault();
 		if (!(await needAI())) return;
 		busy = true;
 		error = '';
@@ -2561,6 +2700,8 @@
 		} catch (e) {
 			error = (e as Error).message;
 			notify(error);
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
@@ -2915,7 +3056,6 @@
 		live.saved = !live.saved;
 		delete live.sampleSaved;
 		kitchen.recipes = [...kitchen.recipes];
-		hasSampleRecords = hasSampleData(kitchen);
 		notify(live.saved ? 'Saved to your collection.' : 'Removed from your collection.');
 	}
 	function toggleRecipeHidden(recipe: Recipe) {
@@ -2942,11 +3082,14 @@
 		editingRecipeMode = 'create';
 		editingRecipe = createBlankRecipe();
 	}
+	function openRecipeEditor(recipe: Recipe) {
+		const draft = recipeForEdit(kitchen, recipe.id);
+		if (!draft) return;
+		startRecipeEditor(draft, 'edit');
+	}
 	function editSavedRecipe(recipe: Recipe) {
-		const next = beginEditSavedRecipe(kitchen.recipes, selectedId, recipe.id);
-		if (!next) return;
-		selectedId = next.selectedId;
-		openRecipeEditor(next.editingRecipe, next.editingRecipeMode);
+		if (!recipesById.get(recipe.id)?.saved) return;
+		openRecipeEditor(recipe);
 	}
 	function saveEditedRecipe(updated: Recipe) {
 		if (editingRecipeMode === 'create') {
@@ -2964,18 +3107,29 @@
 			notify('Recipe saved to your collection.');
 			return;
 		}
-		const next = applyEditedRecipe(kitchen.recipes, selectedId, updated);
+		const previous = kitchen.recipes.find((item) => item.id === updated.id);
+		if (!previous && kitchen.recipes.length >= MAX_RECIPES) {
+			notify(
+				`Your kitchen can hold up to ${MAX_RECIPES} recipes. There isn’t enough room to save this.`
+			);
+			return;
+		}
+		const wasSaved = Boolean(previous?.saved);
+		const nutritionNeedsRefresh = recipeNeedsNutritionRefresh(previous, updated);
 		const returnTarget = editorReturnFocus;
+		kitchen = applyEditedRecipe(kitchen, updated);
+		pruneEditingShoppingState();
 		closeRecipeEditor();
-		if (!next.saved) return;
-		kitchen.recipes = next.recipes;
-		hasSampleRecords = hasSampleData(kitchen);
 		if (!selectedId) detailReturnFocus = returnTarget;
-		selectedId = next.selectedId;
+		selectedId = updated.id;
 		notify(
-			next.nutritionNeedsRefresh
-				? 'Recipe updated. Refresh its nutrition estimate.'
-				: 'Recipe updated.'
+			!wasSaved
+				? nutritionNeedsRefresh
+					? 'Recipe saved to your collection. Refresh its nutrition estimate.'
+					: 'Recipe saved to your collection.'
+				: nutritionNeedsRefresh
+					? 'Recipe updated. Refresh its nutrition estimate.'
+					: 'Recipe updated.'
 		);
 	}
 	function askDeleteRecipe(recipe: Recipe) {
@@ -2984,12 +3138,6 @@
 		selectedId = next.selectedId;
 		recipeToDeleteId = next.recipeToDeleteId;
 		openModal(next.modal);
-	}
-	function weekStartForDate(value: string) {
-		const date = new Date(`${value}T12:00:00`);
-		if (Number.isNaN(date.getTime())) return value;
-		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
-		return dateKey(date);
 	}
 	function weekOffsetForDate(value: string, today = new Date()) {
 		const start = weekStartForDate(value);
@@ -3054,35 +3202,22 @@
 		deductPantry = false;
 		leftoverServings = 0;
 	}
-	function refreshWeekShopping(startDate: string) {
-		kitchen.shopping = refreshWeekShoppingItems(kitchen, startDate);
-		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
-			clearEditingShoppingState();
-	}
 	function confirmDeleteRecipe() {
-		const next = confirmDeleteSavedRecipe(
-			kitchen,
-			selectedId,
-			selectedMealServings,
-			recipeToDeleteId,
-			weekStartForDate
-		);
-		if (!next) return;
-		kitchen.meals = next.meals;
-		kitchen.recipes = next.recipes;
-		hasSampleRecords = hasSampleData(kitchen);
-		kitchen.shopping = next.shopping;
-		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
-			clearEditingShoppingState();
-		kitchen.preferences.ratings = next.ratings;
-		for (const startDate of next.affectedWeeks) refreshWeekShopping(startDate);
-		if (!next.selectedId) detailReturnFocus = null;
-		selectedId = next.selectedId;
-		selectedMealServings = next.selectedMealServings;
-		recipeToDeleteId = next.recipeToDeleteId;
-		openModal(next.modal);
+		const recipe = recipeToDelete;
+		if (!recipe) return;
+		const impactedMealCount = kitchen.meals.filter((meal) => meal.recipeId === recipe.id).length;
+		const closingSelected = selectedId === recipe.id;
+		kitchen = deleteRecipe(kitchen, recipe.id);
+		pruneEditingShoppingState();
+		if (closingSelected) {
+			detailReturnFocus = null;
+			selectedId = null;
+			selectedMealServings = undefined;
+		}
+		recipeToDeleteId = null;
+		openModal('');
 		notify(
-			`${next.deletedRecipe.title} deleted, along with ${next.impactedMealsCount} planned meal${next.impactedMealsCount === 1 ? '' : 's'}.`
+			`${recipe.title} deleted, along with ${impactedMealCount} planned meal${impactedMealCount === 1 ? '' : 's'}.`
 		);
 	}
 	function shoppingSourceLabel(sourceKey?: string) {
@@ -3243,8 +3378,8 @@
 				recipeId: recipe.id,
 				servings
 			};
-			kitchen.meals.push(created);
-			refreshWeekShopping(scheduledWeek);
+			kitchen = upsertMeal(kitchen, created);
+			pruneEditingShoppingState();
 			weekOffset = weekOffsetForDate(scheduledDate);
 			if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 			openRecipeDetail(null);
@@ -3256,9 +3391,10 @@
 				const existing = kitchen.meals.find((entry) => entry.id === created.id);
 				if (!existing) return;
 				const affectedWeek = weekStartForDate(existing.date);
-				kitchen.meals = kitchen.meals.filter((entry) => entry.id !== created.id);
-				refreshWeekShopping(affectedWeek);
-				if (affectedWeek !== scheduledWeek) refreshWeekShopping(scheduledWeek);
+				let next = deleteMeal(kitchen, created.id);
+				if (affectedWeek !== scheduledWeek) next = refreshWeekShopping(next, scheduledWeek);
+				kitchen = next;
+				pruneEditingShoppingState();
 			});
 			return;
 		}
@@ -3282,8 +3418,8 @@
 		plannedServings = next.plannedServings;
 		mealDate = next.mealDate;
 		mealSlot = 'Dinner';
-		if (!modal) modalReturnFocus = trigger;
-		modal = next.modal;
+		formSubmitted = false;
+		openModal(next.modal, trigger);
 	}
 	function editPlannedMeal(meal: Meal) {
 		if (meal.completedAt) return;
@@ -3293,26 +3429,32 @@
 		mealDate = meal.date;
 		mealSlot = meal.slot;
 		plannedServings = meal.servings;
-		if (!modal) modalReturnFocus = trigger;
-		modal = 'editMeal';
+		formSubmitted = false;
+		openModal('editMeal', trigger);
 	}
-	function saveMealChanges(event?: SubmitEvent) {
+	async function saveMealChanges(event?: SubmitEvent) {
 		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === editingMealId);
-		if (!meal || !mealDate || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
-		if (!isValidServings(plannedServings)) {
-			notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
+		if (!meal || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
+		if (
+			validateMealDate(mealDate) ||
+			validatePlannedServings(plannedServings) ||
+			typeof plannedServings !== 'number'
+		) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
-		const previousWeek = weekStartForDate(meal.date);
+		formSubmitted = false;
 		const updatedDate = mealDate;
-		meal.date = updatedDate;
-		meal.slot = mealSlot;
-		meal.servings = Math.round(plannedServings);
-		delete meal.sample;
-		hasSampleRecords = hasSampleData(kitchen);
-		refreshWeekShopping(previousWeek);
-		refreshWeekShopping(weekStartForDate(meal.date));
+		kitchen = upsertMeal(kitchen, {
+			...meal,
+			date: updatedDate,
+			slot: mealSlot,
+			servings: Math.round(plannedServings)
+		});
+		pruneEditingShoppingState();
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
 		openModal('');
@@ -3326,31 +3468,31 @@
 		cookingMealId = meal.id;
 		deductPantry = false;
 		leftoverServings = 0;
-		if (!modal) modalReturnFocus = trigger;
-		modal = 'cookMeal';
+		formSubmitted = false;
+		openModal('cookMeal', trigger);
 	}
-	function markMealCooked(event?: SubmitEvent) {
+	async function markMealCooked(event?: SubmitEvent) {
 		event?.preventDefault();
 		const meal = kitchen.meals.find((item) => item.id === cookingMealId);
 		if (!meal) return;
 		if (
-			!Number.isInteger(leftoverServings) ||
-			leftoverServings < 0 ||
-			leftoverServings > meal.servings
+			validateLeftoverServings(leftoverServings, meal.servings) ||
+			typeof leftoverServings !== 'number'
 		) {
-			notify(`Enter whole leftovers between 0 and ${meal.servings} servings.`);
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
+		formSubmitted = false;
 		const recipeId = meal.recipeId;
 		const servingsCooked = meal.servings;
-		const startDate = weekStartForDate(meal.date);
 		const returnTarget = modalReturnFocus;
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
-		hasSampleRecords = hasSampleData(kitchen);
-		refreshWeekShopping(startDate);
+		pruneEditingShoppingState();
 		resetMealDialogState();
 		openModal('');
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
@@ -3371,7 +3513,6 @@
 		if (!result.restockedCount) return;
 		kitchen.pantry = result.pantry;
 		kitchen.shopping = result.shopping;
-		hasSampleRecords = hasSampleData(kitchen);
 		const appliedPantry = JSON.stringify(kitchen.pantry);
 		const appliedShopping = JSON.stringify(kitchen.shopping);
 		const singleName =
@@ -3392,7 +3533,6 @@
 			) {
 				kitchen.pantry = previousPantry;
 				kitchen.shopping = previousShopping;
-				hasSampleRecords = hasSampleData(kitchen);
 				if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
 					clearEditingShoppingState();
 			} else {
@@ -3441,33 +3581,36 @@
 		filter = PANTRY_FILTER;
 		navigate('discover');
 	}
-	function addMeal(event?: SubmitEvent) {
+	async function addMeal(event?: SubmitEvent) {
 		event?.preventDefault();
-		const result = completePlanMeal(
-			kitchen.recipes,
-			plannedRecipeId,
-			mealDate,
-			mealSlot,
-			plannedServings
-		);
-		if (!result.ok) {
-			if (result.reason === 'invalidServings') {
-				notify(`Choose between 1 and ${MAX_SERVINGS.toLocaleString('en-US')} whole servings.`);
-			}
+		const targetRecipe = plannedRecipe;
+		if (!targetRecipe || !['Breakfast', 'Lunch', 'Dinner'].includes(mealSlot)) return;
+		if (
+			validateMealDate(mealDate) ||
+			validatePlannedServings(plannedServings) ||
+			typeof plannedServings !== 'number'
+		) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
-		const scheduledDate = result.meal.date;
-		kitchen.meals.push(result.meal);
-		refreshWeekShopping(weekStartForDate(scheduledDate));
+		formSubmitted = false;
+		const scheduledDate = mealDate;
+		kitchen = upsertMeal(kitchen, {
+			id: crypto.randomUUID(),
+			date: scheduledDate,
+			slot: mealSlot,
+			recipeId: targetRecipe.id,
+			servings: Math.round(plannedServings)
+		});
+		pruneEditingShoppingState();
 		weekOffset = weekOffsetForDate(scheduledDate);
 		if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
-		plannedRecipeId = result.plannedRecipeId;
-		detailReturnFocus = null;
-		selectedMealServings = result.selectedMealServings;
-		selectedId = result.selectedId;
+		openRecipeDetail(null);
 		resetMealDialogState();
-		openModal(result.modal);
-		page = result.page;
+		openModal('');
+		page = 'planner';
 		void scrollCalendarToDate(scheduledDate);
 		notify('Meal scheduled.');
 	}
@@ -3595,10 +3738,25 @@
 			householdBusy = false;
 		}
 	}
-	async function join(confirmReplace = false) {
-		const confirmed = confirmReplace === true;
-		householdBusy = true;
+	async function join(eventOrConfirm?: SubmitEvent | boolean) {
+		if (
+			eventOrConfirm &&
+			typeof eventOrConfirm === 'object' &&
+			'preventDefault' in eventOrConfirm
+		) {
+			eventOrConfirm.preventDefault();
+		}
+		const confirmed = eventOrConfirm === true;
 		error = '';
+		if (validateInviteCode(joinCode)) {
+			if (modal !== 'household') modal = 'household';
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		householdBusy = true;
 		let joinedHousehold = false;
 		try {
 			syncing = true;
@@ -3618,7 +3776,6 @@
 					clearHouseholdViewState();
 					stateEtag = null;
 					kitchen = createNewUserState();
-					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -3641,6 +3798,10 @@
 			}
 			if (joinedHousehold) modal = 'household';
 			error = err.message;
+			if (modal === 'household') {
+				await tick();
+				focusFirstInvalid(dialogFormEl);
+			}
 		} finally {
 			syncing = false;
 			householdBusy = false;
@@ -3701,6 +3862,7 @@
 		currentInviteId = next.currentInviteId;
 		resumeDialog = next.resumeDialog;
 		if (next.onboardingStatus) kitchen.preferences.onboardingStatus = next.onboardingStatus;
+		formSubmitted = false;
 		openModal(next.modal);
 		error = '';
 	}
@@ -3806,21 +3968,40 @@
 					: undefined
 			: undefined;
 		if (standaloneUrl) {
-			const connected = hasAIConnection();
+			if (!user) {
+				openAuthentication();
+				notify(
+					managedAuth
+						? 'Sign in through your organization to import recipes.'
+						: 'Create an account or sign in to import recipes.'
+				);
+				resumeDialog = 'import';
+				return null;
+			}
+			const useHost = Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI);
+			const connected = !useHost && hasAIConnection();
 			return request(
 				'/api/recipe-import',
 				{
 					url: standaloneUrl,
-					...(connected
+					...(useHost && chatGPT.host
 						? {
-								...(kitchen.preferences.provider === 'chatgpt'
-									? { connectionId: kitchen.preferences.chatgptAccountId }
-									: { apiKey }),
-								provider: kitchen.preferences.provider,
-								model: kitchen.preferences.model,
-								reasoning: kitchen.preferences.reasoning
+								usePersonalAI: false,
+								provider: 'chatgpt',
+								model: chatGPT.host.model,
+								connectionId: HOST_CONNECTION_ID
 							}
-						: {})
+						: connected
+							? {
+									usePersonalAI: true,
+									...(kitchen.preferences.provider === 'chatgpt'
+										? { connectionId: kitchen.preferences.chatgptAccountId }
+										: { apiKey }),
+									provider: kitchen.preferences.provider,
+									model: kitchen.preferences.model,
+									reasoning: kitchen.preferences.reasoning
+								}
+							: { usePersonalAI: true })
 				},
 				'POST',
 				signal
@@ -3919,8 +4100,15 @@
 	async function deleteAccount(event: SubmitEvent) {
 		event.preventDefault();
 		if (managedAuth) return;
-		busy = true;
 		error = '';
+		if (validatePassword(deletePassword, 'delete')) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		busy = true;
 		try {
 			syncing = true;
 			clearTimeout(saveTimer);
@@ -3951,7 +4139,6 @@
 			deletePassword = '';
 			stateEtag = null;
 			kitchen = createInitialState();
-			hasSampleRecords = true;
 			cookedHistoryLimit = COOKED_HISTORY_PAGE_SIZE;
 			clearGuestData(localStorage);
 			quarantineLegacyKitchen(localStorage);
@@ -3961,6 +4148,8 @@
 		} catch (e) {
 			error = (e as Error).message;
 			syncing = false;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
@@ -3990,8 +4179,17 @@
 				'Password recovery is unavailable. Ask the server operator to configure email delivery.';
 			return;
 		}
-		busy = true;
 		error = '';
+		const fieldErr =
+			modal === 'reset' ? validatePassword(password, 'reset') : validateEmail(email, 'recover');
+		if (fieldErr) {
+			formSubmitted = true;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
+			return;
+		}
+		formSubmitted = false;
+		busy = true;
 		try {
 			if (modal === 'reset') {
 				await request('/api/auth', { action: 'resetPassword', token: resetToken, password });
@@ -4008,6 +4206,8 @@
 			}
 		} catch (e) {
 			error = (e as Error).message;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
@@ -4030,7 +4230,6 @@
 					clearHouseholdViewState();
 					stateEtag = null;
 					kitchen = createNewUserState();
-					hasSampleRecords = false;
 					joinCode = '';
 					inviteCode = '';
 					currentInviteId = '';
@@ -4083,9 +4282,12 @@
 		}
 		download(text, 'flavorithm-shopping.txt', 'text/plain');
 	}
-	async function internetSearch() {
+	async function internetSearch(event?: SubmitEvent) {
+		event?.preventDefault();
 		if (!capabilities.recipeSearch) {
 			error = 'Web recipe search is not configured for this kitchen.';
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 			return;
 		}
 		if (!user) {
@@ -4099,6 +4301,8 @@
 				.results;
 		} catch (e) {
 			error = (e as Error).message;
+			await tick();
+			focusFirstInvalid(dialogFormEl);
 		} finally {
 			busy = false;
 		}
@@ -4296,7 +4500,7 @@
 				/>{/if}
 			{#if showStarter && hasSampleRecords}<div class="starter-note">
 					<span><Sparkles size={14} /> Sample kitchen</span><button onclick={freshKitchen}
-						>Start fresh <ArrowRight size={13} /></button
+						>Clear sample data</button
 					><button
 						aria-label="Dismiss sample kitchen notice"
 						onclick={() => {
@@ -4601,7 +4805,6 @@
 										kitchen.pantry = kitchen.pantry.filter(
 											(item) => !(Number.isFinite(item.quantity) && item.quantity <= 0)
 										);
-										hasSampleRecords = hasSampleData(kitchen);
 									}}>Clear depleted items</button
 								></span
 							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
@@ -5310,7 +5513,7 @@
 					<p class="muted onboarding-intro">
 						Optional. Change these preferences anytime in Settings.
 					</p>
-					<form onsubmit={finishOnboarding}>
+					<form novalidate bind:this={dialogFormEl} onsubmit={finishOnboarding}>
 						<fieldset class="quiz-group">
 							<legend>Preferred cooking time</legend>
 							<div class="quiz-options quiz-time">
@@ -5324,14 +5527,19 @@
 									>{/each}
 							</div>
 						</fieldset>
-						<fieldset class="quiz-group">
+						<fieldset class="quiz-group" aria-describedby="quiz-cuisines-help">
 							<legend>Favorite cuisines</legend>
-							<p class="quiz-help">Choose any, or leave blank for all cuisines.</p>
+							<p class="quiz-help" id="quiz-cuisines-help">
+								Choose any, or leave blank for all cuisines.
+							</p>
 							<div class="quiz-options quiz-cuisines">
 								{#each cuisineChoices as cuisine}<label class="quiz-option"
-										><input type="checkbox" value={cuisine} bind:group={quizCuisines} /><span
-											>{cuisine}</span
-										></label
+										><input
+											type="checkbox"
+											value={cuisine}
+											aria-invalid="false"
+											bind:group={quizCuisines}
+										/><span>{cuisine}</span></label
 									>{/each}
 							</div>
 						</fieldset>
@@ -5350,27 +5558,33 @@
 						</fieldset>
 						<details class="quiz-dietary">
 							<summary>Any dietary preferences or allergies? <span>Optional</span></summary>
-							<label class="field"
-								>Dietary style<select bind:value={quizDiet}
-									><option value="none">No dietary restriction</option><option value="vegetarian"
-										>Vegetarian</option
-									><option value="vegan">Vegan</option><option value="pescatarian"
-										>Pescatarian</option
-									><option value="gluten-free">Gluten-free</option><option value="dairy-free"
-										>Dairy-free</option
-									></select
-								></label
+							<FormField id="onboarding-diet" label="Dietary style">
+								{#snippet children(field)}
+									<select bind:value={quizDiet} {...field}
+										><option value="none">No dietary restriction</option><option value="vegetarian"
+											>Vegetarian</option
+										><option value="vegan">Vegan</option><option value="pescatarian"
+											>Pescatarian</option
+										><option value="gluten-free">Gluten-free</option><option value="dairy-free"
+											>Dairy-free</option
+										></select
+									>
+								{/snippet}
+							</FormField>
+							<FormField
+								id="onboarding-allergies"
+								label="Allergies or ingredients to avoid"
+								help="These guide generation. Check ingredients and labels before cooking."
 							>
-							<label class="field"
-								>Allergies or ingredients to avoid<input
-									bind:value={quizAllergies}
-									maxlength="500"
-									placeholder="e.g. peanuts, shellfish"
-								/></label
-							>
-							<p class="field-help">
-								These guide generation. Check ingredients and labels before cooking.
-							</p>
+								{#snippet children(field)}
+									<input
+										bind:value={quizAllergies}
+										maxlength="2000"
+										placeholder="e.g. peanuts, shellfish"
+										{...field}
+									/>
+								{/snippet}
+							</FormField>
 						</details>
 						<div class="dialog-actions quiz-actions">
 							<button class="primary" type="submit">Save preferences <Check size={17} /></button
@@ -5385,34 +5599,38 @@
 							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
 							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
 						</div>{/if}
-
-					<label class="field"
-						>Ingredients<textarea
-							bind:value={pantryInput}
-							maxlength="20000"
-							placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
-							rows="5"></textarea></label
-					>
-					<p class="field-help">
-						Separate with commas or new lines. Add quantities and units when you know them.
-					</p>
-					<div class="dialog-actions">
-						<button class="secondary" type="button" disabled={voiceBusy || busy} onclick={dictate}
-							><Mic size={17} /> Use voice</button
-						><button
-							class="secondary"
-							type="button"
-							aria-busy={scanBusy}
-							onclick={() => imageInput.click()}
-							disabled={scanBusy || busy || voiceBusy}
-							><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
-						><button
-							class="primary"
-							type="button"
-							disabled={voiceBusy || busy || !pantryInput.trim()}
-							onclick={addIngredients}>Add ingredients <ArrowRight size={17} /></button
+					<form novalidate bind:this={dialogFormEl} onsubmit={addIngredients}>
+						<FormField
+							id="pantry-ingredients"
+							label="Ingredients"
+							help="Separate with commas or new lines. Add quantities and units when you know them."
+							error={pantryFieldError}
+							alert
 						>
-					</div>
+							{#snippet children(field)}
+								<textarea
+									bind:value={pantryInput}
+									maxlength="20000"
+									placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
+									rows="5"
+									{...field}></textarea>
+							{/snippet}
+						</FormField>
+						<div class="dialog-actions">
+							<button type="button" class="secondary" disabled={voiceBusy || busy} onclick={dictate}
+								><Mic size={17} /> Use voice</button
+							><button
+								type="button"
+								class="secondary"
+								aria-busy={scanBusy}
+								onclick={() => imageInput.click()}
+								disabled={scanBusy || busy || voiceBusy}
+								><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
+							><button type="submit" class="primary" disabled={voiceBusy || busy}
+								>Add ingredients <ArrowRight size={17} /></button
+							>
+						</div>
+					</form>
 				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
 					<h2>Managed by your organization</h2>
 					<p class="muted">
@@ -5420,49 +5638,69 @@
 					</p>
 					{#if providerLoginUrl}<a class="primary full" href={providerLoginUrl}
 							>Continue with organization sign-in <ArrowRight size={17} /></a
-						>{:else}<p class="field-help">
+						>{:else}<p class="muted">
 							Sign in through your organization's access proxy, then reload Flavorithm.
 						</p>{/if}
 				{:else if modal === 'auth'}<span class="dialog-spark">✳</span>
 					<h2>{authMode === 'register' ? 'Create an account' : 'Sign in'}</h2>
 					<p class="muted">Sync your pantry, recipes, and household.</p>
-					<form onsubmit={authenticate}>
-						{#if authMode === 'register'}<label class="field"
-								>Your name<input
-									required
-									minlength="2"
-									maxlength="80"
-									autocomplete="name"
-									bind:value={name}
-								/></label
-							>{/if}<label class="field"
-							>Email address<input
-								type="email"
-								required
-								autocomplete="email"
-								bind:value={email}
-							/></label
-						><label class="field"
-							>Password<input
-								type="password"
-								required
-								minlength="10"
-								maxlength="128"
-								autocomplete={authMode === 'register' ? 'new-password' : 'current-password'}
-								bind:value={password}
-							/></label
+					<form novalidate bind:this={dialogFormEl} onsubmit={authenticate}>
+						{#if authMode === 'register'}<FormField
+								id="auth-name"
+								label="Your name"
+								help="Use 2 to 80 characters."
+								error={authNameError}
+							>
+								{#snippet children(field)}
+									<input maxlength="80" autocomplete="name" bind:value={name} {...field} />
+								{/snippet}
+							</FormField>{/if}
+						<FormField
+							id="auth-email"
+							label="Email address"
+							error={authEmailError}
+							errorId={error ? 'auth-form-error' : undefined}
+							invalid={Boolean(authEmailError || error)}
 						>
-						<p class="field-help">Use at least 10 characters.</p>
+							{#snippet children(field)}
+								<input type="email" autocomplete="email" bind:value={email} {...field} />
+							{/snippet}
+						</FormField>
+						<FormField
+							id="auth-password"
+							label="Password"
+							help={authMode === 'register'
+								? 'Use 10 to 128 characters.'
+								: 'Enter your account password.'}
+							error={authPasswordError}
+							errorId={error && authMode === 'login' ? 'auth-form-error' : undefined}
+							invalid={Boolean(authPasswordError || (error && authMode === 'login'))}
+						>
+							{#snippet children(field)}
+								<input
+									type="password"
+									maxlength="128"
+									autocomplete={authMode === 'register' ? 'new-password' : 'current-password'}
+									bind:value={password}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
 						{#if authMode === 'login' && capabilities.emailDelivery}<button
 								type="button"
 								class="text-button"
 								onclick={() => {
 									modal = 'recover';
+									formSubmitted = false;
 									error = '';
 								}}>Forgot your password?</button
-							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-							class="primary full"
-							disabled={busy}
+							>{/if}{#if error || authValidationSummary}<p
+								class="error"
+								id="auth-form-error"
+								role="alert"
+							>
+								{error || authValidationSummary}
+							</p>{/if}<button type="submit" class="primary full" disabled={busy}
 							>{busy
 								? 'Opening your kitchen…'
 								: authMode === 'register'
@@ -5474,6 +5712,7 @@
 						class="text-button full"
 						onclick={() => {
 							authMode = authMode === 'register' ? 'login' : 'register';
+							formSubmitted = false;
 							error = '';
 						}}
 						>{authMode === 'register'
@@ -5485,45 +5724,61 @@
 					<p class="muted">
 						Uses your pantry and preferences. Recipes may include additional ingredients.
 					</p>
-					<label class="field"
-						>What are you in the mood for?<textarea
-							rows="3"
-							bind:value={prompt}
-							placeholder="e.g. a spicy vegetarian dinner in 30 minutes"></textarea></label
-					>
-					<div class="two-fields">
-						<label class="field"
-							>Time to cook<select bind:value={kitchen.preferences.maxTime}
-								><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option
-									value={45}>45 minutes</option
-								><option value={60}>An hour</option><option value={120}>A slow afternoon</option
-								></select
-							></label
-						><label class="field"
-							>Dietary style<select bind:value={kitchen.preferences.diet}
-								><option value="none">A bit of everything</option><option>Vegetarian</option><option
-									>Vegan</option
-								><option>Pescatarian</option><option>Gluten-free</option><option>Low-carb</option
-								></select
-							></label
+					<form novalidate bind:this={dialogFormEl} onsubmit={generate}>
+						<FormField
+							id="generate-prompt"
+							label="What are you in the mood for?"
+							errorId={error ? 'generate-form-error' : undefined}
+							invalid={Boolean(error)}
 						>
-					</div>
-					<label class="field"
-						>Allergies & ingredients to avoid<input
-							bind:value={kitchen.preferences.allergies}
-							maxlength="2000"
-							placeholder="e.g. peanuts, shellfish"
-						/></label
-					>
-					<p class="field-help">
-						Check all ingredients and substitutions against your allergies before cooking.
-					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-						class="primary full"
-						disabled={busy}
-						onclick={generate}
-						><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
-					>
+							{#snippet children(field)}
+								<textarea
+									rows="3"
+									bind:value={prompt}
+									placeholder="e.g. a spicy vegetarian dinner in 30 minutes"
+									{...field}></textarea>
+							{/snippet}
+						</FormField>
+						<div class="two-fields">
+							<FormField id="generate-time" label="Time to cook">
+								{#snippet children(field)}
+									<select bind:value={kitchen.preferences.maxTime} {...field}
+										><option value={15}>15 minutes</option><option value={30}>30 minutes</option
+										><option value={45}>45 minutes</option><option value={60}>An hour</option
+										><option value={120}>A slow afternoon</option></select
+									>
+								{/snippet}
+							</FormField>
+							<FormField id="generate-diet" label="Dietary style">
+								{#snippet children(field)}
+									<select bind:value={kitchen.preferences.diet} {...field}
+										><option value="none">A bit of everything</option><option>Vegetarian</option
+										><option>Vegan</option><option>Pescatarian</option><option>Gluten-free</option
+										><option>Low-carb</option></select
+									>
+								{/snippet}
+							</FormField>
+						</div>
+						<FormField
+							id="generate-allergies"
+							label="Allergies & ingredients to avoid"
+							help="Check all ingredients and substitutions against your allergies before cooking."
+						>
+							{#snippet children(field)}
+								<input
+									bind:value={kitchen.preferences.allergies}
+									maxlength="2000"
+									placeholder="e.g. peanuts, shellfish"
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
+						{#if error}<p class="error" id="generate-form-error" role="alert">
+								{error}
+							</p>{/if}<button type="submit" class="primary full" disabled={busy}
+							><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
+						>
+					</form>
 				{:else if modal === 'settings'}
 					<h2>Settings</h2>
 					<div class="settings-section">
@@ -5569,14 +5824,20 @@
 									: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
 							</p>
 							{#if !managedAuth}
-								{#if user.emailVerified}<p class="field-help">
+								{#if user.emailVerified}<p class="muted">
 										Email verification is optional for using your kitchen.
 									</p>{:else}<button
 										class="secondary"
+										aria-describedby={!capabilities.emailDelivery
+											? 'settings-email-delivery-help'
+											: undefined}
 										disabled={!capabilities.emailDelivery || verificationBusy}
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
-									>{#if !capabilities.emailDelivery}<p class="field-help">
+									>{#if !capabilities.emailDelivery}<p
+											class="field-help"
+											id="settings-email-delivery-help"
+										>
 											Email delivery is unavailable. Ask the server operator to configure email
 											delivery.
 										</p>{/if}{/if}
@@ -5658,7 +5919,7 @@
 						{#if user && (!managedAuth || providerLogoutUrl)}<button
 								class="text-button"
 								onclick={logout}><LogOut size={16} /> Sign out</button
-							>{:else if user && managedAuth}<span class="field-help"
+							>{:else if user && managedAuth}<span class="muted"
 								>Sign-out is managed by your access proxy.</span
 							>{:else if !user && !managedAuth}<button
 								class="text-button"
@@ -5676,10 +5937,13 @@
 							}}>Done <Check size={17} /></button
 						>
 					</div>
-				{:else if modal === 'household'}<span class="dialog-spark">✳</span>
+				{:else if modal === 'household'}
+					{@const showSoloHouseholdHelp =
+						members.length <= 1 && (members.length === 1 || !householdBusy)}
+					<span class="dialog-spark">✳</span>
 					<h2>Your household</h2>
 					<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
-					{#if householdBusy}<p class="field-help" role="status">Updating household…</p>{/if}
+					{#if householdBusy}<p class="muted" role="status">Updating household…</p>{/if}
 					<div class="household-members">
 						{#each members as member (member.id)}<div class="member-row">
 								<span class="profile-avatar"
@@ -5715,7 +5979,7 @@
 												onclick={() => revokeInvite(invite.inviteId)}>Revoke</button
 											>
 										</div>{/each}
-								</div>{:else}<p class="field-help">No active invitations.</p>{/if}
+								</div>{:else}<p class="muted">No active invitations.</p>{/if}
 							<button class="primary full" disabled={householdBusy} onclick={invite}
 								><Plus size={17} /> Create invitation</button
 							>
@@ -5723,6 +5987,7 @@
 									<code>{inviteCode}</code><button
 										class="icon-button"
 										aria-label="Copy invitation"
+										aria-describedby="household-invite-help"
 										onclick={() =>
 											navigator.clipboard
 												.writeText(inviteCode)
@@ -5731,25 +5996,39 @@
 										><Copy size={17} /></button
 									>
 								</div>
-								<p class="field-help">Share privately. This code works once.</p>{/if}
-						</section>{:else}<p class="field-help">
+								<p class="field-help" id="household-invite-help">
+									Share privately. This code works once.
+								</p>{/if}
+						</section>{:else}<p class="muted">
 							Only the household owner can manage invitations or remove members.
 						</p>{/if}
 					<hr />
 					<h3>Have an invitation?</h3>
-					<label class="field"
-						>Invite code<input
-							bind:value={joinCode}
-							placeholder="Paste invitation code"
-							autocomplete="off"
-						/></label
-					>
-					<button
-						class="secondary full"
-						disabled={householdBusy || !joinCode.trim()}
-						onclick={() => join()}>Join household <ArrowRight size={17} /></button
-					>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
+					<form novalidate bind:this={dialogFormEl} onsubmit={join}>
+						<FormField
+							id="household-join-code"
+							label="Invite code"
+							help="Paste the one-time invitation code shared by your household owner."
+							helpIds={showSoloHouseholdHelp ? ['household-solo-help'] : []}
+							error={joinCodeError}
+							errorId={error ? 'household-form-error' : undefined}
+							invalid={Boolean(joinCodeError || error)}
+							alert={!error}
+						>
+							{#snippet children(field)}
+								<input
+									bind:value={joinCode}
+									placeholder="Paste invitation code"
+									autocomplete="off"
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
+						<button type="submit" class="secondary full" disabled={householdBusy}
+							>Join household <ArrowRight size={17} /></button
+						>
+					</form>
+					{#if error}<p class="error" id="household-form-error" role="alert">{error}</p>{/if}
 					{#if members.length > 1}
 						<button
 							class="text-button danger full"
@@ -5759,8 +6038,8 @@
 								error = '';
 							}}>Leave this household</button
 						>
-					{:else if members.length === 1 || !householdBusy}
-						<p class="field-help">
+					{:else if showSoloHouseholdHelp}
+						<p class="field-help" id="household-solo-help">
 							You already have your own personal kitchen. Invite someone above to share it, or enter
 							an invite code to join another household.
 						</p>
@@ -5822,7 +6101,7 @@
 						household. You can rejoin with a new invitation.
 					</p>
 					{#if nextHouseholdOwner}
-						<p class="field-help">
+						<p class="field-help" id="leave-owner-help">
 							Ownership of this household will transfer to <b>{nextHouseholdOwner.name}</b>.
 						</p>
 					{/if}
@@ -5837,6 +6116,7 @@
 							}}>Stay in household</button
 						><button
 							class="primary danger-action"
+							aria-describedby={nextHouseholdOwner ? 'leave-owner-help' : undefined}
 							disabled={busy || householdBusy}
 							onclick={leaveHousehold}
 							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
@@ -5849,17 +6129,29 @@
 						remains for other members; a household with no members is deleted. This cannot be
 						undone.
 					</p>
-					<form onsubmit={deleteAccount}>
-						<label class="field"
-							>Confirm with your password<input
-								type="password"
-								required
-								autocomplete="current-password"
-								bind:value={deletePassword}
-							/></label
-						>{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-							class="primary danger-button full"
-							disabled={busy}>Permanently delete my account</button
+					<form novalidate bind:this={dialogFormEl} onsubmit={deleteAccount}>
+						<FormField
+							id="delete-password"
+							label="Confirm with your password"
+							help="Enter your current password to confirm permanent deletion."
+							error={deletePasswordError}
+							errorId={error ? 'delete-form-error' : undefined}
+							invalid={Boolean(deletePasswordError || error)}
+							alert={!error}
+						>
+							{#snippet children(field)}
+								<input
+									type="password"
+									maxlength="128"
+									autocomplete="current-password"
+									bind:value={deletePassword}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>{#if error}<p class="error" id="delete-form-error" role="alert">
+								{error}
+							</p>{/if}<button type="submit" class="primary danger-button full" disabled={busy}
+							>Permanently delete my account</button
 						>
 					</form>
 				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
@@ -5871,26 +6163,40 @@
 							? 'Choose a new password to open your kitchen again.'
 							: 'We’ll email a link to reset your password.'}
 					</p>
-					<form onsubmit={recover}>
-						{#if modal === 'reset'}<label class="field"
-								>New password<input
-									type="password"
-									required
-									minlength="10"
-									maxlength="128"
-									autocomplete="new-password"
-									bind:value={password}
-								/></label
-							>{:else}<label class="field"
-								>Email address<input
-									type="email"
-									required
-									autocomplete="email"
-									bind:value={email}
-								/></label
-							>{/if}{#if error}<p class="error" role="alert">{error}</p>{/if}<button
-							class="primary full"
-							disabled={busy}
+					<form novalidate bind:this={dialogFormEl} onsubmit={recover}>
+						{#if modal === 'reset'}<FormField
+								id="reset-password"
+								label="New password"
+								help="Use 10 to 128 characters."
+								error={resetPasswordError}
+								errorId={error ? 'recover-form-error' : undefined}
+								invalid={Boolean(resetPasswordError || error)}
+								alert={!error}
+							>
+								{#snippet children(field)}
+									<input
+										type="password"
+										maxlength="128"
+										autocomplete="new-password"
+										bind:value={password}
+										{...field}
+									/>
+								{/snippet}
+							</FormField>{:else}<FormField
+								id="recover-email"
+								label="Email address"
+								help="We’ll send a reset link if an account matches this email."
+								error={recoverEmailError}
+								errorId={error ? 'recover-form-error' : undefined}
+								invalid={Boolean(recoverEmailError || error)}
+								alert={!error}
+							>
+								{#snippet children(field)}
+									<input type="email" autocomplete="email" bind:value={email} {...field} />
+								{/snippet}
+							</FormField>{/if}{#if error}<p class="error" id="recover-form-error" role="alert">
+								{error}
+							</p>{/if}<button type="submit" class="primary full" disabled={busy}
 							>{busy
 								? 'One moment…'
 								: modal === 'reset'
@@ -5918,29 +6224,41 @@
 					)}
 					<h2>Edit planned meal</h2>
 					<p class="muted">{editingMealRecipe?.title}</p>
-					<form onsubmit={saveMealChanges}>
-						<label class="field"
-							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
+					<form novalidate bind:this={dialogFormEl} onsubmit={saveMealChanges}>
+						<FormField id="edit-meal-date" label="When are we cooking?" error={mealDateError} alert>
+							{#snippet children(field)}
+								<input type="date" bind:value={mealDate} {...field} />
+							{/snippet}
+						</FormField>
+						<FormField id="edit-meal-slot" label="Meal">
+							{#snippet children(field)}
+								<select bind:value={mealSlot} {...field}
+									><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+								>
+							{/snippet}
+						</FormField>
+						<FormField
+							id="edit-meal-servings"
+							label="Servings"
+							help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
+							error={mealServingsError}
+							alert={!mealDateError}
 						>
-						<label class="field"
-							>Meal<select required bind:value={mealSlot}
-								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-							></label
-						>
-						<label class="field"
-							>Servings<input
-								type="number"
-								min="1"
-								max={MAX_SERVINGS}
-								step="1"
-								required
-								bind:value={plannedServings}
-							/></label
-						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="1"
+									max={MAX_SERVINGS}
+									step="1"
+									bind:value={plannedServings}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
 						<div class="dialog-actions">
-							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
-								class="primary"
-								type="submit">Save meal</button
+							<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
+								type="submit"
+								class="primary">Save meal</button
 							>
 						</div>
 					</form>
@@ -5949,51 +6267,80 @@
 					{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
 					<h2>Mark meal cooked</h2>
 					<p class="muted">{cookingRecipe?.title}</p>
-					<form onsubmit={markMealCooked}>
-						<label class="cook-option"
-							><input type="checkbox" bind:checked={deductPantry} /><span
-								><b>Deduct ingredients from pantry</b><small
+					<form novalidate bind:this={dialogFormEl} onsubmit={markMealCooked}>
+						<label class="cook-option" for="cook-deduct"
+							><input
+								id="cook-deduct"
+								type="checkbox"
+								aria-describedby="cook-deduct-help"
+								aria-invalid="false"
+								bind:checked={deductPantry}
+							/><span
+								><b>Deduct ingredients from pantry</b><small id="cook-deduct-help"
 									>Uses the planned serving amount and available matching stock.</small
 								></span
 							></label
 						>
-						<label class="field"
-							>Leftover servings<input
-								type="number"
-								min="0"
-								max={cookingMeal?.servings ?? MAX_SERVINGS}
-								step="1"
-								required
-								bind:value={leftoverServings}
-							/><small class="field-help">Enter 0 if there are no leftovers.</small></label
+						<FormField
+							id="cook-leftovers"
+							label="Leftover servings"
+							help={`Enter a whole number from 0 to ${(cookingMeal?.servings ?? MAX_SERVINGS).toLocaleString('en-US')} servings. Enter 0 if there are no leftovers.`}
+							error={leftoverError}
+							alert
 						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="0"
+									max={cookingMeal?.servings ?? MAX_SERVINGS}
+									step="1"
+									bind:value={leftoverServings}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
 						<div class="dialog-actions">
-							<button class="secondary" type="button" onclick={closeDialog}>Cancel</button><button
-								class="primary"
-								type="submit"><Check size={17} /> Mark cooked</button
+							<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
+								type="submit"
+								class="primary"><Check size={17} /> Mark cooked</button
 							>
 						</div>
 					</form>
 				{:else if modal === 'plan'}
 					<h2>Schedule a recipe</h2>
 					<p class="muted">{plannedRecipe?.title}</p>
-					<form onsubmit={addMeal}>
-						<label class="field"
-							>When are we cooking?<input type="date" required bind:value={mealDate} /></label
-						><label class="field"
-							>Meal<select required bind:value={mealSlot}
-								><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-							></label
-						><label class="field"
-							>Servings<input
-								type="number"
-								min="1"
-								max={MAX_SERVINGS}
-								step="1"
-								required
-								bind:value={plannedServings}
-							/></label
-						><button class="primary full" type="submit"
+					<form novalidate bind:this={dialogFormEl} onsubmit={addMeal}>
+						<FormField id="plan-date" label="When are we cooking?" error={mealDateError} alert>
+							{#snippet children(field)}
+								<input type="date" bind:value={mealDate} {...field} />
+							{/snippet}
+						</FormField>
+						<FormField id="plan-slot" label="Meal">
+							{#snippet children(field)}
+								<select bind:value={mealSlot} {...field}
+									><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+								>
+							{/snippet}
+						</FormField>
+						<FormField
+							id="plan-servings"
+							label="Servings"
+							help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
+							error={mealServingsError}
+							alert={!mealDateError}
+						>
+							{#snippet children(field)}
+								<input
+									type="number"
+									min="1"
+									max={MAX_SERVINGS}
+									step="1"
+									bind:value={plannedServings}
+									{...field}
+								/>
+							{/snippet}
+						</FormField>
+						<button type="submit" class="primary full"
 							><CalendarDays size={17} /> Put it on the calendar</button
 						>
 					</form>
@@ -6031,21 +6378,27 @@
 					<p class="muted">
 						Search real recipes across the web, with links to the original creators.
 					</p>
-					{#if !capabilities.recipeSearch}<p class="field-help">
-							Web search is unavailable. Ask the server operator to enable online recipe search.
-						</p>{/if}
-					<label class="field"
-						>What are you craving?<input
-							bind:value={prompt}
-							placeholder="Lemony weeknight pasta…"
-						/></label
-					><button
-						class="primary full"
-						disabled={busy || !capabilities.recipeSearch}
-						onclick={internetSearch}
-						><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
-					>{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<button class="secondary full" onclick={() => openImport()}
+					<form novalidate bind:this={dialogFormEl} onsubmit={internetSearch}>
+						{#if !capabilities.recipeSearch}<p class="field-help" id="search-unavailable-help">
+								Web search is unavailable. Ask the server operator to enable online recipe search.
+							</p>{/if}
+						<FormField
+							id="search-query"
+							label="What are you craving?"
+							help="Search by dish, ingredient, or cuisine, or leave blank for seasonal ideas."
+							helpIds={[!capabilities.recipeSearch ? 'search-unavailable-help' : undefined]}
+							errorId={error ? 'search-form-error' : undefined}
+							invalid={Boolean(error)}
+						>
+							{#snippet children(field)}
+								<input bind:value={prompt} placeholder="Lemony weeknight pasta…" {...field} />
+							{/snippet}
+						</FormField>
+						<button type="submit" class="primary full" disabled={busy || !capabilities.recipeSearch}
+							><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
+						>{#if error}<p class="error" id="search-form-error" role="alert">{error}</p>{/if}
+					</form>
+					<button type="button" class="secondary full" onclick={() => openImport()}
 						><Plus size={17} />Import text, a link, or a photo</button
 					>
 					<div class="web-results">
