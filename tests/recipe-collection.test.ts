@@ -264,6 +264,24 @@ test('applyEditedRecipe protects drafts when unsaved or deleted remotely and enf
 	assert.equal(resavedFromDeleted.recipes[0].saved, true);
 	assert.equal(resavedFromDeleted.recipes[0].image, uploadedCover);
 
+	// Editing a recipe that opened unsaved (#97 openRecipeEditor) saves directly without prompting 'unsaved':
+	const unsavedBase = { ...cloneRecipe(base), saved: false, provenance: 'manual' as const };
+	const unsavedDraft = { ...cloneRecipe(draft), saved: false, provenance: undefined };
+	const unsavedMerged = applyEditedRecipe(
+		[{ ...cloneRecipe(unsavedBase), time: 50 }],
+		unsavedBase,
+		unsavedDraft
+	);
+	assert.equal(unsavedMerged.status, 'merged');
+	assert.equal(unsavedMerged.recipes[0].saved, true);
+	assert.equal(unsavedMerged.recipes[0].time, 50);
+	assert.equal(unsavedMerged.recipes[0].description, 'Crisp olive oil crust');
+	assert.equal(unsavedMerged.recipes[0].provenance, 'manual');
+
+	const resavedManualDeleted = applyEditedRecipe([], unsavedBase, unsavedDraft, { resave: true });
+	assert.equal(resavedManualDeleted.status, 'merged');
+	assert.equal(resavedManualDeleted.recipes[0].provenance, 'manual');
+
 	const fullKitchen = collection(MAX_RECIPES);
 	assert.throws(() => applyEditedRecipe(fullKitchen, base, draft, { resave: true }), /250 recipes/);
 });

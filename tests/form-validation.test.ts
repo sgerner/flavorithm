@@ -711,6 +711,48 @@ test('rendered components resolve every aria-describedby and label[for] without 
 		}
 	}).body;
 	assertValidRenderedAccessibility(editorCleanHtml, 'RecipeEditor clean');
+	assert.equal(editorCleanHtml.includes('A household member unsaved this recipe'), false);
+
+	const unsavedRecipe = { ...structuredClone(sampleRecipe), saved: false };
+	const editorUnsavedEditHtml = render(editorCompiled.exports.default, {
+		props: {
+			recipe: unsavedRecipe,
+			liveRecipe: unsavedRecipe,
+			mode: 'edit',
+			canUploadCover: true,
+			cancel: () => {},
+			save: () => {}
+		}
+	}).body;
+	assertValidRenderedAccessibility(editorUnsavedEditHtml, 'RecipeEditor unsaved recipe edit');
+	assert.equal(editorUnsavedEditHtml.includes('Edit recipe'), true);
+	assert.equal(editorUnsavedEditHtml.includes('A household member unsaved this recipe'), false);
+
+	const editorRemoteUnsavedHtml = render(editorCompiled.exports.default, {
+		props: {
+			recipe: { ...structuredClone(sampleRecipe), saved: true },
+			liveRecipe: unsavedRecipe,
+			mode: 'edit',
+			canUploadCover: true,
+			cancel: () => {},
+			save: () => {}
+		}
+	}).body;
+	assertValidRenderedAccessibility(editorRemoteUnsavedHtml, 'RecipeEditor remote unsave alert');
+	assert.equal(editorRemoteUnsavedHtml.includes('A household member unsaved this recipe'), true);
+
+	const editorRemoteDeletedHtml = render(editorCompiled.exports.default, {
+		props: {
+			recipe: unsavedRecipe,
+			liveRecipe: null,
+			mode: 'edit',
+			canUploadCover: true,
+			cancel: () => {},
+			save: () => {}
+		}
+	}).body;
+	assertValidRenderedAccessibility(editorRemoteDeletedHtml, 'RecipeEditor remote delete alert');
+	assert.equal(editorRemoteDeletedHtml.includes('A household member deleted this recipe'), true);
 
 	const brokenRecipe = structuredClone(sampleRecipe);
 	brokenRecipe.title = '   ';

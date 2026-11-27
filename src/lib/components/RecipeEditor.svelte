@@ -57,7 +57,13 @@
 	let conflicts = $state<RecipeFieldConflict[]>([]);
 	let promptedRemoval = $state<'unsaved' | 'deleted' | null>(null);
 	let remoteRemoval = $derived(
-		mode === 'edit' ? (!liveRecipe ? 'deleted' : !liveRecipe.saved ? 'unsaved' : null) : null
+		mode === 'edit'
+			? !liveRecipe
+				? 'deleted'
+				: initialDraft.saved && !liveRecipe.saved
+					? 'unsaved'
+					: null
+			: null
 	);
 	let activeRemoval = $derived(mode === 'edit' ? (remoteRemoval ?? promptedRemoval) : null);
 	let uploading = $state(false);
@@ -70,7 +76,12 @@
 	let cancelButton = $state<HTMLButtonElement>();
 	let keepEditingButton = $state<HTMLButtonElement>();
 	$effect(() => {
-		if (!remoteRemoval && promptedRemoval && liveRecipe?.saved) {
+		if (
+			!remoteRemoval &&
+			promptedRemoval &&
+			liveRecipe &&
+			(!initialDraft.saved || liveRecipe.saved)
+		) {
 			promptedRemoval = null;
 		}
 	});

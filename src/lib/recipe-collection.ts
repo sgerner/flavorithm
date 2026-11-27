@@ -215,7 +215,10 @@ export function mergeEditedRecipe(
 			base.servings !== draft.servings || !equal(base.ingredients, draft.ingredients);
 		const nutritionChanged = !equal(base.nutrition, draft.nutrition);
 		const zeroNutrition = hasZeroNutrition(draft.nutrition);
-		const provenance = draft.provenance ?? base.provenance;
+		const provenance =
+			base.provenance === 'manual' || draft.provenance === 'manual'
+				? 'manual'
+				: (draft.provenance ?? base.provenance);
 		const nutritionStale = nutritionNeedsRefresh
 			? true
 			: provenance === 'manual' && zeroNutrition
@@ -227,9 +230,11 @@ export function mergeEditedRecipe(
 			...base,
 			...draft,
 			saved: true,
+			...(provenance !== undefined ? { provenance } : {}),
 			...(nutritionStale !== undefined ? { nutritionStale } : {})
 		});
 		delete candidate.sampleSaved;
+		if (provenance === undefined) delete candidate.provenance;
 		if (nutritionStale === undefined) delete candidate.nutritionStale;
 		if (!resolved.resave) {
 			return {
@@ -383,9 +388,13 @@ export function mergeEditedRecipe(
 	const nutritionChanged =
 		!equal(live.nutrition, nutrition) || !equal(base.nutrition, draft.nutrition);
 	const zeroNutrition = hasZeroNutrition(nutrition);
+	const provenance =
+		live.provenance === 'manual' || base.provenance === 'manual' || draft.provenance === 'manual'
+			? 'manual'
+			: (live.provenance ?? draft.provenance ?? base.provenance);
 	const nutritionStale = nutritionNeedsRefresh
 		? true
-		: live.provenance === 'manual' && zeroNutrition
+		: provenance === 'manual' && zeroNutrition
 			? true
 			: nutritionChanged && !zeroNutrition
 				? false
@@ -408,6 +417,8 @@ export function mergeEditedRecipe(
 		saved: true
 	});
 	delete merged.sampleSaved;
+	if (provenance !== undefined) merged.provenance = provenance;
+	else delete merged.provenance;
 	if (nutritionStale !== undefined) merged.nutritionStale = nutritionStale;
 	else delete merged.nutritionStale;
 
