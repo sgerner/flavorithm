@@ -1562,13 +1562,14 @@ test('grouped checked shopping removals and recipe-meal batches stay order-indep
 		}
 	];
 
-	// Moving one 12 oz checked pack into pantry alongside shopping.delete('checked-pack-1')
-	// retires checked-pack-1 and checked-recipe-pack once without double-retiring checked-pack-2 in either order.
+	// Moving one 12 oz checked pack into pantry alongside shopping.delete('checked-pack-1') or ('checked-pack-2')
+	// retires only the targeted pack and checked-recipe-pack once without double-retiring the sibling pack in either order.
 	const pantryUpsert = {
 		type: 'pantry.upsert' as const,
 		item: { id: 'pantry-chicken', name: 'chicken', quantity: 12, unit: 'oz', category: 'Meat' }
 	};
 	const deleteCheckedPack1 = { type: 'shopping.delete' as const, id: 'checked-pack-1' };
+	const deleteCheckedPack2 = { type: 'shopping.delete' as const, id: 'checked-pack-2' };
 	const pantryFirst = applyButlerCommands(base, [pantryUpsert, deleteCheckedPack1], now).state;
 	const deleteFirst = applyButlerCommands(base, [deleteCheckedPack1, pantryUpsert], now).state;
 	assert.deepEqual(deleteFirst, pantryFirst);
@@ -1584,8 +1585,23 @@ test('grouped checked shopping removals and recipe-meal batches stay order-indep
 		}
 	]);
 
-	// Completing Tuesday's meal with deductPantry: true alongside shopping.delete('checked-pack-1')
-	// retires only Tuesday's 12 oz weekly demand in both command orders, preserving checked-pack-2 and checked-recipe-pack.
+	const pantryFirstPack2 = applyButlerCommands(base, [pantryUpsert, deleteCheckedPack2], now).state;
+	const deleteFirstPack2 = applyButlerCommands(base, [deleteCheckedPack2, pantryUpsert], now).state;
+	assert.deepEqual(deleteFirstPack2, pantryFirstPack2);
+	assert.equal(pantryFirstPack2.pantry[0].quantity, 12);
+	assert.deepEqual(pantryFirstPack2.shopping, [
+		{
+			id: 'checked-pack-1',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		}
+	]);
+
+	// Completing Tuesday's meal with deductPantry: true alongside shopping.delete('checked-pack-1') or ('checked-pack-2')
+	// retires only Tuesday's 12 oz weekly demand from the targeted pack in both command orders.
 	const completeTuesday = {
 		type: 'meal.complete' as const,
 		id: 'tuesday',
@@ -1601,6 +1617,36 @@ test('grouped checked shopping removals and recipe-meal batches stay order-indep
 	assert.deepEqual(completeFirst.shopping, [
 		{
 			id: 'checked-pack-2',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'checked-recipe-pack',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	]);
+
+	const completeFirstPack2 = applyButlerCommands(
+		base,
+		[completeTuesday, deleteCheckedPack2],
+		now
+	).state;
+	const deleteBeforeCompletePack2 = applyButlerCommands(
+		base,
+		[deleteCheckedPack2, completeTuesday],
+		now
+	).state;
+	assert.deepEqual(deleteBeforeCompletePack2, completeFirstPack2);
+	assert.deepEqual(completeFirstPack2.shopping, [
+		{
+			id: 'checked-pack-1',
 			name: 'chicken',
 			quantity: 12,
 			unit: 'oz',
@@ -2066,6 +2112,34 @@ test('grouped meal removal with shared weekly shopping item preserves remaining 
 	assert.equal(mealFirst.shopping[0].name, 'carrot');
 	assert.equal(mealFirst.shopping[0].quantity, 2);
 	assert.equal(mealFirst.shopping[0].sourceKey, 'week:2026-10-19');
+
+	const withMidweekScope = applyButlerCommands(
+		base,
+		[{ type: 'shopping.generate', weekStart: '2026-10-21' }],
+		now
+	).state;
+	const midweekCarrot = withMidweekScope.shopping.find((item) => item.name === 'carrot')!;
+	const midweekMealFirst = applyButlerCommands(
+		withMidweekScope,
+		[
+			{ type: 'meal.delete', id: 'wed-dinner' },
+			{ type: 'shopping.delete', id: midweekCarrot.id }
+		],
+		now
+	).state;
+	const midweekDeleteFirst = applyButlerCommands(
+		withMidweekScope,
+		[
+			{ type: 'shopping.delete', id: midweekCarrot.id },
+			{ type: 'meal.delete', id: 'wed-dinner' }
+		],
+		now
+	).state;
+	assert.deepEqual(midweekDeleteFirst, midweekMealFirst);
+	assert.equal(
+		midweekMealFirst.shopping.find((item) => item.sourceKey === 'week:2026-10-21')?.quantity,
+		2
+	);
 });
 
 test('meal.complete with deductPantry false records leftovers and clears weekly shopping demand without touching pantry', () => {

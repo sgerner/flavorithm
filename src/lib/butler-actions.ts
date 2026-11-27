@@ -180,7 +180,13 @@ export function buildButlerActions(input: unknown[], kitchen: AppState): ButlerA
 				});
 			}
 			commands.forEach((candidate, candidateIndex) => {
-				if (candidate.type !== 'pantry.upsert' || !(candidate.item.quantity > 0)) return;
+				if (
+					candidate.type !== 'pantry.upsert' ||
+					!(candidate.item.quantity > 0) ||
+					!candidate.item.unit.trim()
+				) {
+					return;
+				}
 				const existingPantry = kitchen.pantry.find((item) => item.id === candidate.item.id);
 				const previousInNextUnit = existingPantry
 					? convertCompatibleQuantity(

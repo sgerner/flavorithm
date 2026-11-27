@@ -278,7 +278,7 @@ function recordGeneratedShoppingIds(items: ShoppingItem[], knownGeneratedIds: Se
 function orderBatchCommands(
 	commands: ButlerCommand[],
 	initialGeneratedIds: ReadonlySet<string>
-): ButlerCommand[] {
+): { orderedCommands: ButlerCommand[]; deferredDeleteIds: Set<string> } {
 	const hasNonShoppingKitchenMutation = commands.some(
 		(command) =>
 			(command.type.startsWith('recipe.') && command.type !== 'recipe.open') ||
@@ -320,6 +320,7 @@ function orderBatchCommands(
 	const hoistedRecipes: ButlerCommand[] = [];
 	const mainCommands: ButlerCommand[] = [];
 	const deferredShoppingDeletes: ButlerCommand[] = [];
+	const deferredDeleteIds = new Set<string>();
 
 	for (const command of commands) {
 		if (
@@ -337,12 +338,57 @@ function orderBatchCommands(
 			!upsertedShoppingIds.has(command.id)
 		) {
 			deferredShoppingDeletes.push(command);
+			deferredDeleteIds.add(command.id);
 			continue;
 		}
 		mainCommands.push(command);
 	}
 
-	return [...hoistedRecipes, ...mainCommands, ...deferredShoppingDeletes];
+	return {
+		orderedCommands: [...hoistedRecipes, ...mainCommands, ...deferredShoppingDeletes],
+		deferredDeleteIds
+	};
+}
+
+function withPrioritizedCheckedShopping<T>(
+	shopping: ShoppingItem[],
+	prioritizedIds: ReadonlySet<string>,
+	run: (reordered: ShoppingItem[]) => T,
+	extractShopping: (result: T) => ShoppingItem[],
+	replaceShopping: (result: T, nextShopping: ShoppingItem[]) => T
+): T {
+	if (
+		prioritizedIds.size === 0 ||
+		!shopping.some((item) => item.checked && prioritizedIds.has(item.id))
+	) {
+		return run(shopping);
+	}
+	const originalCheckedRank = new Map<string, number>();
+	shopping.forEach((item, idx) => {
+		if (item.checked) originalCheckedRank.set(item.id, idx);
+	});
+	const prioritizedChecked = [
+		...shopping.filter((item) => item.checked && prioritizedIds.has(item.id)),
+		...shopping.filter((item) => item.checked && !prioritizedIds.has(item.id))
+	];
+	let inCheckedIdx = 0;
+	const prioritized = shopping.map((item) =>
+		item.checked ? prioritizedChecked[inCheckedIdx++] : item
+	);
+	const result = run(prioritized);
+	const outShopping = extractShopping(result);
+	const checkedSorted = outShopping
+		.filter((item) => item.checked)
+		.sort(
+			(a, b) =>
+				(originalCheckedRank.get(a.id) ?? Number.MAX_SAFE_INTEGER) -
+				(originalCheckedRank.get(b.id) ?? Number.MAX_SAFE_INTEGER)
+		);
+	let outCheckedIdx = 0;
+	const restored = outShopping.map((item) =>
+		item.checked ? checkedSorted[outCheckedIdx++] : item
+	);
+	return replaceShopping(result, restored);
 }
 function isUsablePantryExpiry(expires: string | undefined, now: Date): boolean {
 	const status = expiryStatus(expires, now);
@@ -405,7 +451,7 @@ export function applyButlerCommands(
 	let state = structuredClone(current);
 	const knownGeneratedIds = new Set<string>();
 	recordGeneratedShoppingIds(state.shopping, knownGeneratedIds);
-	const orderedCommands = orderBatchCommands(commands, knownGeneratedIds);
+	const { orderedCommands, deferredDeleteIds } = orderBatchCommands(commands, knownGeneratedIds);
 	const effects: ButlerEffect[] = [];
 	const touchedWeeks = new Set<string>(activeWeeklyScopes(state.shopping));
 	const mutatedWeeks = new Set<string>();
@@ -416,6 +462,25 @@ export function applyButlerCommands(
 	const pantryMutations: PantryMutation[] = [];
 	const deductedIngredientNames = new Set<string>();
 	const deductedPantryIds = new Set<string>();
+
+	const markMutatedDate = (currentState: AppState, dateStr: string | undefined) => {
+		if (!dateStr) return;
+		const monday = weekStartForDate(dateStr);
+		if (monday) {
+			touchedWeeks.add(monday);
+			mutatedWeeks.add(monday);
+		}
+		for (const week of activeWeeklyScopes(currentState.shopping)) {
+			const end = new Date(`${week}T12:00:00Z`);
+			if (Number.isNaN(end.getTime())) continue;
+			end.setUTCDate(end.getUTCDate() + 6);
+			const endKey = end.toISOString().slice(0, 10);
+			if (dateStr >= week && dateStr <= endKey) {
+				touchedWeeks.add(week);
+				mutatedWeeks.add(week);
+			}
+		}
+	};
 
 	const recordShoppingScopes = (nextState: AppState) => {
 		recordGeneratedShoppingIds(nextState.shopping, knownGeneratedIds);
@@ -437,9 +502,7 @@ export function applyButlerCommands(
 				const saved = command.recipe.saved ?? (previous ? previous.saved : true);
 				for (const meal of state.meals) {
 					if (!meal.completedAt && meal.recipeId === command.recipe.id) {
-						const week = weekStartForDate(meal.date);
-						touchedWeeks.add(week);
-						mutatedWeeks.add(week);
+						markMutatedDate(state, meal.date);
 					}
 				}
 				touchedRecipes.add(command.recipe.id);
@@ -460,9 +523,7 @@ export function applyButlerCommands(
 				requireId(state.recipes, command.id);
 				for (const meal of state.meals) {
 					if (meal.recipeId === command.id) {
-						const week = weekStartForDate(meal.date);
-						touchedWeeks.add(week);
-						mutatedWeeks.add(week);
+						markMutatedDate(state, meal.date);
 					}
 				}
 				touchedRecipes.delete(command.id);
@@ -489,7 +550,13 @@ export function applyButlerCommands(
 					afterDeduction: deductedPantryIds.has(promoted.id) || deductedPantryIds.has(targetId)
 				});
 				const nextShopping = added
-					? retireCheckedShoppingItems(state.shopping, [added], safeNow)
+					? withPrioritizedCheckedShopping(
+							state.shopping,
+							deferredDeleteIds,
+							(reordered) => retireCheckedShoppingItems(reordered, [added], safeNow),
+							(items) => items,
+							(_items, restored) => restored
+						)
 					: state.shopping;
 				state = { ...state, pantry: nextPantry, shopping: nextShopping };
 				pantryChanged = true;
@@ -510,14 +577,8 @@ export function applyButlerCommands(
 				requireId(state.recipes, command.meal.recipeId);
 				const previous = state.meals.find((item) => item.id === command.meal.id);
 				if (!previous?.completedAt) {
-					if (previous) {
-						const previousWeek = weekStartForDate(previous.date);
-						touchedWeeks.add(previousWeek);
-						mutatedWeeks.add(previousWeek);
-					}
-					const targetWeek = weekStartForDate(command.meal.date);
-					touchedWeeks.add(targetWeek);
-					mutatedWeeks.add(targetWeek);
+					if (previous) markMutatedDate(state, previous.date);
+					markMutatedDate(state, command.meal.date);
 				}
 				state = upsertMeal(state, command.meal, safeNow);
 				recordShoppingScopes(state);
@@ -526,11 +587,7 @@ export function applyButlerCommands(
 			case 'meal.delete': {
 				requireId(state.meals, command.id);
 				const removed = state.meals.find((item) => item.id === command.id);
-				if (removed) {
-					const week = weekStartForDate(removed.date);
-					touchedWeeks.add(week);
-					mutatedWeeks.add(week);
-				}
+				if (removed) markMutatedDate(state, removed.date);
 				state = deleteMeal(state, command.id, safeNow);
 				recordShoppingScopes(state);
 				break;
@@ -539,11 +596,7 @@ export function applyButlerCommands(
 				requireId(state.meals, command.id);
 				recordShoppingScopes(state);
 				const targetMeal = state.meals.find((item) => item.id === command.id);
-				if (targetMeal) {
-					const week = weekStartForDate(targetMeal.date);
-					touchedWeeks.add(week);
-					mutatedWeeks.add(week);
-				}
+				if (targetMeal) markMutatedDate(state, targetMeal.date);
 				const beforePantry = state.pantry;
 				if (command.deductPantry && targetMeal && !targetMeal.completedAt) {
 					const recipe = state.recipes.find((item) => item.id === targetMeal.recipeId);
@@ -557,14 +610,21 @@ export function applyButlerCommands(
 						}
 					}
 				}
-				state = completeMeal(
-					state,
-					command.id,
-					{
-						deductPantry: command.deductPantry,
-						leftoverServings: command.leftoverServings ?? 0
-					},
-					safeNow
+				state = withPrioritizedCheckedShopping(
+					state.shopping,
+					deferredDeleteIds,
+					(reordered) =>
+						completeMeal(
+							{ ...state, shopping: reordered },
+							command.id,
+							{
+								deductPantry: command.deductPantry,
+								leftoverServings: command.leftoverServings ?? 0
+							},
+							safeNow
+						),
+					(nextState) => nextState.shopping,
+					(nextState, restored) => ({ ...nextState, shopping: restored })
 				);
 				if (state.pantry !== beforePantry) {
 					for (const item of state.pantry) {
