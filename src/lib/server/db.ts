@@ -291,7 +291,7 @@ const appStateSchema = z.object({
 				date: z.string().max(50),
 				slot: z.string().max(100),
 				recipeId: z.string().max(100),
-				servings: z.number().min(1).max(10_000),
+				servings: z.number().finite().min(1).max(10_000),
 				completedAt: z.string().max(50).optional(),
 				leftoverServings: z.number().finite().min(0).max(10_000).optional(),
 				sample: z.boolean().optional()
