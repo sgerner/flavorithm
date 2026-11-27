@@ -2,7 +2,7 @@
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusTrap } from '#lib/focus.ts';
 	import { describeBy, fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
@@ -382,8 +382,12 @@
 							analysis.
 						</p>
 					</div>
-					<button class="text-button full" onclick={nutrition} disabled={busy}
-						>Refresh nutrition estimate with AI</button
+					<button
+						class="text-button full"
+						use:busyAction={busy}
+						onclick={() => {
+							if (!busy) nutrition();
+						}}>Refresh nutrition estimate with AI</button
 					>
 				</div>{/if}
 			<div class="rating-box">

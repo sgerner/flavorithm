@@ -282,7 +282,11 @@ function compileServerModule(
 		'#lib/components/DisclosureButton.svelte': noopComponent,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': {
+			focusTrap: () => ({}),
+			busyAction: () => ({}),
+			focusHandoff: () => ({})
+		},
 		'#lib/form-validation.ts': formValidationMod,
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
@@ -1161,7 +1165,11 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'@lucide/svelte': iconProxy,
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': {
+			focusTrap: () => ({}),
+			busyAction: () => ({}),
+			focusHandoff: () => ({})
+		},
 		'#lib/form-validation.ts': formValidationMod,
 		'#lib/components/FormField.svelte': { default: noopComponent },
 		'#lib/motion.ts': {

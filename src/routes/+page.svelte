@@ -33,7 +33,7 @@
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
 	import {
 		focusFirstInvalid,
 		validateEmail,
@@ -948,7 +948,9 @@
 		if (!restoreFocus) return;
 		await tick();
 		document
-			.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
+			.querySelector<HTMLButtonElement>(
+				`.pantry-row:not([inert]) [data-pantry-edit="${CSS.escape(editedId)}"]`
+			)
 			?.focus();
 	}
 	async function cancelPantryEdit() {
@@ -957,7 +959,9 @@
 		if (editedId) {
 			await tick();
 			document
-				.querySelector<HTMLButtonElement>(`[data-pantry-edit="${CSS.escape(editedId)}"]`)
+				.querySelector<HTMLButtonElement>(
+					`.pantry-row:not([inert]) [data-pantry-edit="${CSS.escape(editedId)}"]`
+				)
 				?.focus();
 		}
 	}
@@ -1754,6 +1758,7 @@
 
 	async function authenticate(event: SubmitEvent) {
 		event.preventDefault();
+		if (busy) return;
 		if (managedAuth) {
 			openAuthentication();
 			return;
@@ -2748,6 +2753,7 @@
 
 	async function generate(event?: SubmitEvent) {
 		event?.preventDefault();
+		if (busy) return;
 		const currentPrompt = prompt;
 		const guestFilters = !user
 			? captureGenerateGuestFilters(kitchen.preferences, defaultPreferences)
@@ -3734,7 +3740,7 @@
 		}
 	}
 	async function invite() {
-		if (!canManageHousehold) return;
+		if (!canManageHousehold || householdBusy) return;
 		householdBusy = true;
 		error = '';
 		try {
@@ -3750,7 +3756,7 @@
 		}
 	}
 	async function revokeInvite(inviteId: string) {
-		if (!canManageHousehold) return;
+		if (!canManageHousehold || householdBusy) return;
 		householdBusy = true;
 		error = '';
 		try {
@@ -3768,13 +3774,14 @@
 		}
 	}
 	function askRemoveMember(member: HouseholdMember) {
-		if (!canManageHousehold || member.role === 'owner' || member.id === user?.id) return;
+		if (householdBusy || !canManageHousehold || member.role === 'owner' || member.id === user?.id)
+			return;
 		memberToRemove = member;
 		modal = 'removeMember';
 		error = '';
 	}
 	async function confirmRemoveMember() {
-		if (!canManageHousehold || !memberToRemove) return;
+		if (householdBusy || !canManageHousehold || !memberToRemove) return;
 		householdBusy = true;
 		error = '';
 		try {
@@ -3793,6 +3800,7 @@
 		}
 	}
 	async function openLeaveHousehold() {
+		if (householdBusy) return;
 		mobileNav = false;
 		if (!user) {
 			openAuthentication();
@@ -3823,6 +3831,7 @@
 		) {
 			eventOrConfirm.preventDefault();
 		}
+		if (householdBusy) return;
 		const confirmed = eventOrConfirm === true;
 		error = '';
 		if (validateInviteCode(joinCode)) {
@@ -3886,7 +3895,7 @@
 		}
 	}
 	async function refreshNutrition() {
-		if (!selected) return;
+		if (busy || !selected) return;
 		const targetId = selected.id;
 		const targetServings = selectedMealServings;
 		selectedDetailTab = 'nutrition';
@@ -4136,7 +4145,7 @@
 	}
 	async function deleteAccount(event: SubmitEvent) {
 		event.preventDefault();
-		if (managedAuth) return;
+		if (managedAuth || busy) return;
 		error = '';
 		if (validatePassword(deletePassword, 'delete')) {
 			formSubmitted = true;
@@ -4209,7 +4218,7 @@
 		}
 	}
 	async function sendEmailVerification() {
-		if (!user || user.emailVerified || !capabilities.emailDelivery) return;
+		if (verificationBusy || !user || user.emailVerified || !capabilities.emailDelivery) return;
 		verificationBusy = true;
 		error = '';
 		try {
@@ -4224,6 +4233,7 @@
 	}
 	async function recover(event: SubmitEvent) {
 		event.preventDefault();
+		if (busy) return;
 		if (managedAuth) {
 			openAuthentication();
 			return;
@@ -4267,6 +4277,7 @@
 		}
 	}
 	async function leaveHousehold() {
+		if (busy || householdBusy) return;
 		busy = true;
 		householdBusy = true;
 		error = '';
@@ -4339,6 +4350,7 @@
 	}
 	async function internetSearch(event?: SubmitEvent) {
 		event?.preventDefault();
+		if (busy) return;
 		if (!capabilities.recipeSearch) {
 			error = 'Web recipe search is not configured for this kitchen.';
 			await tick();
@@ -4363,22 +4375,24 @@
 		}
 	}
 	function handleWindowKeydown(e: KeyboardEvent) {
-		if (e.key !== 'Escape') return;
+		if (e.key !== 'Escape' || e.defaultPrevented) return;
 		const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
 		if (!overlayOpen && pantryDraft) {
 			void cancelPantryEdit();
 		}
 		mobileNav = false;
-		if (modal) closeDialog();
-		else if (editingRecipe) {
+		if (modal) {
+			closeDialog();
+		} else if (editingRecipe) {
 			editingRecipe = null;
 			editingRecipeMode = 'edit';
 		} else if (selected) {
 			selected = null;
 			selectedMealServings = undefined;
 			selectedDetailTab = 'recipe';
-		}
-		if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
+		} else if (butlerOpen) {
+			void butlerChat?.close();
+		} else if (!overlayOpen && page === 'shopping' && editingShoppingId) {
 			e.preventDefault();
 			void cancelEditingShoppingItem();
 		}
@@ -4399,11 +4413,17 @@
 						bind:this={voiceStopButton}
 						type="button"
 						class="primary"
+						use:focusHandoff={{
+							within: '.voice-session',
+							target: 'button',
+							fallback: '.dialog-close, #kitchen-content'
+						}}
 						onclick={() => voiceCapture?.stop()}>Stop recording</button
 					>{/if}<button
 					bind:this={voiceCancelButton}
 					type="button"
 					class="secondary"
+					use:focusHandoff={{ fallback: '.dialog-close, #kitchen-content' }}
 					onclick={() => clearVoiceSession()}>Cancel voice</button
 				>
 			</div>
@@ -4423,13 +4443,21 @@
 					bind:this={voiceRetryButton}
 					class="primary"
 					type="button"
+					use:busyAction={voiceBusy}
+					use:focusHandoff={{
+						target: '.voice-session button',
+						fallback: '.dialog-close, #kitchen-content'
+					}}
 					onclick={() => {
 						void retryVoiceTranscription();
 					}}><RefreshCw size={16} /> Retry transcription</button
 				><button class="secondary" type="button" onclick={openVoiceSettings}
 					><Settings size={16} /> Open Settings</button
-				><button class="text-button" type="button" onclick={discardVoiceRecording}
-					>Discard recording</button
+				><button
+					class="text-button"
+					type="button"
+					use:focusHandoff={{ fallback: '.dialog-close, #kitchen-content' }}
+					onclick={discardVoiceRecording}>Discard recording</button
 				>
 			</div>
 		</div>{/if}
@@ -4476,6 +4504,7 @@
 	{#if mobileNav}<button
 			class="nav-backdrop"
 			aria-label="Dismiss navigation"
+			use:focusHandoff={{ target: '.mobile-menu', fallback: '#kitchen-content' }}
 			onclick={() => (mobileNav = false)}
 			transition:backdropMotion|global
 		></button>{/if}
@@ -4483,6 +4512,7 @@
 		<button
 			class="icon-button sidebar-close"
 			aria-label="Close navigation"
+			use:focusHandoff={{ target: '.mobile-menu', fallback: '#kitchen-content' }}
 			onclick={() => (mobileNav = false)}><X size={20} /></button
 		>
 		<a class="brand" href="/" aria-label="Flavorithm home"
@@ -4575,10 +4605,12 @@
 					exportPending={exportPendingChanges}
 				/>{/if}
 			{#if showStarter && hasSampleRecords}<div class="starter-note">
-					<span><Sparkles size={14} /> Sample kitchen</span><button onclick={freshKitchen}
-						>Clear sample data</button
+					<span><Sparkles size={14} /> Sample kitchen</span><button
+						use:focusHandoff={{ fallback: '#kitchen-content' }}
+						onclick={freshKitchen}>Clear sample data</button
 					><button
 						aria-label="Dismiss sample kitchen notice"
+						use:focusHandoff={{ fallback: '#kitchen-content' }}
 						onclick={() => {
 							showStarter = false;
 							localStorage.setItem('flavorithm-started', 'yes');
@@ -4613,14 +4645,16 @@
 							type="button"
 							aria-label="Scan ingredients from a photo"
 							aria-busy={scanBusy}
-							disabled={scanBusy || busy || voiceBusy}
-							onclick={() => imageInput.click()}><Camera size={19} /></button
+							use:busyAction={scanBusy || busy || voiceBusy}
+							onclick={() => {
+								if (!scanBusy && !busy && !voiceBusy) imageInput.click();
+							}}><Camera size={19} /></button
 						>
 						<button
 							class="secondary"
 							type="button"
 							aria-label="Dictate ingredients"
-							disabled={busy || voiceBusy}
+							use:busyAction={busy || voiceBusy}
 							onclick={dictate}><Mic size={19} /></button
 						>
 					</div>{/if}
@@ -4639,13 +4673,15 @@
 									type="button"
 									aria-label="Scan ingredients from a photo"
 									aria-busy={scanBusy}
-									disabled={scanBusy || busy || voiceBusy}
-									onclick={() => imageInput.click()}><Camera size={20} /></button
+									use:busyAction={scanBusy || busy || voiceBusy}
+									onclick={() => {
+										if (!scanBusy && !busy && !voiceBusy) imageInput.click();
+									}}><Camera size={20} /></button
 								><button
 									class="banner-icon"
 									type="button"
 									aria-label="Dictate ingredients"
-									disabled={busy || voiceBusy}
+									use:busyAction={busy || voiceBusy}
 									onclick={dictate}><Mic size={20} /></button
 								>
 							</div>
@@ -4659,7 +4695,15 @@
 					</section>
 					{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
 							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
-							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
+							<button
+								class="secondary"
+								type="button"
+								use:focusHandoff={{
+									target: 'button[aria-label="Scan ingredients from a photo"]',
+									fallback: '#kitchen-content'
+								}}
+								onclick={() => cancelScan()}>Cancel</button
+							>
 						</div>{/if}{/if}
 				<section class="recipe-section">
 					<div class="section-heading">
@@ -4737,6 +4781,7 @@
 									type="button"
 									class="search-clear"
 									aria-label="Clear search"
+									use:focusHandoff={{ within: '.search-box', target: 'input' }}
 									onclick={() => (query = '')}><X size={16} aria-hidden="true" /></button
 								>{/if}
 						</div>
@@ -4755,6 +4800,7 @@
 							<div class="discover-pantry-actions">
 								{#if activePriorityPantry.length}<button
 										class="text-button"
+										use:focusHandoff={{ within: '.discover-pantry-actions', target: 'button' }}
 										onclick={() => (priorityPantryIds = [])}>All pantry matches</button
 									>{/if}
 								<button
@@ -4848,8 +4894,14 @@
 											? 'No local recipes match those pantry ingredients yet. Reset filters or generate with AI.'
 											: 'No recipes match your current search or filters.'}
 								</p>
-								<button type="button" class="secondary" onclick={resetRecipeFilters}
-									>Reset filters</button
+								<button
+									type="button"
+									class="secondary"
+									use:focusHandoff={{
+										within: '.recipe-section',
+										target: '.filter-tabs button.active, .search-box input'
+									}}
+									onclick={resetRecipeFilters}>Reset filters</button
 								>
 							</div>{:else}<div class="empty-state">
 								<Heart size={36} />
@@ -4881,10 +4933,14 @@
 						><span><b>{kitchen.pantry.length}</b> ingredients</span
 						>{#if kitchen.pantry.some((item) => Number.isFinite(item.quantity) && item.quantity <= 0)}<span
 								class="depleted-actions"
-								><button class="text-button restock-depleted" onclick={() => restockPantryItems()}
+								><button
+									class="text-button restock-depleted"
+									use:focusHandoff={{ within: '.pantry-summary', target: 'button' }}
+									onclick={() => restockPantryItems()}
 									><ShoppingBasket size={16} />Restock depleted items</button
 								><button
 									class="text-button"
+									use:focusHandoff={{ within: '.pantry-summary', target: 'button' }}
 									onclick={() => {
 										commitInlineEdits();
 										kitchen.pantry = kitchen.pantry.filter(
@@ -4892,8 +4948,10 @@
 										);
 									}}>Clear depleted items</button
 								></span
-							>{/if}{#if hasSampleRecords}<button class="text-button" onclick={freshKitchen}
-								>Clear sample data</button
+							>{/if}{#if hasSampleRecords}<button
+								class="text-button"
+								use:focusHandoff={{ within: '.pantry-summary', target: 'button' }}
+								onclick={freshKitchen}>Clear sample data</button
 							>{/if}</span
 					>
 					<div>
@@ -4901,17 +4959,29 @@
 							class="secondary"
 							type="button"
 							aria-busy={scanBusy}
-							disabled={scanBusy || busy || voiceBusy}
-							onclick={() => imageInput.click()}
-							><Camera size={17} /> {scanBusy ? 'Scanning photo…' : 'Scan a photo'}</button
-						><button class="secondary" type="button" disabled={busy || voiceBusy} onclick={dictate}
-							><Mic size={17} /> Tell us what you have</button
+							use:busyAction={scanBusy || busy || voiceBusy}
+							onclick={() => {
+								if (!scanBusy && !busy && !voiceBusy) imageInput.click();
+							}}><Camera size={17} /> {scanBusy ? 'Scanning photo…' : 'Scan a photo'}</button
+						><button
+							class="secondary"
+							type="button"
+							use:busyAction={busy || voiceBusy}
+							onclick={dictate}><Mic size={17} /> Tell us what you have</button
 						>
 					</div>
 				</div>
 				{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
 						<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
-						<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
+						<button
+							class="secondary"
+							type="button"
+							use:focusHandoff={{
+								target: '.pantry-summary div button',
+								fallback: '#kitchen-content'
+							}}
+							onclick={() => cancelScan()}>Cancel</button
+						>
 					</div>{/if}
 				<div class="pantry-controls">
 					<div class="pantry-filter-bar">
@@ -4992,15 +5062,35 @@
 													>
 												</span>
 												<div class="pantry-edit-actions">
-													<button type="submit" class="primary pantry-done-button">Done</button
+													<button
+														type="submit"
+														class="primary pantry-done-button"
+														use:focusHandoff={{
+															row: '.pantry-row',
+															target: '.pantry-edit-button',
+															fallback:
+																'.filtered-pantry-empty button, .pantry-search input, .pantry-footer button'
+														}}>Done</button
 													><button
 														type="button"
 														class="secondary pantry-cancel-button"
+														use:focusHandoff={{
+															row: '.pantry-row',
+															target: '.pantry-edit-button',
+															fallback:
+																'.filtered-pantry-empty button, .pantry-search input, .pantry-footer button'
+														}}
 														onclick={() => cancelPantryEdit()}>Cancel</button
 													><button
 														type="button"
 														class="icon-button pantry-remove-button"
 														aria-label={`Remove ${item.name}`}
+														use:focusHandoff={{
+															row: '.pantry-row',
+															target: '.pantry-remove-button',
+															fallback:
+																'.filtered-pantry-empty button, .pantry-footer button, .page-heading button'
+														}}
 														onclick={() => removePantryItem(item)}
 														><X size={16} aria-hidden="true" /></button
 													>
@@ -5023,6 +5113,12 @@
 														max="1000000"
 														step="any"
 														bind:value={pantryDraft.quantity}
+														use:focusHandoff={{
+															row: '.pantry-row',
+															target: '.pantry-edit-button',
+															fallback:
+																'.filtered-pantry-empty button, .pantry-search input, .pantry-footer button'
+														}}
 														onkeydown={handlePantryInputKeydown}
 													/>
 												</div>
@@ -5036,6 +5132,12 @@
 														type="text"
 														maxlength="40"
 														bind:value={pantryDraft.unit}
+														use:focusHandoff={{
+															row: '.pantry-row',
+															target: '.pantry-edit-button',
+															fallback:
+																'.filtered-pantry-empty button, .pantry-search input, .pantry-footer button'
+														}}
 														onkeydown={handlePantryInputKeydown}
 													/>
 												</div>
@@ -5050,6 +5152,12 @@
 														maxlength="100"
 														list="pantry-category-suggestions"
 														bind:value={pantryDraft.category}
+														use:focusHandoff={{
+															row: '.pantry-row',
+															target: '.pantry-edit-button',
+															fallback:
+																'.filtered-pantry-empty button, .pantry-search input, .pantry-footer button'
+														}}
 														onkeydown={handlePantryInputKeydown}
 													/>
 												</div>
@@ -5062,6 +5170,12 @@
 														id={`pantry-expiry-${itemDomId}`}
 														type="date"
 														bind:value={pantryDraft.expires}
+														use:focusHandoff={{
+															row: '.pantry-row',
+															target: '.pantry-edit-button',
+															fallback:
+																'.filtered-pantry-empty button, .pantry-search input, .pantry-footer button'
+														}}
 														onkeydown={handlePantryInputKeydown}
 													/>
 												</div>
@@ -5079,11 +5193,21 @@
 															type="button"
 															class="text-button restock-item"
 															aria-label={`Restock ${item.name}`}
+															use:focusHandoff={{
+																row: '.pantry-row',
+																target: '.restock-item, .pantry-edit-button',
+																fallback:
+																	'.filtered-pantry-empty button, .pantry-footer button, .page-heading button'
+															}}
 															onclick={() => restockPantryItems([item.id])}
 															><ShoppingBasket size={14} />Restock</button
 														>{:else if expiry === 'soon' && item.quantity > 0}<button
 															type="button"
 															class="text-button use-first"
+															use:focusHandoff={{
+																target: '.discover-pantry-bar button, .filter-tabs button.active',
+																fallback: '#kitchen-content'
+															}}
 															onclick={() => useFirstIngredients([item])}
 															><Sparkles size={14} aria-hidden="true" />Use first</button
 														>{/if}</span
@@ -5111,11 +5235,21 @@
 												class="text-button pantry-edit-button"
 												data-pantry-edit={item.id}
 												aria-label={`Edit ${item.name}`}
+												use:focusHandoff={{
+													within: '.pantry-row',
+													target: 'input[type="number"]'
+												}}
 												onclick={() => startPantryEdit(item)}>Edit</button
 											><button
 												type="button"
 												class="icon-button pantry-remove-button"
 												aria-label={`Remove ${item.name}`}
+												use:focusHandoff={{
+													row: '.pantry-row',
+													target: '.pantry-remove-button',
+													fallback:
+														'.filtered-pantry-empty button, .pantry-footer button, .page-heading button'
+												}}
 												onclick={() => removePantryItem(item)}
 												><X size={16} aria-hidden="true" /></button
 											>
@@ -5131,13 +5265,24 @@
 						<Carrot size={34} />
 						<h2>No matching ingredients</h2>
 						<p>Try another search, category, or expiry filter.</p>
-						<button type="button" class="secondary" onclick={resetPantryFilters}
-							>Reset filters</button
+						<button
+							type="button"
+							class="secondary"
+							use:focusHandoff={{
+								target: '.pantry-search input, .expiry-filters button.active',
+								fallback: '#kitchen-content'
+							}}
+							onclick={resetPantryFilters}>Reset filters</button
 						>
 					</div>{/if}
 				<div class="pantry-footer">
-					<button class="primary" onclick={cookFromPantry}
-						><Sparkles size={17} /> Cook from my pantry</button
+					<button
+						class="primary"
+						use:focusHandoff={{
+							target: '.discover-pantry-bar button, .filter-tabs button.active',
+							fallback: '#kitchen-content'
+						}}
+						onclick={cookFromPantry}><Sparkles size={17} /> Cook from my pantry</button
 					>
 				</div>
 			{:else if page === 'planner'}
@@ -5236,6 +5381,12 @@
 														<button
 															class="remove-meal"
 															aria-label="Remove planned meal"
+															use:focusHandoff={{
+																row: '.calendar-meal',
+																target: '.remove-meal',
+																within: '.meal-slot',
+																fallback: '.add-meal'
+															}}
 															onclick={() => removePlannedMeal(meal)}><X size={13} /></button
 														>
 													</div>
@@ -5278,10 +5429,18 @@
 											{#if meal.leftoverServings}<button
 													class="text-button"
 													aria-label={`Use 1 leftover of ${recipe.title}`}
+													use:focusHandoff={{
+														within: '.cooked-history-actions',
+														target: 'button'
+													}}
 													onclick={() => consumeLeftoverServing(meal)}>Use 1 leftover</button
 												><button
 													class="text-button"
 													aria-label={`Clear leftovers for ${recipe.title}`}
+													use:focusHandoff={{
+														within: '.cooked-history-actions',
+														target: 'button'
+													}}
 													onclick={() => clearMealLeftovers(meal)}
 													>Clear leftovers <Check size={15} /></button
 												>{/if}<button
@@ -5299,6 +5458,7 @@
 						{#if renderableCompletedMeals.length > cookedHistoryLimit}<button
 								type="button"
 								class="secondary history-more"
+								use:focusHandoff={{ within: '.cooked-history', fallback: '#kitchen-content' }}
 								onclick={() => (cookedHistoryLimit += COOKED_HISTORY_PAGE_SIZE)}>Show more</button
 							>{/if}{:else}<p class="muted history-empty">
 							Meals marked cooked will appear here. You can add leftovers and update pantry stock
@@ -5394,6 +5554,11 @@
 									class="check-box"
 									class:checked={item.checked}
 									aria-label={`Mark ${item.name} ${item.checked ? 'needed' : 'purchased'}`}
+									use:focusHandoff={{
+										row: '.shopping-row',
+										target: '.check-box',
+										fallback: '.shopping-complete button'
+									}}
 									onclick={() => {
 										item.checked = !item.checked;
 										if (
@@ -5447,7 +5612,14 @@
 												}}
 											/></span
 										>
-										<button type="submit" class="text-button">Done</button>
+										<button
+											type="submit"
+											class="text-button"
+											use:focusHandoff={{
+												within: '.shopping-row',
+												target: '.shopping-quantity button'
+											}}>Done</button
+										>
 									</form>
 								{:else}
 									<div class="shopping-item-edit">
@@ -5465,6 +5637,10 @@
 											class="text-button"
 											data-shopping-edit={item.id}
 											aria-label={`Edit ${item.name}`}
+											use:focusHandoff={{
+												within: '.shopping-row',
+												target: 'input.shopping-name'
+											}}
 											onclick={() => void startEditingShoppingItem(item)}>Edit</button
 										></span
 									>
@@ -5473,6 +5649,11 @@
 									type="button"
 									class="icon-button"
 									aria-label={`Remove ${item.name}`}
+									use:focusHandoff={{
+										row: '.shopping-row',
+										target: ':scope > .icon-button',
+										fallback: '.inline-add input'
+									}}
 									onclick={() => removeShoppingItem(item)}><X size={15} /></button
 								>
 							</div>{/each}{#if !kitchen.shopping.length}<div class="empty-state">
@@ -5487,7 +5668,13 @@
 									<Check size={16} />All {checkedCount}
 									{checkedCount === 1 ? 'item' : 'items'} purchased.
 								</p>
-								<button class="text-button" onclick={movePurchasedToPantry}
+								<button
+									class="text-button"
+									use:focusHandoff={{
+										target: '.empty-state button',
+										fallback: '.inline-add input'
+									}}
+									onclick={movePurchasedToPantry}
 									>Put purchased items in my pantry <ArrowRight size={16} /></button
 								>
 							</div>{/if}
@@ -5506,9 +5693,12 @@
 	{scanBusy ? 'Scanning photo for ingredients…' : toast}
 </div>
 {#if toast}<div class="toast" transition:revealMotion|global={{ y: 25, duration: 250 }}>
-		<span>✳</span>{toast}{#if toastUndo}<button class="toast-undo" onclick={toastUndo}
-				>{toastActionLabel}</button
+		<span>✳</span>{toast}{#if toastUndo}<button
+				class="toast-undo"
+				use:focusHandoff={{ fallback: '#kitchen-content' }}
+				onclick={toastUndo}>{toastActionLabel}</button
 			>{/if}<button
+			use:focusHandoff={{ fallback: '#kitchen-content' }}
 			onclick={() => {
 				toast = '';
 				toastUndo = null;
@@ -5691,7 +5881,15 @@
 					<h2>Add ingredients</h2>
 					{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
 							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
-							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
+							<button
+								class="secondary"
+								type="button"
+								use:focusHandoff={{
+									target: '.dialog-actions button:nth-child(2)',
+									fallback: 'textarea'
+								}}
+								onclick={() => cancelScan()}>Cancel</button
+							>
 						</div>{/if}
 					<form novalidate bind:this={dialogFormEl} onsubmit={addIngredients}>
 						<FormField
@@ -5716,28 +5914,45 @@
 									<button
 										class="secondary"
 										type="button"
-										disabled={scanBusy || busy || voiceBusy}
-										onclick={() => stagedScanFile && scanPantryPhoto(stagedScanFile)}
-										>{scanBusy ? 'Scanning…' : 'Scan photo'}</button
+										use:busyAction={scanBusy || busy || voiceBusy}
+										use:focusHandoff={{
+											target: '#pantry-ingredients',
+											fallback: '.dialog-actions button'
+										}}
+										onclick={() => {
+											if (!scanBusy && !busy && !voiceBusy && stagedScanFile) {
+												void scanPantryPhoto(stagedScanFile);
+											}
+										}}>{scanBusy ? 'Scanning…' : 'Scan photo'}</button
 									><button
 										class="text-button"
 										type="button"
-										disabled={scanBusy || busy || voiceBusy}
-										onclick={() => (stagedScanFile = null)}>Remove</button
+										use:busyAction={scanBusy || busy || voiceBusy}
+										use:focusHandoff={{
+											target: '#pantry-ingredients',
+											fallback: '.dialog-actions button'
+										}}
+										onclick={() => {
+											if (!scanBusy && !busy && !voiceBusy) stagedScanFile = null;
+										}}>Remove</button
 									>
 								</div>
 							</div>{/if}
 						<div class="dialog-actions">
-							<button type="button" class="secondary" disabled={voiceBusy || busy} onclick={dictate}
-								><Mic size={17} /> Use voice</button
+							<button
+								type="button"
+								class="secondary"
+								use:busyAction={voiceBusy || busy}
+								onclick={dictate}><Mic size={17} /> Use voice</button
 							><button
 								type="button"
 								class="secondary"
 								aria-busy={scanBusy}
-								onclick={() => imageInput.click()}
-								disabled={scanBusy || busy || voiceBusy}
-								><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
-							><button type="submit" class="primary" disabled={voiceBusy || busy}
+								use:busyAction={scanBusy || busy || voiceBusy}
+								onclick={() => {
+									if (!scanBusy && !busy && !voiceBusy) imageInput.click();
+								}}><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
+							><button type="submit" class="primary" use:busyAction={voiceBusy || busy}
 								>Add ingredients <ArrowRight size={17} /></button
 							>
 						</div>
@@ -5811,7 +6026,7 @@
 								role="alert"
 							>
 								{error || authValidationSummary}
-							</p>{/if}<button type="submit" class="primary full" disabled={busy}
+							</p>{/if}<button type="submit" class="primary full" use:busyAction={busy}
 							>{busy
 								? 'Opening your kitchen…'
 								: authMode === 'register'
@@ -5886,7 +6101,7 @@
 						</FormField>
 						{#if error}<p class="error" id="generate-form-error" role="alert">
 								{error}
-							</p>{/if}<button type="submit" class="primary full" disabled={busy}
+							</p>{/if}<button type="submit" class="primary full" use:busyAction={busy}
 							><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
 						>
 					</form>
@@ -5942,7 +6157,9 @@
 										aria-describedby={!capabilities.emailDelivery
 											? 'settings-email-delivery-help'
 											: undefined}
-										disabled={!capabilities.emailDelivery || verificationBusy}
+										disabled={!capabilities.emailDelivery}
+										use:busyAction={verificationBusy}
+										use:focusHandoff={{ fallback: '.dialog-close' }}
 										onclick={sendEmailVerification}
 										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
 									>{#if !capabilities.emailDelivery}<p
@@ -5999,7 +6216,11 @@
 								while keeping everything you added or edited.
 							</p>
 							<div class="dialog-actions">
-								<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
+								<button
+									class="secondary"
+									use:focusHandoff={{ fallback: '.dialog-close' }}
+									onclick={freshKitchen}>Clear sample data</button
+								>
 							</div>
 						</div>{/if}
 					<div class="settings-section">
@@ -6070,7 +6291,7 @@
 								>
 								{#if canManageHousehold && member.role !== 'owner' && member.id !== user?.id}<button
 										class="text-button danger member-remove"
-										disabled={householdBusy}
+										use:busyAction={householdBusy}
 										onclick={() => askRemoveMember(member)}>Remove</button
 									>{/if}
 							</div>{/each}
@@ -6086,12 +6307,18 @@
 												})}</span
 											><button
 												class="text-button danger"
-												disabled={householdBusy}
+												use:busyAction={householdBusy}
+												use:focusHandoff={{
+													row: '.invite-row',
+													target: 'button',
+													within: '.household-invites',
+													fallback: 'button.primary'
+												}}
 												onclick={() => revokeInvite(invite.inviteId)}>Revoke</button
 											>
 										</div>{/each}
 								</div>{:else}<p class="muted">No active invitations.</p>{/if}
-							<button class="primary full" disabled={householdBusy} onclick={invite}
+							<button class="primary full" use:busyAction={householdBusy} onclick={invite}
 								><Plus size={17} /> Create invitation</button
 							>
 							{#if inviteCode}<div class="invite-code">
@@ -6135,7 +6362,7 @@
 								/>
 							{/snippet}
 						</FormField>
-						<button type="submit" class="secondary full" disabled={householdBusy}
+						<button type="submit" class="secondary full" use:busyAction={householdBusy}
 							>Join household <ArrowRight size={17} /></button
 						>
 					</form>
@@ -6143,8 +6370,9 @@
 					{#if members.length > 1}
 						<button
 							class="text-button danger full"
-							disabled={householdBusy}
+							use:busyAction={householdBusy}
 							onclick={() => {
+								if (householdBusy) return;
 								modal = 'leave';
 								error = '';
 							}}>Leave this household</button
@@ -6162,21 +6390,27 @@
 						recipes, cover photos, pantry items, planned meals, and shopping list. Download a backup
 						first if you want to keep a copy.
 					</p>
-					<button class="secondary full" disabled={householdBusy} onclick={exportKitchen}
-						><Download size={17} /> Export backup</button
+					<button
+						class="secondary full"
+						use:busyAction={householdBusy}
+						onclick={() => {
+							if (householdBusy) return;
+							void exportKitchen();
+						}}><Download size={17} /> Export backup</button
 					>
 					{#if error}<p class="error" role="alert">{error}</p>{/if}
 					<div class="dialog-actions">
 						<button
 							class="secondary"
-							disabled={householdBusy}
+							use:busyAction={householdBusy}
 							onclick={() => {
+								if (householdBusy) return;
 								error = '';
 								modal = 'household';
 							}}>Cancel</button
 						><button
 							class="primary danger-action"
-							disabled={householdBusy}
+							use:busyAction={householdBusy}
 							onclick={() => join(true)}>{householdBusy ? 'Joining…' : 'Replace kitchen'}</button
 						>
 					</div>
@@ -6190,15 +6424,16 @@
 					<div class="dialog-actions">
 						<button
 							class="secondary"
-							disabled={householdBusy}
+							use:busyAction={householdBusy}
 							onclick={() => {
+								if (householdBusy) return;
 								memberToRemove = null;
 								error = '';
 								modal = 'household';
 							}}>Keep member</button
 						><button
 							class="primary danger-action"
-							disabled={householdBusy}
+							use:busyAction={householdBusy}
 							onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button
 						>
 					</div>
@@ -6220,15 +6455,16 @@
 					<div class="dialog-actions">
 						<button
 							class="secondary"
-							disabled={busy || householdBusy}
+							use:busyAction={busy || householdBusy}
 							onclick={() => {
+								if (busy || householdBusy) return;
 								error = '';
 								modal = 'household';
 							}}>Stay in household</button
 						><button
 							class="primary danger-action"
 							aria-describedby={nextHouseholdOwner ? 'leave-owner-help' : undefined}
-							disabled={busy || householdBusy}
+							use:busyAction={busy || householdBusy}
 							onclick={leaveHousehold}
 							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
 						>
@@ -6261,8 +6497,10 @@
 							{/snippet}
 						</FormField>{#if error}<p class="error" id="delete-form-error" role="alert">
 								{error}
-							</p>{/if}<button type="submit" class="primary danger-button full" disabled={busy}
-							>Permanently delete my account</button
+							</p>{/if}<button
+							type="submit"
+							class="primary danger-button full"
+							use:busyAction={busy}>Permanently delete my account</button
 						>
 					</form>
 				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
@@ -6307,7 +6545,7 @@
 								{/snippet}
 							</FormField>{/if}{#if error}<p class="error" id="recover-form-error" role="alert">
 								{error}
-							</p>{/if}<button type="submit" class="primary full" disabled={busy}
+							</p>{/if}<button type="submit" class="primary full" use:busyAction={busy}
 							>{busy
 								? 'One moment…'
 								: modal === 'reset'
@@ -6505,7 +6743,11 @@
 								<input bind:value={prompt} placeholder="Lemony weeknight pasta…" {...field} />
 							{/snippet}
 						</FormField>
-						<button type="submit" class="primary full" disabled={busy || !capabilities.recipeSearch}
+						<button
+							type="submit"
+							class="primary full"
+							disabled={!capabilities.recipeSearch}
+							use:busyAction={busy}
 							><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 						>{#if error}<p class="error" id="search-form-error" role="alert">{error}</p>{/if}
 					</form>
@@ -6517,8 +6759,12 @@
 								<a href={result.url} target="_blank" rel="noreferrer"
 									><b>{result.title}<ArrowUpRight size={17} /></b>
 									<p>{result.description}</p></a
-								><button class="secondary" disabled={busy} onclick={() => importRecipe(result.url)}
-									><Plus size={16} /> Import recipe</button
+								><button
+									class="secondary"
+									use:busyAction={busy}
+									onclick={() => {
+										if (!busy) importRecipe(result.url);
+									}}><Plus size={16} /> Import recipe</button
 								>
 							</div>{/each}
 					</div>

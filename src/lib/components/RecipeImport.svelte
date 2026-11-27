@@ -6,6 +6,7 @@
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { ArrowDown, ArrowUp, Camera, Mic, Plus, X, Check, ChevronLeft } from '@lucide/svelte';
 	import { prepareAIPhoto } from '#lib/cover-upload.ts';
+	import { busyAction, focusHandoff } from '#lib/focus.ts';
 	import {
 		emptyRecipeDraftValidation,
 		fieldAria,
@@ -427,7 +428,7 @@
 						bind:value={session.url}
 						maxlength="2048"
 						placeholder="https://example.com/recipe"
-						disabled={busy}
+						readonly={busy}
 						{...field}
 					/>
 				{/snippet}
@@ -446,7 +447,7 @@
 						maxlength="20000"
 						rows="6"
 						placeholder={'Paste recipe text or notes for a linked page…\n\nOr try: chickpeas, tomatoes, spinach. Make a quick dinner for two.'}
-						disabled={busy}
+						readonly={busy}
 						{...field}></textarea>
 				{/snippet}
 			</FormField>
@@ -464,21 +465,27 @@
 				<button
 					class="secondary"
 					type="button"
-					onclick={() => photoInput?.click()}
-					disabled={busy || reading || voiceBusy}
+					onclick={() => {
+						if (!busy && !reading && !voiceBusy) photoInput?.click();
+					}}
+					use:busyAction={busy || reading || voiceBusy}
 					><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
 				>
 				<button
 					class="secondary"
 					type="button"
-					onclick={dictate}
-					disabled={busy || reading || voiceBusy}><Mic size={18} />Use voice</button
+					onclick={() => {
+						if (!busy && !reading && !voiceBusy) dictate();
+					}}
+					use:busyAction={busy || reading || voiceBusy}><Mic size={18} />Use voice</button
 				>
 				{#if session.url || session.text || session.photo}<button
 						type="button"
 						class="text-button"
-						disabled={busy || reading || voiceBusy}
+						use:busyAction={busy || reading || voiceBusy}
+						use:focusHandoff={{ within: '.recipe-dropzone', target: 'textarea' }}
 						onclick={() => {
+							if (busy || reading || voiceBusy) return;
 							clearImportSourceInPlace(session);
 							error = '';
 							captureSubmitted = false;
@@ -495,8 +502,10 @@
 						type="button"
 						class="icon-button"
 						aria-label="Remove recipe photo"
-						disabled={busy || voiceBusy}
+						use:busyAction={busy || voiceBusy}
+						use:focusHandoff={{ within: '.recipe-dropzone', target: '.capture-tools button' }}
 						onclick={() => {
+							if (busy || voiceBusy) return;
 							session.photo = '';
 							session.photoName = '';
 						}}><X size={18} /></button
@@ -508,14 +517,17 @@
 					If a website can’t be read, copy its recipe text or attach a screenshot instead.
 				</p>{/if}{/if}
 		<div class="capture-actions">
-			{#if busy}<button class="secondary" type="button" onclick={cancelPrepare}>Cancel</button>{/if}
+			{#if busy}<button
+					class="secondary"
+					type="button"
+					use:focusHandoff={{ within: '.capture-actions', target: 'button[type="submit"]' }}
+					onclick={cancelPrepare}>Cancel</button
+				>{/if}
 			<button
 				class="primary full"
 				type="submit"
-				disabled={busy ||
-					reading ||
-					voiceBusy ||
-					(!session.url.trim() && !session.text.trim() && !session.photo)}
+				disabled={!session.url.trim() && !session.text.trim() && !session.photo}
+				use:busyAction={busy || reading || voiceBusy}
 				aria-busy={busy}
 				>{busy ? 'Making your draft…' : retryAvailable ? 'Try again' : 'Create recipe draft'}<Check
 					size={18}
@@ -525,8 +537,10 @@
 		{#if session.draft}<button
 				class="text-button"
 				type="button"
-				disabled={voiceBusy}
+				use:busyAction={voiceBusy}
+				use:focusHandoff={{ target: '#recipe-import-title' }}
 				onclick={() => {
+					if (voiceBusy) return;
 					error = '';
 					captureSubmitted = false;
 					session.reviewingDraft = true;
@@ -572,6 +586,11 @@
 								class="icon-button"
 								type="button"
 								aria-label={`Dismiss estimate ${i + 1}`}
+								use:focusHandoff={{
+									row: 'li',
+									target: 'button',
+									fallback: '.draft-title input'
+								}}
 								onclick={() =>
 									(session.assumptions = session.assumptions.filter((_, index) => index !== i))}
 								><X size={16} /></button
@@ -784,6 +803,7 @@
 		<button
 			class="text-button"
 			type="button"
+			use:focusHandoff={{ target: '.recipe-dropzone textarea' }}
 			onclick={() => {
 				session = emptyImportSession();
 				error = '';
@@ -808,12 +828,13 @@
 			<button
 				class="secondary"
 				type="button"
+				use:focusHandoff={{ target: '.recipe-dropzone textarea' }}
 				onclick={() => {
 					session.reviewingDraft = false;
 					draftSubmitted = false;
 					error = '';
 				}}><ChevronLeft size={18} />Back</button
-			><button class="primary" type="submit" disabled={voiceBusy}
+			><button class="primary" type="submit" use:busyAction={voiceBusy}
 				><Check size={18} />Save recipe</button
 			>
 		</div>

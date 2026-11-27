@@ -2,7 +2,7 @@
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { tick, untrack } from 'svelte';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
 	import {
 		NUTRITION_FIELDS,
 		emptyRecipeDraftValidation,
@@ -191,7 +191,7 @@
 	async function uploadCover(event: Event) {
 		const input = event.currentTarget as HTMLInputElement;
 		const file = input.files?.[0];
-		if (!canUploadCover || !file) return;
+		if (!canUploadCover || !file || uploading) return;
 		uploading = true;
 		confirmingDiscard = false;
 		uploadError = '';
@@ -354,15 +354,22 @@
 							type="button"
 							class="secondary"
 							aria-describedby="editor-cover-help"
-							disabled={uploading}
-							onclick={() => photoInput?.click()}
-							>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
+							use:busyAction={uploading}
+							onclick={() => {
+								if (!uploading) photoInput?.click();
+							}}>{uploading ? 'Uploading…' : 'Upload cover photo'}</button
 						>{/if}
 					{#if draft.image}<button
 							type="button"
 							class="text-button"
-							disabled={uploading}
+							use:busyAction={uploading}
+							use:focusHandoff={{
+								within: '.cover-picker',
+								target: 'button',
+								fallback: 'input[placeholder^="https://"], #recipe-editor-title'
+							}}
 							onclick={() => {
+								if (uploading) return;
 								confirmingDiscard = false;
 								draft.image = '';
 							}}>Remove cover</button
@@ -612,7 +619,7 @@
 						bind:this={cancelButton}
 						onclick={() => void requestCancel()}>Cancel</button
 					>
-					<button class="primary" type="submit" disabled={uploading}
+					<button class="primary" type="submit" use:busyAction={uploading}
 						><Check size={18} />{mode === 'create' ? 'Save recipe' : 'Save changes'}</button
 					>
 				{/if}

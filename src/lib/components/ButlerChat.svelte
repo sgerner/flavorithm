@@ -24,7 +24,7 @@
 		type ButlerChatResult,
 		type ButlerTurn as Turn
 	} from '#lib/butler-chat.ts';
-	import { focusTrap } from '#lib/focus.ts';
+	import { busyAction, focusHandoff, focusTrap } from '#lib/focus.ts';
 	import type { AppState, Recipe } from '#lib/types.ts';
 
 	let {
@@ -215,7 +215,9 @@
 		resetReaction();
 		open = false;
 		await tick();
-		if (!launcher?.closest('[inert]')) launcher?.focus();
+		if (!launcher?.closest?.('[inert]')) {
+			launcher?.focus({ preventScroll: true });
+		}
 	}
 	export async function reopen(fallbackPrompt = '') {
 		await tick();
@@ -225,16 +227,16 @@
 		input?.focus();
 	}
 	async function toggle() {
-		open = !open;
 		if (open) {
-			await tick();
-			input?.focus();
-		} else {
-			await tick();
-			launcher?.focus();
+			await close();
+			return;
 		}
+		open = true;
+		await tick();
+		input?.focus();
 	}
 	function clear() {
+		if (working || messages.length === 0) return;
 		chat.clear();
 		input?.focus();
 	}
@@ -305,10 +307,10 @@
 		tabindex="-1"
 		aria-label="Chat with Basil"
 		onkeydown={(event) => {
-			if (event.key === 'Escape') {
+			if (event.key === 'Escape' && !event.defaultPrevented) {
 				event.stopPropagation();
 				event.preventDefault();
-				close();
+				void close();
 			}
 		}}
 	>
@@ -329,7 +331,8 @@
 			<button
 				class="icon-button"
 				onclick={clear}
-				disabled={working || messages.length === 0}
+				disabled={messages.length === 0}
+				use:busyAction={working}
 				aria-label="Clear conversation"
 				title="Clear conversation"><RotateCcw size={17} /></button
 			>
@@ -354,7 +357,10 @@
 				<div class="butler-starters">
 					{#each starters as starter}<button
 							onclick={() => send(starter.prompt)}
-							disabled={working || !owner}>{starter.label}<ArrowRight size={14} /></button
+							disabled={!owner}
+							use:busyAction={working}
+							use:focusHandoff={{ target: '#butler-message' }}
+							>{starter.label}<ArrowRight size={14} /></button
 						>{/each}
 				</div>
 			{/if}
@@ -402,7 +408,9 @@
 												class="butler-primary action-button"
 												class:destructive={action.destructive}
 												onclick={() => applyAction(message, action)}
-												disabled={working || message.snapshot !== JSON.stringify(kitchen)}
+												disabled={message.snapshot !== JSON.stringify(kitchen)}
+												use:busyAction={working}
+												use:focusHandoff={{ target: '#butler-message' }}
 											>
 												{#if applying === `${message.id}:${action.id}`}<LoaderCircle
 														size={15}
@@ -418,13 +426,15 @@
 											<button
 												class="dismiss-action"
 												onclick={() => {
+													if (working) return;
 													action.status = 'dismissed';
 													const ids = action.commands.flatMap((command) =>
 														command.type === 'recipe.upsert' ? [command.recipe.id] : []
 													);
 													recipeDrafts = recipeDrafts.filter((recipe) => !ids.includes(recipe.id));
 												}}
-												disabled={working}
+												use:busyAction={working}
+												use:focusHandoff={{ target: '#butler-message' }}
 												aria-label={`Dismiss ${action.title}`}>Dismiss</button
 											>
 										</div>
@@ -453,7 +463,10 @@
 			</div>{/if}
 		{#if error}<div class="butler-error" role="alert">
 				<p>{error}</p>
-				{#if failedPrompt}<button onclick={() => chat.retry()} disabled={working}>Try again</button
+				{#if failedPrompt}<button
+						onclick={() => chat.retry()}
+						use:busyAction={working}
+						use:focusHandoff={{ target: '#butler-message' }}>Try again</button
 					>{/if}
 			</div>{/if}
 		<form
@@ -481,13 +494,16 @@
 					class="butler-primary butler-send"
 					type="button"
 					onclick={stop}
+					use:focusHandoff={{ target: '#butler-message' }}
 					aria-label="Stop reply"
 					title="Stop reply"><Square size={16} /></button
 				>
 			{:else}<button
 					class="butler-primary butler-send"
 					type="submit"
-					disabled={working || !draft.trim() || !owner}
+					disabled={!draft.trim() || !owner}
+					use:busyAction={working}
+					use:focusHandoff={{ target: '#butler-message' }}
 					aria-label="Send message"><Send size={18} /></button
 				>{/if}
 		</form>

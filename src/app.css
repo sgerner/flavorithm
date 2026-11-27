@@ -620,8 +620,8 @@ main {
 .cream-button svg:last-child {
 	margin-left: 6px;
 }
-.cream-button:hover,
-.primary:hover {
+.cream-button:not(:disabled):not([aria-disabled='true']):hover,
+.primary:not(:disabled):not([aria-disabled='true']):hover {
 	transform: translateY(-2px);
 	filter: brightness(1.08);
 }
@@ -697,7 +697,7 @@ main {
 	border: 1px solid var(--control-border);
 	background: transparent;
 }
-.secondary:hover:not(:disabled) {
+.secondary:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--wash);
 }
 .recipe-toolbar {

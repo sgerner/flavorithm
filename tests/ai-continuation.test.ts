@@ -589,7 +589,11 @@ function createReactivePage(options?: {
 			prepareAIPhoto: preparePhoto
 		},
 		'#lib/recipe-cover.ts': coverMod,
-		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/focus.ts': {
+			focusTrap: () => ({}),
+			busyAction: () => ({}),
+			focusHandoff: () => ({})
+		},
 		'#lib/form-validation.ts': formValidationMod,
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
