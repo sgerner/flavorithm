@@ -37,6 +37,7 @@ const { MAX_RECIPES } = recipeCollectionMod;
 const nodeRequire = createRequire(import.meta.url);
 const svelteClient = nodeRequire('svelte/internal/client') as {
 	effect_root: (fn: () => void) => () => void;
+	flush: () => void;
 };
 const svelteServer = nodeRequire('svelte/internal/server') as Record<string, unknown>;
 
@@ -94,6 +95,8 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [recipe.id]: rating };
 			kitchen.recipes = [...kitchen.recipes];
 		},
+		get statusOwner() { return statusOwner; },
+		notify,
 		logout,
 		deleteAccount
 	});
@@ -150,6 +153,8 @@ type PlannerHarnessApi = {
 	setPlannedDraft: (date: string, slot: string, servings: number) => void;
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
+	readonly statusOwner: string;
+	notify: (message: string, undo?: () => void, owner?: string) => void;
 	logout: () => Promise<void>;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
 };
@@ -268,6 +273,9 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date: customDate ?? Date,
@@ -321,6 +329,9 @@ function createReactivePlanner() {
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date,
@@ -907,4 +918,97 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('page notify scopes undo toasts to userId:householdId and suppresses undo across account, household, logout, and deleteAccount changes', async () => {
+	statusMod.resetStatus();
+	const currentToast = () => statusMod.statusStore.state.toast;
+	const harness = createReactivePlanner();
+	try {
+		const { api } = harness;
+		api.user = {
+			id: 'u-alpha',
+			name: 'Alpha',
+			email: 'alpha@example.test',
+			householdId: 'house-1'
+		};
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'u-alpha:house-1');
+
+		let alphaUndoCalls = 0;
+		api.notify('Removed pasta', () => {
+			alphaUndoCalls += 1;
+		});
+		assert.equal(currentToast()?.owner, 'u-alpha:house-1');
+
+		// Household change clears/hides the previous household toast and blocks old undo callbacks.
+		api.user = {
+			...api.user,
+			householdId: 'house-2'
+		};
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'u-alpha:house-2');
+		assert.equal(currentToast(), null);
+		assert.equal(statusMod.runToastUndo('u-alpha:house-1'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(alphaUndoCalls, 0);
+
+		// Account switch clears/hides the previous account toast and blocks old undo callbacks.
+		let house2UndoCalls = 0;
+		api.notify('Removed tomatoes', () => {
+			house2UndoCalls += 1;
+		});
+		assert.equal(currentToast()?.owner, 'u-alpha:house-2');
+
+		api.user = {
+			id: 'u-beta',
+			name: 'Beta',
+			email: 'beta@example.test',
+			householdId: 'house-2'
+		};
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'u-beta:house-2');
+		assert.equal(currentToast(), null);
+		assert.equal(statusMod.runToastUndo('u-alpha:house-2'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(house2UndoCalls, 0);
+
+		// Logout clears untimed undo toast and blocks old undo callbacks.
+		let betaUndoCalls = 0;
+		api.notify('Removed olive oil', () => {
+			betaUndoCalls += 1;
+		});
+		assert.equal(currentToast()?.owner, 'u-beta:house-2');
+		await api.logout();
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'guest:');
+		assert.equal(currentToast()?.undo ?? null, null);
+		assert.equal(statusMod.runToastUndo('u-beta:house-2'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(betaUndoCalls, 0);
+
+		// deleteAccount clears untimed undo toast and blocks old undo callbacks.
+		api.user = {
+			id: 'u-gamma',
+			name: 'Gamma',
+			email: 'gamma@example.test',
+			householdId: 'house-3'
+		};
+		svelteClient.flush();
+		let gammaUndoCalls = 0;
+		api.notify('Removed garlic', () => {
+			gammaUndoCalls += 1;
+		});
+		assert.equal(currentToast()?.owner, 'u-gamma:house-3');
+		await api.deleteAccount({ preventDefault: () => {} } as SubmitEvent);
+		svelteClient.flush();
+		assert.equal(api.statusOwner, 'guest:');
+		assert.equal(currentToast()?.undo ?? null, null);
+		assert.equal(statusMod.runToastUndo('u-gamma:house-3'), false);
+		assert.equal(statusMod.runToastUndo(), false);
+		assert.equal(gammaUndoCalls, 0);
+	} finally {
+		harness.dispose();
+		statusMod.resetStatus();
+	}
 });
