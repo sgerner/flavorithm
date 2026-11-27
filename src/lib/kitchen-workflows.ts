@@ -1685,9 +1685,6 @@ export function clearSampleData(state: AppState, now: Date = new Date()): AppSta
 		const weekMeals = meals.filter(
 			(meal) => !meal.completedAt && meal.date >= startKey && meal.date <= endKey
 		);
-		if (weekMeals.length === 0) {
-			dismissedShopping = clearScopeDismissals(dismissedShopping, scopeKey);
-		}
 		const additions = buildShoppingList(recipes, pantry, weekMeals, now);
 		shopping = reconcileShoppingList(
 			shopping,

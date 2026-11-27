@@ -4,7 +4,9 @@ import {
 	mergeKitchenStates,
 	mergePendingKitchenJournal,
 	readPendingJournal,
-	type PendingKitchen
+	readQuarantinedJournal,
+	type PendingKitchen,
+	type QuarantinedJournalEntry
 } from '#lib/offline-sync.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
 
@@ -34,6 +36,7 @@ export type KitchenExportEnvelope = {
 	hasPendingChanges: boolean;
 	user?: User;
 	state: AppState;
+	quarantined?: QuarantinedJournalEntry[];
 };
 
 export type ServerExportPayload = {
@@ -47,6 +50,7 @@ export type KitchenExportOptions = {
 	user?: User | null;
 	online?: boolean;
 	pendingSnapshot?: PendingKitchen | null;
+	quarantined?: QuarantinedJournalEntry[];
 	hasPendingSync?: boolean;
 	storage?: StorageReader | null;
 	fetcher?: typeof fetch;
@@ -200,6 +204,9 @@ export function sanitizeKitchenState(state: AppState): AppState {
 		recipes: structuredClone(state.recipes),
 		meals: structuredClone(state.meals),
 		shopping: structuredClone(state.shopping),
+		...(state.dismissedShopping
+			? { dismissedShopping: structuredClone(state.dismissedShopping) }
+			: {}),
 		preferences: sanitizePreferences(state.preferences)
 	};
 }
@@ -228,6 +235,27 @@ function safeReadPendingJournal(storage: StorageReader | null | undefined, user:
 	} catch {
 		return { records: [], error: '' };
 	}
+}
+
+function collectQuarantinedEntries(
+	storage: StorageReader | null | undefined,
+	user: User,
+	provided?: QuarantinedJournalEntry[]
+): QuarantinedJournalEntry[] {
+	const merged = new Map<string, QuarantinedJournalEntry>();
+	for (const entry of provided ?? []) {
+		if (entry && typeof entry.key === 'string') merged.set(entry.key, entry);
+	}
+	if (storage) {
+		try {
+			for (const entry of readQuarantinedJournal(storage, user)) {
+				merged.set(entry.key, entry);
+			}
+		} catch {
+			// Ignore blocked or unreadable storage while assembling backups.
+		}
+	}
+	return [...merged.values()];
 }
 
 export function resolveClientKitchenState(options: {
@@ -340,7 +368,8 @@ export function serializeKitchenExport(
 		source: envelope.source,
 		hasPendingChanges: Boolean(envelope.hasPendingChanges),
 		...(sanitizedUser ? { user: sanitizedUser } : {}),
-		state: sanitizeKitchenState(envelope.state)
+		state: sanitizeKitchenState(envelope.state),
+		...(envelope.quarantined?.length ? { quarantined: envelope.quarantined } : {})
 	};
 	return {
 		envelope: normalized,
@@ -514,6 +543,11 @@ export async function exportKitchenArchive(
 		hasPendingSync: options.hasPendingSync,
 		storage: options.storage
 	});
+	const quarantinedEntries = collectQuarantinedEntries(
+		options.storage,
+		clientUser,
+		options.quarantined
+	);
 
 	const isOnline =
 		options.online ?? (typeof navigator === 'undefined' ? true : Boolean(navigator.onLine));
@@ -535,7 +569,8 @@ export async function exportKitchenArchive(
 				source: 'offline',
 				hasPendingChanges: resolved.hasQueuedChanges,
 				user: clientUser,
-				state: resolved.state
+				state: resolved.state,
+				...(quarantinedEntries.length ? { quarantined: quarantinedEntries } : {})
 			},
 			'offline'
 		);
@@ -606,7 +641,8 @@ export async function exportKitchenArchive(
 			source: 'account',
 			hasPendingChanges: resolved.hasQueuedChanges,
 			user: confirmedUser,
-			state: mergedState
+			state: mergedState,
+			...(quarantinedEntries.length ? { quarantined: quarantinedEntries } : {})
 		});
 	} catch (error) {
 		const fallbackReason = classifyExportError(error);
@@ -616,7 +652,8 @@ export async function exportKitchenArchive(
 				source: 'offline',
 				hasPendingChanges: resolved.hasQueuedChanges,
 				user: clientUser,
-				state: resolved.state
+				state: resolved.state,
+				...(quarantinedEntries.length ? { quarantined: quarantinedEntries } : {})
 			},
 			fallbackReason
 		);

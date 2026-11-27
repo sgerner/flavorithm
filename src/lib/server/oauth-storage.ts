@@ -526,6 +526,25 @@ export function releaseChatGPTRefreshLease(
 	).run(userId, accountId, leaseToken);
 }
 
+export function deferChatGPTRefresh(
+	userId: string,
+	accountId: string,
+	leaseToken: string,
+	earliestRefreshAt: number
+): boolean {
+	const result = db
+		.prepare(
+			`
+			UPDATE chatgpt_oauth_accounts
+			SET earliest_refresh_at = MAX(earliest_refresh_at, ?),
+				refresh_lock_token = NULL, refresh_lock_until = NULL
+			WHERE id = ? AND user_id = ? AND refresh_lock_token = ?
+		`
+		)
+		.run(earliestRefreshAt, accountId, userId, leaseToken);
+	return Number(result.changes) === 1;
+}
+
 export function clearChatGPTCredentials(
 	userId: string,
 	accountId: string,
