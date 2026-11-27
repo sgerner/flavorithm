@@ -10,14 +10,17 @@ import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
 import * as coverUploadMod from '../src/lib/cover-upload.ts';
 import * as dataMod from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
+import * as formValidationMod from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
+import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import { calendarDayScrollLeft, weekOffsetFromStarts } from '../src/lib/planner.ts';
@@ -95,7 +98,44 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.recipes = [...kitchen.recipes];
 		},
 		logout,
-		deleteAccount
+		set deletePassword(value: string) { deletePassword = value; },
+		deleteAccount,
+		exportKitchen,
+		exportPendingChanges,
+		startPantryEdit,
+		setPantryDraftQuantity: (value: string) => {
+			if (pantryDraft) pantryDraft.quantity = value;
+		},
+		get toast() { return toast; },
+		get toastActionLabel() { return toastActionLabel; },
+		get online() { return online; },
+		set online(value: boolean) { online = value; },
+		get ready() { return ready; },
+		set ready(value: boolean) { ready = value; },
+		get kitchenLoaded() { return kitchenLoaded; },
+		set kitchenLoaded(value: boolean) { kitchenLoaded = value; },
+		initKitchenSyncForTest: (initialUser: User, baseline: AppState, etag = 'etag-test') => {
+			kitchenSync = createKitchenSync({
+				storage: localStorage,
+				getUser: () => user,
+				getState: () => sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))),
+				setState: (state) => {
+					kitchen = sanitizeKitchenState(state);
+				},
+				onStatus: (status) => {
+					syncReady = status.ready;
+					pendingSync = status.pending;
+					sendingSync = status.syncing;
+					conflicts = status.conflicts;
+					reviewedEtag = status.reviewedEtag;
+					syncErrors = status.error;
+				},
+				transport: () => {
+					throw new Error('Unused transport in export test');
+				}
+			});
+			kitchenSync.initialize(initialUser, baseline, etag);
+		}
 	});
 `;
 	return svelteSource.slice(0, instanceEnd) + hook + svelteSource.slice(instanceEnd);
@@ -145,7 +185,7 @@ type PlannerHarnessApi = {
 	choosePickedRecipe: (recipe: Recipe) => void;
 	openCookDialog: (meal: Meal) => void;
 	openRecipeCookDialog: (recipe: Recipe, servings?: number) => void;
-	markMealCooked: (event?: SubmitEvent) => void;
+	markMealCooked: (event?: SubmitEvent) => Promise<void>;
 	showMoreHistory: () => void;
 	editPlannedMeal: (meal: Meal) => void;
 	saveMealChanges: () => void;
@@ -153,7 +193,18 @@ type PlannerHarnessApi = {
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
 	logout: () => Promise<void>;
+	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	exportKitchen: () => Promise<void>;
+	exportPendingChanges: () => void;
+	startPantryEdit: (item: AppState['pantry'][number]) => Promise<void>;
+	setPantryDraftQuantity: (value: string) => void;
+	readonly toast: string;
+	readonly toastActionLabel: string;
+	online: boolean;
+	ready: boolean;
+	kitchenLoaded: boolean;
+	initKitchenSyncForTest: (initialUser: User, baseline: AppState, etag?: string) => void;
 };
 
 const noopComponent = () => {};
@@ -170,6 +221,8 @@ function createModuleMap() {
 		'#lib/cover-upload.ts': coverUploadMod,
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/form-validation.ts': formValidationMod,
+		'#lib/components/FormField.svelte': { default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -188,11 +241,13 @@ function createModuleMap() {
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
 		'#lib/ai-connections.ts': aiConnectionsMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
+		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
@@ -266,6 +321,9 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date: customDate ?? Date,
@@ -309,16 +367,66 @@ function renderPlannerHtml(setup: (api: PlannerHarnessApi) => void, customDate?:
 	return { html: rendered.body, api: captured };
 }
 
-function createReactivePlanner() {
+function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolean }) {
 	const modMap = createModuleMap();
 	const exports: { default?: any } = {};
 	let api!: PlannerHarnessApi;
 	const assignedUrls: string[] = [];
+	const downloads: Array<{ filename: string; content: string; type: string }> = [];
+	const blobUrls = new Map<string, { content: string; type: string }>();
 	const storage = makeMemoryStorage();
+	const navigatorState = { onLine: options?.onLine ?? true };
+	let fetchImpl: typeof fetch =
+		options?.fetch ??
+		(async () =>
+			new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			}));
+	const customUrl = Object.assign(
+		function URLProxy(input: string | URL, base?: string | URL) {
+			return new URL(input, base);
+		},
+		{
+			createObjectURL: (blob: Blob) => {
+				const token = `blob:test-${blobUrls.size + 1}`;
+				blobUrls.set(token, { content: '', type: blob.type });
+				void blob.text().then((text) => {
+					const existing = blobUrls.get(token);
+					if (existing) existing.content = text;
+				});
+				return token;
+			},
+			revokeObjectURL: () => {}
+		}
+	);
+	class RecordedBlob {
+		readonly textContent: string;
+		readonly type: string;
+		constructor(parts: Array<string>, init?: { type?: string }) {
+			this.textContent = parts.join('');
+			this.type = init?.type ?? '';
+		}
+		async text() {
+			return this.textContent;
+		}
+	}
+	customUrl.createObjectURL = (blob: unknown) => {
+		const token = `blob:test-${blobUrls.size + 1}`;
+		const recorded = blob as RecordedBlob;
+		blobUrls.set(token, {
+			content: typeof recorded?.textContent === 'string' ? recorded.textContent : '',
+			type: typeof recorded?.type === 'string' ? recorded.type : ''
+		});
+		return token;
+	};
 	const sandbox: Record<string, unknown> = {
 		exports,
 		require: (id: string) => {
 			if (id in modMap) return modMap[id];
+			if (id.startsWith('#lib/components/') && id.endsWith('.svelte')) {
+				return { __esModule: true, default: noopComponent };
+			}
 			throw new Error(`Unexpected planner dependency ${id}`);
 		},
 		Date,
@@ -334,19 +442,47 @@ function createReactivePlanner() {
 		JSON,
 		RegExp,
 		Error,
+		TypeError,
 		RangeError,
+		DOMException,
+		AbortSignal,
+		Blob: RecordedBlob,
+		CSS: { escape: (value: string) => value },
 		Promise,
-		URL,
+		URL: customUrl,
 		Response,
 		Request,
 		crypto,
 		console,
-		setTimeout,
+		setTimeout: (fn: (...args: unknown[]) => void, ms?: number) => setTimeout(fn, ms).unref(),
 		clearTimeout,
 		setInterval,
 		clearInterval,
 		localStorage: storage,
-		navigator: { onLine: true },
+		navigator: navigatorState,
+		document: {
+			documentElement: {
+				dataset: {},
+				classList: { toggle: () => {} }
+			},
+			querySelector: () => null,
+			createElement: (tag: string) => {
+				const anchor = {
+					tag,
+					href: '',
+					download: '',
+					click: () => {
+						const payload = blobUrls.get(anchor.href);
+						downloads.push({
+							filename: anchor.download,
+							content: payload?.content ?? '',
+							type: payload?.type ?? ''
+						});
+					}
+				};
+				return anchor;
+			}
+		},
 		window: {
 			location: {
 				assign: (url: string) => assignedUrls.push(url),
@@ -354,11 +490,7 @@ function createReactivePlanner() {
 			},
 			scrollTo: () => {}
 		},
-		fetch: async () =>
-			new Response(JSON.stringify({ ok: true }), {
-				status: 200,
-				headers: { 'content-type': 'application/json' }
-			})
+		fetch: (...args: Parameters<typeof fetch>) => fetchImpl(...args)
 	};
 	sandbox.globalThis = sandbox;
 	sandbox.__onPlannerInit = (instance: PlannerHarnessApi) => {
@@ -368,7 +500,17 @@ function createReactivePlanner() {
 	const dispose = svelteClient.effect_root(() => {
 		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
 	});
-	return { api, assignedUrls, storage, dispose };
+	return {
+		api,
+		assignedUrls,
+		downloads,
+		navigatorState,
+		setFetch: (next: typeof fetch) => {
+			fetchImpl = next;
+		},
+		storage,
+		dispose
+	};
 }
 
 test('unmodified +page.svelte compiles cleanly and avoids linear recipe scans and per-item toLocaleDateString in planner', () => {
@@ -733,6 +875,7 @@ test('incremental history slicing reveals 20 rows per click, preserves limit acr
 			email: 'sam@example.test',
 			householdId: 'h-2'
 		};
+		api.deletePassword = 'valid-password';
 		await api.deleteAccount({ preventDefault: () => {} } as SubmitEvent);
 		assert.equal(api.cookedHistoryLimit, 20);
 	} finally {
@@ -798,34 +941,78 @@ test('choosing a recipe for a planner slot keeps valid servings above 24', () =>
 	}
 });
 
-test('marking a meal cooked keeps pantry deduction opt-in', () => {
+test('marking a meal cooked keeps pantry deduction opt-in', async () => {
 	const harness = createReactivePlanner();
 	try {
 		const { api } = harness;
 		const recipe = makeRecipe('r-cook', 'Weeknight Pasta');
-		const meal: Meal = {
-			id: 'meal-cook',
+		recipe.ingredients = [
+			{ name: 'olive oil', quantity: 1, unit: 'tbsp' },
+			{ name: 'garlic', quantity: 2, unit: 'clove' }
+		];
+		const firstMeal: Meal = {
+			id: 'meal-cook-1',
 			date: '2026-11-23',
 			slot: 'Dinner',
 			recipeId: recipe.id,
 			servings: recipe.servings
 		};
-		api.kitchen = { ...dataMod.createNewUserState(), recipes: [recipe], meals: [meal] };
+		const secondMeal: Meal = {
+			id: 'meal-cook-2',
+			date: '2026-11-24',
+			slot: 'Dinner',
+			recipeId: recipe.id,
+			servings: recipe.servings
+		};
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			pantry: [{ id: 'p-oil', name: 'olive oil', quantity: 4, unit: 'tbsp', category: 'Pantry' }],
+			recipes: [recipe],
+			meals: [firstMeal, secondMeal],
+			shopping: [
+				{
+					id: 'checked-garlic',
+					name: 'garlic',
+					quantity: 2,
+					unit: 'clove',
+					checked: true,
+					sourceKey: 'week:2026-11-23'
+				}
+			]
+		};
 
-		api.openCookDialog(meal);
+		api.openCookDialog(firstMeal);
 		assert.equal(api.deductPantry, false);
 
+		await api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === firstMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 4);
+		assert.equal(api.kitchen.shopping.find((item) => item.id === 'checked-garlic')?.quantity, 2);
+		assert.equal(api.deductPantry, false);
+
+		api.openCookDialog(secondMeal);
+		assert.equal(api.deductPantry, false);
 		api.deductPantry = true;
 		assert.equal(api.deductPantry, true);
 
-		api.openCookDialog(meal);
+		api.openCookDialog(secondMeal);
+		assert.equal(api.deductPantry, false);
+
+		api.deductPantry = true;
+		await api.markMealCooked();
+		assert.ok(api.kitchen.meals.find((item) => item.id === secondMeal.id)?.completedAt);
+		assert.equal(api.kitchen.pantry[0].quantity, 3);
+		assert.equal(
+			api.kitchen.shopping.some((item) => item.id === 'checked-garlic'),
+			false
+		);
 		assert.equal(api.deductPantry, false);
 	} finally {
 		harness.dispose();
 	}
 });
 
-test('direct recipe cook completion keeps pantry deduction opt-in and records Unscheduled history', () => {
+test('direct recipe cook completion keeps pantry deduction opt-in and records Unscheduled history', async () => {
 	const harness = createReactivePlanner();
 	try {
 		const { api } = harness;
@@ -840,7 +1027,7 @@ test('direct recipe cook completion keeps pantry deduction opt-in and records Un
 		api.openRecipeCookDialog(recipe, 4);
 		assert.equal(api.deductPantry, false);
 
-		api.markMealCooked();
+		await api.markMealCooked();
 		assert.equal(api.kitchen.meals.length, 1);
 		assert.equal(api.kitchen.meals[0].slot, 'Unscheduled');
 		assert.equal(api.kitchen.meals[0].servings, 4);
@@ -850,7 +1037,7 @@ test('direct recipe cook completion keeps pantry deduction opt-in and records Un
 		api.openRecipeCookDialog(recipe, 4);
 		assert.equal(api.deductPantry, false);
 		api.deductPantry = true;
-		api.markMealCooked();
+		await api.markMealCooked();
 		assert.equal(api.kitchen.meals.length, 2);
 		assert.equal(api.kitchen.pantry[0].quantity, 3);
 	} finally {
@@ -938,4 +1125,134 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('+page.svelte exportKitchen commits inline edits, merges account state, and distinguishes 401 expiry and offline modes', async () => {
+	let fetchCalls = 0;
+	const harness = createReactivePlanner({
+		fetch: (async () => {
+			fetchCalls += 1;
+			throw new Error('Guest export must not call fetch');
+		}) as typeof fetch
+	});
+
+	try {
+		const { api, downloads, navigatorState, setFetch } = harness;
+
+		// 1. Guest export: zero network calls, source='guest', guest toast.
+		api.user = null;
+		const guestState = dataMod.createInitialState();
+		guestState.pantry = [
+			{ id: 'mint', name: 'Mint', quantity: 1, unit: 'bunch', category: 'Produce' }
+		];
+		api.kitchen = guestState;
+		await api.exportKitchen();
+
+		assert.equal(fetchCalls, 0);
+		assert.equal(downloads.length, 1);
+		assert.equal(downloads[0].filename, 'flavorithm-kitchen.json');
+		const guestEnvelope = JSON.parse(downloads[0].content);
+		assert.equal(guestEnvelope.source, 'guest');
+		assert.equal(guestEnvelope.hasPendingChanges, false);
+		assert.equal(guestEnvelope.state.pantry[0]?.id, 'mint');
+		assert.match(api.toast, /guest kitchen data exported/i);
+
+		// 2. Signed-in online export with uncommitted inline pantry draft: commits draft, stages, merges with /api/export.
+		const signedInUser: User = {
+			id: 'page-cook',
+			name: 'Page Cook',
+			email: 'page@example.test',
+			householdId: 'page-home'
+		};
+		const baseline = dataMod.createNewUserState();
+		baseline.pantry = [
+			{ id: 'beans', name: 'Black beans', quantity: 2, unit: 'can', category: 'Canned goods' }
+		];
+		api.user = signedInUser;
+		api.online = true;
+		navigatorState.onLine = true;
+		api.kitchenLoaded = true;
+		api.initKitchenSyncForTest(signedInUser, baseline, 'etag-page-1');
+		api.ready = true;
+
+		await api.startPantryEdit(api.kitchen.pantry[0]);
+		api.setPantryDraftQuantity('9');
+
+		const serverState = structuredClone(baseline);
+		serverState.shopping = [
+			{ id: 'cilantro', name: 'Cilantro', quantity: 1, unit: 'bunch', checked: false }
+		];
+		let exportCalls = 0;
+		setFetch((async (input, init) => {
+			if (input !== '/api/export') {
+				return Response.json({ ok: true });
+			}
+			exportCalls += 1;
+			assert.equal(init?.redirect, 'manual');
+			return Response.json({
+				exportedAt: '2026-11-24T18:00:00.000Z',
+				user: { ...signedInUser, emailVerified: true },
+				state: serverState
+			});
+		}) as typeof fetch);
+
+		await api.exportKitchen();
+		assert.equal(exportCalls, 1);
+		assert.equal(downloads.length, 2);
+		const accountEnvelope = JSON.parse(downloads[1].content);
+		assert.equal(accountEnvelope.source, 'account');
+		assert.equal(accountEnvelope.hasPendingChanges, true);
+		assert.equal(accountEnvelope.state.pantry[0]?.quantity, 9);
+		assert.equal(accountEnvelope.state.shopping[0]?.id, 'cilantro');
+		assert.match(api.toast, /merged account and kitchen data exported/i);
+
+		// 3. Expired session (401) while online via exportPendingChanges: no retry, distinct session-expired toast.
+		let auth401Calls = 0;
+		setFetch((async () => {
+			auth401Calls += 1;
+			return Response.json({ error: 'Authentication required' }, { status: 401 });
+		}) as typeof fetch);
+
+		api.exportPendingChanges();
+		// Wait for async exportKitchen triggered by exportPendingChanges.
+		await new Promise((resolve) => setImmediate(resolve));
+		await new Promise((resolve) => setImmediate(resolve));
+
+		assert.equal(auth401Calls, 1);
+		assert.equal(downloads.length, 3);
+		const expiredEnvelope = JSON.parse(downloads[2].content);
+		assert.equal(expiredEnvelope.source, 'offline');
+		assert.match(api.toast, /session expired/i);
+		assert.doesNotMatch(api.toast, /offline device kitchen data/i);
+
+		// 4. Slow/timed-out /api/export retries once and shows distinct timeout toast on fallback.
+		let timeoutAttempts = 0;
+		setFetch((async (input) => {
+			if (input !== '/api/export') return Response.json({ ok: true });
+			timeoutAttempts += 1;
+			throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+		}) as typeof fetch);
+
+		await api.exportKitchen();
+		assert.equal(timeoutAttempts, 2);
+		assert.equal(downloads.length, 4);
+		assert.equal(JSON.parse(downloads[3].content).source, 'offline');
+		assert.match(api.toast, /took too long/i);
+
+		// 5. Offline mode skips network calls and shows offline backup toast.
+		navigatorState.onLine = false;
+		let offlineCalls = 0;
+		setFetch((async () => {
+			offlineCalls += 1;
+			throw new Error('Offline mode must not call fetch');
+		}) as typeof fetch);
+
+		await api.exportKitchen();
+		assert.equal(offlineCalls, 0);
+		assert.equal(downloads.length, 5);
+		assert.equal(JSON.parse(downloads[4].content).source, 'offline');
+		assert.match(api.toast, /offline device kitchen data/i);
+	} finally {
+		harness.dispose();
+	}
 });

@@ -3,7 +3,7 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import { request as httpsRequest, type RequestOptions } from 'node:https';
 import { isIP } from 'node:net';
 import { z } from 'zod';
-import { ButlerResponseSchema } from '#lib/butler.ts';
+import { ButlerCommandSchema, ButlerResponseSchema, type ButlerCommand } from '#lib/butler.ts';
 import {
 	buildStructuredRecipeDraft,
 	isStandaloneRecipeUrl,
@@ -342,7 +342,7 @@ type AIRequest = z.infer<typeof AIRequestSchema>;
 type ModelResultSchema = keyof typeof SUPPORTED_JSON_SCHEMAS;
 type Fetcher = typeof fetch;
 type RecipePagePolicy = 'import' | 'capture';
-type SecureRecipePageFetcher = (
+export type SecureRecipePageFetcher = (
 	url: string,
 	policy?: RecipePagePolicy,
 	signal?: AbortSignal
@@ -350,12 +350,6 @@ type SecureRecipePageFetcher = (
 
 const secureRecipePageFetcher: SecureRecipePageFetcher = (url, policy = 'import', signal) =>
 	policy === 'capture' ? fetchCaptureRecipePage(url, { signal }) : fetchRecipePage(url, { signal });
-
-let recipePageFetcherForTests: SecureRecipePageFetcher | undefined;
-
-export function setRecipePageFetcherForTests(fetcher: SecureRecipePageFetcher | undefined): void {
-	recipePageFetcherForTests = fetcher;
-}
 
 export async function runAIRequest(
 	input: unknown,
@@ -788,6 +782,7 @@ async function callOpenAICompatible(
 				{
 					accessToken: apiKey,
 					model,
+					action,
 					instructions: promptFor(action),
 					prompt,
 					image: image?.dataUrl,
@@ -933,16 +928,110 @@ function parseModelJson(value: unknown): unknown {
 	}
 }
 
+const ButlerChatEnvelopeSchema = z.object({
+	reply: z.string().trim().min(1).max(12_000),
+	commands: z.array(z.unknown()).max(50)
+});
+
+function rawStringId(value: unknown): string | undefined {
+	if (typeof value !== 'string') return undefined;
+	const trimmed = value.trim();
+	return trimmed.length > 0 && trimmed.length <= 100 ? trimmed : undefined;
+}
+
+function isolateButlerChatResult(value: unknown) {
+	const envelope = ButlerChatEnvelopeSchema.safeParse(value);
+	if (!envelope.success) throw invalidProviderResult();
+	const parsedCommands: ButlerCommand[] = [];
+	const validRecipeIds = new Set<string>();
+	const validMealIds = new Set<string>();
+	const validPantryIds = new Set<string>();
+	const validShoppingIds = new Set<string>();
+	const droppedRecipeIds = new Set<string>();
+	const droppedMealIds = new Set<string>();
+	const droppedPantryIds = new Set<string>();
+	const droppedShoppingIds = new Set<string>();
+	let invalidCommands = 0;
+
+	for (const rawCommand of envelope.data.commands) {
+		const parsed = ButlerCommandSchema.safeParse(rawCommand);
+		if (parsed.success) {
+			parsedCommands.push(parsed.data);
+			if (parsed.data.type === 'recipe.upsert') validRecipeIds.add(parsed.data.recipe.id);
+			else if (parsed.data.type === 'meal.upsert') validMealIds.add(parsed.data.meal.id);
+			else if (parsed.data.type === 'pantry.upsert') validPantryIds.add(parsed.data.item.id);
+			else if (parsed.data.type === 'shopping.upsert') validShoppingIds.add(parsed.data.item.id);
+			continue;
+		}
+		invalidCommands += 1;
+		if (rawCommand && typeof rawCommand === 'object') {
+			const candidate = rawCommand as Record<string, any>;
+			if (candidate.type === 'recipe.upsert') {
+				const id = rawStringId(candidate.recipe?.id);
+				if (id) droppedRecipeIds.add(id);
+			} else if (candidate.type === 'meal.upsert') {
+				const id = rawStringId(candidate.meal?.id);
+				if (id) droppedMealIds.add(id);
+			} else if (candidate.type === 'pantry.upsert') {
+				const id = rawStringId(candidate.item?.id);
+				if (id) droppedPantryIds.add(id);
+			} else if (candidate.type === 'shopping.upsert') {
+				const id = rawStringId(candidate.item?.id);
+				if (id) droppedShoppingIds.add(id);
+			}
+		}
+	}
+
+	for (const id of validRecipeIds) droppedRecipeIds.delete(id);
+	for (const id of validMealIds) droppedMealIds.delete(id);
+	for (const id of validPantryIds) droppedPantryIds.delete(id);
+	for (const id of validShoppingIds) droppedShoppingIds.delete(id);
+
+	const afterRecipeFilter = parsedCommands.filter((command) => {
+		if (command.type === 'meal.upsert' && droppedRecipeIds.has(command.meal.recipeId)) {
+			validMealIds.delete(command.meal.id);
+			droppedMealIds.add(command.meal.id);
+			return false;
+		}
+		if (
+			(command.type === 'recipe.open' ||
+				command.type === 'recipe.delete' ||
+				command.type === 'recipe.complete') &&
+			droppedRecipeIds.has(command.id)
+		) {
+			return false;
+		}
+		return true;
+	});
+	for (const command of afterRecipeFilter) {
+		if (command.type === 'meal.upsert') droppedMealIds.delete(command.meal.id);
+	}
+
+	const commands = afterRecipeFilter.filter((command) => {
+		if (
+			(command.type === 'meal.complete' || command.type === 'meal.delete') &&
+			droppedMealIds.has(command.id)
+		) {
+			return false;
+		}
+		if (command.type === 'pantry.delete' && droppedPantryIds.has(command.id)) return false;
+		if (command.type === 'shopping.delete' && droppedShoppingIds.has(command.id)) return false;
+		return true;
+	});
+
+	const droppedCommands = invalidCommands;
+	return droppedCommands > 0
+		? { reply: envelope.data.reply, commands, droppedCommands }
+		: { reply: envelope.data.reply, commands };
+}
+
 function validateResult(
 	action: Exclude<AIAction, 'search' | 'import' | 'capture'>,
 	value: unknown
 ) {
 	switch (action) {
-		case 'chat': {
-			const result = ButlerResponseSchema.safeParse(value);
-			if (!result.success) throw invalidProviderResult();
-			return result.data;
-		}
+		case 'chat':
+			return isolateButlerChatResult(value);
 		case 'generate': {
 			const result = GeneratedRecipesSchema.safeParse(value);
 			if (!result.success) throw invalidProviderResult();
@@ -1412,15 +1501,7 @@ async function captureRecipe(
 		if (!/^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType)) {
 			throw new AIRequestError('The selected page did not return HTML.', 415);
 		}
-		let html: string;
-		try {
-			html = await response.text();
-		} catch {
-			throw new AIRequestError('Recipe page could not be read.', 502);
-		}
-		if (new TextEncoder().encode(html).byteLength > MAX_RECIPE_PAGE_BYTES) {
-			throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
-		}
+		const html = await decodeRecipePageHtml(response, contentType);
 		sourceRecipe = extractJsonLdRecipe(html);
 		sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
 		if (!sourceRecipe) {
@@ -1500,13 +1581,72 @@ export type RecipeUrlImportFallback = {
 	fetcher?: Fetcher;
 };
 
+function extractHtmlCharset(rawBytes: Uint8Array, contentType: string): string {
+	if (
+		rawBytes.byteLength >= 3 &&
+		rawBytes[0] === 0xef &&
+		rawBytes[1] === 0xbb &&
+		rawBytes[2] === 0xbf
+	) {
+		return 'utf-8';
+	}
+	if (rawBytes.byteLength >= 2 && rawBytes[0] === 0xff && rawBytes[1] === 0xfe) {
+		return 'utf-16le';
+	}
+	if (rawBytes.byteLength >= 2 && rawBytes[0] === 0xfe && rawBytes[1] === 0xff) {
+		return 'utf-16be';
+	}
+
+	const headerMatch = /;\s*charset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s;]+))/i.exec(contentType);
+	const headerCharset = (headerMatch?.[1] ?? headerMatch?.[2] ?? headerMatch?.[3] ?? '').trim();
+	if (headerCharset) return headerCharset;
+
+	const headPreview = new TextDecoder('latin1').decode(rawBytes.subarray(0, 1024));
+	for (const tagMatch of headPreview.matchAll(/<meta\b[^>]*>/gi)) {
+		const tag = tagMatch[0];
+		const directCharset = /\bcharset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"';/>]+))/i.exec(tag);
+		const hasHttpEquivContentType =
+			/\bhttp-equiv\s*=\s*(?:"content-type"|'content-type'|content-type\b)/i.test(tag);
+		if (!hasHttpEquivContentType && directCharset) {
+			const label = (directCharset[1] ?? directCharset[2] ?? directCharset[3] ?? '').trim();
+			if (label) return label;
+		}
+		if (hasHttpEquivContentType) {
+			const contentAttr = /\bcontent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(tag);
+			const contentVal = contentAttr?.[1] ?? contentAttr?.[2] ?? contentAttr?.[3] ?? '';
+			const metaCharset = /;\s*charset\s*=\s*([^\s;]+)/i.exec(contentVal)?.[1]?.trim();
+			if (metaCharset) return metaCharset.replace(/^["']|["']$/g, '');
+		}
+	}
+
+	return 'utf-8';
+}
+
+async function decodeRecipePageHtml(response: Response, contentType: string): Promise<string> {
+	let rawBytes: Uint8Array;
+	try {
+		rawBytes = new Uint8Array(await response.arrayBuffer());
+	} catch {
+		throw new AIRequestError('Recipe page could not be read.', 502);
+	}
+	if (rawBytes.byteLength > MAX_RECIPE_PAGE_BYTES) {
+		throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
+	}
+	const charset = extractHtmlCharset(rawBytes, contentType);
+	try {
+		return new TextDecoder(charset).decode(rawBytes);
+	} catch {
+		return new TextDecoder('utf-8').decode(rawBytes);
+	}
+}
+
 export async function importRecipeFromUrl(
 	input: {
 		url: string;
 		authenticated?: boolean;
 		resolveFallback?: () => Promise<RecipeUrlImportFallback | null>;
 	},
-	pageFetcher: SecureRecipePageFetcher = recipePageFetcherForTests ?? secureRecipePageFetcher,
+	pageFetcher: SecureRecipePageFetcher = secureRecipePageFetcher,
 	requestSignal?: AbortSignal
 ): Promise<{ recipe: Recipe; assumptions: string[] }> {
 	const rawUrl = input.url?.trim() ?? '';
@@ -1522,15 +1662,7 @@ export async function importRecipeFromUrl(
 	if (!/^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType)) {
 		throw new AIRequestError('The selected page did not return HTML.', 415);
 	}
-	let html: string;
-	try {
-		html = await response.text();
-	} catch {
-		throw new AIRequestError('Recipe page could not be read.', 502);
-	}
-	if (new TextEncoder().encode(html).byteLength > MAX_RECIPE_PAGE_BYTES) {
-		throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
-	}
+	const html = await decodeRecipePageHtml(response, contentType);
 
 	const sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
 	const structured = extractScrapedRecipe(html);
@@ -1546,9 +1678,9 @@ export async function importRecipeFromUrl(
 	const fallback = input.resolveFallback ? await input.resolveFallback() : null;
 	if (!fallback) {
 		throw new AIRequestError(
-			input.authenticated
-				? 'This page does not include structured recipe data. Connect a model in Settings to extract it, or paste the recipe text.'
-				: 'This page does not include structured recipe data. Create an account and connect a model in Settings to extract it, or paste the recipe text.',
+			input.authenticated === false
+				? 'This page does not include structured recipe data. Sign in and connect a model in Settings to extract it, or paste the recipe text.'
+				: 'This page does not include structured recipe data. Connect a model in Settings to extract it, or paste the recipe text.',
 			422
 		);
 	}

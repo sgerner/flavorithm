@@ -82,18 +82,119 @@ test('butler chat receives the supplied display name as untrusted kitchen contex
 	);
 });
 
-test('butler chat rejects unknown commands and malformed upstream results', async () => {
-	await assert.rejects(
-		runAIRequest(
-			request,
-			provider({ reply: 'Done.', commands: [{ type: 'run-shell', command: 'oops' }] })
-		),
-		(error: unknown) => error instanceof AIRequestError && error.status === 502
+test('butler chat preserves a valid command when an invalid sibling is dropped and rejects malformed envelopes', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const { applyButlerCommands } = await import('../src/lib/butler.ts');
+	const kitchen = createInitialState();
+
+	const allInvalid = await runAIRequest(
+		request,
+		provider({ reply: 'Done.', commands: [{ type: 'run-shell', command: 'oops' }] })
 	);
-	await assert.rejects(
-		runAIRequest(request, provider({ reply: 'Done.' })),
-		(error: unknown) => error instanceof AIRequestError && error.status === 502
-	);
+	assert.deepEqual(allInvalid, {
+		reply: 'Done.',
+		commands: [],
+		droppedCommands: 1
+	});
+
+	const validPantryCommand = {
+		type: 'pantry.upsert',
+		item: { id: 'garlic-1', name: 'Garlic', quantity: 4, unit: 'cloves', category: 'Produce' }
+	};
+	const siblingIsolated = (await runAIRequest(
+		request,
+		provider({
+			reply: 'I added the garlic; the malformed recipe card was omitted.',
+			commands: [
+				validPantryCommand,
+				{
+					type: 'recipe.upsert',
+					recipe: { id: 'broken-stew', title: 'Broken Stew', servings: 0 }
+				}
+			]
+		})
+	)) as { reply: string; commands: unknown[]; droppedCommands?: number };
+	assert.equal(siblingIsolated.reply, 'I added the garlic; the malformed recipe card was omitted.');
+	assert.deepEqual(siblingIsolated.commands, [validPantryCommand]);
+	assert.equal(siblingIsolated.droppedCommands, 1);
+	const applied = applyButlerCommands(kitchen, siblingIsolated.commands);
+	assert.ok(applied.state.pantry.some((item) => item.id === 'garlic-1'));
+
+	for (const malformed of [
+		{ reply: 'Done.' },
+		{ reply: '   ', commands: [] },
+		{ reply: 'Done.', commands: 'not-an-array' }
+	]) {
+		await assert.rejects(
+			runAIRequest(request, provider(malformed)),
+			(error: unknown) => error instanceof AIRequestError && error.status === 502
+		);
+	}
+});
+
+test('butler chat cascade-drops dependent commands while counting only per-command validation failures', async () => {
+	const { createInitialState } = await import('../src/lib/data.ts');
+	const { applyButlerCommands } = await import('../src/lib/butler.ts');
+	const kitchen = createInitialState();
+	const validPantryCommand = {
+		type: 'pantry.upsert',
+		item: { id: 'garlic-1', name: 'Garlic', quantity: 4, unit: 'cloves', category: 'Produce' }
+	};
+
+	const cascaded = (await runAIRequest(
+		request,
+		provider({
+			reply: 'I have added the garlic; the soup card needed another pass.',
+			commands: [
+				{
+					type: 'meal.upsert',
+					meal: {
+						id: 'dinner-1',
+						date: '2026-10-24',
+						slot: 'Dinner',
+						recipeId: 'broken-soup',
+						servings: 2
+					}
+				},
+				{
+					type: 'recipe.upsert',
+					recipe: { id: 'broken-soup', title: 'Broken Soup', servings: 0 }
+				},
+				{ type: 'recipe.open', id: 'broken-soup', mode: 'detail' },
+				{ type: 'recipe.delete', id: 'broken-soup' },
+				{ type: 'meal.complete', id: 'dinner-1', deductPantry: true },
+				validPantryCommand
+			]
+		})
+	)) as { reply: string; commands: unknown[]; droppedCommands?: number };
+	assert.equal(cascaded.reply, 'I have added the garlic; the soup card needed another pass.');
+	assert.deepEqual(cascaded.commands, [validPantryCommand]);
+	// 1 invalid command (`recipe.upsert`) + 4 cascade-dropped dependents -> droppedCommands counts only the 1 validation failure
+	assert.equal(cascaded.droppedCommands, 1);
+	const applied = applyButlerCommands(kitchen, cascaded.commands);
+	assert.ok(applied.state.pantry.some((item) => item.id === 'garlic-1'));
+
+	const multiInvalidCascaded = (await runAIRequest(
+		request,
+		provider({
+			reply: 'I added the garlic; two invalid items and their follow-ups were skipped.',
+			commands: [
+				{
+					type: 'recipe.upsert',
+					recipe: { id: 'broken-soup', title: 'Broken Soup', servings: 0 }
+				},
+				{ type: 'recipe.open', id: 'broken-soup', mode: 'detail' },
+				{
+					type: 'shopping.upsert',
+					item: { id: 'bad-milk', name: 'Milk', quantity: -1, unit: 'cup', checked: false }
+				},
+				{ type: 'shopping.delete', id: 'bad-milk' },
+				validPantryCommand
+			]
+		})
+	)) as { reply: string; commands: unknown[]; droppedCommands?: number };
+	assert.deepEqual(multiInvalidCascaded.commands, [validPantryCommand]);
+	assert.equal(multiInvalidCascaded.droppedCommands, 2);
 });
 
 test('butler chat requires bounded conversation and kitchen context before inference', async () => {
@@ -191,16 +292,18 @@ test('Basil can propose recipe.complete with explicit deductPantry and rejects o
 	);
 	assert.deepEqual(updated.pantry, kitchen.pantry);
 
-	await assert.rejects(
-		runAIRequest(
-			request,
-			provider({
-				reply: 'Missing deduction flag on recipe.',
-				commands: [{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 4 }]
-			})
-		),
-		(error: unknown) => error instanceof AIRequestError && error.status === 502
+	const missingRecipeDeductFlag = await runAIRequest(
+		request,
+		provider({
+			reply: 'Missing deduction flag on recipe.',
+			commands: [{ type: 'recipe.complete', id: 'tomato-butter-beans', servings: 4 }]
+		})
 	);
+	assert.deepEqual(missingRecipeDeductFlag, {
+		reply: 'Missing deduction flag on recipe.',
+		commands: [],
+		droppedCommands: 1
+	});
 });
 
 test('butler chat prompt and schema require explicit deductPantry and forbid duplicate deductions', async () => {
@@ -222,14 +325,16 @@ test('butler chat prompt and schema require explicit deductPantry and forbid dup
 		)
 	);
 
-	await assert.rejects(
-		runAIRequest(
-			request,
-			provider({
-				reply: 'Missing deduction flag.',
-				commands: [{ type: 'meal.complete', id: 'meal-1' }]
-			})
-		),
-		(error: unknown) => error instanceof AIRequestError && error.status === 502
+	const missingDeductFlag = await runAIRequest(
+		request,
+		provider({
+			reply: 'Missing deduction flag.',
+			commands: [{ type: 'meal.complete', id: 'meal-1' }]
+		})
 	);
+	assert.deepEqual(missingDeductFlag, {
+		reply: 'Missing deduction flag.',
+		commands: [],
+		droppedCommands: 1
+	});
 });
