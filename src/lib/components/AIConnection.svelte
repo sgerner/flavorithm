@@ -252,9 +252,14 @@
 				<div class="plan-status">
 					<span
 						class="connection-status"
-						class:connected={activeAccount?.connected && activeAccount?.planEnabled}
+						class:connected={activeAccount?.connected &&
+							activeAccount?.planEnabled &&
+							models.length > 0}
 					>
-						{#if activeAccount?.connected && activeAccount.planEnabled}<Check size={16} /> Connected
+						{#if activeAccount?.connected && activeAccount.planEnabled}
+							{#if models.length > 0}<Check size={16} /> Connected
+							{:else if loading}Checking connection…
+							{:else}Model catalog unavailable{/if}
 						{:else if activeAccount?.connected}Plan access needed{:else}Not connected{/if}
 					</span>
 				</div>
@@ -398,7 +403,7 @@
 			<input type="text" class="readonly-input" value={chatGPT.host!.model} readonly {...field} />
 		{/snippet}
 	</FormField>
-{:else if (subscription && activeAccount?.connected && activeAccount.planEnabled) || (!subscription && provider?.supported)}
+{:else if (subscription && activeAccount?.connected && activeAccount.planEnabled && models.length > 0) || (!subscription && provider?.supported)}
 	<SearchPicker
 		label="Model"
 		placeholder="Search this provider’s models…"
@@ -473,6 +478,10 @@
 				</FormField>{/if}
 		</div>
 	{/if}
+{:else if subscription && activeAccount?.connected && activeAccount.planEnabled && !catalogError}
+	<button class="text-button" disabled={loading || busy} onclick={onrefresh}
+		><RefreshCw size={15} /> Refresh account models</button
+	>
 {/if}
 <p class="catalog-credit">
 	Provider and model options from <a href="https://models.dev" target="_blank" rel="noreferrer"
