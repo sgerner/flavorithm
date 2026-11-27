@@ -412,14 +412,12 @@ export async function fetchAccountExportPayload(
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
 		const controller = new AbortController();
-		const signal = controller.signal;
-		const timer = setTimeout(
-			() =>
-				controller.abort(
-					new DOMException('The operation was aborted due to timeout', 'TimeoutError')
-				),
-			timeoutMs
-		);
+		const timeout = setTimeout(() => {
+			controller.abort(
+				new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+			);
+		}, timeoutMs);
+		const { signal } = controller;
 		try {
 			let response: Response;
 			try {
@@ -484,7 +482,7 @@ export async function fetchAccountExportPayload(
 				);
 			}
 		} finally {
-			clearTimeout(timer);
+			clearTimeout(timeout);
 		}
 	}
 

@@ -113,6 +113,8 @@
 		addPantryItems,
 		backfillSampleData,
 		completeMeal,
+		deleteMeal,
+		deleteRecipe,
 		deleteShoppingItem,
 		expiryStatus,
 		filterPantryItems,
@@ -123,13 +125,18 @@
 		normalizePantryDraft,
 		promoteSampleIngredient,
 		normalizeShoppingItem,
-		refreshWeekShopping as refreshWeekShoppingItems,
+		recipeForEdit,
+		recipeNeedsNutritionRefresh,
+		refreshWeekShopping,
 		restockDepletedPantryItems,
 		restoreShoppingItem,
 		revertShoppingItem,
+		saveEditedRecipe as applyEditedRecipe,
 		shopForScope,
 		snapshotShoppingItem,
 		unitInfo,
+		upsertMeal,
+		weekStartForDate,
 		type PantryDraft,
 		type ShoppingItemDraft,
 		type ShoppingItemSnapshot
@@ -142,8 +149,8 @@
 		filterTabsOverflow,
 		finalizeManualRecipe,
 		hasActiveRecipeFilters,
-		hasZeroNutrition,
 		insertRecipes,
+		MAX_RECIPES,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
 	import { applyRecipeRating } from '#lib/recipe-detail.ts';
@@ -1082,6 +1089,10 @@
 		editingShoppingDraft = null;
 		editingShoppingSnapshot = null;
 	}
+	function pruneEditingShoppingState() {
+		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
+			clearEditingShoppingState();
+	}
 	async function startEditingShoppingItem(item: AppState['shopping'][number]) {
 		if (editingShoppingId && editingShoppingId !== item.id) {
 			const active = kitchen.shopping.find((entry) => entry.id === editingShoppingId);
@@ -1159,15 +1170,15 @@
 	}
 	function removePlannedMeal(meal: Meal) {
 		const removed = structuredClone($state.snapshot(meal));
-		kitchen.meals = kitchen.meals.filter((entry) => entry.id !== meal.id);
-		refreshWeekShopping(weekStartForDate(meal.date));
+		kitchen = deleteMeal(kitchen, meal.id);
+		pruneEditingShoppingState();
 		notify('Planned meal removed.', () => {
 			if (
 				kitchen.recipes.some((recipe) => recipe.id === removed.recipeId) &&
 				!kitchen.meals.some((entry) => entry.id === removed.id)
 			) {
-				kitchen.meals.push(removed);
-				refreshWeekShopping(weekStartForDate(removed.date));
+				kitchen = upsertMeal(kitchen, removed, undefined, { preserveSample: true });
+				pruneEditingShoppingState();
 			}
 		});
 	}
@@ -2547,12 +2558,13 @@
 		const previousKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
+		pruneEditingShoppingState();
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
 				butlerChat?.close();
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
-				if (recipe && effect.mode === 'edit') editSavedRecipe(recipe);
+				if (recipe && effect.mode === 'edit') openRecipeEditor(recipe);
 				else if (recipe && effect.mode === 'cook') {
 					const meal = kitchen.meals.find(
 						(item) => item.recipeId === recipe.id && !item.completedAt
@@ -2575,8 +2587,10 @@
 		}
 		const appliedSnapshot = JSON.stringify(kitchen);
 		notify('Basil’s changes applied.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) kitchen = previousKitchen;
-			else notify('Your kitchen changed again. Review the current values before editing.');
+			if (JSON.stringify(kitchen) === appliedSnapshot) {
+				kitchen = previousKitchen;
+				pruneEditingShoppingState();
+			} else notify('Your kitchen changed again. Review the current values before editing.');
 		});
 		return appliedSnapshot;
 	}
@@ -3099,18 +3113,13 @@
 		editingRecipeMode = 'create';
 		editingRecipe = createBlankRecipe();
 	}
-	function editSavedRecipe(recipe: Recipe) {
-		const saved = kitchen.recipes.find((item) => item.id === recipe.id && item.saved);
-		if (!saved) return;
+	function openRecipeEditor(recipe: Recipe) {
+		const draft = recipeForEdit(kitchen, recipe.id);
+		if (!draft) return;
 		selected = null;
+		selectedMealServings = undefined;
 		editingRecipeMode = 'edit';
-		editingRecipe = {
-			...saved,
-			tags: [...saved.tags],
-			ingredients: saved.ingredients.map((item) => ({ ...item })),
-			steps: [...saved.steps],
-			nutrition: { ...saved.nutrition }
-		};
+		editingRecipe = draft;
 	}
 	function saveEditedRecipe(updated: Recipe) {
 		if (editingRecipeMode === 'create') {
@@ -3129,32 +3138,26 @@
 			return;
 		}
 		const previous = kitchen.recipes.find((item) => item.id === updated.id);
-		if (!previous || !previous.saved) {
-			editingRecipe = null;
+		if (!previous && kitchen.recipes.length >= MAX_RECIPES) {
+			notify(
+				`Your kitchen can hold up to ${MAX_RECIPES} recipes. There isn’t enough room to save this.`
+			);
 			return;
 		}
-		const nutritionNeedsRefresh =
-			previous.servings !== updated.servings ||
-			JSON.stringify(previous.ingredients) !== JSON.stringify(updated.ingredients);
-		const nutritionChanged =
-			JSON.stringify(previous.nutrition) !== JSON.stringify(updated.nutrition);
-		const zeroNutrition = hasZeroNutrition(updated.nutrition);
-		const { sampleSaved: _sampleSaved, ...cleanUpdated } = updated;
-		const saved = {
-			...cleanUpdated,
-			saved: true,
-			nutritionStale: nutritionNeedsRefresh
-				? true
-				: updated.provenance === 'manual' && zeroNutrition
-					? true
-					: nutritionChanged && !zeroNutrition
-						? false
-						: previous.nutritionStale
-		};
-		kitchen.recipes = kitchen.recipes.map((item) => (item.id === saved.id ? saved : item));
+		const wasSaved = Boolean(previous?.saved);
+		const nutritionNeedsRefresh = recipeNeedsNutritionRefresh(previous, updated);
+		kitchen = applyEditedRecipe(kitchen, updated);
+		pruneEditingShoppingState();
 		editingRecipe = null;
+		editingRecipeMode = 'edit';
 		notify(
-			nutritionNeedsRefresh ? 'Recipe updated. Refresh its nutrition estimate.' : 'Recipe updated.'
+			!wasSaved
+				? nutritionNeedsRefresh
+					? 'Recipe saved to your collection. Refresh its nutrition estimate.'
+					: 'Recipe saved to your collection.'
+				: nutritionNeedsRefresh
+					? 'Recipe updated. Refresh its nutrition estimate.'
+					: 'Recipe updated.'
 		);
 	}
 	function askDeleteRecipe(recipe: Recipe) {
@@ -3162,12 +3165,6 @@
 		recipeToDelete = recipe;
 		selected = null;
 		modal = 'deleteRecipe';
-	}
-	function weekStartForDate(value: string) {
-		const date = new Date(`${value}T12:00:00`);
-		if (Number.isNaN(date.getTime())) return value;
-		date.setDate(date.getDate() - ((date.getDay() + 6) % 7));
-		return dateKey(date);
 	}
 	function weekOffsetForDate(value: string, today = new Date()) {
 		const start = weekStartForDate(value);
@@ -3231,33 +3228,16 @@
 		deductPantry = false;
 		leftoverServings = 0;
 	}
-	function refreshWeekShopping(startDate: string) {
-		kitchen.shopping = refreshWeekShoppingItems(kitchen, startDate);
-		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
-			clearEditingShoppingState();
-	}
 	function confirmDeleteRecipe() {
 		const recipe = recipeToDelete;
 		if (!recipe) return;
-		const impactedMeals = kitchen.meals.filter((meal) => meal.recipeId === recipe.id);
-		const affectedWeeks = new Set(impactedMeals.map((meal) => weekStartForDate(meal.date)));
-		kitchen.meals = kitchen.meals.filter((meal) => meal.recipeId !== recipe.id);
-		kitchen.recipes = kitchen.recipes.filter((item) => item.id !== recipe.id);
-		kitchen.shopping = kitchen.shopping.filter(
-			(item) => item.sourceKey !== `recipe:${recipe.id}` || item.checked
-		);
-		if (editingShoppingId && !kitchen.shopping.some((entry) => entry.id === editingShoppingId))
-			clearEditingShoppingState();
-		if (kitchen.preferences.ratings) {
-			const ratings = { ...kitchen.preferences.ratings };
-			delete ratings[recipe.id];
-			kitchen.preferences.ratings = ratings;
-		}
-		for (const startDate of affectedWeeks) refreshWeekShopping(startDate);
+		const impactedMealCount = kitchen.meals.filter((meal) => meal.recipeId === recipe.id).length;
+		kitchen = deleteRecipe(kitchen, recipe.id);
+		pruneEditingShoppingState();
 		recipeToDelete = null;
 		modal = '';
 		notify(
-			`${recipe.title} deleted, along with ${impactedMeals.length} planned meal${impactedMeals.length === 1 ? '' : 's'}.`
+			`${recipe.title} deleted, along with ${impactedMealCount} planned meal${impactedMealCount === 1 ? '' : 's'}.`
 		);
 	}
 	function shoppingSourceLabel(sourceKey?: string) {
@@ -3418,8 +3398,8 @@
 				recipeId: recipe.id,
 				servings
 			};
-			kitchen.meals.push(created);
-			refreshWeekShopping(scheduledWeek);
+			kitchen = upsertMeal(kitchen, created);
+			pruneEditingShoppingState();
 			weekOffset = weekOffsetForDate(scheduledDate);
 			if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 			selectedMealServings = undefined;
@@ -3433,9 +3413,10 @@
 				const existing = kitchen.meals.find((entry) => entry.id === created.id);
 				if (!existing) return;
 				const affectedWeek = weekStartForDate(existing.date);
-				kitchen.meals = kitchen.meals.filter((entry) => entry.id !== created.id);
-				refreshWeekShopping(affectedWeek);
-				if (affectedWeek !== scheduledWeek) refreshWeekShopping(scheduledWeek);
+				let next = deleteMeal(kitchen, created.id);
+				if (affectedWeek !== scheduledWeek) next = refreshWeekShopping(next, scheduledWeek);
+				kitchen = next;
+				pruneEditingShoppingState();
 			});
 			return;
 		}
@@ -3475,14 +3456,14 @@
 			return;
 		}
 		formSubmitted = false;
-		const previousWeek = weekStartForDate(meal.date);
 		const updatedDate = mealDate;
-		meal.date = updatedDate;
-		meal.slot = mealSlot;
-		meal.servings = Math.round(plannedServings);
-		delete meal.sample;
-		refreshWeekShopping(previousWeek);
-		refreshWeekShopping(weekStartForDate(meal.date));
+		kitchen = upsertMeal(kitchen, {
+			...meal,
+			date: updatedDate,
+			slot: mealSlot,
+			servings: Math.round(plannedServings)
+		});
+		pruneEditingShoppingState();
 		weekOffset = weekOffsetForDate(updatedDate);
 		resetMealDialogState();
 		modal = '';
@@ -3514,12 +3495,11 @@
 		formSubmitted = false;
 		const recipeId = meal.recipeId;
 		const servingsCooked = meal.servings;
-		const startDate = weekStartForDate(meal.date);
 		kitchen = completeMeal(kitchen, meal.id, {
 			deductPantry,
 			leftoverServings: Math.round(leftoverServings)
 		});
-		refreshWeekShopping(startDate);
+		pruneEditingShoppingState();
 		resetMealDialogState();
 		modal = '';
 		const recipe = kitchen.recipes.find((item) => item.id === recipeId);
@@ -3619,14 +3599,14 @@
 		}
 		formSubmitted = false;
 		const scheduledDate = mealDate;
-		kitchen.meals.push({
+		kitchen = upsertMeal(kitchen, {
 			id: crypto.randomUUID(),
 			date: scheduledDate,
 			slot: mealSlot,
 			recipeId: selected.id,
 			servings: Math.round(plannedServings)
 		});
-		refreshWeekShopping(weekStartForDate(scheduledDate));
+		pruneEditingShoppingState();
 		weekOffset = weekOffsetForDate(scheduledDate);
 		if (page !== 'planner') pendingPlannerScrollDate = scheduledDate;
 		selectedMealServings = undefined;
@@ -3946,21 +3926,40 @@
 					: undefined
 			: undefined;
 		if (standaloneUrl) {
-			const connected = Boolean(user) && hasPersonalAIReady();
+			if (!user) {
+				openAuthentication();
+				notify(
+					managedAuth
+						? 'Sign in through your organization to import recipes.'
+						: 'Create an account or sign in to import recipes.'
+				);
+				resumeDialog = 'import';
+				return null;
+			}
+			const useHost = Boolean(chatGPT.host && !kitchen.preferences.usePersonalAI);
+			const connected = !useHost && hasPersonalAIReady();
 			return request(
 				'/api/recipe-import',
 				{
 					url: standaloneUrl,
-					...(connected
+					...(useHost && chatGPT.host
 						? {
-								...(kitchen.preferences.provider === 'chatgpt'
-									? { connectionId: kitchen.preferences.chatgptAccountId }
-									: { apiKey }),
-								provider: kitchen.preferences.provider,
-								model: kitchen.preferences.model,
-								reasoning: kitchen.preferences.reasoning
+								usePersonalAI: false,
+								provider: 'chatgpt',
+								model: chatGPT.host.model,
+								connectionId: HOST_CONNECTION_ID
 							}
-						: {})
+						: connected
+							? {
+									usePersonalAI: true,
+									...(kitchen.preferences.provider === 'chatgpt'
+										? { connectionId: kitchen.preferences.chatgptAccountId }
+										: { apiKey }),
+									provider: kitchen.preferences.provider,
+									model: kitchen.preferences.model,
+									reasoning: kitchen.preferences.reasoning
+								}
+							: { usePersonalAI: true })
 				},
 				'POST',
 				signal
@@ -5449,7 +5448,7 @@
 			)}
 		plan={(servings) => planRecipe(selected!, servings)}
 		nutrition={refreshNutrition}
-		edit={() => editSavedRecipe(selected!)}
+		edit={() => openRecipeEditor(selected!)}
 		remove={() => askDeleteRecipe(selected!)}
 		toggleHidden={() => toggleRecipeHidden(selected!)}
 		{busy}

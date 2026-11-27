@@ -278,7 +278,9 @@
 		tabindex="-1"
 		transition:dialogMotion|global
 	>
-		<h2 id="recipe-editor-title">{mode === 'create' ? 'New recipe' : 'Edit saved recipe'}</h2>
+		<h2 id="recipe-editor-title">
+			{mode === 'create' ? 'New recipe' : recipe.saved ? 'Edit saved recipe' : 'Edit recipe'}
+		</h2>
 		<p class="muted">
 			{mode === 'create'
 				? 'Add a personal recipe to your collection.'
