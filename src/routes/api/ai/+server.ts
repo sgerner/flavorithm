@@ -1,52 +1,24 @@
 import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
-import { ChatGPTOAuthError, getChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
-import { ChatGPTInferenceError } from '#lib/server/chatgpt-inference.ts';
+import { mapSignedInAIRouteError, sessionExpiredResponse } from '#lib/server/ai-route-errors.ts';
+import { withChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
 import type { RequestHandler } from './$types';
 import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
 
 const MAX_REQUEST_BYTES = 9_000_000;
 
-function aiErrorHeaders(status: number, retryAfter?: number): Record<string, string> {
-	return {
-		'cache-control': 'no-store',
-		...(status === 429 && retryAfter !== undefined
-			? { 'Retry-After': String(Math.max(1, Math.ceil(retryAfter))) }
-			: {})
-	};
-}
-
-function mapAIErrorResponse(error: unknown): Response {
-	if (
-		error instanceof ChatGPTInferenceError ||
-		error instanceof ChatGPTOAuthError ||
-		error instanceof AIRequestError ||
-		error instanceof ApiError
-	) {
-		const code =
-			'code' in error && typeof error.code === 'string' && error.code ? error.code : undefined;
-		const retryAfter =
-			'retryAfter' in error && typeof error.retryAfter === 'number' ? error.retryAfter : undefined;
-		return Response.json(
-			{ error: error.message, ...(code ? { code } : {}) },
-			{
-				status: error.status,
-				headers: aiErrorHeaders(error.status, retryAfter)
-			}
-		);
-	}
-	return Response.json(
-		{ error: 'The AI request could not be completed.' },
-		{ status: 500, headers: { 'cache-control': 'no-store' } }
-	);
-}
-
 export const POST: RequestHandler = async (event) => {
+	let user: NonNullable<typeof event.locals.user> | null = null;
+	let usingHostAI = false;
+	let hostTarget: { userId: string; accountId: string } | null = null;
+	let personalAccountId = '';
+	let isChatGPTProvider = false;
 	try {
 		assertSameOrigin(event.request);
-		const user = event.locals.user;
-		if (!user) throw new ApiError(401, 'Unauthorized.');
-		consumeRateLimit(`ai-user:${user.id}`, 30, 60 * 60 * 1000);
+		user = event.locals.user;
+		if (!user) return sessionExpiredResponse();
+		const currentUser = user;
+		consumeRateLimit(`ai-user:${currentUser.id}`, 30, 60 * 60 * 1000);
 
 		const contentLength = Number(event.request.headers.get('content-length') ?? 0);
 		if (contentLength > MAX_REQUEST_BYTES) {
@@ -65,8 +37,7 @@ export const POST: RequestHandler = async (event) => {
 		const isObjectBody = Boolean(body && typeof body === 'object' && !Array.isArray(body));
 		const record = isObjectBody ? (body as Record<string, unknown>) : null;
 		const isSearch = record?.action === 'search';
-		const host = isSearch ? null : getHostAIFor(user.id);
-		let usingHost = false;
+		const host = isSearch ? null : getHostAIFor(currentUser.id);
 
 		if (record && !isSearch) {
 			const explicitPersonal = record.usePersonalAI === true;
@@ -98,25 +69,26 @@ export const POST: RequestHandler = async (event) => {
 					model: host.model,
 					connectionId: host.accountId
 				};
-				usingHost = true;
+				usingHostAI = true;
+				hostTarget = { userId: host.userId, accountId: host.accountId };
 			} else if (!host && explicitHost) {
 				throw new ApiError(400, 'Host AI is not enabled. Connect a personal model in Settings.');
 			}
 		}
 
-		let connection: { accessToken: string; codex?: boolean } | undefined;
-		let providerFetch = event.fetch;
-		if (
+		isChatGPTProvider = Boolean(
 			body &&
 			typeof body === 'object' &&
 			'provider' in body &&
 			body.provider === 'chatgpt' &&
-			(!('action' in body) || body.action !== 'search')
-		) {
+			!isSearch
+		);
+
+		if (isChatGPTProvider && body && typeof body === 'object') {
 			const accountId =
 				'connectionId' in body && typeof body.connectionId === 'string' ? body.connectionId : '';
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
-			if (!usingHost && accountId === HOST_CONNECTION_ID) {
+			if (!usingHostAI && accountId === HOST_CONNECTION_ID) {
 				throw new ApiError(
 					400,
 					host
@@ -124,22 +96,40 @@ export const POST: RequestHandler = async (event) => {
 						: 'Host AI is not enabled. Connect a personal model in Settings.'
 				);
 			}
-			const resolved = await getChatGPTConnection(
-				usingHost && host ? host.userId : user.id,
-				usingHost && host ? host.accountId : accountId,
-				event.fetch
+			if (!usingHostAI) personalAccountId = accountId;
+			const result = await withChatGPTConnection(
+				usingHostAI && host ? host.userId : currentUser.id,
+				usingHostAI && host ? host.accountId : accountId,
+				event.fetch,
+				(resolved) =>
+					runAIRequest(
+						body,
+						resolved.fetcher,
+						undefined,
+						{ accessToken: resolved.accessToken, codex: resolved.codex },
+						event.request.signal
+					),
+				{ sharedHost: usingHostAI }
 			);
-			connection = { accessToken: resolved.accessToken, codex: resolved.codex };
-			providerFetch = resolved.fetcher;
+			return Response.json(result, {
+				headers: { 'cache-control': 'no-store' }
+			});
 		}
 		return Response.json(
-			await runAIRequest(body, providerFetch, undefined, connection, event.request.signal),
+			await runAIRequest(body, event.fetch, undefined, undefined, event.request.signal),
 			{
 				headers: { 'cache-control': 'no-store' }
 			}
 		);
 	} catch (error) {
-		return mapAIErrorResponse(error);
+		return mapSignedInAIRouteError(error, {
+			userId: user?.id ?? '',
+			usingHostAI,
+			hostTarget,
+			personalAccountId,
+			isChatGPTProvider,
+			fallbackMessage: 'The AI request could not be completed.'
+		});
 	}
 };
 
