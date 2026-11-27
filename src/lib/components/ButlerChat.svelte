@@ -171,6 +171,7 @@
 			failedPrompt = value;
 		},
 		request: (prompt, history, signal, drafts) => request(prompt, history, signal, drafts),
+		timeoutMs: 100_000,
 		onSpeak: (duration) => react('speaking', duration),
 		onResetReaction: resetReaction,
 		onScroll: () => void scroll()

@@ -47,6 +47,7 @@
 		plan,
 		rate,
 		nutrition,
+		oncancel,
 		edit,
 		remove,
 		toggleHidden,
@@ -62,6 +63,7 @@
 		plan: (servings: number) => void;
 		rate: (n: number | undefined) => void;
 		nutrition: () => void;
+		oncancel?: () => void;
 		edit: () => void;
 		remove: () => void;
 		toggleHidden: () => void;
@@ -382,9 +384,13 @@
 							analysis.
 						</p>
 					</div>
-					<button class="text-button full" onclick={nutrition} disabled={busy}
-						>Refresh nutrition estimate with AI</button
-					>
+					{#if busy && oncancel}<button class="secondary full" type="button" onclick={oncancel}
+							>Cancel nutrition refresh</button
+						>{:else}<button class="text-button full" onclick={nutrition} disabled={busy}
+							>{busy
+								? 'Refreshing nutrition estimate…'
+								: 'Refresh nutrition estimate with AI'}</button
+						>{/if}
 				</div>{/if}
 			<div class="rating-box">
 				<div>

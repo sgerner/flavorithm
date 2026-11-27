@@ -7,6 +7,7 @@
 	import type { Preferences } from '#lib/types.ts';
 	import {
 		HOST_CONNECTION_ID,
+		resolveConnectionModel,
 		searchConnections,
 		type ConnectionModel,
 		type ConnectionProvider
@@ -86,10 +87,17 @@
 	}
 	let personalAccounts = $derived(chatGPT.accounts.filter((a) => a.id !== HOST_CONNECTION_ID));
 	let usingHost = $derived(Boolean(chatGPT.host && !preferences.usePersonalAI));
-	let provider = $derived(providers.find((p) => p.id === preferences.provider));
 	let subscription = $derived(preferences.provider === 'chatgpt');
-	let models = $derived(subscription ? accountModels : provider?.models || []);
-	let selectedModel = $derived(models.find((m) => m.id === preferences.model));
+	let resolved = $derived(resolveConnectionModel(preferences, providers, accountModels));
+	let provider = $derived(resolved.provider);
+	let models = $derived(resolved.models);
+	let selectedModel = $derived(resolved.selectedModel);
+	let catalogOutage = $derived(
+		!subscription && !providers.length && !loading && Boolean(preferences.provider)
+	);
+	let providerOmitted = $derived(
+		!subscription && providers.length > 0 && Boolean(preferences.provider) && !provider
+	);
 	let reasoning = $derived(selectedModel?.reasoning);
 	function togglePersonalOverride(enabled: boolean) {
 		preferences.usePersonalAI = enabled ? true : undefined;
@@ -234,7 +242,8 @@
 			subscription && chatGPT.mode !== 'local' && !chatGPT.configured && signedIn
 				? 'ai-unconfigured-help'
 				: undefined,
-			!subscription && provider && !provider.supported ? 'ai-unsupported-provider-help' : undefined
+			!subscription && provider && !provider.supported ? 'ai-unsupported-provider-help' : undefined,
+			providerOmitted ? 'ai-omitted-provider-error' : undefined
 		)}
 		{onselect}
 	/>
@@ -363,14 +372,17 @@
 						>
 					</div>
 				{/if}
-			{:else if provider?.supported}
-				<FormField id="ai-provider-api-key" label={`${provider.name} API key`}>
+			{:else if provider?.supported || catalogOutage}
+				<FormField
+					id="ai-provider-api-key"
+					label={`${provider?.name || preferences.provider} API key`}
+				>
 					{#snippet children(field)}
 						<input
 							type="password"
 							autocomplete="off"
 							spellcheck="false"
-							placeholder={provider.apiKeyHint || 'Your provider API key'}
+							placeholder={provider?.apiKeyHint || 'Your provider API key'}
 							bind:value={apiKey}
 							disabled={!signedIn}
 							{...field}
@@ -378,13 +390,17 @@
 					{/snippet}
 					{#snippet helpSnippet(helpId)}
 						<p class="field-help" id={helpId}>
-							Kept in memory for this tab. Uses {provider.name} API billing.{#if provider.documentation}
+							Kept in memory for this tab. Uses {provider?.name || preferences.provider} API billing.{#if provider?.documentation}
 								<a href={provider.documentation} target="_blank" rel="noreferrer"
 									>Provider setup <ArrowUpRight size={13} /></a
 								>{/if}
 						</p>
 					{/snippet}
 				</FormField>
+			{:else if providerOmitted}<p class="error" id="ai-omitted-provider-error" role="status">
+					Provider “{preferences.provider}” is not in the loaded catalog. Choose a supported
+					connection above, or retry the catalog.
+				</p>
 			{:else if provider}<p class="field-help" id="ai-unsupported-provider-help">
 					This provider requires an integration Flavorithm does not support yet. Choose another
 					connection.
@@ -403,24 +419,50 @@
 			<input type="text" class="readonly-input" value={chatGPT.host!.model} readonly {...field} />
 		{/snippet}
 	</FormField>
-{:else if (subscription && activeAccount?.connected && activeAccount.planEnabled && models.length > 0) || (!subscription && provider?.supported)}
-	<SearchPicker
-		label="Model"
-		placeholder="Search this provider’s models…"
-		options={models.map((model) => ({
-			id: model.id,
-			label: model.name,
-			detail: `${model.id}${model.vision ? ' · image input' : ''}${model.reasoning ? ' · reasoning' : ''}`
-		}))}
-		value={preferences.model}
-		fallback={preferences.model}
-		describedBy={selectedModel && !selectedModel.vision ? 'ai-model-vision-help' : undefined}
-		onselect={selectModel}
-		disabled={!signedIn || !models.length}
-	/>
+{:else if (subscription && activeAccount?.connected && activeAccount.planEnabled && models.length > 0) || (!subscription && (provider?.supported || catalogOutage))}
+	{#if models.length || loading}
+		<SearchPicker
+			label="Model"
+			placeholder="Search this provider’s models…"
+			options={models.map((model) => ({
+				id: model.id,
+				label: model.name,
+				detail: `${model.id}${model.vision ? ' · image input' : ''}${model.reasoning ? ' · reasoning' : ''}`
+			}))}
+			value={preferences.model}
+			fallback={preferences.model}
+			describedBy={describeBy(
+				!loading && resolved.modelOmitted ? 'ai-model-omitted-error' : undefined,
+				selectedModel && !selectedModel.vision ? 'ai-model-vision-help' : undefined
+			)}
+			onselect={selectModel}
+			disabled={!signedIn || !models.length}
+		/>
+	{:else}
+		<FormField
+			id="ai-manual-model"
+			label="Model"
+			errorId={!loading && resolved.modelOmitted ? 'ai-model-omitted-error' : undefined}
+			invalid={Boolean(!loading && resolved.modelOmitted)}
+		>
+			{#snippet children(field)}
+				<input
+					bind:value={preferences.model}
+					placeholder="Enter model ID…"
+					disabled={!signedIn}
+					onchange={() => (preferences.reasoning = undefined)}
+					{...field}
+				/>
+			{/snippet}
+		</FormField>
+	{/if}
 	{#if subscription}<button class="text-button" disabled={loading || busy} onclick={onrefresh}
 			><RefreshCw size={15} /> Refresh account models</button
 		>{/if}
+	{#if !loading && resolved.modelOmitted}<p class="error" id="ai-model-omitted-error" role="status">
+			Model “{preferences.model}” is not in the loaded catalog and may be retired or lack image
+			support. Choose an available model above, or test a live request.
+		</p>{/if}
 	{#if selectedModel && !selectedModel.vision}<p class="field-help" id="ai-model-vision-help">
 			This model accepts text only. Choose a model with image input to import photos.
 		</p>{/if}

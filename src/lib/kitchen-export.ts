@@ -414,6 +414,17 @@ function classifyExportError(error: unknown): KitchenExportFallbackReason {
 	return 'network-error';
 }
 
+function createExportTimeout(timeoutMs: number): { signal: AbortSignal; clear: () => void } {
+	const controller = new AbortController();
+	const timer = setTimeout(() => {
+		controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+	}, timeoutMs);
+	return {
+		signal: controller.signal,
+		clear: () => clearTimeout(timer)
+	};
+}
+
 /**
  * Fetch `GET /api/export` with a 30s timeout and one retry on timeouts or transient server/network
  * failures while refusing to retry expired sessions or auth redirects.
@@ -437,13 +448,8 @@ export async function fetchAccountExportPayload(
 	let lastError: KitchenExportError | null = null;
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		const controller = new AbortController();
-		const timeout = setTimeout(() => {
-			controller.abort(
-				new DOMException('The operation was aborted due to timeout', 'TimeoutError')
-			);
-		}, timeoutMs);
-		const { signal } = controller;
+		const timeout = createExportTimeout(timeoutMs);
+		const { signal } = timeout;
 		try {
 			let response: Response;
 			try {
@@ -508,7 +514,7 @@ export async function fetchAccountExportPayload(
 				);
 			}
 		} finally {
-			clearTimeout(timeout);
+			timeout.clear();
 		}
 	}
 
@@ -582,10 +588,11 @@ export async function exportKitchenArchive(
 					: 1;
 			let lastAttemptError: unknown;
 			for (let attempt = 1; attempt <= attempts; attempt += 1) {
-				const signal =
+				const timeout =
 					options.timeoutMs && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
-						? AbortSignal.timeout(options.timeoutMs)
+						? createExportTimeout(options.timeoutMs)
 						: undefined;
+				const signal = timeout?.signal;
 				try {
 					serverPayload = await options.fetchAccountExport(signal);
 					lastAttemptError = undefined;
@@ -598,6 +605,8 @@ export async function exportKitchenArchive(
 					if (reason === 'session-expired' || attempt >= attempts) {
 						throw lastAttemptError;
 					}
+				} finally {
+					timeout?.clear();
 				}
 			}
 		} else {

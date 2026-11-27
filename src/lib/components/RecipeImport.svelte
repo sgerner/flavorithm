@@ -35,12 +35,16 @@
 	import FormField from './FormField.svelte';
 	let {
 		session = $bindable(),
+		visionSupported = true,
+		opensettings,
 		capture,
 		save,
 		dictate,
 		voiceBusy = false
 	}: {
 		session: ImportSession;
+		visionSupported?: boolean;
+		opensettings?: () => void;
 		capture: (
 			input: { url?: string; prompt: string; image?: string },
 			signal: AbortSignal
@@ -59,6 +63,15 @@
 	let nutritionOpen = $state(
 		untrack(() => (session.draft ? !isValidNutrition(session.draft.nutrition) : false))
 	);
+	let visionBlocked = $state(false);
+	const visionBlockedMessage =
+		'Your selected model accepts text only and cannot read photos. Choose a model with image input in Settings, or paste recipe text instead.';
+	$effect(() => {
+		if (visionSupported && visionBlocked) {
+			visionBlocked = false;
+			if (error === visionBlockedMessage) error = '';
+		}
+	});
 	let dragging = $state(false);
 	let photoInput = $state<HTMLInputElement>();
 	let heading = $state<HTMLHeadingElement>();
@@ -71,7 +84,12 @@
 			: emptyRecipeDraftValidation()
 	);
 	let showLinkFallbackHelp = $derived(
-		Boolean(error && (session.url.trim() || /^https?:\/\/\S+$/i.test(session.text.trim())))
+		Boolean(
+			error &&
+			visionSupported &&
+			!visionBlocked &&
+			(session.url.trim() || /^https?:\/\/\S+$/i.test(session.text.trim()))
+		)
 	);
 	if (untrack(() => session.draft !== null && session.baseline === null)) {
 		session.baseline = untrack(() => createDraftBaseline(session.draft!));
@@ -215,8 +233,24 @@
 		controller?.abort();
 	});
 
+	function openPhotoPicker() {
+		if (busy || reading || voiceBusy) return;
+		if (!visionSupported) {
+			visionBlocked = true;
+			error = visionBlockedMessage;
+			return;
+		}
+		photoInput?.click();
+	}
+
 	async function attachPhoto(file?: File) {
 		if (!file || busy || reading || voiceBusy) {
+			if (photoInput) photoInput.value = '';
+			return;
+		}
+		if (!visionSupported) {
+			visionBlocked = true;
+			error = visionBlockedMessage;
 			if (photoInput) photoInput.value = '';
 			return;
 		}
@@ -287,6 +321,11 @@
 		const url = session.url.trim();
 		if (busy || reading || voiceBusy || !alive || (!url && !session.text.trim() && !session.photo))
 			return;
+		if (session.photo && !visionSupported) {
+			visionBlocked = true;
+			error = visionBlockedMessage;
+			return;
+		}
 		error = '';
 		if (validateRecipeLink(session.url)) {
 			captureSubmitted = true;
@@ -464,7 +503,7 @@
 				<button
 					class="secondary"
 					type="button"
-					onclick={() => photoInput?.click()}
+					onclick={openPhotoPicker}
 					disabled={busy || reading || voiceBusy}
 					><Camera size={18} />{reading ? 'Reading photo…' : 'Add photo'}</button
 				>
@@ -504,9 +543,19 @@
 				</div>{/if}
 		</div>
 		{#if error}<p class="error" id="import-capture-error" role="alert">{error}</p>
+			{#if (visionBlocked || (session.photo && !visionSupported)) && opensettings}<button
+					class="secondary"
+					type="button"
+					onclick={opensettings}>Open AI settings</button
+				>{/if}
 			{#if showLinkFallbackHelp}<p class="field-help" id="import-link-help">
 					If a website can’t be read, copy its recipe text or attach a screenshot instead.
 				</p>{/if}{/if}
+		{#if !visionSupported && !error}<p class="field-help" role="status">
+				Your selected model accepts text only. Choose an image-capable model in{#if opensettings}
+					<button class="text-button" type="button" onclick={opensettings}>Settings</button>{:else}
+					Settings{/if} to import photos.
+			</p>{/if}
 		<div class="capture-actions">
 			{#if busy}<button class="secondary" type="button" onclick={cancelPrepare}>Cancel</button>{/if}
 			<button

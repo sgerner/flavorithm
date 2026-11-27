@@ -13,7 +13,9 @@ import {
 import type { Ingredient, Preferences, Recipe } from '#lib/types.ts';
 import { PROVIDER_ENDPOINTS } from './provider-endpoints.ts';
 import {
+	formatRetryWait,
 	modelMetadata,
+	parseRetryAfter,
 	type ConnectionProvider,
 	type ConnectionModel,
 	type ReasoningSettings
@@ -33,36 +35,56 @@ const MAX_ANTHROPIC_BASE64_BYTES = 5 * 1024 * 1024;
 
 export class AIRequestError extends Error {
 	status: number;
+	code?: string;
+	retryAfter?: number;
 
-	constructor(message: string, status = 400) {
+	constructor(message: string, status = 400, options?: { code?: string; retryAfter?: number }) {
 		super(message);
 		this.name = 'AIRequestError';
 		this.status = status;
+		this.code = options?.code;
+		this.retryAfter = options?.retryAfter;
 	}
 }
 
 const IngredientInputSchema = z.object({
-	name: z.string().trim().min(1).max(100),
-	quantity: z.number().nonnegative(),
+	id: z.string().min(1).max(100).optional(),
+	name: z.string().trim().min(1).max(200),
+	quantity: z.number().nonnegative().max(1_000_000),
 	unit: z.string().max(40),
-	category: z.string().max(60),
-	expires: z.string().max(40).optional()
+	category: z.string().max(100),
+	expires: z.string().max(50).optional(),
+	sample: z.boolean().optional()
 });
 
 const PreferencesInputSchema = z.object({
 	diet: z.string().max(200),
-	allergies: z.string().max(500),
-	maxTime: z.number().nonnegative(),
-	complexity: z.string().max(80),
+	allergies: z.string().max(2_000),
+	maxTime: z.number().nonnegative().max(100_000),
+	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
-	theme: z.string().max(80),
+	onboardingStatus: z.enum(['completed', 'skipped']).optional(),
+	theme: z.string().max(100),
 	dark: z.boolean(),
 	provider: z.string().max(100),
-	model: z.string().max(200)
+	model: z.string().max(200),
+	reasoning: z
+		.object({
+			effort: z
+				.string()
+				.regex(/^[a-z_]{1,24}$/)
+				.optional(),
+			enabled: z.boolean().optional(),
+			budgetTokens: z.number().int().min(0).max(32_768).optional()
+		})
+		.optional(),
+	chatgptAccountId: z.string().max(100).optional(),
+	usePersonalAI: z.boolean().optional(),
+	ratings: z.record(z.string().min(1).max(100), z.number().min(0).max(5)).optional()
 });
 
 const RecipeInputSchema = z.object({
-	id: z.string().min(1).max(100),
+	id: z.string().min(1).max(100).optional(),
 	title: z.string().trim().min(1).max(200),
 	description: z.string().max(10_000),
 	image: z.string().max(4_000).optional().default(''),
@@ -92,8 +114,13 @@ const RecipeInputSchema = z.object({
 		protein: z.number().nonnegative().max(1_000_000)
 	}),
 	source: z.string().max(4_000).optional(),
+	provenance: z.enum(['web-import', 'ai-generated', 'manual']).optional(),
+	importNotes: z.array(z.string().trim().min(1).max(300)).max(30).optional(),
+	nutritionStale: z.boolean().optional(),
 	rating: z.number().min(0).max(5).optional(),
-	saved: z.boolean().optional()
+	saved: z.boolean().optional(),
+	sampleSaved: z.boolean().optional(),
+	hidden: z.boolean().optional()
 });
 
 const AIRequestSchema = z
@@ -117,7 +144,7 @@ const AIRequestSchema = z
 		apiKey: z.string().max(1_000).optional(),
 		connectionId: z.string().max(100).optional(),
 		usePersonalAI: z.boolean().optional(),
-		pantry: z.array(IngredientInputSchema).max(300).optional().default([]),
+		pantry: z.array(IngredientInputSchema).max(1_000).optional().default([]),
 		preferences: PreferencesInputSchema.optional(),
 		recipes: z.array(RecipeInputSchema).max(250).optional().default([]),
 		prompt: z.string().trim().max(20_000).optional(),
@@ -134,7 +161,7 @@ const AIRequestSchema = z
 			.min(1)
 			.max(40)
 			.optional(),
-		context: z.string().max(300_000).optional()
+		context: z.string().max(1_200_000).optional()
 	})
 	.superRefine((request, context) => {
 		if (request.action !== 'capture' && request.prompt && request.prompt.length > 2_000) {
@@ -351,25 +378,169 @@ export type SecureRecipePageFetcher = (
 const secureRecipePageFetcher: SecureRecipePageFetcher = (url, policy = 'import', signal) =>
 	policy === 'capture' ? fetchCaptureRecipePage(url, { signal }) : fetchRecipePage(url, { signal });
 
+const cachedReasoningModels = new Set<string>();
+
+function isDefaultReasoningModelId(provider: string, model: string): boolean {
+	const id = model.trim().toLowerCase();
+	if (!id || provider === 'anthropic') return false;
+	if (
+		/(?:^|\/)gpt-5-chat(?:$|[-_])/.test(id) ||
+		/(?:^|\/)gemini-2\.5-flash-lite(?:$|[-_])/.test(id)
+	) {
+		return false;
+	}
+	return /(?:^|\/)(?:o[134](?:$|[-_])|gpt-5(?:$|[-_])|codex(?:$|[-_])|deepseek-(?:r1|reasoner)(?:$|[-_])|gemini-(?:2\.5-(?:pro|flash)|2\.0-flash-thinking|3(?:\.\d+)?-(?:pro|flash))(?:$|[-_])|qwq(?:$|[-_])|qvq(?:$|[-_])|grok-(?:3-mini|4)(?:$|[-_])|sonar-reasoning(?:$|[-_])|magistral(?:$|[-_]))/.test(
+		id
+	);
+}
+
+function isReasoningActive(
+	provider: string,
+	model: string,
+	reasoning?: ReasoningSettings,
+	catalogReasoning = false
+): boolean {
+	if (reasoning?.enabled === false) return false;
+	if (reasoning !== undefined) return true;
+	const lookupProvider = provider === 'chatgpt' ? 'openai' : provider;
+	return (
+		catalogReasoning ||
+		cachedReasoningModels.has(`${lookupProvider}:${model}`) ||
+		isDefaultReasoningModelId(lookupProvider, model)
+	);
+}
+
+export function parseAIRequest(input: unknown, signal?: AbortSignal): AIRequest {
+	const parsed = AIRequestSchema.safeParse(input);
+	if (!parsed.success) throw new AIRequestError('Invalid AI request.');
+	assertRequestActive(signal);
+	return parsed.data;
+}
+
+export function validateAIRequest(
+	input: unknown,
+	options?: { signal?: AbortSignal; requireRouteConnectionId?: boolean }
+): AIRequest {
+	const request = parseAIRequest(input, options?.signal);
+
+	if (request.action === 'search') {
+		if (!request.prompt) throw new AIRequestError('A search query is required.');
+		const searchKey = typeof process !== 'undefined' ? process.env.BRAVE_SEARCH_API_KEY : undefined;
+		if (!searchKey) {
+			throw new AIRequestError(
+				'Recipe search is not configured on this installation. Ask the server operator to enable online recipe search.',
+				503
+			);
+		}
+		return request;
+	}
+
+	if (request.action === 'capture') {
+		const explicitUrl = request.url?.trim() || undefined;
+		if (!request.prompt && !request.image && !explicitUrl) {
+			throw new AIRequestError('Add recipe text, a photo, or a recipe URL to create a draft.');
+		}
+		if (request.image) {
+			const image = parseDataImage(request.image);
+			if (image.byteLength > MAX_CAPTURE_IMAGE_BYTES) {
+				throw new AIRequestError('Recipe photos must be 5 MB or smaller.', 413);
+			}
+			if (request.provider === 'anthropic' && image.base64.length > MAX_ANTHROPIC_BASE64_BYTES) {
+				throw new AIRequestError(
+					'Photos sent to Anthropic must be 5 MB or smaller after encoding.',
+					413
+				);
+			}
+		}
+		const promptText = request.prompt ?? '';
+		const detectedUrl = !explicitUrl && isStandaloneRecipeUrl(promptText) ? promptText : undefined;
+		const inputUrl = explicitUrl ?? detectedUrl;
+		if (inputUrl) validateCaptureRecipeUrl(inputUrl);
+	}
+
+	const { provider, model, apiKey } = request;
+	const selectedModel = model?.trim();
+	if (provider === 'chatgpt') {
+		if (options?.requireRouteConnectionId) {
+			if (!request.connectionId?.trim()) {
+				throw new AIRequestError('Select a connected ChatGPT account.');
+			}
+			if (!selectedModel) {
+				throw new AIRequestError('A provider, model, and API key are required.');
+			}
+		}
+	} else {
+		if (!provider || !selectedModel || !apiKey?.trim()) {
+			throw new AIRequestError('A provider, model, and API key are required.');
+		}
+		if (!Object.hasOwn(PROVIDER_ENDPOINTS, provider)) {
+			throw new AIRequestError(
+				'This provider needs an integration that Flavorithm does not support yet.'
+			);
+		}
+	}
+
+	if (
+		request.reasoning?.enabled === false &&
+		(request.reasoning.effort || request.reasoning.budgetTokens !== undefined)
+	) {
+		throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
+	}
+
+	if (request.action === 'import') {
+		if (!request.url) throw new AIRequestError('A recipe URL is required to import a recipe.');
+		validateRecipeUrl(request.url);
+	} else if (request.action === 'vision') {
+		const image = parseDataImage(request.image);
+		if (image.byteLength > MAX_CAPTURE_IMAGE_BYTES) {
+			throw new AIRequestError('Ingredient photos must be 5 MB or smaller.', 413);
+		}
+		if (request.provider === 'anthropic' && image.base64.length > MAX_ANTHROPIC_BASE64_BYTES) {
+			throw new AIRequestError(
+				'Photos sent to Anthropic must be 5 MB or smaller after encoding.',
+				413
+			);
+		}
+	} else if (request.action === 'chat') {
+		if (!request.messages?.length || request.messages.at(-1)?.role !== 'user' || !request.context) {
+			throw new AIRequestError(
+				'A conversation ending with a user message and kitchen context are required.'
+			);
+		}
+	} else if (request.action === 'generate') {
+		if (!request.preferences) {
+			throw new AIRequestError('Preferences are required to generate recipes.');
+		}
+	} else if (request.action === 'nutrition') {
+		if (!request.recipe) {
+			throw new AIRequestError('A recipe is required to estimate nutrition.');
+		}
+	}
+
+	return request;
+}
+
 export async function runAIRequest(
 	input: unknown,
 	fetcher: Fetcher = fetch,
 	pageFetcher: SecureRecipePageFetcher = secureRecipePageFetcher,
 	connection?: { accessToken: string; codex?: boolean },
-	requestSignal?: AbortSignal
+	requestSignal?: AbortSignal,
+	onValidated?: () => void
 ) {
-	const parsed = AIRequestSchema.safeParse(input);
-	if (!parsed.success) throw new AIRequestError('Invalid AI request.');
-	const request = parsed.data;
-	assertRequestActive(requestSignal);
+	const request = validateAIRequest(input, { signal: requestSignal });
 	const requestFetcher = withRequestSignal(fetcher, requestSignal);
+	let validatedNotified = false;
+	const notifyValidated = () => {
+		if (validatedNotified) return;
+		validatedNotified = true;
+		onValidated?.();
+	};
 
 	if (request.action === 'search') {
 		if (!request.prompt) throw new AIRequestError('A search query is required.');
-		return searchRecipes(request.prompt, requestFetcher);
-	}
-	if (request.action === 'capture' && !request.prompt && !request.image && !request.url) {
-		throw new AIRequestError('Add recipe text, a photo, or a recipe URL to create a draft.');
+		notifyValidated();
+		return searchRecipes(request.prompt, requestFetcher, requestSignal);
 	}
 
 	const validated = await validateProviderAndReasoning(
@@ -381,12 +552,14 @@ export async function runAIRequest(
 		},
 		connection,
 		requestFetcher,
-		requestSignal
+		requestSignal,
+		notifyValidated
 	);
 	request.reasoning = validated.reasoning;
-	const { provider, selectedModel, selectedApiKey } = validated;
+	const { provider, selectedModel, selectedApiKey, reasoningActive } = validated;
 	if (request.action === 'import') {
 		if (!request.url) throw new AIRequestError('A recipe URL is required to import a recipe.');
+		notifyValidated();
 		return importRecipe(
 			request.url,
 			provider,
@@ -395,10 +568,12 @@ export async function runAIRequest(
 			requestFetcher,
 			pageFetcher,
 			requestSignal,
-			request.reasoning
+			request.reasoning,
+			reasoningActive
 		);
 	}
 	if (request.action === 'capture') {
+		notifyValidated();
 		return captureRecipe(
 			request,
 			provider,
@@ -406,7 +581,8 @@ export async function runAIRequest(
 			selectedApiKey,
 			requestFetcher,
 			pageFetcher,
-			requestSignal
+			requestSignal,
+			reasoningActive
 		);
 	}
 
@@ -416,6 +592,7 @@ export async function runAIRequest(
 		throw new AIRequestError('Ingredient photos must be 5 MB or smaller.', 413);
 	}
 	assertRequestActive(requestSignal);
+	notifyValidated();
 	const modelResult = await callProvider(
 		provider,
 		selectedModel,
@@ -424,7 +601,9 @@ export async function runAIRequest(
 		prompt,
 		image,
 		requestFetcher,
-		request.reasoning
+		request.reasoning,
+		reasoningActive,
+		requestSignal
 	);
 
 	return validateResult(request.action, modelResult);
@@ -439,18 +618,22 @@ async function validateProviderAndReasoning(
 	},
 	connection: { accessToken: string; codex?: boolean } | undefined,
 	requestFetcher: Fetcher,
-	requestSignal?: AbortSignal
+	requestSignal?: AbortSignal,
+	onBeforeCatalogFetch?: () => void
 ): Promise<{
 	provider: AIProvider;
 	selectedModel: string;
 	selectedApiKey: string;
 	reasoning?: ReasoningSettings;
+	reasoningActive: boolean;
 }> {
 	const { provider, model, apiKey } = input;
 	const selectedModel = model?.trim();
 	const selectedApiKey = provider === 'chatgpt' ? connection?.accessToken : apiKey?.trim();
 	if (provider === 'chatgpt' && !selectedApiKey)
-		throw new AIRequestError('Connect a ChatGPT account before using your plan.', 401);
+		throw new AIRequestError('Connect a ChatGPT account before using your plan.', 401, {
+			code: 'chatgpt_reauth_required'
+		});
 	if (!provider || !selectedModel || !selectedApiKey) {
 		throw new AIRequestError('A provider, model, and API key are required.');
 	}
@@ -458,8 +641,13 @@ async function validateProviderAndReasoning(
 		throw new AIRequestError(
 			'This provider needs an integration that Flavorithm does not support yet.'
 		);
+	let catalogReasoning = false;
 	const reasoning = input.reasoning ? { ...input.reasoning } : undefined;
+	if (reasoning?.enabled === false && (reasoning.effort || reasoning.budgetTokens !== undefined)) {
+		throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
+	}
 	if (reasoning && Object.keys(reasoning).length) {
+		onBeforeCatalogFetch?.();
 		const catalog = connection?.codex
 			? await listChatGPTModels(connection.accessToken, requestFetcher)
 			: await getPublicModelCatalog(requestFetcher);
@@ -480,8 +668,7 @@ async function validateProviderAndReasoning(
 					reasoning.budgetTokens > (metadata.budgetMax ?? 32_768)))
 		)
 			throw new AIRequestError('Choose reasoning settings supported by the selected model.');
-		if (reasoning.enabled === false && (reasoning.effort || reasoning.budgetTokens !== undefined))
-			throw new AIRequestError('Turn thinking on before choosing a reasoning level or budget.');
+		catalogReasoning = true;
 		if (
 			provider === 'anthropic' &&
 			metadata.budgetMin !== undefined &&
@@ -494,7 +681,8 @@ async function validateProviderAndReasoning(
 				Math.max(2048, metadata.budgetMin)
 			);
 	}
-	return { provider, selectedModel, selectedApiKey, reasoning };
+	const reasoningActive = isReasoningActive(provider, selectedModel, reasoning, catalogReasoning);
+	return { provider, selectedModel, selectedApiKey, reasoning, reasoningActive };
 }
 
 function buildPrompt(request: AIRequest): string {
@@ -561,7 +749,7 @@ function buildPrompt(request: AIRequest): string {
 }
 
 function projectPantry(pantry: Array<Omit<Ingredient, 'id'>>): Omit<Ingredient, 'id'>[] {
-	return pantry.map(({ name, quantity, unit, category, expires }) => ({
+	return pantry.slice(0, 300).map(({ name, quantity, unit, category, expires }) => ({
 		name,
 		quantity,
 		unit,
@@ -585,7 +773,7 @@ function projectPreferences(preferences: Preferences): Preferences {
 }
 
 function projectRecipe(
-	recipe: Recipe
+	recipe: Omit<Recipe, 'id'> & { id?: string }
 ): Omit<Recipe, 'id' | 'image' | 'source' | 'rating' | 'saved'> {
 	return {
 		title: recipe.title,
@@ -627,10 +815,17 @@ const underlyingFetchers = new WeakMap<Fetcher, Fetcher>();
 
 function withRequestSignal(fetcher: Fetcher, requestSignal?: AbortSignal): Fetcher {
 	if (!requestSignal) return fetcher;
-	const wrapped: Fetcher = (input, init) => {
+	const wrapped: Fetcher = async (input, init) => {
 		assertRequestActive(requestSignal);
 		const signal = init?.signal ? AbortSignal.any([init.signal, requestSignal]) : requestSignal;
-		return fetcher(input, { ...init, signal });
+		try {
+			return await fetcher(input, { ...init, signal });
+		} catch (error) {
+			if (requestSignal.aborted && !String(input).includes('api.openai.com/v1/responses')) {
+				assertRequestActive(requestSignal);
+			}
+			throw error;
+		}
 	};
 	underlyingFetchers.set(wrapped, underlyingFetchers.get(fetcher) ?? fetcher);
 	return wrapped;
@@ -638,7 +833,7 @@ function withRequestSignal(fetcher: Fetcher, requestSignal?: AbortSignal): Fetch
 
 function assertRequestActive(requestSignal?: AbortSignal) {
 	if (requestSignal?.aborted) {
-		throw new AIRequestError('The AI request was cancelled.', 499);
+		throw new AIRequestError('The AI request was cancelled.', 499, { code: 'request_cancelled' });
 	}
 }
 
@@ -665,7 +860,11 @@ export function compatibleReasoning(
 	provider: string,
 	settings?: ReasoningSettings
 ): Record<string, unknown> {
-	if (!settings) return {};
+	if (
+		!settings ||
+		(!settings.effort && settings.enabled === undefined && settings.budgetTokens === undefined)
+	)
+		return {};
 	if (provider === 'openrouter')
 		return {
 			reasoning: {
@@ -682,16 +881,25 @@ export function compatibleReasoning(
 	};
 }
 
+function truncationError(service = 'AI provider') {
+	return new AIRequestError(
+		`The ${service} response was cut off because it reached the output token limit. Shorten your prompt, lower the thinking budget in Settings, or try another model.`,
+		422,
+		{ code: 'output_truncated' }
+	);
+}
+
 function outputTokenBudget(
 	action: Exclude<AIAction, 'search'>,
-	reasoning?: ReasoningSettings
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false)
 ): number {
 	return (
 		(action === 'chat'
 			? 8192
 			: action === 'generate' || action === 'import' || action === 'capture'
 				? 4096
-				: 1200) + (reasoning?.budgetTokens ?? (reasoning ? 4096 : 0))
+				: 1200) + (reasoning?.budgetTokens ?? (reasoningActive ? 4096 : 0))
 	);
 }
 
@@ -703,13 +911,36 @@ function callProvider(
 	prompt: string,
 	image: ReturnType<typeof parseDataImage> | undefined,
 	fetcher: Fetcher,
-	reasoning?: ReasoningSettings
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false),
+	requestSignal?: AbortSignal
 ) {
 	return provider === 'anthropic'
-		? callAnthropic(provider, model, apiKey, action, prompt, image, fetcher, reasoning)
-		: callOpenAICompatible(provider, model, apiKey, action, prompt, image, fetcher, reasoning);
+		? callAnthropic(
+				provider,
+				model,
+				apiKey,
+				action,
+				prompt,
+				image,
+				fetcher,
+				reasoning,
+				reasoningActive,
+				requestSignal
+			)
+		: callOpenAICompatible(
+				provider,
+				model,
+				apiKey,
+				action,
+				prompt,
+				image,
+				fetcher,
+				reasoning,
+				reasoningActive,
+				requestSignal
+			);
 }
-
 async function callGoogle(
 	model: string,
 	apiKey: string,
@@ -717,8 +948,11 @@ async function callGoogle(
 	prompt: string,
 	image: ReturnType<typeof parseDataImage> | undefined,
 	fetcher: Fetcher,
-	reasoning?: ReasoningSettings
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false),
+	requestSignal?: AbortSignal
 ) {
+	const hasThinkingOverrides = Boolean(reasoning?.effort || reasoning?.budgetTokens !== undefined);
 	const response = await fetchWithTimeout(
 		fetcher,
 		`${PROVIDER_ENDPOINTS.google}/models/${encodeURIComponent(model)}:generateContent`,
@@ -740,11 +974,11 @@ async function callGoogle(
 				generationConfig: {
 					responseMimeType: 'application/json',
 					maxOutputTokens: 8192 + (reasoning?.budgetTokens ?? 0),
-					...(reasoning
+					...(hasThinkingOverrides
 						? {
 								thinkingConfig: {
-									...(reasoning.effort ? { thinkingLevel: reasoning.effort.toUpperCase() } : {}),
-									...(reasoning.budgetTokens !== undefined
+									...(reasoning?.effort ? { thinkingLevel: reasoning.effort.toUpperCase() } : {}),
+									...(reasoning?.budgetTokens !== undefined
 										? { thinkingBudget: reasoning.budgetTokens }
 										: {})
 								}
@@ -752,14 +986,24 @@ async function callGoogle(
 						: {})
 				}
 			}),
-			signal: AbortSignal.timeout(reasoning ? 90_000 : PROVIDER_TIMEOUT_MS)
+			signal: AbortSignal.timeout(reasoningActive ? 90_000 : PROVIDER_TIMEOUT_MS)
 		},
-		'Google'
+		'Google',
+		requestSignal
 	);
-	const body = await readJsonResponse(response, 'Google');
-	if (!response.ok) throw upstreamError(response.status, 'Google');
+	if (!response.ok) {
+		const errorBody = await readErrorPayload(response, requestSignal);
+		throw upstreamError(response.status, 'Google', errorBody, response.headers.get('retry-after'));
+	}
+	const body = await readJsonResponse(response, 'Google', requestSignal);
+	const candidate = body?.candidates?.[0];
+	const finishReason =
+		typeof candidate?.finishReason === 'string' ? candidate.finishReason.toLowerCase() : '';
+	if (finishReason === 'max_tokens' || finishReason === 'length') {
+		throw truncationError('Google');
+	}
 	return parseModelJson(
-		body?.candidates?.[0]?.content?.parts
+		candidate?.content?.parts
 			?.filter((part: any) => !part.thought && typeof part.text === 'string')
 			.map((part: any) => part.text)
 			.join('\n')
@@ -774,7 +1018,9 @@ async function callOpenAICompatible(
 	prompt: string,
 	image: ReturnType<typeof parseDataImage> | undefined,
 	fetcher: Fetcher,
-	reasoning?: ReasoningSettings
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false),
+	requestSignal?: AbortSignal
 ) {
 	if (provider === 'chatgpt')
 		return parseModelJson(
@@ -786,13 +1032,24 @@ async function callOpenAICompatible(
 					instructions: promptFor(action),
 					prompt,
 					image: image?.dataUrl,
-					reasoning
+					reasoning,
+					signal: requestSignal
 				},
 				fetcher
 			)
 		);
 	if (provider === 'google')
-		return callGoogle(model, apiKey, action, prompt, image, fetcher, reasoning);
+		return callGoogle(
+			model,
+			apiKey,
+			action,
+			prompt,
+			image,
+			fetcher,
+			reasoning,
+			reasoningActive,
+			requestSignal
+		);
 	if (!Object.hasOwn(PROVIDER_ENDPOINTS, provider))
 		throw new AIRequestError('Unsupported provider.');
 	const endpoint = `${PROVIDER_ENDPOINTS[provider]}/chat/completions`;
@@ -824,16 +1081,32 @@ async function callOpenAICompatible(
 					: {}),
 				[provider === 'openai' ? 'max_completion_tokens' : 'max_tokens']: outputTokenBudget(
 					action,
-					reasoning
+					reasoning,
+					reasoningActive
 				)
 			}),
-			signal: AbortSignal.timeout(reasoning ? 90_000 : PROVIDER_TIMEOUT_MS)
+			signal: AbortSignal.timeout(reasoningActive ? 90_000 : PROVIDER_TIMEOUT_MS)
 		},
-		'AI provider'
+		'AI provider',
+		requestSignal
 	);
-	const body = await readJsonResponse(response, 'AI provider');
-	if (!response.ok) throw upstreamError(response.status);
-	const content = body?.choices?.[0]?.message?.content;
+	if (!response.ok) {
+		const errorBody = await readErrorPayload(response, requestSignal);
+		throw upstreamError(
+			response.status,
+			'AI provider',
+			errorBody,
+			response.headers.get('retry-after')
+		);
+	}
+	const body = await readJsonResponse(response, 'AI provider', requestSignal);
+	const choice = body?.choices?.[0];
+	const finishReason =
+		typeof choice?.finish_reason === 'string' ? choice.finish_reason.toLowerCase() : '';
+	if (finishReason === 'length' || finishReason === 'max_tokens') {
+		throw truncationError('AI provider');
+	}
+	const content = choice?.message?.content;
 	const text =
 		typeof content === 'string'
 			? content
@@ -854,7 +1127,9 @@ async function callAnthropic(
 	prompt: string,
 	image: ReturnType<typeof parseDataImage> | undefined,
 	fetcher: Fetcher,
-	reasoning?: ReasoningSettings
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false),
+	requestSignal?: AbortSignal
 ) {
 	if (image && image.base64.length > MAX_ANTHROPIC_BASE64_BYTES) {
 		throw new AIRequestError(
@@ -884,7 +1159,7 @@ async function callAnthropic(
 			},
 			body: JSON.stringify({
 				model,
-				max_tokens: outputTokenBudget(action, reasoning),
+				max_tokens: outputTokenBudget(action, reasoning, reasoningActive),
 				...(reasoning?.enabled === false
 					? { thinking: { type: 'disabled' } }
 					: reasoning?.budgetTokens
@@ -902,12 +1177,29 @@ async function callAnthropic(
 					}
 				}
 			}),
-			signal: AbortSignal.timeout(reasoning ? 90_000 : PROVIDER_TIMEOUT_MS)
+			signal: AbortSignal.timeout(reasoningActive ? 90_000 : PROVIDER_TIMEOUT_MS)
 		},
-		'Anthropic'
+		'Anthropic',
+		requestSignal
 	);
-	const body = await readJsonResponse(response, 'Anthropic');
-	if (!response.ok) throw upstreamError(response.status);
+	if (!response.ok) {
+		const errorBody = await readErrorPayload(response, requestSignal);
+		throw upstreamError(
+			response.status,
+			'Anthropic',
+			errorBody,
+			response.headers.get('retry-after')
+		);
+	}
+	const body = await readJsonResponse(response, 'Anthropic', requestSignal);
+	const stopReason = typeof body?.stop_reason === 'string' ? body.stop_reason.toLowerCase() : '';
+	if (
+		stopReason === 'max_tokens' ||
+		stopReason === 'length' ||
+		stopReason === 'model_context_window_exceeded'
+	) {
+		throw truncationError('Anthropic');
+	}
 	const content = Array.isArray(body?.content)
 		? body.content.find((block: any) => block?.type === 'text')?.text
 		: undefined;
@@ -1061,7 +1353,7 @@ function invalidProviderResult() {
 	);
 }
 
-async function searchRecipes(prompt: string, fetcher: Fetcher) {
+async function searchRecipes(prompt: string, fetcher: Fetcher, requestSignal?: AbortSignal) {
 	const searchKey = typeof process !== 'undefined' ? process.env.BRAVE_SEARCH_API_KEY : undefined;
 	if (!searchKey) {
 		throw new AIRequestError(
@@ -1085,10 +1377,19 @@ async function searchRecipes(prompt: string, fetcher: Fetcher) {
 			},
 			signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
 		},
-		'recipe search'
+		'recipe search',
+		requestSignal
 	);
-	const body = await readJsonResponse(response, 'recipe search');
-	if (!response.ok) throw upstreamError(response.status, 'Recipe search');
+	if (!response.ok) {
+		const errorBody = await readErrorPayload(response, requestSignal);
+		throw upstreamError(
+			response.status,
+			'Recipe search',
+			errorBody,
+			response.headers.get('retry-after')
+		);
+	}
+	const body = await readJsonResponse(response, 'recipe search', requestSignal);
 	const results = Array.isArray(body?.web?.results)
 		? body.web.results
 				.flatMap((result: any) => {
@@ -1211,12 +1512,20 @@ async function fetchRecipePageWithValidator(
 	const resolver = dependencies.resolveAddresses ?? resolveHostAddresses;
 	const requestPinned = dependencies.requestPinned ?? requestPinnedHttps;
 	for (let redirects = 0; redirects <= 3; redirects += 1) {
-		const address = await resolvePublicAddress(current.hostname, resolver, signal);
+		assertRequestActive(dependencies.signal);
+		const address = await resolvePublicAddress(
+			current.hostname,
+			resolver,
+			signal,
+			dependencies.signal
+		);
+		assertRequestActive(dependencies.signal);
 		if (signal.aborted) throw new AIRequestError('Recipe page request timed out.', 504);
 		let response: Response;
 		try {
 			response = await requestPinned(current, address, signal);
 		} catch (error) {
+			assertRequestActive(dependencies.signal);
 			if (error instanceof AIRequestError) throw error;
 			if (signal.aborted) throw new AIRequestError('Recipe page request timed out.', 504);
 			throw new AIRequestError('Recipe page could not be loaded.', 502);
@@ -1253,6 +1562,7 @@ async function fetchRecipePageWithValidator(
 		try {
 			body = new Uint8Array(await response.arrayBuffer());
 		} catch {
+			assertRequestActive(dependencies.signal);
 			if (signal.aborted) throw new AIRequestError('Recipe page request timed out.', 504);
 			throw new AIRequestError('Recipe page could not be read.', 502);
 		}
@@ -1280,8 +1590,10 @@ function unbracketHostname(hostname: string): string {
 async function resolvePublicAddress(
 	hostname: string,
 	resolver: (hostname: string) => Promise<string[]>,
-	signal: AbortSignal
+	signal: AbortSignal,
+	callerSignal?: AbortSignal
 ) {
+	assertRequestActive(callerSignal);
 	if (signal.aborted) throw new AIRequestError('Recipe page request timed out.', 504);
 	let timeout: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -1294,7 +1606,14 @@ async function resolvePublicAddress(
 				);
 				signal.addEventListener(
 					'abort',
-					() => reject(new AIRequestError('Recipe page DNS lookup timed out.', 504)),
+					() =>
+						reject(
+							callerSignal?.aborted
+								? new AIRequestError('The AI request was cancelled.', 499, {
+										code: 'request_cancelled'
+									})
+								: new AIRequestError('Recipe page DNS lookup timed out.', 504)
+						),
 					{ once: true }
 				);
 			})
@@ -1304,6 +1623,7 @@ async function resolvePublicAddress(
 		}
 		return addresses[0];
 	} catch (error) {
+		assertRequestActive(callerSignal);
 		if (error instanceof AIRequestError) throw error;
 		if (signal.aborted) throw new AIRequestError('Recipe page DNS lookup timed out.', 504);
 		throw new AIRequestError('Recipe page host could not be resolved.', 502);
@@ -1471,7 +1791,8 @@ async function captureRecipe(
 	apiKey: string,
 	fetcher: Fetcher,
 	pageFetcher: SecureRecipePageFetcher,
-	requestSignal?: AbortSignal
+	requestSignal?: AbortSignal,
+	reasoningActive = Boolean(request.reasoning && request.reasoning.enabled !== false)
 ) {
 	const image = request.image ? parseDataImage(request.image) : undefined;
 	if (image && image.byteLength > MAX_CAPTURE_IMAGE_BYTES) {
@@ -1499,7 +1820,7 @@ async function captureRecipe(
 		if (!/^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType)) {
 			throw new AIRequestError('The selected page did not return HTML.', 415);
 		}
-		const html = await decodeRecipePageHtml(response, contentType);
+		const html = await decodeRecipePageHtml(response, contentType, requestSignal);
 		sourceRecipe = extractJsonLdRecipe(html);
 		sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
 		if (!sourceRecipe) {
@@ -1528,7 +1849,9 @@ async function captureRecipe(
 		prompt,
 		image,
 		fetcher,
-		request.reasoning
+		request.reasoning,
+		reasoningActive,
+		requestSignal
 	);
 	const parsed = CapturedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
@@ -1620,11 +1943,16 @@ function extractHtmlCharset(rawBytes: Uint8Array, contentType: string): string {
 	return 'utf-8';
 }
 
-async function decodeRecipePageHtml(response: Response, contentType: string): Promise<string> {
+async function decodeRecipePageHtml(
+	response: Response,
+	contentType: string,
+	requestSignal?: AbortSignal
+): Promise<string> {
 	let rawBytes: Uint8Array;
 	try {
 		rawBytes = new Uint8Array(await response.arrayBuffer());
 	} catch {
+		assertRequestActive(requestSignal);
 		throw new AIRequestError('Recipe page could not be read.', 502);
 	}
 	if (rawBytes.byteLength > MAX_RECIPE_PAGE_BYTES) {
@@ -1660,7 +1988,7 @@ export async function importRecipeFromUrl(
 	if (!/^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType)) {
 		throw new AIRequestError('The selected page did not return HTML.', 415);
 	}
-	const html = await decodeRecipePageHtml(response, contentType);
+	const html = await decodeRecipePageHtml(response, contentType, requestSignal);
 
 	const sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
 	const structured = extractScrapedRecipe(html);
@@ -1685,16 +2013,18 @@ export async function importRecipeFromUrl(
 
 	assertRequestActive(requestSignal);
 	const requestFetcher = withRequestSignal(fallback.fetcher ?? fetch, requestSignal);
-	const { provider, selectedModel, selectedApiKey, reasoning } = await validateProviderAndReasoning(
-		{
-			provider: fallback.provider,
-			model: fallback.model,
-			apiKey: fallback.apiKey,
-			reasoning: fallback.reasoning
-		},
-		fallback.connection,
-		requestFetcher
-	);
+	const { provider, selectedModel, selectedApiKey, reasoning, reasoningActive } =
+		await validateProviderAndReasoning(
+			{
+				provider: fallback.provider,
+				model: fallback.model,
+				apiKey: fallback.apiKey,
+				reasoning: fallback.reasoning
+			},
+			fallback.connection,
+			requestFetcher,
+			requestSignal
+		);
 
 	const prompt = buildCapturePrompt({
 		userText: '',
@@ -1710,7 +2040,9 @@ export async function importRecipeFromUrl(
 		prompt,
 		undefined,
 		requestFetcher,
-		reasoning
+		reasoning,
+		reasoningActive,
+		requestSignal
 	);
 	const parsed = CapturedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
@@ -2223,7 +2555,8 @@ async function importRecipe(
 	fetcher: Fetcher,
 	pageFetcher: SecureRecipePageFetcher,
 	requestSignal?: AbortSignal,
-	reasoning?: ReasoningSettings
+	reasoning?: ReasoningSettings,
+	reasoningActive = Boolean(reasoning && reasoning.enabled !== false)
 ) {
 	const selectedUrl = validateRecipeUrl(inputUrl);
 	assertRequestActive(requestSignal);
@@ -2252,7 +2585,9 @@ async function importRecipe(
 		prompt,
 		undefined,
 		fetcher,
-		reasoning
+		reasoning,
+		reasoningActive,
+		requestSignal
 	);
 	const parsed = ImportedRecipeDraftSchema.safeParse(modelResult);
 	if (!parsed.success) throw invalidProviderResult();
@@ -3058,30 +3393,132 @@ function safeHttpsUrl(value: string) {
 	}
 }
 
-function upstreamError(status: number, service = 'AI provider') {
-	return new AIRequestError(`${service} request failed with status ${status}.`, 502);
+function extractErrorDetail(body: unknown): string {
+	if (!body || typeof body !== 'object') return '';
+	const record = body as Record<string, any>;
+	if (typeof record.error === 'string') return record.error;
+	if (typeof record.error?.message === 'string') return record.error.message;
+	if (typeof record.message === 'string') return record.message;
+	return '';
+}
+
+function upstreamError(
+	status: number,
+	service = 'AI provider',
+	errorBody?: unknown,
+	retryAfterHeader?: string | null
+) {
+	const detail = extractErrorDetail(errorBody);
+	const retryAfter = parseRetryAfter(retryAfterHeader);
+	if (status === 400) {
+		if (service === 'Recipe search' || service === 'Model catalog') {
+			return new AIRequestError(
+				`${service} rejected this request. Check your query and try again.`,
+				400,
+				{
+					code: 'invalid_input'
+				}
+			);
+		}
+		if (/image|vision|modality|multimodal|media/i.test(detail)) {
+			return new AIRequestError(
+				`${service} rejected the attached photo because the selected model may accept text only. Choose an image-capable model in Settings or continue with text.`,
+				400,
+				{ code: 'invalid_input' }
+			);
+		}
+		return new AIRequestError(
+			`${service} rejected this request as invalid. Shorten your input or check your model settings in Settings.`,
+			400,
+			{ code: 'invalid_input' }
+		);
+	}
+	if (status === 401) {
+		return new AIRequestError(
+			`${service} rejected your API key. Enter a valid API key in Settings → AI connection.`,
+			401,
+			{ code: 'provider_auth' }
+		);
+	}
+	if (status === 403) {
+		return new AIRequestError(
+			`${service} denied access to this model or feature. Check your API key permissions and billing, or choose another model in Settings.`,
+			403,
+			{ code: 'provider_permission_error' }
+		);
+	}
+	if (status === 404) {
+		return new AIRequestError(
+			`The selected model was not found on ${service}. Choose an available model in Settings → AI connection.`,
+			404,
+			{ code: 'model_not_found' }
+		);
+	}
+	if (status === 413) {
+		return new AIRequestError(
+			`This request is too large for ${service}. Shorten your input or use a smaller photo and try again.`,
+			413,
+			{ code: 'payload_too_large' }
+		);
+	}
+	if (status === 429) {
+		const waitText = retryAfter
+			? `Try again in ${formatRetryWait(retryAfter)}`
+			: 'Wait a moment and try again';
+		return new AIRequestError(
+			`${service} rate limit reached. ${waitText}, or check your provider quota.`,
+			429,
+			{ code: 'rate_limited', retryAfter: retryAfter ?? 60 }
+		);
+	}
+	return new AIRequestError(
+		`${service} request failed with status ${status}. Please try again.`,
+		502,
+		{
+			code: 'upstream_error'
+		}
+	);
 }
 
 async function fetchWithTimeout(
 	fetcher: Fetcher,
 	input: RequestInfo | URL,
 	init: RequestInit,
-	service: string
+	service: string,
+	requestSignal?: AbortSignal
 ) {
 	try {
 		return await fetcher(input, init);
 	} catch (error) {
+		assertRequestActive(requestSignal);
+		if (error instanceof AIRequestError) throw error;
 		if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
-			throw new AIRequestError(`${service} request timed out.`, 504);
+			throw new AIRequestError(`${service} request timed out.`, 504, { code: 'timeout' });
 		}
-		throw new AIRequestError(`${service} request could not be completed.`, 502);
+		throw new AIRequestError(`${service} request could not be completed.`, 502, {
+			code: 'upstream_error'
+		});
 	}
 }
 
-async function readJsonResponse(response: Response, service: string): Promise<any> {
+async function readErrorPayload(response: Response, requestSignal?: AbortSignal): Promise<unknown> {
 	try {
 		return await response.json();
 	} catch {
+		assertRequestActive(requestSignal);
+		return undefined;
+	}
+}
+
+async function readJsonResponse(
+	response: Response,
+	service: string,
+	requestSignal?: AbortSignal
+): Promise<any> {
+	try {
+		return await response.json();
+	} catch {
+		assertRequestActive(requestSignal);
 		throw new AIRequestError(`${service} returned an invalid response.`, 502);
 	}
 }
@@ -3108,6 +3545,7 @@ export function transformModelCatalog(catalog: unknown): SupportedModelResponse 
 					return [];
 				const id = typeof model.id === 'string' ? model.id : key;
 				if (!id || id.length > 200) return [];
+				if (model.reasoning === true) cachedReasoningModels.add(`${providerId}:${id}`);
 				return [
 					{
 						id,
@@ -3175,7 +3613,8 @@ function publicCatalogKey(fetcher: Fetcher): Fetcher {
 }
 
 export async function getSupportedModels(
-	fetcher: Fetcher = fetch
+	fetcher: Fetcher = fetch,
+	requestSignal?: AbortSignal
 ): Promise<SupportedModelResponse> {
 	const response = await fetchWithTimeout(
 		fetcher,
@@ -3186,10 +3625,19 @@ export async function getSupportedModels(
 			headers: { Accept: 'application/json', 'User-Agent': 'Flavorithm/1.0' },
 			signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS)
 		},
-		'Model catalog'
+		'Model catalog',
+		requestSignal
 	);
-	const body = await readJsonResponse(response, 'Model catalog');
-	if (!response.ok) throw upstreamError(response.status, 'Model catalog');
+	if (!response.ok) {
+		const errorBody = await readErrorPayload(response, requestSignal);
+		throw upstreamError(
+			response.status,
+			'Model catalog',
+			errorBody,
+			response.headers.get('retry-after')
+		);
+	}
+	const body = await readJsonResponse(response, 'Model catalog', requestSignal);
 	return transformModelCatalog(body);
 }
 

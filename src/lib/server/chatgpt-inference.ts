@@ -1,12 +1,14 @@
-import type { ReasoningSettings } from '#lib/ai-connections.ts';
+import { formatRetryWait, parseRetryAfter, type ReasoningSettings } from '#lib/ai-connections.ts';
 /** Official Sign in with ChatGPT plan inference, over the public Responses API. */
 export class ChatGPTInferenceError extends Error {
 	status: number;
 	code?: string;
-	constructor(message: string, status = 502, code?: string) {
+	retryAfter?: number;
+	constructor(message: string, status = 502, code?: string, retryAfter?: number) {
 		super(message);
 		this.status = status;
 		this.code = code;
+		this.retryAfter = retryAfter;
 		this.name = 'ChatGPTInferenceError';
 	}
 }
@@ -24,36 +26,61 @@ const knownErrors: Record<string, string> = {
 	chatpass_v2_invalid_authorization_context:
 		'The ChatGPT connection is not authorized for this request. Reconnect or check the app registration.'
 };
-function upstreamFailure(value: unknown, status = 502): ChatGPTInferenceError {
+function upstreamFailure(value: unknown, status = 502, retryAfter?: number): ChatGPTInferenceError {
 	const body = value as { error?: { code?: string }; response?: { error?: { code?: string } } };
 	const code =
 		body?.error?.code || body?.response?.error?.code || (value as { code?: string })?.code;
-	if (code && knownErrors[code])
-		return new ChatGPTInferenceError(knownErrors[code], /limit/.test(code) ? 429 : status, code);
+	if (code && knownErrors[code]) {
+		const mappedStatus = /limit/.test(code) ? 429 : status;
+		return new ChatGPTInferenceError(
+			knownErrors[code],
+			mappedStatus,
+			code,
+			mappedStatus === 429 ? (retryAfter ?? 60) : undefined
+		);
+	}
+	if (status === 400)
+		return new ChatGPTInferenceError(
+			'ChatGPT rejected this request (for example, the selected model may not accept photos). Check your input or choose another model in Settings.',
+			400,
+			code || 'invalid_input'
+		);
 	if (status === 401)
 		return new ChatGPTInferenceError(
 			'Your ChatGPT connection needs to be renewed. Reconnect the selected account.',
 			401,
-			code
+			code || 'chatgpt_auth_error'
 		);
 	if (status === 403)
 		return new ChatGPTInferenceError(
 			'ChatGPT plan access was not authorized. Check the granted permissions, account eligibility, and app registration.',
 			403,
-			code
+			code || 'chatgpt_permission_error'
 		);
-	if (status === 429)
+	if (status === 404)
 		return new ChatGPTInferenceError(
-			'ChatGPT usage is currently limited. Review ChatGPT Settings → Usage or try again later.',
-			429,
-			code
+			'The selected ChatGPT model was not found for this account. Choose an available model in Settings.',
+			404,
+			code || 'model_not_found'
 		);
+	if (status === 429) {
+		const waitNote = retryAfter
+			? `Try again in ${formatRetryWait(retryAfter)}, or review ChatGPT Settings → Usage.`
+			: 'Review ChatGPT Settings → Usage or try again later.';
+		return new ChatGPTInferenceError(
+			`ChatGPT usage is currently limited. ${waitNote}`,
+			429,
+			code || 'rate_limited',
+			retryAfter ?? 60
+		);
+	}
 	return new ChatGPTInferenceError(
 		'ChatGPT could not complete this request. No API-key billing was used as a fallback.',
 		status >= 500 ? 502 : status,
 		code
 	);
 }
+
 async function limitedJson(response: Response) {
 	if (Number(response.headers.get('content-length') || 0) > MAX_RESPONSE_BYTES)
 		throw new ChatGPTInferenceError('ChatGPT returned an oversized response.');
@@ -159,6 +186,10 @@ function incompleteMessage(action?: ChatGPTResponseAction): string {
 	return 'ChatGPT stopped before finishing the nutrition estimate. Please try again.';
 }
 
+function incompleteCutoffMessage(action?: ChatGPTResponseAction): string {
+	return `${incompleteMessage(action).replace(/\. Please try again\.$/, '')} because it reached the output limit. Shorten your prompt or try another model.`;
+}
+
 function unconfirmedStreamMessage(action?: ChatGPTResponseAction): string {
 	if (isRecipeAction(action))
 		return 'ChatGPT ended the stream before confirming completion. No partial recipe was saved.';
@@ -258,7 +289,11 @@ export async function chatGPTResponse(
 		try {
 			body = await limitedJson(response);
 		} catch {}
-		throw upstreamFailure(body, response.status);
+		throw upstreamFailure(
+			body,
+			response.status,
+			parseRetryAfter(response.headers.get('retry-after'))
+		);
 	}
 	if (!response.body) throw new ChatGPTInferenceError('ChatGPT returned an empty stream.');
 	const reader = response.body.getReader();
@@ -299,9 +334,29 @@ export async function chatGPTResponse(
 			output += event.delta;
 		if (event.type === 'response.failed' || event.type === 'error')
 			throw upstreamFailure(event, 502);
-		if (event.type === 'response.incomplete')
+		if (event.type === 'response.incomplete') {
+			const reason = event.response?.incomplete_details?.reason ?? event.incomplete_details?.reason;
+			if (reason === 'max_output_tokens' || reason === 'max_tokens') {
+				throw new ChatGPTInferenceError(
+					incompleteCutoffMessage(options.action),
+					422,
+					'output_truncated'
+				);
+			}
 			throw new ChatGPTInferenceError(incompleteMessage(options.action));
+		}
 		if (event.type === 'response.completed') {
+			if (event.response?.status === 'incomplete') {
+				const reason = event.response?.incomplete_details?.reason;
+				if (reason === 'max_output_tokens' || reason === 'max_tokens') {
+					throw new ChatGPTInferenceError(
+						incompleteCutoffMessage(options.action),
+						422,
+						'output_truncated'
+					);
+				}
+				throw new ChatGPTInferenceError(incompleteMessage(options.action));
+			}
 			if (event.response?.status && event.response.status !== 'completed')
 				throw new ChatGPTInferenceError('ChatGPT did not complete the request.');
 			const finalText = Array.isArray(event.response?.output)

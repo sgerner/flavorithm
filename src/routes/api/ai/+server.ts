@@ -1,8 +1,9 @@
 import { getHostAIFor, HOST_CONNECTION_ID } from '#lib/server/host-ai.ts';
 import { mapSignedInAIRouteError, sessionExpiredResponse } from '#lib/server/ai-route-errors.ts';
-import { withChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
+import { ChatGPTOAuthError, withChatGPTConnection } from '#lib/server/chatgpt-oauth.ts';
+import { getChatGPTAccount } from '#lib/server/oauth-storage.ts';
 import type { RequestHandler } from './$types';
-import { AIRequestError, runAIRequest } from '#lib/server/ai.ts';
+import { AIRequestError, parseAIRequest, runAIRequest, validateAIRequest } from '#lib/server/ai.ts';
 import { ApiError, assertSameOrigin, consumeRateLimit } from '#lib/server/db.ts';
 
 const MAX_REQUEST_BYTES = 9_000_000;
@@ -18,7 +19,10 @@ export const POST: RequestHandler = async (event) => {
 		user = event.locals.user;
 		if (!user) return sessionExpiredResponse();
 		const currentUser = user;
-		consumeRateLimit(`ai-user:${currentUser.id}`, 30, 60 * 60 * 1000);
+
+		if (event.request.signal.aborted) {
+			throw new AIRequestError('The AI request was cancelled.', 499, { code: 'request_cancelled' });
+		}
 
 		const contentLength = Number(event.request.headers.get('content-length') ?? 0);
 		if (contentLength > MAX_REQUEST_BYTES) {
@@ -31,28 +35,33 @@ export const POST: RequestHandler = async (event) => {
 			body = JSON.parse(raw);
 		} catch (error) {
 			if (error instanceof AIRequestError) throw error;
+			if (event.request.signal.aborted) {
+				throw new AIRequestError('The AI request was cancelled.', 499, {
+					code: 'request_cancelled'
+				});
+			}
 			throw new AIRequestError('Request body must contain valid JSON.');
 		}
 
-		const isObjectBody = Boolean(body && typeof body === 'object' && !Array.isArray(body));
-		const record = isObjectBody ? (body as Record<string, unknown>) : null;
-		const isSearch = record?.action === 'search';
+		let parsed = parseAIRequest(body, event.request.signal);
+		const record = body as Record<string, unknown>;
+		const isSearch = parsed.action === 'search';
 		const host = isSearch ? null : getHostAIFor(currentUser.id);
 
-		if (record && !isSearch) {
-			const explicitPersonal = record.usePersonalAI === true;
+		if (!isSearch) {
+			const explicitPersonal = parsed.usePersonalAI === true;
 			const explicitHost =
-				record.usePersonalAI === false || record.connectionId === HOST_CONNECTION_ID;
+				parsed.usePersonalAI === false || parsed.connectionId === HOST_CONNECTION_ID;
 			const hasPersonalApiKey =
-				typeof record.provider === 'string' &&
-				record.provider !== 'chatgpt' &&
-				typeof record.apiKey === 'string' &&
-				record.apiKey.trim().length > 0;
+				typeof parsed.provider === 'string' &&
+				parsed.provider !== 'chatgpt' &&
+				typeof parsed.apiKey === 'string' &&
+				parsed.apiKey.trim().length > 0;
 			const hasPersonalChatGPT =
-				record.provider === 'chatgpt' &&
-				typeof record.connectionId === 'string' &&
-				record.connectionId.trim().length > 0 &&
-				record.connectionId !== HOST_CONNECTION_ID;
+				parsed.provider === 'chatgpt' &&
+				typeof parsed.connectionId === 'string' &&
+				parsed.connectionId.trim().length > 0 &&
+				parsed.connectionId !== HOST_CONNECTION_ID;
 			const usePersonal =
 				explicitPersonal || (!explicitHost && (hasPersonalApiKey || hasPersonalChatGPT));
 
@@ -69,6 +78,7 @@ export const POST: RequestHandler = async (event) => {
 					model: host.model,
 					connectionId: host.accountId
 				};
+				parsed = parseAIRequest(body, event.request.signal);
 				usingHostAI = true;
 				hostTarget = { userId: host.userId, accountId: host.accountId };
 			} else if (!host && explicitHost) {
@@ -76,17 +86,17 @@ export const POST: RequestHandler = async (event) => {
 			}
 		}
 
-		isChatGPTProvider = Boolean(
-			body &&
-			typeof body === 'object' &&
-			'provider' in body &&
-			body.provider === 'chatgpt' &&
-			!isSearch
-		);
+		let quotaConsumed = false;
+		const consumeQuotaOnce = () => {
+			if (quotaConsumed) return;
+			quotaConsumed = true;
+			consumeRateLimit(`ai-user:${currentUser.id}`, 30, 60 * 60 * 1000);
+		};
 
-		if (isChatGPTProvider && body && typeof body === 'object') {
-			const accountId =
-				'connectionId' in body && typeof body.connectionId === 'string' ? body.connectionId : '';
+		isChatGPTProvider = parsed.provider === 'chatgpt' && !isSearch;
+
+		if (isChatGPTProvider) {
+			const accountId = parsed.connectionId?.trim() ?? '';
 			if (!accountId) throw new ApiError(400, 'Select a connected ChatGPT account.');
 			if (!usingHostAI && accountId === HOST_CONNECTION_ID) {
 				throw new ApiError(
@@ -97,9 +107,23 @@ export const POST: RequestHandler = async (event) => {
 				);
 			}
 			if (!usingHostAI) personalAccountId = accountId;
+			const targetUserId = usingHostAI && host ? host.userId : currentUser.id;
+			const targetAccountId = usingHostAI && host ? host.accountId : accountId;
+			if (!getChatGPTAccount(targetUserId, targetAccountId)) {
+				throw new ChatGPTOAuthError(
+					404,
+					'ChatGPT account was not found.',
+					'chatgpt_account_not_found'
+				);
+			}
+			validateAIRequest(body, {
+				signal: event.request.signal,
+				requireRouteConnectionId: true
+			});
+			consumeQuotaOnce();
 			const result = await withChatGPTConnection(
-				usingHostAI && host ? host.userId : currentUser.id,
-				usingHostAI && host ? host.accountId : accountId,
+				targetUserId,
+				targetAccountId,
 				event.fetch,
 				(resolved) =>
 					runAIRequest(
@@ -107,7 +131,8 @@ export const POST: RequestHandler = async (event) => {
 						resolved.fetcher,
 						undefined,
 						{ accessToken: resolved.accessToken, codex: resolved.codex },
-						event.request.signal
+						event.request.signal,
+						consumeQuotaOnce
 					),
 				{ sharedHost: usingHostAI }
 			);
@@ -115,8 +140,20 @@ export const POST: RequestHandler = async (event) => {
 				headers: { 'cache-control': 'no-store' }
 			});
 		}
+
+		validateAIRequest(body, {
+			signal: event.request.signal,
+			requireRouteConnectionId: true
+		});
 		return Response.json(
-			await runAIRequest(body, event.fetch, undefined, undefined, event.request.signal),
+			await runAIRequest(
+				body,
+				event.fetch,
+				undefined,
+				undefined,
+				event.request.signal,
+				consumeQuotaOnce
+			),
 			{
 				headers: { 'cache-control': 'no-store' }
 			}
@@ -140,6 +177,12 @@ async function readLimitedBody(request: Request) {
 	let size = 0;
 	try {
 		while (true) {
+			if (request.signal.aborted) {
+				void reader.cancel().catch(() => undefined);
+				throw new AIRequestError('The AI request was cancelled.', 499, {
+					code: 'request_cancelled'
+				});
+			}
 			const { done, value } = await reader.read();
 			if (done) break;
 			size += value.byteLength;
@@ -149,6 +192,12 @@ async function readLimitedBody(request: Request) {
 			}
 			chunks.push(value);
 		}
+	} catch (error) {
+		if (error instanceof AIRequestError) throw error;
+		if (request.signal.aborted) {
+			throw new AIRequestError('The AI request was cancelled.', 499, { code: 'request_cancelled' });
+		}
+		throw error;
 	} finally {
 		reader.releaseLock();
 	}

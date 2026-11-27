@@ -349,6 +349,69 @@ test('recipe generation uses the server-resolved ChatGPT token and includes actu
 	assert.notEqual(result.recipes[0].id, favorite.id);
 });
 
+test('ChatGPT maps upstream 400, 401, 403, 404, and 429 responses to distinct statuses with Retry-After and maps incomplete cutoffs to 422', async () => {
+	for (const [status, expectedStatus] of [
+		[400, 400],
+		[401, 401],
+		[403, 403],
+		[404, 404],
+		[429, 429]
+	] as const) {
+		await assert.rejects(
+			() =>
+				chatGPTResponse(options, async () => {
+					return new Response(JSON.stringify({ error: { message: `status ${status}` } }), {
+						status,
+						headers: status === 429 ? { 'retry-after': '120' } : {}
+					});
+				}),
+			(error: unknown) => {
+				assert.ok(error instanceof ChatGPTInferenceError);
+				assert.equal(error.status, expectedStatus);
+				assert.notEqual(error.status, 502);
+				assert.equal(error.message.includes('server-only-token'), false);
+				if (status === 429) {
+					assert.equal(error.retryAfter, 120);
+					assert.match(error.message, /2 minutes/);
+				}
+				return true;
+			}
+		);
+	}
+
+	await assert.rejects(
+		() =>
+			chatGPTResponse(options, async () =>
+				stream([
+					{ type: 'response.output_text.delta', delta: '{"recipes":[' },
+					{
+						type: 'response.incomplete',
+						response: { status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' } }
+					}
+				])
+			),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 422 &&
+			error.code === 'output_truncated'
+	);
+});
+
+test('ChatGPT returns 499 instead of 504 when the caller AbortSignal is aborted', async () => {
+	const preAborted = new AbortController();
+	preAborted.abort();
+	await assert.rejects(
+		() =>
+			chatGPTResponse({ ...options, signal: preAborted.signal }, async () => {
+				throw new Error('fetch should not run for pre-aborted signals');
+			}),
+		(error: unknown) =>
+			error instanceof ChatGPTInferenceError &&
+			error.status === 499 &&
+			error.code === 'request_cancelled'
+	);
+});
+
 function rawByteStream(chunks: Uint8Array[], onCancel?: () => void) {
 	let index = 0;
 	return new Response(
