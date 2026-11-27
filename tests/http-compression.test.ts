@@ -6,6 +6,8 @@ import { test } from 'node:test';
 import {
 	brotliCompressSync,
 	brotliDecompressSync,
+	createBrotliDecompress,
+	createGunzip,
 	gunzipSync,
 	gzipSync,
 	inflateSync
@@ -14,7 +16,6 @@ import {
 	appendVaryAcceptEncoding,
 	isCompressibleContentType,
 	negotiateEncoding,
-	suffixStrongEtag,
 	withDynamicCompression
 } from '../server.mjs';
 
@@ -146,12 +147,11 @@ test('isCompressibleContentType matches allowed text/json/js/xml/svg types and r
 	}
 });
 
-test('suffixStrongEtag appends encoding suffixes only to strong ETags and matchesStateEtag validates If-Match variants', async () => {
-	assert.equal(suffixStrongEtag('"abc123"', 'br'), '"abc123-br"');
-	assert.equal(suffixStrongEtag('"abc123"', 'gzip'), '"abc123-gzip"');
-	assert.equal(suffixStrongEtag('"abc123"', 'deflate'), '"abc123-deflate"');
-	assert.equal(suffixStrongEtag('"abc123-br"', 'br'), '"abc123-br"');
-	assert.equal(suffixStrongEtag('W/"abc123"', 'br'), 'W/"abc123"');
+test('matchesStateEtag enforces RFC 9110 strong comparison and rejects weak W/ or suffixed tags', async () => {
+	assert.equal(backend.matchesStateEtag('"x"', '"x"'), true);
+	assert.equal(backend.matchesStateEtag('W/"x"', '"x"'), false);
+	assert.equal(backend.matchesStateEtag('"x"', 'W/"x"'), false);
+	assert.equal(backend.matchesStateEtag('W/"x"', 'W/"x"'), false);
 
 	const { user } = await backend.registerUser(
 		'Compression Sync User',
@@ -162,16 +162,7 @@ test('suffixStrongEtag appends encoding suffixes only to strong ETags and matche
 	const baseTag = backend.getStateEtag(user);
 	const inner = baseTag.slice(1, -1);
 
-	for (const validIfMatch of [
-		baseTag,
-		`"${inner}-br"`,
-		`"${inner}-gzip"`,
-		`"${inner}-deflate"`,
-		`W/${baseTag}`,
-		`W/"${inner}-br"`,
-		`W/"${inner}-gzip"`,
-		`"stale-tag", "${inner}-br"`
-	]) {
+	for (const validIfMatch of [baseTag, `"stale-tag", ${baseTag}`, `  ${baseTag}  `]) {
 		assert.equal(
 			backend.matchesStateEtag(validIfMatch, baseTag),
 			true,
@@ -183,9 +174,12 @@ test('suffixStrongEtag appends encoding suffixes only to strong ETags and matche
 		'',
 		'*',
 		inner,
-		'"different"',
-		'"different-br"',
-		`"${inner}-unknown"`
+		`W/${baseTag}`,
+		`W/"x", "other"`,
+		`"${inner}-br"`,
+		`"${inner}-gzip"`,
+		`"${inner}-deflate"`,
+		'"different"'
 	]) {
 		assert.equal(
 			backend.matchesStateEtag(invalidIfMatch, baseTag),
@@ -194,17 +188,23 @@ test('suffixStrongEtag appends encoding suffixes only to strong ETags and matche
 		);
 	}
 
-	// Verify actual saveState round-trips with suffixed and weak tags, plus 412 and 428 errors.
-	for (const suffix of ['-br', '-gzip', '-deflate']) {
-		const current = backend.getStateEtag(user);
-		const suffixed = `"${current.slice(1, -1)}${suffix}"`;
-		backend.saveState(user, initialState, { ifMatch: suffixed, ifNoneMatch: null });
-	}
-	const weakCurrent = `W/${backend.getStateEtag(user)}`;
-	backend.saveState(user, initialState, { ifMatch: weakCurrent, ifNoneMatch: null });
+	// Verify actual saveState round-trips with strong and comma-separated tags, plus 412 on weak/stale and 428 on missing.
+	const current = backend.getStateEtag(user);
+	backend.saveState(user, initialState, { ifMatch: current, ifNoneMatch: null });
 
+	const nextCurrent = backend.getStateEtag(user);
+	backend.saveState(user, initialState, {
+		ifMatch: `"stale-tag", ${nextCurrent}`,
+		ifNoneMatch: null
+	});
+
+	const weakCurrent = `W/${backend.getStateEtag(user)}`;
 	assert.throws(
-		() => backend.saveState(user, initialState, { ifMatch: '"stale-br"', ifNoneMatch: null }),
+		() => backend.saveState(user, initialState, { ifMatch: weakCurrent, ifNoneMatch: null }),
+		{ status: 412 }
+	);
+	assert.throws(
+		() => backend.saveState(user, initialState, { ifMatch: '"stale"', ifNoneMatch: null }),
 		{ status: 412 }
 	);
 	assert.throws(
@@ -214,8 +214,22 @@ test('suffixStrongEtag appends encoding suffixes only to strong ETags and matche
 		}
 	);
 
-	// Route-level PUT /api/state check with a -br ETag.
-	const routeTag = suffixStrongEtag(backend.getStateEtag(user), 'br');
+	// Route-level PUT /api/state check with strong vs weak ETag.
+	const routeTag = backend.getStateEtag(user);
+	const weakRouteResponse = await stateRoute.PUT({
+		locals: { user },
+		request: new Request('https://flavorithm.example/api/state', {
+			method: 'PUT',
+			headers: {
+				origin: 'https://flavorithm.example',
+				'content-type': 'application/json',
+				'if-match': `W/${routeTag}`
+			},
+			body: JSON.stringify({ state: initialState })
+		})
+	} as never);
+	assert.equal(weakRouteResponse.status, 412);
+
 	const putResponse = await stateRoute.PUT({
 		locals: { user },
 		request: new Request('https://flavorithm.example/api/state', {
@@ -247,6 +261,7 @@ test('withDynamicCompression compresses eligible payloads, preserves headers, ha
 
 	let capturedAbortCompressor: Transform | undefined;
 	let startAbortStream: (() => void) | undefined;
+	let finishFlushedStream: (() => void) | undefined;
 
 	const server = createServer((req, res) => {
 		withDynamicCompression(req, res, {
@@ -363,6 +378,12 @@ test('withDynamicCompression compresses eligible payloads, preserves headers, ha
 			return;
 		}
 
+		if (req.url === '/not-modified-bare') {
+			res.writeHead(304, { ETag: '"cached-static"' });
+			res.end();
+			return;
+		}
+
 		if (req.url === '/no-content') {
 			res.writeHead(204);
 			res.end();
@@ -370,14 +391,27 @@ test('withDynamicCompression compresses eligible payloads, preserves headers, ha
 		}
 
 		if (req.url === '/state') {
-			res.writeHead(200, {
-				'Content-Type': 'application/json',
-				'Content-Length': Buffer.byteLength(largeJson),
-				'Cache-Control': 'no-store, max-age=0',
-				Pragma: 'no-cache',
-				ETag: '"version1"'
-			});
+			res.setHeader('Content-Type', 'application/json');
+			res.setHeader('Cache-Control', 'no-store, max-age=0');
+			res.setHeader('Pragma', 'no-cache');
+			res.setHeader('ETag', '"version1"');
+			if (req.method === 'HEAD') {
+				res.writeHead(200);
+				res.end();
+				return;
+			}
+			res.setHeader('Content-Length', Buffer.byteLength(largeJson));
+			res.writeHead(200);
 			res.end(largeJson);
+			return;
+		}
+
+		if (req.url === '/stream-flush') {
+			res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+			res.write('[{"chunk":1}');
+			finishFlushedStream = () => {
+				res.end(',{"chunk":2}]');
+			};
 			return;
 		}
 
@@ -433,12 +467,19 @@ test('withDynamicCompression compresses eligible payloads, preserves headers, ha
 		assert.ok(brHtml.body.byteLength < Buffer.byteLength(htmlPayload) / 4);
 		assert.equal(brotliDecompressSync(brHtml.body).toString('utf8'), htmlPayload);
 
-		// 2. Gzip and deflate negotiation + ETag suffixing.
+		// 2. Gzip, br, deflate, and HEAD preserve encoding-independent strong ETags.
+		const brState = await rawRequest(port, '/state', {
+			headers: { 'Accept-Encoding': 'br, gzip' }
+		});
+		assert.equal(brState.headers['content-encoding'], 'br');
+		assert.equal(brState.headers['etag'], '"version1"');
+		assert.equal(brotliDecompressSync(brState.body).toString('utf8'), largeJson);
+
 		const gzipState = await rawRequest(port, '/state', {
 			headers: { 'Accept-Encoding': 'gzip;q=1.0, br;q=0.5' }
 		});
 		assert.equal(gzipState.headers['content-encoding'], 'gzip');
-		assert.equal(gzipState.headers['etag'], '"version1-gzip"');
+		assert.equal(gzipState.headers['etag'], '"version1"');
 		assert.equal(gzipState.headers['cache-control'], 'no-store, max-age=0');
 		assert.equal(gzipState.headers['pragma'], 'no-cache');
 		assert.equal(gunzipSync(gzipState.body).toString('utf8'), largeJson);
@@ -447,8 +488,18 @@ test('withDynamicCompression compresses eligible payloads, preserves headers, ha
 			headers: { 'Accept-Encoding': 'deflate, br;q=0' }
 		});
 		assert.equal(deflateState.headers['content-encoding'], 'deflate');
-		assert.equal(deflateState.headers['etag'], '"version1-deflate"');
+		assert.equal(deflateState.headers['etag'], '"version1"');
 		assert.equal(inflateSync(deflateState.body).toString('utf8'), largeJson);
+
+		const headState = await rawRequest(port, '/state', {
+			method: 'HEAD',
+			headers: { 'Accept-Encoding': 'br, gzip' }
+		});
+		assert.equal(headState.status, 200);
+		assert.equal(headState.headers['content-encoding'], undefined);
+		assert.equal(headState.headers['etag'], '"version1"');
+		assert.equal(headState.headers['vary'], 'Accept-Encoding');
+		assert.equal(headState.body.byteLength, 0);
 
 		// 3. Vary token deduplication (case-insensitive).
 		const varyDedup = await rawRequest(port, '/vary-existing', {
@@ -521,7 +572,20 @@ test('withDynamicCompression compresses eligible payloads, preserves headers, ha
 		});
 		assert.equal(notModified.status, 304);
 		assert.equal(notModified.headers['content-encoding'], undefined);
+		assert.equal(notModified.headers['vary'], 'Accept-Encoding');
 		assert.equal(notModified.body.byteLength, 0);
+
+		const notModifiedBare = await rawRequest(port, '/not-modified-bare', {
+			headers: { 'Accept-Encoding': 'br, gzip' }
+		});
+		assert.equal(notModifiedBare.status, 304);
+		assert.equal(notModifiedBare.headers['content-encoding'], undefined);
+		assert.equal(notModifiedBare.headers['vary'], 'Accept-Encoding');
+		assert.equal(notModifiedBare.body.byteLength, 0);
+
+		const notModifiedNoAccept = await rawRequest(port, '/not-modified-bare');
+		assert.equal(notModifiedNoAccept.status, 304);
+		assert.equal(notModifiedNoAccept.headers['vary'], undefined);
 
 		const noContent = await rawRequest(port, '/no-content', {
 			headers: { 'Accept-Encoding': 'br, gzip' }
@@ -540,7 +604,49 @@ test('withDynamicCompression compresses eligible payloads, preserves headers, ha
 		assert.equal(headHtml.headers['vary'], 'Origin, Accept-Encoding');
 		assert.equal(headHtml.body.byteLength, 0);
 
-		// 8. Multi-megabyte streaming response forwards drain events without stalling.
+		// 8. Streamed responses without Content-Length flush each write immediately before res.end().
+		for (const [encoding, createDecoder] of [
+			['br', createBrotliDecompress],
+			['gzip', createGunzip]
+		] as const) {
+			const streamedText = await new Promise<string>((resolve, reject) => {
+				const req = httpRequest(
+					{
+						hostname: '127.0.0.1',
+						port,
+						path: '/stream-flush',
+						headers: { 'Accept-Encoding': encoding }
+					},
+					(res) => {
+						try {
+							assert.equal(res.statusCode, 200);
+							assert.equal(res.headers['content-encoding'], encoding);
+							const decoder = createDecoder();
+							let output = '';
+							let releasedSecondChunk = false;
+							decoder.on('data', (chunk: Buffer) => {
+								output += chunk.toString('utf8');
+								if (!releasedSecondChunk && output.includes('[{"chunk":1}')) {
+									releasedSecondChunk = true;
+									finishFlushedStream?.();
+								}
+							});
+							decoder.on('end', () => resolve(output));
+							decoder.on('error', reject);
+							res.pipe(decoder);
+						} catch (error) {
+							req.destroy();
+							reject(error);
+						}
+					}
+				);
+				req.on('error', reject);
+				req.end();
+			});
+			assert.equal(streamedText, '[{"chunk":1},{"chunk":2}]');
+		}
+
+		// 9. Multi-megabyte streaming response forwards drain events without stalling.
 		const drained = await rawRequest(port, '/large-drain', {
 			headers: { 'Accept-Encoding': 'br' }
 		});

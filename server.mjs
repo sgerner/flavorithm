@@ -128,38 +128,27 @@ export function appendVaryAcceptEncoding(res) {
 }
 
 /**
- * Appends `-${encoding}` inside strong quoted ETags, leaving weak `W/` tags untouched.
+ * Creates a `node:zlib` transform stream. When `flushPerWrite` is true (used
+ * for responses without a known `Content-Length`), configures per-write
+ * flushing so streamed text/JSON responses emit chunks immediately instead of
+ * buffering inside zlib until `res.end()`.
  *
- * @param {string} etagHeader
  * @param {ContentCoding} encoding
- * @returns {string}
- */
-export function suffixStrongEtag(etagHeader, encoding) {
-	const trimmed = etagHeader.trim();
-	if (trimmed.length >= 2 && trimmed.startsWith('"') && trimmed.endsWith('"')) {
-		const inner = trimmed.slice(1, -1);
-		const suffix = `-${encoding}`;
-		if (!inner.endsWith(suffix)) {
-			return `"${inner}${suffix}"`;
-		}
-	}
-	return etagHeader;
-}
-
-/**
- * @param {ContentCoding} encoding
+ * @param {boolean} flushPerWrite
  * @returns {import('node:stream').Transform}
  */
-function createCompressor(encoding) {
+function createCompressor(encoding, flushPerWrite) {
 	if (encoding === 'br') {
 		return createBrotliCompress({
+			...(flushPerWrite ? { flush: zlibConstants.BROTLI_OPERATION_FLUSH } : {}),
 			params: {
 				[zlibConstants.BROTLI_PARAM_MODE]: zlibConstants.BROTLI_MODE_TEXT,
 				[zlibConstants.BROTLI_PARAM_QUALITY]: 4
 			}
 		});
 	}
-	return encoding === 'gzip' ? createGzip() : createDeflate();
+	const zlibOptions = flushPerWrite ? { flush: zlibConstants.Z_SYNC_FLUSH } : undefined;
+	return encoding === 'gzip' ? createGzip(zlibOptions) : createDeflate(zlibOptions);
 }
 
 /**
@@ -188,13 +177,18 @@ export function withDynamicCompression(req, res, options) {
 		prepared = true;
 
 		const status = res.statusCode;
-		if (
-			(status >= 100 && status < 200) ||
-			status === 204 ||
-			status === 205 ||
-			status === 206 ||
-			status === 304
-		) {
+		if (status === 304) {
+			const acceptEncoding = req.headers['accept-encoding'];
+			const hasAcceptEncoding = Array.isArray(acceptEncoding)
+				? acceptEncoding.some((value) => value.trim() !== '')
+				: typeof acceptEncoding === 'string' && acceptEncoding.trim() !== '';
+			if (hasAcceptEncoding && !hasNoTransform(res.getHeader('cache-control'))) {
+				appendVaryAcceptEncoding(res);
+			}
+			return;
+		}
+
+		if ((status >= 100 && status < 200) || status === 204 || status === 205 || status === 206) {
 			return;
 		}
 
@@ -211,11 +205,16 @@ export function withDynamicCompression(req, res, options) {
 		if (req.method === 'HEAD') return;
 
 		const rawLength = res.getHeader('content-length');
+		let hasKnownLength = false;
 		if (rawLength !== undefined) {
 			const parsedLength = Number(Array.isArray(rawLength) ? rawLength[0] : rawLength);
-			if (Number.isFinite(parsedLength) && parsedLength < MIN_COMPRESS_BYTES) return;
-		} else if (implicitByteLength !== undefined && implicitByteLength < MIN_COMPRESS_BYTES) {
-			return;
+			if (Number.isFinite(parsedLength)) {
+				hasKnownLength = true;
+				if (parsedLength < MIN_COMPRESS_BYTES) return;
+			}
+		} else if (implicitByteLength !== undefined) {
+			hasKnownLength = true;
+			if (implicitByteLength < MIN_COMPRESS_BYTES) return;
 		}
 
 		const encoding = negotiateEncoding(req.headers['accept-encoding']);
@@ -225,12 +224,9 @@ export function withDynamicCompression(req, res, options) {
 		res.removeHeader('Content-Length');
 		res.removeHeader('Accept-Ranges');
 
-		const etag = res.getHeader('etag');
-		if (typeof etag === 'string') {
-			res.setHeader('ETag', suffixStrongEtag(etag, encoding));
-		}
-
-		const stream = createCompressor(encoding);
+		// Flush after each write when Content-Length is absent so streamed text/JSON
+		// responses deliver chunks incrementally instead of buffering until res.end().
+		const stream = createCompressor(encoding, !hasKnownLength);
 		compressor = stream;
 		options?.onCompressor?.(stream);
 

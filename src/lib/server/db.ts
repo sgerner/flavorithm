@@ -1189,18 +1189,18 @@ export function getStateEtag(user: User): string {
 }
 
 export function matchesStateEtag(ifMatchHeader: string, currentEtag: string): boolean {
-	const expected =
-		currentEtag.length >= 2 && currentEtag.startsWith('"') && currentEtag.endsWith('"')
-			? currentEtag.slice(1, -1)
-			: currentEtag;
+	if (
+		currentEtag.length < 2 ||
+		currentEtag.startsWith('W/') ||
+		!currentEtag.startsWith('"') ||
+		!currentEtag.endsWith('"')
+	) {
+		return false;
+	}
 	return ifMatchHeader.split(',').some((rawCandidate) => {
-		let candidate = rawCandidate.trim();
-		if (candidate.startsWith('W/')) candidate = candidate.slice(2);
-		if (candidate.length < 2 || !candidate.startsWith('"') || !candidate.endsWith('"')) {
-			return false;
-		}
-		const inner = candidate.slice(1, -1).replace(/-(?:br|gzip|deflate)$/, '');
-		return inner === expected;
+		const candidate = rawCandidate.trim();
+		if (candidate.startsWith('W/')) return false;
+		return candidate === currentEtag;
 	});
 }
 

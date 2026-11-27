@@ -151,6 +151,22 @@ try {
 	const manifest = await fetch(`${baseUrl}/manifest.webmanifest`);
 	assert.equal(manifest.status, 200);
 	assert.equal((await manifest.json()).orientation, 'any');
+	const manifestRaw200 = await rawHttp('/manifest.webmanifest', {
+		headers: { 'Accept-Encoding': 'br, gzip' }
+	});
+	assert.equal(manifestRaw200.status, 200);
+	assert.match(String(manifestRaw200.headers['vary']), /Accept-Encoding/i);
+	assert.ok(manifestRaw200.headers['etag']);
+	const manifestRaw304 = await rawHttp('/manifest.webmanifest', {
+		headers: {
+			'Accept-Encoding': 'br, gzip',
+			'If-None-Match': String(manifestRaw200.headers['etag'])
+		}
+	});
+	assert.equal(manifestRaw304.status, 304);
+	assert.equal(manifestRaw304.headers['content-encoding'], undefined);
+	assert.match(String(manifestRaw304.headers['vary']), /Accept-Encoding/i);
+	assert.equal(manifestRaw304.body.byteLength, 0);
 	assert.equal((await fetch(`${baseUrl}/service-worker.js`)).status, 200);
 	const healthProbe = await fetch(`${baseUrl}/api/auth`);
 	assert.equal(healthProbe.status, 200);
@@ -352,14 +368,19 @@ try {
 	assert.equal(result.data.state.recipes[0].rating, 5);
 	assert.equal((await owner('/api/export')).data.user.email, 'smoke-owner@example.test');
 
-	// Verify GET/PUT /api/state and GET /api/export compression + ETag formats (br, gzip, identity, W/).
+	// Verify GET/PUT /api/state and GET /api/export compression + strong encoding-independent ETags.
 	const ownerCookie = owner.cookie();
 	const stateBr = await rawHttp('/api/state', {
 		headers: { Cookie: ownerCookie, 'Accept-Encoding': 'br, gzip' }
 	});
+	const statePrePutIdentity = await rawHttp('/api/state', {
+		headers: { Cookie: ownerCookie, 'Accept-Encoding': 'identity' }
+	});
 	assert.equal(stateBr.headers['content-encoding'], 'br');
 	assert.match(String(stateBr.headers['vary']), /Accept-Encoding/i);
-	assert.match(String(stateBr.headers['etag']), /-br"$/);
+	assert.match(String(stateBr.headers['etag']), /^"[^"]+"$/);
+	assert.doesNotMatch(String(stateBr.headers['etag']), /-(?:br|gzip|deflate)"$/);
+	assert.equal(stateBr.headers['etag'], statePrePutIdentity.headers['etag']);
 	const parsedStateBr = JSON.parse(brotliDecompressSync(stateBr.body).toString('utf8'));
 
 	const putStateBr = await rawHttp('/api/state', {
@@ -379,7 +400,7 @@ try {
 		headers: { Cookie: ownerCookie, 'Accept-Encoding': 'gzip' }
 	});
 	assert.equal(stateGzip.headers['content-encoding'], 'gzip');
-	assert.match(String(stateGzip.headers['etag']), /-gzip"$/);
+	assert.doesNotMatch(String(stateGzip.headers['etag']), /-(?:br|gzip|deflate)"$/);
 	const putStateGzip = await rawHttp('/api/state', {
 		method: 'PUT',
 		headers: {
@@ -424,7 +445,7 @@ try {
 		},
 		body: JSON.stringify({ state: parsedStateBr.state })
 	});
-	assert.equal(putStateWeak.status, 200);
+	assert.equal(putStateWeak.status, 412);
 
 	const exportBr = await rawHttp('/api/export', {
 		headers: { Cookie: ownerCookie, 'Accept-Encoding': 'br, gzip' }
