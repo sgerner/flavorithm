@@ -191,13 +191,14 @@ export async function runConcurrentModelCatalog(options: {
 	onResult: (result: {
 		catalog: SettledValue<{ providers: ConnectionProvider[] }>;
 		account: SettledValue<{ providers: Array<{ models: ConnectionModel[] }> } | null>;
-	}) => void;
+		queriedAccountId: string | null;
+	}) => void | Promise<void>;
 }): Promise<void> {
-	const initialAccountId = options.getEntitledAccountId();
+	let queriedAccountId = options.getEntitledAccountId();
 	const catalogTask = settle(options.fetchPublicCatalog());
 	let accountTask: Promise<
 		SettledValue<{ providers: Array<{ models: ConnectionModel[] }> } | null>
-	> | null = initialAccountId ? settle(options.fetchAccountCatalog(initialAccountId)) : null;
+	> | null = queriedAccountId ? settle(options.fetchAccountCatalog(queriedAccountId)) : null;
 	let connectionError: unknown = null;
 	let hasConnectionError = false;
 
@@ -209,9 +210,11 @@ export async function runConcurrentModelCatalog(options: {
 			connectionError = connResult.reason;
 		} else {
 			const nextAccountId = options.getEntitledAccountId();
-			if (nextAccountId && nextAccountId !== initialAccountId) {
+			if (nextAccountId && nextAccountId !== queriedAccountId) {
+				queriedAccountId = nextAccountId;
 				accountTask = settle(options.fetchAccountCatalog(nextAccountId));
 			} else if (!nextAccountId) {
+				queriedAccountId = null;
 				accountTask = null;
 			}
 		}
@@ -222,7 +225,7 @@ export async function runConcurrentModelCatalog(options: {
 		accountTask ?? Promise.resolve({ status: 'fulfilled' as const, value: null })
 	]);
 	if (!options.isCurrent()) return;
-	options.onResult({ catalog, account });
+	await options.onResult({ catalog, account, queriedAccountId });
 	if (hasConnectionError) throw connectionError;
 }
 

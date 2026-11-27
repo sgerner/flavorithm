@@ -1071,6 +1071,94 @@ test('rendered components resolve every aria-describedby and label[for] without 
 		}).body,
 		'AIConnection personal override active'
 	);
+
+	const connectedPersonalAccount = {
+		id: 'acct-personal',
+		label: 'Personal ChatGPT',
+		connected: true,
+		planEnabled: true
+	};
+	const aiHostWithPersonalSubHtml = render(aiConnectionSsrMod.default, {
+		props: {
+			preferences: {
+				...structuredClone(createInitialState().preferences),
+				provider: 'chatgpt',
+				chatgptAccountId: 'acct-personal',
+				usePersonalAI: false
+			},
+			apiKey: '',
+			providers: [],
+			accountModels: [],
+			chatGPT: {
+				configured: true,
+				mode: 'device',
+				host: { model: 'gpt-5.4' },
+				accounts: [connectedPersonalAccount]
+			},
+			activeAccount: connectedPersonalAccount,
+			signedIn: true,
+			managedAuth: false,
+			busy: false,
+			loading: false,
+			catalogError: '',
+			authorizationUrl: '',
+			device: null,
+			oncancel: () => {},
+			oncopycode: () => {},
+			onselect: () => {},
+			onaccount: () => {},
+			onconnect: () => {},
+			ondisconnect: () => {},
+			onrefresh: () => {},
+			onsignin: () => {}
+		}
+	}).body;
+	assertValidRenderedAccessibility(
+		aiHostWithPersonalSubHtml,
+		'AIConnection host active with personal ChatGPT saved'
+	);
+	assert.equal(aiHostWithPersonalSubHtml.includes('Refresh account models'), false);
+
+	const aiOverrideEmptySubHtml = render(aiConnectionSsrMod.default, {
+		props: {
+			preferences: {
+				...structuredClone(createInitialState().preferences),
+				provider: 'chatgpt',
+				chatgptAccountId: 'acct-personal',
+				usePersonalAI: true
+			},
+			apiKey: '',
+			providers: [],
+			accountModels: [],
+			chatGPT: {
+				configured: true,
+				mode: 'device',
+				host: { model: 'gpt-5.4' },
+				accounts: [connectedPersonalAccount]
+			},
+			activeAccount: connectedPersonalAccount,
+			signedIn: true,
+			managedAuth: false,
+			busy: false,
+			loading: false,
+			catalogError: '',
+			authorizationUrl: '',
+			device: null,
+			oncancel: () => {},
+			oncopycode: () => {},
+			onselect: () => {},
+			onaccount: () => {},
+			onconnect: () => {},
+			ondisconnect: () => {},
+			onrefresh: () => {},
+			onsignin: () => {}
+		}
+	}).body;
+	assertValidRenderedAccessibility(
+		aiOverrideEmptySubHtml,
+		'AIConnection personal ChatGPT override empty catalog'
+	);
+	assert.equal(aiOverrideEmptySubHtml.includes('Refresh account models'), true);
 });
 
 // --- +page.svelte modal accessibility & end-to-end login/onboarding harness ---

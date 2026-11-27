@@ -86,6 +86,172 @@ test('only the explicitly configured host admin can share an encrypted Codex gra
 	delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
 });
 
+test('Host AI retains credentials on transient, bare-401, and non-terminal 401 errors, clears under lease on terminal refresh codes, and never leaks admin details', async (t) => {
+	const admin = await db.registerUser(
+		'Host Admin',
+		'admin-secret@example.com',
+		'correct horse battery'
+	);
+	const member = await db.registerUser(
+		'Household Member',
+		'member@example.com',
+		'correct horse battery'
+	);
+	let now = Date.now();
+	t.mock.method(Date, 'now', () => now);
+	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = admin.user.id;
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
+	try {
+		const grant = storage.saveChatGPTAccount({
+			userId: admin.user.id,
+			mode: 'local',
+			clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+			subject: 'admin-subject:codex-secret-acct',
+			email: 'admin-secret@example.com',
+			scopes: ['codex.subscription'],
+			credentials: {
+				accessToken: 'admin-stale-access-secret',
+				refreshToken: 'admin-refresh-secret',
+				idToken: 'admin-id-secret',
+				codexAccountId: 'codex-secret-acct'
+			},
+			expiresAt: now + 3600_000,
+			earliestRefreshAt: 0
+		});
+		host.configureHostAI(admin.user.id, grant.id, 'codex-shared-model');
+
+		const aiRoute = await import('../src/routes/api/ai/+server.ts');
+		const modelsRoute = await import('../src/routes/api/models/+server.ts');
+		const oauth = await import('../src/lib/server/chatgpt-oauth.ts');
+		const { defaultPreferences } = await import('../src/lib/data.ts');
+
+		// Transient refresh outage returns 502 without clearing admin credentials and arms a per-account cooldown.
+		let tokenPosts = 0;
+		t.mock.method(globalThis, 'fetch', async () => {
+			tokenPosts += 1;
+			return new Response('outage', { status: 503 });
+		});
+		const transient = await aiRoute.POST({
+			locals: { user: member.user },
+			fetch: async () => Response.json({ error: { message: 'Revoked' } }, { status: 401 }),
+			request: new Request('https://flavorithm.example/api/ai', {
+				method: 'POST',
+				headers: { origin: 'https://flavorithm.example', 'content-type': 'application/json' },
+				body: JSON.stringify({
+					action: 'generate',
+					provider: 'chatgpt',
+					model: 'codex-shared-model',
+					connectionId: host.HOST_CONNECTION_ID,
+					preferences: defaultPreferences
+				})
+			})
+		} as any);
+		assert.equal(transient.status, 502);
+		assert.equal(tokenPosts, 1);
+		assert.ok(host.getHostAI(), 'transient refresh errors keep Host AI credentials intact');
+
+		// Immediate follow-up during the 502 cooldown returns 503 without hammering the token endpoint.
+		const coolingDown = await aiRoute.POST({
+			locals: { user: member.user },
+			fetch: async () => Response.json({ error: { message: 'Revoked' } }, { status: 401 }),
+			request: new Request('https://flavorithm.example/api/ai', {
+				method: 'POST',
+				headers: { origin: 'https://flavorithm.example', 'content-type': 'application/json' },
+				body: JSON.stringify({
+					action: 'generate',
+					provider: 'chatgpt',
+					model: 'codex-shared-model',
+					connectionId: host.HOST_CONNECTION_ID,
+					preferences: defaultPreferences
+				})
+			})
+		} as any);
+		assert.equal(coolingDown.status, 503);
+		assert.equal((await coolingDown.json()).code, 'chatgpt_refresh_not_ready');
+		assert.equal(tokenPosts, 1);
+		assert.ok(host.getHostAI());
+
+		// Bare 401 from token endpoint maps to 502 chatgpt_refresh_failed and retains Host AI credentials.
+		now += oauth.REFRESH_FAILURE_COOLDOWN_MS + 1;
+		t.mock.method(globalThis, 'fetch', async () => new Response('', { status: 401 }));
+		const bare401Refresh = await aiRoute.POST({
+			locals: { user: member.user },
+			fetch: async () => Response.json({ error: { message: 'Revoked' } }, { status: 401 }),
+			request: new Request('https://flavorithm.example/api/ai', {
+				method: 'POST',
+				headers: { origin: 'https://flavorithm.example', 'content-type': 'application/json' },
+				body: JSON.stringify({
+					action: 'generate',
+					provider: 'chatgpt',
+					model: 'codex-shared-model',
+					connectionId: host.HOST_CONNECTION_ID,
+					preferences: defaultPreferences
+				})
+			})
+		} as any);
+		assert.equal(bare401Refresh.status, 502);
+		assert.equal((await bare401Refresh.json()).code, 'chatgpt_refresh_failed');
+		assert.ok(host.getHostAI(), 'bare 401 from token endpoint must not wipe Host AI credentials');
+
+		// Non-terminal upstream 401 after refresh returns 503 host_ai_unavailable without wiping Host AI credentials.
+		now += oauth.REFRESH_FAILURE_COOLDOWN_MS + 1;
+		t.mock.method(globalThis, 'fetch', async () =>
+			Response.json({
+				access_token: 'admin-rotated-access-secret',
+				refresh_token: 'admin-rotated-refresh-secret',
+				expires_in: 3600
+			})
+		);
+		const upstream401 = await modelsRoute.GET({
+			locals: { user: member.user },
+			fetch: async (input: any) =>
+				String(input) === 'https://models.dev/api.json'
+					? Response.json({})
+					: Response.json({ error: { message: 'Upstream proxy 401' } }, { status: 401 }),
+			url: new URL(
+				`https://flavorithm.example/api/models?connection=chatgpt&accountId=${host.HOST_CONNECTION_ID}`
+			)
+		} as any);
+		assert.equal(upstream401.status, 503);
+		assert.equal((await upstream401.json()).code, 'host_ai_unavailable');
+		assert.ok(host.getHostAI(), 'non-terminal upstream 401 must not wipe Host AI credentials');
+
+		// Terminal refresh error clears admin credentialEnvelope under lease and returns 503 host_ai_unavailable.
+		t.mock.method(globalThis, 'fetch', async () =>
+			Response.json({ error: { code: 'invalid_grant' } }, { status: 400 })
+		);
+		const failed = await aiRoute.POST({
+			locals: { user: member.user },
+			fetch: async () => Response.json({ error: { message: 'Revoked' } }, { status: 401 }),
+			request: new Request('https://flavorithm.example/api/ai', {
+				method: 'POST',
+				headers: { origin: 'https://flavorithm.example', 'content-type': 'application/json' },
+				body: JSON.stringify({
+					action: 'generate',
+					provider: 'chatgpt',
+					model: 'codex-shared-model',
+					connectionId: host.HOST_CONNECTION_ID,
+					preferences: defaultPreferences
+				})
+			})
+		} as any);
+		assert.equal(failed.status, 503);
+		const payload = await failed.json();
+		assert.equal(payload.code, 'host_ai_unavailable');
+		const serialized = JSON.stringify(payload);
+		assert.equal(serialized.includes('admin-secret@example.com'), false);
+		assert.equal(serialized.includes('admin-stale-access-secret'), false);
+		assert.equal(serialized.includes('admin-rotated-access-secret'), false);
+		assert.equal(serialized.includes(grant.id), false);
+		assert.equal(host.getHostAI(), null);
+		assert.equal(storage.getChatGPTAccount(admin.user.id, grant.id)?.credentialEnvelope, null);
+	} finally {
+		host.configureHostAI(admin.user.id);
+		delete process.env.FLAVORITHM_HOST_AI_SHARED;
+		delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+	}
+});
+
 test('host AI acts as an overridable default, strips incompatible personal reasoning, and leaves search independent', async () => {
 	const admin = await db.registerUser(
 		'Host Admin 2',
