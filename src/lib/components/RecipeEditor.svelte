@@ -2,6 +2,7 @@
 	import { COVER_PATH, prepareCover } from '#lib/cover-upload.ts';
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { tick, untrack } from 'svelte';
+	import type { FocusTrapOptions } from '#lib/focus.ts';
 	import ModalDialog from '#lib/components/ModalDialog.svelte';
 	import {
 		NUTRITION_FIELDS,
@@ -25,12 +26,16 @@
 		recipe,
 		mode = 'edit',
 		canUploadCover = false,
+		returnFocus,
+		fallbackFocus,
 		cancel,
 		save
 	}: {
 		recipe: Recipe;
 		mode?: 'create' | 'edit';
 		canUploadCover?: boolean;
+		returnFocus?: FocusTrapOptions['returnFocus'];
+		fallbackFocus?: FocusTrapOptions['fallbackFocus'];
 		cancel: () => void;
 		save: (recipe: Recipe) => void;
 	} = $props();
@@ -271,6 +276,8 @@
 	dialogClass="flavor-dialog wide capture-dialog recipe-editor-dialog"
 	labelledBy="recipe-editor-title"
 	closeLabel="Close recipe editor"
+	{returnFocus}
+	{fallbackFocus}
 	onclose={() => void requestCancel()}
 >
 	<h2 id="recipe-editor-title">

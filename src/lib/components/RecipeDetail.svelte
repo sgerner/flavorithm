@@ -2,6 +2,7 @@
 	import { recipePlaceholder } from '#lib/recipe-cover.ts';
 	import { MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	import { untrack } from 'svelte';
+	import type { FocusTrapOptions } from '#lib/focus.ts';
 	import ModalDialog from '#lib/components/ModalDialog.svelte';
 	import { describeBy, fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
@@ -51,6 +52,8 @@
 		toggleHidden,
 		busy,
 		initialServings,
+		returnFocus,
+		fallbackFocus,
 		completedSteps = $bindable<number[]>([]),
 		tab = $bindable<RecipeTab>('recipe')
 	}: {
@@ -66,6 +69,8 @@
 		toggleHidden: () => void;
 		busy: boolean;
 		initialServings?: number;
+		returnFocus?: FocusTrapOptions['returnFocus'];
+		fallbackFocus?: FocusTrapOptions['fallbackFocus'];
 		completedSteps?: number[];
 		tab?: RecipeTab;
 	} = $props();
@@ -141,6 +146,8 @@
 	closeIconSize={22}
 	closeLabel="Close recipe"
 	label={recipe.title}
+	{returnFocus}
+	{fallbackFocus}
 	onclose={close}
 >
 	<div

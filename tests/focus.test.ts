@@ -12,7 +12,7 @@ import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
 import type { Recipe } from '../src/lib/types.ts';
 
-const { focusableControls, focusTrap } = focusMod;
+const { activeFocusedElement, focusableControls, focusTrap } = focusMod;
 const nodeRequire = createRequire(import.meta.url);
 const svelteInternalClient = nodeRequire('svelte/internal/client');
 const svelteClientIndex = nodeRequire(
@@ -1001,15 +1001,18 @@ test(
 		const inactiveRadioBtn = doc.el('button', { tabindex: '-1', role: 'radio' });
 		const closedDetails = doc.el('details');
 		const closedSummary = doc.el('summary');
+		const extraClosedSummary = doc.el('summary');
 		const hiddenSelect = doc.el('select');
 		const hiddenInput = doc.el('input');
-		closedDetails.append(closedSummary, hiddenSelect, hiddenInput);
+		closedDetails.append(closedSummary, extraClosedSummary, hiddenSelect, hiddenInput);
 
 		const openDetails = doc.el('details', { open: '' });
 		const openSummary = doc.el('summary');
+		const extraOpenSummary = doc.el('summary');
 		const visibleInput = doc.el('input');
-		openDetails.append(openSummary, visibleInput);
+		openDetails.append(openSummary, extraOpenSummary, visibleInput);
 
+		const bareSummary = doc.el('summary');
 		const scrollRegion = doc.el('div', { tabindex: '0', role: 'region' });
 		const programmaticTarget = doc.el('div', { tabindex: '-1' });
 		const saveBtn = doc.el('button');
@@ -1019,6 +1022,7 @@ test(
 			inactiveRadioBtn,
 			closedDetails,
 			openDetails,
+			bareSummary,
 			scrollRegion,
 			programmaticTarget,
 			saveBtn
@@ -1662,5 +1666,143 @@ test(
 		assert.deepEqual(main.lastFocusOptions, { preventScroll: true });
 
 		await unmount(instance);
+	})
+);
+
+test(
+	'stacked ModalDialog over stay-mounted inert parent restores child returnFocus and inherits parent returnFocus on delete',
+	withMockDOM(async (doc) => {
+		const shell = doc.el('div', { class: 'app-shell' });
+		const main = doc.el('main', { id: 'kitchen-content', tabindex: '-1' });
+		const cardTrigger = doc.el('button', { class: 'recipe-card-button' });
+		main.append(cardTrigger);
+		shell.append(main);
+		const parentWrap = doc.el('div', { class: 'detail-layer' });
+		const childRoot = doc.el('div', { class: 'child-layer' });
+		doc.body.append(shell, parentWrap, childRoot);
+
+		assert.equal(activeFocusedElement(), null);
+		cardTrigger.focus();
+		const capturedCardTrigger = activeFocusedElement();
+		assert.equal(capturedCardTrigger, cardTrigger);
+
+		// Simulate inert blurring document.activeElement before parent ModalDialog mounts
+		shell.inert = true;
+		cardTrigger.blur();
+		assert.equal(activeFocusedElement(), null);
+
+		const parentProps = svelteInternalClient.proxy({
+			onclose: () => {},
+			label: 'Roasted Cauliflower',
+			closeLabel: 'Close recipe',
+			returnFocus: capturedCardTrigger,
+			children: createRawSnippet(() => ({
+				render: () =>
+					`<div class="parent-actions"><button type="button" class="edit-btn">Edit</button><button type="button" class="delete-btn">Delete</button></div>`
+			}))
+		});
+		const parentInstance = mount(ModalDialog, {
+			target: parentWrap as unknown as Element,
+			props: parentProps
+		});
+		flushSync();
+		await flushMicrotasks();
+
+		const parentDialog = parentWrap.querySelector('[role="dialog"]')!;
+		const editBtn = parentDialog.querySelector('.edit-btn')!;
+		const deleteBtn = parentDialog.querySelector('.delete-btn')!;
+		assert.equal(doc.body.style.overflow, 'hidden');
+		assert.equal(doc.activeElement, parentDialog.querySelector('.dialog-close'));
+
+		// 1. Open child ModalDialog (e.g. RecipeEditor) while parent stays mounted inside an inert wrapper
+		editBtn.focus();
+		const capturedEditBtn = activeFocusedElement();
+		assert.equal(capturedEditBtn, editBtn);
+		parentWrap.inert = true;
+		editBtn.blur();
+
+		const childProps = svelteInternalClient.proxy({
+			onclose: () => {},
+			label: 'Edit recipe',
+			closeLabel: 'Close editor',
+			viewKey: 'editor',
+			returnFocus: capturedEditBtn,
+			children: createRawSnippet(() => ({
+				render: () => `<button type="button" class="save-edit">Save changes</button>`
+			}))
+		});
+		const childInstance = mount(ModalDialog, {
+			target: childRoot as unknown as Element,
+			props: childProps
+		});
+		flushSync();
+		await flushMicrotasks();
+
+		const childDialog = childRoot.querySelector('[role="dialog"]')!;
+		const childClose = childDialog.querySelector('.dialog-close')!;
+		const childSave = childDialog.querySelector('.save-edit')!;
+		assert.equal(doc.activeElement, childClose);
+
+		// Parent trap ignores Tab while child trap is on top
+		const parentTab = tabEvent(false);
+		parentDialog.dispatchEvent(parentTab);
+		assert.equal(parentTab.defaultPrevented, false);
+
+		// Child trap wraps Tab cleanly between its own controls
+		childSave.focus();
+		const childWrap = tabEvent(false);
+		childDialog.dispatchEvent(childWrap);
+		assert.equal(childWrap.defaultPrevented, true);
+		assert.equal(doc.activeElement, childClose);
+
+		// Closing child while parentWrap clears inert asynchronously restores focus to editBtn and keeps scroll locked
+		childDialog.dispatchEvent({ type: 'outrostart', target: childDialog });
+		queueMicrotask(() => {
+			parentWrap.inert = false;
+		});
+		await flushMicrotasks(8);
+		assert.equal(parentWrap.inert, false);
+		assert.equal(doc.activeElement, editBtn);
+		assert.deepEqual(editBtn.lastFocusOptions, { preventScroll: true });
+		assert.equal(doc.body.style.overflow, 'hidden');
+		await unmount(childInstance);
+
+		// 2. Open delete confirmation child over parent, then unmount parent underneath (confirming delete)
+		deleteBtn.focus();
+		const capturedDeleteBtn = activeFocusedElement();
+		parentWrap.inert = true;
+		deleteBtn.blur();
+
+		const confirmProps = svelteInternalClient.proxy({
+			onclose: () => {},
+			label: 'Delete recipe?',
+			closeLabel: 'Close confirmation',
+			returnFocus: capturedDeleteBtn,
+			children: createRawSnippet(() => ({
+				render: () => `<button type="button" class="confirm-delete">Delete recipe</button>`
+			}))
+		});
+		const confirmInstance = mount(ModalDialog, {
+			target: childRoot as unknown as Element,
+			props: confirmProps
+		});
+		flushSync();
+		await flushMicrotasks();
+
+		// Recipe deletion removes cardTrigger, unmounts parent RecipeDetail, and closes confirmation dialog
+		cardTrigger.remove();
+		await unmount(parentInstance);
+		parentWrap.remove();
+		const confirmDialog = childRoot.querySelector('[role="dialog"]')!;
+		confirmDialog.dispatchEvent({ type: 'outrostart', target: confirmDialog });
+		queueMicrotask(() => {
+			shell.inert = false;
+		});
+		await flushMicrotasks(8);
+
+		assert.equal(doc.body.style.overflow, '');
+		assert.equal(doc.activeElement, main);
+		assert.deepEqual(main.lastFocusOptions, { preventScroll: true });
+		await unmount(confirmInstance);
 	})
 );
