@@ -270,6 +270,76 @@ function recordGeneratedShoppingIds(items: ShoppingItem[], knownGeneratedIds: Se
 	}
 }
 
+function orderBatchCommands(
+	commands: ButlerCommand[],
+	initialGeneratedIds: ReadonlySet<string>
+): ButlerCommand[] {
+	const hasNonShoppingKitchenMutation = commands.some(
+		(command) =>
+			(command.type.startsWith('recipe.') && command.type !== 'recipe.open') ||
+			command.type.startsWith('meal.') ||
+			command.type.startsWith('pantry.')
+	);
+	const upsertedShoppingIds = new Set<string>();
+	const generatedIdsInBatch = new Set(initialGeneratedIds);
+	for (const command of commands) {
+		if (command.type === 'shopping.upsert') {
+			upsertedShoppingIds.add(command.item.id);
+			if (command.item.sourceKey?.trim()) generatedIdsInBatch.add(command.item.id);
+		}
+	}
+
+	// Hoist recipe.upsert only when an earlier meal.upsert, meal.complete, or recipe.open
+	// references that recipe ID without an intervening recipe.delete on the same ID.
+	const deletedRecipeIds = new Set<string>();
+	const referencedBeforeUpsert = new Set<string>();
+	const seenRecipeUpserts = new Set<string>();
+	for (const command of commands) {
+		if (command.type === 'recipe.delete') {
+			deletedRecipeIds.add(command.id);
+		} else if (command.type === 'recipe.upsert') {
+			seenRecipeUpserts.add(command.recipe.id);
+		} else if (command.type === 'meal.upsert') {
+			if (!seenRecipeUpserts.has(command.meal.recipeId)) {
+				referencedBeforeUpsert.add(command.meal.recipeId);
+			}
+		} else if (command.type === 'recipe.open') {
+			if (!seenRecipeUpserts.has(command.id)) {
+				referencedBeforeUpsert.add(command.id);
+			}
+		} else if (command.type === 'meal.complete') {
+			referencedBeforeUpsert.add('*');
+		}
+	}
+
+	const hoistedRecipes: ButlerCommand[] = [];
+	const mainCommands: ButlerCommand[] = [];
+	const deferredShoppingDeletes: ButlerCommand[] = [];
+
+	for (const command of commands) {
+		if (
+			command.type === 'recipe.upsert' &&
+			!deletedRecipeIds.has(command.recipe.id) &&
+			(referencedBeforeUpsert.has(command.recipe.id) || referencedBeforeUpsert.has('*'))
+		) {
+			hoistedRecipes.push(command);
+			continue;
+		}
+		if (
+			hasNonShoppingKitchenMutation &&
+			command.type === 'shopping.delete' &&
+			generatedIdsInBatch.has(command.id) &&
+			!upsertedShoppingIds.has(command.id)
+		) {
+			deferredShoppingDeletes.push(command);
+			continue;
+		}
+		mainCommands.push(command);
+	}
+
+	return [...hoistedRecipes, ...mainCommands, ...deferredShoppingDeletes];
+}
+
 function calendarKey(day: Date) {
 	return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, '0')}-${String(day.getDate()).padStart(2, '0')}`;
 }
@@ -342,13 +412,14 @@ export function applyButlerCommands(
 	const trackedWeeks = new Set(activeWeeklyScopes(state.shopping));
 	const knownGeneratedIds = new Set<string>();
 	recordGeneratedShoppingIds(state.shopping, knownGeneratedIds);
+	const orderedCommands = orderBatchCommands(commands, knownGeneratedIds);
 	let shouldRefreshWeeks = false;
 	const effects: ButlerEffect[] = [];
 	const pantryMutations: PantryMutation[] = [];
 	const deductedIngredientNames = new Set<string>();
 	const deductedPantryIds = new Set<string>();
 	const deletedCheckedWeeks = new Set<string>();
-	for (const command of commands) {
+	for (const command of orderedCommands) {
 		switch (command.type) {
 			case 'recipe.upsert': {
 				const previous = state.recipes.find((item) => item.id === command.recipe.id);

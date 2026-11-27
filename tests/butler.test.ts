@@ -1190,19 +1190,18 @@ test('combined cards skip already-cleared generated shopping removals but still 
 		{ id: 'manual-milk', name: 'milk', quantity: 1, unit: 'l', checked: false }
 	);
 
-	const cleared = applyButlerCommands(
-		withWeek,
-		[
-			{ type: 'recipe.delete', id: recipe.id },
-			{ type: 'shopping.generate', weekStart: '2026-10-19' },
-			{ type: 'shopping.delete', id: 'recipe-scoped' },
-			{ type: 'shopping.delete', id: weekItemId }
-		],
-		now
-	).state;
-	assert.deepEqual(cleared.shopping, [
-		{ id: 'manual-milk', name: 'milk', quantity: 1, unit: 'l', checked: false }
-	]);
+	const forwardCommands = [
+		{ type: 'recipe.delete', id: recipe.id },
+		{ type: 'shopping.generate', weekStart: '2026-10-19' },
+		{ type: 'shopping.delete', id: 'recipe-scoped' },
+		{ type: 'shopping.delete', id: weekItemId }
+	];
+	for (const ordered of [forwardCommands, [...forwardCommands].reverse()]) {
+		const cleared = applyButlerCommands(withWeek, ordered, now).state;
+		assert.deepEqual(cleared.shopping, [
+			{ id: 'manual-milk', name: 'milk', quantity: 1, unit: 'l', checked: false }
+		]);
+	}
 
 	assert.throws(() =>
 		applyButlerCommands(withWeek, [{ type: 'shopping.delete', id: 'never-existed' }], now)
@@ -1217,6 +1216,133 @@ test('combined cards skip already-cleared generated shopping removals but still 
 			now
 		)
 	);
+});
+
+test('grouped checked shopping removals and recipe-meal batches stay order-independent without double-retiring checked rows', () => {
+	const now = new Date('2026-10-20T18:00:00Z');
+	const base = createInitialState();
+	const recipe = {
+		...base.recipes[0],
+		id: 'roast-chicken',
+		servings: 2,
+		ingredients: [{ name: 'chicken', quantity: 12, unit: 'oz' }]
+	};
+	base.recipes = [recipe];
+	base.pantry = [];
+	base.meals = [
+		{ id: 'tuesday', date: '2026-10-20', slot: 'Dinner', recipeId: recipe.id, servings: 2 },
+		{ id: 'saturday', date: '2026-10-24', slot: 'Dinner', recipeId: recipe.id, servings: 2 }
+	];
+	base.shopping = [
+		{
+			id: 'checked-pack-1',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'checked-pack-2',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'checked-recipe-pack',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	];
+
+	// Moving one 12 oz checked pack into pantry alongside shopping.delete('checked-pack-1')
+	// retires checked-pack-1 and checked-recipe-pack once without double-retiring checked-pack-2 in either order.
+	const pantryUpsert = {
+		type: 'pantry.upsert' as const,
+		item: { id: 'pantry-chicken', name: 'chicken', quantity: 12, unit: 'oz', category: 'Meat' }
+	};
+	const deleteCheckedPack1 = { type: 'shopping.delete' as const, id: 'checked-pack-1' };
+	const pantryFirst = applyButlerCommands(base, [pantryUpsert, deleteCheckedPack1], now).state;
+	const deleteFirst = applyButlerCommands(base, [deleteCheckedPack1, pantryUpsert], now).state;
+	assert.deepEqual(deleteFirst, pantryFirst);
+	assert.equal(pantryFirst.pantry[0].quantity, 12);
+	assert.deepEqual(pantryFirst.shopping, [
+		{
+			id: 'checked-pack-2',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		}
+	]);
+
+	// Completing Tuesday's meal with deductPantry: true alongside shopping.delete('checked-pack-1')
+	// retires only Tuesday's 12 oz weekly demand in both command orders, preserving checked-pack-2 and checked-recipe-pack.
+	const completeTuesday = {
+		type: 'meal.complete' as const,
+		id: 'tuesday',
+		deductPantry: true
+	};
+	const completeFirst = applyButlerCommands(base, [completeTuesday, deleteCheckedPack1], now).state;
+	const deleteBeforeComplete = applyButlerCommands(
+		base,
+		[deleteCheckedPack1, completeTuesday],
+		now
+	).state;
+	assert.deepEqual(deleteBeforeComplete, completeFirst);
+	assert.deepEqual(completeFirst.shopping, [
+		{
+			id: 'checked-pack-2',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: 'week:2026-10-19'
+		},
+		{
+			id: 'checked-recipe-pack',
+			name: 'chicken',
+			quantity: 12,
+			unit: 'oz',
+			checked: true,
+			sourceKey: `recipe:${recipe.id}`
+		}
+	]);
+
+	// Reversed recipe.upsert + meal.upsert / recipe.open batches succeed identically to forward order.
+	const newRecipe = { ...recipe, id: 'sunday-soup', title: 'Sunday Soup' };
+	const newMeal = {
+		id: 'sunday-dinner',
+		date: '2026-10-25',
+		slot: 'Dinner' as const,
+		recipeId: 'sunday-soup',
+		servings: 2
+	};
+	const forwardPlan = applyButlerCommands(
+		base,
+		[
+			{ type: 'recipe.upsert', recipe: newRecipe },
+			{ type: 'meal.upsert', meal: newMeal },
+			{ type: 'recipe.open', id: 'sunday-soup', mode: 'detail' }
+		],
+		now
+	);
+	const reversePlan = applyButlerCommands(
+		base,
+		[
+			{ type: 'meal.upsert', meal: newMeal },
+			{ type: 'recipe.open', id: 'sunday-soup', mode: 'detail' },
+			{ type: 'recipe.upsert', recipe: newRecipe }
+		],
+		now
+	);
+	assert.deepEqual(reversePlan, forwardPlan);
 });
 
 test('validation rejects AI connection mutations and sync-invalid fields while accepted states pass validateAppState', async () => {
