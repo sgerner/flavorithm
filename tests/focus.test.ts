@@ -6,6 +6,7 @@ import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { compile } from 'svelte/compiler';
 import * as focusMod from '../src/lib/focus.ts';
+import * as formValidationMod from '../src/lib/form-validation.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
 import * as recipeDetailMod from '../src/lib/recipe-detail.ts';
 import * as recipeDraftMod from '../src/lib/recipe-draft.ts';
@@ -951,6 +952,7 @@ const ToggleButton = compileClientComponent('src/lib/components/ToggleButton.sve
 const RecipeDetail = compileClientComponent('src/lib/components/RecipeDetail.svelte', {
 	'#lib/components/ModalDialog.svelte': { __esModule: true, default: ModalDialog },
 	'#lib/components/ToggleButton.svelte': { __esModule: true, default: ToggleButton },
+	'#lib/form-validation.ts': formValidationMod,
 	'#lib/recipe-cover.ts': coverMod,
 	'#lib/recipe-draft.ts': recipeDraftMod,
 	'#lib/recipe-detail.ts': recipeDetailMod

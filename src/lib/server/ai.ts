@@ -342,7 +342,7 @@ type AIRequest = z.infer<typeof AIRequestSchema>;
 type ModelResultSchema = keyof typeof SUPPORTED_JSON_SCHEMAS;
 type Fetcher = typeof fetch;
 type RecipePagePolicy = 'import' | 'capture';
-type SecureRecipePageFetcher = (
+export type SecureRecipePageFetcher = (
 	url: string,
 	policy?: RecipePagePolicy,
 	signal?: AbortSignal
@@ -350,12 +350,6 @@ type SecureRecipePageFetcher = (
 
 const secureRecipePageFetcher: SecureRecipePageFetcher = (url, policy = 'import', signal) =>
 	policy === 'capture' ? fetchCaptureRecipePage(url, { signal }) : fetchRecipePage(url, { signal });
-
-let recipePageFetcherForTests: SecureRecipePageFetcher | undefined;
-
-export function setRecipePageFetcherForTests(fetcher: SecureRecipePageFetcher | undefined): void {
-	recipePageFetcherForTests = fetcher;
-}
 
 export async function runAIRequest(
 	input: unknown,
@@ -1505,15 +1499,7 @@ async function captureRecipe(
 		if (!/^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType)) {
 			throw new AIRequestError('The selected page did not return HTML.', 415);
 		}
-		let html: string;
-		try {
-			html = await response.text();
-		} catch {
-			throw new AIRequestError('Recipe page could not be read.', 502);
-		}
-		if (new TextEncoder().encode(html).byteLength > MAX_RECIPE_PAGE_BYTES) {
-			throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
-		}
+		const html = await decodeRecipePageHtml(response, contentType);
 		sourceRecipe = extractJsonLdRecipe(html);
 		sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
 		if (!sourceRecipe) {
@@ -1593,13 +1579,72 @@ export type RecipeUrlImportFallback = {
 	fetcher?: Fetcher;
 };
 
+function extractHtmlCharset(rawBytes: Uint8Array, contentType: string): string {
+	if (
+		rawBytes.byteLength >= 3 &&
+		rawBytes[0] === 0xef &&
+		rawBytes[1] === 0xbb &&
+		rawBytes[2] === 0xbf
+	) {
+		return 'utf-8';
+	}
+	if (rawBytes.byteLength >= 2 && rawBytes[0] === 0xff && rawBytes[1] === 0xfe) {
+		return 'utf-16le';
+	}
+	if (rawBytes.byteLength >= 2 && rawBytes[0] === 0xfe && rawBytes[1] === 0xff) {
+		return 'utf-16be';
+	}
+
+	const headerMatch = /;\s*charset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s;]+))/i.exec(contentType);
+	const headerCharset = (headerMatch?.[1] ?? headerMatch?.[2] ?? headerMatch?.[3] ?? '').trim();
+	if (headerCharset) return headerCharset;
+
+	const headPreview = new TextDecoder('latin1').decode(rawBytes.subarray(0, 1024));
+	for (const tagMatch of headPreview.matchAll(/<meta\b[^>]*>/gi)) {
+		const tag = tagMatch[0];
+		const directCharset = /\bcharset\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s"';/>]+))/i.exec(tag);
+		const hasHttpEquivContentType =
+			/\bhttp-equiv\s*=\s*(?:"content-type"|'content-type'|content-type\b)/i.test(tag);
+		if (!hasHttpEquivContentType && directCharset) {
+			const label = (directCharset[1] ?? directCharset[2] ?? directCharset[3] ?? '').trim();
+			if (label) return label;
+		}
+		if (hasHttpEquivContentType) {
+			const contentAttr = /\bcontent\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(tag);
+			const contentVal = contentAttr?.[1] ?? contentAttr?.[2] ?? contentAttr?.[3] ?? '';
+			const metaCharset = /;\s*charset\s*=\s*([^\s;]+)/i.exec(contentVal)?.[1]?.trim();
+			if (metaCharset) return metaCharset.replace(/^["']|["']$/g, '');
+		}
+	}
+
+	return 'utf-8';
+}
+
+async function decodeRecipePageHtml(response: Response, contentType: string): Promise<string> {
+	let rawBytes: Uint8Array;
+	try {
+		rawBytes = new Uint8Array(await response.arrayBuffer());
+	} catch {
+		throw new AIRequestError('Recipe page could not be read.', 502);
+	}
+	if (rawBytes.byteLength > MAX_RECIPE_PAGE_BYTES) {
+		throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
+	}
+	const charset = extractHtmlCharset(rawBytes, contentType);
+	try {
+		return new TextDecoder(charset).decode(rawBytes);
+	} catch {
+		return new TextDecoder('utf-8').decode(rawBytes);
+	}
+}
+
 export async function importRecipeFromUrl(
 	input: {
 		url: string;
 		authenticated?: boolean;
 		resolveFallback?: () => Promise<RecipeUrlImportFallback | null>;
 	},
-	pageFetcher: SecureRecipePageFetcher = recipePageFetcherForTests ?? secureRecipePageFetcher,
+	pageFetcher: SecureRecipePageFetcher = secureRecipePageFetcher,
 	requestSignal?: AbortSignal
 ): Promise<{ recipe: Recipe; assumptions: string[] }> {
 	const rawUrl = input.url?.trim() ?? '';
@@ -1615,15 +1660,7 @@ export async function importRecipeFromUrl(
 	if (!/^text\/html\b|^application\/xhtml\+xml\b/i.test(contentType)) {
 		throw new AIRequestError('The selected page did not return HTML.', 415);
 	}
-	let html: string;
-	try {
-		html = await response.text();
-	} catch {
-		throw new AIRequestError('Recipe page could not be read.', 502);
-	}
-	if (new TextEncoder().encode(html).byteLength > MAX_RECIPE_PAGE_BYTES) {
-		throw new AIRequestError('Recipe page is larger than 1 MB.', 413);
-	}
+	const html = await decodeRecipePageHtml(response, contentType);
 
 	const sourceUrl = canonicalRecipeUrl(html, selectedUrl, validateCaptureRecipeUrl, true);
 	const structured = extractScrapedRecipe(html);
@@ -1639,9 +1676,9 @@ export async function importRecipeFromUrl(
 	const fallback = input.resolveFallback ? await input.resolveFallback() : null;
 	if (!fallback) {
 		throw new AIRequestError(
-			input.authenticated
-				? 'This page does not include structured recipe data. Connect a model in Settings to extract it, or paste the recipe text.'
-				: 'This page does not include structured recipe data. Create an account and connect a model in Settings to extract it, or paste the recipe text.',
+			input.authenticated === false
+				? 'This page does not include structured recipe data. Sign in and connect a model in Settings to extract it, or paste the recipe text.'
+				: 'This page does not include structured recipe data. Connect a model in Settings to extract it, or paste the recipe text.',
 			422
 		);
 	}
