@@ -33,7 +33,6 @@
 	import { recipePlaceholder, recipeImageError } from '#lib/recipe-cover.ts';
 	import { onMount, tick, untrack } from 'svelte';
 	import type { PageData } from './$types';
-	import { focusTrap } from '#lib/focus.ts';
 	import {
 		focusFirstInvalid,
 		validateEmail,
@@ -46,14 +45,7 @@
 		validateRegistrationName
 	} from '#lib/form-validation.ts';
 	import FormField from '#lib/components/FormField.svelte';
-	import {
-		backdropMotion,
-		dialogMotion,
-		revealMotion,
-		fadeMotion,
-		motionDuration,
-		prefersReducedMotion
-	} from '#lib/motion.ts';
+	import { revealMotion, fadeMotion, motionDuration, prefersReducedMotion } from '#lib/motion.ts';
 	import { calendarDayScrollLeft, weekOffsetFromStarts } from '#lib/planner.ts';
 	import { flip } from 'svelte/animate';
 	import {
@@ -153,6 +145,8 @@
 		MAX_RECIPES,
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
+	import ModalDialog from '#lib/components/ModalDialog.svelte';
+	import MobileDrawer from '#lib/components/MobileDrawer.svelte';
 	import { applyRecipeRating } from '#lib/recipe-detail.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
@@ -355,6 +349,9 @@
 		if (!silent && wasBusy) notify('Photo scan cancelled.');
 	}
 	let mobileNav = $state(false);
+	let mobileViewport = $state(false);
+	let mobileMenuButton = $state<HTMLButtonElement | null>(null);
+	let mobileDrawerOpen = $derived(mobileViewport && mobileNav);
 	let mobileCalendar = $state(
 		typeof window !== 'undefined' &&
 			typeof window.matchMedia === 'function' &&
@@ -429,6 +426,7 @@
 			notify('Sign-in is unavailable because authentication is misconfigured.');
 			return;
 		}
+		mobileNav = false;
 		modal = 'auth';
 	}
 	function clearHouseholdViewState() {
@@ -538,6 +536,7 @@
 	let voiceTarget = $state<VoiceTarget | ''>('');
 	let shoppingVoiceInput = $state(false);
 	let shoppingMicButton = $state<HTMLButtonElement>();
+	let pantryVoiceButton = $state<HTMLButtonElement>();
 	let voiceSessionEl = $state<HTMLDivElement>();
 	let voiceStopButton = $state<HTMLButtonElement>();
 	let voiceCancelButton = $state<HTMLButtonElement>();
@@ -1528,6 +1527,14 @@
 			if (online) void reconnectKitchen();
 			else if (managedAuth) clearManagedIdentity();
 		};
+		const mobileMedia =
+			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
+		const syncMobileViewport = () => {
+			mobileViewport = Boolean(mobileMedia?.matches);
+			if (!mobileMedia?.matches && mobileNav) mobileNav = false;
+		};
+		syncMobileViewport();
+		mobileMedia?.addEventListener('change', syncMobileViewport);
 		const calendarMedia =
 			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
 		const calendarMediaChanged = () => {
@@ -1539,6 +1546,7 @@
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
 		return () => {
+			mobileMedia?.removeEventListener('change', syncMobileViewport);
 			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
@@ -2885,22 +2893,47 @@
 			Boolean(voiceSessionEl?.contains(active))
 		);
 	}
+	function isInteractiveFocusElement(el: HTMLElement | null | undefined): el is HTMLElement {
+		return Boolean(
+			el &&
+			el.isConnected &&
+			!(el as HTMLButtonElement).disabled &&
+			!el.closest?.('[inert], [hidden]')
+		);
+	}
 	function scheduleVoiceIdleFocus(endedTarget: VoiceTarget | '', restoreEl: HTMLElement | null) {
-		if (!endedTarget || !restoreEl) return;
+		if (!endedTarget) return;
 		void tick().then(() => {
 			if (
-				!voiceBusy &&
-				!voiceRetained &&
-				isVoiceTargetActive(endedTarget, {
+				voiceBusy ||
+				voiceRetained ||
+				!isVoiceTargetActive(endedTarget, {
 					modal,
 					page,
 					overlay: voiceOverlay,
 					reviewingDraft: isReviewingImportDraft(importSession)
-				}) &&
-				restoreEl.isConnected &&
-				!(restoreEl as HTMLButtonElement).disabled
+				})
 			) {
-				restoreEl.focus();
+				return;
+			}
+			if (isInteractiveFocusElement(restoreEl)) {
+				restoreEl.focus({ preventScroll: true });
+				return;
+			}
+			if (endedTarget === 'pantry' && isInteractiveFocusElement(pantryVoiceButton)) {
+				pantryVoiceButton.focus({ preventScroll: true });
+				return;
+			}
+			if (typeof document !== 'undefined') {
+				const activeDialog = document.querySelector<HTMLElement>('[aria-modal="true"]');
+				if (activeDialog && !activeDialog.contains(document.activeElement)) {
+					const dialogControl = activeDialog.querySelector<HTMLElement>(
+						'button:not([disabled]):not([tabindex="-1"]), textarea:not([disabled]):not([tabindex="-1"]), input:not([disabled]):not([tabindex="-1"])'
+					);
+					(isInteractiveFocusElement(dialogControl) ? dialogControl : activeDialog).focus({
+						preventScroll: true
+					});
+				}
 			}
 		});
 	}
@@ -3911,6 +3944,17 @@
 			busy = false;
 		}
 	}
+	let recipeEditor = $state<RecipeEditor>();
+	function closeRecipeDetail() {
+		selected = null;
+		selectedMealServings = undefined;
+		selectedDetailTab = 'recipe';
+	}
+	function closeRecipeEditor() {
+		editingRecipe = null;
+		editingRecipeMode = 'edit';
+		error = '';
+	}
 	function closeDialog() {
 		if (
 			modal === 'settings' &&
@@ -3942,7 +3986,7 @@
 			currentInviteId = '';
 		}
 		if ((modal === 'pantry' || modal === 'import') && voiceTarget === modal) {
-			clearVoiceSession();
+			clearVoiceSession(false);
 		}
 		if (modal === 'onboarding') dismissOnboarding();
 		else if (pendingAIContinuation && modal === 'delete') {
@@ -3953,13 +3997,42 @@
 		) {
 			if (isAIReady()) restoreAIContinuation();
 			else dismissAIContinuation();
-		} else {
+		} else if (modal) {
 			const next = resolveClosedDialog(modal, resumeDialog);
 			resumeDialog = next.resumeDialog;
 			modal = next.modal;
 		}
 		formSubmitted = false;
 		error = '';
+	}
+	function handleWindowKeydown(e: KeyboardEvent) {
+		if (e.key !== 'Escape' || e.defaultPrevented) return;
+		if (modal) {
+			e.preventDefault?.();
+			closeDialog();
+		} else if (editingRecipe) {
+			e.preventDefault?.();
+			if (recipeEditor) void recipeEditor.requestCancel();
+			else closeRecipeEditor();
+		} else if (selected) {
+			e.preventDefault?.();
+			closeRecipeDetail();
+		} else if (butlerOpen) {
+			e.preventDefault?.();
+			void butlerChat?.close();
+		} else if (mobileNav) {
+			e.preventDefault?.();
+			mobileNav = false;
+		} else if (page === 'shopping' && voiceTarget === 'shopping' && voiceBusy) {
+			e.preventDefault?.();
+			clearVoiceSession();
+		} else if (page === 'shopping' && editingShoppingId) {
+			e.preventDefault?.();
+			void cancelEditingShoppingItem();
+		} else if (pantryDraft) {
+			e.preventDefault?.();
+			void cancelPantryEdit();
+		}
 	}
 	function openImport(text?: string) {
 		if (pendingAIContinuation?.kind === 'import') pendingAIContinuation = null;
@@ -4362,27 +4435,6 @@
 			busy = false;
 		}
 	}
-	function handleWindowKeydown(e: KeyboardEvent) {
-		if (e.key !== 'Escape') return;
-		const overlayOpen = Boolean(modal || selected || editingRecipe || butlerOpen || mobileNav);
-		if (!overlayOpen && pantryDraft) {
-			void cancelPantryEdit();
-		}
-		mobileNav = false;
-		if (modal) closeDialog();
-		else if (editingRecipe) {
-			editingRecipe = null;
-			editingRecipeMode = 'edit';
-		} else if (selected) {
-			selected = null;
-			selectedMealServings = undefined;
-			selectedDetailTab = 'recipe';
-		}
-		if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
-			e.preventDefault();
-			void cancelEditingShoppingItem();
-		}
-	}
 </script>
 
 {#snippet voiceSession()}
@@ -4436,7 +4488,7 @@
 {/snippet}
 
 {#if ready}
-	<div inert={!!modal || !!selected || !!editingRecipe}>
+	<div inert={!!modal || !!selected || !!editingRecipe || mobileDrawerOpen}>
 		<ButlerChat
 			bind:this={butlerChat}
 			bind:open={butlerOpen}
@@ -4459,7 +4511,11 @@
 <input
 	class="visually-hidden"
 	tabindex="-1"
-	inert={(!!modal && modal !== 'pantry') || !!selected || !!editingRecipe || butlerOpen}
+	inert={(!!modal && modal !== 'pantry') ||
+		!!selected ||
+		!!editingRecipe ||
+		butlerOpen ||
+		mobileDrawerOpen}
 	type="file"
 	accept={SCAN_PHOTO_ACCEPT}
 	aria-label="Scan pantry ingredients from a photo"
@@ -4469,22 +4525,17 @@
 />
 <a
 	class="skip-link"
-	inert={!!modal || !!selected || !!editingRecipe || butlerOpen}
+	inert={!!modal || !!selected || !!editingRecipe || butlerOpen || mobileDrawerOpen}
 	href="#kitchen-content">Skip to kitchen content</a
 >
 <div class="app-shell" inert={!!modal || !!selected || !!editingRecipe || butlerOpen}>
-	{#if mobileNav}<button
-			class="nav-backdrop"
-			aria-label="Dismiss navigation"
-			onclick={() => (mobileNav = false)}
-			transition:backdropMotion|global
-		></button>{/if}
-	<aside class:mobile-open={mobileNav} class="sidebar">
-		<button
-			class="icon-button sidebar-close"
-			aria-label="Close navigation"
-			onclick={() => (mobileNav = false)}><X size={20} /></button
-		>
+	<MobileDrawer
+		open={mobileNav}
+		modal={mobileDrawerOpen}
+		hidden={mobileViewport && !mobileNav}
+		trigger={mobileMenuButton}
+		onclose={() => (mobileNav = false)}
+	>
 		<a class="brand" href="/" aria-label="Flavorithm home"
 			><img src="/favicon.svg" alt="" /><span>flavorithm<span class="brand-dot">✳</span></span></a
 		>
@@ -4528,11 +4579,14 @@
 				></span
 			><ArrowUpRight size={16} /></button
 		>
-	</aside>
-	<main id="kitchen-content" tabindex="-1">
+	</MobileDrawer>
+	<main id="kitchen-content" tabindex="-1" inert={mobileDrawerOpen}>
 		<header class="topbar">
 			<button
 				class="icon-button mobile-menu"
+				bind:this={mobileMenuButton}
+				aria-expanded={mobileNav}
+				aria-controls="kitchen-sidebar"
 				onclick={() => (mobileNav = !mobileNav)}
 				aria-label="Toggle navigation"><Menu size={22} /></button
 			>
@@ -5527,11 +5581,7 @@
 				cookingSteps[cookingSessionKey] = steps;
 			}
 		}
-		close={() => {
-			selected = null;
-			selectedMealServings = undefined;
-			selectedDetailTab = 'recipe';
-		}}
+		close={closeRecipeDetail}
 		save={() => saveRecipe(selected!)}
 		shop={(servings) =>
 			shoppingFor(
@@ -5558,974 +5608,954 @@
 		}}
 	/>{/if}
 {#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
+			bind:this={recipeEditor}
 			recipe={editingRecipe}
 			mode={editingRecipeMode}
 			canUploadCover={Boolean(user) && online}
-			cancel={() => {
-				editingRecipe = null;
-				editingRecipeMode = 'edit';
-			}}
+			cancel={closeRecipeEditor}
 			save={saveEditedRecipe}
 		/>{/key}{/if}
-{#if modal}<div class="modal-backdrop" transition:backdropMotion|global>
-		{#key modal}
-			<div
-				class="flavor-dialog"
-				class:onboarding-dialog={modal === 'onboarding'}
-				use:focusTrap
-				class:wide={modal === 'settings' ||
-					modal === 'pickRecipe' ||
-					modal === 'import' ||
-					modal === 'editMeal' ||
-					modal === 'cookMeal'}
-				class:capture-dialog={modal === 'import'}
-				role="dialog"
-				aria-labelledby={modal === 'import' ? 'recipe-import-title' : undefined}
-				aria-modal="true"
-				aria-label={dialogNames[modal] || 'Kitchen dialog'}
-				tabindex="-1"
-				transition:dialogMotion|global
-			>
-				{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
-
-				<button
-					class="icon-button dialog-close"
-					onclick={() => {
-						closeDialog();
-					}}
-					aria-label="Close dialog"><X size={21} /></button
-				>
-				{#if modal === 'import'}<RecipeImport
-						bind:session={importSession}
-						capture={captureImport}
-						save={saveImportedRecipe}
-						dictate={dictateRecipe}
-						{voiceBusy}
-					/>{:else if modal === 'onboarding'}
-					<span class="dialog-spark">✷</span>
-					<h2>Recipe preferences</h2>
-					<p class="muted onboarding-intro">
-						Optional. Change these preferences anytime in Settings.
-					</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={finishOnboarding}>
-						<fieldset class="quiz-group">
-							<legend>Preferred cooking time</legend>
-							<div class="quiz-options quiz-time">
-								{#each [15, 30, 45, 60] as minutes}<label class="quiz-option"
-										><input
-											type="radio"
-											name="cooking-time"
-											value={minutes}
-											bind:group={quizTime}
-										/><span>{minutes} min</span></label
-									>{/each}
-							</div>
-						</fieldset>
-						<fieldset class="quiz-group" aria-describedby="quiz-cuisines-help">
-							<legend>Favorite cuisines</legend>
-							<p class="quiz-help" id="quiz-cuisines-help">
-								Choose any, or leave blank for all cuisines.
-							</p>
-							<div class="quiz-options quiz-cuisines">
-								{#each cuisineChoices as cuisine}<label class="quiz-option"
-										><input
-											type="checkbox"
-											value={cuisine}
-											aria-invalid="false"
-											bind:group={quizCuisines}
-										/><span>{cuisine}</span></label
-									>{/each}
-							</div>
-						</fieldset>
-						<fieldset class="quiz-group">
-							<legend>Cooking complexity</legend>
-							<div class="quiz-options quiz-complexity">
-								{#each ['Easy', 'Moderate', 'Adventurous'] as complexity}<label class="quiz-option"
-										><input
-											type="radio"
-											name="cooking-complexity"
-											value={complexity}
-											bind:group={quizComplexity}
-										/><span>{complexity}</span></label
-									>{/each}
-							</div>
-						</fieldset>
-						<details class="quiz-dietary">
-							<summary>Any dietary preferences or allergies? <span>Optional</span></summary>
-							<FormField id="onboarding-diet" label="Dietary style">
-								{#snippet children(field)}
-									<select bind:value={quizDiet} {...field}
-										><option value="none">No dietary restriction</option><option value="vegetarian"
-											>Vegetarian</option
-										><option value="vegan">Vegan</option><option value="pescatarian"
-											>Pescatarian</option
-										><option value="gluten-free">Gluten-free</option><option value="dairy-free"
-											>Dairy-free</option
-										></select
-									>
-								{/snippet}
-							</FormField>
-							<FormField
-								id="onboarding-allergies"
-								label="Allergies or ingredients to avoid"
-								help="These guide generation. Check ingredients and labels before cooking."
-							>
-								{#snippet children(field)}
-									<input
-										bind:value={quizAllergies}
-										maxlength="2000"
-										placeholder="e.g. peanuts, shellfish"
-										{...field}
-									/>
-								{/snippet}
-							</FormField>
-						</details>
-						<div class="dialog-actions quiz-actions">
-							<button class="primary" type="submit">Save preferences <Check size={17} /></button
-							><button class="text-button" type="button" onclick={dismissOnboarding}
-								>Maybe later</button
-							>
-						</div>
-					</form>
-				{:else if modal === 'pantry'}<span class="dialog-spark">✳</span>
-					<h2>Add ingredients</h2>
-					{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
-							<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
-							<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
-						</div>{/if}
-					<form novalidate bind:this={dialogFormEl} onsubmit={addIngredients}>
-						<FormField
-							id="pantry-ingredients"
-							label="Ingredients"
-							help="Separate with commas or new lines. Add quantities and units when you know them."
-							error={pantryFieldError}
-							alert
-						>
-							{#snippet children(field)}
-								<textarea
-									bind:value={pantryInput}
-									maxlength="20000"
-									placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
-									rows="5"
-									{...field}></textarea>
-							{/snippet}
-						</FormField>
-						{#if stagedScanFile}<div class="staged-scan" role="status">
-								<span>Photo staged: <b>{stagedScanFile.name}</b></span>
-								<div class="staged-scan-actions">
-									<button
-										class="secondary"
-										type="button"
-										disabled={scanBusy || busy || voiceBusy}
-										onclick={() => stagedScanFile && scanPantryPhoto(stagedScanFile)}
-										>{scanBusy ? 'Scanning…' : 'Scan photo'}</button
-									><button
-										class="text-button"
-										type="button"
-										disabled={scanBusy || busy || voiceBusy}
-										onclick={() => (stagedScanFile = null)}>Remove</button
-									>
-								</div>
-							</div>{/if}
-						<div class="dialog-actions">
-							<button type="button" class="secondary" disabled={voiceBusy || busy} onclick={dictate}
-								><Mic size={17} /> Use voice</button
-							><button
-								type="button"
-								class="secondary"
-								aria-busy={scanBusy}
-								onclick={() => imageInput.click()}
-								disabled={scanBusy || busy || voiceBusy}
-								><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
-							><button type="submit" class="primary" disabled={voiceBusy || busy}
-								>Add ingredients <ArrowRight size={17} /></button
-							>
-						</div>
-					</form>
-				{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
-					<h2>Managed by your organization</h2>
-					<p class="muted">
-						Your account and access are managed by your organization's identity provider.
-					</p>
-					{#if providerLoginUrl}<a class="primary full" href={providerLoginUrl}
-							>Continue with organization sign-in <ArrowRight size={17} /></a
-						>{:else}<p class="muted">
-							Sign in through your organization's access proxy, then reload Flavorithm.
-						</p>{/if}
-				{:else if modal === 'auth'}<span class="dialog-spark">✳</span>
-					<h2>{authMode === 'register' ? 'Create an account' : 'Sign in'}</h2>
-					<p class="muted">Sync your pantry, recipes, and household.</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={authenticate}>
-						{#if authMode === 'register'}<FormField
-								id="auth-name"
-								label="Your name"
-								help="Use 2 to 80 characters."
-								error={authNameError}
-							>
-								{#snippet children(field)}
-									<input maxlength="80" autocomplete="name" bind:value={name} {...field} />
-								{/snippet}
-							</FormField>{/if}
-						<FormField
-							id="auth-email"
-							label="Email address"
-							error={authEmailError}
-							errorId={error ? 'auth-form-error' : undefined}
-							invalid={Boolean(authEmailError || error)}
-						>
-							{#snippet children(field)}
-								<input type="email" autocomplete="email" bind:value={email} {...field} />
-							{/snippet}
-						</FormField>
-						<FormField
-							id="auth-password"
-							label="Password"
-							help={authMode === 'register'
-								? 'Use 10 to 128 characters.'
-								: 'Enter your account password.'}
-							error={authPasswordError}
-							errorId={error && authMode === 'login' ? 'auth-form-error' : undefined}
-							invalid={Boolean(authPasswordError || (error && authMode === 'login'))}
-						>
-							{#snippet children(field)}
-								<input
-									type="password"
-									maxlength="128"
-									autocomplete={authMode === 'register' ? 'new-password' : 'current-password'}
-									bind:value={password}
-									{...field}
-								/>
-							{/snippet}
-						</FormField>
-						{#if authMode === 'login' && capabilities.emailDelivery}<button
-								type="button"
-								class="text-button"
-								onclick={() => {
-									modal = 'recover';
-									formSubmitted = false;
-									error = '';
-								}}>Forgot your password?</button
-							>{/if}{#if error || authValidationSummary}<p
-								class="error"
-								id="auth-form-error"
-								role="alert"
-							>
-								{error || authValidationSummary}
-							</p>{/if}<button type="submit" class="primary full" disabled={busy}
-							>{busy
-								? 'Opening your kitchen…'
-								: authMode === 'register'
-									? 'Create account'
-									: 'Sign in'}<ArrowRight size={17} /></button
-						>
-					</form>
-					<button
-						class="text-button full"
-						onclick={() => {
-							authMode = authMode === 'register' ? 'login' : 'register';
-							formSubmitted = false;
-							error = '';
-						}}
-						>{authMode === 'register'
-							? 'Already have a kitchen? Sign in'
-							: 'New around here? Create an account'}</button
-					>
-				{:else if modal === 'generate'}<span class="dialog-spark">✴</span>
-					<h2>Generate recipes</h2>
-					<p class="muted">
-						Uses your pantry and preferences. Recipes may include additional ingredients.
-					</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={generate}>
-						<FormField
-							id="generate-prompt"
-							label="What are you in the mood for?"
-							errorId={error ? 'generate-form-error' : undefined}
-							invalid={Boolean(error)}
-						>
-							{#snippet children(field)}
-								<textarea
-									rows="3"
-									bind:value={prompt}
-									placeholder="e.g. a spicy vegetarian dinner in 30 minutes"
-									{...field}></textarea>
-							{/snippet}
-						</FormField>
-						<div class="two-fields">
-							<FormField id="generate-time" label="Time to cook">
-								{#snippet children(field)}
-									<select bind:value={kitchen.preferences.maxTime} {...field}
-										><option value={15}>15 minutes</option><option value={30}>30 minutes</option
-										><option value={45}>45 minutes</option><option value={60}>An hour</option
-										><option value={120}>A slow afternoon</option></select
-									>
-								{/snippet}
-							</FormField>
-							<FormField id="generate-diet" label="Dietary style">
-								{#snippet children(field)}
-									<select bind:value={kitchen.preferences.diet} {...field}
-										><option value="none">A bit of everything</option><option>Vegetarian</option
-										><option>Vegan</option><option>Pescatarian</option><option>Gluten-free</option
-										><option>Low-carb</option></select
-									>
-								{/snippet}
-							</FormField>
-						</div>
-						<FormField
-							id="generate-allergies"
-							label="Allergies & ingredients to avoid"
-							help="Check all ingredients and substitutions against your allergies before cooking."
-						>
-							{#snippet children(field)}
-								<input
-									bind:value={kitchen.preferences.allergies}
-									maxlength="2000"
-									placeholder="e.g. peanuts, shellfish"
-									{...field}
-								/>
-							{/snippet}
-						</FormField>
-						{#if error}<p class="error" id="generate-form-error" role="alert">
-								{error}
-							</p>{/if}<button type="submit" class="primary full" disabled={busy}
-							><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
-						>
-					</form>
-				{:else if modal === 'settings'}
-					<h2>Settings</h2>
-					<div class="settings-section">
-						<h3>Appearance</h3>
-						<div class="theme-grid" role="group" aria-label="Color theme">
-							{#each themes as theme}<ToggleButton
-									class={{ active: kitchen.preferences.theme === theme }}
-									pressed={kitchen.preferences.theme === theme}
-									onclick={() => (kitchen.preferences.theme = theme)}
-									>{theme}{#if kitchen.preferences.theme === theme}<Check
-											size={13}
-											aria-hidden="true"
-										/>{/if}</ToggleButton
-								>{/each}
-						</div>
-						<ToggleButton
-							class={{ secondary: true, active: kitchen.preferences.dark }}
-							pressed={kitchen.preferences.dark}
-							onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
-							>{#if kitchen.preferences.dark}<Sun size={16} aria-hidden="true" />{:else}<Moon
-									size={16}
-									aria-hidden="true"
-								/>{/if}Dark appearance</ToggleButton
-						>
-					</div>
-
-					<div class="settings-section">
-						<h3>Recipe preferences</h3>
-						<p class="muted">
-							{kitchen.preferences.maxTime} minutes · {kitchen.preferences.complexity} · {kitchen.preferences.cuisines?.join(
-								', '
-							) || 'Open to every cuisine'}
-						</p>
-						<button class="secondary" onclick={openOnboarding}
-							>Edit my taste preferences <SlidersHorizontal size={16} /></button
-						>
-					</div>
-					{#if user}<div class="settings-section">
-							<h3>{managedAuth ? 'Organization account' : 'Account email'}</h3>
-							<p class="muted">
-								{user.email}{managedAuth
-									? ' · Managed by your identity provider'
-									: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
-							</p>
-							{#if !managedAuth}
-								{#if user.emailVerified}<p class="muted">
-										Email verification is optional for using your kitchen.
-									</p>{:else}<button
-										class="secondary"
-										aria-describedby={!capabilities.emailDelivery
-											? 'settings-email-delivery-help'
-											: undefined}
-										disabled={!capabilities.emailDelivery || verificationBusy}
-										onclick={sendEmailVerification}
-										>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
-									>{#if !capabilities.emailDelivery}<p
-											class="field-help"
-											id="settings-email-delivery-help"
-										>
-											Email delivery is unavailable. Ask the server operator to configure email
-											delivery.
-										</p>{/if}{/if}
-							{/if}
-						</div>{/if}
-					<div class="settings-section">
-						<VoiceSettings
-							bind:provider={voiceProvider}
-							bind:model={voiceModel}
-							bind:apiKey={voiceApiKey}
-							localAvailable={localVoiceAvailable}
-							userId={user?.id}
-						/>
-					</div>
-					<div class="settings-section intelligence-settings">
-						<AIConnection
-							bind:preferences={kitchen.preferences}
-							bind:apiKey
-							{providers}
-							{accountModels}
-							{chatGPT}
-							activeAccount={activeChatGPTAccount}
-							signedIn={Boolean(user)}
-							{managedAuth}
-							busy={connectionBusy}
-							loading={catalogLoading}
-							{catalogError}
-							authorizationUrl={chatGPTAuthorizationUrl}
-							device={chatGPTDevice}
-							oncancel={cancelChatGPTDevice}
-							oncopycode={copyChatGPTDeviceCode}
-							onselect={(id) => changeConnection(id)}
-							onaccount={() => changeConnection()}
-							onconnect={connectChatGPT}
-							ondisconnect={disconnectChatGPT}
-							onrefresh={refreshAISettings}
-							onsignin={openAuthentication}
-							onoverride={() => {
-								void loadModelCatalog();
-							}}
-						/>
-					</div>
-
-					{#if hasSampleRecords}<div class="settings-section">
-							<h3>Sample data</h3>
-							<p class="muted">
-								Remove untouched starter ingredients, planned meals, and saved recipe bookmarks
-								while keeping everything you added or edited.
-							</p>
-							<div class="dialog-actions">
-								<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
-							</div>
-						</div>{/if}
-					<div class="settings-section">
-						<h3>Your data</h3>
-						<p class="muted">
-							{#if !user}
-								Export the kitchen saved in this browser as JSON.
-							{:else if managedAuth}
-								Export your account and shared kitchen.
-							{:else}
-								Export your account and shared kitchen, or permanently remove your account.
-							{/if}
-						</p>
-						<div class="dialog-actions">
-							<button class="secondary" onclick={exportKitchen}
-								><Download size={16} /> Export my data</button
-							>{#if user && !managedAuth}<button
-									class="text-button danger"
-									onclick={() => {
-										modal = 'delete';
-										error = '';
-									}}>Delete account</button
-								>{/if}
-						</div>
-					</div>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<div class="dialog-actions">
-						{#if user && (!managedAuth || providerLogoutUrl)}<button
-								class="text-button"
-								onclick={logout}><LogOut size={16} /> Sign out</button
-							>{:else if user && managedAuth}<span class="muted"
-								>Sign-out is managed by your access proxy.</span
-							>{:else if !user && !managedAuth}<button
-								class="text-button"
-								onclick={openAuthentication}>Create an account</button
-							>{:else if !user}<button class="text-button" onclick={openAuthentication}
-								>Organization sign-in</button
-							>{/if}{#if deferredInstall}<button
-								class="secondary"
-								onclick={() => deferredInstall.prompt()}>Install app</button
-							>{/if}<button
-							class="primary"
-							onclick={() => {
-								closeDialog();
-								notify('Preferences saved.');
-							}}>Done <Check size={17} /></button
-						>
-					</div>
-				{:else if modal === 'household'}
-					{@const showSoloHouseholdHelp =
-						members.length <= 1 && (members.length === 1 || !householdBusy)}
-					<span class="dialog-spark">✳</span>
-					<h2>Your household</h2>
-					<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
-					{#if householdBusy}<p class="muted" role="status">Updating household…</p>{/if}
-					<div class="household-members">
-						{#each members as member (member.id)}<div class="member-row">
-								<span class="profile-avatar"
-									>{member.name.trim().charAt(0).toUpperCase() || '•'}</span
-								>
-								<div class="member-copy">
-									<b>{member.name}{member.id === user?.id ? ' · You' : ''}</b><span
-										>{member.email}</span
-									>
-								</div>
-								<span class="member-role" class:owner-role={member.role === 'owner'}
-									>{member.role === 'owner' ? 'Owner' : 'Member'}</span
-								>
-								{#if canManageHousehold && member.role !== 'owner' && member.id !== user?.id}<button
-										class="text-button danger member-remove"
-										disabled={householdBusy}
-										onclick={() => askRemoveMember(member)}>Remove</button
-									>{/if}
-							</div>{/each}
-					</div>
-					{#if canManageHousehold}<section class="household-invites">
-							<h3>Invitations</h3>
-							{#if householdInvites.length}<div class="invite-list">
-									{#each householdInvites as invite (invite.inviteId)}<div class="invite-row">
-											<span
-												>Expires {new Date(invite.expiresAt).toLocaleDateString('en', {
-													month: 'short',
-													day: 'numeric'
-												})}</span
-											><button
-												class="text-button danger"
-												disabled={householdBusy}
-												onclick={() => revokeInvite(invite.inviteId)}>Revoke</button
-											>
-										</div>{/each}
-								</div>{:else}<p class="muted">No active invitations.</p>{/if}
-							<button class="primary full" disabled={householdBusy} onclick={invite}
-								><Plus size={17} /> Create invitation</button
-							>
-							{#if inviteCode}<div class="invite-code">
-									<code>{inviteCode}</code><button
-										class="icon-button"
-										aria-label="Copy invitation"
-										aria-describedby="household-invite-help"
-										onclick={() =>
-											navigator.clipboard
-												.writeText(inviteCode)
-												.then(() => notify('Invite code copied.'))
-												.catch(() => notify('Select and copy the code manually.'))}
-										><Copy size={17} /></button
-									>
-								</div>
-								<p class="field-help" id="household-invite-help">
-									Share privately. This code works once.
-								</p>{/if}
-						</section>{:else}<p class="muted">
-							Only the household owner can manage invitations or remove members.
-						</p>{/if}
-					<hr />
-					<h3>Have an invitation?</h3>
-					<form novalidate bind:this={dialogFormEl} onsubmit={join}>
-						<FormField
-							id="household-join-code"
-							label="Invite code"
-							help="Paste the one-time invitation code shared by your household owner."
-							helpIds={showSoloHouseholdHelp ? ['household-solo-help'] : []}
-							error={joinCodeError}
-							errorId={error ? 'household-form-error' : undefined}
-							invalid={Boolean(joinCodeError || error)}
-							alert={!error}
-						>
-							{#snippet children(field)}
-								<input
-									bind:value={joinCode}
-									placeholder="Paste invitation code"
-									autocomplete="off"
-									{...field}
-								/>
-							{/snippet}
-						</FormField>
-						<button type="submit" class="secondary full" disabled={householdBusy}
-							>Join household <ArrowRight size={17} /></button
-						>
-					</form>
-					{#if error}<p class="error" id="household-form-error" role="alert">{error}</p>{/if}
-					{#if members.length > 1}
-						<button
-							class="text-button danger full"
-							disabled={householdBusy}
-							onclick={() => {
-								modal = 'leave';
-								error = '';
-							}}>Leave this household</button
-						>
-					{:else if showSoloHouseholdHelp}
-						<p class="field-help" id="household-solo-help">
-							You already have your own personal kitchen. Invite someone above to share it, or enter
-							an invite code to join another household.
-						</p>
-					{/if}
-				{:else if modal === 'confirmJoin'}
-					<h2>Replace your personal kitchen?</h2>
-					<p class="muted">
-						Joining this household will replace your current personal kitchen, including any saved
-						recipes, cover photos, pantry items, planned meals, and shopping list. Download a backup
-						first if you want to keep a copy.
-					</p>
-					<button class="secondary full" disabled={householdBusy} onclick={exportKitchen}
-						><Download size={17} /> Export backup</button
-					>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<div class="dialog-actions">
-						<button
-							class="secondary"
-							disabled={householdBusy}
-							onclick={() => {
-								error = '';
-								modal = 'household';
-							}}>Cancel</button
-						><button
-							class="primary danger-action"
-							disabled={householdBusy}
-							onclick={() => join(true)}>{householdBusy ? 'Joining…' : 'Replace kitchen'}</button
-						>
-					</div>
-				{:else if modal === 'removeMember'}
-					<h2>Remove household member?</h2>
-					<p class="muted">
-						{memberToRemove?.name} will lose access to this shared kitchen. Their account will remain
-						active.
-					</p>
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<div class="dialog-actions">
-						<button
-							class="secondary"
-							disabled={householdBusy}
-							onclick={() => {
-								memberToRemove = null;
-								error = '';
-								modal = 'household';
-							}}>Keep member</button
-						><button
-							class="primary danger-action"
-							disabled={householdBusy}
-							onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button
-						>
-					</div>
-				{:else if modal === 'leave'}
-					{@const nextHouseholdOwner = canManageHousehold
-						? members.find((member) => member.id !== user?.id)
-						: undefined}
-					<h2>Leave this household?</h2>
-					<p class="muted">
-						Leaving gives you a new personal kitchen. The shared pantry and recipes stay with your
-						household. You can rejoin with a new invitation.
-					</p>
-					{#if nextHouseholdOwner}
-						<p class="field-help" id="leave-owner-help">
-							Ownership of this household will transfer to <b>{nextHouseholdOwner.name}</b>.
-						</p>
-					{/if}
-					{#if error}<p class="error" role="alert">{error}</p>{/if}
-					<div class="dialog-actions">
-						<button
-							class="secondary"
-							disabled={busy || householdBusy}
-							onclick={() => {
-								error = '';
-								modal = 'household';
-							}}>Stay in household</button
-						><button
-							class="primary danger-action"
-							aria-describedby={nextHouseholdOwner ? 'leave-owner-help' : undefined}
-							disabled={busy || householdBusy}
-							onclick={leaveHousehold}
-							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
-						>
-					</div>
-				{:else if modal === 'delete' && !managedAuth}
-					<h2>Delete your account?</h2>
-					<p class="muted">
-						This permanently deletes your account, preferences, and sessions. Your shared kitchen
-						remains for other members; a household with no members is deleted. This cannot be
-						undone.
-					</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={deleteAccount}>
-						<FormField
-							id="delete-password"
-							label="Confirm with your password"
-							help="Enter your current password to confirm permanent deletion."
-							error={deletePasswordError}
-							errorId={error ? 'delete-form-error' : undefined}
-							invalid={Boolean(deletePasswordError || error)}
-							alert={!error}
-						>
-							{#snippet children(field)}
-								<input
-									type="password"
-									maxlength="128"
-									autocomplete="current-password"
-									bind:value={deletePassword}
-									{...field}
-								/>
-							{/snippet}
-						</FormField>{#if error}<p class="error" id="delete-form-error" role="alert">
-								{error}
-							</p>{/if}<button type="submit" class="primary danger-button full" disabled={busy}
-							>Permanently delete my account</button
-						>
-					</form>
-				{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
-						class="dialog-spark">✳</span
-					>
-					<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
-					<p class="muted">
-						{modal === 'reset'
-							? 'Choose a new password to open your kitchen again.'
-							: 'We’ll email a link to reset your password.'}
-					</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={recover}>
-						{#if modal === 'reset'}<FormField
-								id="reset-password"
-								label="New password"
-								help="Use 10 to 128 characters."
-								error={resetPasswordError}
-								errorId={error ? 'recover-form-error' : undefined}
-								invalid={Boolean(resetPasswordError || error)}
-								alert={!error}
-							>
-								{#snippet children(field)}
-									<input
-										type="password"
-										maxlength="128"
-										autocomplete="new-password"
-										bind:value={password}
-										{...field}
-									/>
-								{/snippet}
-							</FormField>{:else}<FormField
-								id="recover-email"
-								label="Email address"
-								help="We’ll send a reset link if an account matches this email."
-								error={recoverEmailError}
-								errorId={error ? 'recover-form-error' : undefined}
-								invalid={Boolean(recoverEmailError || error)}
-								alert={!error}
-							>
-								{#snippet children(field)}
-									<input type="email" autocomplete="email" bind:value={email} {...field} />
-								{/snippet}
-							</FormField>{/if}{#if error}<p class="error" id="recover-form-error" role="alert">
-								{error}
-							</p>{/if}<button type="submit" class="primary full" disabled={busy}
-							>{busy
-								? 'One moment…'
-								: modal === 'reset'
-									? 'Reset password'
-									: 'Send reset link'}<ArrowRight size={17} /></button
-						>
-					</form>
-				{:else if modal === 'deleteRecipe'}<span class="dialog-spark">✳</span>
-					<h2>Delete saved recipe?</h2>
-					<p class="muted">
-						{recipeToDelete?.title} will be removed from your collection. This also removes {kitchen.meals.filter(
-							(meal) => meal.recipeId === recipeToDelete?.id
-						).length} planned or cooked meal entries and your personal rating.
-					</p>
-					<div class="dialog-actions">
-						<button class="secondary" onclick={closeDialog}>Keep recipe</button>
-						<button class="primary danger-action" onclick={confirmDeleteRecipe}
-							>Delete recipe</button
-						>
-					</div>
-				{:else if modal === 'editMeal'}
-					{@const editingMeal = kitchen.meals.find((meal) => meal.id === editingMealId)}
-					{@const editingMealRecipe = kitchen.recipes.find(
-						(recipe) => recipe.id === editingMeal?.recipeId
-					)}
-					<h2>Edit planned meal</h2>
-					<p class="muted">{editingMealRecipe?.title}</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={saveMealChanges}>
-						<FormField id="edit-meal-date" label="When are we cooking?" error={mealDateError} alert>
-							{#snippet children(field)}
-								<input type="date" bind:value={mealDate} {...field} />
-							{/snippet}
-						</FormField>
-						<FormField id="edit-meal-slot" label="Meal">
-							{#snippet children(field)}
-								<select bind:value={mealSlot} {...field}
-									><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-								>
-							{/snippet}
-						</FormField>
-						<FormField
-							id="edit-meal-servings"
-							label="Servings"
-							help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
-							error={mealServingsError}
-							alert={!mealDateError}
-						>
-							{#snippet children(field)}
-								<input
-									type="number"
-									min="1"
-									max={MAX_SERVINGS}
-									step="1"
-									bind:value={plannedServings}
-									{...field}
-								/>
-							{/snippet}
-						</FormField>
-						<div class="dialog-actions">
-							<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
-								type="submit"
-								class="primary">Save meal</button
-							>
-						</div>
-					</form>
-				{:else if modal === 'cookMeal'}
-					{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
-					{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
-					<h2>Mark meal cooked</h2>
-					<p class="muted">{cookingRecipe?.title}</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={markMealCooked}>
-						<label class="cook-option" for="cook-deduct"
-							><input
-								id="cook-deduct"
-								type="checkbox"
-								aria-describedby="cook-deduct-help"
-								aria-invalid="false"
-								bind:checked={deductPantry}
-							/><span
-								><b>Deduct ingredients from pantry</b><small id="cook-deduct-help"
-									>Uses the planned serving amount and available matching stock.</small
-								></span
-							></label
-						>
-						<FormField
-							id="cook-leftovers"
-							label="Leftover servings"
-							help={`Enter a whole number from 0 to ${(cookingMeal?.servings ?? MAX_SERVINGS).toLocaleString('en-US')} servings. Enter 0 if there are no leftovers.`}
-							error={leftoverError}
-							alert
-						>
-							{#snippet children(field)}
-								<input
-									type="number"
-									min="0"
-									max={cookingMeal?.servings ?? MAX_SERVINGS}
-									step="1"
-									bind:value={leftoverServings}
-									{...field}
-								/>
-							{/snippet}
-						</FormField>
-						<div class="dialog-actions">
-							<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
-								type="submit"
-								class="primary"><Check size={17} /> Mark cooked</button
-							>
-						</div>
-					</form>
-				{:else if modal === 'plan'}
-					<h2>Schedule a recipe</h2>
-					<p class="muted">{selected?.title}</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={addMeal}>
-						<FormField id="plan-date" label="When are we cooking?" error={mealDateError} alert>
-							{#snippet children(field)}
-								<input type="date" bind:value={mealDate} {...field} />
-							{/snippet}
-						</FormField>
-						<FormField id="plan-slot" label="Meal">
-							{#snippet children(field)}
-								<select bind:value={mealSlot} {...field}
-									><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
-								>
-							{/snippet}
-						</FormField>
-						<FormField
-							id="plan-servings"
-							label="Servings"
-							help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
-							error={mealServingsError}
-							alert={!mealDateError}
-						>
-							{#snippet children(field)}
-								<input
-									type="number"
-									min="1"
-									max={MAX_SERVINGS}
-									step="1"
-									bind:value={plannedServings}
-									{...field}
-								/>
-							{/snippet}
-						</FormField>
-						<button type="submit" class="primary full"
-							><CalendarDays size={17} /> Put it on the calendar</button
-						>
-					</form>
-				{:else if modal === 'pickRecipe'}
-					<h2>Choose a recipe</h2>
-					<div class="pick-list">
-						{#each kitchen.recipes as recipe}<button
-								type="button"
-								onclick={() => choosePickedRecipe(recipe)}
-								><img
-									src={recipe.image || recipePlaceholder(recipe)}
-									onerror={(event) => recipeImageError(event, recipe)}
-									alt=""
-									width="75"
-									height="60"
-									loading="lazy"
-									decoding="async"
-								/><span
-									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
-								><Plus size={17} /></button
+{#if modal}<ModalDialog
+		viewKey={modal}
+		dialogClass={[
+			'flavor-dialog',
+			modal === 'onboarding' && 'onboarding-dialog',
+			(modal === 'settings' ||
+				modal === 'pickRecipe' ||
+				modal === 'import' ||
+				modal === 'editMeal' ||
+				modal === 'cookMeal') &&
+				'wide',
+			modal === 'import' && 'capture-dialog'
+		]
+			.filter(Boolean)
+			.join(' ')}
+		labelledBy={modal === 'import' ? 'recipe-import-title' : undefined}
+		label={dialogNames[modal] || 'Kitchen dialog'}
+		onclose={closeDialog}
+	>
+		{#snippet header()}
+			{#if modal === voiceTarget && (voiceTarget !== 'import' || !isReviewingImportDraft(importSession)) && (voiceBusy || voiceRetained)}{@render voiceSession()}{/if}
+		{/snippet}
+		{#if modal === 'import'}<RecipeImport
+				bind:session={importSession}
+				capture={captureImport}
+				save={saveImportedRecipe}
+				dictate={dictateRecipe}
+				{voiceBusy}
+			/>{:else if modal === 'onboarding'}
+			<span class="dialog-spark">✷</span>
+			<h2>Recipe preferences</h2>
+			<p class="muted onboarding-intro">Optional. Change these preferences anytime in Settings.</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={finishOnboarding}>
+				<fieldset class="quiz-group">
+					<legend>Preferred cooking time</legend>
+					<div class="quiz-options quiz-time">
+						{#each [15, 30, 45, 60] as minutes}<label class="quiz-option"
+								><input
+									type="radio"
+									name="cooking-time"
+									value={minutes}
+									bind:group={quizTime}
+								/><span>{minutes} min</span></label
 							>{/each}
 					</div>
-				{:else if modal === 'taste'}<span class="dialog-spark">✷</span>
-					<h2>Recipe preferences</h2>
-					<p class="muted">
-						Rate recipes after cooking. Your favorite cuisines, cooking times, and complexity are
-						included in the prompt for your next AI recipe.
+				</fieldset>
+				<fieldset class="quiz-group" aria-describedby="quiz-cuisines-help">
+					<legend>Favorite cuisines</legend>
+					<p class="quiz-help" id="quiz-cuisines-help">
+						Choose any, or leave blank for all cuisines.
 					</p>
-					<div class="taste-summary">{String(preferenceSummary(kitchen.recipes))}</div>
-					<button class="primary full" onclick={openOnboarding}
-						>Edit preferences <ArrowRight size={17} /></button
-					>
-				{:else if modal === 'search'}<span class="dialog-spark">✳</span>
-					<h2>Find recipes online</h2>
-					<p class="muted">
-						Search real recipes across the web, with links to the original creators.
-					</p>
-					<form novalidate bind:this={dialogFormEl} onsubmit={internetSearch}>
-						{#if !capabilities.recipeSearch}<p class="field-help" id="search-unavailable-help">
-								Web search is unavailable. Ask the server operator to enable online recipe search.
-							</p>{/if}
-						<FormField
-							id="search-query"
-							label="What are you craving?"
-							help="Search by dish, ingredient, or cuisine, or leave blank for seasonal ideas."
-							helpIds={[!capabilities.recipeSearch ? 'search-unavailable-help' : undefined]}
-							errorId={error ? 'search-form-error' : undefined}
-							invalid={Boolean(error)}
-						>
-							{#snippet children(field)}
-								<input bind:value={prompt} placeholder="Lemony weeknight pasta…" {...field} />
-							{/snippet}
-						</FormField>
-						<button type="submit" class="primary full" disabled={busy || !capabilities.recipeSearch}
-							><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
-						>{#if error}<p class="error" id="search-form-error" role="alert">{error}</p>{/if}
-					</form>
-					<button type="button" class="secondary full" onclick={() => openImport()}
-						><Plus size={17} />Import text, a link, or a photo</button
-					>
-					<div class="web-results">
-						{#each searchResults as result}<div class="web-result">
-								<a href={result.url} target="_blank" rel="noreferrer"
-									><b>{result.title}<ArrowUpRight size={17} /></b>
-									<p>{result.description}</p></a
-								><button class="secondary" disabled={busy} onclick={() => importRecipe(result.url)}
-									><Plus size={16} /> Import recipe</button
-								>
-							</div>{/each}
+					<div class="quiz-options quiz-cuisines">
+						{#each cuisineChoices as cuisine}<label class="quiz-option"
+								><input
+									type="checkbox"
+									value={cuisine}
+									aria-invalid="false"
+									bind:group={quizCuisines}
+								/><span>{cuisine}</span></label
+							>{/each}
 					</div>
-				{/if}
+				</fieldset>
+				<fieldset class="quiz-group">
+					<legend>Cooking complexity</legend>
+					<div class="quiz-options quiz-complexity">
+						{#each ['Easy', 'Moderate', 'Adventurous'] as complexity}<label class="quiz-option"
+								><input
+									type="radio"
+									name="cooking-complexity"
+									value={complexity}
+									bind:group={quizComplexity}
+								/><span>{complexity}</span></label
+							>{/each}
+					</div>
+				</fieldset>
+				<details class="quiz-dietary">
+					<summary>Any dietary preferences or allergies? <span>Optional</span></summary>
+					<FormField id="onboarding-diet" label="Dietary style">
+						{#snippet children(field)}
+							<select bind:value={quizDiet} {...field}
+								><option value="none">No dietary restriction</option><option value="vegetarian"
+									>Vegetarian</option
+								><option value="vegan">Vegan</option><option value="pescatarian">Pescatarian</option
+								><option value="gluten-free">Gluten-free</option><option value="dairy-free"
+									>Dairy-free</option
+								></select
+							>
+						{/snippet}
+					</FormField>
+					<FormField
+						id="onboarding-allergies"
+						label="Allergies or ingredients to avoid"
+						help="These guide generation. Check ingredients and labels before cooking."
+					>
+						{#snippet children(field)}
+							<input
+								bind:value={quizAllergies}
+								maxlength="2000"
+								placeholder="e.g. peanuts, shellfish"
+								{...field}
+							/>
+						{/snippet}
+					</FormField>
+				</details>
+				<div class="dialog-actions quiz-actions">
+					<button class="primary" type="submit">Save preferences <Check size={17} /></button><button
+						class="text-button"
+						type="button"
+						onclick={dismissOnboarding}>Maybe later</button
+					>
+				</div>
+			</form>
+		{:else if modal === 'pantry'}<span class="dialog-spark">✳</span>
+			<h2>Add ingredients</h2>
+			{#if scanBusy}<div class="scan-status" role="status" aria-live="polite" in:revealMotion>
+					<span><RefreshCw size={17} class="scan-spin" />Scanning photo for ingredients…</span>
+					<button class="secondary" type="button" onclick={() => cancelScan()}>Cancel</button>
+				</div>{/if}
+			<form novalidate bind:this={dialogFormEl} onsubmit={addIngredients}>
+				<FormField
+					id="pantry-ingredients"
+					label="Ingredients"
+					help="Separate with commas or new lines. Add quantities and units when you know them."
+					error={pantryFieldError}
+					alert
+				>
+					{#snippet children(field)}
+						<textarea
+							bind:value={pantryInput}
+							maxlength="20000"
+							placeholder={'Tomatoes, spinach, 200 g pasta, 2 eggs…'}
+							rows="5"
+							{...field}></textarea>
+					{/snippet}
+				</FormField>
+				{#if stagedScanFile}<div class="staged-scan" role="status">
+						<span>Photo staged: <b>{stagedScanFile.name}</b></span>
+						<div class="staged-scan-actions">
+							<button
+								class="secondary"
+								type="button"
+								disabled={scanBusy || busy || voiceBusy}
+								onclick={() => stagedScanFile && scanPantryPhoto(stagedScanFile)}
+								>{scanBusy ? 'Scanning…' : 'Scan photo'}</button
+							><button
+								class="text-button"
+								type="button"
+								disabled={scanBusy || busy || voiceBusy}
+								onclick={() => (stagedScanFile = null)}>Remove</button
+							>
+						</div>
+					</div>{/if}
+				<div class="dialog-actions">
+					<button
+						bind:this={pantryVoiceButton}
+						type="button"
+						class="secondary"
+						disabled={voiceBusy || busy}
+						onclick={dictate}><Mic size={17} /> Use voice</button
+					><button
+						type="button"
+						class="secondary"
+						aria-busy={scanBusy}
+						onclick={() => imageInput.click()}
+						disabled={scanBusy || busy || voiceBusy}
+						><Camera size={17} /> {scanBusy ? 'Scanning…' : 'Use photo'}</button
+					><button type="submit" class="primary" disabled={voiceBusy || busy}
+						>Add ingredients <ArrowRight size={17} /></button
+					>
+				</div>
+			</form>
+		{:else if modal === 'auth' && managedAuth}<span class="dialog-spark">✳</span>
+			<h2>Managed by your organization</h2>
+			<p class="muted">
+				Your account and access are managed by your organization's identity provider.
+			</p>
+			{#if providerLoginUrl}<a class="primary full" href={providerLoginUrl}
+					>Continue with organization sign-in <ArrowRight size={17} /></a
+				>{:else}<p class="muted">
+					Sign in through your organization's access proxy, then reload Flavorithm.
+				</p>{/if}
+		{:else if modal === 'auth'}<span class="dialog-spark">✳</span>
+			<h2>{authMode === 'register' ? 'Create an account' : 'Sign in'}</h2>
+			<p class="muted">Sync your pantry, recipes, and household.</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={authenticate}>
+				{#if authMode === 'register'}<FormField
+						id="auth-name"
+						label="Your name"
+						help="Use 2 to 80 characters."
+						error={authNameError}
+					>
+						{#snippet children(field)}
+							<input maxlength="80" autocomplete="name" bind:value={name} {...field} />
+						{/snippet}
+					</FormField>{/if}
+				<FormField
+					id="auth-email"
+					label="Email address"
+					error={authEmailError}
+					errorId={error ? 'auth-form-error' : undefined}
+					invalid={Boolean(authEmailError || error)}
+				>
+					{#snippet children(field)}
+						<input type="email" autocomplete="email" bind:value={email} {...field} />
+					{/snippet}
+				</FormField>
+				<FormField
+					id="auth-password"
+					label="Password"
+					help={authMode === 'register'
+						? 'Use 10 to 128 characters.'
+						: 'Enter your account password.'}
+					error={authPasswordError}
+					errorId={error && authMode === 'login' ? 'auth-form-error' : undefined}
+					invalid={Boolean(authPasswordError || (error && authMode === 'login'))}
+				>
+					{#snippet children(field)}
+						<input
+							type="password"
+							maxlength="128"
+							autocomplete={authMode === 'register' ? 'new-password' : 'current-password'}
+							bind:value={password}
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				{#if authMode === 'login' && capabilities.emailDelivery}<button
+						type="button"
+						class="text-button"
+						onclick={() => {
+							modal = 'recover';
+							formSubmitted = false;
+							error = '';
+						}}>Forgot your password?</button
+					>{/if}{#if error || authValidationSummary}<p
+						class="error"
+						id="auth-form-error"
+						role="alert"
+					>
+						{error || authValidationSummary}
+					</p>{/if}<button type="submit" class="primary full" disabled={busy}
+					>{busy
+						? 'Opening your kitchen…'
+						: authMode === 'register'
+							? 'Create account'
+							: 'Sign in'}<ArrowRight size={17} /></button
+				>
+			</form>
+			<button
+				class="text-button full"
+				onclick={() => {
+					authMode = authMode === 'register' ? 'login' : 'register';
+					formSubmitted = false;
+					error = '';
+				}}
+				>{authMode === 'register'
+					? 'Already have a kitchen? Sign in'
+					: 'New around here? Create an account'}</button
+			>
+		{:else if modal === 'generate'}<span class="dialog-spark">✴</span>
+			<h2>Generate recipes</h2>
+			<p class="muted">
+				Uses your pantry and preferences. Recipes may include additional ingredients.
+			</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={generate}>
+				<FormField
+					id="generate-prompt"
+					label="What are you in the mood for?"
+					errorId={error ? 'generate-form-error' : undefined}
+					invalid={Boolean(error)}
+				>
+					{#snippet children(field)}
+						<textarea
+							rows="3"
+							bind:value={prompt}
+							placeholder="e.g. a spicy vegetarian dinner in 30 minutes"
+							{...field}></textarea>
+					{/snippet}
+				</FormField>
+				<div class="two-fields">
+					<FormField id="generate-time" label="Time to cook">
+						{#snippet children(field)}
+							<select bind:value={kitchen.preferences.maxTime} {...field}
+								><option value={15}>15 minutes</option><option value={30}>30 minutes</option><option
+									value={45}>45 minutes</option
+								><option value={60}>An hour</option><option value={120}>A slow afternoon</option
+								></select
+							>
+						{/snippet}
+					</FormField>
+					<FormField id="generate-diet" label="Dietary style">
+						{#snippet children(field)}
+							<select bind:value={kitchen.preferences.diet} {...field}
+								><option value="none">A bit of everything</option><option>Vegetarian</option><option
+									>Vegan</option
+								><option>Pescatarian</option><option>Gluten-free</option><option>Low-carb</option
+								></select
+							>
+						{/snippet}
+					</FormField>
+				</div>
+				<FormField
+					id="generate-allergies"
+					label="Allergies & ingredients to avoid"
+					help="Check all ingredients and substitutions against your allergies before cooking."
+				>
+					{#snippet children(field)}
+						<input
+							bind:value={kitchen.preferences.allergies}
+							maxlength="2000"
+							placeholder="e.g. peanuts, shellfish"
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				{#if error}<p class="error" id="generate-form-error" role="alert">
+						{error}
+					</p>{/if}<button type="submit" class="primary full" disabled={busy}
+					><Sparkles size={18} />{busy ? 'Generating recipes…' : 'Generate recipes'}</button
+				>
+			</form>
+		{:else if modal === 'settings'}
+			<h2>Settings</h2>
+			<div class="settings-section">
+				<h3>Appearance</h3>
+				<div class="theme-grid" role="group" aria-label="Color theme">
+					{#each themes as theme}<ToggleButton
+							class={{ active: kitchen.preferences.theme === theme }}
+							pressed={kitchen.preferences.theme === theme}
+							onclick={() => (kitchen.preferences.theme = theme)}
+							>{theme}{#if kitchen.preferences.theme === theme}<Check
+									size={13}
+									aria-hidden="true"
+								/>{/if}</ToggleButton
+						>{/each}
+				</div>
+				<ToggleButton
+					class={{ secondary: true, active: kitchen.preferences.dark }}
+					pressed={kitchen.preferences.dark}
+					onclick={() => (kitchen.preferences.dark = !kitchen.preferences.dark)}
+					>{#if kitchen.preferences.dark}<Sun size={16} aria-hidden="true" />{:else}<Moon
+							size={16}
+							aria-hidden="true"
+						/>{/if}Dark appearance</ToggleButton
+				>
 			</div>
-		{/key}
-	</div>{/if}
+
+			<div class="settings-section">
+				<h3>Recipe preferences</h3>
+				<p class="muted">
+					{kitchen.preferences.maxTime} minutes · {kitchen.preferences.complexity} · {kitchen.preferences.cuisines?.join(
+						', '
+					) || 'Open to every cuisine'}
+				</p>
+				<button class="secondary" onclick={openOnboarding}
+					>Edit my taste preferences <SlidersHorizontal size={16} /></button
+				>
+			</div>
+			{#if user}<div class="settings-section">
+					<h3>{managedAuth ? 'Organization account' : 'Account email'}</h3>
+					<p class="muted">
+						{user.email}{managedAuth
+							? ' · Managed by your identity provider'
+							: ` · ${user.emailVerified ? 'Verified' : 'Not verified'}`}
+					</p>
+					{#if !managedAuth}
+						{#if user.emailVerified}<p class="muted">
+								Email verification is optional for using your kitchen.
+							</p>{:else}<button
+								class="secondary"
+								aria-describedby={!capabilities.emailDelivery
+									? 'settings-email-delivery-help'
+									: undefined}
+								disabled={!capabilities.emailDelivery || verificationBusy}
+								onclick={sendEmailVerification}
+								>{verificationBusy ? 'Sending…' : 'Send / resend verification email'}</button
+							>{#if !capabilities.emailDelivery}<p
+									class="field-help"
+									id="settings-email-delivery-help"
+								>
+									Email delivery is unavailable. Ask the server operator to configure email
+									delivery.
+								</p>{/if}{/if}
+					{/if}
+				</div>{/if}
+			<div class="settings-section">
+				<VoiceSettings
+					bind:provider={voiceProvider}
+					bind:model={voiceModel}
+					bind:apiKey={voiceApiKey}
+					localAvailable={localVoiceAvailable}
+					userId={user?.id}
+				/>
+			</div>
+			<div class="settings-section intelligence-settings">
+				<AIConnection
+					bind:preferences={kitchen.preferences}
+					bind:apiKey
+					{providers}
+					{accountModels}
+					{chatGPT}
+					activeAccount={activeChatGPTAccount}
+					signedIn={Boolean(user)}
+					{managedAuth}
+					busy={connectionBusy}
+					loading={catalogLoading}
+					{catalogError}
+					authorizationUrl={chatGPTAuthorizationUrl}
+					device={chatGPTDevice}
+					oncancel={cancelChatGPTDevice}
+					oncopycode={copyChatGPTDeviceCode}
+					onselect={(id) => changeConnection(id)}
+					onaccount={() => changeConnection()}
+					onconnect={connectChatGPT}
+					ondisconnect={disconnectChatGPT}
+					onrefresh={refreshAISettings}
+					onsignin={openAuthentication}
+					onoverride={() => {
+						void loadModelCatalog();
+					}}
+				/>
+			</div>
+
+			{#if hasSampleRecords}<div class="settings-section">
+					<h3>Sample data</h3>
+					<p class="muted">
+						Remove untouched starter ingredients, planned meals, and saved recipe bookmarks while
+						keeping everything you added or edited.
+					</p>
+					<div class="dialog-actions">
+						<button class="secondary" onclick={freshKitchen}>Clear sample data</button>
+					</div>
+				</div>{/if}
+			<div class="settings-section">
+				<h3>Your data</h3>
+				<p class="muted">
+					{#if !user}
+						Export the kitchen saved in this browser as JSON.
+					{:else if managedAuth}
+						Export your account and shared kitchen.
+					{:else}
+						Export your account and shared kitchen, or permanently remove your account.
+					{/if}
+				</p>
+				<div class="dialog-actions">
+					<button class="secondary" onclick={exportKitchen}
+						><Download size={16} /> Export my data</button
+					>{#if user && !managedAuth}<button
+							class="text-button danger"
+							onclick={() => {
+								modal = 'delete';
+								error = '';
+							}}>Delete account</button
+						>{/if}
+				</div>
+			</div>
+			{#if error}<p class="error" role="alert">{error}</p>{/if}
+			<div class="dialog-actions">
+				{#if user && (!managedAuth || providerLogoutUrl)}<button
+						class="text-button"
+						onclick={logout}><LogOut size={16} /> Sign out</button
+					>{:else if user && managedAuth}<span class="muted"
+						>Sign-out is managed by your access proxy.</span
+					>{:else if !user && !managedAuth}<button class="text-button" onclick={openAuthentication}
+						>Create an account</button
+					>{:else if !user}<button class="text-button" onclick={openAuthentication}
+						>Organization sign-in</button
+					>{/if}{#if deferredInstall}<button
+						class="secondary"
+						onclick={() => deferredInstall.prompt()}>Install app</button
+					>{/if}<button
+					class="primary"
+					onclick={() => {
+						closeDialog();
+						notify('Preferences saved.');
+					}}>Done <Check size={17} /></button
+				>
+			</div>
+		{:else if modal === 'household'}
+			{@const showSoloHouseholdHelp =
+				members.length <= 1 && (members.length === 1 || !householdBusy)}
+			<span class="dialog-spark">✳</span>
+			<h2>Your household</h2>
+			<p class="muted">Shared pantry, recipes, meals, and shopping.</p>
+			{#if householdBusy}<p class="muted" role="status">Updating household…</p>{/if}
+			<div class="household-members">
+				{#each members as member (member.id)}<div class="member-row">
+						<span class="profile-avatar">{member.name.trim().charAt(0).toUpperCase() || '•'}</span>
+						<div class="member-copy">
+							<b>{member.name}{member.id === user?.id ? ' · You' : ''}</b><span>{member.email}</span
+							>
+						</div>
+						<span class="member-role" class:owner-role={member.role === 'owner'}
+							>{member.role === 'owner' ? 'Owner' : 'Member'}</span
+						>
+						{#if canManageHousehold && member.role !== 'owner' && member.id !== user?.id}<button
+								class="text-button danger member-remove"
+								disabled={householdBusy}
+								onclick={() => askRemoveMember(member)}>Remove</button
+							>{/if}
+					</div>{/each}
+			</div>
+			{#if canManageHousehold}<section class="household-invites">
+					<h3>Invitations</h3>
+					{#if householdInvites.length}<div class="invite-list">
+							{#each householdInvites as invite (invite.inviteId)}<div class="invite-row">
+									<span
+										>Expires {new Date(invite.expiresAt).toLocaleDateString('en', {
+											month: 'short',
+											day: 'numeric'
+										})}</span
+									><button
+										class="text-button danger"
+										disabled={householdBusy}
+										onclick={() => revokeInvite(invite.inviteId)}>Revoke</button
+									>
+								</div>{/each}
+						</div>{:else}<p class="muted">No active invitations.</p>{/if}
+					<button class="primary full" disabled={householdBusy} onclick={invite}
+						><Plus size={17} /> Create invitation</button
+					>
+					{#if inviteCode}<div class="invite-code">
+							<code>{inviteCode}</code><button
+								class="icon-button"
+								aria-label="Copy invitation"
+								aria-describedby="household-invite-help"
+								onclick={() =>
+									navigator.clipboard
+										.writeText(inviteCode)
+										.then(() => notify('Invite code copied.'))
+										.catch(() => notify('Select and copy the code manually.'))}
+								><Copy size={17} /></button
+							>
+						</div>
+						<p class="field-help" id="household-invite-help">
+							Share privately. This code works once.
+						</p>{/if}
+				</section>{:else}<p class="muted">
+					Only the household owner can manage invitations or remove members.
+				</p>{/if}
+			<hr />
+			<h3>Have an invitation?</h3>
+			<form novalidate bind:this={dialogFormEl} onsubmit={join}>
+				<FormField
+					id="household-join-code"
+					label="Invite code"
+					help="Paste the one-time invitation code shared by your household owner."
+					helpIds={showSoloHouseholdHelp ? ['household-solo-help'] : []}
+					error={joinCodeError}
+					errorId={error ? 'household-form-error' : undefined}
+					invalid={Boolean(joinCodeError || error)}
+					alert={!error}
+				>
+					{#snippet children(field)}
+						<input
+							bind:value={joinCode}
+							placeholder="Paste invitation code"
+							autocomplete="off"
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				<button type="submit" class="secondary full" disabled={householdBusy}
+					>Join household <ArrowRight size={17} /></button
+				>
+			</form>
+			{#if error}<p class="error" id="household-form-error" role="alert">{error}</p>{/if}
+			{#if members.length > 1}
+				<button
+					class="text-button danger full"
+					disabled={householdBusy}
+					onclick={() => {
+						modal = 'leave';
+						error = '';
+					}}>Leave this household</button
+				>
+			{:else if showSoloHouseholdHelp}
+				<p class="field-help" id="household-solo-help">
+					You already have your own personal kitchen. Invite someone above to share it, or enter an
+					invite code to join another household.
+				</p>
+			{/if}
+		{:else if modal === 'confirmJoin'}
+			<h2>Replace your personal kitchen?</h2>
+			<p class="muted">
+				Joining this household will replace your current personal kitchen, including any saved
+				recipes, cover photos, pantry items, planned meals, and shopping list. Download a backup
+				first if you want to keep a copy.
+			</p>
+			<button class="secondary full" disabled={householdBusy} onclick={exportKitchen}
+				><Download size={17} /> Export backup</button
+			>
+			{#if error}<p class="error" role="alert">{error}</p>{/if}
+			<div class="dialog-actions">
+				<button
+					class="secondary"
+					disabled={householdBusy}
+					onclick={() => {
+						error = '';
+						modal = 'household';
+					}}>Cancel</button
+				><button class="primary danger-action" disabled={householdBusy} onclick={() => join(true)}
+					>{householdBusy ? 'Joining…' : 'Replace kitchen'}</button
+				>
+			</div>
+		{:else if modal === 'removeMember'}
+			<h2>Remove household member?</h2>
+			<p class="muted">
+				{memberToRemove?.name} will lose access to this shared kitchen. Their account will remain active.
+			</p>
+			{#if error}<p class="error" role="alert">{error}</p>{/if}
+			<div class="dialog-actions">
+				<button
+					class="secondary"
+					disabled={householdBusy}
+					onclick={() => {
+						memberToRemove = null;
+						error = '';
+						modal = 'household';
+					}}>Keep member</button
+				><button
+					class="primary danger-action"
+					disabled={householdBusy}
+					onclick={confirmRemoveMember}>{householdBusy ? 'Removing…' : 'Remove member'}</button
+				>
+			</div>
+		{:else if modal === 'leave'}
+			{@const nextHouseholdOwner = canManageHousehold
+				? members.find((member) => member.id !== user?.id)
+				: undefined}
+			<h2>Leave this household?</h2>
+			<p class="muted">
+				Leaving gives you a new personal kitchen. The shared pantry and recipes stay with your
+				household. You can rejoin with a new invitation.
+			</p>
+			{#if nextHouseholdOwner}
+				<p class="field-help" id="leave-owner-help">
+					Ownership of this household will transfer to <b>{nextHouseholdOwner.name}</b>.
+				</p>
+			{/if}
+			{#if error}<p class="error" role="alert">{error}</p>{/if}
+			<div class="dialog-actions">
+				<button
+					class="secondary"
+					disabled={busy || householdBusy}
+					onclick={() => {
+						error = '';
+						modal = 'household';
+					}}>Stay in household</button
+				><button
+					class="primary danger-action"
+					aria-describedby={nextHouseholdOwner ? 'leave-owner-help' : undefined}
+					disabled={busy || householdBusy}
+					onclick={leaveHousehold}>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
+				>
+			</div>
+		{:else if modal === 'delete' && !managedAuth}
+			<h2>Delete your account?</h2>
+			<p class="muted">
+				This permanently deletes your account, preferences, and sessions. Your shared kitchen
+				remains for other members; a household with no members is deleted. This cannot be undone.
+			</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={deleteAccount}>
+				<FormField
+					id="delete-password"
+					label="Confirm with your password"
+					help="Enter your current password to confirm permanent deletion."
+					error={deletePasswordError}
+					errorId={error ? 'delete-form-error' : undefined}
+					invalid={Boolean(deletePasswordError || error)}
+					alert={!error}
+				>
+					{#snippet children(field)}
+						<input
+							type="password"
+							maxlength="128"
+							autocomplete="current-password"
+							bind:value={deletePassword}
+							{...field}
+						/>
+					{/snippet}
+				</FormField>{#if error}<p class="error" id="delete-form-error" role="alert">
+						{error}
+					</p>{/if}<button type="submit" class="primary danger-button full" disabled={busy}
+					>Permanently delete my account</button
+				>
+			</form>
+		{:else if (modal === 'reset' || (modal === 'recover' && capabilities.emailDelivery)) && !managedAuth}<span
+				class="dialog-spark">✳</span
+			>
+			<h2>{modal === 'reset' ? 'Reset password' : 'Forgot your password?'}</h2>
+			<p class="muted">
+				{modal === 'reset'
+					? 'Choose a new password to open your kitchen again.'
+					: 'We’ll email a link to reset your password.'}
+			</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={recover}>
+				{#if modal === 'reset'}<FormField
+						id="reset-password"
+						label="New password"
+						help="Use 10 to 128 characters."
+						error={resetPasswordError}
+						errorId={error ? 'recover-form-error' : undefined}
+						invalid={Boolean(resetPasswordError || error)}
+						alert={!error}
+					>
+						{#snippet children(field)}
+							<input
+								type="password"
+								maxlength="128"
+								autocomplete="new-password"
+								bind:value={password}
+								{...field}
+							/>
+						{/snippet}
+					</FormField>{:else}<FormField
+						id="recover-email"
+						label="Email address"
+						help="We’ll send a reset link if an account matches this email."
+						error={recoverEmailError}
+						errorId={error ? 'recover-form-error' : undefined}
+						invalid={Boolean(recoverEmailError || error)}
+						alert={!error}
+					>
+						{#snippet children(field)}
+							<input type="email" autocomplete="email" bind:value={email} {...field} />
+						{/snippet}
+					</FormField>{/if}{#if error}<p class="error" id="recover-form-error" role="alert">
+						{error}
+					</p>{/if}<button type="submit" class="primary full" disabled={busy}
+					>{busy
+						? 'One moment…'
+						: modal === 'reset'
+							? 'Reset password'
+							: 'Send reset link'}<ArrowRight size={17} /></button
+				>
+			</form>
+		{:else if modal === 'deleteRecipe'}<span class="dialog-spark">✳</span>
+			<h2>Delete saved recipe?</h2>
+			<p class="muted">
+				{recipeToDelete?.title} will be removed from your collection. This also removes {kitchen.meals.filter(
+					(meal) => meal.recipeId === recipeToDelete?.id
+				).length} planned or cooked meal entries and your personal rating.
+			</p>
+			<div class="dialog-actions">
+				<button class="secondary" onclick={closeDialog}>Keep recipe</button>
+				<button class="primary danger-action" onclick={confirmDeleteRecipe}>Delete recipe</button>
+			</div>
+		{:else if modal === 'editMeal'}
+			{@const editingMeal = kitchen.meals.find((meal) => meal.id === editingMealId)}
+			{@const editingMealRecipe = kitchen.recipes.find(
+				(recipe) => recipe.id === editingMeal?.recipeId
+			)}
+			<h2>Edit planned meal</h2>
+			<p class="muted">{editingMealRecipe?.title}</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={saveMealChanges}>
+				<FormField id="edit-meal-date" label="When are we cooking?" error={mealDateError} alert>
+					{#snippet children(field)}
+						<input type="date" bind:value={mealDate} {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="edit-meal-slot" label="Meal">
+					{#snippet children(field)}
+						<select bind:value={mealSlot} {...field}
+							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+						>
+					{/snippet}
+				</FormField>
+				<FormField
+					id="edit-meal-servings"
+					label="Servings"
+					help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
+					error={mealServingsError}
+					alert={!mealDateError}
+				>
+					{#snippet children(field)}
+						<input
+							type="number"
+							min="1"
+							max={MAX_SERVINGS}
+							step="1"
+							bind:value={plannedServings}
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				<div class="dialog-actions">
+					<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
+						type="submit"
+						class="primary">Save meal</button
+					>
+				</div>
+			</form>
+		{:else if modal === 'cookMeal'}
+			{@const cookingMeal = kitchen.meals.find((meal) => meal.id === cookingMealId)}
+			{@const cookingRecipe = cookingMeal ? recipesById.get(cookingMeal.recipeId) : undefined}
+			<h2>Mark meal cooked</h2>
+			<p class="muted">{cookingRecipe?.title}</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={markMealCooked}>
+				<label class="cook-option" for="cook-deduct"
+					><input
+						id="cook-deduct"
+						type="checkbox"
+						aria-describedby="cook-deduct-help"
+						aria-invalid="false"
+						bind:checked={deductPantry}
+					/><span
+						><b>Deduct ingredients from pantry</b><small id="cook-deduct-help"
+							>Uses the planned serving amount and available matching stock.</small
+						></span
+					></label
+				>
+				<FormField
+					id="cook-leftovers"
+					label="Leftover servings"
+					help={`Enter a whole number from 0 to ${(cookingMeal?.servings ?? MAX_SERVINGS).toLocaleString('en-US')} servings. Enter 0 if there are no leftovers.`}
+					error={leftoverError}
+					alert
+				>
+					{#snippet children(field)}
+						<input
+							type="number"
+							min="0"
+							max={cookingMeal?.servings ?? MAX_SERVINGS}
+							step="1"
+							bind:value={leftoverServings}
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				<div class="dialog-actions">
+					<button type="button" class="secondary" onclick={closeDialog}>Cancel</button><button
+						type="submit"
+						class="primary"><Check size={17} /> Mark cooked</button
+					>
+				</div>
+			</form>
+		{:else if modal === 'plan'}
+			<h2>Schedule a recipe</h2>
+			<p class="muted">{selected?.title}</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={addMeal}>
+				<FormField id="plan-date" label="When are we cooking?" error={mealDateError} alert>
+					{#snippet children(field)}
+						<input type="date" bind:value={mealDate} {...field} />
+					{/snippet}
+				</FormField>
+				<FormField id="plan-slot" label="Meal">
+					{#snippet children(field)}
+						<select bind:value={mealSlot} {...field}
+							><option>Breakfast</option><option>Lunch</option><option>Dinner</option></select
+						>
+					{/snippet}
+				</FormField>
+				<FormField
+					id="plan-servings"
+					label="Servings"
+					help={`Enter a whole number from 1 to ${MAX_SERVINGS.toLocaleString('en-US')} servings.`}
+					error={mealServingsError}
+					alert={!mealDateError}
+				>
+					{#snippet children(field)}
+						<input
+							type="number"
+							min="1"
+							max={MAX_SERVINGS}
+							step="1"
+							bind:value={plannedServings}
+							{...field}
+						/>
+					{/snippet}
+				</FormField>
+				<button type="submit" class="primary full"
+					><CalendarDays size={17} /> Put it on the calendar</button
+				>
+			</form>
+		{:else if modal === 'pickRecipe'}
+			<h2>Choose a recipe</h2>
+			<div class="pick-list">
+				{#each kitchen.recipes as recipe}<button
+						type="button"
+						onclick={() => choosePickedRecipe(recipe)}
+						><img
+							src={recipe.image || recipePlaceholder(recipe)}
+							onerror={(event) => recipeImageError(event, recipe)}
+							alt=""
+							width="75"
+							height="60"
+							loading="lazy"
+							decoding="async"
+						/><span><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
+						><Plus size={17} /></button
+					>{/each}
+			</div>
+		{:else if modal === 'taste'}<span class="dialog-spark">✷</span>
+			<h2>Recipe preferences</h2>
+			<p class="muted">
+				Rate recipes after cooking. Your favorite cuisines, cooking times, and complexity are
+				included in the prompt for your next AI recipe.
+			</p>
+			<div class="taste-summary">{String(preferenceSummary(kitchen.recipes))}</div>
+			<button class="primary full" onclick={openOnboarding}
+				>Edit preferences <ArrowRight size={17} /></button
+			>
+		{:else if modal === 'search'}<span class="dialog-spark">✳</span>
+			<h2>Find recipes online</h2>
+			<p class="muted">Search real recipes across the web, with links to the original creators.</p>
+			<form novalidate bind:this={dialogFormEl} onsubmit={internetSearch}>
+				{#if !capabilities.recipeSearch}<p class="field-help" id="search-unavailable-help">
+						Web search is unavailable. Ask the server operator to enable online recipe search.
+					</p>{/if}
+				<FormField
+					id="search-query"
+					label="What are you craving?"
+					help="Search by dish, ingredient, or cuisine, or leave blank for seasonal ideas."
+					helpIds={[!capabilities.recipeSearch ? 'search-unavailable-help' : undefined]}
+					errorId={error ? 'search-form-error' : undefined}
+					invalid={Boolean(error)}
+				>
+					{#snippet children(field)}
+						<input bind:value={prompt} placeholder="Lemony weeknight pasta…" {...field} />
+					{/snippet}
+				</FormField>
+				<button type="submit" class="primary full" disabled={busy || !capabilities.recipeSearch}
+					><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
+				>{#if error}<p class="error" id="search-form-error" role="alert">{error}</p>{/if}
+			</form>
+			<button type="button" class="secondary full" onclick={() => openImport()}
+				><Plus size={17} />Import text, a link, or a photo</button
+			>
+			<div class="web-results">
+				{#each searchResults as result}<div class="web-result">
+						<a href={result.url} target="_blank" rel="noreferrer"
+							><b>{result.title}<ArrowUpRight size={17} /></b>
+							<p>{result.description}</p></a
+						><button class="secondary" disabled={busy} onclick={() => importRecipe(result.url)}
+							><Plus size={16} /> Import recipe</button
+						>
+					</div>{/each}
+			</div>
+		{/if}
+	</ModalDialog>{/if}
 
 <style>
 	.voice-session {

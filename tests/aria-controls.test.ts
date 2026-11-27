@@ -379,8 +379,11 @@ const iconProxy = new Proxy({}, { get: () => noopComponent });
 
 const toggleSource = readRepoFile('src/lib/components/ToggleButton.svelte');
 const disclosureSource = readRepoFile('src/lib/components/DisclosureButton.svelte');
+const modalDialogSource = readRepoFile('src/lib/components/ModalDialog.svelte');
+const mobileDrawerSource = readRepoFile('src/lib/components/MobileDrawer.svelte');
+const formFieldSource = readRepoFile('src/lib/components/FormField.svelte');
 
-const baseModMap: Record<string, unknown> = {
+const coreModMap: Record<string, unknown> = {
 	svelte,
 	'svelte/animate': svelteAnimate,
 	'svelte/internal/client': svelteClient,
@@ -400,12 +403,31 @@ const baseModMap: Record<string, unknown> = {
 
 const ToggleButtonServer = loadServerComponent(
 	compileServerComponent(toggleSource, 'ToggleButton.svelte'),
-	baseModMap
+	coreModMap
 );
 const DisclosureButtonServer = loadServerComponent(
 	compileServerComponent(disclosureSource, 'DisclosureButton.svelte'),
-	baseModMap
+	coreModMap
 );
+const ModalDialogServer = loadServerComponent(
+	compileServerComponent(modalDialogSource, 'ModalDialog.svelte'),
+	coreModMap
+);
+const MobileDrawerServer = loadServerComponent(
+	compileServerComponent(mobileDrawerSource, 'MobileDrawer.svelte'),
+	coreModMap
+);
+const FormFieldServer = loadServerComponent(
+	compileServerComponent(formFieldSource, 'FormField.svelte'),
+	coreModMap
+);
+
+const baseModMap: Record<string, unknown> = {
+	...coreModMap,
+	'#lib/components/ModalDialog.svelte': { __esModule: true, default: ModalDialogServer },
+	'#lib/components/MobileDrawer.svelte': { __esModule: true, default: MobileDrawerServer },
+	'#lib/components/FormField.svelte': { __esModule: true, default: FormFieldServer }
+};
 
 function walkAst(node: unknown, visit: (entry: Record<string, any>) => void) {
 	if (!node || typeof node !== 'object') return;

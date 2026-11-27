@@ -211,11 +211,16 @@
 					: 'smooth'
 		});
 	}
+	function focusLauncherIfInteractive() {
+		if (launcher?.isConnected && !launcher.closest('[inert], [hidden]')) {
+			launcher.focus({ preventScroll: true });
+		}
+	}
 	export async function close() {
 		resetReaction();
 		open = false;
 		await tick();
-		if (!launcher?.closest('[inert]')) launcher?.focus();
+		focusLauncherIfInteractive();
 	}
 	export async function reopen(fallbackPrompt = '') {
 		await tick();
@@ -231,7 +236,7 @@
 			input?.focus();
 		} else {
 			await tick();
-			launcher?.focus();
+			focusLauncherIfInteractive();
 		}
 	}
 	function clear() {
@@ -299,16 +304,16 @@
 		class:motion-paused={paused}
 		style={viewportStyle}
 		id="butler-panel"
-		use:focusTrap
+		use:focusTrap={{ returnFocus: () => launcher }}
 		role="dialog"
 		aria-modal="true"
 		tabindex="-1"
 		aria-label="Chat with Basil"
 		onkeydown={(event) => {
-			if (event.key === 'Escape') {
+			if (event.key === 'Escape' && !event.defaultPrevented) {
 				event.stopPropagation();
 				event.preventDefault();
-				close();
+				void close();
 			}
 		}}
 	>

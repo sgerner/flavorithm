@@ -605,6 +605,21 @@ const formFieldMod = compileServerModule(
 	readFileSync('src/lib/components/FormField.svelte', 'utf8')
 ).exports;
 
+const modalDialogSsrMod = compileServerModule(
+	'src/lib/components/ModalDialog.svelte',
+	readFileSync('src/lib/components/ModalDialog.svelte', 'utf8')
+).exports;
+
+const mobileDrawerSsrMod = compileServerModule(
+	'src/lib/components/MobileDrawer.svelte',
+	readFileSync('src/lib/components/MobileDrawer.svelte', 'utf8')
+).exports;
+
+const dialogPrimitivesMap = {
+	'#lib/components/ModalDialog.svelte': modalDialogSsrMod,
+	'#lib/components/MobileDrawer.svelte': mobileDrawerSsrMod
+};
+
 const searchPickerSsrMod = compileServerModule(
 	'src/lib/components/SearchPicker.svelte',
 	readFileSync('src/lib/components/SearchPicker.svelte', 'utf8')
@@ -636,7 +651,8 @@ test('rendered components resolve every aria-describedby and label[for] without 
 	);
 	const detailCompiled = compileServerModule(
 		'src/lib/components/RecipeDetail.svelte',
-		hookedDetail
+		hookedDetail,
+		dialogPrimitivesMap
 	);
 	const detailBaseProps = {
 		recipe: sampleRecipe,
@@ -700,7 +716,7 @@ test('rendered components resolve every aria-describedby and label[for] without 
 	const editorCompiled = compileServerModule(
 		'src/lib/components/RecipeEditor.svelte',
 		hookedEditor,
-		{ './FormField.svelte': formFieldMod }
+		{ './FormField.svelte': formFieldMod, ...dialogPrimitivesMap }
 	);
 	editorCompiled.sandbox.__onEditorInit = undefined;
 	const editorCleanHtml = render(editorCompiled.exports.default, {
@@ -964,6 +980,7 @@ const pageHookCode = `
 
 const hookedPageSource = injectScriptHook(rawPageSource, pageHookCode);
 const pageSsrCompiled = compileServerModule('src/routes/+page.svelte', hookedPageSource, {
+	...dialogPrimitivesMap,
 	'#lib/components/FormField.svelte': formFieldMod,
 	'#lib/components/ToggleButton.svelte': noopComponent,
 	'#lib/components/DisclosureButton.svelte': noopComponent,
