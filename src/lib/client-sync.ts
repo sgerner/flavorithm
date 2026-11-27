@@ -1,4 +1,5 @@
 import { createNewUserState } from '#lib/data.ts';
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
 import type { AppState, User } from '#lib/types.ts';
 import {
 	causallyIncludesDelta,
@@ -6,16 +7,22 @@ import {
 	composePendingKitchenJournal,
 	filterUnfoldedJournalRecords,
 	type FoldedJournalRef,
+	isKitchenState,
+	isKitchenStateShape,
+	isRecordFoldedInto,
 	jsonEqual,
 	MAX_PENDING_JOURNAL_ENTRIES,
 	mergeKitchenStates,
 	mergePendingKitchenJournal,
 	orderPendingJournalRecords,
 	readPendingJournal,
+	readQuarantinedJournal,
+	repairLegacyKitchenState,
 	syncPendingKitchenJournal,
 	type KitchenTransport,
 	type PendingJournalRecord,
 	type PendingKitchen,
+	type QuarantinedJournalEntry,
 	type SyncConflict,
 	writePending,
 	writePendingJournal
@@ -36,10 +43,20 @@ export type SyncStatus = {
 	reviewedEtag: string | null;
 	error: string;
 };
+export type KitchenBackupPayload =
+	| AppState
+	| {
+			pending?: AppState;
+			quarantined: QuarantinedJournalEntry[];
+	  };
+export const MAX_SYNC_CONTINUATIONS = 3;
+export const DEFAULT_WRITER_LEASE_TTL_MS = 120_000;
+
 type ConfirmedKitchen = {
 	userId: string;
 	householdId: string;
 	state: AppState;
+	rawState?: AppState;
 	etag: string;
 	updatedAt: number;
 };
@@ -56,12 +73,19 @@ type WriterLease = {
 	updatedAt: number;
 	expiresAt: number;
 };
+type OwnDurableTracker = {
+	record: PendingJournalRecord;
+	baselineEtag: string | null;
+	baselineUpdatedAt: number;
+	getStateAtStage: AppState | null;
+};
 type ActiveContext = {
 	user: User;
 	identity: Identity;
 	key: string;
 	generation: number;
 	baseline: ConfirmedKitchen | null;
+	legacyReference: AppState | null;
 	confirmed: boolean;
 	loading: boolean;
 	loadError: string;
@@ -70,16 +94,22 @@ type ActiveContext = {
 	pendingDurable: boolean;
 	blockedByStorage: boolean;
 	syncing: boolean;
+	initializedOnline: boolean;
 	conflicts: SyncConflict[];
+	storageAlert: string;
+	validationError: boolean;
+	retiredRecords: PendingJournalRecord[];
+	ownDurable: OwnDurableTracker | null;
 	reviewedEtag: string | null;
 	reviewedState: AppState | null;
 	error: string;
 };
 
+const WRITER_STORAGE_KEY = 'flavorithm-writer-id:v1';
 const WRITER_LEASE_PREFIX = 'flavorithm-writer-lease:v1:';
 const writerLeaseKey = (id: string) => `${WRITER_LEASE_PREFIX}${encodeURIComponent(id)}`;
-export const DEFAULT_WRITER_LEASE_TTL_MS = 120_000;
-
+const STAGE_QUOTA_ALERT =
+	'Offline changes could not be saved on this device. Sync online or back up your changes before closing this tab.';
 const confirmedKey = (identity: Identity) =>
 	`flavorithm-confirmed:v1:${encodeURIComponent(identity.userId)}:${encodeURIComponent(identity.householdId)}`;
 const identityKey = (identity: Identity) => `${identity.userId}\u0000${identity.householdId}`;
@@ -100,19 +130,6 @@ function randomId(): string {
 	return (
 		globalThis.crypto?.randomUUID?.() ||
 		`${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
-	);
-}
-
-function isState(value: unknown): value is AppState {
-	if (!value || typeof value !== 'object') return false;
-	const state = value as Partial<AppState>;
-	return (
-		Array.isArray(state.pantry) &&
-		Array.isArray(state.recipes) &&
-		Array.isArray(state.meals) &&
-		Array.isArray(state.shopping) &&
-		!!state.preferences &&
-		typeof state.preferences === 'object'
 	);
 }
 
@@ -151,15 +168,56 @@ function readConfirmed(storage: StorageLike, identity: Identity): ConfirmedKitch
 		if (
 			value?.userId !== identity.userId ||
 			value?.householdId !== identity.householdId ||
-			!isState(value.state) ||
+			!isKitchenStateShape(value.state) ||
 			typeof value.etag !== 'string'
 		) {
 			return null;
 		}
-		return value as ConfirmedKitchen;
+		const rawState = clone(value.state);
+		const normalizedState = isKitchenState(rawState) ? rawState : sanitizeKitchenState(rawState);
+		return {
+			userId: value.userId,
+			householdId: value.householdId,
+			state: normalizedState,
+			...(rawState !== normalizedState ? { rawState } : {}),
+			etag: value.etag,
+			updatedAt: typeof value.updatedAt === 'number' ? value.updatedAt : 0
+		};
 	} catch {
 		return null;
 	}
+}
+
+function hasUnretiredJournalVersion(
+	storage: StorageLike,
+	records: PendingJournalRecord[]
+): boolean {
+	for (const record of records) {
+		for (const entry of record.keys) {
+			try {
+				const raw = storage.getItem(entry.key);
+				if (!raw) continue;
+				const parsed = JSON.parse(raw) as PendingKitchen;
+				if (
+					parsed &&
+					typeof parsed === 'object' &&
+					parsed.userId === entry.pending.userId &&
+					parsed.householdId === entry.pending.householdId &&
+					(sameVersion(parsed, entry.pending) ||
+						(!parsed.writeId &&
+							!entry.pending.writeId &&
+							parsed.updatedAt === entry.pending.updatedAt &&
+							parsed.createdAt === entry.pending.createdAt &&
+							parsed.etag === entry.pending.etag))
+				) {
+					return true;
+				}
+			} catch {
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 /**
@@ -236,7 +294,9 @@ export function createKitchenSync(options: {
 			for (const storageKey of expired) {
 				options.storage.removeItem(storageKey);
 			}
-		} catch {}
+		} catch {
+			// Ignore blocked or non-enumerable storage during lease maintenance.
+		}
 	}
 
 	function hasActiveForeignLease(id: string, now = nowOf()): boolean {
@@ -244,12 +304,25 @@ export function createKitchenSync(options: {
 		return !!lease && lease.ownerId !== ownerId;
 	}
 
+	// Scrub any legacy sessionStorage writer-id key without reading or adopting it: sessionStorage is
+	// cloned when duplicating a tab, so each live controller allocates its own lease-checked writerId.
+	try {
+		const sessionStore =
+			options.sessionStorage !== undefined
+				? options.sessionStorage
+				: typeof window !== 'undefined'
+					? window.sessionStorage
+					: globalThis.sessionStorage;
+		sessionStore?.removeItem(WRITER_STORAGE_KEY);
+	} catch {
+		// Ignore blocked or unavailable sessionStorage in sandboxed contexts.
+	}
+
 	purgeExpiredLeases();
-	// Each browsing context owns a unique writerId so a duplicated tab can never adopt a frozen live
-	// tab's slot even after its lease TTL expires.
 	let writerId =
 		options.writerId && !hasActiveForeignLease(options.writerId) ? options.writerId : randomId();
 	let leaseHeld = false;
+	let restagingFromWake = false;
 
 	function acquireOrRefreshLease(): void {
 		const now = nowOf();
@@ -265,12 +338,9 @@ export function createKitchenSync(options: {
 			};
 			options.storage.setItem(writerLeaseKey(writerId), JSON.stringify(lease));
 			leaseHeld = true;
-		} catch {}
-	}
-
-	function refreshLease(): void {
-		if (!leaseHeld && !active) return;
-		acquireOrRefreshLease();
+		} catch {
+			// Ignore quota or read-only storage errors when refreshing advisory leases.
+		}
 	}
 
 	function releaseLease(): void {
@@ -282,7 +352,9 @@ export function createKitchenSync(options: {
 			if (!parsed || parsed.ownerId === ownerId) {
 				options.storage.removeItem(writerLeaseKey(writerId));
 			}
-		} catch {}
+		} catch {
+			// Ignore storage errors when releasing advisory leases.
+		}
 	}
 
 	acquireOrRefreshLease();
@@ -309,6 +381,43 @@ export function createKitchenSync(options: {
 		}
 	};
 
+	function safeReadGetState(): AppState | null {
+		try {
+			const current = options.getState();
+			return isKitchenStateShape(current) ? clone(current) : null;
+		} catch {
+			return null;
+		}
+	}
+
+	function trackOwnDurable(context: ActiveContext, record: PendingJournalRecord): void {
+		context.ownDurable = {
+			record: clone(record),
+			baselineEtag: context.baseline?.etag ?? null,
+			baselineUpdatedAt: context.baseline?.updatedAt ?? 0,
+			getStateAtStage: safeReadGetState()
+		};
+	}
+
+	function isAcknowledgedByStoredBaseline(
+		ownDurable: OwnDurableTracker,
+		storedConfirmed: ConfirmedKitchen | null
+	): boolean {
+		if (!storedConfirmed) return false;
+		if (storedConfirmed.etag !== ownDurable.baselineEtag) return true;
+		if (
+			storedConfirmed.updatedAt > ownDurable.baselineUpdatedAt &&
+			causallyIncludesDelta(
+				ownDurable.record.pending.base,
+				ownDurable.record.pending.local,
+				storedConfirmed.state
+			)
+		) {
+			return true;
+		}
+		return false;
+	}
+
 	function writerMemory(context: ActiveContext): Map<string, MemoryRecord> {
 		let values = memoryRecords.get(context.key);
 		if (!values) {
@@ -324,20 +433,78 @@ export function createKitchenSync(options: {
 		durable: boolean
 	): void {
 		writerMemory(context).set(record.writerId, { record: clone(record), durable });
+		if (durable && record.writerId === writerId) {
+			trackOwnDurable(context, record);
+		}
 	}
 
 	function forgetAcknowledged(context: ActiveContext, records: PendingJournalRecord[]): void {
 		const memory = writerMemory(context);
 		for (const record of records) {
 			const latest = memory.get(record.writerId);
-			if (latest && sameVersion(latest.record.pending, record.pending))
+			if (latest && sameVersion(latest.record.pending, record.pending)) {
 				memory.delete(record.writerId);
+			}
+			if (
+				context.ownDurable &&
+				context.ownDurable.record.writerId === record.writerId &&
+				sameVersion(context.ownDurable.record.pending, record.pending)
+			) {
+				context.ownDurable = null;
+			}
 		}
+	}
+
+	function addRetiredRecords(context: ActiveContext, records: PendingJournalRecord[]): void {
+		for (const record of records) {
+			const exists = context.retiredRecords.some(
+				(item) => item.writerId === record.writerId && sameVersion(item.pending, record.pending)
+			);
+			if (!exists) context.retiredRecords.push(clone(record));
+		}
+	}
+
+	function retireJournalRecords(
+		context: ActiveContext,
+		records: PendingJournalRecord[],
+		failureMessage: string
+	): string {
+		const targets = [...records, ...context.retiredRecords];
+		if (!targets.length) return '';
+		forgetAcknowledged(context, targets);
+		let threw = false;
+		try {
+			clearPendingJournalRecords(options.storage, context.user, targets);
+		} catch {
+			threw = true;
+		}
+		const unretiredNew = records.filter((record) =>
+			hasUnretiredJournalVersion(options.storage, [record])
+		);
+		const unretiredPrior = context.retiredRecords.filter((record) =>
+			hasUnretiredJournalVersion(options.storage, [record])
+		);
+		context.retiredRecords = [];
+		addRetiredRecords(context, [...unretiredPrior, ...unretiredNew]);
+		return threw || unretiredNew.length ? failureMessage : '';
 	}
 
 	function loadJournal(context: ActiveContext): LoadedJournal {
 		const durable = readPendingJournal(options.storage, context.user);
-		const byWriter = new Map(durable.records.map((record) => [record.writerId, record]));
+		const activeDurable = durable.records.filter(
+			(record) =>
+				!context.retiredRecords.some(
+					(retired) =>
+						retired.writerId === record.writerId && sameVersion(retired.pending, record.pending)
+				)
+		);
+		context.retiredRecords = context.retiredRecords.filter((retired) =>
+			durable.records.some(
+				(record) =>
+					record.writerId === retired.writerId && sameVersion(record.pending, retired.pending)
+			)
+		);
+		const byWriter = new Map(activeDurable.map((record) => [record.writerId, record]));
 		const memory = writerMemory(context);
 		let blocked = !!durable.error;
 		let error = durable.error;
@@ -345,7 +512,7 @@ export function createKitchenSync(options: {
 			const stored = byWriter.get(id);
 			if (cached.durable) {
 				if (!stored) {
-					// Another tab may have acknowledged and retired this writer's exact durable version.
+					// Another tab may have acknowledged or compacted this writer's exact durable version.
 					memory.delete(id);
 					continue;
 				}
@@ -360,8 +527,20 @@ export function createKitchenSync(options: {
 				}
 			} else {
 				blocked = true;
-				error ||= 'Some offline changes are only in memory and are not safe to sync yet.';
-				byWriter.set(id, cached.record);
+				error ||= STAGE_QUOTA_ALERT;
+				const keys = stored
+					? [
+							...cached.record.keys,
+							...stored.keys.filter(
+								(entry) =>
+									!cached.record.keys.some(
+										(current) =>
+											current.key === entry.key && sameVersion(current.pending, entry.pending)
+									)
+							)
+						]
+					: cached.record.keys;
+				byWriter.set(id, { ...cached.record, keys });
 			}
 		}
 		for (const record of byWriter.values()) {
@@ -394,7 +573,21 @@ export function createKitchenSync(options: {
 	function refreshBaseline(context: ActiveContext): ConfirmedKitchen | null {
 		const latest = resolveLatestBaseline(context.identity, context.key, context.baseline);
 		context.baseline = latest;
+		if (latest?.rawState && !context.legacyReference) {
+			context.legacyReference = clone(latest.rawState);
+		}
 		return latest;
+	}
+
+	function syncInitialOwnDurable(context: ActiveContext, loaded: LoadedJournal): void {
+		const unfoldedOwn = filterUnfoldedJournalRecords(loaded.records).find(
+			(record) => record.writerId === writerId
+		);
+		if (unfoldedOwn && writerMemory(context).get(writerId)?.durable !== false) {
+			trackOwnDurable(context, unfoldedOwn);
+		} else if (!unfoldedOwn) {
+			context.ownDurable = null;
+		}
 	}
 
 	function aggregatePending(
@@ -431,26 +624,48 @@ export function createKitchenSync(options: {
 		context.pendingDurable = loaded.durable;
 		context.blockedByStorage = loaded.blocked;
 		context.conflicts = clone(merged.conflicts);
+		if (loaded.error) context.storageAlert ||= loaded.error;
 		if (setUI) context.viewState = clone(localState);
-		if (loaded.error) context.error = loaded.error;
-		else if (context.confirmed || loaded.records.length) context.error = '';
-		else context.error = context.loadError;
+		if (loaded.error || context.storageAlert) {
+			context.error = loaded.error || context.storageAlert;
+		} else if (context.confirmed || loaded.records.length) {
+			context.error = '';
+		} else {
+			context.error = context.loadError;
+		}
 		if (setUI) setContextState(context, localState);
 		return { state: localState, conflicts: merged.conflicts };
 	}
 
 	function saveBaseline(context: ActiveContext, state: AppState, etag: string): void {
+		const rawState = clone(state);
+		const normalizedState =
+			isKitchenState(rawState) || !isKitchenStateShape(rawState)
+				? rawState
+				: sanitizeKitchenState(rawState);
 		const baseline: ConfirmedKitchen = {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
-			state: clone(state),
+			state: normalizedState,
+			...(rawState !== normalizedState ? { rawState } : {}),
 			etag,
 			updatedAt: nowOf()
 		};
 		context.baseline = baseline;
+		if (rawState !== normalizedState) context.legacyReference = rawState;
+		else context.legacyReference = null;
 		baselines.set(context.key, baseline);
 		try {
-			options.storage.setItem(confirmedKey(context.identity), JSON.stringify(baseline));
+			options.storage.setItem(
+				confirmedKey(context.identity),
+				JSON.stringify({
+					userId: baseline.userId,
+					householdId: baseline.householdId,
+					state: baseline.state,
+					etag: baseline.etag,
+					updatedAt: baseline.updatedAt
+				})
+			);
 			unpersistedBaselines.delete(context.key);
 		} catch (error) {
 			unpersistedBaselines.add(context.key);
@@ -464,12 +679,14 @@ export function createKitchenSync(options: {
 		acquireOrRefreshLease();
 		generation += 1;
 		const key = identityKey(identity);
+		const baseline = resolveLatestBaseline(identity, key);
 		const context: ActiveContext = {
 			user: clone(user),
 			identity,
 			key,
 			generation,
-			baseline: resolveLatestBaseline(identity, key),
+			baseline,
+			legacyReference: baseline?.rawState ? clone(baseline.rawState) : null,
 			confirmed: false,
 			loading: false,
 			loadError: '',
@@ -478,35 +695,18 @@ export function createKitchenSync(options: {
 			pendingDurable: false,
 			blockedByStorage: false,
 			syncing: false,
+			initializedOnline: false,
 			conflicts: [],
+			storageAlert: '',
+			validationError: false,
+			retiredRecords: [],
+			ownDurable: null,
 			reviewedEtag: null,
 			reviewedState: null,
 			error: ''
 		};
 		active = context;
 		return context;
-	}
-
-	function acknowledge(context: ActiveContext, records: PendingJournalRecord[]): void {
-		try {
-			clearPendingJournalRecords(options.storage, context.user, records);
-			forgetAcknowledged(context, records);
-		} catch (error) {
-			const removed = records.filter((record) =>
-				record.keys.every((captured) => {
-					try {
-						const raw = options.storage.getItem(captured.key);
-						if (raw === null) return true;
-						const current = JSON.parse(raw) as PendingKitchen | null;
-						return !current || !sameVersion(current, captured.pending);
-					} catch {
-						return false;
-					}
-				})
-			);
-			if (removed.length) forgetAcknowledged(context, removed);
-			throw error;
-		}
 	}
 
 	function rebaseNewerWriterRecords(
@@ -538,25 +738,26 @@ export function createKitchenSync(options: {
 				updatedAt: nowOf(),
 				writeId: randomId()
 			};
+			const updated: PendingJournalRecord = {
+				writerId: record.writerId,
+				pending,
+				keys: record.keys.map((entry) => ({
+					key: entry.key,
+					pending:
+						entry.key.includes('flavorithm-pending-journal:') ||
+						(!enumerableStorage(options.storage) &&
+							entry.key ===
+								`flavorithm-pending:${context.identity.userId}:${context.identity.householdId}`)
+							? pending
+							: entry.pending
+				}))
+			};
 			try {
 				if (enumerableStorage(options.storage)) writePendingJournal(options.storage, pending);
 				else writePending(options.storage, pending);
-				const updated: PendingJournalRecord = {
-					writerId: record.writerId,
-					pending,
-					keys: record.keys.map((entry) => ({
-						key: entry.key,
-						pending:
-							entry.key.includes('flavorithm-pending-journal:') ||
-							(!enumerableStorage(options.storage) &&
-								entry.key ===
-									`flavorithm-pending:${context.identity.userId}:${context.identity.householdId}`)
-								? pending
-								: entry.pending
-					}))
-				};
 				rememberRecord(context, updated, true);
 			} catch {
+				rememberRecord(context, updated, false);
 				return 'Earlier edits were saved, but newer edits could not be rebased durably.';
 			}
 		}
@@ -571,6 +772,7 @@ export function createKitchenSync(options: {
 		context.loadError = '';
 		const baseline = refreshBaseline(context);
 		const loaded = loadJournal(context);
+		syncInitialOwnDurable(context, loaded);
 		const firstPending = firstActivePending(loaded.records);
 		const seed = baseline?.state || firstPending?.base || createNewUserState();
 		if (loaded.records.length) {
@@ -581,6 +783,7 @@ export function createKitchenSync(options: {
 			context.reviewedEtag = null;
 			context.reviewedState = null;
 			context.viewState = clone(seed);
+			if (loaded.error) context.storageAlert = loaded.error;
 			context.error = loaded.error;
 			context.blockedByStorage = loaded.blocked;
 			setContextState(context, seed);
@@ -601,39 +804,58 @@ export function createKitchenSync(options: {
 	}
 
 	function initialize(user: User, remoteState: AppState, etag: string): void {
+		const previous = active;
 		const context = activate(user);
 		if (!context) return;
 		context.confirmed = true;
 		context.loading = false;
 		context.loadError = '';
+		context.initializedOnline = true;
+		const normalizedRemote =
+			isKitchenState(remoteState) || !isKitchenStateShape(remoteState)
+				? remoteState
+				: sanitizeKitchenState(remoteState);
+		const carriedQuarantine =
+			previous &&
+			previous.key === context.key &&
+			(!previous.initializedOnline || !!previous.pending) &&
+			previous.storageAlert.includes('quarantined')
+				? previous.storageAlert
+				: '';
 		let baselineError = '';
 		try {
 			saveBaseline(context, remoteState, etag);
 		} catch {
 			baselineError = 'The confirmed kitchen could not be saved for offline use.';
 		}
+		if (normalizedRemote !== remoteState) context.legacyReference = clone(remoteState);
 		let loaded = loadJournal(context);
-		let merged = updateAggregate(context, loaded, remoteState);
+		syncInitialOwnDurable(context, loaded);
+		let quarantineError = loaded.error || carriedQuarantine;
+		let merged = updateAggregate(context, loaded, normalizedRemote);
+		let retireError = '';
 		if (
 			!baselineError &&
 			loaded.records.length &&
 			!merged.conflicts.length &&
-			equal(merged.state, remoteState)
+			equal(merged.state, normalizedRemote)
 		) {
-			try {
-				acknowledge(context, loaded.records);
-				loaded = loadJournal(context);
-				merged = updateAggregate(context, loaded, remoteState);
-			} catch {
-				context.error =
-					'The server already has these changes, but the saved offline journal could not be cleared.';
-			}
+			retireError = retireJournalRecords(
+				context,
+				loaded.records,
+				'The server already has these changes, but the saved offline journal could not be cleared.'
+			);
+			loaded = loadJournal(context);
+			quarantineError ||= loaded.error;
+			merged = updateAggregate(context, loaded, normalizedRemote);
 		}
+		const initAlert = baselineError || retireError || quarantineError;
+		context.storageAlert = initAlert;
+		context.error = initAlert;
 		context.viewState = clone(merged.state);
 		context.reviewedEtag = merged.conflicts.length ? etag : null;
-		context.reviewedState = merged.conflicts.length ? clone(remoteState) : null;
+		context.reviewedState = merged.conflicts.length ? clone(normalizedRemote) : null;
 		setContextState(context, merged.state);
-		if (baselineError) context.error = baselineError;
 		emitStatus(context);
 	}
 
@@ -642,6 +864,8 @@ export function createKitchenSync(options: {
 		if (!context) return false;
 		const baseline = refreshBaseline(context);
 		const loaded = loadJournal(context);
+		syncInitialOwnDurable(context, loaded);
+		context.storageAlert = loaded.error;
 		if (loaded.records.length) {
 			const first = firstActivePending(loaded.records) ?? loaded.records[0].pending;
 			const seed = baseline?.state || first.base || createNewUserState();
@@ -656,7 +880,7 @@ export function createKitchenSync(options: {
 			context.reviewedEtag = null;
 			context.reviewedState = null;
 			context.viewState = clone(baseline.state);
-			context.error = loaded.error;
+			context.error = loaded.error || context.storageAlert;
 			context.blockedByStorage = loaded.blocked;
 			setContextState(context, baseline.state);
 			emitStatus(context);
@@ -705,7 +929,6 @@ export function createKitchenSync(options: {
 	}
 
 	function buildFoldedRefs(
-		loadedRecords: PendingJournalRecord[],
 		ownBefore: PendingJournalRecord | undefined,
 		newlyFolded: PendingJournalRecord[]
 	): FoldedJournalRef[] | undefined {
@@ -723,6 +946,8 @@ export function createKitchenSync(options: {
 				refs.push(ref);
 			}
 		};
+		// Preserve both newly folded peers and transitive foldedFrom lineages so a frozen peer woken
+		// after multi-hop compaction (A -> B -> C) still sees its snapshot listed in foldedFrom.
 		for (const record of newlyFolded) {
 			addRef({
 				writerId: record.writerId,
@@ -731,22 +956,17 @@ export function createKitchenSync(options: {
 				...(record.pending.createdAt !== undefined ? { createdAt: record.pending.createdAt } : {})
 			});
 			for (const inherited of record.pending.foldedFrom ?? []) {
-				if (loadedRecords.some((candidate) => candidate.writerId === inherited.writerId)) {
-					addRef(inherited);
-				}
+				addRef(inherited);
 			}
 		}
 		for (const inherited of ownBefore?.pending.foldedFrom ?? []) {
-			if (loadedRecords.some((candidate) => candidate.writerId === inherited.writerId)) {
-				addRef(inherited);
-			}
+			addRef(inherited);
 		}
 		return refs.length ? refs : undefined;
 	}
 
 	function findCompactionPlan(
 		context: ActiveContext,
-		loaded: LoadedJournal,
 		unfoldedRecords: PendingJournalRecord[],
 		alreadyFoldedPeers: PendingJournalRecord[],
 		effectiveOwn: PendingJournalRecord | undefined,
@@ -762,6 +982,7 @@ export function createKitchenSync(options: {
 		const now = nowOf();
 		const baseline = refreshBaseline(context);
 		const priorLocal = effectiveOwn?.pending.local ?? context.viewState;
+		const observedState = effectiveOwn?.pending.local ?? viewBase;
 		const rebasedOwnAnchor = (() => {
 			if (!effectiveOwn) return null;
 			if (baseline && effectiveOwn.pending.etag !== baseline.etag) {
@@ -797,7 +1018,8 @@ export function createKitchenSync(options: {
 		const ancestorPeers = peers.filter(
 			(record) =>
 				equal(record.pending.base, record.pending.local) ||
-				causallyIncludesDelta(record.pending.base, record.pending.local, viewBase)
+				(causallyIncludesDelta(record.pending.base, record.pending.local, viewBase) &&
+					causallyIncludesDelta(record.pending.base, record.pending.local, observedState))
 		);
 		const hasLeasedAncestor = ancestorPeers.some((record) =>
 			hasActiveForeignLease(record.writerId, now)
@@ -853,9 +1075,12 @@ export function createKitchenSync(options: {
 				base: viewBase,
 				local: next,
 				etag: defaultEtag,
-				createdAt: now,
+				createdAt: effectiveOwn?.pending.createdAt ?? now,
 				updatedAt: now,
-				writerId
+				writerId,
+				...(effectiveOwn?.pending.foldedFrom
+					? { foldedFrom: clone(effectiveOwn.pending.foldedFrom) }
+					: {})
 			},
 			keys: []
 		};
@@ -893,7 +1118,14 @@ export function createKitchenSync(options: {
 			const candidateIds = new Set(candidates.map((record) => record.writerId));
 			const remainingPeers = peers.filter((record) => !candidateIds.has(record.writerId));
 			const composed = composePendingKitchenJournal([...candidates, syntheticStep]);
-			if (!composed || composed.conflicts.length > 0) {
+			const uncompactedAll = composePendingKitchenJournal([
+				...peers,
+				{
+					...syntheticStep,
+					pending: { ...syntheticStep.pending, base: defaultBaseSource, local: next }
+				}
+			]);
+			if (!composed || composed.conflicts.length > 0 || !uncompactedAll) {
 				return {
 					foldableAncestors: [],
 					alreadyFoldedPeers,
@@ -902,15 +1134,38 @@ export function createKitchenSync(options: {
 					anchoredToBaseline: !!baseline && equal(defaultBaseSource, baseline.state)
 				};
 			}
+			const previewFoldedFrom = buildFoldedRefs(effectiveOwn, candidates);
 			if (baseline) {
 				const alignedComposedBase = context.confirmed
 					? alignRevertedBaselinePantryQuantities(composed.base, priorLocal, next, baseline.state)
 					: composed.base;
 				const onBaseline = mergeKitchenStates(alignedComposedBase, composed.local, baseline.state);
+				const compactedAnchored = composePendingKitchenJournal([
+					...remainingPeers,
+					{
+						...syntheticStep,
+						pending: {
+							...syntheticStep.pending,
+							base: baseline.state,
+							local: next,
+							etag: baseline.etag,
+							...(previewFoldedFrom ? { foldedFrom: previewFoldedFrom } : {})
+						}
+					}
+				]);
+				const expectedOnBaseline = mergeKitchenStates(
+					uncompactedAll.base,
+					uncompactedAll.local,
+					baseline.state
+				);
 				if (
 					!onBaseline.conflicts.length &&
 					equal(onBaseline.state, next) &&
-					preservesPeersOnBaseline(remainingPeers, alignedComposedBase)
+					preservesPeersOnBaseline(remainingPeers, alignedComposedBase) &&
+					compactedAnchored &&
+					!expectedOnBaseline.conflicts.length &&
+					compactedAnchored.conflicts.length === uncompactedAll.conflicts.length &&
+					equal(compactedAnchored.local, expectedOnBaseline.state)
 				) {
 					return {
 						foldableAncestors: candidates,
@@ -921,8 +1176,27 @@ export function createKitchenSync(options: {
 					};
 				}
 			}
-			if (equal(composed.local, next)) {
-				const firstOrdered = composed.ordered[0]?.pending;
+			const firstOrdered = composed.ordered[0]?.pending;
+			const compactedDirect = composePendingKitchenJournal([
+				...remainingPeers,
+				{
+					...syntheticStep,
+					pending: {
+						...syntheticStep.pending,
+						base: composed.base,
+						local: next,
+						etag: firstOrdered?.etag ?? defaultEtag,
+						...(previewFoldedFrom ? { foldedFrom: previewFoldedFrom } : {})
+					}
+				}
+			]);
+			if (
+				equal(composed.local, next) &&
+				compactedDirect &&
+				compactedDirect.conflicts.length === uncompactedAll.conflicts.length &&
+				equal(compactedDirect.base, uncompactedAll.base) &&
+				equal(compactedDirect.local, uncompactedAll.local)
+			) {
 				return {
 					foldableAncestors: candidates,
 					alreadyFoldedPeers,
@@ -979,13 +1253,16 @@ export function createKitchenSync(options: {
 		if (!context || !isActive(context)) return;
 		acquireOrRefreshLease();
 		const next = clone(state);
-		if (!isState(next)) {
+		if (!isKitchenStateShape(next)) {
+			context.validationError = true;
 			context.error = 'The kitchen state is invalid and was not saved.';
 			emitStatus(context);
 			return;
 		}
 		const baseline = refreshBaseline(context);
+		const trackedBeforeLoad = context.ownDurable ? clone(context.ownDurable) : null;
 		const loaded = loadJournal(context);
+		if (loaded.error) context.storageAlert ||= loaded.error;
 		const unfoldedRecords = filterUnfoldedJournalRecords(loaded.records);
 		const unfoldedSet = new Set(unfoldedRecords);
 		const alreadyFoldedPeers = loaded.records.filter(
@@ -993,10 +1270,24 @@ export function createKitchenSync(options: {
 		);
 		const own = loaded.records.find((record) => record.writerId === writerId);
 		const effectiveOwn = own && unfoldedSet.has(own) ? own : undefined;
+		let unacknowledgedVanishedBase: AppState | null = null;
+		if (!effectiveOwn && trackedBeforeLoad) {
+			const storedConfirmed = readConfirmed(options.storage, context.identity);
+			if (isAcknowledgedByStoredBaseline(trackedBeforeLoad, storedConfirmed)) {
+				context.ownDurable = null;
+			} else if (!isRecordFoldedInto(trackedBeforeLoad.record, loaded.records)) {
+				unacknowledgedVanishedBase = clone(trackedBeforeLoad.record.pending.base);
+			}
+		}
 		const firstPending = firstActivePending(loaded.records);
-		const base = clone(
-			effectiveOwn?.pending.base || context.viewState || baseline?.state || createNewUserState()
+		const rawBase = clone(
+			effectiveOwn?.pending.base ||
+				unacknowledgedVanishedBase ||
+				context.viewState ||
+				baseline?.state ||
+				createNewUserState()
 		);
+		const base = isKitchenState(rawBase) ? rawBase : sanitizeKitchenState(rawBase);
 		const conflictSeed = context.reviewedState || baseline?.state || firstPending?.base || base;
 		const conflictSeedEtag = baseline?.etag ?? firstPending?.etag ?? null;
 		const syncReviewedConflictSeed = (conflicts: SyncConflict[]) => {
@@ -1008,55 +1299,97 @@ export function createKitchenSync(options: {
 				context.reviewedState = clone(conflictSeed);
 			}
 		};
-		const isReactiveEcho = Boolean(stageOptions?.echo && equal(next, context.viewState));
+		const isReactiveEcho = Boolean(
+			!unacknowledgedVanishedBase && stageOptions?.echo && equal(next, context.viewState)
+		);
 		const isUnchangedState =
-			(!effectiveOwn && equal(next, context.viewState)) ||
+			(!effectiveOwn && !unacknowledgedVanishedBase && equal(next, context.viewState)) ||
 			Boolean(effectiveOwn && equal(next, effectiveOwn.pending.local));
 		if (isReactiveEcho || isUnchangedState) {
-			const previousError = context.error;
+			const priorError = context.validationError ? '' : context.error;
+			context.validationError = false;
 			if (!isReactiveEcho && effectiveOwn) context.viewState = next;
 			const merged = updateAggregate(context, loaded, conflictSeed);
-			if (!loaded.error && previousError) context.error = previousError;
 			syncReviewedConflictSeed(merged.conflicts);
+			context.error =
+				loaded.error ||
+				context.storageAlert ||
+				priorError ||
+				(!context.confirmed && !loaded.records.length ? context.loadError : '');
 			emitStatus(context);
 			return;
 		}
+		const reference =
+			context.legacyReference && !isKitchenState(context.legacyReference)
+				? context.legacyReference
+				: rawBase;
+		const validatedNext = repairLegacyKitchenState(next, reference);
+		if (!validatedNext) {
+			context.validationError = true;
+			context.error = 'The kitchen state is invalid and was not saved.';
+			emitStatus(context);
+			return;
+		}
+		if (effectiveOwn && equal(validatedNext, effectiveOwn.pending.local)) {
+			const priorError = context.validationError ? '' : context.error;
+			context.validationError = false;
+			context.viewState = next;
+			const merged = updateAggregate(context, loaded, conflictSeed);
+			syncReviewedConflictSeed(merged.conflicts);
+			context.error =
+				loaded.error ||
+				context.storageAlert ||
+				priorError ||
+				(!context.confirmed && !loaded.records.length ? context.loadError : '');
+			emitStatus(context);
+			return;
+		}
+		context.validationError = false;
 
 		const plan = findCompactionPlan(
 			context,
-			loaded,
 			unfoldedRecords,
 			alreadyFoldedPeers,
 			effectiveOwn,
 			base,
-			next
+			validatedNext
 		);
 		const latestBaseline = context.baseline;
 		const matchesBaseline =
 			!context.syncing &&
-			((plan.anchoredToBaseline && !!latestBaseline && equal(next, latestBaseline.state)) ||
-				equal(next, plan.base));
+			((plan.anchoredToBaseline &&
+				!!latestBaseline &&
+				(equal(next, latestBaseline.state) || equal(validatedNext, latestBaseline.state))) ||
+				equal(next, plan.base) ||
+				equal(validatedNext, plan.base));
 		if (matchesBaseline) {
+			context.ownDurable = null;
 			const toRetire = [
 				...(own ? [own] : []),
 				...plan.foldableAncestors,
 				...plan.alreadyFoldedPeers
 			];
-			try {
-				if (toRetire.length) acknowledge(context, toRetire);
-				const after = loadJournal(context);
-				const afterFirst = firstActivePending(after.records);
-				context.viewState = next;
-				const merged = updateAggregate(
-					context,
-					after,
-					context.reviewedState || latestBaseline?.state || afterFirst?.base || next
-				);
-				context.viewState = next;
-				syncReviewedConflictSeed(merged.conflicts);
-			} catch {
-				context.error = 'The reverted offline changes could not be removed from this device.';
-			}
+			const retireError = retireJournalRecords(
+				context,
+				toRetire,
+				'The reverted offline changes could not be removed from this device.'
+			);
+			const after = loadJournal(context);
+			const afterFirst = firstActivePending(after.records);
+			const preservedAlert =
+				context.storageAlert && context.storageAlert !== STAGE_QUOTA_ALERT
+					? context.storageAlert
+					: '';
+			context.storageAlert = retireError || after.error || preservedAlert;
+			context.viewState = next;
+			const merged = updateAggregate(
+				context,
+				after,
+				context.reviewedState || latestBaseline?.state || afterFirst?.base || validatedNext
+			);
+			context.viewState = next;
+			syncReviewedConflictSeed(merged.conflicts);
+			context.error = context.storageAlert;
 			emitStatus(context);
 			return;
 		}
@@ -1075,12 +1408,12 @@ export function createKitchenSync(options: {
 
 		const now = nowOf();
 		const ancestorsToRetire = [...plan.foldableAncestors, ...plan.alreadyFoldedPeers];
-		const foldedFrom = buildFoldedRefs(loaded.records, own, ancestorsToRetire);
+		const foldedFrom = buildFoldedRefs(own, ancestorsToRetire);
 		const pending: PendingKitchen = {
 			userId: context.identity.userId,
 			householdId: context.identity.householdId,
 			base: plan.base,
-			local: next,
+			local: validatedNext,
 			etag: plan.etag,
 			createdAt: effectiveOwn?.pending.createdAt ?? now,
 			updatedAt: now,
@@ -1101,7 +1434,7 @@ export function createKitchenSync(options: {
 			}
 			durable = true;
 		} catch {
-			persistenceError = 'Offline changes could not be saved on this device. Sync is paused.';
+			persistenceError = STAGE_QUOTA_ALERT;
 		}
 		const journalStorageKey = enumerableStorage(options.storage)
 			? `flavorithm-pending-journal:v1:${encodeURIComponent(context.identity.userId)}:${encodeURIComponent(context.identity.householdId)}:${encodeURIComponent(writerId)}`
@@ -1118,19 +1451,25 @@ export function createKitchenSync(options: {
 		};
 		if (durable) {
 			rememberRecord(context, ownRecord, true);
-			if (ancestorsToRetire.length) {
-				try {
-					acknowledge(context, ancestorsToRetire);
-				} catch {
-					persistenceError ||=
-						'Compacted offline journal entries could not be retired on this device.';
-				}
+			if (ancestorsToRetire.length || context.retiredRecords.length) {
+				const retireError = retireJournalRecords(
+					context,
+					ancestorsToRetire,
+					'Compacted offline journal entries could not be retired on this device.'
+				);
+				if (retireError) persistenceError ||= retireError;
 			}
 		} else {
 			rememberRecord(context, ownRecord, false);
 		}
 		const after = loadJournal(context);
 		const afterFirst = firstActivePending(after.records);
+		const preservedAlert =
+			context.storageAlert && context.storageAlert !== STAGE_QUOTA_ALERT
+				? context.storageAlert
+				: '';
+		context.storageAlert =
+			persistenceError || (durable ? after.error || preservedAlert : context.storageAlert);
 		const aggregate = updateAggregate(
 			context,
 			after,
@@ -1139,19 +1478,86 @@ export function createKitchenSync(options: {
 		// Stage is driven by the UI's current state. Keep it as the view even if a different tab has
 		// additional queued deltas that are not reflected in this tab yet.
 		context.viewState = next;
-		if (persistenceError) context.error = persistenceError;
-		else if (durable && !after.error) context.error = '';
+		context.error = persistenceError || after.error || context.storageAlert;
 		if (aggregate.conflicts.length) context.conflicts = clone(aggregate.conflicts);
 		syncReviewedConflictSeed(aggregate.conflicts);
 		emitStatus(context);
 	}
 
-	async function sync(prefer?: 'local' | 'remote', expectedEtag?: string | null): Promise<void> {
+	function refreshLease(): void {
+		if (!leaseHeld && !active) return;
+		acquireOrRefreshLease();
+		if (restagingFromWake || !active || !isActive(active) || active.syncing || !active.ownDurable) {
+			return;
+		}
+		const tracked = clone(active.ownDurable);
+		const durable = readPendingJournal(options.storage, active.user);
+		const activeDurable = durable.records.filter(
+			(record) =>
+				!active!.retiredRecords.some(
+					(retired) =>
+						retired.writerId === record.writerId && sameVersion(retired.pending, record.pending)
+				)
+		);
+		const unfolded = filterUnfoldedJournalRecords(activeDurable);
+		if (
+			unfolded.some(
+				(record) =>
+					record.writerId === tracked.record.writerId &&
+					sameVersion(record.pending, tracked.record.pending)
+			) ||
+			unfolded.some((record) => record.writerId === writerId)
+		) {
+			return;
+		}
+		const storedConfirmed = readConfirmed(options.storage, active.identity);
+		if (isAcknowledgedByStoredBaseline(tracked, storedConfirmed)) {
+			active.ownDurable = null;
+			const baseline = refreshBaseline(active);
+			const loaded = loadJournal(active);
+			const firstPending = firstActivePending(loaded.records);
+			const seed = baseline?.state || firstPending?.base || createNewUserState();
+			updateAggregate(active, loaded, seed);
+			emitStatus(active);
+			return;
+		}
+		if (isRecordFoldedInto(tracked.record, activeDurable)) {
+			return;
+		}
+		const liveState = safeReadGetState();
+		const hasNewLiveEdit =
+			liveState !== null &&
+			(tracked.getStateAtStage === null || !equal(liveState, tracked.getStateAtStage));
+		const candidateState = hasNewLiveEdit
+			? liveState
+			: clone(active.viewState ?? tracked.record.pending.local);
+		restagingFromWake = true;
+		try {
+			writerMemory(active).delete(writerId);
+			active.ownDurable = null;
+			active.viewState = clone(tracked.record.pending.base);
+			stage(candidateState);
+		} finally {
+			restagingFromWake = false;
+		}
+	}
+
+	async function runSync(
+		prefer?: 'local' | 'remote',
+		expectedEtag?: string | null,
+		continuationDepth = 0
+	): Promise<void> {
 		const context = active;
 		if (!context || !isActive(context) || context.syncing) return;
 		acquireOrRefreshLease();
 		const baseline = refreshBaseline(context);
 		const loaded = loadJournal(context);
+		const persistentAlert =
+			(loaded.error && loaded.error !== STAGE_QUOTA_ALERT ? loaded.error : '') ||
+			(context.storageAlert && context.storageAlert !== STAGE_QUOTA_ALERT
+				? context.storageAlert
+				: '');
+		if (loaded.error) context.storageAlert ||= loaded.error;
 		if (!loaded.records.length) {
 			context.pending = null;
 			context.pendingDurable = false;
@@ -1159,7 +1565,8 @@ export function createKitchenSync(options: {
 			context.conflicts = [];
 			context.reviewedEtag = null;
 			context.reviewedState = null;
-			context.error = loaded.error || (!context.confirmed ? context.loadError : '');
+			context.error =
+				loaded.error || context.storageAlert || (!context.confirmed ? context.loadError : '');
 			emitStatus(context);
 			return;
 		}
@@ -1172,11 +1579,6 @@ export function createKitchenSync(options: {
 		);
 		context.pendingDurable = loaded.durable;
 		context.blockedByStorage = loaded.blocked;
-		if (!loaded.durable || loaded.blocked) {
-			context.error ||= 'Offline changes are not safely saved on this device, so sync is paused.';
-			emitStatus(context);
-			return;
-		}
 		const captured = clone(loaded.records);
 		const pinnedEtag = prefer
 			? expectedEtag !== undefined
@@ -1221,6 +1623,7 @@ export function createKitchenSync(options: {
 			const result = await syncPendingKitchenJournal(captured, guarded, prefer, pinnedEtag);
 			if (!isActive(context)) return;
 			if (!result.saved) {
+				shouldContinue = false;
 				context.conflicts = clone(result.conflicts);
 				context.reviewedEtag = result.conflicts.length ? result.etag : null;
 				context.reviewedState =
@@ -1241,22 +1644,40 @@ export function createKitchenSync(options: {
 			saved = true;
 			savedEtag = result.etag;
 			savedState = clone(result.state);
+			// Failure ordering after server acknowledgement:
+			// 1. Write the new confirmed baseline first so a crash before journal cleanup never drops
+			//    acknowledged edits between journal removal and baseline persistence.
+			// 2. Retire acknowledged journal entries (and suppress any key whose removeItem threw or
+			//    silently no-opped so sync cannot re-send an acknowledged version in a loop).
+			// 3. If step 1 failed due to tight storage quota, retry saveBaseline now that journal space
+			//    has been freed; if it still fails, drop any stale confirmed cache so an offline reload
+			//    cannot silently revert to an older pre-save baseline.
+			let baselineSaveError = '';
 			try {
 				saveBaseline(context, result.state, result.etag);
 			} catch {
-				context.error =
+				baselineSaveError =
 					'The server saved these changes, but the confirmed state could not be saved on this device.';
-				return;
 			}
-			let afterSaveError = '';
-			try {
-				acknowledge(context, captured);
-			} catch {
-				afterSaveError =
-					'The server saved these changes, but acknowledged journal entries could not be retired.';
+			const retireError = retireJournalRecords(
+				context,
+				captured,
+				'The server saved these changes, but acknowledged journal entries could not be retired.'
+			);
+			if (baselineSaveError) {
+				try {
+					saveBaseline(context, result.state, result.etag);
+					baselineSaveError = '';
+				} catch {
+					try {
+						options.storage.removeItem(confirmedKey(context.identity));
+					} catch {
+						// Ignore blocked or read-only storage when evicting stale confirmed state.
+					}
+				}
 			}
 			let remaining = loadJournal(context);
-			afterSaveError ||= rebaseNewerWriterRecords(
+			const rebaseError = rebaseNewerWriterRecords(
 				context,
 				captured,
 				remaining.records,
@@ -1264,13 +1685,32 @@ export function createKitchenSync(options: {
 				result.etag
 			);
 			remaining = loadJournal(context);
+			const remainingPersistent =
+				remaining.error && remaining.error !== STAGE_QUOTA_ALERT ? remaining.error : '';
+			const afterSaveError =
+				baselineSaveError || retireError || rebaseError || remainingPersistent || persistentAlert;
+			context.storageAlert = afterSaveError || remaining.error;
 			const merged = updateAggregate(context, remaining, result.state);
 			if (remaining.records.length) {
+				context.viewState = clone(merged.state);
+				context.error = afterSaveError || remaining.error;
 				setContextState(context, merged.state);
-				shouldContinue = remaining.durable && !remaining.blocked && merged.conflicts.length === 0;
+				const hasNewerRecords = remaining.records.some(
+					(record) =>
+						!captured.some(
+							(done) =>
+								done.writerId === record.writerId && sameVersion(done.pending, record.pending)
+						)
+				);
 				if (merged.conflicts.length) {
+					shouldContinue = false;
 					context.error =
 						'Newer offline edits overlap saved changes. Review the conflicts before syncing.';
+				} else if (hasNewerRecords && continuationDepth < MAX_SYNC_CONTINUATIONS) {
+					shouldContinue = true;
+				} else if (hasNewerRecords) {
+					shouldContinue = false;
+					context.error ||= 'Kitchen changes are updating rapidly. Retry sync to finish saving.';
 				}
 			} else {
 				context.pending = null;
@@ -1278,11 +1718,11 @@ export function createKitchenSync(options: {
 				context.blockedByStorage = !!remaining.error;
 				context.conflicts = [];
 				context.viewState = clone(result.state);
+				context.error = afterSaveError || remaining.error;
 				setContextState(context, result.state);
 			}
-			if (remaining.error) context.error = remaining.error;
-			if (afterSaveError) context.error = afterSaveError;
 		} catch (error) {
+			shouldContinue = false;
 			if (isActive(context)) {
 				context.error = error instanceof Error ? error.message : 'Could not sync offline changes.';
 			}
@@ -1294,11 +1734,15 @@ export function createKitchenSync(options: {
 				}
 				context.syncing = false;
 				emitStatus(context);
-				if (shouldContinue && context.pending && context.pendingDurable && !context.error) {
-					void sync();
+				if (shouldContinue && context.pending && !context.conflicts.length) {
+					void runSync(undefined, undefined, continuationDepth + 1);
 				}
 			}
 		}
+	}
+
+	function sync(prefer?: 'local' | 'remote', expectedEtag?: string | null): Promise<void> {
+		return runSync(prefer, expectedEtag, 0);
 	}
 
 	function clearContext(): void {
@@ -1326,6 +1770,24 @@ export function createKitchenSync(options: {
 		return aggregatePending(active, loaded.records, merged.state);
 	}
 
+	function quarantined(): QuarantinedJournalEntry[] {
+		if (!active || !isActive(active)) return [];
+		return readQuarantinedJournal(options.storage, active.user);
+	}
+
+	function exportBackup(): KitchenBackupPayload | null {
+		if (!active || !isActive(active)) return null;
+		const snap = snapshot();
+		const quarantinedEntries = readQuarantinedJournal(options.storage, active.user);
+		if (quarantinedEntries.length) {
+			return {
+				...(snap ? { pending: snap.local } : {}),
+				quarantined: quarantinedEntries
+			};
+		}
+		return snap ? snap.local : null;
+	}
+
 	return {
 		prepare,
 		failLoad,
@@ -1334,6 +1796,8 @@ export function createKitchenSync(options: {
 		stage,
 		sync,
 		snapshot,
+		quarantined,
+		exportBackup,
 		clearContext,
 		refreshLease,
 		releaseLease

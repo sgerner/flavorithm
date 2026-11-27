@@ -1,10 +1,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createInitialState, createNewUserState, seedRecipes } from '../src/lib/data.ts';
-import { createKitchenSync, type SyncStatus } from '../src/lib/client-sync.ts';
+import {
+	createKitchenSync,
+	MAX_SYNC_CONTINUATIONS,
+	type SyncStatus
+} from '../src/lib/client-sync.ts';
 import { MAX_RECIPES } from '../src/lib/recipe-collection.ts';
-import type { AppState, User } from '../src/lib/types.ts';
-import type { KitchenTransport } from '../src/lib/offline-sync.ts';
+import { validateKitchenState } from '../src/lib/state-schema.ts';
+import type { AppState, Meal, Recipe, User } from '../src/lib/types.ts';
+import { jsonEqual, mergeKitchenStates, type KitchenTransport } from '../src/lib/offline-sync.ts';
+
+function requireValidState(state: AppState): AppState {
+	const parsed = validateKitchenState(state);
+	assert.ok(parsed, 'Expected kitchen state to satisfy shared schema');
+	return parsed;
+}
 
 function memoryStorage() {
 	const values = new Map<string, string>();
@@ -44,10 +55,11 @@ const makeUser = (id = 'user-a', householdId = 'home-a'): User => ({
 function harness(args: {
 	user: User | null;
 	storage?: ReturnType<typeof memoryStorage>;
-	sessionStorage?: ReturnType<typeof memoryStorage>;
+	sessionStorage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'> | null;
 	writerId?: string;
 	now?: () => number;
 	leaseTtlMs?: number;
+	reactiveStage?: boolean;
 	transport?: (user: User) => KitchenTransport;
 	initial?: AppState;
 }) {
@@ -67,6 +79,12 @@ function harness(args: {
 		setState: (state) => {
 			currentState = structuredClone(state);
 			setStates.push(structuredClone(state));
+			if (args.reactiveStage) {
+				const snapshot = JSON.stringify(currentState);
+				queueMicrotask(() => {
+					if (currentUser) controller.stage(JSON.parse(snapshot));
+				});
+			}
 		},
 		onStatus: (status) => statuses.push(status),
 		transport: (user) => {
@@ -278,18 +296,25 @@ test('unresolved conflicts retain the queue until an explicit resolution is chos
 	assert.equal(sync.statuses.at(-1)?.conflicts.length, 0);
 });
 
-test('storage failure blocks network sync and reports that the edit was not saved', async () => {
+test('storage quota failure keeps edits pending in memory for backup and online sync', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
-	const local = structuredClone(base);
-	local.preferences.maxTime = 30;
+	const firstLocal = structuredClone(base);
+	firstLocal.preferences.maxTime = 30;
+	const latestLocal = structuredClone(base);
+	latestLocal.preferences.maxTime = 20;
 	const storage = memoryStorage();
 	const originalSet = storage.setItem;
+	let quotaExceeded = false;
 	storage.setItem = (key, value) => {
-		if (key.startsWith('flavorithm-pending-journal:')) throw new Error('Storage full');
+		if (quotaExceeded && key.startsWith('flavorithm-pending-journal:')) {
+			throw Object.assign(new Error('QuotaExceededError'), { name: 'QuotaExceededError' });
+		}
 		originalSet(key, value);
 	};
 	let reads = 0;
+	let writes = 0;
+	const savedStates: AppState[] = [];
 	const sync = harness({
 		user,
 		storage,
@@ -297,16 +322,46 @@ test('storage failure blocks network sync and reports that the edit was not save
 			identity: { userId: user.id, householdId: user.householdId },
 			get: async () => {
 				reads += 1;
-				return { state: base, etag: 'v1', userId: user.id, householdId: user.householdId };
+				return {
+					state: structuredClone(base),
+					etag: 'v1',
+					userId: user.id,
+					householdId: user.householdId
+				};
 			},
-			put: async (state) => ({ state, etag: 'v2' })
+			put: async (state) => {
+				writes += 1;
+				savedStates.push(structuredClone(state));
+				return { state: structuredClone(state), etag: 'v2' };
+			}
 		})
 	});
 	sync.controller.initialize(user, base, 'v1');
-	sync.controller.stage(local);
+	sync.controller.stage(firstLocal);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		1
+	);
+
+	quotaExceeded = true;
+	sync.controller.stage(latestLocal);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.match(sync.statuses.at(-1)?.error || '', /could not be saved on this device/);
+	assert.equal(sync.controller.snapshot()?.local.preferences.maxTime, 20);
+
 	await sync.controller.sync();
-	assert.equal(reads, 0);
-	assert.match(sync.statuses.at(-1)?.error || '', /could not be saved|not safely saved/);
+	assert.equal(reads, 1);
+	assert.equal(writes, 1);
+	assert.equal(savedStates.at(-1)?.preferences.maxTime, 20);
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
 });
 
 test('separate offline writers survive destroy and reload, then sync their disjoint changes', async () => {
@@ -753,6 +808,330 @@ test('active foreign leases protect live peer journal slots until released', () 
 	);
 });
 
+test('a peer woken after its lease lapsed and its slot was folded preserves edits made after the fold', async () => {
+	// Part 1: Multi-hop fold (tabA -> tabB -> tabC) followed by wake-up and same-timestamp post-fold edits in tabA.
+	let clock = 1_000;
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	let server = structuredClone(base);
+	const transport = () => ({
+		identity: { userId: user.id, householdId: user.householdId },
+		get: async () => ({
+			state: structuredClone(server),
+			etag: 'v1',
+			userId: user.id,
+			householdId: user.householdId
+		}),
+		put: async (state: AppState) => {
+			server = requireValidState(state);
+			return { state: structuredClone(server), etag: 'v2' };
+		}
+	});
+
+	const tabA = harness({
+		user,
+		storage,
+		writerId: 'a-frozen-peer',
+		now: () => clock,
+		leaseTtlMs: 120_000,
+		transport
+	});
+	tabA.controller.initialize(user, base, 'v1');
+	const editA1 = structuredClone(base);
+	editA1.meals.push({
+		id: 'meal-a1',
+		date: '2026-11-03',
+		slot: 'Dinner',
+		recipeId: base.recipes[0].id,
+		servings: 2
+	});
+	editA1.shopping.push({
+		id: 'shop-a1',
+		name: 'chickpeas',
+		quantity: 2,
+		unit: 'can',
+		checked: false
+	});
+	tabA.state = editA1;
+	tabA.controller.stage(editA1);
+
+	// Background tabA past its 120 s lease; tabB folds tabA, then closes, and tabC folds tabB.
+	clock += 150_000;
+	const tabB = harness({
+		user,
+		storage,
+		writerId: 'm-folder-one',
+		now: () => clock,
+		leaseTtlMs: 120_000,
+		transport
+	});
+	assert.equal(tabB.controller.restore(user), true);
+	const editB1 = structuredClone(tabB.state);
+	editB1.shopping.push({
+		id: 'shop-b1',
+		name: 'lemons',
+		quantity: 4,
+		unit: 'piece',
+		checked: false
+	});
+	tabB.controller.stage(editB1);
+	tabB.controller.releaseLease();
+
+	clock += 1_000;
+	const tabC = harness({
+		user,
+		storage,
+		writerId: 'z-folder-two',
+		now: () => clock,
+		leaseTtlMs: 120_000,
+		transport
+	});
+	assert.equal(tabC.controller.restore(user), true);
+	const editC1 = structuredClone(tabC.state);
+	editC1.meals.push({
+		id: 'meal-c1',
+		date: '2026-11-04',
+		slot: 'Lunch',
+		recipeId: base.recipes[1].id,
+		servings: 3
+	});
+	tabC.controller.stage(editC1);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		1
+	);
+
+	// Wake tabA (refreshLease on visibilitychange/pageshow): slotC transitively lists tabA in foldedFrom,
+	// so tabA does not duplicate editA1 yet, and its subsequent post-fold edits (even at the same timestamp
+	// with writerId 'a-frozen-peer' < 'z-folder-two') apply cleanly on top of the folded state.
+	tabA.controller.refreshLease();
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		1
+	);
+
+	const editA2 = structuredClone(editA1);
+	editA2.meals[0].servings = 5;
+	editA2.shopping[0].checked = true;
+	editA2.shopping.push({
+		id: 'shop-a2',
+		name: 'tahini',
+		quantity: 1,
+		unit: 'jar',
+		checked: false
+	});
+	tabA.state = editA2;
+	tabA.controller.stage(editA2);
+
+	await tabA.controller.sync();
+	assert.equal(server.meals.find((meal) => meal.id === 'meal-a1')?.servings, 5);
+	assert.equal(server.meals.find((meal) => meal.id === 'meal-c1')?.servings, 3);
+	assert.equal(server.shopping.find((item) => item.id === 'shop-a1')?.checked, true);
+	assert.equal(server.shopping.find((item) => item.id === 'shop-b1')?.quantity, 4);
+	assert.equal(server.shopping.find((item) => item.id === 'shop-a2')?.quantity, 1);
+
+	// Part 2: Woken peer deletes/reverts its folded item, freezes again, and the folding peer stages another edit:
+	// the folding peer must not fold away the woken peer's post-fold deletion.
+	let clock2 = 10_000;
+	const storage2 = memoryStorage();
+	let server2 = structuredClone(base);
+	const transport2 = () => ({
+		identity: { userId: user.id, householdId: user.householdId },
+		get: async () => ({
+			state: structuredClone(server2),
+			etag: 'v1',
+			userId: user.id,
+			householdId: user.householdId
+		}),
+		put: async (state: AppState) => {
+			server2 = requireValidState(state);
+			return { state: structuredClone(server2), etag: 'v2' };
+		}
+	});
+	const peerWoken = harness({
+		user,
+		storage: storage2,
+		now: () => clock2,
+		leaseTtlMs: 120_000,
+		transport: transport2
+	});
+	peerWoken.controller.initialize(user, base, 'v1');
+	const withOats = structuredClone(base);
+	withOats.shopping.push({ id: 'oats', name: 'oats', quantity: 1, unit: 'bag', checked: false });
+	peerWoken.state = withOats;
+	peerWoken.controller.stage(withOats);
+
+	clock2 += 150_000;
+	const peerFolder = harness({
+		user,
+		storage: storage2,
+		now: () => clock2,
+		leaseTtlMs: 120_000,
+		transport: transport2
+	});
+	assert.equal(peerFolder.controller.restore(user), true);
+	const withOatsAndTea = structuredClone(peerFolder.state);
+	withOatsAndTea.shopping.push({
+		id: 'tea',
+		name: 'tea',
+		quantity: 1,
+		unit: 'box',
+		checked: false
+	});
+	peerFolder.state = withOatsAndTea;
+	peerFolder.controller.stage(withOatsAndTea);
+
+	// peerWoken wakes up and deletes oats, then freezes again past its lease TTL.
+	clock2 += 1_000;
+	peerWoken.controller.refreshLease();
+	peerWoken.state = structuredClone(base);
+	peerWoken.controller.stage(structuredClone(base));
+
+	clock2 += 150_000;
+	const updatedTea = structuredClone(peerFolder.state);
+	updatedTea.shopping.find((item) => item.id === 'tea')!.quantity = 3;
+	peerFolder.state = updatedTea;
+	peerFolder.controller.stage(updatedTea);
+
+	await peerFolder.controller.sync();
+	assert.deepEqual(
+		server2.shopping.map((item) => ({ id: item.id, quantity: item.quantity })),
+		[{ id: 'tea', quantity: 3 }]
+	);
+});
+
+test('visibilitychange and pageshow re-stage when a woken peer durable slot is gone and unlisted in foldedFrom', async () => {
+	let clock = 5_000;
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	let server = structuredClone(base);
+	let currentEtag = 'v1';
+	const transport = () => ({
+		identity: { userId: user.id, householdId: user.householdId },
+		get: async () => ({
+			state: structuredClone(server),
+			etag: currentEtag,
+			userId: user.id,
+			householdId: user.householdId
+		}),
+		put: async (state: AppState) => {
+			server = requireValidState(state);
+			currentEtag = currentEtag === 'v1' ? 'v2' : 'v3';
+			return { state: structuredClone(server), etag: currentEtag };
+		}
+	});
+
+	let visibilityState: 'visible' | 'hidden' = 'visible';
+	const tabA = harness({
+		user,
+		storage,
+		writerId: 'tab-wake-a',
+		now: () => clock,
+		leaseTtlMs: 120_000,
+		transport
+	});
+	const onVisibilityChange = () => {
+		if (visibilityState === 'visible') tabA.controller.refreshLease();
+	};
+	const onPageShow = () => {
+		tabA.controller.refreshLease();
+	};
+
+	tabA.controller.initialize(user, base, 'v1');
+	const offlineA = structuredClone(base);
+	offlineA.meals.push({
+		id: 'wake-meal',
+		date: '2026-11-05',
+		slot: 'Dinner',
+		recipeId: base.recipes[0].id,
+		servings: 4
+	});
+	offlineA.shopping.push({
+		id: 'wake-shop',
+		name: 'avocados',
+		quantity: 3,
+		unit: 'piece',
+		checked: false
+	});
+	tabA.state = offlineA;
+	tabA.controller.stage(offlineA);
+
+	const journalKeyA = `flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:tab-wake-a`;
+	assert.ok(storage.getItem(journalKeyA));
+
+	// Freeze tabA in the background past its 120 s lease; its durable slot disappears with no surviving foldedFrom reference.
+	visibilityState = 'hidden';
+	onVisibilityChange();
+	clock += 180_000;
+	storage.removeItem(journalKeyA);
+	assert.equal(storage.getItem(journalKeyA), null);
+
+	// Hidden visibilitychange does not re-stage; becoming visible re-stages the unacknowledged delta durably.
+	onVisibilityChange();
+	assert.equal(storage.getItem(journalKeyA), null);
+
+	visibilityState = 'visible';
+	onVisibilityChange();
+	assert.ok(
+		storage.getItem(journalKeyA),
+		'visibilitychange -> visible must re-stage vanished slot'
+	);
+	assert.equal(tabA.statuses.at(-1)?.pending, true);
+	assert.equal(tabA.controller.snapshot()?.local.meals[0]?.id, 'wake-meal');
+	assert.equal(tabA.controller.snapshot()?.local.shopping[0]?.id, 'wake-shop');
+
+	// Also verify pageshow re-stages (including live state edits made while hidden) when unlisted in foldedFrom.
+	visibilityState = 'hidden';
+	clock += 180_000;
+	storage.removeItem(journalKeyA);
+	const editedWhileHidden = structuredClone(offlineA);
+	editedWhileHidden.shopping[0].quantity = 5;
+	tabA.state = editedWhileHidden;
+	visibilityState = 'visible';
+	onPageShow();
+	assert.ok(storage.getItem(journalKeyA), 'pageshow must re-stage vanished slot');
+	assert.equal(tabA.controller.snapshot()?.local.shopping[0]?.quantity, 5);
+
+	// Conversely, if another tab folds tabA and then syncs online (advancing confirmedKey to v2),
+	// waking tabA via visibilitychange/pageshow must NOT re-stage already-synced edits.
+	clock += 180_000;
+	const tabB = harness({
+		user,
+		storage,
+		writerId: 'tab-wake-b',
+		now: () => clock,
+		leaseTtlMs: 120_000,
+		transport
+	});
+	assert.equal(tabB.controller.restore(user), true);
+	const withGarlic = structuredClone(tabB.state);
+	withGarlic.pantry.push({
+		id: 'garlic',
+		name: 'garlic',
+		quantity: 2,
+		unit: 'bulb',
+		category: 'Produce'
+	});
+	tabB.state = withGarlic;
+	tabB.controller.stage(withGarlic);
+	assert.equal(storage.getItem(journalKeyA), null);
+
+	// While tabB holds the folded record (listing tabA in foldedFrom), waking tabA does not re-stage.
+	onVisibilityChange();
+	assert.equal(storage.getItem(journalKeyA), null);
+
+	// Once tabB syncs online (confirmedKey advances to v2), waking tabA recognizes acknowledgement and clears pending.
+	await tabB.controller.sync();
+	assert.equal(currentEtag, 'v2');
+	onPageShow();
+	assert.equal(storage.getItem(journalKeyA), null);
+	assert.equal(tabA.statuses.at(-1)?.pending, false);
+});
+
 test('compacted reverts remove the writer journal entry when matching baseline and sync cleanly against household changes', async () => {
 	const user = makeUser();
 	const base = createNewUserState();
@@ -1168,11 +1547,13 @@ test('compaction re-reads confirmedKey from storage instead of anchoring to a st
 	activeTab.controller.stage(stepTo30);
 
 	// Another tab confirms maxTime = 30 at etag 'v2' in storage while activeTab stays mounted with stale ('v1', maxTime = 60) in memory.
+	clock += 10;
 	const peerSynced = harness({ user, storage: storage2, now: () => clock, transport });
 	peerSynced.controller.initialize(user, stepTo30, 'v2');
 	peerSynced.controller.clearContext();
 
 	// activeTab now edits maxTime from 30 back to 60 without calling restore/initialize; it must not treat 60 as reverting to stale v1!
+	clock += 10;
 	const backTo60 = structuredClone(stepTo30);
 	backTo60.preferences.maxTime = 60;
 	activeTab.controller.stage(backTo60);
@@ -1271,6 +1652,616 @@ test('partial retire failure when removeItem throws keeps leftover ancestors fol
 		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
 			.length,
 		0
+	);
+});
+
+test('stage rejects malformed kitchen snapshots at the client boundary before staging or syncing', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	let requests = 0;
+	const sync = harness({
+		user,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => {
+				requests += 1;
+				return { state: base, etag: 'v1', userId: user.id, householdId: user.householdId };
+			},
+			put: async (state) => {
+				requests += 1;
+				return { state, etag: 'v2' };
+			}
+		})
+	});
+	sync.controller.initialize(user, base, 'v1');
+
+	const nullQuantity = structuredClone(base);
+	nullQuantity.pantry.push({
+		id: 'bad-qty',
+		name: 'flour',
+		quantity: null as unknown as number,
+		unit: 'cup',
+		category: 'Pantry'
+	});
+	sync.controller.stage(nullQuantity);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const longUnit = structuredClone(base);
+	longUnit.pantry.push({
+		id: 'bad-unit',
+		name: 'sugar',
+		quantity: 1,
+		unit: 'u'.repeat(41),
+		category: 'Pantry'
+	});
+	sync.controller.stage(longUnit);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const insecureImage = structuredClone(base);
+	insecureImage.recipes[0].image = 'http://example.com/insecure.jpg';
+	sync.controller.stage(insecureImage);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	const badEffort = structuredClone(base);
+	badEffort.preferences.reasoning = { effort: 'x-high' };
+	sync.controller.stage(badEffort);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(
+		[...sync.storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+	await sync.controller.sync();
+	assert.equal(requests, 0);
+
+	const valid = structuredClone(base);
+	valid.pantry.push({ id: 'ok', name: 'flour', quantity: 0, unit: 'cup', category: 'Pantry' });
+	sync.controller.stage(valid);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+});
+
+test('duplicated tabs sharing one sessionStorage get distinct writer IDs and never overwrite each other', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const sharedSessionStorage = memoryStorage();
+	sharedSessionStorage.setItem('flavorithm-writer-id:v1', 'inherited-opener-writer');
+
+	const tabA = harness({ user, storage, sessionStorage: sharedSessionStorage });
+	const tabB = harness({ user, storage, sessionStorage: sharedSessionStorage });
+	assert.equal(sharedSessionStorage.getItem('flavorithm-writer-id:v1'), null);
+
+	tabA.controller.initialize(user, base, 'v1');
+	tabB.controller.initialize(user, base, 'v1');
+
+	const editA = structuredClone(base);
+	editA.pantry.push({
+		id: 'tab-a-oil',
+		name: 'olive oil',
+		quantity: 1,
+		unit: 'bottle',
+		category: 'Pantry'
+	});
+	tabA.controller.stage(editA);
+
+	const editB = structuredClone(base);
+	editB.shopping.push({
+		id: 'tab-b-milk',
+		name: 'oat milk',
+		quantity: 2,
+		unit: 'carton',
+		checked: false
+	});
+	tabB.controller.stage(editB);
+
+	const journalKeys = [...storage.values.keys()].filter((key) =>
+		key.startsWith('flavorithm-pending-journal:')
+	);
+	assert.equal(journalKeys.length, 2);
+
+	let serverState = structuredClone(base);
+	let serverEtag = 'v1';
+	const syncTab = harness({
+		user,
+		storage,
+		sessionStorage: sharedSessionStorage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = 'v2';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+	assert.equal(syncTab.controller.restore(user), true);
+	await syncTab.controller.sync();
+	assert.deepEqual(
+		serverState.pantry.map((item) => item.id),
+		['tab-a-oil']
+	);
+	assert.deepEqual(
+		serverState.shopping.map((item) => item.id),
+		['tab-b-milk']
+	);
+	assert.equal(
+		[...storage.values.keys()].filter((key) => key.startsWith('flavorithm-pending-journal:'))
+			.length,
+		0
+	);
+});
+
+test('createKitchenSync survives SecurityError when reading blocked global sessionStorage', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const originalSessionDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'sessionStorage');
+	const originalWindowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+	try {
+		const throwingSessionHost = {};
+		Object.defineProperty(throwingSessionHost, 'sessionStorage', {
+			configurable: true,
+			get() {
+				throw Object.assign(new Error('Access is denied for this document.'), {
+					name: 'SecurityError'
+				});
+			}
+		});
+		Object.defineProperty(globalThis, 'window', {
+			configurable: true,
+			value: throwingSessionHost
+		});
+		Object.defineProperty(globalThis, 'sessionStorage', {
+			configurable: true,
+			get() {
+				throw Object.assign(new Error('Access is denied for this document.'), {
+					name: 'SecurityError'
+				});
+			}
+		});
+
+		const savedStates: AppState[] = [];
+		const controller = createKitchenSync({
+			storage,
+			getUser: () => user,
+			getState: () => base,
+			setState: () => {},
+			onStatus: () => {},
+			transport: () => ({
+				identity: { userId: user.id, householdId: user.householdId },
+				get: async () => ({
+					state: structuredClone(base),
+					etag: 'v1',
+					userId: user.id,
+					householdId: user.householdId
+				}),
+				put: async (state) => {
+					const validated = requireValidState(state);
+					savedStates.push(validated);
+					return { state: structuredClone(validated), etag: 'v2' };
+				}
+			})
+		});
+		controller.initialize(user, base, 'v1');
+		const edited = structuredClone(base);
+		edited.preferences.maxTime = 25;
+		controller.stage(edited);
+		await controller.sync();
+		assert.equal(savedStates.at(-1)?.preferences.maxTime, 25);
+	} finally {
+		if (originalWindowDescriptor) {
+			Object.defineProperty(globalThis, 'window', originalWindowDescriptor);
+		} else {
+			Reflect.deleteProperty(globalThis, 'window');
+		}
+		if (originalSessionDescriptor) {
+			Object.defineProperty(globalThis, 'sessionStorage', originalSessionDescriptor);
+		} else {
+			Reflect.deleteProperty(globalThis, 'sessionStorage');
+		}
+	}
+});
+
+test('legacy stored recipes do not block unrelated kitchen saves while new invalid edits still fail', async () => {
+	const user = makeUser();
+	const storage = memoryStorage();
+	const legacyRemote = createInitialState();
+	legacyRemote.recipes[0].image = '/recipe-covers/legacy-cover-id';
+	legacyRemote.recipes[1].image = 'http://legacy.example/soup.jpg';
+	legacyRemote.recipes[1].importNotes = ['x'.repeat(350)];
+	(legacyRemote.preferences as Record<string, unknown>).connectionId = 'host-chatgpt';
+	legacyRemote.preferences.reasoning = { effort: 'legacy-unknown' };
+
+	let serverState = structuredClone(legacyRemote);
+	let serverEtag = 'v1';
+	const sync = harness({
+		user,
+		storage,
+		reactiveStage: true,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = 'v2';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, legacyRemote, 'v1');
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	// Even a caller still holding the raw legacy snapshot can stage multiple sequential valid edits.
+	const editOne = structuredClone(legacyRemote);
+	editOne.pantry.push({
+		id: 'garlic',
+		name: 'garlic',
+		quantity: 4,
+		unit: 'clove',
+		category: 'Produce'
+	});
+	sync.controller.stage(editOne);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	const editTwo = structuredClone(editOne);
+	editTwo.recipes[1].title = 'Updated Legacy Soup Title';
+	sync.controller.stage(editTwo);
+	assert.equal(sync.statuses.at(-1)?.pending, true);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	// Newly introduced invalid mutations on top of the legacy baseline are still rejected.
+	const newlyInvalid = structuredClone(editTwo);
+	newlyInvalid.recipes[0].image = 'http://attacker.example/new-bad.jpg';
+	sync.controller.stage(newlyInvalid);
+	assert.equal(sync.statuses.at(-1)?.error, 'The kitchen state is invalid and was not saved.');
+	assert.equal(sync.controller.snapshot()?.local.recipes[1].title, 'Updated Legacy Soup Title');
+
+	await sync.controller.sync();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	assert.equal(serverState.recipes[0].image, '');
+	assert.equal(serverState.recipes[1].image, '');
+	assert.equal(serverState.recipes[1].title, 'Updated Legacy Soup Title');
+	assert.equal(
+		serverState.pantry.some((item) => item.id === 'garlic'),
+		true
+	);
+});
+
+test('exportBackup includes quarantined journal entries alongside or after pending edits', async () => {
+	const user = makeUser('backup-u', 'backup-h');
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const sync = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => ({
+				state: requireValidState(state),
+				etag: 'v2'
+			})
+		})
+	});
+	sync.controller.initialize(user, base, 'v1');
+	assert.equal(sync.controller.exportBackup(), null);
+
+	const edited = structuredClone(base);
+	edited.pantry.push({ id: 'rice', name: 'rice', quantity: 2, unit: 'lb', category: 'Grains' });
+	sync.controller.stage(edited);
+	const plainBackup = sync.controller.exportBackup();
+	assert.ok(plainBackup && 'pantry' in plainBackup);
+	assert.equal(plainBackup.pantry[0]?.id, 'rice');
+
+	const corruptKey = `flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:lost-tab`;
+	storage.setItem(corruptKey, '{"broken":true');
+	await sync.controller.sync();
+
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.match(sync.statuses.at(-1)?.error || '', /quarantined/);
+	assert.equal(sync.controller.quarantined().length, 1);
+
+	const quarantinedOnlyBackup = sync.controller.exportBackup();
+	assert.ok(quarantinedOnlyBackup && 'quarantined' in quarantinedOnlyBackup);
+	assert.equal('pending' in quarantinedOnlyBackup, false);
+	assert.equal(quarantinedOnlyBackup.quarantined[0]?.slot, 'lost-tab');
+	assert.equal(quarantinedOnlyBackup.quarantined[0]?.raw, '{"broken":true');
+
+	const secondEdit = structuredClone(sync.state);
+	secondEdit.preferences.maxTime = 20;
+	sync.controller.stage(secondEdit);
+	const combinedBackup = sync.controller.exportBackup();
+	assert.ok(combinedBackup && 'quarantined' in combinedBackup);
+	assert.equal(combinedBackup.pending?.preferences.maxTime, 20);
+	assert.equal(combinedBackup.quarantined.length, 1);
+});
+
+test('sync bounds self-recursion and suppresses silent removeItem no-ops', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	let serverState = structuredClone(base);
+	let version = 1;
+	let puts = 0;
+
+	let controller!: ReturnType<typeof createKitchenSync>;
+	let currentState = structuredClone(base);
+	const statuses: SyncStatus[] = [];
+	let mutateInFlight = false;
+
+	controller = createKitchenSync({
+		storage: memoryStorage(),
+		getUser: () => user,
+		getState: () => currentState,
+		setState: (state) => {
+			currentState = structuredClone(state);
+		},
+		onStatus: (status) => statuses.push(status),
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: `v${version}`,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				puts += 1;
+				version += 1;
+				serverState = requireValidState(state);
+				if (mutateInFlight) {
+					const next = structuredClone(serverState);
+					next.preferences.maxTime = serverState.preferences.maxTime + 1;
+					currentState = next;
+					controller.stage(next);
+				}
+				return { state: structuredClone(serverState), etag: `v${version}` };
+			}
+		})
+	});
+
+	controller.initialize(user, base, 'v1');
+	mutateInFlight = true;
+	const first = structuredClone(base);
+	first.preferences.maxTime = 50;
+	controller.stage(first);
+	await controller.sync();
+	for (let tick = 0; tick < 40; tick += 1) {
+		await Promise.resolve();
+	}
+	mutateInFlight = false;
+
+	assert.equal(puts, MAX_SYNC_CONTINUATIONS + 1);
+	assert.equal(statuses.at(-1)?.pending, true);
+	assert.equal(
+		statuses.at(-1)?.error,
+		'Kitchen changes are updating rapidly. Retry sync to finish saving.'
+	);
+
+	// Also verify a storage implementation whose removeItem silently no-ops never loops PUTs.
+	const stickyStorage = memoryStorage();
+	stickyStorage.removeItem = () => {};
+	let stickyPuts = 0;
+	const stickySync = harness({
+		user,
+		storage: stickyStorage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				stickyPuts += 1;
+				return { state: requireValidState(state), etag: 'v2' };
+			}
+		})
+	});
+	stickySync.controller.initialize(user, base, 'v1');
+	const stickyEdit = structuredClone(base);
+	stickyEdit.preferences.maxTime = 30;
+	stickySync.controller.stage(stickyEdit);
+	await stickySync.controller.sync();
+	for (let tick = 0; tick < 10; tick += 1) {
+		await Promise.resolve();
+	}
+	assert.equal(stickyPuts, 1);
+	assert.equal(stickySync.statuses.at(-1)?.pending, false);
+	assert.equal(
+		stickySync.statuses.at(-1)?.error,
+		'The server saved these changes, but acknowledged journal entries could not be retired.'
+	);
+});
+
+test('sync writes confirmed baseline before retiring journal and retries baseline when quota frees up', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const operations: string[] = [];
+	const storage = memoryStorage();
+	const originalSet = storage.setItem;
+	const originalRemove = storage.removeItem;
+	let tightQuota = false;
+	storage.setItem = (key, value) => {
+		if (key.startsWith('flavorithm-confirmed:')) {
+			operations.push('setConfirmed');
+			const activeJournalCount = [...storage.values.keys()].filter((entry) =>
+				entry.startsWith('flavorithm-pending-journal:')
+			).length;
+			if (tightQuota && activeJournalCount > 0) {
+				throw new Error('QuotaExceededError');
+			}
+		}
+		originalSet(key, value);
+	};
+	storage.removeItem = (key) => {
+		if (key.startsWith('flavorithm-pending-journal:')) {
+			operations.push('removeJournal');
+		}
+		originalRemove(key);
+	};
+
+	let serverState = structuredClone(base);
+	let serverEtag = 'v1';
+	const sync = harness({
+		user,
+		storage,
+		transport: () => ({
+			identity: { userId: user.id, householdId: user.householdId },
+			get: async () => ({
+				state: structuredClone(serverState),
+				etag: serverEtag,
+				userId: user.id,
+				householdId: user.householdId
+			}),
+			put: async (state) => {
+				serverState = requireValidState(state);
+				serverEtag = serverEtag === 'v1' ? 'v2' : 'v3';
+				return { state: structuredClone(serverState), etag: serverEtag };
+			}
+		})
+	});
+
+	sync.controller.initialize(user, base, 'v1');
+	operations.length = 0;
+
+	const firstEdit = structuredClone(base);
+	firstEdit.preferences.maxTime = 30;
+	sync.controller.stage(firstEdit);
+	await sync.controller.sync();
+	assert.deepEqual(operations, ['setConfirmed', 'removeJournal']);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+
+	operations.length = 0;
+	tightQuota = true;
+	const secondEdit = structuredClone(sync.state);
+	secondEdit.preferences.maxTime = 20;
+	sync.controller.stage(secondEdit);
+	await sync.controller.sync();
+	assert.deepEqual(operations, ['setConfirmed', 'removeJournal', 'setConfirmed']);
+	assert.equal(sync.statuses.at(-1)?.error, '');
+	const persistedConfirmed = JSON.parse(
+		storage.getItem(`flavorithm-confirmed:v1:${user.id}:${user.householdId}`) || 'null'
+	);
+	assert.equal(persistedConfirmed?.state.preferences.maxTime, 20);
+});
+
+test('online sync saves valid edits and quarantines a corrupt slot under isolated keys', async () => {
+	const userA = makeUser('user-a', 'home-a');
+	const userB = makeUser('user-b', 'home-b');
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const savedQuarantine: AppState[] = [];
+	const sync = harness({
+		user: userA,
+		storage,
+		transport: () => ({
+			identity: { userId: userA.id, householdId: userA.householdId },
+			get: async () => ({
+				state: structuredClone(base),
+				etag: 'v1',
+				userId: userA.id,
+				householdId: userA.householdId
+			}),
+			put: async (state) => {
+				savedQuarantine.push(structuredClone(state));
+				return { state: structuredClone(state), etag: 'v2' };
+			}
+		})
+	});
+	sync.controller.initialize(userA, base, 'v1');
+	const edit = structuredClone(base);
+	edit.pantry.push({ id: 'beans', name: 'beans', quantity: 2, unit: 'can', category: 'Pantry' });
+	sync.controller.stage(edit);
+
+	const corruptKeyA = `flavorithm-pending-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:corrupt-writer`;
+	const otherUserKey = `flavorithm-pending-journal:v1:${encodeURIComponent(userB.id)}:${encodeURIComponent(userB.householdId)}:peer-writer`;
+	storage.setItem(corruptKeyA, '{not-valid-json');
+	storage.setItem(otherUserKey, '{also-corrupt-for-other-user');
+
+	await sync.controller.sync();
+	assert.deepEqual(
+		savedQuarantine.at(-1)?.pantry.map((item) => item.id),
+		['beans']
+	);
+	assert.equal(storage.getItem(corruptKeyA), null);
+	assert.equal(
+		storage.getItem(
+			`flavorithm-quarantined-journal:v1:${encodeURIComponent(userA.id)}:${encodeURIComponent(userA.householdId)}:corrupt-writer`
+		),
+		'{not-valid-json'
+	);
+	assert.equal(storage.getItem(otherUserKey), '{also-corrupt-for-other-user');
+	assert.equal(sync.controller.snapshot(), null);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.match(sync.statuses.at(-1)?.error || '', /quarantined/);
+});
+
+test('baselineError and afterSaveError remain visible after reactive microtasks flush', async () => {
+	const user = makeUser();
+	const base = createNewUserState();
+	const storage = memoryStorage();
+	const originalSet = storage.setItem;
+	storage.setItem = (key, value) => {
+		if (key.startsWith('flavorithm-confirmed:')) {
+			throw new Error('QuotaExceededError');
+		}
+		originalSet(key, value);
+	};
+
+	const sync = harness({
+		user,
+		storage,
+		reactiveStage: true,
+		transport: () => transportFor(user, base, 'v1')
+	});
+	sync.controller.initialize(user, base, 'v1');
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(
+		sync.statuses.at(-1)?.error,
+		'The confirmed kitchen could not be saved for offline use.'
+	);
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+
+	const edited = structuredClone(base);
+	edited.preferences.maxTime = 35;
+	sync.state = edited;
+	sync.controller.stage(edited);
+	await sync.controller.sync();
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(sync.statuses.at(-1)?.pending, false);
+	assert.equal(
+		sync.statuses.at(-1)?.error,
+		'The server saved these changes, but the confirmed state could not be saved on this device.'
 	);
 });
 
@@ -1937,4 +2928,224 @@ test('initialize records reviewedEtag on conflicts and blocks stale resolution i
 	assert.equal(writes, 0);
 	assert.equal(reconnected.statuses.at(-1)?.reviewedEtag, 'etag-3');
 	assert.match(reconnected.statuses.at(-1)?.error || '', /updated|review/i);
+});
+
+function createReloadRng(seed: number): () => number {
+	let state = seed >>> 0;
+	return () => {
+		state = (state + 0x6d2b79f5) >>> 0;
+		let t = Math.imul(state ^ (state >>> 15), 1 | state);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+}
+
+function pickFrom<T>(items: readonly T[], rng: () => number): T {
+	return items[Math.floor(rng() * items.length)];
+}
+
+const RELOAD_DATES = ['2026-11-10', '2026-11-11', '2026-11-12', '2026-11-13'];
+const RELOAD_SLOTS = ['Breakfast', 'Lunch', 'Dinner'] as const;
+const RELOAD_UNITS = ['cup', 'piece', 'tbsp', 'lb'] as const;
+const RELOAD_MEAL_IDS = ['rm-0', 'rm-1', 'rm-2', 'rm-3', 'rm-4'];
+const RELOAD_SHOP_IDS = ['rs-0', 'rs-1', 'rs-2', 'rs-3', 'rs-4'];
+
+function mutateReloadMealsAndShopping(
+	current: AppState,
+	baseline: AppState,
+	rng: () => number
+): AppState {
+	const next = structuredClone(current);
+	const steps = 1 + Math.floor(rng() * 2);
+	for (let i = 0; i < steps; i += 1) {
+		const op = Math.floor(rng() * 8);
+		if (op <= 1 && next.recipes.length) {
+			const id = pickFrom(RELOAD_MEAL_IDS, rng);
+			const recipe = pickFrom(next.recipes, rng);
+			const meal: Meal = {
+				id,
+				date: pickFrom(RELOAD_DATES, rng),
+				slot: pickFrom(RELOAD_SLOTS, rng),
+				recipeId: recipe.id,
+				servings: 1 + Math.floor(rng() * 5)
+			};
+			const idx = next.meals.findIndex((entry) => entry.id === id);
+			if (idx === -1) next.meals.push(meal);
+			else next.meals[idx] = meal;
+		} else if (op === 2 && next.meals.length) {
+			const target = pickFrom(next.meals, rng);
+			target.servings = (target.servings % 6) + 1;
+			if (rng() < 0.4) {
+				target.completedAt = '2026-11-12T18:30:00.000Z';
+				target.leftoverServings = Math.floor(rng() * 3);
+			}
+		} else if (op === 3 && next.meals.length) {
+			next.meals.splice(Math.floor(rng() * next.meals.length), 1);
+		} else if (op === 4 && next.recipes.length > 2) {
+			const dropped = next.recipes[Math.floor(rng() * next.recipes.length)];
+			next.recipes = next.recipes.filter((recipe) => recipe.id !== dropped.id);
+			next.meals = next.meals.filter((meal) => meal.recipeId !== dropped.id);
+		} else if (op === 5) {
+			const id = pickFrom(RELOAD_SHOP_IDS, rng);
+			const found = next.shopping.find((item) => item.id === id);
+			if (!found) {
+				next.shopping.push({
+					id,
+					name: `Shop ${id}`,
+					quantity: 1 + Math.floor(rng() * 5),
+					unit: pickFrom(RELOAD_UNITS, rng),
+					checked: rng() < 0.4
+				});
+			} else {
+				found.checked = !found.checked;
+				found.quantity = Math.max(1, (found.quantity % 6) + 1);
+			}
+		} else if (op === 6 && next.shopping.length) {
+			next.shopping.splice(Math.floor(rng() * next.shopping.length), 1);
+		} else {
+			// Revert either a meal or shopping item back to baseline.
+			if (rng() < 0.5) {
+				const id = pickFrom(RELOAD_MEAL_IDS, rng);
+				const baseMeal = baseline.meals.find((entry) => entry.id === id);
+				const idx = next.meals.findIndex((entry) => entry.id === id);
+				if (!baseMeal) {
+					if (idx !== -1) next.meals.splice(idx, 1);
+				} else if (next.recipes.some((recipe) => recipe.id === baseMeal.recipeId)) {
+					if (idx === -1) next.meals.push(structuredClone(baseMeal));
+					else next.meals[idx] = structuredClone(baseMeal);
+				}
+			} else {
+				const id = pickFrom(RELOAD_SHOP_IDS, rng);
+				const baseShop = baseline.shopping.find((item) => item.id === id);
+				const idx = next.shopping.findIndex((item) => item.id === id);
+				if (!baseShop) {
+					if (idx !== -1) next.shopping.splice(idx, 1);
+				} else if (idx === -1) {
+					next.shopping.push(structuredClone(baseShop));
+				} else {
+					next.shopping[idx] = structuredClone(baseShop);
+				}
+			}
+		}
+	}
+	return next;
+}
+
+function sameIdSet<T extends { id: string }>(left: T[], right: T[]): boolean {
+	if (left.length !== right.length) return false;
+	const rightById = new Map(right.map((item) => [item.id, item]));
+	return left.every((item) => jsonEqual(item, rightById.get(item.id)));
+}
+
+test('property: offline reload compaction chains for meals and shopping match single-delta reconciliation across 100 seeds', async () => {
+	for (let seed = 1; seed <= 100; seed += 1) {
+		const rng = createReloadRng(seed * 2_053 + 11);
+		let clock = 10_000;
+		const user = makeUser(`prop-u-${seed}`, `prop-h-${seed}`);
+		const starter = createInitialState();
+		const s0 = createNewUserState();
+		s0.recipes = [0, 1, 2, 3].map((idx) => ({
+			...structuredClone(starter.recipes[idx % starter.recipes.length]),
+			id: `reload-r-${idx}`,
+			saved: true,
+			sampleSaved: false
+		}));
+		s0.meals = [
+			{
+				id: 'rm-0',
+				date: '2026-11-10',
+				slot: 'Dinner',
+				recipeId: 'reload-r-0',
+				servings: 2
+			}
+		];
+		s0.shopping = [{ id: 'rs-0', name: 'Shop rs-0', quantity: 2, unit: 'cup', checked: false }];
+
+		const storage = memoryStorage();
+		const initialTab = harness({ user, storage, now: () => clock });
+		initialTab.controller.initialize(user, s0, 'etag-0');
+		let expectedLocal = mutateReloadMealsAndShopping(s0, s0, rng);
+		initialTab.state = expectedLocal;
+		initialTab.controller.stage(expectedLocal);
+		initialTab.controller.releaseLease();
+
+		const reloadCount = 4 + Math.floor(rng() * 4);
+		for (let r = 0; r < reloadCount; r += 1) {
+			clock += 25;
+			const session = harness({ user, storage, now: () => clock });
+			assert.equal(session.controller.restore(user), true);
+			assert.equal(sameIdSet(session.state.meals, expectedLocal.meals), true);
+			assert.equal(sameIdSet(session.state.shopping, expectedLocal.shopping), true);
+			expectedLocal = mutateReloadMealsAndShopping(session.state, s0, rng);
+			session.state = expectedLocal;
+			session.controller.stage(expectedLocal);
+
+			const activeKeys = [...storage.values.keys()].filter((key) =>
+				key.startsWith('flavorithm-pending-journal:')
+			);
+			const revertedAll =
+				sameIdSet(expectedLocal.recipes, s0.recipes) &&
+				sameIdSet(expectedLocal.meals, s0.meals) &&
+				sameIdSet(expectedLocal.shopping, s0.shopping) &&
+				jsonEqual(expectedLocal.pantry, s0.pantry) &&
+				jsonEqual(expectedLocal.preferences, s0.preferences);
+			assert.equal(
+				activeKeys.length,
+				revertedAll ? 0 : 1,
+				`seed ${seed} reload ${r}: expected compacted journal slot count`
+			);
+			session.controller.releaseLease();
+		}
+
+		const remote = mutateReloadMealsAndShopping(s0, s0, rng);
+		const expectedPreview = mergeKitchenStates(s0, expectedLocal, remote);
+		const choice: 'local' | 'remote' = seed % 2 === 0 ? 'local' : 'remote';
+		const expectedResolved = mergeKitchenStates(s0, expectedLocal, remote, choice);
+
+		let server = structuredClone(remote);
+		const finalTab = harness({
+			user,
+			storage,
+			now: () => clock,
+			transport: () => ({
+				identity: { userId: user.id, householdId: user.householdId },
+				get: async () => ({
+					state: structuredClone(server),
+					etag: 'etag-remote',
+					userId: user.id,
+					householdId: user.householdId
+				}),
+				put: async (state) => {
+					server = requireValidState(state);
+					return { state: structuredClone(server), etag: 'etag-final' };
+				}
+			})
+		});
+		assert.equal(finalTab.controller.restore(user), true);
+		if (!finalTab.controller.snapshot()) {
+			assert.equal(expectedPreview.conflicts.length, 0);
+			continue;
+		}
+		await finalTab.controller.sync();
+		if (expectedPreview.conflicts.length > 0) {
+			const sortPaths = (items: Array<{ path: string }>) => items.map((item) => item.path).sort();
+			assert.deepEqual(
+				sortPaths(finalTab.statuses.at(-1)?.conflicts ?? []),
+				sortPaths(expectedPreview.conflicts),
+				`seed ${seed}: compacted reload chain conflict paths diverged`
+			);
+			await finalTab.controller.sync(choice);
+			assert.equal(sameIdSet(server.recipes, expectedResolved.state.recipes), true);
+			assert.equal(sameIdSet(server.meals, expectedResolved.state.meals), true);
+			assert.equal(sameIdSet(server.shopping, expectedResolved.state.shopping), true);
+		} else {
+			assert.equal(sameIdSet(server.recipes, expectedPreview.state.recipes), true);
+			assert.equal(sameIdSet(server.meals, expectedPreview.state.meals), true);
+			assert.equal(sameIdSet(server.shopping, expectedPreview.state.shopping), true);
+		}
+		const serverRecipeIds = new Set(server.recipes.map((recipe: Recipe) => recipe.id));
+		for (const meal of server.meals) {
+			assert.ok(serverRecipeIds.has(meal.recipeId));
+		}
+	}
 });

@@ -1,4 +1,8 @@
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
+import { isKitchenState, isKitchenStateShape } from '#lib/state-schema.ts';
 import type { AppState, User } from '#lib/types.ts';
+
+export { isKitchenState, isKitchenStateShape };
 
 export type SyncConflict = { path: string; local: unknown; remote: unknown };
 export type FoldedJournalRef = {
@@ -29,7 +33,10 @@ const key = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-pending:${user.id}:${user.householdId}`;
 const journalPrefix = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
+const quarantinePrefix = (user: Pick<User, 'id' | 'householdId'>) =>
+	`flavorithm-quarantined-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
 export const MAX_PENDING_JOURNAL_ENTRIES = 64;
+export const MAX_QUARANTINED_JOURNAL_ENTRIES = 8;
 
 export type PendingJournalRecord = {
 	writerId: string;
@@ -38,6 +45,139 @@ export type PendingJournalRecord = {
 	keys: Array<{ key: string; pending: PendingKitchen }>;
 };
 export type PendingJournalRead = { records: PendingJournalRecord[]; error: string };
+export type QuarantinedJournalEntry = {
+	key: string;
+	slot: string;
+	raw: string;
+	parsed?: unknown;
+};
+
+/**
+ * Validate a candidate kitchen snapshot while allowing untouched legacy fields already present in
+ * `referenceBase` to heal via `sanitizeKitchenState`. Newly introduced invalid edits still return
+ * `null` and are rejected.
+ */
+export function repairLegacyKitchenState(
+	value: unknown,
+	referenceBase?: AppState | null
+): AppState | null {
+	if (isKitchenState(value)) return value;
+	if (!isKitchenStateShape(value)) return null;
+	if (!referenceBase || !isKitchenStateShape(referenceBase) || isKitchenState(referenceBase)) {
+		return null;
+	}
+	const sanitizedBase = sanitizeKitchenState(referenceBase);
+	const candidate = mergeKitchenStates(referenceBase, value, sanitizedBase, 'local').state;
+	return isKitchenState(candidate) ? candidate : null;
+}
+
+function listQuarantinedKeys(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>
+): string[] {
+	if (typeof storage.length !== 'number' || typeof storage.key !== 'function') return [];
+	const prefix = quarantinePrefix(user);
+	const keys: string[] = [];
+	for (let index = 0; index < storage.length; index += 1) {
+		const storageKey = storage.key(index);
+		if (storageKey?.startsWith(prefix)) keys.push(storageKey);
+	}
+	return keys;
+}
+
+function quarantineSlot(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>,
+	activeKey: string,
+	slotId: string,
+	raw: string
+): void {
+	const safeSlot = (slotId ? encodeURIComponent(slotId) : 'corrupt').slice(0, 120) || 'corrupt';
+	const baseKey = `${quarantinePrefix(user)}${safeSlot}`;
+	// Never truncate: a quarantined entry is the only copy of the user's unsynced edits.
+	const boundedRaw = raw;
+	try {
+		const existingKeys = listQuarantinedKeys(storage, user);
+		for (const existingKey of existingKeys) {
+			if (storage.getItem(existingKey) === boundedRaw) {
+				storage.removeItem(activeKey);
+				return;
+			}
+		}
+		let targetKey = `${baseKey}:${MAX_QUARANTINED_JOURNAL_ENTRIES}`;
+		for (let suffix = 1; suffix <= MAX_QUARANTINED_JOURNAL_ENTRIES; suffix += 1) {
+			const candidate = suffix === 1 ? baseKey : `${baseKey}:${suffix}`;
+			const current = storage.getItem(candidate);
+			if (current === null || current === boundedRaw) {
+				targetKey = candidate;
+				break;
+			}
+		}
+		const evictable = existingKeys.filter((entry) => entry !== targetKey);
+		const overflowCount =
+			existingKeys.includes(targetKey) || existingKeys.length < MAX_QUARANTINED_JOURNAL_ENTRIES
+				? 0
+				: existingKeys.length - MAX_QUARANTINED_JOURNAL_ENTRIES + 1;
+		try {
+			if (storage.getItem(targetKey) !== boundedRaw) {
+				storage.setItem(targetKey, boundedRaw);
+			}
+		} catch (writeError) {
+			if (!evictable.length) throw writeError;
+			storage.removeItem(evictable.shift()!);
+			storage.setItem(targetKey, boundedRaw);
+		}
+		for (let i = 0; i < overflowCount && evictable.length > 0; i += 1) {
+			storage.removeItem(evictable.shift()!);
+		}
+		storage.removeItem(activeKey);
+	} catch {
+		// Leave the original untouched for manual recovery if storage refuses writes or removals.
+	}
+}
+
+/** Read quarantined journal entries for this account/household so backups can export them. */
+export function readQuarantinedJournal(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>
+): QuarantinedJournalEntry[] {
+	const prefix = quarantinePrefix(user);
+	const entries: QuarantinedJournalEntry[] = [];
+	try {
+		const keys =
+			typeof storage.length === 'number' && typeof storage.key === 'function'
+				? listQuarantinedKeys(storage, user).sort()
+				: [`${prefix}legacy-main`];
+		for (const storageKey of keys) {
+			const raw = storage.getItem(storageKey);
+			if (raw === null) continue;
+			const rawSlot = storageKey.slice(prefix.length);
+			let slot = rawSlot || 'corrupt';
+			try {
+				slot = decodeURIComponent(rawSlot) || 'corrupt';
+			} catch {
+				slot = rawSlot || 'corrupt';
+			}
+			let hasParsed = false;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(raw);
+				hasParsed = true;
+			} catch {
+				hasParsed = false;
+			}
+			entries.push({
+				key: storageKey,
+				slot,
+				raw,
+				...(hasParsed ? { parsed } : {})
+			});
+		}
+	} catch {
+		return entries;
+	}
+	return entries;
+}
 
 function isFoldedJournalRef(value: unknown): value is FoldedJournalRef {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -57,8 +197,8 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 		typeof value !== 'object' ||
 		(value as PendingKitchen).userId !== user.id ||
 		(value as PendingKitchen).householdId !== user.householdId ||
-		!isState((value as PendingKitchen).base) ||
-		!isState((value as PendingKitchen).local) ||
+		!isKitchenStateShape((value as PendingKitchen).base) ||
+		!isKitchenStateShape((value as PendingKitchen).local) ||
 		!(
 			(value as PendingKitchen).etag === null || typeof (value as PendingKitchen).etag === 'string'
 		) ||
@@ -75,7 +215,17 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 	) {
 		return null;
 	}
-	return value as PendingKitchen;
+	const candidate = value as PendingKitchen;
+	if (isKitchenState(candidate.base) && isKitchenState(candidate.local)) {
+		return candidate;
+	}
+	const repairedLocal = repairLegacyKitchenState(candidate.local, candidate.base);
+	if (!repairedLocal) return null;
+	return {
+		...candidate,
+		base: isKitchenState(candidate.base) ? candidate.base : sanitizeKitchenState(candidate.base),
+		local: repairedLocal
+	};
 }
 
 /** Read every per-writer durable delta, plus the old single-slot format for migration. */
@@ -83,12 +233,18 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 	const byWriter = new Map<string, PendingJournalRecord>();
 	let error = '';
 	if (typeof storage.length !== 'number' || typeof storage.key !== 'function') {
+		let serialized: string | null = null;
 		try {
-			const serialized = storage.getItem(key(user));
+			serialized = storage.getItem(key(user));
 			if (serialized === null) return { records: [], error: '' };
 			const pending = parsePending(JSON.parse(serialized), user);
-			if (!pending)
-				return { records: [], error: 'A saved offline snapshot could not be read safely.' };
+			if (!pending) {
+				quarantineSlot(storage, user, key(user), 'legacy-main', serialized);
+				return {
+					records: [],
+					error: 'A saved offline snapshot could not be read safely and was quarantined.'
+				};
+			}
 			return {
 				records: [
 					{
@@ -100,42 +256,63 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 				error: ''
 			};
 		} catch {
+			if (serialized !== null) quarantineSlot(storage, user, key(user), 'legacy-main', serialized);
 			return { records: [], error: 'Saved offline changes could not be read.' };
 		}
 	}
 	try {
 		const prefix = journalPrefix(user);
+		const matchingKeys: string[] = [];
 		for (let index = 0; index < storage.length; index += 1) {
 			const storageKey = storage.key(index);
-			if (!storageKey?.startsWith(prefix)) continue;
-			const writerId = decodeURIComponent(storageKey.slice(prefix.length));
-			const pending = parsePending(JSON.parse(storage.getItem(storageKey) || 'null'), user);
-			if (!writerId || !pending || pending.writerId !== writerId) {
-				error ||= 'A saved offline journal entry could not be read safely.';
-				continue;
+			if (storageKey?.startsWith(prefix)) matchingKeys.push(storageKey);
+		}
+		for (const storageKey of matchingKeys) {
+			const rawSuffix = storageKey.slice(prefix.length);
+			let raw: string | null = null;
+			try {
+				raw = storage.getItem(storageKey);
+				if (raw === null) continue;
+				const writerId = decodeURIComponent(rawSuffix);
+				const pending = parsePending(JSON.parse(raw), user);
+				if (!writerId || !pending || pending.writerId !== writerId) {
+					quarantineSlot(storage, user, storageKey, writerId || rawSuffix || 'empty', raw);
+					error ||= 'A saved offline journal entry could not be read safely and was quarantined.';
+					continue;
+				}
+				byWriter.set(writerId, {
+					writerId,
+					pending,
+					keys: [{ key: storageKey, pending }]
+				});
+			} catch {
+				if (raw !== null) quarantineSlot(storage, user, storageKey, rawSuffix || 'corrupt', raw);
+				error ||= 'A saved offline journal entry could not be read safely and was quarantined.';
 			}
-			byWriter.set(writerId, {
-				writerId,
-				pending,
-				keys: [{ key: storageKey, pending }]
-			});
 		}
 		const mainKey = key(user);
-		const serialized = storage.getItem(mainKey);
-		if (serialized !== null) {
-			const pending = parsePending(JSON.parse(serialized), user);
-			if (!pending) {
-				error ||= 'A saved offline snapshot could not be read safely.';
-			} else {
-				const writerId = pending.writerId || 'legacy-main';
-				const existing = byWriter.get(writerId);
-				if (!existing) {
-					byWriter.set(writerId, { writerId, pending, keys: [{ key: mainKey, pending }] });
+		let serialized: string | null = null;
+		try {
+			serialized = storage.getItem(mainKey);
+			if (serialized !== null) {
+				const pending = parsePending(JSON.parse(serialized), user);
+				if (!pending) {
+					quarantineSlot(storage, user, mainKey, 'legacy-main', serialized);
+					error ||= 'A saved offline snapshot could not be read safely and was quarantined.';
 				} else {
-					existing.keys.push({ key: mainKey, pending });
-					if (pending.updatedAt > existing.pending.updatedAt) existing.pending = pending;
+					const writerId = pending.writerId || 'legacy-main';
+					const existing = byWriter.get(writerId);
+					if (!existing) {
+						byWriter.set(writerId, { writerId, pending, keys: [{ key: mainKey, pending }] });
+					} else {
+						existing.keys.push({ key: mainKey, pending });
+						if (pending.updatedAt > existing.pending.updatedAt) existing.pending = pending;
+					}
 				}
 			}
+		} catch {
+			if (serialized !== null) quarantineSlot(storage, user, mainKey, 'legacy-main', serialized);
+			error ||= 'A saved offline snapshot could not be read safely and was quarantined.';
 		}
 	} catch {
 		error ||= 'Saved offline changes could not be enumerated.';
@@ -148,18 +325,6 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 		),
 		error
 	};
-}
-
-function isState(value: unknown): value is AppState {
-	if (!value || typeof value !== 'object') return false;
-	const state = value as AppState;
-	return (
-		['pantry', 'recipes', 'meals', 'shopping'].every((field) =>
-			Array.isArray(state[field as keyof AppState])
-		) &&
-		!!state.preferences &&
-		typeof state.preferences === 'object'
-	);
 }
 
 /** One durable latest snapshot per account and household; never stores credentials. */
@@ -202,7 +367,14 @@ export function clearPendingJournalRecords(
 	for (const record of records) {
 		for (const captured of record.keys) {
 			try {
-				const current = parsePending(JSON.parse(storage.getItem(captured.key) || 'null'), user);
+				const raw = storage.getItem(captured.key);
+				if (raw === null) continue;
+				let current: PendingKitchen | null = null;
+				try {
+					current = parsePending(JSON.parse(raw), user);
+				} catch {
+					current = null;
+				}
 				if (current && sameJournalVersion(current, captured.pending))
 					storage.removeItem(captured.key);
 			} catch (error) {
@@ -483,7 +655,9 @@ function reconcileOrphanedMeals(
 			: [...localBranch.recipes, ...remoteBranch.recipes];
 		const recipe = candidates.find((item) => item.id === meal.recipeId);
 		if (recipe) {
-			state.recipes.push(structuredClone(recipe));
+			if (!recipeIds.has(recipe.id)) {
+				state.recipes.push(structuredClone(recipe));
+			}
 			recipeIds.add(recipe.id);
 		}
 	}
@@ -641,6 +815,37 @@ function matchesFoldedRef(record: PendingJournalRecord, ref: FoldedJournalRef): 
 }
 
 /**
+ * True when `target` is listed in `foldedFrom` of at least one surviving unfolded journal record
+ * (directly or transitively through intermediate compacted records).
+ */
+export function isRecordFoldedInto(
+	target: PendingJournalRecord,
+	records: PendingJournalRecord[]
+): boolean {
+	const candidates = records.filter(
+		(record) =>
+			!(record.writerId === target.writerId && sameJournalVersion(record.pending, target.pending))
+	);
+	if (!candidates.length) return false;
+	const unfolded = filterUnfoldedJournalRecords(candidates);
+	const visited = new Set<PendingJournalRecord>(unfolded);
+	const queue = [...unfolded];
+	while (queue.length) {
+		const current = queue.shift()!;
+		for (const ref of current.pending.foldedFrom ?? []) {
+			if (matchesFoldedRef(target, ref)) return true;
+			for (const intermediate of candidates) {
+				if (!visited.has(intermediate) && matchesFoldedRef(intermediate, ref)) {
+					visited.add(intermediate);
+					queue.push(intermediate);
+				}
+			}
+		}
+	}
+	return false;
+}
+
+/**
  * Omit exact ancestor journal versions that were already folded into a surviving compacted entry,
  * so a partial retirement failure (`removeItem` error) never replays or conflicts against itself.
  */
@@ -702,38 +907,167 @@ export function filterUnfoldedJournalRecords(
 	return records.filter((record) => !folded.has(record));
 }
 
-/** Order journal snapshots by causal inclusion first and creation order second. */
+function analyzeCausalRelation(
+	ancestorBase: AppState,
+	ancestorLocal: AppState,
+	dependentBase: AppState,
+	dependentLocal: AppState
+): {
+	hasNonDeletionMutation: boolean;
+	sharesMutatedLeaf: boolean;
+	ancestorHoldsDependentPostImage: boolean;
+} {
+	let hasNonDeletionMutation = false;
+	let sharesMutatedLeaf = false;
+	let ancestorHoldsDependentPostImage = false;
+	const walk = (a0: unknown, a1: unknown, d0: unknown, d1: unknown): void => {
+		const aChanged = !equal(a0, a1);
+		const dChanged = !equal(d0, d1);
+		if (!aChanged && !dChanged) return;
+		if (
+			(a0 === undefined || Array.isArray(a0)) &&
+			(a1 === undefined || Array.isArray(a1)) &&
+			(d0 === undefined || Array.isArray(d0)) &&
+			(d1 === undefined || Array.isArray(d1))
+		) {
+			const mA0 = indexedById(a0 || []);
+			const mA1 = indexedById(a1 || []);
+			const mD0 = indexedById(d0 || []);
+			const mD1 = indexedById(d1 || []);
+			if (mA0 && mA1 && mD0 && mD1) {
+				for (const id of new Set([...mA0.keys(), ...mA1.keys(), ...mD0.keys(), ...mD1.keys()])) {
+					walk(mA0.get(id), mA1.get(id), mD0.get(id), mD1.get(id));
+				}
+				return;
+			}
+		}
+		if (
+			(a0 === undefined || object(a0)) &&
+			(a1 === undefined || object(a1)) &&
+			(d0 === undefined || object(d0)) &&
+			(d1 === undefined || object(d1))
+		) {
+			// Whole-entity creation or deletion (e.g. adding or removing an id-keyed item).
+			if (a0 === undefined || a1 === undefined || d0 === undefined || d1 === undefined) {
+				if (aChanged && a1 !== undefined) hasNonDeletionMutation = true;
+				if (aChanged && dChanged) sharesMutatedLeaf = true;
+				if (!aChanged && dChanged && d1 !== undefined && equal(a0, d1)) {
+					ancestorHoldsDependentPostImage = true;
+				}
+				return;
+			}
+			for (const name of new Set([
+				...Object.keys(a0),
+				...Object.keys(a1),
+				...Object.keys(d0),
+				...Object.keys(d1)
+			])) {
+				walk(a0[name], a1[name], d0[name], d1[name]);
+			}
+			return;
+		}
+		if (aChanged && a1 !== undefined) hasNonDeletionMutation = true;
+		if (aChanged && dChanged) sharesMutatedLeaf = true;
+		if (!aChanged && dChanged && d1 !== undefined && equal(a0, d1)) {
+			ancestorHoldsDependentPostImage = true;
+		}
+	};
+	walk(ancestorBase, ancestorLocal, dependentBase, dependentLocal);
+	return { hasNonDeletionMutation, sharesMutatedLeaf, ancestorHoldsDependentPostImage };
+}
+
+/** Order journal snapshots by folded lineage, creation timestamp, and same-timestamp causal inclusion. */
 export function orderPendingJournalRecords(
 	records: PendingJournalRecord[]
 ): PendingJournalRecord[] {
+	const createdAtOf = (record: PendingJournalRecord): number =>
+		record.pending.createdAt ?? record.pending.updatedAt;
 	const stableOrder = [...records].sort(
-		(a, b) =>
-			(a.pending.createdAt ?? a.pending.updatedAt) - (b.pending.createdAt ?? b.pending.updatedAt) ||
-			a.writerId.localeCompare(b.writerId)
+		(a, b) => createdAtOf(a) - createdAtOf(b) || a.writerId.localeCompare(b.writerId)
 	);
-	// Replay a writer's ancestor before a snapshot staged from that already-updated view, even when
-	// both tabs receive the same millisecond timestamp or carry peer collection items.
 	const dependencies = new Map(stableOrder.map((record) => [record.writerId, new Set<string>()]));
+	const dependsOn = (targetId: string, candidateAncestorId: string): boolean => {
+		const visited = new Set<string>();
+		const stack = [targetId];
+		while (stack.length) {
+			const current = stack.pop()!;
+			if (current === candidateAncestorId) return true;
+			if (visited.has(current)) continue;
+			visited.add(current);
+			for (const prev of dependencies.get(current) || []) stack.push(prev);
+		}
+		return false;
+	};
+	const addDependency = (ancestorId: string, dependentId: string): void => {
+		if (ancestorId === dependentId || dependsOn(ancestorId, dependentId)) return;
+		dependencies.get(dependentId)?.add(ancestorId);
+	};
+
+	// Tier 1: If `ancestor` folded an earlier snapshot of a peer that later woke up and staged a
+	// newer delta, replay `ancestor` before that peer's post-fold continuation.
+	for (const ancestor of stableOrder) {
+		for (const ref of ancestor.pending.foldedFrom ?? []) {
+			for (const dependent of stableOrder) {
+				if (
+					dependent !== ancestor &&
+					dependent.writerId === ref.writerId &&
+					!matchesFoldedRef(dependent, ref) &&
+					dependent.pending.updatedAt >= ref.updatedAt
+				) {
+					addDependency(ancestor.writerId, dependent.writerId);
+				}
+			}
+		}
+	}
+
+	// Tier 2: Same-timestamp exact full-snapshot handoffs (`ancestor.local === dependent.base`).
 	for (const ancestor of stableOrder) {
 		if (equal(ancestor.pending.base, ancestor.pending.local)) continue;
 		for (const dependent of stableOrder) {
-			if (ancestor === dependent) continue;
+			if (ancestor === dependent || createdAtOf(ancestor) !== createdAtOf(dependent)) continue;
+			if (equal(dependent.pending.base, dependent.pending.local)) continue;
+			if (equal(ancestor.pending.local, dependent.pending.base)) {
+				addDependency(ancestor.writerId, dependent.writerId);
+			}
+		}
+	}
+
+	// Tiers 3 & 4: Same-timestamp causal inclusion when concurrent peers also contributed to
+	// `dependent.base`. Apply non-deletion inclusions before pure deletions so an `item -> undefined`
+	// deletion never forms a backward edge ahead of an earlier `undefined -> item` creation.
+	const tier3Edges: Array<[string, string]> = [];
+	const tier4Edges: Array<[string, string]> = [];
+	for (const ancestor of stableOrder) {
+		if (equal(ancestor.pending.base, ancestor.pending.local)) continue;
+		for (const dependent of stableOrder) {
+			if (ancestor === dependent || createdAtOf(ancestor) !== createdAtOf(dependent)) continue;
+			if (equal(dependent.pending.base, dependent.pending.local)) continue;
 			if (
-				causallyIncludesDelta(ancestor.pending.base, ancestor.pending.local, dependent.pending.base)
+				!causallyIncludesDelta(
+					ancestor.pending.base,
+					ancestor.pending.local,
+					dependent.pending.base
+				)
 			) {
-				dependencies.get(dependent.writerId)?.add(ancestor.writerId);
+				continue;
+			}
+			const relation = analyzeCausalRelation(
+				ancestor.pending.base,
+				ancestor.pending.local,
+				dependent.pending.base,
+				dependent.pending.local
+			);
+			if (relation.ancestorHoldsDependentPostImage) continue;
+			if (relation.hasNonDeletionMutation) {
+				tier3Edges.push([ancestor.writerId, dependent.writerId]);
+			} else if (relation.sharesMutatedLeaf) {
+				tier4Edges.push([ancestor.writerId, dependent.writerId]);
 			}
 		}
 	}
-	for (let i = 0; i < stableOrder.length; i += 1) {
-		for (let j = i + 1; j < stableOrder.length; j += 1) {
-			const earlier = stableOrder[i].writerId;
-			const later = stableOrder[j].writerId;
-			if (dependencies.get(earlier)?.has(later) && dependencies.get(later)?.has(earlier)) {
-				dependencies.get(earlier)?.delete(later);
-			}
-		}
-	}
+	for (const [ancestorId, dependentId] of tier3Edges) addDependency(ancestorId, dependentId);
+	for (const [ancestorId, dependentId] of tier4Edges) addDependency(ancestorId, dependentId);
+
 	const ordered: PendingJournalRecord[] = [];
 	const remaining = new Map(stableOrder.map((record) => [record.writerId, record]));
 	while (remaining.size) {
@@ -1062,6 +1396,11 @@ export function mergePendingKitchenJournal(
 	};
 }
 
+function prepareMergedStateForPut(mergedState: AppState, remoteState: AppState): AppState {
+	if (isKitchenState(mergedState)) return mergedState;
+	return repairLegacyKitchenState(mergedState, remoteState) ?? sanitizeKitchenState(mergedState);
+}
+
 /** Reconcile every account-scoped writer delta against current server state before the write. */
 export async function syncPendingKitchenJournal(
 	records: PendingJournalRecord[],
@@ -1096,7 +1435,10 @@ export async function syncPendingKitchenJournal(
 		}
 		const resolved = mergePendingKitchenJournal(records, remote.state, prefer);
 		try {
-			const result = await transport.put(resolved.state, expectedEtag);
+			const result = await transport.put(
+				prepareMergedStateForPut(resolved.state, remote.state),
+				expectedEtag
+			);
 			return { ...result, conflicts: [], saved: true };
 		} catch (error) {
 			if ((error as { status?: number }).status !== 412) throw error;
@@ -1129,7 +1471,10 @@ export async function syncPendingKitchenJournal(
 			};
 		}
 		try {
-			const result = await transport.put(merged.state, remote.etag);
+			const result = await transport.put(
+				prepareMergedStateForPut(merged.state, remote.state),
+				remote.etag
+			);
 			return { ...result, conflicts: [], saved: true };
 		} catch (error) {
 			if ((error as { status?: number }).status !== 412 || attempt === 2) throw error;
