@@ -42,20 +42,20 @@ export class AIRequestError extends Error {
 }
 
 const IngredientInputSchema = z.object({
-	name: z.string().trim().min(1).max(100),
+	name: z.string().trim().min(1).max(200),
 	quantity: z.number().nonnegative(),
 	unit: z.string().max(40),
-	category: z.string().max(60),
-	expires: z.string().max(40).optional()
+	category: z.string().max(100),
+	expires: z.string().max(50).optional()
 });
 
 const PreferencesInputSchema = z.object({
 	diet: z.string().max(200),
-	allergies: z.string().max(500),
-	maxTime: z.number().nonnegative(),
-	complexity: z.string().max(80),
+	allergies: z.string().max(2_000),
+	maxTime: z.number().nonnegative().max(100_000),
+	complexity: z.string().max(100),
 	cuisines: z.array(z.string().trim().min(1).max(80)).max(8).optional(),
-	theme: z.string().max(80),
+	theme: z.string().max(100),
 	dark: z.boolean(),
 	provider: z.string().max(100),
 	model: z.string().max(200)

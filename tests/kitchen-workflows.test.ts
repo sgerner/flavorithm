@@ -1,9 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { ButlerCommandSchema } from '../src/lib/butler.ts';
-import { createInitialState, createNewUserState } from '../src/lib/data.ts';
-import { rankPantryRecipes, rankRecipes } from '../src/lib/discovery.ts';
-import { applyButlerCommands } from '../src/lib/butler.ts';
+import { applyButlerCommands, ButlerCommandSchema } from '../src/lib/butler.ts';
+import { createInitialState, createNewUserState, seedRecipes } from '../src/lib/data.ts';
+import {
+	DIET_OPTIONS,
+	evaluateRecipeConflicts,
+	normalizeDiet,
+	parseAllergies,
+	rankPantryRecipes,
+	rankRecipes
+} from '../src/lib/discovery.ts';
 import {
 	buildShoppingList,
 	normalizeName as normalizeDomainName,
@@ -976,6 +982,603 @@ test('learned time affinity favors candidates near a single rated favorite', () 
 	assert.ok(
 		ranked.findIndex((item) => item.id === 'near') < ranked.findIndex((item) => item.id === 'far')
 	);
+});
+
+test('normalizes diet values case-insensitively across all canonical lowercase options', () => {
+	assert.deepEqual(
+		DIET_OPTIONS.map((option) => option.value),
+		['none', 'vegetarian', 'vegan', 'pescatarian', 'gluten-free', 'dairy-free', 'low-carb']
+	);
+	assert.equal(normalizeDiet(''), 'none');
+	assert.equal(normalizeDiet('A bit of everything'), 'none');
+	assert.equal(normalizeDiet('No dietary restriction'), 'none');
+	assert.equal(normalizeDiet('Vegetarian'), 'vegetarian');
+	assert.equal(normalizeDiet('VEGAN'), 'vegan');
+	assert.equal(normalizeDiet('Pescetarian'), 'pescatarian');
+	assert.equal(normalizeDiet('Gluten Free'), 'gluten-free');
+	assert.equal(normalizeDiet('Dairy-Free'), 'dairy-free');
+	assert.equal(normalizeDiet('Low_Carb'), 'low-carb');
+});
+
+test('never truncates allergies at 500 characters: 300 filler entries and 2,000-char strings still flag tail peanut conflicts', () => {
+	const fillerPool = [
+		'kiwi',
+		'mango',
+		'papaya',
+		'pineapple',
+		'guava',
+		'lychee',
+		'persimmon',
+		'fig',
+		'plum',
+		'apricot'
+	];
+	const threeHundredFillers = Array.from(
+		{ length: 300 },
+		(_, index) => fillerPool[index % fillerPool.length]
+	);
+	const longAllergies = `${threeHundredFillers.join(', ')}, peanut`;
+	assert.ok(longAllergies.length > 1_800, `expected >1800 chars, got ${longAllergies.length}`);
+
+	const paddedToTwoThousand = `${'kiwi, '.repeat(332)}peanut`;
+	assert.equal(paddedToTwoThousand.length, 1_998);
+
+	const pbRecipe = recipe({
+		id: 'pb-toast',
+		ingredients: [{ name: 'peanut butter', quantity: 2, unit: 'tbsp' }]
+	});
+	const safeCucumber = recipe({
+		id: 'cucumber-salad',
+		ingredients: [{ name: 'cucumber', quantity: 1, unit: 'whole' }]
+	});
+
+	for (const allergies of [longAllergies, paddedToTwoThousand]) {
+		const pbConflict = evaluateRecipeConflicts(pbRecipe, { diet: 'none', allergies });
+		assert.equal(pbConflict.hasConflict, true);
+		assert.deepEqual(pbConflict.allergenMatches, ['peanut']);
+		assert.deepEqual(pbConflict.matchingIngredientIndices, [0]);
+
+		const safeReport = evaluateRecipeConflicts(safeCucumber, { diet: 'none', allergies });
+		assert.equal(safeReport.hasConflict, false);
+	}
+});
+
+test('parses conversational free-text allergies, medical synonyms, parentheticals, and flags unrecognized text', () => {
+	assert.deepEqual(parseAllergies('Avoid soy and sesame\npeanuts, tree nuts, or shellfish'), [
+		'soy',
+		'sesame',
+		'peanut',
+		'tree nut',
+		'shellfish'
+	]);
+	assert.deepEqual(parseAllergies('none'), []);
+	assert.deepEqual(parseAllergies('No known food allergies'), []);
+
+	const peanutDish = recipe({
+		id: 'peanut-noodles',
+		ingredients: [{ name: 'peanut butter', quantity: 2, unit: 'tbsp' }]
+	});
+	for (const phrase of [
+		'I am allergic to peanuts',
+		'severe peanut allergy',
+		'peanuts (severe)',
+		'deadly anaphylactic reaction to groundnuts'
+	]) {
+		const report = evaluateRecipeConflicts(peanutDish, { diet: 'none', allergies: phrase });
+		assert.equal(report.hasConflict, true, `expected conflict for "${phrase}"`);
+		assert.deepEqual(report.allergenMatches, ['peanut']);
+		assert.equal(report.unrecognizedAllergens.length, 0);
+	}
+
+	const wheatBread = recipe({
+		id: 'wheat-bread',
+		ingredients: [{ name: 'all-purpose flour', quantity: 2, unit: 'cup' }]
+	});
+	for (const celiacInput of ['celiac', 'coeliac disease', 'severe celiac']) {
+		const report = evaluateRecipeConflicts(wheatBread, { diet: 'none', allergies: celiacInput });
+		assert.equal(report.hasConflict, true, `expected gluten conflict for "${celiacInput}"`);
+		assert.deepEqual(report.allergenMatches, ['gluten']);
+	}
+
+	const creamySoup = recipe({
+		id: 'creamy-soup',
+		ingredients: [{ name: 'heavy cream', quantity: 1, unit: 'cup' }]
+	});
+	const lactoseReport = evaluateRecipeConflicts(creamySoup, {
+		diet: 'none',
+		allergies: 'lactose intolerant'
+	});
+	assert.equal(lactoseReport.hasConflict, true);
+	assert.deepEqual(lactoseReport.allergenMatches, ['dairy']);
+
+	const prawnBowl = recipe({
+		id: 'prawn-bowl',
+		ingredients: [{ name: 'tiger shrimp', quantity: 8, unit: 'oz' }]
+	});
+	for (const shellfishSynonym of ['crustaceans', 'molluscs', 'mollusk allergy']) {
+		const report = evaluateRecipeConflicts(prawnBowl, {
+			diet: 'none',
+			allergies: shellfishSynonym
+		});
+		assert.equal(report.hasConflict, true, `expected shellfish conflict for "${shellfishSynonym}"`);
+		assert.deepEqual(report.allergenMatches, ['shellfish']);
+	}
+
+	// Unrecognized / unparsed text must warn to check labels rather than silently reporting safe.
+	const plainWater = recipe({
+		id: 'plain-water',
+		ingredients: [{ name: 'water', quantity: 1, unit: 'cup' }]
+	});
+	for (const unknownText of ['peantus', 'low histamine protocol', 'severe allergy']) {
+		const report = evaluateRecipeConflicts(plainWater, { diet: 'none', allergies: unknownText });
+		assert.equal(report.hasConflict, true, `expected warning for "${unknownText}"`);
+		assert.equal(report.badge, 'Check labels');
+		assert.match(report.summary, /allergy text not understood — check labels/i);
+	}
+
+	const peaSafe = recipe({
+		id: 'pea-safe',
+		ingredients: [
+			{ name: 'chickpeas', quantity: 1, unit: 'can' },
+			{ name: 'peanut butter', quantity: 1, unit: 'tbsp' }
+		]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(peaSafe, { diet: 'none', allergies: 'peas' }).hasConflict,
+		false
+	);
+
+	const squashAndCoconut = recipe({
+		id: 'squash-coconut',
+		tags: ['vegan', 'dairy-free'],
+		ingredients: [
+			{ name: 'butternut squash', quantity: 10, unit: 'oz' },
+			{ name: 'light coconut milk', quantity: 1, unit: 'cup' },
+			{ name: 'eggplant', quantity: 1, unit: 'whole' },
+			{ name: 'oyster mushroom', quantity: 4, unit: 'oz' },
+			{ name: 'nutmeg', quantity: 0.25, unit: 'tsp' }
+		]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(squashAndCoconut, {
+			diet: 'vegan',
+			allergies: 'tree nuts, dairy, eggs, and shellfish'
+		}).hasConflict,
+		false
+	);
+});
+
+test('covers nut/peanut expansions, span-scoped exemptions, seafood/fish species, dairy/egg/gluten/meat gaps, prepared foods, and oats/buckwheat/soba label checks', () => {
+	// `nuts` includes peanuts & groundnuts; both `nuts` and `tree nuts` catch bare nuts, nut butter, nut milk, and pesto.
+	for (const peanutIngredient of ['peanut butter', 'groundnut oil']) {
+		const item = recipe({
+			id: 'nut-peanut',
+			ingredients: [{ name: peanutIngredient, quantity: 1, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(item, { diet: 'none', allergies: 'nuts' }).hasConflict,
+			true,
+			`expected "nuts" to flag "${peanutIngredient}"`
+		);
+	}
+	for (const sharedNutIngredient of [
+		'chopped nuts',
+		'mixed nut butter',
+		'nut milk',
+		'basil pesto'
+	]) {
+		const item = recipe({
+			id: 'shared-nut',
+			ingredients: [{ name: sharedNutIngredient, quantity: 2, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(item, { diet: 'none', allergies: 'nuts' }).hasConflict,
+			true,
+			`expected "nuts" to flag "${sharedNutIngredient}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(item, { diet: 'none', allergies: 'tree nuts' }).hasConflict,
+			true,
+			`expected "tree nuts" to flag "${sharedNutIngredient}"`
+		);
+	}
+
+	// Span-scoped exemptions strip only the exempt span ("coconut") and still catch remaining allergens ("almond").
+	const coconutAlmondGranola = recipe({
+		id: 'coconut-almond',
+		ingredients: [{ name: 'coconut almond granola', quantity: 0.5, unit: 'cup' }]
+	});
+	const granolaTreeNutReport = evaluateRecipeConflicts(coconutAlmondGranola, {
+		diet: 'none',
+		allergies: 'tree nuts'
+	});
+	assert.equal(granolaTreeNutReport.hasConflict, true);
+	assert.deepEqual(granolaTreeNutReport.allergenMatches, ['tree nut']);
+
+	const coconutAndHeavyCream = recipe({
+		id: 'coconut-heavy-cream',
+		ingredients: [{ name: 'coconut milk and heavy cream', quantity: 1, unit: 'cup' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(coconutAndHeavyCream, { diet: 'dairy-free', allergies: '' })
+			.hasConflict,
+		true
+	);
+
+	// `seafood` maps to fish + shellfish, and expanded fish species flag under fish allergy & vegetarian.
+	for (const marineIngredient of [
+		'salmon fillet',
+		'jumbo shrimp',
+		'grouper',
+		'grilled eel',
+		'sea bass',
+		'yellow perch',
+		'northern pike',
+		'carp',
+		'monkfish tail',
+		'mahi-mahi'
+	]) {
+		const dish = recipe({
+			id: `seafood-${marineIngredient}`,
+			ingredients: [{ name: marineIngredient, quantity: 6, unit: 'oz' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'seafood' }).hasConflict,
+			true,
+			`expected seafood allergy to flag "${marineIngredient}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'vegetarian', allergies: '' }).hasConflict,
+			true,
+			`expected vegetarian diet to flag "${marineIngredient}"`
+		);
+		if (marineIngredient !== 'jumbo shrimp') {
+			assert.equal(
+				evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'fish' }).hasConflict,
+				true,
+				`expected fish allergy to flag "${marineIngredient}"`
+			);
+		}
+	}
+
+	// Dairy & egg culinary gaps (including accented crème fraîche).
+	for (const dairyItem of ['crème fraîche', 'creme fraiche', 'brioche buns', 'vanilla custard']) {
+		const dish = recipe({
+			id: `dairy-${dairyItem}`,
+			ingredients: [{ name: dairyItem, quantity: 2, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'dairy-free', allergies: '' }).hasConflict,
+			true,
+			`expected dairy-free to flag "${dairyItem}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'dairy' }).hasConflict,
+			true,
+			`expected dairy allergy to flag "${dairyItem}"`
+		);
+	}
+	for (const eggItem of ['brioche', 'challah bread', 'pastry custard']) {
+		const dish = recipe({
+			id: `egg-${eggItem}`,
+			ingredients: [{ name: eggItem, quantity: 1, unit: 'slice' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'vegan', allergies: '' }).dietCategories.includes(
+				'egg'
+			),
+			true,
+			`expected vegan egg rule to flag "${eggItem}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'eggs' }).hasConflict,
+			true,
+			`expected egg allergy to flag "${eggItem}"`
+		);
+	}
+
+	// Gluten baked-goods / dough / batter gaps.
+	for (const glutenItem of [
+		'pizza dough',
+		'burger bun',
+		'soft pretzel',
+		'puff pastry',
+		'sponge cake',
+		'chocolate chip cookies',
+		'water crackers',
+		'pie crust',
+		'pork dumplings',
+		'buttermilk pancakes',
+		'belgian waffles',
+		'breakfast cereal'
+	]) {
+		const dish = recipe({
+			id: `gluten-${glutenItem}`,
+			ingredients: [{ name: glutenItem, quantity: 1, unit: 'serving' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'gluten-free', allergies: '' }).hasConflict,
+			true,
+			`expected gluten-free to flag "${glutenItem}"`
+		);
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'gluten' }).hasConflict,
+			true,
+			`expected gluten allergy to flag "${glutenItem}"`
+		);
+	}
+
+	// Oats, buckwheat, and soba require checking labels unless explicitly certified gluten-free.
+	for (const [itemName, expectedLabel] of [
+		['rolled oats', 'oats'],
+		['oat flour', 'oats'],
+		['toasted buckwheat', 'buckwheat'],
+		['soba noodles', 'soba']
+	] as const) {
+		const unlabeled = recipe({
+			id: `check-${itemName}`,
+			ingredients: [{ name: itemName, quantity: 1, unit: 'cup' }]
+		});
+		const gfReport = evaluateRecipeConflicts(unlabeled, { diet: 'gluten-free', allergies: '' });
+		assert.equal(gfReport.hasConflict, true, `expected check-label conflict for "${itemName}"`);
+		assert.deepEqual(gfReport.labelCheckItems, [expectedLabel]);
+		assert.match(gfReport.summary, /check label for gluten/i);
+
+		const celiacReport = evaluateRecipeConflicts(unlabeled, {
+			diet: 'none',
+			allergies: 'celiac'
+		});
+		assert.equal(celiacReport.hasConflict, true);
+		assert.deepEqual(celiacReport.labelCheckItems, [expectedLabel]);
+
+		const certifiedGf = recipe({
+			id: `certified-${itemName}`,
+			ingredients: [{ name: `gluten-free ${itemName}`, quantity: 1, unit: 'cup' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(certifiedGf, { diet: 'gluten-free', allergies: 'celiac' })
+				.hasConflict,
+			false,
+			`expected gluten-free "${itemName}" to pass`
+		);
+	}
+
+	// Prepared foods with hidden allergens: satay / pad thai sauce (peanut) and hummus (sesame).
+	for (const peanutSauce of ['chicken satay', 'satay sauce', 'pad thai sauce']) {
+		const dish = recipe({
+			id: `prep-${peanutSauce}`,
+			ingredients: [{ name: peanutSauce, quantity: 2, unit: 'tbsp' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'none', allergies: 'peanuts' }).hasConflict,
+			true,
+			`expected peanut allergy to flag "${peanutSauce}"`
+		);
+	}
+	const hummusPlate = recipe({
+		id: 'hummus-plate',
+		ingredients: [{ name: 'classic hummus', quantity: 0.5, unit: 'cup' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(hummusPlate, { diet: 'none', allergies: 'sesame' }).hasConflict,
+		true
+	);
+
+	// Vegetarian meat gaps (while keeping plant "celery ribs" safe).
+	for (const meatItem of [
+		'baby back ribs',
+		'chicken liver',
+		'braised oxtail',
+		'roast rabbit',
+		'beef hotdog',
+		'beef jerky',
+		'lamb mince'
+	]) {
+		const dish = recipe({
+			id: `meat-${meatItem}`,
+			ingredients: [{ name: meatItem, quantity: 6, unit: 'oz' }]
+		});
+		assert.equal(
+			evaluateRecipeConflicts(dish, { diet: 'vegetarian', allergies: '' }).hasConflict,
+			true,
+			`expected vegetarian to flag "${meatItem}"`
+		);
+	}
+	const celerySnack = recipe({
+		id: 'celery-ribs',
+		ingredients: [
+			{ name: 'celery ribs', quantity: 3, unit: 'stalk' },
+			{ name: '2 ribs of celery', quantity: 2, unit: 'stalk' }
+		]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(celerySnack, { diet: 'vegetarian', allergies: '' }).hasConflict,
+		false
+	);
+
+	// Contractions, curly apostrophes, possessives, and framing stopwords must not leak unrecognized tokens.
+	const plainCucumber = recipe({
+		id: 'plain-cucumber',
+		ingredients: [{ name: 'cucumber', quantity: 1, unit: 'whole' }]
+	});
+	for (const [input, expected] of [
+		["I'm allergic to peanuts", ['peanut']],
+		['I\u2019m allergic to peanuts', ['peanut']],
+		["can't eat dairy", ['dairy']],
+		["don't eat shell-fish", ['shellfish']],
+		['sea food allergy', ['seafood']],
+		["cow's milk allergy", ['dairy']],
+		['severe food allergy to tree nuts', ['tree nut']],
+		['non-celiac gluten sensitivity', ['gluten']],
+		['diagnosed with celiac', ['gluten']]
+	] as const) {
+		assert.deepEqual(parseAllergies(input), [...expected]);
+		assert.equal(
+			evaluateRecipeConflicts(plainCucumber, { diet: 'none', allergies: input }).hasConflict,
+			false,
+			`expected safe cucumber recipe to stay safe for "${input}"`
+		);
+	}
+
+	// Compound forms & punctuation: mustard seeds -> dijon mustard, peanut butter != dairy butter, egg whites != white wine, za'atar -> sesame.
+	const dijonDressing = recipe({
+		id: 'dijon-dressing',
+		ingredients: [{ name: 'dijon mustard', quantity: 1, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(dijonDressing, { diet: 'none', allergies: 'mustard seeds' })
+			.hasConflict,
+		true
+	);
+	const butteredToast = recipe({
+		id: 'buttered-toast',
+		ingredients: [{ name: 'unsalted butter', quantity: 1, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(butteredToast, { diet: 'none', allergies: 'peanut butter' })
+			.hasConflict,
+		false
+	);
+	const whiteWinePan = recipe({
+		id: 'white-wine-pan',
+		ingredients: [{ name: 'white wine', quantity: 0.5, unit: 'cup' }]
+	});
+	const mayoDip = recipe({
+		id: 'mayo-dip',
+		ingredients: [{ name: 'mayonnaise', quantity: 2, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(whiteWinePan, { diet: 'none', allergies: 'egg whites' }).hasConflict,
+		false
+	);
+	assert.equal(
+		evaluateRecipeConflicts(mayoDip, { diet: 'none', allergies: 'egg whites' }).hasConflict,
+		true
+	);
+	const zaatarFlatbread = recipe({
+		id: 'zaatar',
+		ingredients: [{ name: "za'atar spice blend", quantity: 1, unit: 'tbsp' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(zaatarFlatbread, { diet: 'none', allergies: 'sesame' }).hasConflict,
+		true
+	);
+
+	// Recipe tags are scanned for allergens while honoring *-free tags.
+	const taggedPeanut = recipe({
+		id: 'tagged-peanut',
+		tags: ['thai', 'contains-peanuts'],
+		ingredients: [{ name: 'rice noodles', quantity: 4, unit: 'oz' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(taggedPeanut, { diet: 'none', allergies: 'peanuts' }).hasConflict,
+		true
+	);
+	const taggedPeanutFree = recipe({
+		id: 'tagged-peanut-free',
+		tags: ['peanut-free', 'nut-free'],
+		ingredients: [{ name: 'rice noodles', quantity: 4, unit: 'oz' }]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(taggedPeanutFree, { diet: 'none', allergies: 'peanuts' }).hasConflict,
+		false
+	);
+});
+
+test('evaluates deterministic meat, poultry, seafood, dairy, egg, honey, gluten, and carb rules', () => {
+	const steakBowl = recipe({
+		id: 'steak',
+		ingredients: [
+			{ name: 'ribeye steak', quantity: 8, unit: 'oz' },
+			{ name: 'green beans', quantity: 6, unit: 'oz' },
+			{ name: 'rice vinegar', quantity: 1, unit: 'tbsp' }
+		]
+	});
+	assert.deepEqual(
+		evaluateRecipeConflicts(steakBowl, { diet: 'vegetarian', allergies: '' }).dietCategories,
+		['meat']
+	);
+	assert.deepEqual(
+		evaluateRecipeConflicts(steakBowl, { diet: 'pescatarian', allergies: '' }).dietCategories,
+		['meat']
+	);
+	assert.equal(
+		evaluateRecipeConflicts(steakBowl, { diet: 'low-carb', allergies: '' }).hasConflict,
+		false
+	);
+
+	const goatCheeseEgg = recipe({
+		id: 'frittata',
+		ingredients: [
+			{ name: 'eggs', quantity: 3, unit: 'whole' },
+			{ name: 'goat cheese', quantity: 2, unit: 'oz' },
+			{ name: 'raw honey', quantity: 1, unit: 'tsp' }
+		]
+	});
+	assert.equal(
+		evaluateRecipeConflicts(goatCheeseEgg, { diet: 'vegetarian', allergies: '' }).hasConflict,
+		false
+	);
+	assert.deepEqual(
+		evaluateRecipeConflicts(goatCheeseEgg, { diet: 'vegan', allergies: '' }).dietCategories,
+		['dairy', 'egg', 'honey']
+	);
+	assert.deepEqual(
+		evaluateRecipeConflicts(goatCheeseEgg, { diet: 'dairy-free', allergies: '' }).dietCategories,
+		['dairy']
+	);
+
+	const orzo = seedRecipes.find((item) => item.id === 'lemon-chickpea-orzo')!;
+	const orzoGluten = evaluateRecipeConflicts(orzo, { diet: 'Gluten-Free', allergies: '' });
+	assert.equal(orzoGluten.hasConflict, true);
+	assert.deepEqual(orzoGluten.dietCategories, ['gluten']);
+	assert.deepEqual(orzoGluten.matchingIngredientIndices, [0]);
+
+	const orzoLowCarb = evaluateRecipeConflicts(orzo, { diet: 'low-carb', allergies: '' });
+	assert.equal(orzoLowCarb.hasConflict, true);
+	assert.deepEqual(orzoLowCarb.dietCategories, ['carb']);
+});
+
+test('Mediterranean vegan For you ranking excludes chicken, salmon, feta, yogurt, and parmesan recipes', () => {
+	const ranked = rankRecipes(
+		seedRecipes,
+		[],
+		preferences({ cuisines: ['Mediterranean'], diet: 'Vegan', allergies: '' }),
+		new Date(2026, 9, 22)
+	);
+	const ids = ranked.map((item) => item.id);
+	assert.deepEqual(ids.sort(), ['coconut-red-lentil-dal', 'maple-chili-tofu']);
+	for (const excluded of [
+		'lemon-herb-chicken',
+		'sesame-salmon-bowls',
+		'tomato-butter-beans',
+		'lemon-chickpea-orzo',
+		'roasted-veg-farro',
+		'chicken-shawarma-wraps'
+	]) {
+		assert.equal(ids.includes(excluded), false, `expected ${excluded} to be excluded`);
+	}
+});
+
+test('avoiding soy and sesame excludes maple-chili-tofu and sesame-salmon-bowls from For you while search/saved can inspect conflicts', () => {
+	const userPrefs = preferences({ diet: 'none', allergies: 'soy and sesame' });
+	const ranked = rankRecipes(seedRecipes, [], userPrefs, new Date(2026, 9, 22));
+	const ids = ranked.map((item) => item.id);
+	assert.equal(ids.includes('maple-chili-tofu'), false);
+	assert.equal(ids.includes('sesame-salmon-bowls'), false);
+	assert.equal(ids.length, seedRecipes.length - 2);
+
+	const withConflicts = rankRecipes(seedRecipes, [], userPrefs, new Date(2026, 9, 22), {
+		includeConflicts: true
+	});
+	assert.equal(withConflicts.length, seedRecipes.length);
+	const tofuReport = evaluateRecipeConflicts(
+		seedRecipes.find((item) => item.id === 'maple-chili-tofu')!,
+		userPrefs
+	);
+	assert.equal(tofuReport.hasConflict, true);
+	assert.deepEqual(tofuReport.allergenMatches, ['soy', 'sesame']);
+	assert.deepEqual(tofuReport.matchingIngredientIndices, [0, 4, 8]);
 });
 
 test('editing a recipe refreshes scheduled weeks and existing recipe scopes independently while keeping manual and checked rows', () => {

@@ -244,14 +244,26 @@ test('sanitizeKitchenState preserves valid states and clamps corrupt guest field
 	assert.equal(sanitized.shopping[0].quantity, 0);
 	assert.equal(sanitized.shopping[0].unit, 'piece');
 	assert.equal(sanitized.shopping[1].quantity, 1_000_000);
+	assert.equal(sanitized.preferences.diet.length, 200);
+	assert.equal(sanitized.preferences.allergies.length, 2_000);
 	assert.equal(sanitized.preferences.maxTime, 45);
 	assert.equal(sanitized.preferences.cuisines?.length, 8);
 	assert.equal(sanitized.preferences.reasoning?.effort, undefined);
 	assert.equal(sanitized.preferences.reasoning?.budgetTokens, 32_768);
 	assert.deepEqual(sanitized.preferences.ratings, { 'recipe-0': 5, 'recipe-1': 0 });
 
+	const longGuestAllergies = `${'peanuts, sesame, '.repeat(70)}tail-marker`;
+	assert.ok(longGuestAllergies.length > 500 && longGuestAllergies.length <= 2_000);
+	const legacyPrefs = sanitizeKitchenState({
+		...initial,
+		preferences: { ...initial.preferences, diet: 'Vegetarian', allergies: longGuestAllergies }
+	});
+	assert.equal(legacyPrefs.preferences.diet, 'Vegetarian');
+	assert.equal(legacyPrefs.preferences.allergies, longGuestAllergies);
+
 	const validated = validateAppState(sanitized);
 	assert.ok(validated, 'validateAppState should accept any state produced by sanitizeKitchenState');
+	assert.ok(validateAppState(legacyPrefs));
 });
 
 test('signup migration sanitizes guest state for immediate sync and retains journal offline', async () => {

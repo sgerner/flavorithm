@@ -254,6 +254,62 @@ test('state validation rejects malformed values and registration enforces the UI
 		() => backend.registerUser('Short Password', 'short@example.com', 'too-short'),
 		{ status: 400 }
 	);
+
+	const valid2000 = backend.validateAppState({
+		pantry: [],
+		recipes: [],
+		meals: [],
+		shopping: [],
+		preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(2_000) }
+	});
+	assert.equal(valid2000?.preferences.allergies.length, 2_000);
+	assert.equal(
+		backend.validateAppState({
+			pantry: [],
+			recipes: [],
+			meals: [],
+			shopping: [],
+			preferences: { ...data.defaultPreferences, allergies: 'a'.repeat(2_001) }
+		}),
+		null
+	);
+
+	const legacyUser = await backend.registerUser(
+		'Legacy Example',
+		'legacy-prefs@example.com',
+		'a secure legacy password'
+	);
+	const legacyAllergies = `${'peanuts 🥜, shellfish, '.repeat(75)}tail-marker`;
+	assert.ok(legacyAllergies.length > 500 && legacyAllergies.length <= 2_000);
+	backend
+		.getDatabase()
+		.prepare('UPDATE user_preferences SET preferences_json = ? WHERE user_id = ?')
+		.run(
+			JSON.stringify({
+				...data.defaultPreferences,
+				diet: 'Gluten-Free',
+				allergies: legacyAllergies
+			}),
+			legacyUser.user.id
+		);
+	const loadedLegacy = backend.getState(legacyUser.user);
+	assert.ok(loadedLegacy);
+	assert.equal(loadedLegacy.preferences.diet, 'Gluten-Free');
+	assert.equal(loadedLegacy.preferences.allergies, legacyAllergies);
+
+	const validatedLegacy = backend.validateAppState({
+		...loadedLegacy,
+		pantry: [{ id: 'rice', name: 'Rice', quantity: 2, unit: 'cup', category: 'Grains' }]
+	});
+	assert.ok(validatedLegacy);
+	backend.saveState(legacyUser.user, validatedLegacy, {
+		ifMatch: backend.getStateEtag(legacyUser.user),
+		ifNoneMatch: null
+	});
+	const roundTrippedLegacy = backend.getState(legacyUser.user);
+	assert.equal(roundTrippedLegacy?.preferences.diet, 'Gluten-Free');
+	assert.equal(roundTrippedLegacy?.preferences.allergies, legacyAllergies);
+	assert.equal(roundTrippedLegacy?.pantry[0]?.name, 'Rice');
 });
 
 test('account deletion confirms the password and preserves a shared household for remaining members', async () => {

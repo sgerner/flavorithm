@@ -141,7 +141,14 @@
 		type ShoppingItemDraft,
 		type ShoppingItemSnapshot
 	} from '#lib/kitchen-workflows.ts';
-	import { rankPantryRecipes, rankRecipes } from '#lib/discovery.ts';
+	import {
+		DIET_OPTIONS,
+		evaluateRecipeConflicts,
+		normalizeDiet,
+		rankPantryRecipes,
+		rankRecipes,
+		sanitizePreferencesForAI
+	} from '#lib/discovery.ts';
 	import {
 		createBlankRecipe,
 		DEFAULT_RECIPE_FILTER,
@@ -411,7 +418,7 @@
 		quizTime = kitchen.preferences.maxTime;
 		quizComplexity = kitchen.preferences.complexity;
 		quizCuisines = [...(kitchen.preferences.cuisines ?? [])];
-		quizDiet = kitchen.preferences.diet;
+		quizDiet = normalizeDiet(kitchen.preferences.diet);
 		quizAllergies = kitchen.preferences.allergies;
 		formSubmitted = false;
 		modal = 'onboarding';
@@ -506,7 +513,7 @@
 			maxTime: quizTime,
 			complexity: quizComplexity,
 			cuisines: [...quizCuisines],
-			diet: quizDiet,
+			diet: normalizeDiet(quizDiet),
 			allergies: quizAllergies.trim(),
 			onboardingStatus: 'completed'
 		});
@@ -875,9 +882,13 @@
 				activePriorityPantry.length ? activePriorityPantry : undefined
 			);
 		}
-		return filter === 'For you'
-			? rankRecipes(matches, kitchen.pantry, kitchen.preferences)
-			: matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
+		if (filter === 'For you') {
+			const includeConflicts = page === 'saved' || Boolean(query.trim());
+			return rankRecipes(matches, kitchen.pantry, kitchen.preferences, new Date(), {
+				includeConflicts
+			});
+		}
+		return matches.sort((a, b) => (b.rating ?? 0) - (a.rating ?? 0));
 	});
 	let visiblePantry = $derived(
 		filterPantryItems(kitchen.pantry, {
@@ -2510,19 +2521,22 @@
 							...(kitchen.preferences.provider === 'chatgpt'
 								? { connectionId: kitchen.preferences.chatgptAccountId }
 								: { apiKey }),
-							provider: kitchen.preferences.provider,
+							...(kitchen.preferences.provider &&
+							/^[a-z0-9-]{1,100}$/.test(kitchen.preferences.provider.trim())
+								? { provider: kitchen.preferences.provider.trim() }
+								: {}),
 							model: kitchen.preferences.model,
 							reasoning: kitchen.preferences.reasoning
 						}),
 			...(action === 'capture' || action === 'chat' || isSearch
 				? {}
 				: {
-						pantry: kitchen.pantry.filter(
-							(item) => item.quantity > 0 && expiryStatus(item.expires) !== 'expired'
-						),
-						preferences: kitchen.preferences,
+						pantry: kitchen.pantry
+							.filter((item) => item.quantity > 0 && expiryStatus(item.expires) !== 'expired')
+							.slice(0, 300),
+						preferences: sanitizePreferencesForAI(kitchen.preferences),
 						recipes: kitchen.recipes.filter((r) => r.rating).slice(0, 30),
-						prompt
+						prompt: prompt.slice(0, 2_000)
 					}),
 			...extra
 		});
@@ -2597,7 +2611,15 @@
 		const { diet, allergies, maxTime, complexity, cuisines, theme, dark } = kitchen.preferences;
 		const context = JSON.stringify({
 			...JSON.parse(snapshot),
-			preferences: { diet, allergies, maxTime, complexity, cuisines, theme, dark },
+			preferences: {
+				diet: normalizeDiet(diet),
+				allergies,
+				maxTime,
+				complexity,
+				cuisines,
+				theme,
+				dark
+			},
 			today: dateKey(new Date()),
 			availableThemes: themes,
 			recipeDrafts,
@@ -4767,8 +4789,18 @@
 							</div>
 						</div>
 					{/if}
+					{#if normalizeDiet(kitchen.preferences.diet) !== 'none' || Boolean(kitchen.preferences.allergies.trim())}
+						<p class="discover-scope-note">
+							Dietary and allergy filtering scans ingredients and tags only — recipe steps and notes
+							are not scanned. Always check package labels before cooking.
+						</p>
+					{/if}
 					<div class="recipe-grid">
-						{#each recipes as recipe, i (recipe.id)}<article
+						{#each recipes as recipe, i (recipe.id)}{@const conflict = evaluateRecipeConflicts(
+								recipe,
+								kitchen.preferences
+							)}
+							<article
 								class="recipe-card"
 								animate:flip={{ duration: motionDuration(250) }}
 								in:revealMotion|global={{ y: 20, duration: 400, delay: Math.min(i * 65, 350) }}
@@ -4810,6 +4842,13 @@
 											selected = recipe;
 										}}>{recipe.title}<ArrowUpRight size={18} /></button
 									>
+									{#if conflict.hasConflict}<div class="card-conflict-warning">
+											<span class="conflict-pill">{conflict.badge}</span>
+											<span
+												>{conflict.summary} · Ingredients/tags only (steps &amp; notes not scanned); check
+												labels before cooking.</span
+											>
+										</div>{/if}
 									<p>{recipe.description}</p>
 									{#if recipe.hidden || recipe.tags.length}<ul class="recipe-tags">
 											{#if recipe.hidden}<li class="recipe-badge">Hidden</li>{/if}
@@ -5519,6 +5558,7 @@
 	</div>{/if}
 {#if selected && !modal}<RecipeDetail
 		recipe={selected}
+		preferences={kitchen.preferences}
 		initialServings={selectedMealServings ?? selected.servings}
 		bind:tab={selectedDetailTab}
 		bind:completedSteps={
@@ -5650,25 +5690,24 @@
 									>{/each}
 							</div>
 						</fieldset>
-						<details class="quiz-dietary">
+						<details
+							class="quiz-dietary"
+							open={quizDiet !== 'none' || Boolean(quizAllergies.trim())}
+						>
 							<summary>Any dietary preferences or allergies? <span>Optional</span></summary>
 							<FormField id="onboarding-diet" label="Dietary style">
 								{#snippet children(field)}
 									<select bind:value={quizDiet} {...field}
-										><option value="none">No dietary restriction</option><option value="vegetarian"
-											>Vegetarian</option
-										><option value="vegan">Vegan</option><option value="pescatarian"
-											>Pescatarian</option
-										><option value="gluten-free">Gluten-free</option><option value="dairy-free"
-											>Dairy-free</option
-										></select
+										>{#each DIET_OPTIONS as option}<option value={option.value}
+												>{option.label}</option
+											>{/each}</select
 									>
 								{/snippet}
 							</FormField>
 							<FormField
 								id="onboarding-allergies"
 								label="Allergies or ingredients to avoid"
-								help="These guide generation. Check ingredients and labels before cooking."
+								help="Culinary guidance for discovery and generation (checks ingredients and tags only, not steps or notes). Check package labels before cooking."
 							>
 								{#snippet children(field)}
 									<input
@@ -5862,10 +5901,15 @@
 							</FormField>
 							<FormField id="generate-diet" label="Dietary style">
 								{#snippet children(field)}
-									<select bind:value={kitchen.preferences.diet} {...field}
-										><option value="none">A bit of everything</option><option>Vegetarian</option
-										><option>Vegan</option><option>Pescatarian</option><option>Gluten-free</option
-										><option>Low-carb</option></select
+									<select
+										bind:value={
+											() => normalizeDiet(kitchen.preferences.diet),
+											(value) => (kitchen.preferences.diet = normalizeDiet(value))
+										}
+										{...field}
+										>{#each DIET_OPTIONS as option}<option value={option.value}
+												>{option.label}</option
+											>{/each}</select
 									>
 								{/snippet}
 							</FormField>
@@ -5873,7 +5917,7 @@
 						<FormField
 							id="generate-allergies"
 							label="Allergies & ingredients to avoid"
-							help="Check all ingredients and substitutions against your allergies before cooking."
+							help="Checks ingredients and tags only (not steps or notes). Verify all ingredients, substitutions, and package labels before cooking."
 						>
 							{#snippet children(field)}
 								<input
@@ -6458,9 +6502,10 @@
 				{:else if modal === 'pickRecipe'}
 					<h2>Choose a recipe</h2>
 					<div class="pick-list">
-						{#each kitchen.recipes as recipe}<button
-								type="button"
-								onclick={() => choosePickedRecipe(recipe)}
+						{#each kitchen.recipes as recipe}{@const conflict = evaluateRecipeConflicts(
+								recipe,
+								kitchen.preferences
+							)}<button type="button" onclick={() => choosePickedRecipe(recipe)}
 								><img
 									src={recipe.image || recipePlaceholder(recipe)}
 									onerror={(event) => recipeImageError(event, recipe)}
@@ -6470,7 +6515,11 @@
 									loading="lazy"
 									decoding="async"
 								/><span
-									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small></span
+									><b>{recipe.title}</b><small>{recipe.time} min · {recipe.cuisine}</small
+									>{#if conflict.hasConflict}<small class="picker-conflict-warning"
+											><span class="conflict-pill">{conflict.badge}</span>
+											{conflict.summary} · Check labels</small
+										>{/if}</span
 								><Plus size={17} /></button
 							>{/each}
 					</div>
@@ -6751,6 +6800,15 @@
 		background: var(--wash);
 		border: 1px solid var(--line);
 		font-size: 14px;
+	}
+	.discover-scope-note {
+		padding: 10px 14px;
+		margin: 0 0 18px;
+		background: var(--wash);
+		border: 1px solid var(--line);
+		color: var(--ink);
+		font-size: 13px;
+		line-height: 1.5;
 	}
 	.discover-pantry-actions {
 		display: flex;
@@ -7172,6 +7230,38 @@
 		min-height: 40px;
 		padding-inline: 6px;
 	}
+	.card-conflict-warning {
+		margin-top: 8px;
+		padding: 7px 9px;
+		background: var(--danger-surface);
+		border-left: 2px solid var(--danger-ink);
+		color: var(--danger-ink);
+		font-size: 13px;
+		line-height: 1.5;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+	}
+	.conflict-pill {
+		padding: 1px 6px;
+		background: var(--danger-fill);
+		color: var(--on-danger-fill);
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.5px;
+		text-transform: uppercase;
+	}
+	.pick-list small.picker-conflict-warning {
+		display: inline-flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 5px;
+		margin-top: 6px;
+		color: var(--danger-ink);
+		font-size: 12px;
+		line-height: 1.45;
+	}
 	.staged-scan {
 		display: flex;
 		align-items: center;
@@ -7195,6 +7285,10 @@
 			color: HighlightText;
 			border: 1px solid Highlight;
 			forced-color-adjust: none;
+		}
+		.card-conflict-warning,
+		.conflict-pill {
+			border: 1px solid CanvasText;
 		}
 	}
 </style>

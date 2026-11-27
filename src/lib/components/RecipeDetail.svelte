@@ -6,6 +6,7 @@
 	import { describeBy, fieldAria, validatePlannedServings } from '#lib/form-validation.ts';
 	import { backdropMotion, dialogMotion, fadeMotion, revealMotion } from '#lib/motion.ts';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
+	import { evaluateRecipeConflicts, normalizeDiet, parseAllergies } from '#lib/discovery.ts';
 	import {
 		RATING_STARS,
 		bookmarkLabel,
@@ -26,7 +27,7 @@
 		type NutritionMode,
 		type RecipeTab
 	} from '#lib/recipe-detail.ts';
-	import type { Recipe } from '#lib/types.ts';
+	import type { Preferences, Recipe } from '#lib/types.ts';
 	import {
 		X,
 		Clock,
@@ -52,6 +53,7 @@
 		toggleHidden,
 		busy,
 		initialServings,
+		preferences,
 		completedSteps = $bindable<number[]>([]),
 		tab = $bindable<RecipeTab>('recipe')
 	}: {
@@ -67,6 +69,7 @@
 		toggleHidden: () => void;
 		busy: boolean;
 		initialServings?: number;
+		preferences?: Pick<Preferences, 'diet' | 'allergies'>;
 		completedSteps?: number[];
 		tab?: RecipeTab;
 	} = $props();
@@ -108,6 +111,15 @@
 	let activeServings = $derived(resolveActiveServings(servingCount, lastValidServings));
 	let nutritionMultiplier = $derived(
 		nutritionMultiplierFor(nutritionMode, recipe.servings, activeServings)
+	);
+	let conflict = $derived(preferences ? evaluateRecipeConflicts(recipe, preferences) : null);
+	let hasActiveGuidance = $derived(
+		Boolean(
+			preferences &&
+			(normalizeDiet(preferences.diet) !== 'none' ||
+				Boolean(conflict?.hasConflict) ||
+				parseAllergies(preferences.allergies).length > 0)
+		)
 	);
 	let recipeTabButton = $state<HTMLButtonElement | null>(null);
 	let nutritionTabButton = $state<HTMLButtonElement | null>(null);
@@ -214,6 +226,22 @@
 			{#if servingsError}<p class="error" id={servingsAria.errorId} role="alert">
 					{servingsError}
 				</p>{/if}
+			{#if conflict?.hasConflict}<div
+					class="conflict-banner"
+					role="region"
+					aria-label="Dietary and allergen guidance"
+				>
+					<div class="conflict-banner-header">
+						<span class="conflict-banner-badge">{conflict.badge}</span>
+						<strong>{conflict.summary}</strong>
+					</div>
+					<p>
+						Checks ingredients and tags only — recipe steps and notes are not scanned. Culinary
+						guidance only, not medical certification{recipe.provenance
+							? ' (especially for imported or AI-generated recipes)'
+							: ''}; always verify every ingredient, substitution, and package label before cooking.
+					</p>
+				</div>{/if}
 			<div class="tabs" role="tablist" aria-label="Recipe details">
 				<button
 					bind:this={recipeTabButton}
@@ -270,7 +298,9 @@
 							</div>
 						</div>
 						<ul class="ingredients-list">
-							{#each recipe.ingredients as item}<li>
+							{#each recipe.ingredients as item, idx}{@const reasons =
+									conflict?.ingredientReasons[idx]}
+								<li class:conflict-ingredient={Boolean(reasons)}>
 									<span
 										>{formatScaledIngredientQuantity(
 											item.quantity,
@@ -278,9 +308,18 @@
 											activeServings
 										)}
 										{item.unit}</span
-									>{item.name}
+									><span class="ingredient-line-name"
+										>{item.name}{#if reasons?.length}<small class="ingredient-conflict-tag"
+												>{reasons.join(', ')}</small
+											>{/if}</span
+									>
 								</li>{/each}
 						</ul>
+						{#if hasActiveGuidance}<p class="label-check-note">
+								Checks ingredients and tags only (steps and notes are not scanned). Check package
+								labels and sub-ingredients before cooking; dietary and allergy flags are culinary
+								guidance, not medical certification.
+							</p>{/if}
 					</div>
 					<div>
 						<h3>Let's make it</h3>
@@ -443,5 +482,69 @@
 		background: var(--wash);
 		color: var(--muted);
 		font-size: 14px;
+	}
+	.conflict-banner {
+		padding: 14px 16px;
+		margin: 0 0 22px;
+		background: var(--danger-surface);
+		border-left: 3px solid var(--danger-ink);
+		color: var(--danger-ink);
+		font-size: 14px;
+	}
+	.conflict-banner-header {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+		margin-bottom: 6px;
+	}
+	.conflict-banner-badge {
+		padding: 2px 7px;
+		background: var(--danger-fill);
+		color: var(--on-danger-fill);
+		font-size: 11px;
+		font-weight: 700;
+		letter-spacing: 0.6px;
+		text-transform: uppercase;
+	}
+	.conflict-banner p {
+		font-size: 13px;
+		line-height: 1.6;
+	}
+	.ingredients-list li.conflict-ingredient {
+		padding-inline: 8px;
+		background: var(--danger-surface);
+		border-left: 2px solid var(--danger-ink);
+	}
+	.ingredients-list li.conflict-ingredient span {
+		color: var(--ink);
+	}
+	.ingredients-list li span.ingredient-line-name {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px;
+		color: var(--ink);
+		min-width: 0;
+	}
+	.ingredient-conflict-tag {
+		padding: 1px 6px;
+		background: var(--danger-fill);
+		color: var(--on-danger-fill);
+		font-size: 12px;
+		font-weight: 600;
+	}
+	.label-check-note {
+		margin-top: 10px;
+		font-size: 13px;
+		line-height: 1.6;
+		color: var(--muted);
+	}
+	@media (forced-colors: active) {
+		.conflict-banner,
+		.conflict-banner-badge,
+		.ingredient-conflict-tag {
+			border: 1px solid CanvasText;
+		}
 	}
 </style>
