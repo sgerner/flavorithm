@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { ArrowUpRight, RefreshCw, Check, Copy } from '@lucide/svelte';
 	import FormField from './FormField.svelte';
+	import HostAIDefault from './HostAIDefault.svelte';
 	import SearchPicker from './SearchPicker.svelte';
 	import { describeBy } from '#lib/form-validation.ts';
 	import { revealMotion } from '#lib/motion.ts';
@@ -92,7 +93,7 @@
 	let selectedModel = $derived(models.find((m) => m.id === preferences.model));
 	let reasoning = $derived(selectedModel?.reasoning);
 	function togglePersonalOverride(enabled: boolean) {
-		preferences.usePersonalAI = enabled ? true : undefined;
+		preferences.usePersonalAI = enabled;
 		onoverride?.(enabled);
 	}
 	let options = $derived([
@@ -145,8 +146,8 @@
 	<div class="device-login">
 		<h4>Host AI administration</h4>
 		<p class="muted">
-			Use one Codex connection and model for every signed-in account on this host, across
-			households.
+			Use one Codex connection and model for this admin account, or for every signed-in account when
+			<code>FLAVORITHM_HOST_AI_SHARED=true</code>.
 		</p>
 		{#if chatGPT.host}<p>Host connection enabled · {chatGPT.host.model}</p>
 			<button class="secondary" onclick={() => setHost(false)}>Disable host connection</button>
@@ -165,60 +166,15 @@
 		{#if hostError}<p class="error" role="alert">{hostError}</p>{/if}
 	</div>
 {/if}
-{#if chatGPT.host}
-	<div class="host-default-banner">
-		<div class="plan-status">
-			<span class="connection-status" class:connected={usingHost}>
-				{#if usingHost}<Check size={16} /> Host ChatGPT connection active by default{:else}Personal
-					AI override active{/if}
-			</span>
-		</div>
-		<p class="field-help" id="ai-host-help">
-			{#if usingHost}
-				AI is provided by this host by default. Your saved personal connection and reasoning
-				settings remain unchanged.
-			{:else}
-				Requests use your personal connection below instead of shared host AI ({chatGPT.host
-					.model}).
-			{/if}
-		</p>
-		{#if signedIn}
-			<label class="host-override" for="ai-host-override">
-				<input
-					id="ai-host-override"
-					type="checkbox"
-					aria-describedby="ai-host-override-help"
-					aria-invalid="false"
-					checked={Boolean(preferences.usePersonalAI)}
-					onchange={(event) => togglePersonalOverride(event.currentTarget.checked)}
-				/>
-				<span>
-					<b>Use a personal AI connection instead</b>
-					<small id="ai-host-override-help"
-						>Unlock your own API key or ChatGPT subscription without changing shared host settings.</small
-					>
-				</span>
-			</label>
-		{/if}
-	</div>
-{/if}
-{#if usingHost}
-	<FormField
-		id="ai-host-connection"
-		label="Connection"
-		helpIds={[!signedIn ? 'ai-signin-help' : undefined, 'ai-host-help']}
-	>
-		{#snippet children(field)}
-			<input
-				type="text"
-				class="readonly-input"
-				value="Host ChatGPT connection"
-				readonly
-				{...field}
-			/>
-		{/snippet}
-	</FormField>
-{:else}
+<HostAIDefault
+	host={chatGPT.host}
+	{signedIn}
+	{usingHost}
+	usePersonalAI={Boolean(preferences.usePersonalAI)}
+	signinHelpId={!signedIn ? 'ai-signin-help' : undefined}
+	ontoggle={togglePersonalOverride}
+/>
+{#if !usingHost}
 	<SearchPicker
 		label="Connection"
 		placeholder={loading ? 'Loading connections…' : 'Search providers or models…'}
@@ -393,17 +349,7 @@
 	{/key}
 {/if}
 
-{#if usingHost}
-	<FormField
-		id="ai-host-model"
-		label="Model"
-		help="Managed by the host administrator. Turn on a personal AI connection above to choose your own model or reasoning settings."
-	>
-		{#snippet children(field)}
-			<input type="text" class="readonly-input" value={chatGPT.host!.model} readonly {...field} />
-		{/snippet}
-	</FormField>
-{:else if (subscription && activeAccount?.connected && activeAccount.planEnabled && models.length > 0) || (!subscription && provider?.supported)}
+{#if !usingHost && ((subscription && activeAccount?.connected && activeAccount.planEnabled && models.length > 0) || (!subscription && provider?.supported))}
 	<SearchPicker
 		label="Model"
 		placeholder="Search this provider’s models…"
@@ -478,7 +424,7 @@
 				</FormField>{/if}
 		</div>
 	{/if}
-{:else if subscription && activeAccount?.connected && activeAccount.planEnabled && !catalogError}
+{:else if !usingHost && subscription && activeAccount?.connected && activeAccount.planEnabled && !catalogError}
 	<button class="text-button" disabled={loading || busy} onclick={onrefresh}
 		><RefreshCw size={15} /> Refresh account models</button
 	>
@@ -505,47 +451,6 @@
 	.connection-status.connected {
 		color: var(--green);
 		font-weight: 600;
-	}
-	.host-default-banner {
-		margin-block: 16px;
-		padding: 14px 16px;
-		background: var(--wash);
-		border-left: 3px solid var(--green);
-	}
-	.host-default-banner .plan-status {
-		margin-top: 0;
-	}
-	.host-default-banner .field-help {
-		margin: 6px 0 0;
-	}
-	.host-override {
-		display: flex;
-		align-items: flex-start;
-		gap: 12px;
-		margin-top: 14px;
-		font-size: 14px;
-		cursor: pointer;
-	}
-	.host-override input {
-		width: 20px;
-		height: 20px;
-		flex: 0 0 20px;
-		margin-top: 2px;
-		accent-color: var(--green);
-	}
-	.host-override span {
-		display: flex;
-		flex-direction: column;
-		gap: 3px;
-	}
-	.host-override small {
-		color: var(--muted);
-		line-height: 1.5;
-	}
-	.readonly-input {
-		background: var(--wash);
-		color: var(--muted);
-		cursor: default;
 	}
 	.device-login {
 		margin-block: 20px;

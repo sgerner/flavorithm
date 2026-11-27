@@ -616,14 +616,27 @@ const voiceSettingsSsrMod = compileServerModule(
 	{ './FormField.svelte': formFieldMod }
 ).exports;
 
-const aiConnectionSsrMod = compileServerModule(
+const hostAIDefaultSsrMod = compileServerModule(
+	'src/lib/components/HostAIDefault.svelte',
+	readFileSync('src/lib/components/HostAIDefault.svelte', 'utf8'),
+	{ './FormField.svelte': formFieldMod }
+).exports;
+
+const rawAIConnectionSource = readFileSync('src/lib/components/AIConnection.svelte', 'utf8');
+const hookedAIConnectionSource = injectScriptHook(
+	rawAIConnectionSource,
+	`(globalThis as any).__onAIConnectionInit?.({ togglePersonalOverride });`
+);
+const aiConnectionCompiled = compileServerModule(
 	'src/lib/components/AIConnection.svelte',
-	readFileSync('src/lib/components/AIConnection.svelte', 'utf8'),
+	hookedAIConnectionSource,
 	{
 		'./FormField.svelte': formFieldMod,
+		'./HostAIDefault.svelte': hostAIDefaultSsrMod,
 		'./SearchPicker.svelte': searchPickerSsrMod
 	}
-).exports;
+);
+const aiConnectionSsrMod = aiConnectionCompiled.exports;
 
 test('rendered components resolve every aria-describedby and label[for] without duplicate IDs', () => {
 	const sampleRecipe = structuredClone(createInitialState().recipes[0]);
@@ -818,7 +831,7 @@ test('rendered components resolve every aria-describedby and label[for] without 
 	);
 	assert.equal(getTagById(importDraftTags, 'import-title')?.attrs['aria-invalid'], 'true');
 
-	// 4. VoiceSettings & AIConnection
+	// 4. VoiceSettings, HostAIDefault & AIConnection
 	assertValidRenderedAccessibility(
 		render(voiceSettingsSsrMod.default, {
 			props: { provider: 'auto', model: '', apiKey: '', localAvailable: false }
@@ -837,6 +850,54 @@ test('rendered components resolve every aria-describedby and label[for] without 
 		}).body,
 		'VoiceSettings local unavailable'
 	);
+
+	const hostDefaultStandaloneHtml = render(hostAIDefaultSsrMod.default, {
+		props: {
+			host: { model: 'gpt-5.4' },
+			signedIn: true,
+			usingHost: true,
+			usePersonalAI: false,
+			ontoggle: () => {}
+		}
+	}).body;
+	const hostDefaultStandaloneTags = assertValidRenderedAccessibility(
+		hostDefaultStandaloneHtml,
+		'HostAIDefault standalone active'
+	);
+	assert.equal(
+		getTagById(hostDefaultStandaloneTags, 'ai-host-override')?.attrs['aria-describedby'],
+		'ai-host-override-help'
+	);
+	assert.equal(
+		getTagById(hostDefaultStandaloneTags, 'ai-host-override')?.attrs['aria-invalid'],
+		'false'
+	);
+	assert.equal(
+		getTagById(hostDefaultStandaloneTags, 'ai-host-connection')?.attrs['aria-describedby'],
+		'ai-host-help'
+	);
+	assert.equal(
+		getTagById(hostDefaultStandaloneTags, 'ai-host-model')?.attrs['aria-describedby'],
+		'ai-host-model-help'
+	);
+
+	const hostOverrideStandaloneHtml = render(hostAIDefaultSsrMod.default, {
+		props: {
+			host: { model: 'gpt-5.4' },
+			signedIn: true,
+			usingHost: false,
+			usePersonalAI: true,
+			ontoggle: () => {}
+		}
+	}).body;
+	const hostOverrideStandaloneTags = assertValidRenderedAccessibility(
+		hostOverrideStandaloneHtml,
+		'HostAIDefault standalone override'
+	);
+	assert.equal(getTagById(hostOverrideStandaloneTags, 'ai-host-connection'), undefined);
+	assert.equal(getTagById(hostOverrideStandaloneTags, 'ai-host-model'), undefined);
+	assert.ok(getTagById(hostOverrideStandaloneTags, 'ai-host-help'));
+
 	assertValidRenderedAccessibility(
 		render(aiConnectionSsrMod.default, {
 			props: {
@@ -872,12 +933,120 @@ test('rendered components resolve every aria-describedby and label[for] without 
 		}).body,
 		'AIConnection api-key with catalog error'
 	);
+
+	let capturedToggle: ((enabled: boolean) => void) | undefined;
+	const togglePrefs = structuredClone(createInitialState().preferences);
+	assert.equal(togglePrefs.usePersonalAI, undefined);
+	const overrideEvents: boolean[] = [];
+	aiConnectionCompiled.sandbox.__onAIConnectionInit = (api: {
+		togglePersonalOverride: (enabled: boolean) => void;
+	}) => {
+		capturedToggle = api.togglePersonalOverride;
+	};
+	const aiHostSignedInHtml = render(aiConnectionSsrMod.default, {
+		props: {
+			preferences: togglePrefs,
+			apiKey: '',
+			providers: [],
+			accountModels: [],
+			chatGPT: {
+				configured: true,
+				mode: 'device',
+				host: { model: 'gpt-5.4' },
+				accounts: []
+			},
+			signedIn: true,
+			managedAuth: false,
+			busy: false,
+			loading: false,
+			catalogError: '',
+			authorizationUrl: '',
+			device: null,
+			oncancel: () => {},
+			oncopycode: () => {},
+			onselect: () => {},
+			onaccount: () => {},
+			onconnect: () => {},
+			ondisconnect: () => {},
+			onrefresh: () => {},
+			onsignin: () => {},
+			onoverride: (enabled: boolean) => overrideEvents.push(enabled)
+		}
+	}).body;
+	aiConnectionCompiled.sandbox.__onAIConnectionInit = undefined;
+	const aiHostSignedInTags = assertValidRenderedAccessibility(
+		aiHostSignedInHtml,
+		'AIConnection host default active'
+	);
+	assert.equal(
+		getTagById(aiHostSignedInTags, 'ai-host-connection')?.attrs['aria-describedby'],
+		'ai-host-help'
+	);
+	assert.equal(
+		getTagById(aiHostSignedInTags, 'ai-host-model')?.attrs['aria-describedby'],
+		'ai-host-model-help'
+	);
+	assert.ok(capturedToggle, 'expected togglePersonalOverride hook');
+	capturedToggle(true);
+	assert.equal(togglePrefs.usePersonalAI, true);
+	capturedToggle(false);
+	assert.equal(togglePrefs.usePersonalAI, false);
+	assert.deepEqual(overrideEvents, [true, false]);
+
+	const aiHostSignedOutHtml = render(aiConnectionSsrMod.default, {
+		props: {
+			preferences: structuredClone(createInitialState().preferences),
+			apiKey: '',
+			providers: [],
+			accountModels: [],
+			chatGPT: {
+				configured: true,
+				mode: 'device',
+				host: { model: 'gpt-5.4' },
+				accounts: []
+			},
+			signedIn: false,
+			managedAuth: false,
+			busy: false,
+			loading: false,
+			catalogError: '',
+			authorizationUrl: '',
+			device: null,
+			oncancel: () => {},
+			oncopycode: () => {},
+			onselect: () => {},
+			onaccount: () => {},
+			onconnect: () => {},
+			ondisconnect: () => {},
+			onrefresh: () => {},
+			onsignin: () => {}
+		}
+	}).body;
+	const aiHostSignedOutTags = assertValidRenderedAccessibility(
+		aiHostSignedOutHtml,
+		'AIConnection host default signed-out'
+	);
+	assert.equal(
+		getTagById(aiHostSignedOutTags, 'ai-host-connection')?.attrs['aria-describedby'],
+		'ai-signin-help ai-host-help'
+	);
+
 	assertValidRenderedAccessibility(
 		render(aiConnectionSsrMod.default, {
 			props: {
-				preferences: structuredClone(createInitialState().preferences),
+				preferences: {
+					...structuredClone(createInitialState().preferences),
+					usePersonalAI: true
+				},
 				apiKey: '',
-				providers: [],
+				providers: [
+					{
+						id: 'openai',
+						name: 'OpenAI',
+						supported: true,
+						models: [{ id: 'gpt-4o-mini', name: 'GPT-4o mini', vision: true }]
+					} as any
+				],
 				accountModels: [],
 				chatGPT: {
 					configured: true,
@@ -902,8 +1071,96 @@ test('rendered components resolve every aria-describedby and label[for] without 
 				onsignin: () => {}
 			}
 		}).body,
-		'AIConnection host default active'
+		'AIConnection personal override active'
 	);
+
+	const connectedPersonalAccount = {
+		id: 'acct-personal',
+		label: 'Personal ChatGPT',
+		connected: true,
+		planEnabled: true
+	};
+	const aiHostWithPersonalSubHtml = render(aiConnectionSsrMod.default, {
+		props: {
+			preferences: {
+				...structuredClone(createInitialState().preferences),
+				provider: 'chatgpt',
+				chatgptAccountId: 'acct-personal',
+				usePersonalAI: false
+			},
+			apiKey: '',
+			providers: [],
+			accountModels: [],
+			chatGPT: {
+				configured: true,
+				mode: 'device',
+				host: { model: 'gpt-5.4' },
+				accounts: [connectedPersonalAccount]
+			},
+			activeAccount: connectedPersonalAccount,
+			signedIn: true,
+			managedAuth: false,
+			busy: false,
+			loading: false,
+			catalogError: '',
+			authorizationUrl: '',
+			device: null,
+			oncancel: () => {},
+			oncopycode: () => {},
+			onselect: () => {},
+			onaccount: () => {},
+			onconnect: () => {},
+			ondisconnect: () => {},
+			onrefresh: () => {},
+			onsignin: () => {}
+		}
+	}).body;
+	assertValidRenderedAccessibility(
+		aiHostWithPersonalSubHtml,
+		'AIConnection host active with personal ChatGPT saved'
+	);
+	assert.equal(aiHostWithPersonalSubHtml.includes('Refresh account models'), false);
+
+	const aiOverrideEmptySubHtml = render(aiConnectionSsrMod.default, {
+		props: {
+			preferences: {
+				...structuredClone(createInitialState().preferences),
+				provider: 'chatgpt',
+				chatgptAccountId: 'acct-personal',
+				usePersonalAI: true
+			},
+			apiKey: '',
+			providers: [],
+			accountModels: [],
+			chatGPT: {
+				configured: true,
+				mode: 'device',
+				host: { model: 'gpt-5.4' },
+				accounts: [connectedPersonalAccount]
+			},
+			activeAccount: connectedPersonalAccount,
+			signedIn: true,
+			managedAuth: false,
+			busy: false,
+			loading: false,
+			catalogError: '',
+			authorizationUrl: '',
+			device: null,
+			oncancel: () => {},
+			oncopycode: () => {},
+			onselect: () => {},
+			onaccount: () => {},
+			onconnect: () => {},
+			ondisconnect: () => {},
+			onrefresh: () => {},
+			onsignin: () => {}
+		}
+	}).body;
+	assertValidRenderedAccessibility(
+		aiOverrideEmptySubHtml,
+		'AIConnection personal ChatGPT override empty catalog'
+	);
+	assert.equal(aiOverrideEmptySubHtml.includes('Refresh account models'), true);
 });
 
 // --- +page.svelte modal accessibility & end-to-end login/onboarding harness ---

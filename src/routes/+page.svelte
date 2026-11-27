@@ -191,6 +191,7 @@
 		type ConnectionProvider
 	} from '#lib/ai-connections.ts';
 	import {
+		consumeHostAIDefaultNotice,
 		entitledChatGPTAccountId,
 		reconcileChatGPTPreferences,
 		runConcurrentModelCatalog,
@@ -1452,6 +1453,7 @@
 								if (attempt !== connectionAttempt || user?.id !== owner) return;
 								chatGPT = result;
 								reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+								maybeNotifyHostAIDefault();
 							},
 							onConnectionsError: () => {
 								if (attempt !== connectionAttempt || user?.id !== owner) return;
@@ -1991,6 +1993,26 @@
 			}
 		});
 	}
+	function maybeNotifyHostAIDefault() {
+		if (
+			!user ||
+			!consumeHostAIDefaultNotice({
+				userId: user.id,
+				storage: typeof localStorage === 'undefined' ? null : localStorage,
+				preferences: kitchen.preferences,
+				chatGPT
+			})
+		) {
+			return;
+		}
+		notify(
+			'Shared host AI is now active by default. Your saved personal AI settings are preserved.',
+			() => {
+				void openSettings('ai');
+			},
+			'Settings'
+		);
+	}
 	async function refreshConnections() {
 		if (!user) return;
 		const owner = user.id;
@@ -1999,6 +2021,7 @@
 		if (attempt !== connectionAttempt || user?.id !== owner) return;
 		chatGPT = result;
 		reconcileChatGPTPreferences(kitchen.preferences, chatGPT);
+		maybeNotifyHostAIDefault();
 	}
 	async function refreshAISettings() {
 		error = '';

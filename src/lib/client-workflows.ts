@@ -3,7 +3,7 @@ import {
 	type ConnectionModel,
 	type ConnectionProvider
 } from '#lib/ai-connections.ts';
-import { createNewUserState } from '#lib/data.ts';
+import { createNewUserState, defaultPreferences } from '#lib/data.ts';
 import { sanitizeKitchenState } from '#lib/guest-storage.ts';
 import { clearSampleData, hasSampleData } from '#lib/kitchen-workflows.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
@@ -51,6 +51,84 @@ export function reconcileChatGPTPreferences(
 			personalAccounts[0]?.id;
 	} else if (!personalAccounts.length && preferences.chatgptAccountId) {
 		preferences.chatgptAccountId = undefined;
+	}
+}
+
+const fallbackNotifiedUsers = new Set<string>();
+
+/** True when a user has saved non-default personal AI settings beyond starter defaults or sanitized host state. */
+export function hasSavedPersonalAIConfig(
+	preferences: Pick<Preferences, 'provider' | 'model' | 'chatgptAccountId' | 'reasoning'>,
+	chatGPT?: ChatGPTConnectionSummary
+): boolean {
+	if (preferences.chatgptAccountId && preferences.chatgptAccountId !== HOST_CONNECTION_ID) {
+		return true;
+	}
+	if (
+		preferences.provider === 'chatgpt' &&
+		chatGPT?.accounts.some((account) => account.id !== HOST_CONNECTION_ID && account.connected)
+	) {
+		return true;
+	}
+	if (
+		preferences.provider !== defaultPreferences.provider &&
+		!(preferences.provider === 'chatgpt' && !preferences.model)
+	) {
+		return true;
+	}
+	if (preferences.model && preferences.model !== defaultPreferences.model) {
+		return true;
+	}
+	return Boolean(
+		preferences.reasoning &&
+		(preferences.reasoning.effort !== undefined ||
+			preferences.reasoning.enabled !== undefined ||
+			preferences.reasoning.budgetTokens !== undefined)
+	);
+}
+
+/** True when Host AI is active and an existing user with saved personal AI settings has no explicit usePersonalAI choice yet. */
+export function shouldNotifyHostAIDefault(
+	preferences: Pick<
+		Preferences,
+		'provider' | 'model' | 'chatgptAccountId' | 'reasoning' | 'usePersonalAI'
+	>,
+	chatGPT: ChatGPTConnectionSummary
+): boolean {
+	return (
+		Boolean(chatGPT.host) &&
+		preferences.usePersonalAI === undefined &&
+		hasSavedPersonalAIConfig(preferences, chatGPT)
+	);
+}
+
+/** Record and return true once per user when Host AI becomes the default over a saved personal AI configuration. */
+export function consumeHostAIDefaultNotice(options: {
+	userId: string;
+	storage?: Pick<Storage, 'getItem' | 'setItem'> | null;
+	preferences: Pick<
+		Preferences,
+		'provider' | 'model' | 'chatgptAccountId' | 'reasoning' | 'usePersonalAI'
+	>;
+	chatGPT: ChatGPTConnectionSummary;
+}): boolean {
+	if (!options.userId || !shouldNotifyHostAIDefault(options.preferences, options.chatGPT)) {
+		return false;
+	}
+	const key = `flavorithm-host-ai-notice:${options.userId}:v1`;
+	if (!options.storage) {
+		if (fallbackNotifiedUsers.has(options.userId)) return false;
+		fallbackNotifiedUsers.add(options.userId);
+		return true;
+	}
+	try {
+		if (options.storage.getItem(key) === '1') return false;
+		options.storage.setItem(key, '1');
+		return true;
+	} catch {
+		if (fallbackNotifiedUsers.has(options.userId)) return false;
+		fallbackNotifiedUsers.add(options.userId);
+		return true;
 	}
 }
 

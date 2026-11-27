@@ -752,8 +752,13 @@ test('personal preferences survive Host AI cycles, never persist host-chatgpt, a
 
 test('client workflow reconciliation and kitchen state sanitization preserve personal AI preferences and usePersonalAI override', async () => {
 	const { createNewUserState, defaultPreferences } = await import('../src/lib/data.ts');
-	const { entitledChatGPTAccountId, reconcileChatGPTPreferences } =
-		await import('../src/lib/client-workflows.ts');
+	const {
+		consumeHostAIDefaultNotice,
+		entitledChatGPTAccountId,
+		hasSavedPersonalAIConfig,
+		reconcileChatGPTPreferences,
+		shouldNotifyHostAIDefault
+	} = await import('../src/lib/client-workflows.ts');
 	const { sanitizeKitchenState } = await import('../src/lib/guest-storage.ts');
 
 	// 1. reconcileChatGPTPreferences leaves personal provider, model, account, and reasoning intact when Host AI is active.
@@ -834,6 +839,11 @@ test('client workflow reconciliation and kitchen state sanitization preserve per
 	assert.equal(sanitizedOverride.preferences.model, 'claude-sonnet-4');
 	assert.deepEqual(sanitizedOverride.preferences.reasoning, { enabled: true, budgetTokens: 4096 });
 
+	const explicitHostChoiceState = structuredClone(overrideState);
+	explicitHostChoiceState.preferences.usePersonalAI = false;
+	const sanitizedExplicitHost = sanitizeKitchenState(explicitHostChoiceState);
+	assert.equal(sanitizedExplicitHost.preferences.usePersonalAI, false);
+
 	const legacyHostState = createNewUserState();
 	legacyHostState.preferences = {
 		...defaultPreferences,
@@ -846,4 +856,378 @@ test('client workflow reconciliation and kitchen state sanitization preserve per
 	assert.equal(sanitizedLegacy.preferences.chatgptAccountId, undefined);
 	assert.equal(sanitizedLegacy.preferences.model, '');
 	assert.deepEqual(sanitizedLegacy.preferences.reasoning, { effort: 'medium' });
+
+	// 5. Existing users with saved personal AI settings and undefined usePersonalAI get a one-time notice; untouched starter defaults and sanitized host-only state do not.
+	assert.equal(hasSavedPersonalAIConfig(defaultPreferences, hostSummary), false);
+	assert.equal(
+		hasSavedPersonalAIConfig(
+			{ ...defaultPreferences, provider: 'chatgpt', model: '' },
+			{ host: { model: 'gpt-5-codex' }, accounts: [hostSummary.accounts[0]] }
+		),
+		false
+	);
+	assert.equal(hasSavedPersonalAIConfig(personalPrefs, hostSummary), true);
+	assert.equal(shouldNotifyHostAIDefault(defaultPreferences, hostSummary), false);
+	assert.equal(shouldNotifyHostAIDefault(personalPrefs, hostSummary), true);
+	assert.equal(
+		shouldNotifyHostAIDefault({ ...personalPrefs, usePersonalAI: true }, hostSummary),
+		false
+	);
+	assert.equal(
+		shouldNotifyHostAIDefault({ ...personalPrefs, usePersonalAI: false }, hostSummary),
+		false
+	);
+	assert.equal(shouldNotifyHostAIDefault(personalPrefs, { host: null, accounts: [] }), false);
+
+	const store = new Map<string, string>();
+	const memoryStorage = {
+		getItem: (key: string) => store.get(key) ?? null,
+		setItem: (key: string, value: string) => void store.set(key, value)
+	};
+	assert.equal(
+		consumeHostAIDefaultNotice({
+			userId: 'user-existing-1',
+			storage: memoryStorage,
+			preferences: personalPrefs,
+			chatGPT: hostSummary
+		}),
+		true
+	);
+	assert.equal(store.get('flavorithm-host-ai-notice:user-existing-1:v1'), '1');
+	assert.equal(
+		consumeHostAIDefaultNotice({
+			userId: 'user-existing-1',
+			storage: memoryStorage,
+			preferences: personalPrefs,
+			chatGPT: hostSummary
+		}),
+		false
+	);
+});
+
+test('cross-user OAuth ownership negative tests and zero host-identifier leakage in response bodies', async () => {
+	const admin = await db.registerUser(
+		'Host Admin LeakCheck',
+		'host-admin-leak@example.com',
+		'correct horse battery'
+	);
+	const alice = await db.registerUser(
+		'Alice Personal',
+		'alice-personal@example.com',
+		'correct horse battery'
+	);
+	const bob = await db.registerUser(
+		'Bob OtherHousehold',
+		'bob-other@example.com',
+		'correct horse battery'
+	);
+
+	process.env.FLAVORITHM_HOST_ADMIN_USER_ID = admin.user.id;
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'true';
+
+	const hostGrant = storage.saveChatGPTAccount({
+		userId: admin.user.id,
+		mode: 'local',
+		clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+		subject: 'secret-host-subject:secret-host-codex-acct',
+		email: 'secret-host-admin@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'secret-host-access-token',
+			refreshToken: 'secret-host-refresh-token',
+			idToken: 'secret-host-id-token',
+			codexAccountId: 'secret-host-codex-acct'
+		},
+		expiresAt: Date.now() + 3_600_000,
+		earliestRefreshAt: 0
+	});
+	host.configureHostAI(admin.user.id, hostGrant.id, 'gpt-5-codex');
+
+	const aliceGrant = storage.saveChatGPTAccount({
+		userId: alice.user.id,
+		mode: 'local',
+		clientId: 'app_EMoamEEZ73f0CkXaXp7hrann',
+		subject: 'alice-subject:alice-codex-acct',
+		email: 'alice-private@example.com',
+		scopes: ['codex.subscription'],
+		credentials: {
+			accessToken: 'alice-access-token',
+			refreshToken: 'alice-refresh-token',
+			idToken: 'alice-id-token',
+			codexAccountId: 'alice-codex-acct'
+		},
+		expiresAt: Date.now() + 3_600_000,
+		earliestRefreshAt: 0
+	});
+
+	// Even the configured host admin cannot bind another user's OAuth grant as Host AI.
+	assert.throws(
+		() => host.configureHostAI(admin.user.id, aliceGrant.id, 'gpt-5-codex'),
+		/Connect a Codex device-code account first/
+	);
+	assert.equal(host.getHostAI()?.accountId, hostGrant.id);
+
+	const connectionsRoute = await import('../src/routes/api/connections/chatgpt/+server.ts');
+	const modelsRoute = await import('../src/routes/api/models/+server.ts');
+	const aiRoute = await import('../src/routes/api/ai/+server.ts');
+
+	const forbiddenSecrets = [
+		admin.user.id,
+		alice.user.id,
+		hostGrant.id,
+		aliceGrant.id,
+		'secret-host-codex-acct',
+		'secret-host-subject',
+		'secret-host-admin@example.com',
+		'secret-host-access-token',
+		'secret-host-refresh-token',
+		'secret-host-id-token',
+		'alice-codex-acct',
+		'alice-private@example.com',
+		'alice-access-token'
+	];
+
+	const assertNoLeak = (label: string, payloadText: string) => {
+		for (const secret of forbiddenSecrets) {
+			assert.equal(
+				payloadText.includes(secret),
+				false,
+				`Expected ${label} response body not to leak "${secret}"`
+			);
+		}
+	};
+
+	let upstreamCalled = false;
+	const strictNeverFetch: typeof fetch = (async (input: any) => {
+		const url = String(input);
+		if (url === 'https://models.dev/api.json') {
+			return Response.json({});
+		}
+		upstreamCalled = true;
+		throw new Error(`Unexpected upstream call to ${url}`);
+	}) as typeof fetch;
+
+	const origin = 'https://flavorithm.example';
+
+	// 1. Cross-user negative tests: Bob cannot use Alice's personal grant ID or the host admin's real grant ID on /api/ai, /api/models, or /api/connections/chatgpt.
+	for (const foreignAccountId of [aliceGrant.id, hostGrant.id]) {
+		for (const usePersonalAI of [true, undefined]) {
+			const aiProbeRes = await aiRoute.POST({
+				locals: { user: bob.user },
+				fetch: strictNeverFetch,
+				request: new Request(`${origin}/api/ai`, {
+					method: 'POST',
+					headers: { origin, 'content-type': 'application/json' },
+					body: JSON.stringify({
+						action: 'chat',
+						...(usePersonalAI !== undefined ? { usePersonalAI } : {}),
+						provider: 'chatgpt',
+						model: 'gpt-5-codex',
+						connectionId: foreignAccountId,
+						messages: [{ role: 'user', content: 'Probe foreign account' }]
+					})
+				})
+			} as any);
+			assert.equal(aiProbeRes.status, 404);
+			assertNoLeak(`POST /api/ai foreign probe (${foreignAccountId})`, await aiProbeRes.text());
+		}
+
+		const modelsProbeRes = await modelsRoute.GET({
+			locals: { user: bob.user },
+			fetch: strictNeverFetch,
+			url: new URL(
+				`${origin}/api/models?connection=chatgpt&accountId=${encodeURIComponent(foreignAccountId)}`
+			)
+		} as any);
+		assert.equal(modelsProbeRes.status, 404);
+		assertNoLeak(
+			`GET /api/models foreign probe (${foreignAccountId})`,
+			await modelsProbeRes.text()
+		);
+
+		const disconnectProbeRes = await connectionsRoute.POST({
+			locals: { user: bob.user },
+			url: new URL(`${origin}/api/connections/chatgpt`),
+			getClientAddress: () => '127.0.0.1',
+			cookies: { get: () => bob.token },
+			request: new Request(`${origin}/api/connections/chatgpt`, {
+				method: 'POST',
+				headers: { origin, 'content-type': 'application/json' },
+				body: JSON.stringify({ action: 'disconnect', accountId: foreignAccountId })
+			})
+		} as any);
+		assert.equal(disconnectProbeRes.status, 404);
+		assertNoLeak(
+			`POST /api/connections/chatgpt disconnect (${foreignAccountId})`,
+			await disconnectProbeRes.text()
+		);
+	}
+	assert.equal(upstreamCalled, false);
+	// Both grants and Host AI remain intact after Bob's cross-user disconnect attempts.
+	assert.ok(storage.getChatGPTAccount(admin.user.id, hostGrant.id)?.credentialEnvelope);
+	assert.ok(storage.getChatGPTAccount(alice.user.id, aliceGrant.id)?.credentialEnvelope);
+	assert.ok(host.getHostAI());
+
+	// Disconnecting synthetic 'host-chatgpt' as Bob also fails with 404 without affecting Host AI.
+	const disconnectHostAliasRes = await connectionsRoute.POST({
+		locals: { user: bob.user },
+		url: new URL(`${origin}/api/connections/chatgpt`),
+		getClientAddress: () => '127.0.0.1',
+		cookies: { get: () => bob.token },
+		request: new Request(`${origin}/api/connections/chatgpt`, {
+			method: 'POST',
+			headers: { origin, 'content-type': 'application/json' },
+			body: JSON.stringify({ action: 'disconnect', accountId: 'host-chatgpt' })
+		})
+	} as any);
+	assert.equal(disconnectHostAliasRes.status, 404);
+	assertNoLeak(
+		'POST /api/connections/chatgpt disconnect host-chatgpt',
+		await disconnectHostAliasRes.text()
+	);
+	assert.ok(host.getHostAI());
+
+	// 2. No-leak assertions across success & error response bodies while Host AI is shared and active.
+	const connSharedRes = await connectionsRoute.GET({
+		locals: { user: bob.user },
+		url: new URL(`${origin}/api/connections/chatgpt`),
+		getClientAddress: () => '127.0.0.1'
+	} as any);
+	assert.equal(connSharedRes.status, 200);
+	assertNoLeak('GET /api/connections/chatgpt (shared)', await connSharedRes.text());
+
+	const hostFetcher: typeof fetch = (async (input: any) => {
+		const url = String(input);
+		if (url.startsWith('https://chatgpt.com/')) {
+			if (new URL(url).pathname.endsWith('/models')) {
+				return Response.json({
+					models: [
+						{
+							slug: 'gpt-5-codex',
+							display_name: 'GPT-5 Codex',
+							visibility: 'list',
+							input_modalities: ['text', 'image'],
+							supported_reasoning_levels: [{ effort: 'medium' }]
+						}
+					]
+				});
+			}
+			return new Response(
+				'data: ' +
+					JSON.stringify({
+						type: 'response.completed',
+						response: {
+							status: 'completed',
+							output: [
+								{
+									content: [
+										{
+											type: 'output_text',
+											text: JSON.stringify({ reply: 'Safe host answer.', commands: [] })
+										}
+									]
+								}
+							]
+						}
+					}) +
+					'\n\n',
+				{ headers: { 'content-type': 'text/event-stream' } }
+			);
+		}
+		if (url === 'https://models.dev/api.json') {
+			return Response.json({});
+		}
+		throw new Error(`Unexpected fetch URL: ${url}`);
+	}) as typeof fetch;
+
+	const hostModelsRes = await modelsRoute.GET({
+		locals: { user: bob.user },
+		fetch: hostFetcher,
+		url: new URL(`${origin}/api/models?connection=chatgpt&accountId=host-chatgpt`)
+	} as any);
+	assert.equal(hostModelsRes.status, 200);
+	assertNoLeak('GET /api/models (host-chatgpt active)', await hostModelsRes.text());
+
+	const hostChatSuccessRes = await aiRoute.POST({
+		locals: { user: bob.user },
+		fetch: hostFetcher,
+		request: new Request(`${origin}/api/ai`, {
+			method: 'POST',
+			headers: { origin, 'content-type': 'application/json' },
+			body: JSON.stringify({
+				action: 'chat',
+				messages: [{ role: 'user', content: 'Dinner ideas?' }],
+				context: JSON.stringify({
+					recipes: [],
+					meals: [],
+					pantry: [],
+					shopping: [],
+					today: '2026-10-23'
+				})
+			})
+		})
+	} as any);
+	assert.equal(hostChatSuccessRes.status, 200);
+	assertNoLeak('POST /api/ai (host success)', await hostChatSuccessRes.text());
+
+	const failingHostFetcher: typeof fetch = (async () =>
+		new Response(JSON.stringify({ detail: 'Upstream rate limit' }), {
+			status: 429,
+			headers: { 'content-type': 'application/json' }
+		})) as typeof fetch;
+	const hostChatErrorRes = await aiRoute.POST({
+		locals: { user: bob.user },
+		fetch: failingHostFetcher,
+		request: new Request(`${origin}/api/ai`, {
+			method: 'POST',
+			headers: { origin, 'content-type': 'application/json' },
+			body: JSON.stringify({
+				action: 'chat',
+				messages: [{ role: 'user', content: 'Trigger upstream failure' }],
+				context: JSON.stringify({
+					recipes: [],
+					meals: [],
+					pantry: [],
+					shopping: [],
+					today: '2026-10-23'
+				})
+			})
+		})
+	} as any);
+	assert.notEqual(hostChatErrorRes.status, 200);
+	assertNoLeak('POST /api/ai (upstream error)', await hostChatErrorRes.text());
+
+	// 3. When FLAVORITHM_HOST_AI_SHARED is disabled, Bob cannot draw on Host AI and responses still leak zero host identifiers.
+	process.env.FLAVORITHM_HOST_AI_SHARED = 'false';
+	const connUnsharedRes = await connectionsRoute.GET({
+		locals: { user: bob.user },
+		url: new URL(`${origin}/api/connections/chatgpt`),
+		getClientAddress: () => '127.0.0.1'
+	} as any);
+	assert.equal(connUnsharedRes.status, 200);
+	assertNoLeak('GET /api/connections/chatgpt (unshared)', await connUnsharedRes.text());
+
+	const unsharedAiRes = await aiRoute.POST({
+		locals: { user: bob.user },
+		fetch: strictNeverFetch,
+		request: new Request(`${origin}/api/ai`, {
+			method: 'POST',
+			headers: { origin, 'content-type': 'application/json' },
+			body: JSON.stringify({
+				action: 'chat',
+				connectionId: 'host-chatgpt',
+				provider: 'chatgpt',
+				model: 'gpt-5-codex',
+				messages: [{ role: 'user', content: 'Attempt unshared host AI' }]
+			})
+		})
+	} as any);
+	assert.equal(unsharedAiRes.status, 400);
+	assertNoLeak('POST /api/ai (unshared host-chatgpt)', await unsharedAiRes.text());
+
+	assertNoLeak('GET /api/state (bob)', JSON.stringify(db.getState(bob.user)));
+
+	host.configureHostAI(admin.user.id);
+	delete process.env.FLAVORITHM_HOST_ADMIN_USER_ID;
+	delete process.env.FLAVORITHM_HOST_AI_SHARED;
 });
