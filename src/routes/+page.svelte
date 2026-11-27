@@ -156,7 +156,12 @@
 	import { applyRecipeRating } from '#lib/recipe-detail.ts';
 	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
 	import ButlerChat from '#lib/components/ButlerChat.svelte';
-	import { applyButlerCommands } from '#lib/butler.ts';
+	import { applyButlerCommands, type ButlerCommand } from '#lib/butler.ts';
+	import {
+		reconcileButlerUndoViews,
+		resolveButlerControlTarget,
+		type ButlerExportKind
+	} from '#lib/butler-actions.ts';
 	import {
 		BUTLER_HISTORY_LIMIT,
 		pairButlerHistory,
@@ -372,6 +377,8 @@
 		confirmJoin: 'Replace personal kitchen',
 		removeMember: 'Remove household member',
 		leave: 'Leave household',
+		signOut: 'Sign out',
+		export: 'Export data',
 		delete: 'Delete account',
 		recover: 'Recover your account',
 		reset: 'Reset password',
@@ -671,6 +678,7 @@
 	let editingShoppingDraft = $state<(ShoppingItemDraft & { id: string }) | null>(null);
 	let editingShoppingSnapshot = $state<ShoppingItemSnapshot | null>(null);
 	let deletePassword = $state('');
+	let pendingExport = $state<ButlerExportKind | null>(null);
 	let resetToken = $state('');
 	let mealDateError = $derived(
 		formSubmitted && (modal === 'plan' || modal === 'editMeal') ? validateMealDate(mealDate) : ''
@@ -2636,6 +2644,8 @@
 		const result = applyButlerCommands(JSON.parse(JSON.stringify(kitchen)), commands);
 		kitchen = result.state;
 		pruneEditingShoppingState();
+		const appliedKitchen = JSON.parse(JSON.stringify(kitchen)) as AppState;
+		let requiresConfirmation = false;
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
@@ -2659,20 +2669,83 @@
 				}
 			} else if (effect.type === 'ui') {
 				butlerChat?.close();
-				openButlerControl(effect.action);
+				if (openButlerControl(effect.action)) requiresConfirmation = true;
 			}
 		}
 		const appliedSnapshot = JSON.stringify(kitchen);
-		notify('Basil’s changes applied.', () => {
-			if (JSON.stringify(kitchen) === appliedSnapshot) {
+		if (appliedSnapshot !== expectedSnapshot) {
+			notify('Basil’s changes applied.', () => {
+				if (JSON.stringify(kitchen) !== appliedSnapshot) {
+					notify('Your kitchen changed again. Review the current values before editing.');
+					return;
+				}
+				const cleanup = reconcileButlerUndoViews(
+					previousKitchen,
+					appliedKitchen,
+					{
+						selectedId: selected?.id,
+						editingRecipeId: editingRecipe?.id,
+						editingRecipeMode,
+						recipeToDeleteId: recipeToDelete?.id,
+						modal,
+						cookingMealId,
+						editingMealId,
+						editingPantryId: pantryDraft?.id,
+						editingShoppingId
+					},
+					result.effects
+				);
 				kitchen = previousKitchen;
 				pruneEditingShoppingState();
-			} else notify('Your kitchen changed again. Review the current values before editing.');
-		});
+				if (cleanup.closeSelected) {
+					selected = null;
+					selectedMealServings = undefined;
+				}
+				if (cleanup.closeEditor) {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}
+				if (cleanup.clearRecipeToDelete) recipeToDelete = null;
+				if (cleanup.clearCookingMeal) cookingMealId = '';
+				if (cleanup.clearEditingMeal) editingMealId = '';
+				if (cleanup.clearEditingPantry) pantryDraft = null;
+				if (cleanup.clearEditingShopping) clearEditingShoppingState();
+				if (cleanup.closeModal) modal = '';
+				const sessionPrefix = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}:`;
+				for (const recipeId of cleanup.revertedRecipeIds) {
+					if (!previousKitchen.recipes.some((item) => item.id === recipeId))
+						delete cookingSteps[`${sessionPrefix}${recipeId}`];
+				}
+			});
+		} else {
+			notify(requiresConfirmation ? 'Confirm this action to continue.' : 'Opened in your kitchen.');
+		}
 		return appliedSnapshot;
 	}
-	function openButlerControl(target: string) {
-		switch (target) {
+	function openButlerControl(target: Extract<ButlerCommand, { type: 'ui' }>['action']): boolean {
+		const resolution = resolveButlerControlTarget(target);
+		if (resolution.kind === 'confirm-sign-out') {
+			error = '';
+			modal = 'signOut';
+			return true;
+		}
+		if (resolution.kind === 'confirm-export') {
+			pendingExport = resolution.exportKind;
+			error = '';
+			modal = 'export';
+			return true;
+		}
+		if (resolution.kind === 'confirm-delete-account') {
+			error = '';
+			if (!managedAuth) modal = 'delete';
+			else void openSettings();
+			return true;
+		}
+		if (resolution.kind === 'confirm-leave-household') {
+			void openLeaveHousehold();
+			return true;
+		}
+		switch (resolution.target) {
 			case 'settings':
 				if (modal === 'pantry' || modal === 'import') resumeDialog = modal;
 				void openSettings();
@@ -2701,27 +2774,8 @@
 			case 'join-household':
 				void household();
 				break;
-			case 'export-kitchen':
-				void exportKitchen();
-				break;
-			case 'export-shopping':
-				void exportList();
-				break;
-			case 'export-pending':
-				exportPendingChanges();
-				break;
 			case 'sign-in':
 				openAuthentication();
-				break;
-			case 'sign-out':
-				void logout();
-				break;
-			case 'delete-account':
-				if (!managedAuth) modal = 'delete';
-				else void openSettings();
-				break;
-			case 'leave-household':
-				void openLeaveHousehold();
 				break;
 			case 'scan':
 				if (!scanBusy && !busy && !voiceBusy) imageInput?.click();
@@ -2743,6 +2797,28 @@
 			case 'taste':
 				modal = 'taste';
 				break;
+		}
+		return false;
+	}
+	function hasPendingExportData(): boolean {
+		return (
+			pendingSync ||
+			conflicts.length > 0 ||
+			Boolean(kitchenSync?.snapshot()) ||
+			Boolean(kitchenSync?.quarantined().length)
+		);
+	}
+	async function confirmPendingExport() {
+		const kind = pendingExport;
+		if (!kind) return;
+		pendingExport = null;
+		modal = '';
+		error = '';
+		if (kind === 'kitchen') await exportKitchen();
+		else if (kind === 'shopping') downloadShoppingList();
+		else if (kind === 'pending') {
+			if (hasPendingExportData()) await exportKitchen();
+			else notify('There are no pending changes to export.');
 		}
 	}
 
@@ -3936,6 +4012,7 @@
 			resetMealDialogState();
 		}
 		if (modal === 'deleteRecipe') recipeToDelete = null;
+		if (modal === 'export') pendingExport = null;
 		if (modal === 'removeMember') memberToRemove = null;
 		if (modal === 'household') {
 			inviteCode = '';
@@ -4309,11 +4386,17 @@
 		}
 	}
 
-	async function exportList() {
-		if (!kitchen.shopping.length) return;
-		const text = kitchen.shopping
+	function formatShoppingListText() {
+		return kitchen.shopping
 			.map((i) => `${i.checked ? '✓' : '☐'} ${i.quantity} ${i.unit} ${i.name}`)
 			.join('\n');
+	}
+	function downloadShoppingList() {
+		download(formatShoppingListText(), 'flavorithm-shopping.txt', 'text/plain');
+	}
+	async function exportList() {
+		if (!kitchen.shopping.length) return;
+		const text = formatShoppingListText();
 		const shareData = { title: 'Shopping list', text };
 		if (
 			typeof navigator.share === 'function' &&
@@ -6231,6 +6314,68 @@
 							disabled={busy || householdBusy}
 							onclick={leaveHousehold}
 							>{busy || householdBusy ? 'Leaving…' : 'Leave household'}</button
+						>
+					</div>
+				{:else if modal === 'signOut'}
+					<h2>Sign out of your kitchen?</h2>
+					{#if user && (!managedAuth || providerLogoutUrl)}
+						<p class="muted">
+							Pending kitchen changes will sync before your session ends on this device.
+						</p>
+						{#if error}<p class="error" role="alert">{error}</p>{/if}
+						<div class="dialog-actions">
+							<button class="secondary" onclick={closeDialog} disabled={syncing}
+								>Stay signed in</button
+							><button class="primary danger-action" onclick={logout} disabled={syncing}
+								><LogOut size={16} /> Sign out</button
+							>
+						</div>
+					{:else if user && managedAuth}
+						<p class="muted">Sign-out is managed by your organization's access proxy.</p>
+						<div class="dialog-actions">
+							<button class="secondary" onclick={closeDialog}>Close</button>
+						</div>
+					{:else}
+						<p class="muted">You are already signed out on this device.</p>
+						<div class="dialog-actions">
+							<button class="secondary" onclick={closeDialog}>Close</button>
+						</div>
+					{/if}
+				{:else if modal === 'export'}
+					{@const hasPendingChanges = hasPendingExportData()}
+					<h2>
+						{pendingExport === 'shopping'
+							? 'Export shopping list?'
+							: pendingExport === 'pending'
+								? 'Export pending changes?'
+								: 'Export kitchen data?'}
+					</h2>
+					<p class="muted">
+						{#if pendingExport === 'shopping'}
+							Download your current shopping list ({kitchen.shopping.length} item{kitchen.shopping
+								.length === 1
+								? ''
+								: 's'}) as plain text (<code>flavorithm-shopping.txt</code>).
+						{:else if pendingExport === 'pending'}
+							{hasPendingChanges
+								? 'Download a JSON backup including your unsynced local kitchen changes (flavorithm-kitchen.json).'
+								: 'There are no unsynced pending changes to export right now.'}
+						{:else}
+							Download a JSON backup of your account, recipes, pantry, meal plan, and shopping list
+							(<code>flavorithm-kitchen.json</code>).
+						{/if}
+					</p>
+					<div class="dialog-actions">
+						<button class="secondary" onclick={closeDialog}>Cancel</button><button
+							class="primary"
+							disabled={exporting || (pendingExport === 'pending' && !hasPendingChanges)}
+							onclick={confirmPendingExport}
+							><Download size={16} />
+							{pendingExport === 'shopping'
+								? 'Export shopping list'
+								: pendingExport === 'pending'
+									? 'Export pending changes'
+									: 'Export kitchen data'}</button
 						>
 					</div>
 				{:else if modal === 'delete' && !managedAuth}

@@ -11,12 +11,13 @@
 		Trash2,
 		Pencil,
 		ArrowRight,
+		LogOut,
+		Download,
 		Pause
 	} from '@lucide/svelte';
 	import BasilAvatar from './BasilAvatar.svelte';
 	import ChatMarkdown from './ChatMarkdown.svelte';
 	import { transitionButlerOwner } from '#lib/ai-continuation.ts';
-	import { previewButlerCommand } from '#lib/butler-actions.ts';
 	import {
 		createButlerChat,
 		type ButlerChatAction as Action,
@@ -258,7 +259,7 @@
 			if (message.snapshot !== JSON.stringify(kitchen))
 				throw new Error('Your kitchen changed. Ask Basil for an updated proposal.');
 			const snapshot = await apply(action.commands, message.snapshot);
-			if (!chat.alive || token !== chat.generation) return;
+			if (!chat.alive || token !== chat.generation || activeOwner !== owner) return;
 			message.snapshot = snapshot;
 			const savedIds = action.commands.flatMap((command) =>
 				command.type === 'recipe.upsert' ? [command.recipe.id] : []
@@ -272,9 +273,6 @@
 		} finally {
 			if (chat.alive && token === chat.generation) applying = '';
 		}
-	}
-	function preview(command: unknown, batch: unknown[] = []): string {
-		return previewButlerCommand(command, kitchen, batch);
 	}
 </script>
 
@@ -390,10 +388,7 @@
 											role="region"
 											aria-label={labels?.details ?? `${action.title} details`}
 										>
-											{#each action.commands as command}<pre>{preview(
-														command,
-														action.commands
-													)}</pre>{/each}
+											{#each action.details as detail}<pre>{detail}</pre>{/each}
 										</div>
 									</details>
 									{#if action.status === 'pending'}
@@ -407,7 +402,11 @@
 												{#if applying === `${message.id}:${action.id}`}<LoaderCircle
 														size={15}
 														class="spin"
+													/>{:else if action.label === 'Sign out' || action.label === 'Leave household'}<LogOut
+														size={14}
 													/>{:else if action.destructive}<Trash2
+														size={14}
+													/>{:else if action.label.startsWith('Export')}<Download
 														size={14}
 													/>{:else if action.label.startsWith('Add')}<Plus
 														size={14}

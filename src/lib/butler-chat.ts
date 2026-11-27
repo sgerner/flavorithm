@@ -1,4 +1,8 @@
-import { buildButlerActions, type ButlerAction } from './butler-actions.ts';
+import {
+	buildButlerActions,
+	formatButlerHistoryContent,
+	type ButlerAction
+} from './butler-actions.ts';
 import type { AppState, Recipe } from './types.ts';
 
 export type ButlerTurn = { role: 'user' | 'assistant'; content: string };
@@ -20,21 +24,16 @@ export const BUTLER_TIMEOUT_MESSAGE = 'Basil took too long to respond. Please tr
 /**
  * Cap history at 20 turns (10 completed user -> assistant pairs). Every chat request
  * already supplies the current kitchen state and recipeDrafts in `context` alongside
- * `[User applied: ...]` annotations, so 10 exchanges preserve iterative refinement
- * continuity while keeping token cost and latency bounded well inside `/api/ai`'s
- * 40-message schema limit.
+ * `[User applied: ...]` / `[User opened: ...]` annotations, so 10 exchanges preserve
+ * iterative refinement continuity while keeping token cost and latency bounded well
+ * inside `/api/ai`'s 40-message schema limit.
  */
 export const BUTLER_HISTORY_LIMIT = 20;
 
 export function formatButlerMessage(
 	message: Pick<ButlerChatMessage, 'content' | 'actions'>
 ): string {
-	const applied = message.actions
-		?.filter((action) => action.status === 'applied')
-		.map((action) => action.title);
-	return applied?.length
-		? `${message.content}\n\n[User applied: ${applied.join('; ')}]`
-		: message.content;
+	return formatButlerHistoryContent(message);
 }
 
 /** Build chat history strictly from completed user -> assistant turn pairs. */

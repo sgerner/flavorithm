@@ -10,6 +10,7 @@ import * as svelte from 'svelte';
 import * as svelteAnimate from 'svelte/animate';
 import * as aiConnectionsMod from '../src/lib/ai-connections.ts';
 import * as aiContinuationMod from '../src/lib/ai-continuation.ts';
+import * as butlerActionsMod from '../src/lib/butler-actions.ts';
 import * as butlerMod from '../src/lib/butler.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
@@ -98,6 +99,48 @@ function injectPlannerHook(svelteSource: string): string {
 			kitchen.preferences.ratings = { ...(kitchen.preferences.ratings ?? {}), [recipe.id]: rating };
 			kitchen.recipes = [...kitchen.recipes];
 		},
+		get modal() { return modal; },
+		set modal(value: string) { modal = value; },
+		get pendingExport() { return pendingExport; },
+		set pendingExport(value: 'kitchen' | 'shopping' | 'pending' | null) { pendingExport = value; },
+		get toast() { return toast; },
+		get toastUndo() { return toastUndo; },
+		get selected() { return selected; },
+		set selected(value: Recipe | null) { selected = value; },
+		get editingRecipe() { return editingRecipe; },
+		set editingRecipe(value: Recipe | null) { editingRecipe = value; },
+		get editingRecipeMode() { return editingRecipeMode; },
+		set editingRecipeMode(value: 'create' | 'edit') { editingRecipeMode = value; },
+		get pendingSync() { return pendingSync; },
+		set pendingSync(value: boolean) { pendingSync = value; },
+		setPendingSyncSnapshot: (localState: AppState | null) => {
+			const plainLocal = localState ? (JSON.parse(JSON.stringify(localState)) as AppState) : null;
+			kitchenSync = plainLocal
+				? ({
+						snapshot: () => ({
+							userId: user?.id ?? 'u-1',
+							householdId: user?.householdId ?? 'h-1',
+							local: plainLocal,
+							base: createNewUserState(),
+							etag: 'etag-1',
+							updatedAt: '2026-11-24T12:00:00.000Z'
+						}),
+						clearContext: () => {},
+						quarantined: () => [],
+						stage: () => {},
+						flush: async () => {}
+					} as any)
+				: null;
+		},
+		setApiKey: (value: string) => {
+			apiKey = value;
+		},
+		askButler,
+		applyButler,
+		openButlerControl,
+		confirmPendingExport,
+		openNewRecipe,
+		closeDialog,
 		logout,
 		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
@@ -107,7 +150,6 @@ function injectPlannerHook(svelteSource: string): string {
 		setPantryDraftQuantity: (value: string) => {
 			if (pantryDraft) pantryDraft.quantity = value;
 		},
-		get toast() { return toast; },
 		get toastActionLabel() { return toastActionLabel; },
 		get online() { return online; },
 		set online(value: boolean) { online = value; },
@@ -192,6 +234,29 @@ type PlannerHarnessApi = {
 	setPlannedDraft: (date: string, slot: string, servings: number) => void;
 	useLeftovers: (meal: Meal) => void;
 	rateRecipe: (recipe: Recipe, rating: number) => void;
+	modal: string;
+	pendingExport: 'kitchen' | 'shopping' | 'pending' | null;
+	readonly toast: string;
+	readonly toastUndo: (() => void) | null;
+	selected: Recipe | null;
+	editingRecipe: Recipe | null;
+	editingRecipeMode: 'create' | 'edit';
+	pendingSync: boolean;
+	setPendingSyncSnapshot: (localState: AppState | null) => void;
+	setApiKey: (value: string) => void;
+	askButler: (
+		message: string,
+		history: butlerChatMod.ButlerTurn[],
+		signal?: AbortSignal,
+		recipeDrafts?: Recipe[]
+	) => Promise<butlerChatMod.ButlerChatResult | null>;
+	applyButler: (commands: unknown[], expectedSnapshot: string) => string;
+	openButlerControl: (
+		target: Extract<butlerMod.ButlerCommand, { type: 'ui' }>['action']
+	) => boolean;
+	confirmPendingExport: () => Promise<void>;
+	openNewRecipe: () => void;
+	closeDialog: () => void;
 	logout: () => Promise<void>;
 	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
@@ -199,7 +264,6 @@ type PlannerHarnessApi = {
 	exportPendingChanges: () => void;
 	startPantryEdit: (item: AppState['pantry'][number]) => Promise<void>;
 	setPantryDraftQuantity: (value: string) => void;
-	readonly toast: string;
 	readonly toastActionLabel: string;
 	online: boolean;
 	ready: boolean;
@@ -222,7 +286,7 @@ function createModuleMap() {
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
 		'#lib/form-validation.ts': formValidationMod,
-		'#lib/components/FormField.svelte': { default: noopComponent },
+		'#lib/components/FormField.svelte': { __esModule: true, default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -242,6 +306,7 @@ function createModuleMap() {
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-actions.ts': butlerActionsMod,
 		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
@@ -252,13 +317,14 @@ function createModuleMap() {
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/state-schema.ts': stateSchemaMod,
-		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
-		'#lib/components/ButlerChat.svelte': { default: noopComponent },
-		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
-		'#lib/components/SyncStatus.svelte': { default: noopComponent },
-		'#lib/components/AIConnection.svelte': { default: noopComponent },
-		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
+		'#lib/components/RecipeDetail.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ButlerChat.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/RecipeEditor.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/SyncStatus.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/AIConnection.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/VoiceSettings.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
+			__esModule: true,
 			default: noopComponent,
 			emptyImportSession: importSessionMod.emptyImportSession
 		}
@@ -376,52 +442,74 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 	const assignedUrls: string[] = [];
 	const downloads: Array<{ filename: string; content: string; type: string }> = [];
 	const blobUrls = new Map<string, { content: string; type: string }>();
+	let blobSeq = 0;
+	const aiRequests: Record<string, unknown>[] = [];
+	let aiResponse: butlerChatMod.ButlerChatResult = { reply: 'Ready.', commands: [] };
 	const storage = makeMemoryStorage();
 	const navigatorState = { onLine: options?.onLine ?? true };
 	let fetchImpl: typeof fetch =
 		options?.fetch ??
-		(async () =>
-			new Response(JSON.stringify({ ok: true }), {
+		(async (input: unknown, init?: RequestInit) => {
+			const path = String(input);
+			if (path === '/api/export') {
+				return new Response(
+					JSON.stringify({
+						exportedAt: '2026-11-24T18:00:00.000Z',
+						user: api?.user ?? undefined,
+						state: api ? JSON.parse(JSON.stringify(api.kitchen)) : dataMod.createNewUserState()
+					}),
+					{
+						status: 200,
+						headers: { 'content-type': 'application/json' }
+					}
+				);
+			}
+			if (path === '/api/ai') {
+				if (typeof init?.body === 'string') {
+					aiRequests.push(JSON.parse(init.body) as Record<string, unknown>);
+				}
+				return new Response(JSON.stringify(aiResponse), {
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				});
+			}
+			return new Response(JSON.stringify({ ok: true }), {
 				status: 200,
 				headers: { 'content-type': 'application/json' }
-			}));
-	const customUrl = Object.assign(
-		function URLProxy(input: string | URL, base?: string | URL) {
-			return new URL(input, base);
-		},
-		{
-			createObjectURL: (blob: Blob) => {
-				const token = `blob:test-${blobUrls.size + 1}`;
-				blobUrls.set(token, { content: '', type: blob.type });
-				void blob.text().then((text) => {
-					const existing = blobUrls.get(token);
-					if (existing) existing.content = text;
-				});
-				return token;
-			},
-			revokeObjectURL: () => {}
-		}
-	);
+			});
+		});
 	class RecordedBlob {
 		readonly textContent: string;
 		readonly type: string;
-		constructor(parts: Array<string>, init?: { type?: string }) {
-			this.textContent = parts.join('');
+		constructor(parts: Array<unknown> = [], init?: { type?: string }) {
+			this.textContent = parts.map((part) => String(part)).join('');
 			this.type = init?.type ?? '';
 		}
 		async text() {
 			return this.textContent;
 		}
 	}
-	customUrl.createObjectURL = (blob: unknown) => {
-		const token = `blob:test-${blobUrls.size + 1}`;
-		const recorded = blob as RecordedBlob;
-		blobUrls.set(token, {
-			content: typeof recorded?.textContent === 'string' ? recorded.textContent : '',
-			type: typeof recorded?.type === 'string' ? recorded.type : ''
-		});
-		return token;
-	};
+	const customUrl = Object.assign(
+		function URLProxy(input: string | URL, base?: string | URL) {
+			return new URL(input, base);
+		},
+		{
+			canParse: URL.canParse?.bind(URL),
+			parse: URL.parse?.bind(URL),
+			createObjectURL: (blob: unknown) => {
+				const token = `blob:test-${++blobSeq}`;
+				const recorded = blob as RecordedBlob;
+				blobUrls.set(token, {
+					content: typeof recorded?.textContent === 'string' ? recorded.textContent : '',
+					type: typeof recorded?.type === 'string' ? recorded.type : ''
+				});
+				return token;
+			},
+			revokeObjectURL: (url: string) => {
+				blobUrls.delete(url);
+			}
+		}
+	);
 	const sandbox: Record<string, unknown> = {
 		exports,
 		require: (id: string) => {
@@ -506,6 +594,10 @@ function createReactivePlanner(options?: { fetch?: typeof fetch; onLine?: boolea
 		api,
 		assignedUrls,
 		downloads,
+		aiRequests,
+		setAiResponse: (next: butlerChatMod.ButlerChatResult) => {
+			aiResponse = next;
+		},
 		navigatorState,
 		setFetch: (next: typeof fetch) => {
 			fetchImpl = next;
@@ -1094,6 +1186,346 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('Butler sign-out modal, export confirmation modal, and undo-toast presence render accurately in +page.svelte', () => {
+	// 1. Sign-out modal for signed-in local user
+	const signedInSignOut = renderPlannerHtml((planner) => {
+		planner.user = {
+			id: 'u-local',
+			name: 'Alex',
+			email: 'alex@example.test',
+			householdId: 'h-local'
+		};
+		planner.runtimeAuthMode = 'local';
+		planner.applyButler([{ type: 'ui', action: 'sign-out' }], JSON.stringify(planner.kitchen));
+	});
+	assert.equal(signedInSignOut.api.modal, 'signOut');
+	assert.equal(signedInSignOut.api.toastUndo, null);
+	assert.match(signedInSignOut.html, /Sign out of your kitchen\?/);
+	assert.match(signedInSignOut.html, />Stay signed in<\/button>/);
+	assert.match(signedInSignOut.html, /Sign out<\/button>/);
+	assert.doesNotMatch(signedInSignOut.html, />Undo<\/button>/);
+
+	// 2. Sign-out modal for managed proxy user without logout URL and signed-out guest
+	const proxySignOut = renderPlannerHtml((planner) => {
+		planner.user = {
+			id: 'u-proxy',
+			name: 'Pat',
+			email: 'pat@example.test',
+			householdId: 'h-proxy'
+		};
+		planner.runtimeAuthMode = 'proxy';
+		planner.runtimeLogoutUrl = null;
+		planner.modal = 'signOut';
+	});
+	assert.match(proxySignOut.html, /Sign-out is managed by your organization's access proxy\./);
+
+	const guestSignOut = renderPlannerHtml((planner) => {
+		planner.user = null;
+		planner.modal = 'signOut';
+	});
+	assert.match(guestSignOut.html, /You are already signed out on this device\./);
+
+	// 3. Export modal across shopping, kitchen, and pending (disabled vs enabled)
+	const shoppingExport = renderPlannerHtml((planner) => {
+		planner.kitchen.shopping = [
+			{ id: 's-1', name: 'Lemons', quantity: 3, unit: 'each', checked: false }
+		];
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-shopping' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.equal(shoppingExport.api.modal, 'export');
+	assert.equal(shoppingExport.api.pendingExport, 'shopping');
+	assert.equal(shoppingExport.api.toastUndo, null);
+	assert.match(shoppingExport.html, /Export shopping list\?/);
+	assert.match(shoppingExport.html, /flavorithm-shopping\.txt/);
+	assert.doesNotMatch(shoppingExport.html, />Undo<\/button>/);
+
+	const kitchenExport = renderPlannerHtml((planner) => {
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-kitchen' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.equal(kitchenExport.api.modal, 'export');
+	assert.equal(kitchenExport.api.pendingExport, 'kitchen');
+	assert.match(kitchenExport.html, /Export kitchen data\?/);
+	assert.match(kitchenExport.html, /flavorithm-kitchen\.json/);
+
+	const emptyPendingExport = renderPlannerHtml((planner) => {
+		planner.pendingSync = false;
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-pending' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.match(
+		emptyPendingExport.html,
+		/There are no unsynced pending changes to export right now\./
+	);
+	const emptyPendingDialog = emptyPendingExport.html.slice(
+		emptyPendingExport.html.indexOf('aria-label="Export data"')
+	);
+	assert.equal(emptyPendingDialog.includes('<button class="primary" disabled'), true);
+	assert.equal(emptyPendingDialog.includes('Export pending changes</button>'), true);
+
+	const activePendingExport = renderPlannerHtml((planner) => {
+		planner.pendingSync = true;
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-pending' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.match(activePendingExport.html, /flavorithm-kitchen\.json/);
+	const activePendingDialog = activePendingExport.html.slice(
+		activePendingExport.html.indexOf('aria-label="Export data"')
+	);
+	assert.equal(activePendingDialog.includes('<button class="primary" disabled'), false);
+	assert.equal(activePendingDialog.includes('Export pending changes</button>'), true);
+
+	const snapshotPendingExport = renderPlannerHtml((planner) => {
+		planner.pendingSync = false;
+		planner.setPendingSyncSnapshot(planner.kitchen);
+		planner.applyButler(
+			[{ type: 'ui', action: 'export-pending' }],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	const snapshotPendingDialog = snapshotPendingExport.html.slice(
+		snapshotPendingExport.html.indexOf('aria-label="Export data"')
+	);
+	assert.equal(snapshotPendingDialog.includes('<button class="primary" disabled'), false);
+	assert.equal(snapshotPendingDialog.includes('Export pending changes</button>'), true);
+
+	// 4. Undo-toast presence: mutation shows Undo button, navigation omits Undo button
+	const mutationRender = renderPlannerHtml((planner) => {
+		planner.applyButler(
+			[
+				{
+					type: 'pantry.upsert',
+					item: { id: 'p-salt', name: 'Kosher salt', quantity: 1, unit: 'box', category: 'Spices' }
+				}
+			],
+			JSON.stringify(planner.kitchen)
+		);
+	});
+	assert.equal(typeof mutationRender.api.toastUndo, 'function');
+	assert.match(mutationRender.html, /Basil’s changes applied\./);
+	assert.match(mutationRender.html, />Undo<\/button>/);
+
+	const navRender = renderPlannerHtml((planner) => {
+		planner.applyButler([{ type: 'navigate', page: 'shopping' }], JSON.stringify(planner.kitchen));
+	});
+	assert.equal(navRender.api.toastUndo, null);
+	assert.match(navRender.html, /Opened in your kitchen\./);
+	assert.doesNotMatch(navRender.html, />Undo<\/button>/);
+});
+
+test('applyButler gates sign-out and confirmPendingExport downloads and preserves create-mode recipe drafts on undo', async () => {
+	const harness = createReactivePlanner();
+	try {
+		const { api, downloads } = harness;
+		api.kitchen = {
+			...dataMod.createNewUserState(),
+			recipes: [makeRecipe('r-existing', 'Existing Soup')],
+			shopping: [{ id: 'shop-milk', name: 'Milk', quantity: 2, unit: 'L', checked: false }]
+		};
+		api.user = {
+			id: 'u-1',
+			name: 'Alex',
+			email: 'alex@example.test',
+			householdId: 'h-1'
+		};
+
+		// Sign-out UI command opens confirmation modal without ending the session or offering Undo.
+		api.applyButler([{ type: 'ui', action: 'sign-out' }], JSON.stringify(api.kitchen));
+		assert.equal(api.modal, 'signOut');
+		assert.equal(api.user?.id, 'u-1');
+		assert.equal(api.toast, 'Confirm this action to continue.');
+		assert.equal(api.toastUndo, null);
+		api.closeDialog();
+		assert.equal(api.modal, '');
+
+		// Export shopping opens confirmation modal without downloading until confirmPendingExport runs.
+		api.applyButler([{ type: 'ui', action: 'export-shopping' }], JSON.stringify(api.kitchen));
+		assert.equal(api.modal, 'export');
+		assert.equal(api.pendingExport, 'shopping');
+		assert.equal(downloads.length, 0);
+		await api.confirmPendingExport();
+		assert.equal(api.modal, '');
+		assert.equal(api.pendingExport, null);
+		assert.equal(downloads.length, 1);
+		assert.equal(downloads[0].filename, 'flavorithm-shopping.txt');
+		assert.match(downloads[0].content, /☐ 2 L Milk/);
+
+		// Export kitchen fetches /api/export only upon confirmation.
+		api.applyButler([{ type: 'ui', action: 'export-kitchen' }], JSON.stringify(api.kitchen));
+		assert.equal(api.modal, 'export');
+		assert.equal(api.pendingExport, 'kitchen');
+		assert.equal(downloads.length, 1);
+		await api.confirmPendingExport();
+		assert.equal(downloads.length, 2);
+		assert.equal(downloads[1].filename, 'flavorithm-kitchen.json');
+		assert.equal(JSON.parse(downloads[1].content).source, 'account');
+
+		// Export pending downloads staged local state when present, and notifies when absent.
+		api.setPendingSyncSnapshot(api.kitchen);
+		api.applyButler([{ type: 'ui', action: 'export-pending' }], JSON.stringify(api.kitchen));
+		await api.confirmPendingExport();
+		assert.equal(downloads.length, 3);
+		assert.equal(downloads[2].filename, 'flavorithm-kitchen.json');
+		assert.equal(JSON.parse(downloads[2].content).hasPendingChanges, true);
+
+		api.setPendingSyncSnapshot(null);
+		api.pendingSync = false;
+		api.pendingExport = 'pending';
+		await api.confirmPendingExport();
+		assert.equal(downloads.length, 3);
+		assert.equal(api.toast, 'There are no pending changes to export.');
+
+		// Open a create-mode recipe editor draft, edit its title, apply an unrelated Basil mutation, and undo.
+		api.openNewRecipe();
+		assert.equal(api.editingRecipeMode, 'create');
+		assert.ok(api.editingRecipe);
+		const draftId = api.editingRecipe.id;
+		api.editingRecipe.title = 'My Unsaved Focaccia Draft';
+
+		api.applyButler(
+			[
+				{
+					type: 'pantry.upsert',
+					item: {
+						id: 'p-rosemary',
+						name: 'Rosemary',
+						quantity: 2,
+						unit: 'sprigs',
+						category: 'Produce'
+					}
+				}
+			],
+			JSON.stringify(api.kitchen)
+		);
+		assert.equal(api.kitchen.pantry.length, 1);
+		assert.equal(api.toast, 'Basil’s changes applied.');
+		assert.equal(typeof api.toastUndo, 'function');
+
+		api.toastUndo!();
+		assert.equal(api.kitchen.pantry.length, 0);
+		assert.equal(api.editingRecipeMode, 'create');
+		assert.equal(api.editingRecipe?.id, draftId);
+		assert.equal(api.editingRecipe?.title, 'My Unsaved Focaccia Draft');
+
+		// Conversely, undoing a compound recipe upsert + open closes the newly created recipe view.
+		const createdRecipe = { ...makeRecipe('r-basil-new', 'Basil Risotto'), image: '' };
+		api.applyButler(
+			[
+				{ type: 'recipe.upsert', recipe: createdRecipe },
+				{ type: 'recipe.open', id: createdRecipe.id, mode: 'edit' }
+			],
+			JSON.stringify(api.kitchen)
+		);
+		assert.equal(api.editingRecipeMode, 'edit');
+		assert.equal(api.editingRecipe?.id, createdRecipe.id);
+		assert.equal(typeof api.toastUndo, 'function');
+
+		api.toastUndo!();
+		assert.equal(
+			api.kitchen.recipes.some((item) => item.id === createdRecipe.id),
+			false
+		);
+		assert.equal(api.editingRecipe, null);
+
+		// Verify createButlerChat + askButler controller integration preserves droppedCommands warnings,
+		// frozen details, and split [User applied]/[User opened] paired history.
+		api.kitchen.preferences.usePersonalAI = true;
+		api.kitchen.preferences.provider = 'openai';
+		api.kitchen.preferences.model = 'gpt-4.1-mini';
+		api.setApiKey('sk-test-key');
+
+		let chatDraft = '';
+		let chatMessages: butlerChatMod.ButlerChatMessage[] = [];
+		let chatDrafts: Recipe[] = [];
+		let chatBusy = false;
+		let chatError = '';
+		let chatFailedPrompt = '';
+		const controller = butlerChatMod.createButlerChat({
+			getKitchen: () => JSON.parse(JSON.stringify(api.kitchen)) as AppState,
+			getOwner: () => `${api.user?.id ?? ''}:${api.user?.householdId ?? ''}`,
+			isWorking: () => chatBusy,
+			getDraft: () => chatDraft,
+			setDraft: (value) => {
+				chatDraft = value;
+			},
+			getMessages: () => chatMessages,
+			setMessages: (value) => {
+				chatMessages = value;
+			},
+			getRecipeDrafts: () => chatDrafts,
+			setRecipeDrafts: (value) => {
+				chatDrafts = value;
+			},
+			setBusy: (value) => {
+				chatBusy = value;
+			},
+			setError: (value) => {
+				chatError = value;
+			},
+			getFailedPrompt: () => chatFailedPrompt,
+			setFailedPrompt: (value) => {
+				chatFailedPrompt = value;
+			},
+			request: (prompt, history, signal, recipeDrafts) =>
+				api.askButler(prompt, history, signal, recipeDrafts)
+		});
+
+		harness.setAiResponse({
+			reply: 'Added thyme and prepared your shopping export.',
+			commands: [
+				{
+					type: 'pantry.upsert',
+					item: { id: 'p-thyme', name: 'Thyme', quantity: 1, unit: 'bunch', category: 'Produce' }
+				},
+				{ type: 'ui', action: 'export-shopping' }
+			],
+			droppedCommands: 1
+		});
+		chatDraft = 'Add thyme and export shopping';
+		await controller.send();
+		assert.equal(chatError, '');
+		assert.equal(chatMessages.length, 2);
+		assert.equal(chatMessages[1].warning, '1 invalid action was omitted from this reply.');
+		assert.equal(chatMessages[1].actions?.length, 2);
+
+		const firstCard = chatMessages[1].actions![0];
+		const secondCard = chatMessages[1].actions![1];
+		chatMessages[1].snapshot = api.applyButler(firstCard.commands, chatMessages[1].snapshot!);
+		firstCard.status = 'applied';
+		chatMessages[1].snapshot = api.applyButler(secondCard.commands, chatMessages[1].snapshot!);
+		secondCard.status = 'applied';
+		api.closeDialog();
+
+		harness.setAiResponse({ reply: 'All set.', commands: [] });
+		chatDraft = 'Follow up';
+		await controller.send();
+		const secondPayload = harness.aiRequests.at(-1) as {
+			messages: butlerChatMod.ButlerTurn[];
+		};
+		assert.deepEqual(secondPayload.messages, [
+			{ role: 'user', content: 'Add thyme and export shopping' },
+			{
+				role: 'assistant',
+				content:
+					'Added thyme and prepared your shopping export.\n\n[User applied: Thyme]\n[User opened: Export shopping list]'
+			},
+			{ role: 'user', content: 'Follow up' }
+		]);
+		controller.destroy();
+	} finally {
+		harness.dispose();
+	}
 });
 
 test('+page.svelte exportKitchen commits inline edits, merges account state, and distinguishes 401 expiry and offline modes', async () => {

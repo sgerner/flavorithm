@@ -332,6 +332,7 @@ test('pairButlerHistory keeps only completed user and assistant pairs and preser
 					label: 'Add item',
 					title: 'Garlic',
 					summary: 'Pantry · 3 cloves',
+					details: ['Add pantry item: Garlic · 3 cloves · Produce'],
 					commands: [],
 					destructive: false,
 					status: 'applied'
@@ -381,6 +382,52 @@ test('assistant messages record droppedCommands warnings while keeping valid act
 	assert.equal(harness.messages.length, 2);
 	assert.equal(harness.messages[1].actions?.length, 1);
 	assert.equal(harness.messages[1].warning, '2 invalid actions were omitted from this reply.');
+});
+
+test('createButlerChat freezes action details from initial snapshot and splits [User applied] from [User opened] in history', async () => {
+	const observedHistory: ButlerTurn[][] = [];
+	let callCount = 0;
+	const harness = createHarness({
+		request: async (_prompt, history) => {
+			observedHistory.push(history);
+			callCount += 1;
+			if (callCount === 1) {
+				return {
+					reply: 'Here is a pantry removal and an export shortcut.',
+					commands: [
+						{ type: 'pantry.delete', id: harness.kitchen.pantry[0].id },
+						{ type: 'ui', action: 'export-shopping' }
+					]
+				};
+			}
+			return { reply: 'Noted.', commands: [] };
+		}
+	});
+
+	const removedItemName = harness.kitchen.pantry[0].name;
+	harness.draft = 'Remove the first pantry item and export my shopping list';
+	await harness.chat.send();
+
+	const actions = harness.messages[1].actions ?? [];
+	assert.equal(actions.length, 2);
+	assert.match(actions[0].details[0], new RegExp(`^Remove pantry item: ${removedItemName}`));
+	assert.match(actions[1].details[0], /^Export shopping list:/);
+
+	// Mutate live kitchen state and mark both cards applied; frozen details stay intact and history splits applied vs opened.
+	harness.kitchen = { ...harness.kitchen, pantry: harness.kitchen.pantry.slice(1) };
+	actions[0].status = 'applied';
+	actions[1].status = 'applied';
+	assert.match(actions[0].details[0], new RegExp(`^Remove pantry item: ${removedItemName}`));
+
+	harness.draft = 'What next?';
+	await harness.chat.send();
+	assert.deepEqual(observedHistory[1], [
+		{ role: 'user', content: 'Remove the first pantry item and export my shopping list' },
+		{
+			role: 'assistant',
+			content: `Here is a pantry removal and an export shortcut.\n\n[User applied: ${removedItemName}]\n[User opened: Export shopping list]`
+		}
+	]);
 });
 
 test('null request result from AI setup detour rolls back unanswered turn, restores draft, and leaves error empty', async () => {

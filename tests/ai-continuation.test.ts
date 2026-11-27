@@ -22,6 +22,7 @@ import {
 	type PendingAIContinuation
 } from '../src/lib/ai-continuation.ts';
 import * as butlerMod from '../src/lib/butler.ts';
+import * as butlerActionsMod from '../src/lib/butler-actions.ts';
 import * as butlerChatMod from '../src/lib/butler-chat.ts';
 import * as syncMod from '../src/lib/client-sync.ts';
 import * as clientWorkflowsMod from '../src/lib/client-workflows.ts';
@@ -610,6 +611,7 @@ function createReactivePage(options?: {
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
 		'#lib/butler.ts': butlerMod,
+		'#lib/butler-actions.ts': butlerActionsMod,
 		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
 		'#lib/voice-config.ts': voiceConfigMod,
