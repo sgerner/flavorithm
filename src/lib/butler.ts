@@ -242,7 +242,6 @@ function addedNonExpiredPantryItem(
 	const delta = next.quantity - Math.max(0, previousInNextUnit);
 	return delta > 0 ? { ...next, quantity: delta } : undefined;
 }
-
 type PantryMutation =
 	| {
 			kind: 'upsert';

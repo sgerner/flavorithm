@@ -1052,13 +1052,19 @@ test('transferring merged weekly purchases moves only the checked quantity and l
 	assert.equal(mergedWithRestock.state.pantry[0].quantity, 1);
 	assert.deepEqual(mergedWithRestock.state.shopping, []);
 
+	const baseWithStrayDeduction = structuredClone(base);
+	baseWithStrayDeduction.meals[0].pantryDeductions = [
+		{ pantryId: 'olive oil-cup', name: 'olive oil', quantity: 0.5, unit: 'cup' }
+	];
 	const cookedWithoutDeduction = completeMeal(
-		base,
+		baseWithStrayDeduction,
 		'wed',
 		{ deductPantry: false, leftoverServings: 2 },
 		new Date('2026-10-21T18:00:00.000Z')
 	);
 	assert.equal(cookedWithoutDeduction.meals[0].pantryDeductions, undefined);
+	assert.equal('pantryDeductions' in cookedWithoutDeduction.meals[0], false);
+	assert.equal(cookedWithoutDeduction.pantry[0].quantity, base.pantry[0].quantity);
 });
 
 test('editing a recipe refreshes scheduled weeks and existing recipe scopes independently while keeping manual and checked rows', () => {

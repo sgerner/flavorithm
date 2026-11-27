@@ -1,10 +1,14 @@
 import { buildShoppingList } from '#lib/domain.ts';
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
 import {
 	clampLeftoverServings,
 	convertCompatibleQuantity,
 	reconcileShoppingList
 } from '#lib/kitchen-workflows.ts';
+import { isKitchenState, isKitchenStateShape } from '#lib/state-schema.ts';
 import type { AppState, Ingredient, Meal, ShoppingItem, User } from '#lib/types.ts';
+
+export { isKitchenState, isKitchenStateShape };
 
 export type SyncConflict = { path: string; local: unknown; remote: unknown };
 export type PendingKitchen = {
@@ -27,7 +31,10 @@ const key = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-pending:${user.id}:${user.householdId}`;
 const journalPrefix = (user: Pick<User, 'id' | 'householdId'>) =>
 	`flavorithm-pending-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
+const quarantinePrefix = (user: Pick<User, 'id' | 'householdId'>) =>
+	`flavorithm-quarantined-journal:v1:${encodeURIComponent(user.id)}:${encodeURIComponent(user.householdId)}:`;
 export const MAX_PENDING_JOURNAL_ENTRIES = 64;
+export const MAX_QUARANTINED_JOURNAL_ENTRIES = 8;
 
 export type PendingJournalRecord = {
 	writerId: string;
@@ -36,6 +43,139 @@ export type PendingJournalRecord = {
 	keys: Array<{ key: string; pending: PendingKitchen }>;
 };
 export type PendingJournalRead = { records: PendingJournalRecord[]; error: string };
+export type QuarantinedJournalEntry = {
+	key: string;
+	slot: string;
+	raw: string;
+	parsed?: unknown;
+};
+
+/**
+ * Validate a candidate kitchen snapshot while allowing untouched legacy fields already present in
+ * `referenceBase` to heal via `sanitizeKitchenState`. Newly introduced invalid edits still return
+ * `null` and are rejected.
+ */
+export function repairLegacyKitchenState(
+	value: unknown,
+	referenceBase?: AppState | null
+): AppState | null {
+	if (isKitchenState(value)) return value;
+	if (!isKitchenStateShape(value)) return null;
+	if (!referenceBase || !isKitchenStateShape(referenceBase) || isKitchenState(referenceBase)) {
+		return null;
+	}
+	const sanitizedBase = sanitizeKitchenState(referenceBase);
+	const candidate = mergeKitchenStates(referenceBase, value, sanitizedBase, 'local').state;
+	return isKitchenState(candidate) ? candidate : null;
+}
+
+function listQuarantinedKeys(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>
+): string[] {
+	if (typeof storage.length !== 'number' || typeof storage.key !== 'function') return [];
+	const prefix = quarantinePrefix(user);
+	const keys: string[] = [];
+	for (let index = 0; index < storage.length; index += 1) {
+		const storageKey = storage.key(index);
+		if (storageKey?.startsWith(prefix)) keys.push(storageKey);
+	}
+	return keys;
+}
+
+function quarantineSlot(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>,
+	activeKey: string,
+	slotId: string,
+	raw: string
+): void {
+	const safeSlot = (slotId ? encodeURIComponent(slotId) : 'corrupt').slice(0, 120) || 'corrupt';
+	const baseKey = `${quarantinePrefix(user)}${safeSlot}`;
+	// Never truncate: a quarantined entry is the only copy of the user's unsynced edits.
+	const boundedRaw = raw;
+	try {
+		const existingKeys = listQuarantinedKeys(storage, user);
+		for (const existingKey of existingKeys) {
+			if (storage.getItem(existingKey) === boundedRaw) {
+				storage.removeItem(activeKey);
+				return;
+			}
+		}
+		let targetKey = `${baseKey}:${MAX_QUARANTINED_JOURNAL_ENTRIES}`;
+		for (let suffix = 1; suffix <= MAX_QUARANTINED_JOURNAL_ENTRIES; suffix += 1) {
+			const candidate = suffix === 1 ? baseKey : `${baseKey}:${suffix}`;
+			const current = storage.getItem(candidate);
+			if (current === null || current === boundedRaw) {
+				targetKey = candidate;
+				break;
+			}
+		}
+		const evictable = existingKeys.filter((entry) => entry !== targetKey);
+		const overflowCount =
+			existingKeys.includes(targetKey) || existingKeys.length < MAX_QUARANTINED_JOURNAL_ENTRIES
+				? 0
+				: existingKeys.length - MAX_QUARANTINED_JOURNAL_ENTRIES + 1;
+		try {
+			if (storage.getItem(targetKey) !== boundedRaw) {
+				storage.setItem(targetKey, boundedRaw);
+			}
+		} catch (writeError) {
+			if (!evictable.length) throw writeError;
+			storage.removeItem(evictable.shift()!);
+			storage.setItem(targetKey, boundedRaw);
+		}
+		for (let i = 0; i < overflowCount && evictable.length > 0; i += 1) {
+			storage.removeItem(evictable.shift()!);
+		}
+		storage.removeItem(activeKey);
+	} catch {
+		// Leave the original untouched for manual recovery if storage refuses writes or removals.
+	}
+}
+
+/** Read quarantined journal entries for this account/household so backups can export them. */
+export function readQuarantinedJournal(
+	storage: StorageLike,
+	user: Pick<User, 'id' | 'householdId'>
+): QuarantinedJournalEntry[] {
+	const prefix = quarantinePrefix(user);
+	const entries: QuarantinedJournalEntry[] = [];
+	try {
+		const keys =
+			typeof storage.length === 'number' && typeof storage.key === 'function'
+				? listQuarantinedKeys(storage, user).sort()
+				: [`${prefix}legacy-main`];
+		for (const storageKey of keys) {
+			const raw = storage.getItem(storageKey);
+			if (raw === null) continue;
+			const rawSlot = storageKey.slice(prefix.length);
+			let slot = rawSlot || 'corrupt';
+			try {
+				slot = decodeURIComponent(rawSlot) || 'corrupt';
+			} catch {
+				slot = rawSlot || 'corrupt';
+			}
+			let hasParsed = false;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(raw);
+				hasParsed = true;
+			} catch {
+				hasParsed = false;
+			}
+			entries.push({
+				key: storageKey,
+				slot,
+				raw,
+				...(hasParsed ? { parsed } : {})
+			});
+		}
+	} catch {
+		return entries;
+	}
+	return entries;
+}
 
 function parsePending(value: unknown, user: User): PendingKitchen | null {
 	if (
@@ -43,8 +183,8 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 		typeof value !== 'object' ||
 		(value as PendingKitchen).userId !== user.id ||
 		(value as PendingKitchen).householdId !== user.householdId ||
-		!isState((value as PendingKitchen).base) ||
-		!isState((value as PendingKitchen).local) ||
+		!isKitchenStateShape((value as PendingKitchen).base) ||
+		!isKitchenStateShape((value as PendingKitchen).local) ||
 		!(
 			(value as PendingKitchen).etag === null || typeof (value as PendingKitchen).etag === 'string'
 		) ||
@@ -58,7 +198,17 @@ function parsePending(value: unknown, user: User): PendingKitchen | null {
 	) {
 		return null;
 	}
-	return value as PendingKitchen;
+	const candidate = value as PendingKitchen;
+	if (isKitchenState(candidate.base) && isKitchenState(candidate.local)) {
+		return candidate;
+	}
+	const repairedLocal = repairLegacyKitchenState(candidate.local, candidate.base);
+	if (!repairedLocal) return null;
+	return {
+		...candidate,
+		base: isKitchenState(candidate.base) ? candidate.base : sanitizeKitchenState(candidate.base),
+		local: repairedLocal
+	};
 }
 
 /** Read every per-writer durable delta, plus the old single-slot format for migration. */
@@ -66,12 +216,18 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 	const byWriter = new Map<string, PendingJournalRecord>();
 	let error = '';
 	if (typeof storage.length !== 'number' || typeof storage.key !== 'function') {
+		let serialized: string | null = null;
 		try {
-			const serialized = storage.getItem(key(user));
+			serialized = storage.getItem(key(user));
 			if (serialized === null) return { records: [], error: '' };
 			const pending = parsePending(JSON.parse(serialized), user);
-			if (!pending)
-				return { records: [], error: 'A saved offline snapshot could not be read safely.' };
+			if (!pending) {
+				quarantineSlot(storage, user, key(user), 'legacy-main', serialized);
+				return {
+					records: [],
+					error: 'A saved offline snapshot could not be read safely and was quarantined.'
+				};
+			}
 			return {
 				records: [
 					{
@@ -83,42 +239,63 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 				error: ''
 			};
 		} catch {
+			if (serialized !== null) quarantineSlot(storage, user, key(user), 'legacy-main', serialized);
 			return { records: [], error: 'Saved offline changes could not be read.' };
 		}
 	}
 	try {
 		const prefix = journalPrefix(user);
+		const matchingKeys: string[] = [];
 		for (let index = 0; index < storage.length; index += 1) {
 			const storageKey = storage.key(index);
-			if (!storageKey?.startsWith(prefix)) continue;
-			const writerId = decodeURIComponent(storageKey.slice(prefix.length));
-			const pending = parsePending(JSON.parse(storage.getItem(storageKey) || 'null'), user);
-			if (!writerId || !pending || pending.writerId !== writerId) {
-				error ||= 'A saved offline journal entry could not be read safely.';
-				continue;
+			if (storageKey?.startsWith(prefix)) matchingKeys.push(storageKey);
+		}
+		for (const storageKey of matchingKeys) {
+			const rawSuffix = storageKey.slice(prefix.length);
+			let raw: string | null = null;
+			try {
+				raw = storage.getItem(storageKey);
+				if (raw === null) continue;
+				const writerId = decodeURIComponent(rawSuffix);
+				const pending = parsePending(JSON.parse(raw), user);
+				if (!writerId || !pending || pending.writerId !== writerId) {
+					quarantineSlot(storage, user, storageKey, writerId || rawSuffix || 'empty', raw);
+					error ||= 'A saved offline journal entry could not be read safely and was quarantined.';
+					continue;
+				}
+				byWriter.set(writerId, {
+					writerId,
+					pending,
+					keys: [{ key: storageKey, pending }]
+				});
+			} catch {
+				if (raw !== null) quarantineSlot(storage, user, storageKey, rawSuffix || 'corrupt', raw);
+				error ||= 'A saved offline journal entry could not be read safely and was quarantined.';
 			}
-			byWriter.set(writerId, {
-				writerId,
-				pending,
-				keys: [{ key: storageKey, pending }]
-			});
 		}
 		const mainKey = key(user);
-		const serialized = storage.getItem(mainKey);
-		if (serialized !== null) {
-			const pending = parsePending(JSON.parse(serialized), user);
-			if (!pending) {
-				error ||= 'A saved offline snapshot could not be read safely.';
-			} else {
-				const writerId = pending.writerId || 'legacy-main';
-				const existing = byWriter.get(writerId);
-				if (!existing) {
-					byWriter.set(writerId, { writerId, pending, keys: [{ key: mainKey, pending }] });
+		let serialized: string | null = null;
+		try {
+			serialized = storage.getItem(mainKey);
+			if (serialized !== null) {
+				const pending = parsePending(JSON.parse(serialized), user);
+				if (!pending) {
+					quarantineSlot(storage, user, mainKey, 'legacy-main', serialized);
+					error ||= 'A saved offline snapshot could not be read safely and was quarantined.';
 				} else {
-					existing.keys.push({ key: mainKey, pending });
-					if (pending.updatedAt > existing.pending.updatedAt) existing.pending = pending;
+					const writerId = pending.writerId || 'legacy-main';
+					const existing = byWriter.get(writerId);
+					if (!existing) {
+						byWriter.set(writerId, { writerId, pending, keys: [{ key: mainKey, pending }] });
+					} else {
+						existing.keys.push({ key: mainKey, pending });
+						if (pending.updatedAt > existing.pending.updatedAt) existing.pending = pending;
+					}
 				}
 			}
+		} catch {
+			if (serialized !== null) quarantineSlot(storage, user, mainKey, 'legacy-main', serialized);
+			error ||= 'A saved offline snapshot could not be read safely and was quarantined.';
 		}
 	} catch {
 		error ||= 'Saved offline changes could not be enumerated.';
@@ -134,15 +311,7 @@ export function readPendingJournal(storage: StorageLike, user: User): PendingJou
 }
 
 function isState(value: unknown): value is AppState {
-	if (!value || typeof value !== 'object') return false;
-	const state = value as AppState;
-	return (
-		['pantry', 'recipes', 'meals', 'shopping'].every((field) =>
-			Array.isArray(state[field as keyof AppState])
-		) &&
-		!!state.preferences &&
-		typeof state.preferences === 'object'
-	);
+	return isKitchenState(value);
 }
 
 /** One durable latest snapshot per account and household; never stores credentials. */
@@ -182,7 +351,14 @@ export function clearPendingJournalRecords(
 ): void {
 	for (const record of records) {
 		for (const captured of record.keys) {
-			const current = parsePending(JSON.parse(storage.getItem(captured.key) || 'null'), user);
+			const raw = storage.getItem(captured.key);
+			if (raw === null) continue;
+			let current: PendingKitchen | null = null;
+			try {
+				current = parsePending(JSON.parse(raw), user);
+			} catch {
+				current = null;
+			}
 			if (current && sameJournalVersion(current, captured.pending))
 				storage.removeItem(captured.key);
 		}
@@ -412,19 +588,20 @@ function segmentsStartWith(prefix: PathSegment[], full: PathSegment[]): boolean 
 	});
 }
 
-function resolveOrphanedMeals(
-	state: Pick<AppState, 'meals' | 'recipes'>,
-	localSnapshot: AppState,
-	remoteSnapshot: AppState,
+function reconcileOrphanedMeals(
+	state: AppState,
+	localBranch: AppState,
+	remoteBranch: AppState,
 	conflicts: DetailedConflict[],
 	prefer?: 'local' | 'remote'
 ): void {
+	// Deleting a recipe while someone plans it must never create an orphaned meal.
 	const recipeIds = new Set(state.recipes.map((recipe) => recipe.id));
 	for (const meal of state.meals.filter((meal) => !recipeIds.has(meal.recipeId))) {
 		conflicts.push({
 			path: `kitchen.meals[${meal.id}].recipeId`,
-			local: describeMealRecipe(localSnapshot, meal.id, meal.recipeId),
-			remote: describeMealRecipe(remoteSnapshot, meal.id, meal.recipeId),
+			local: describeMealRecipe(localBranch, meal.id, meal.recipeId),
+			remote: describeMealRecipe(remoteBranch, meal.id, meal.recipeId),
 			segments: [
 				{ kind: 'prop', key: 'meals' },
 				{ kind: 'id', id: meal.id },
@@ -434,8 +611,8 @@ function resolveOrphanedMeals(
 		});
 		// Keep the complete proposed meal available for review and backup until a choice is made.
 		const candidates = prefer
-			? (prefer === 'local' ? localSnapshot : remoteSnapshot).recipes
-			: [...localSnapshot.recipes, ...remoteSnapshot.recipes];
+			? (prefer === 'local' ? localBranch : remoteBranch).recipes
+			: [...localBranch.recipes, ...remoteBranch.recipes];
 		const recipe = candidates.find((item) => item.id === meal.recipeId);
 		if (recipe) {
 			state.recipes.push(structuredClone(recipe));
@@ -737,19 +914,30 @@ function mergeKitchenStatesDetailed(
 	const state = structuredClone(
 		merge(base, localNormalized, remoteNormalized, 'kitchen', [])
 	) as AppState;
-	// Deleting a recipe while someone plans it must never create an orphaned meal.
-	resolveOrphanedMeals(state, local, remote, conflicts, prefer);
+	reconcileOrphanedMeals(state, local, remote, conflicts, prefer);
 	state.meals = state.meals.map((meal) => {
 		if (!meal.completedAt) {
+			if (meal.leftoverServings === undefined && meal.pantryDeductions === undefined) {
+				return meal;
+			}
 			const next = { ...meal };
 			delete next.leftoverServings;
 			delete next.pantryDeductions;
 			return next;
 		}
-		return {
-			...meal,
-			leftoverServings: clampLeftoverServings(meal.leftoverServings, meal.servings)
-		};
+		if (meal.leftoverServings === undefined) {
+			if (!('leftoverServings' in meal)) return meal;
+			const next = { ...meal };
+			delete next.leftoverServings;
+			return next;
+		}
+		const normalizedLeftovers = clampLeftoverServings(meal.leftoverServings, meal.servings);
+		return normalizedLeftovers === meal.leftoverServings
+			? meal
+			: {
+					...meal,
+					leftoverServings: normalizedLeftovers
+				};
 	});
 
 	const baseMealsById = new Map(base.meals.map((meal) => [meal.id, meal]));
@@ -1036,6 +1224,11 @@ export function mergePendingKitchenJournal(
 	};
 }
 
+function prepareMergedStateForPut(mergedState: AppState, remoteState: AppState): AppState {
+	if (isKitchenState(mergedState)) return mergedState;
+	return repairLegacyKitchenState(mergedState, remoteState) ?? sanitizeKitchenState(mergedState);
+}
+
 /** Reconcile every account-scoped writer delta against current server state before the write. */
 export async function syncPendingKitchenJournal(
 	records: PendingJournalRecord[],
@@ -1070,7 +1263,10 @@ export async function syncPendingKitchenJournal(
 		}
 		const resolved = mergePendingKitchenJournal(records, remote.state, prefer);
 		try {
-			const result = await transport.put(resolved.state, expectedEtag);
+			const result = await transport.put(
+				prepareMergedStateForPut(resolved.state, remote.state),
+				expectedEtag
+			);
 			return { ...result, conflicts: [], saved: true };
 		} catch (error) {
 			if ((error as { status?: number }).status !== 412) throw error;
@@ -1103,7 +1299,10 @@ export async function syncPendingKitchenJournal(
 			};
 		}
 		try {
-			const result = await transport.put(merged.state, remote.etag);
+			const result = await transport.put(
+				prepareMergedStateForPut(merged.state, remote.state),
+				remote.etag
+			);
 			return { ...result, conflicts: [], saved: true };
 		} catch (error) {
 			if ((error as { status?: number }).status !== 412 || attempt === 2) throw error;

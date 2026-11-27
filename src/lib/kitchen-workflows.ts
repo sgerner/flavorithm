@@ -1201,12 +1201,12 @@ export function completeMeal(
 
 	const meals = state.meals.map((meal) => {
 		if (meal.id !== mealId) return meal;
-		const { sample: _sample, ...userMeal } = meal;
+		const { sample: _sample, pantryDeductions: _pantryDeductions, ...userMeal } = meal;
 		return {
 			...userMeal,
 			completedAt: safeNow.toISOString(),
 			leftoverServings,
-			...(deductions.length ? { pantryDeductions: deductions } : {})
+			...(options.deductPantry && deductions.length ? { pantryDeductions: deductions } : {})
 		};
 	});
 
