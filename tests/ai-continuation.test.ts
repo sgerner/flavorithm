@@ -30,8 +30,10 @@ import * as dataMod from '../src/lib/data.ts';
 import { defaultPreferences } from '../src/lib/data.ts';
 import * as discoveryMod from '../src/lib/discovery.ts';
 import * as domainMod from '../src/lib/domain.ts';
+import * as formValidationMod from '../src/lib/form-validation.ts';
 import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
+import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
 import type { PantryDraft } from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
@@ -425,6 +427,7 @@ function injectContinuationHook(svelteSource: string): string {
 		cancelScan,
 		addIngredients,
 		logout,
+		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
 		clearManagedIdentity,
 		refreshAuth,
@@ -502,8 +505,9 @@ type PageContinuationApi = {
 	scan: (event: Event) => Promise<void>;
 	scanPantryPhoto: (file: File, fromContinuation?: boolean) => Promise<void>;
 	cancelScan: (silent?: boolean) => void;
-	addIngredients: () => void;
+	addIngredients: (event?: SubmitEvent) => Promise<void>;
 	logout: () => Promise<void>;
+	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
 	clearManagedIdentity: () => void;
 	refreshAuth: () => Promise<unknown>;
@@ -586,6 +590,7 @@ function createReactivePage(options?: {
 		},
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
+		'#lib/form-validation.ts': formValidationMod,
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -611,6 +616,7 @@ function createReactivePage(options?: {
 		'#lib/ai-connections.ts': aiConnectionsMod,
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
+		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
@@ -1117,7 +1123,7 @@ test('scan staging validates MIME/size, resets file inputs immediately, and guar
 
 		// Adding manual ingredients clears stagedScanFile
 		api.pantryInput = '2 lemons';
-		api.addIngredients();
+		await api.addIngredients();
 		assert.equal(api.stagedScanFile, null);
 		assert.equal(api.modal, '');
 	} finally {
@@ -1239,6 +1245,7 @@ test('logout, deleteAccount, clearManagedIdentity, and refreshAuth identity swit
 		// 3. deleteAccount()
 		api.user = { ...userA };
 		seedSensitiveSessionState(api, imageInputStub);
+		api.deletePassword = 'TestablePassword123!';
 		await api.deleteAccount({ preventDefault: () => {} } as unknown as SubmitEvent);
 		assert.equal(deleteCalled, 1);
 		assert.equal(api.user, null);
