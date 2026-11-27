@@ -35,6 +35,7 @@ import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
 import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
+import * as modalPreloaderMod from '../src/lib/modal-preloader.ts';
 import type { PantryDraft } from '../src/lib/kitchen-workflows.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
@@ -609,6 +610,7 @@ function createReactivePage(options?: {
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/modal-preloader.ts': modalPreloaderMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },

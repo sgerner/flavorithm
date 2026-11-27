@@ -1,5 +1,7 @@
 /** Keep keyboard focus in a modal and return it to its trigger on close. */
 let activeTraps = 0;
+let settling = false;
+let settleToken = 0;
 let originalOverflow = '';
 let originalFocus: HTMLElement | null = null;
 
@@ -12,7 +14,7 @@ export function focusTrap(node: HTMLElement) {
 			)
 		).filter((el) => el.offsetParent !== null);
 	queueMicrotask(() => {
-		(controls()[0] || node).focus();
+		if (node.isConnected) (controls()[0] || node).focus();
 	});
 	function keydown(event: KeyboardEvent) {
 		if (event.key !== 'Tab') return;
@@ -33,10 +35,15 @@ export function focusTrap(node: HTMLElement) {
 		}
 	}
 	node.addEventListener('keydown', keydown);
-	if (activeTraps === 0) {
+	if (activeTraps === 0 && !settling) {
 		originalOverflow = document.body.style.overflow;
-		originalFocus = previous;
+		originalFocus =
+			previous && previous !== document.body && previous !== document.documentElement
+				? previous
+				: null;
 	}
+	settleToken += 1;
+	settling = false;
 	activeTraps += 1;
 	document.body.style.overflow = 'hidden';
 	return {
@@ -44,11 +51,19 @@ export function focusTrap(node: HTMLElement) {
 			node.removeEventListener('keydown', keydown);
 			activeTraps -= 1;
 			if (activeTraps === 0) {
-				document.body.style.overflow = originalOverflow;
-				const returnTarget = originalFocus;
+				const token = ++settleToken;
+				settling = true;
 				queueMicrotask(() => {
-					if (activeTraps === 0 && returnTarget?.isConnected && !returnTarget.closest('[inert]'))
-						returnTarget.focus({ preventScroll: true });
+					if (token !== settleToken) return;
+					settling = false;
+					if (activeTraps === 0) {
+						document.body.style.overflow = originalOverflow;
+						const returnTarget = originalFocus;
+						originalFocus = null;
+						if (returnTarget?.isConnected && !returnTarget.closest('[inert]')) {
+							returnTarget.focus({ preventScroll: true });
+						}
+					}
 				});
 			}
 		}

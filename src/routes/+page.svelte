@@ -80,15 +80,15 @@
 		ChevronLeft,
 		ChevronRight,
 		LogOut,
-		Copy,
 		Download,
+		Copy,
 		Share2,
 		Leaf,
 		SlidersHorizontal,
-		Flame,
 		ChefHat,
 		Star,
 		Menu,
+		LoaderCircle,
 		RefreshCw
 	} from '@lucide/svelte';
 	import type { AppState, Meal, Recipe, User } from '#lib/types.ts';
@@ -154,19 +154,12 @@
 		resetRecipeFilterState
 	} from '#lib/recipe-collection.ts';
 	import { applyRecipeRating } from '#lib/recipe-detail.ts';
-	import RecipeDetail from '#lib/components/RecipeDetail.svelte';
-	import ButlerChat from '#lib/components/ButlerChat.svelte';
-	import { applyButlerCommands } from '#lib/butler.ts';
-	import {
-		BUTLER_HISTORY_LIMIT,
-		pairButlerHistory,
-		type ButlerChatResult
-	} from '#lib/butler-chat.ts';
-	import RecipeEditor from '#lib/components/RecipeEditor.svelte';
+	import BasilAvatar from '#lib/components/BasilAvatar.svelte';
+	import type ButlerChatType from '#lib/components/ButlerChat.svelte';
+	import type { ButlerChatResult } from '#lib/butler-chat.ts';
 	import SyncStatus from '#lib/components/SyncStatus.svelte';
 	import ToggleButton from '#lib/components/ToggleButton.svelte';
-	import AIConnection from '#lib/components/AIConnection.svelte';
-	import VoiceSettings from '#lib/components/VoiceSettings.svelte';
+	import type { VoiceCapture as VoiceCaptureInstance } from '#lib/voice-capture.ts';
 	import {
 		appendDictatedText,
 		isVoiceTargetActive,
@@ -174,12 +167,12 @@
 		planVoiceRetry,
 		planVoiceStart,
 		resolveClosedDialog,
-		VoiceCapture,
+		voiceProviders,
 		type ResumeDialog,
+		type VoiceProvider,
 		type VoiceState,
 		type VoiceTarget
-	} from '#lib/voice-capture.ts';
-	import { voiceProviders, type VoiceProvider } from '#lib/voice-config.ts';
+	} from '#lib/voice-config.ts';
 	import {
 		CHATGPT_OAUTH_POLL_INTERVAL_MS,
 		CHATGPT_OAUTH_TTL_MS,
@@ -210,18 +203,17 @@
 	import { exportKitchenArchive } from '#lib/kitchen-export.ts';
 	import { createKitchenSync } from '#lib/client-sync.ts';
 	import type { SyncConflict } from '#lib/offline-sync.ts';
-	import RecipeImport, {
-		emptyImportSession,
-		type ImportSession
-	} from '#lib/components/RecipeImport.svelte';
 	import { isStandaloneRecipeUrl } from '#lib/recipe-scraper.ts';
 	import {
 		applyImportedRecipeSave,
 		canAppendImportTranscript,
 		cloneImportSession,
+		emptyImportSession,
 		isReviewingImportDraft,
-		replaceImportSessionWithUrl
+		replaceImportSessionWithUrl,
+		type ImportSession
 	} from '#lib/import-session.ts';
+	import { createModalPreloader, scheduleIdleWarmup } from '#lib/modal-preloader.ts';
 	import { isValidServings, MAX_SERVINGS } from '#lib/recipe-draft.ts';
 	type AuthMode = 'local' | 'oidc' | 'proxy' | 'invalid';
 	let { data }: { data: PageData } = $props();
@@ -383,6 +375,117 @@
 		taste: 'Recipe preferences',
 		search: 'Find recipes online'
 	};
+	type LazyModalKey =
+		| 'recipeDetail'
+		| 'recipeEditor'
+		| 'recipeImport'
+		| 'voiceSettings'
+		| 'aiConnection'
+		| 'butlerChat';
+	let RecipeDetailComponent = $state.raw<
+		(typeof import('#lib/components/RecipeDetail.svelte'))['default'] | null
+	>(null);
+	let ButlerChatComponent = $state.raw<
+		(typeof import('#lib/components/ButlerChat.svelte'))['default'] | null
+	>(null);
+	let RecipeEditorComponent = $state.raw<
+		(typeof import('#lib/components/RecipeEditor.svelte'))['default'] | null
+	>(null);
+	let RecipeImportComponent = $state.raw<
+		(typeof import('#lib/components/RecipeImport.svelte'))['default'] | null
+	>(null);
+	let VoiceSettingsComponent = $state.raw<
+		(typeof import('#lib/components/VoiceSettings.svelte'))['default'] | null
+	>(null);
+	let AIConnectionComponent = $state.raw<
+		(typeof import('#lib/components/AIConnection.svelte'))['default'] | null
+	>(null);
+	type VoiceCaptureConstructor = (typeof import('#lib/voice-capture.ts'))['VoiceCapture'];
+	let VoiceCaptureClass: VoiceCaptureConstructor | null = null;
+	let modalErrors = $state<Record<LazyModalKey, string>>({
+		recipeDetail: '',
+		recipeEditor: '',
+		recipeImport: '',
+		voiceSettings: '',
+		aiConnection: '',
+		butlerChat: ''
+	});
+	const modalPreloader = createModalPreloader({
+		recipeDetail: () =>
+			import('#lib/components/RecipeDetail.svelte').then(
+				(m) => (RecipeDetailComponent = m.default)
+			),
+		recipeEditor: () =>
+			import('#lib/components/RecipeEditor.svelte').then(
+				(m) => (RecipeEditorComponent = m.default)
+			),
+		recipeImport: () =>
+			import('#lib/components/RecipeImport.svelte').then(
+				(m) => (RecipeImportComponent = m.default)
+			),
+		voiceSettings: () =>
+			import('#lib/components/VoiceSettings.svelte').then((m) => {
+				const restoreHeading =
+					typeof document !== 'undefined' &&
+					document.activeElement?.id === 'voice-settings-heading';
+				VoiceSettingsComponent = m.default;
+				if (restoreHeading) {
+					void tick().then(() => {
+						if (modal === 'settings') document.getElementById('voice-settings-heading')?.focus();
+					});
+				}
+				return m.default;
+			}),
+		aiConnection: () =>
+			import('#lib/components/AIConnection.svelte').then((m) => {
+				const restoreHeading =
+					typeof document !== 'undefined' && document.activeElement?.id === 'ai-connection-heading';
+				AIConnectionComponent = m.default;
+				if (restoreHeading) {
+					void tick().then(() => {
+						if (modal === 'settings') document.getElementById('ai-connection-heading')?.focus();
+					});
+				}
+				return m.default;
+			}),
+		butlerChat: () =>
+			import('#lib/components/ButlerChat.svelte').then((m) => (ButlerChatComponent = m.default)),
+		butlerChatHelpers: () => import('#lib/butler-chat.ts'),
+		butlerCommands: () => import('#lib/butler.ts'),
+		voiceCapture: (): Promise<VoiceCaptureConstructor> =>
+			import('#lib/voice-capture.ts').then((m) => {
+				VoiceCaptureClass = m.VoiceCapture;
+				return m.VoiceCapture;
+			})
+	});
+	const warmModal = (key: Parameters<typeof modalPreloader.warm>[0]) => {
+		modalPreloader.warm(key, typeof navigator !== 'undefined' ? navigator : null);
+	};
+	const warmSettings = () => {
+		warmModal('voiceSettings');
+		warmModal('aiConnection');
+	};
+	async function loadModal(key: LazyModalKey) {
+		modalErrors[key] = '';
+		try {
+			await modalPreloader.load(key);
+			return true;
+		} catch {
+			modalErrors[key] = 'Could not load this view. Check your connection and try again.';
+			return false;
+		}
+	}
+	const loadSettingsModules = () =>
+		Promise.all([loadModal('voiceSettings'), loadModal('aiConnection')]).then(
+			([voiceOk, aiOk]) => voiceOk && aiOk
+		);
+	function focusSettingsHeading(headingId: string) {
+		if (typeof document === 'undefined') return;
+		const active = document.activeElement as { tagName?: string } | null | undefined;
+		const tag = active?.tagName?.toUpperCase();
+		const inField = tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA';
+		if (!inField) document.getElementById(headingId)?.focus();
+	}
 	let quizTime = $state(45);
 	let quizComplexity = $state('Easy');
 	let quizCuisines = $state<string[]>([]);
@@ -543,7 +646,7 @@
 	let voiceCancelButton = $state<HTMLButtonElement>();
 	let voiceRetryButton = $state<HTMLButtonElement>();
 	let voiceReturnFocus: HTMLElement | null = null;
-	let voiceCapture: VoiceCapture | undefined;
+	let voiceCapture: VoiceCaptureInstance | undefined;
 	let activeVoiceImportSession: ImportSession | undefined;
 	let voiceOwner = $derived(user?.id ?? '');
 	$effect(() => {
@@ -1386,6 +1489,12 @@
 		const verificationToken = pageUrl.searchParams.get('verify');
 		if (returnFromChatGPT) {
 			modal = 'settings';
+			void loadSettingsModules().then(async (loaded) => {
+				if (loaded && modal === 'settings') {
+					await tick();
+					focusSettingsHeading('ai-connection-heading');
+				}
+			});
 		}
 		if (reset && !managedAuth) {
 			resetToken = reset;
@@ -1446,7 +1555,7 @@
 							},
 							openSettings: async () => {
 								if (online && kitchenSync?.snapshot()) await retrySync();
-								await openSettings();
+								await openSettings(true);
 							},
 							onConnections: (result) => {
 								if (attempt !== connectionAttempt || user?.id !== owner) return;
@@ -1519,14 +1628,42 @@
 			navigator.serviceWorker.register('/service-worker.js').catch(() => {
 				/* Offline installation is retried on the next visit. */
 			});
+		const idleModalOrder = [
+			'recipeDetail',
+			'recipeImport',
+			'butlerChat',
+			'aiConnection',
+			'voiceSettings',
+			'recipeEditor',
+			'butlerChatHelpers',
+			'butlerCommands',
+			'voiceCapture'
+		] as const;
+		const startIdleWarmup = () =>
+			scheduleIdleWarmup(idleModalOrder, (key) => modalPreloader.load(key), {
+				nav: typeof navigator !== 'undefined' ? navigator : undefined,
+				requestIdle:
+					typeof requestIdleCallback === 'function'
+						? (cb, opts) => requestIdleCallback(cb, opts)
+						: undefined,
+				cancelIdle:
+					typeof cancelIdleCallback === 'function' ? (id) => cancelIdleCallback(id) : undefined
+			});
+		let cancelIdleWarmup = startIdleWarmup();
 		const install = (e: Event) => {
 			e.preventDefault();
 			deferredInstall = e;
 		};
 		const connectionChanged = () => {
 			online = navigator.onLine;
-			if (online) void reconnectKitchen();
-			else if (managedAuth) clearManagedIdentity();
+			if (online) {
+				cancelIdleWarmup();
+				cancelIdleWarmup = startIdleWarmup();
+				void reconnectKitchen();
+			} else {
+				cancelIdleWarmup();
+				if (managedAuth) clearManagedIdentity();
+			}
 		};
 		const calendarMedia =
 			typeof window.matchMedia === 'function' ? window.matchMedia('(max-width: 650px)') : null;
@@ -1539,6 +1676,7 @@
 		window.addEventListener('offline', connectionChanged);
 		window.addEventListener('beforeinstallprompt', install);
 		return () => {
+			cancelIdleWarmup();
 			calendarMedia?.removeEventListener('change', calendarMediaChanged);
 			window.removeEventListener('beforeinstallprompt', install);
 			window.removeEventListener('online', connectionChanged);
@@ -2016,6 +2154,7 @@
 		}
 		modal = 'settings';
 		error = '';
+		const settingsReady = loadSettingsModules();
 		const headingId =
 			focusTarget === true || focusTarget === 'ai'
 				? 'ai-connection-heading'
@@ -2031,7 +2170,10 @@
 				? async () => {
 						if (modal !== 'settings') return;
 						await tick();
-						document.getElementById(headingId)?.focus();
+						if (modal === 'settings') focusSettingsHeading(headingId);
+						await settingsReady;
+						await tick();
+						if (modal === 'settings') focusSettingsHeading(headingId);
 					}
 				: undefined,
 			onAuthError: (e) => {
@@ -2404,7 +2546,16 @@
 				break;
 			case 'butler':
 				modal = '';
-				void butlerChat?.reopen(continuation.prompt);
+				butlerActivated = true;
+				if (butlerChat) {
+					void butlerChat.reopen(continuation.prompt);
+				} else {
+					butlerOpen = true;
+					void loadModal('butlerChat').then(async () => {
+						await tick();
+						await butlerChat?.reopen(continuation.prompt);
+					});
+				}
 				break;
 			case 'scan':
 				modal = 'pantry';
@@ -2549,8 +2700,18 @@
 			throw err;
 		}
 	}
-	let butlerChat = $state<ButlerChat>();
+	let butlerChat = $state<ButlerChatType>();
 	let butlerOpen = $state(false);
+	let butlerActivated = $state(false);
+	function openBasil() {
+		butlerActivated = true;
+		butlerOpen = true;
+		void loadModal('butlerChat');
+	}
+	function closeBasilFallback() {
+		butlerOpen = false;
+		if (!ButlerChatComponent) butlerActivated = false;
+	}
 	let voiceOverlay = $derived(
 		Boolean(butlerOpen || editingRecipe || (!modal && (selected || mobileNav)))
 	);
@@ -2578,6 +2739,19 @@
 	$effect(() => {
 		if (selected && !cookingSteps[cookingSessionKey]) cookingSteps[cookingSessionKey] = [];
 	});
+	$effect(() => {
+		if (selected && !modal) {
+			void loadModal('recipeDetail');
+			if (selected.saved) warmModal('recipeEditor');
+		}
+		if (editingRecipe) void loadModal('recipeEditor');
+		if (modal === 'import') {
+			void loadModal('recipeImport');
+			warmModal('voiceCapture');
+		} else if (modal === 'pantry') warmModal('voiceCapture');
+		else if (modal === 'settings') void loadSettingsModules();
+		if (butlerOpen) void loadModal('butlerChat');
+	});
 	async function askButler(
 		message: string,
 		history: { role: 'user' | 'assistant'; content: string }[],
@@ -2586,11 +2760,21 @@
 	) {
 		if (!(await needAI())) {
 			if (recordAIContinuation({ kind: 'butler', prompt: message })) {
+				butlerOpen = false;
 				void butlerChat?.close();
 				return null;
 			}
-			butlerChat?.close();
+			butlerOpen = false;
+			await butlerChat?.close();
 			throw new Error('Sign in and connect a model in Settings to speak with Basil.');
+		}
+		let pairButlerHistory: (typeof import('#lib/butler-chat.ts'))['pairButlerHistory'];
+		let BUTLER_HISTORY_LIMIT: (typeof import('#lib/butler-chat.ts'))['BUTLER_HISTORY_LIMIT'];
+		try {
+			({ BUTLER_HISTORY_LIMIT, pairButlerHistory } =
+				await modalPreloader.load('butlerChatHelpers'));
+		} catch {
+			throw new Error('Could not load Basil’s chat. Check your connection and try again.');
 		}
 		const owner = `${user?.id}:${user?.householdId}`;
 		const snapshot = JSON.stringify(kitchen);
@@ -2626,7 +2810,24 @@
 			throw new Error('The active kitchen changed. Ask Basil again.');
 		return result as ButlerChatResult;
 	}
-	function applyButler(commands: unknown[], expectedSnapshot: string) {
+	async function applyButler(commands: unknown[], expectedSnapshot: string) {
+		if (JSON.stringify(kitchen) !== expectedSnapshot) {
+			throw new Error(
+				'Your kitchen changed since this proposal. Ask Basil for an updated proposal.'
+			);
+		}
+		const activeOwner = `${user?.id ?? 'guest'}:${user?.householdId ?? ''}`;
+		let applyButlerCommands: (typeof import('#lib/butler.ts'))['applyButlerCommands'];
+		try {
+			({ applyButlerCommands } = await modalPreloader.load('butlerCommands'));
+		} catch {
+			throw new Error(
+				'Could not load Basil’s kitchen actions. Check your connection and try again.'
+			);
+		}
+		if (`${user?.id ?? 'guest'}:${user?.householdId ?? ''}` !== activeOwner) {
+			throw new Error('The active kitchen changed. Ask Basil again.');
+		}
 		if (JSON.stringify(kitchen) !== expectedSnapshot) {
 			throw new Error(
 				'Your kitchen changed since this proposal. Ask Basil for an updated proposal.'
@@ -2639,7 +2840,7 @@
 		for (const effect of result.effects) {
 			if (effect.type === 'navigate') navigate(effect.page);
 			else if (effect.type === 'recipe.open') {
-				butlerChat?.close();
+				void butlerChat?.close();
 				const recipe = kitchen.recipes.find((recipe) => recipe.id === effect.id);
 				if (recipe && effect.mode === 'edit') openRecipeEditor(recipe);
 				else if (recipe && effect.mode === 'cook') {
@@ -2658,7 +2859,7 @@
 					selected = recipe ?? null;
 				}
 			} else if (effect.type === 'ui') {
-				butlerChat?.close();
+				void butlerChat?.close();
 				openButlerControl(effect.action);
 			}
 		}
@@ -3039,7 +3240,32 @@
 		voiceTarget = target;
 		activeVoiceImportSession = importSession;
 		const owner = user?.id;
-		const capture = new VoiceCapture({
+		let Capture: VoiceCaptureConstructor;
+		if (VoiceCaptureClass) {
+			Capture = VoiceCaptureClass;
+		} else {
+			try {
+				Capture = await modalPreloader.load('voiceCapture');
+			} catch {
+				if (voiceStarting) clearVoiceSession();
+				notify('Voice input could not be loaded. Check your connection and try again.');
+				return;
+			}
+			if (
+				!voiceStarting ||
+				voiceTarget !== target ||
+				user?.id !== owner ||
+				!isVoiceTargetActive(target, {
+					modal,
+					page,
+					overlay: voiceOverlay,
+					reviewingDraft: isReviewingImportDraft(importSession)
+				})
+			) {
+				return;
+			}
+		}
+		const capture = new Capture({
 			state: (value) => {
 				if (voiceCapture !== capture) return;
 				const focusInVoiceUi = isFocusManagedByVoice();
@@ -3179,6 +3405,7 @@
 		);
 	}
 	function openNewRecipe() {
+		void loadModal('recipeEditor');
 		mobileNav = false;
 		resetMealDialogState();
 		resumeDialog = '';
@@ -3193,6 +3420,7 @@
 	function openRecipeEditor(recipe: Recipe) {
 		const draft = recipeForEdit(kitchen, recipe.id);
 		if (!draft) return;
+		void loadModal('recipeEditor');
 		selected = null;
 		selectedMealServings = undefined;
 		editingRecipeMode = 'edit';
@@ -3200,6 +3428,7 @@
 	}
 	function saveEditedRecipe(updated: Recipe) {
 		if (editingRecipeMode === 'create') {
+			void loadModal('recipeDetail');
 			const saved = finalizeManualRecipe(updated);
 			kitchen.recipes = insertRecipes(kitchen.recipes, [saved]);
 			editingRecipe = null;
@@ -3970,6 +4199,7 @@
 		}
 		error = '';
 		mobileNav = false;
+		void loadModal('recipeImport');
 		modal = 'import';
 	}
 	function importRecipe(url: string) {
@@ -3983,6 +4213,7 @@
 				importSession = cloneImportSession(previous);
 				resumeDialog = '';
 				error = '';
+				void loadModal('recipeImport');
 				modal = 'import';
 			});
 		}
@@ -4063,6 +4294,7 @@
 		if (pendingAIContinuation?.kind === 'import') pendingAIContinuation = null;
 		resumeDialog = '';
 		modal = '';
+		void loadModal('recipeDetail');
 		selectedDetailTab = 'recipe';
 		selected = applied.saved;
 		page = 'saved';
@@ -4094,6 +4326,7 @@
 				page = previousPage;
 				query = previousQuery;
 				filter = previousFilter;
+				void loadModal('recipeImport');
 				modal = 'import';
 			}
 		);
@@ -4377,6 +4610,8 @@
 			selected = null;
 			selectedMealServings = undefined;
 			selectedDetailTab = 'recipe';
+		} else if (!ButlerChatComponent && butlerOpen) {
+			closeBasilFallback();
 		}
 		if (!overlayOpen && !e.defaultPrevented && page === 'shopping' && editingShoppingId) {
 			e.preventDefault();
@@ -4385,6 +4620,39 @@
 	}
 </script>
 
+{#snippet lazyStatus(key: LazyModalKey, label: string, onclose?: () => void)}
+	{#if modalErrors[key]}
+		<p class="error" role="alert">{modalErrors[key]}</p>
+		<div class="dialog-actions">
+			{#if onclose}<button class="secondary" onclick={onclose}>Close</button>{/if}
+			<button class="primary" onclick={() => void loadModal(key)}
+				><RefreshCw size={15} /> Try again</button
+			>
+		</div>
+	{:else}
+		<p class="muted" role="status">{label}</p>
+	{/if}
+{/snippet}
+{#snippet lazyDialog(key: LazyModalKey, title: string, onclose: () => void, headingId?: string)}
+	<div class="modal-backdrop" transition:backdropMotion|global>
+		<div
+			class="flavor-dialog wide"
+			use:focusTrap
+			role="dialog"
+			aria-modal="true"
+			aria-label={headingId ? undefined : title}
+			aria-labelledby={headingId}
+			tabindex="-1"
+			transition:dialogMotion|global
+		>
+			<button class="icon-button dialog-close" onclick={onclose} aria-label="Close dialog"
+				><X size={21} /></button
+			>
+			<h2 id={headingId}>{title}</h2>
+			{@render lazyStatus(key, 'Loading…', onclose)}
+		</div>
+	</div>
+{/snippet}
 {#snippet voiceSession()}
 	{#if voiceBusy}<div class="voice-session" bind:this={voiceSessionEl} in:revealMotion>
 			<p role="status" aria-live="polite">
@@ -4437,17 +4705,55 @@
 
 {#if ready}
 	<div inert={!!modal || !!selected || !!editingRecipe}>
-		<ButlerChat
-			bind:this={butlerChat}
-			bind:open={butlerOpen}
-			{kitchen}
-			owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
-			request={askButler}
-			apply={applyButler}
-			userName={user?.name ?? ''}
-			syncing={sendingSync}
-			{pendingSync}
-		/>
+		{#if butlerActivated && ButlerChatComponent}
+			<ButlerChatComponent
+				bind:this={butlerChat}
+				bind:open={butlerOpen}
+				{kitchen}
+				owner={`${user?.id ?? 'guest'}:${user?.householdId ?? ''}`}
+				request={askButler}
+				apply={applyButler}
+				userName={user?.name ?? ''}
+				syncing={sendingSync}
+				{pendingSync}
+			/>
+		{:else}
+			<button
+				class="butler-launcher"
+				class:waiting={sendingSync}
+				onpointerenter={() => warmModal('butlerChat')}
+				onfocusin={() => warmModal('butlerChat')}
+				onclick={openBasil}
+				aria-expanded={butlerOpen}
+				aria-controls="butler-panel"
+				aria-label={butlerOpen ? 'Close Basil chat' : 'Chat with Basil, your kitchen butler'}
+				title="Chat with Basil"
+			>
+				<BasilAvatar size={32} active={false} /><span>Basil</span>
+				{#if sendingSync}<LoaderCircle size={13} class="spin launcher-spinner" />{/if}
+			</button>
+			{#if butlerOpen}
+				<div
+					class="butler-fallback-panel"
+					id="butler-panel"
+					use:focusTrap
+					role="dialog"
+					aria-modal="true"
+					tabindex="-1"
+					aria-label="Chat with Basil"
+				>
+					<div class="butler-fallback-header">
+						<strong>Basil</strong>
+						<button class="icon-button" onclick={closeBasilFallback} aria-label="Close chat"
+							><X size={20} /></button
+						>
+					</div>
+					<div class="butler-fallback-body">
+						{@render lazyStatus('butlerChat', 'Summoning Basil…', closeBasilFallback)}
+					</div>
+				</div>
+			{/if}
+		{/if}
 	</div>
 {/if}
 
@@ -4501,7 +4807,8 @@
 		</nav>
 		<div class="bottom-nav">
 			<button onclick={household}><Users size={18} /> My household <Plus size={15} /></button
-			><button onclick={() => openSettings()}><Settings size={18} /> Settings & themes</button
+			><button onpointerenter={warmSettings} onfocusin={warmSettings} onclick={() => openSettings()}
+				><Settings size={18} /> Settings & themes</button
 			><ToggleButton
 				pressed={kitchen.preferences.dark}
 				onclick={() => {
@@ -4517,7 +4824,15 @@
 				></span></ToggleButton
 			>
 		</div>
-		<button class="profile-button" onclick={() => (user ? openSettings() : openAuthentication())}
+		<button
+			class="profile-button"
+			onpointerenter={() => {
+				if (user) warmSettings();
+			}}
+			onfocusin={() => {
+				if (user) warmSettings();
+			}}
+			onclick={() => (user ? openSettings() : openAuthentication())}
 			><span class="profile-avatar">{user ? user.name.slice(0, 1).toUpperCase() : 'Y'}</span><span
 				><b>{user?.name || (managedAuth ? 'Managed by provider' : 'Sign in')}</b><small
 					>{user
@@ -4621,6 +4936,8 @@
 							type="button"
 							aria-label="Dictate ingredients"
 							disabled={busy || voiceBusy}
+							onpointerenter={() => warmModal('voiceCapture')}
+							onfocusin={() => warmModal('voiceCapture')}
 							onclick={dictate}><Mic size={19} /></button
 						>
 					</div>{/if}
@@ -4646,6 +4963,8 @@
 									type="button"
 									aria-label="Dictate ingredients"
 									disabled={busy || voiceBusy}
+									onpointerenter={() => warmModal('voiceCapture')}
+									onfocusin={() => warmModal('voiceCapture')}
 									onclick={dictate}><Mic size={20} /></button
 								>
 							</div>
@@ -4672,10 +4991,17 @@
 							</h2>
 						</div>
 						<div class="recipe-actions">
-							<button class="secondary" onclick={openNewRecipe}><Plus size={17} />New recipe</button
+							<button
+								class="secondary"
+								onpointerenter={() => warmModal('recipeEditor')}
+								onfocusin={() => warmModal('recipeEditor')}
+								onclick={openNewRecipe}><Plus size={17} />New recipe</button
 							>
-							<button class="secondary" onclick={() => openImport()}
-								><Plus size={17} />Import</button
+							<button
+								class="secondary"
+								onpointerenter={() => warmModal('recipeImport')}
+								onfocusin={() => warmModal('recipeImport')}
+								onclick={() => openImport()}><Plus size={17} />Import</button
 							>
 							<button
 								class="primary"
@@ -4770,6 +5096,8 @@
 					<div class="recipe-grid">
 						{#each recipes as recipe, i (recipe.id)}<article
 								class="recipe-card"
+								onpointerenter={() => warmModal('recipeDetail')}
+								onfocusin={() => warmModal('recipeDetail')}
 								animate:flip={{ duration: motionDuration(250) }}
 								in:revealMotion|global={{ y: 20, duration: 400, delay: Math.min(i * 65, 350) }}
 							>
@@ -4833,8 +5161,12 @@
 								<Heart size={36} />
 								<h2>No saved recipes yet</h2>
 								<p>Tap the bookmark on any recipe to keep it close, or add your own.</p>
-								<button type="button" class="secondary" onclick={openNewRecipe}
-									><Plus size={17} />New recipe</button
+								<button
+									type="button"
+									class="secondary"
+									onpointerenter={() => warmModal('recipeEditor')}
+									onfocusin={() => warmModal('recipeEditor')}
+									onclick={openNewRecipe}><Plus size={17} />New recipe</button
 								>
 							</div>{:else if activeRecipeFilters}<div class="empty-state filtered-recipe-empty">
 								<Heart size={36} />
@@ -4855,8 +5187,12 @@
 								<Heart size={36} />
 								<h2>No recipes found</h2>
 								<p>Add a new recipe, import a link, or generate ideas to get started.</p>
-								<button type="button" class="secondary" onclick={openNewRecipe}
-									><Plus size={17} />New recipe</button
+								<button
+									type="button"
+									class="secondary"
+									onpointerenter={() => warmModal('recipeEditor')}
+									onfocusin={() => warmModal('recipeEditor')}
+									onclick={openNewRecipe}><Plus size={17} />New recipe</button
 								>
 							</div>{/if}{/if}{#if capabilities.recipeSearch}<button
 							class="browse-link"
@@ -4904,8 +5240,13 @@
 							disabled={scanBusy || busy || voiceBusy}
 							onclick={() => imageInput.click()}
 							><Camera size={17} /> {scanBusy ? 'Scanning photo…' : 'Scan a photo'}</button
-						><button class="secondary" type="button" disabled={busy || voiceBusy} onclick={dictate}
-							><Mic size={17} /> Tell us what you have</button
+						><button
+							class="secondary"
+							type="button"
+							disabled={busy || voiceBusy}
+							onpointerenter={() => warmModal('voiceCapture')}
+							onfocusin={() => warmModal('voiceCapture')}
+							onclick={dictate}><Mic size={17} /> Tell us what you have</button
 						>
 					</div>
 				</div>
@@ -5203,6 +5544,8 @@
 												recipesById.get(meal.recipeId)}{#if recipe}<div class="calendar-meal">
 													<button
 														class="meal-open"
+														onpointerenter={() => warmModal('recipeDetail')}
+														onfocusin={() => warmModal('recipeDetail')}
 														onclick={() => {
 															selectedMealServings = meal.servings;
 															selectedDetailTab = 'recipe';
@@ -5286,6 +5629,8 @@
 													>Clear leftovers <Check size={15} /></button
 												>{/if}<button
 												class="text-button"
+												onpointerenter={() => warmModal('recipeDetail')}
+												onfocusin={() => warmModal('recipeDetail')}
 												onclick={() => {
 													selectedMealServings = undefined;
 													selectedDetailTab = 'recipe';
@@ -5377,6 +5722,8 @@
 								class="icon-button"
 								aria-label="Dictate shopping items"
 								aria-disabled={voiceBusy || undefined}
+								onpointerenter={() => warmModal('voiceCapture')}
+								onfocusin={() => warmModal('voiceCapture')}
 								onclick={dictateShopping}><Mic size={18} /></button
 							><button type="submit" class="text-button">Add</button>
 						</form>
@@ -5517,56 +5864,74 @@
 			aria-label="Dismiss notification"><X size={16} /></button
 		>
 	</div>{/if}
-{#if selected && !modal}<RecipeDetail
-		recipe={selected}
-		initialServings={selectedMealServings ?? selected.servings}
-		bind:tab={selectedDetailTab}
-		bind:completedSteps={
-			() => cookingSteps[cookingSessionKey] ?? [],
-			(steps) => {
-				cookingSteps[cookingSessionKey] = steps;
+{#if selected && !modal}{#if RecipeDetailComponent}<RecipeDetailComponent
+			recipe={selected}
+			initialServings={selectedMealServings ?? selected.servings}
+			bind:tab={selectedDetailTab}
+			bind:completedSteps={
+				() => cookingSteps[cookingSessionKey] ?? [],
+				(steps) => {
+					cookingSteps[cookingSessionKey] = steps;
+				}
 			}
-		}
-		close={() => {
+			close={() => {
+				selected = null;
+				selectedMealServings = undefined;
+				selectedDetailTab = 'recipe';
+			}}
+			save={() => saveRecipe(selected!)}
+			shop={(servings) =>
+				shoppingFor(
+					[selected!],
+					[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }],
+					`recipe:${selected!.id}`
+				)}
+			plan={(servings) => planRecipe(selected!, servings)}
+			nutrition={refreshNutrition}
+			edit={() => openRecipeEditor(selected!)}
+			remove={() => askDeleteRecipe(selected!)}
+			toggleHidden={() => toggleRecipeHidden(selected!)}
+			{busy}
+			rate={(n) => {
+				kitchen.preferences.ratings = applyRecipeRating(selected!, kitchen.preferences.ratings, n);
+				const stored = kitchen.recipes.find((item) => item.id === selected!.id);
+				if (stored && stored !== selected!) {
+					applyRecipeRating(stored, undefined, n);
+				}
+				kitchen.recipes = [...kitchen.recipes];
+				notify(
+					n === undefined
+						? 'Rating cleared.'
+						: 'Rating saved. Future recipes will use your feedback.'
+				);
+			}}
+		/>{:else}{@render lazyDialog('recipeDetail', selected.title, () => {
 			selected = null;
 			selectedMealServings = undefined;
 			selectedDetailTab = 'recipe';
-		}}
-		save={() => saveRecipe(selected!)}
-		shop={(servings) =>
-			shoppingFor(
-				[selected!],
-				[{ id: crypto.randomUUID(), recipeId: selected!.id, date: '', slot: '', servings }],
-				`recipe:${selected!.id}`
-			)}
-		plan={(servings) => planRecipe(selected!, servings)}
-		nutrition={refreshNutrition}
-		edit={() => openRecipeEditor(selected!)}
-		remove={() => askDeleteRecipe(selected!)}
-		toggleHidden={() => toggleRecipeHidden(selected!)}
-		{busy}
-		rate={(n) => {
-			kitchen.preferences.ratings = applyRecipeRating(selected!, kitchen.preferences.ratings, n);
-			const stored = kitchen.recipes.find((item) => item.id === selected!.id);
-			if (stored && stored !== selected!) {
-				applyRecipeRating(stored, undefined, n);
-			}
-			kitchen.recipes = [...kitchen.recipes];
-			notify(
-				n === undefined ? 'Rating cleared.' : 'Rating saved. Future recipes will use your feedback.'
-			);
-		}}
-	/>{/if}
-{#if editingRecipe}{#key editingRecipe.id}<RecipeEditor
-			recipe={editingRecipe}
-			mode={editingRecipeMode}
-			canUploadCover={Boolean(user) && online}
-			cancel={() => {
-				editingRecipe = null;
-				editingRecipeMode = 'edit';
-			}}
-			save={saveEditedRecipe}
-		/>{/key}{/if}
+		})}{/if}{/if}
+{#if editingRecipe}{#key editingRecipe.id}{#if RecipeEditorComponent}<RecipeEditorComponent
+				recipe={editingRecipe}
+				mode={editingRecipeMode}
+				canUploadCover={Boolean(user) && online}
+				cancel={() => {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				}}
+				save={saveEditedRecipe}
+			/>{:else}{@render lazyDialog(
+				'recipeEditor',
+				editingRecipeMode === 'create'
+					? 'New recipe'
+					: editingRecipe.saved
+						? 'Edit saved recipe'
+						: 'Edit recipe',
+				() => {
+					editingRecipe = null;
+					editingRecipeMode = 'edit';
+				},
+				'recipe-editor-title'
+			)}{/if}{/key}{/if}
 {#if modal}<div class="modal-backdrop" transition:backdropMotion|global>
 		{#key modal}
 			<div
@@ -5595,13 +5960,19 @@
 					}}
 					aria-label="Close dialog"><X size={21} /></button
 				>
-				{#if modal === 'import'}<RecipeImport
-						bind:session={importSession}
-						capture={captureImport}
-						save={saveImportedRecipe}
-						dictate={dictateRecipe}
-						{voiceBusy}
-					/>{:else if modal === 'onboarding'}
+				{#if modal === 'import'}{#if RecipeImportComponent}<RecipeImportComponent
+							bind:session={importSession}
+							capture={captureImport}
+							save={saveImportedRecipe}
+							dictate={dictateRecipe}
+							{voiceBusy}
+						/>{:else}<span class="dialog-spark">✳</span>
+						<h2 id="recipe-import-title">Import recipe</h2>
+						{@render lazyStatus(
+							'recipeImport',
+							'Opening recipe import…',
+							closeDialog
+						)}{/if}{:else if modal === 'onboarding'}
 					<span class="dialog-spark">✷</span>
 					<h2>Recipe preferences</h2>
 					<p class="muted onboarding-intro">
@@ -5728,8 +6099,13 @@
 								</div>
 							</div>{/if}
 						<div class="dialog-actions">
-							<button type="button" class="secondary" disabled={voiceBusy || busy} onclick={dictate}
-								><Mic size={17} /> Use voice</button
+							<button
+								type="button"
+								class="secondary"
+								disabled={voiceBusy || busy}
+								onpointerenter={() => warmModal('voiceCapture')}
+								onfocusin={() => warmModal('voiceCapture')}
+								onclick={dictate}><Mic size={17} /> Use voice</button
 							><button
 								type="button"
 								class="secondary"
@@ -5955,41 +6331,51 @@
 							{/if}
 						</div>{/if}
 					<div class="settings-section">
-						<VoiceSettings
-							bind:provider={voiceProvider}
-							bind:model={voiceModel}
-							bind:apiKey={voiceApiKey}
-							localAvailable={localVoiceAvailable}
-							userId={user?.id}
-						/>
+						{#if VoiceSettingsComponent}
+							<VoiceSettingsComponent
+								bind:provider={voiceProvider}
+								bind:model={voiceModel}
+								bind:apiKey={voiceApiKey}
+								localAvailable={localVoiceAvailable}
+								userId={user?.id}
+							/>
+						{:else}
+							<h3 id="voice-settings-heading" tabindex="-1">Voice input</h3>
+							{@render lazyStatus('voiceSettings', 'Loading voice settings…')}
+						{/if}
 					</div>
 					<div class="settings-section intelligence-settings">
-						<AIConnection
-							bind:preferences={kitchen.preferences}
-							bind:apiKey
-							{providers}
-							{accountModels}
-							{chatGPT}
-							activeAccount={activeChatGPTAccount}
-							signedIn={Boolean(user)}
-							{managedAuth}
-							busy={connectionBusy}
-							loading={catalogLoading}
-							{catalogError}
-							authorizationUrl={chatGPTAuthorizationUrl}
-							device={chatGPTDevice}
-							oncancel={cancelChatGPTDevice}
-							oncopycode={copyChatGPTDeviceCode}
-							onselect={(id) => changeConnection(id)}
-							onaccount={() => changeConnection()}
-							onconnect={connectChatGPT}
-							ondisconnect={disconnectChatGPT}
-							onrefresh={refreshAISettings}
-							onsignin={openAuthentication}
-							onoverride={() => {
-								void loadModelCatalog();
-							}}
-						/>
+						{#if AIConnectionComponent}
+							<AIConnectionComponent
+								bind:preferences={kitchen.preferences}
+								bind:apiKey
+								{providers}
+								{accountModels}
+								{chatGPT}
+								activeAccount={activeChatGPTAccount}
+								signedIn={Boolean(user)}
+								{managedAuth}
+								busy={connectionBusy}
+								loading={catalogLoading}
+								{catalogError}
+								authorizationUrl={chatGPTAuthorizationUrl}
+								device={chatGPTDevice}
+								oncancel={cancelChatGPTDevice}
+								oncopycode={copyChatGPTDeviceCode}
+								onselect={(id) => changeConnection(id)}
+								onaccount={() => changeConnection()}
+								onconnect={connectChatGPT}
+								ondisconnect={disconnectChatGPT}
+								onrefresh={refreshAISettings}
+								onsignin={openAuthentication}
+								onoverride={() => {
+									void loadModelCatalog();
+								}}
+							/>
+						{:else}
+							<h3 id="ai-connection-heading" tabindex="-1">AI connection</h3>
+							{@render lazyStatus('aiConnection', 'Loading AI connection…')}
+						{/if}
 					</div>
 
 					{#if hasSampleRecords}<div class="settings-section">
@@ -6509,16 +6895,24 @@
 							><Search size={17} />{busy ? 'Looking for something good…' : 'Search recipes'}</button
 						>{#if error}<p class="error" id="search-form-error" role="alert">{error}</p>{/if}
 					</form>
-					<button type="button" class="secondary full" onclick={() => openImport()}
-						><Plus size={17} />Import text, a link, or a photo</button
+					<button
+						type="button"
+						class="secondary full"
+						onpointerenter={() => warmModal('recipeImport')}
+						onfocusin={() => warmModal('recipeImport')}
+						onclick={() => openImport()}><Plus size={17} />Import text, a link, or a photo</button
 					>
 					<div class="web-results">
 						{#each searchResults as result}<div class="web-result">
 								<a href={result.url} target="_blank" rel="noreferrer"
 									><b>{result.title}<ArrowUpRight size={17} /></b>
 									<p>{result.description}</p></a
-								><button class="secondary" disabled={busy} onclick={() => importRecipe(result.url)}
-									><Plus size={16} /> Import recipe</button
+								><button
+									class="secondary"
+									disabled={busy}
+									onpointerenter={() => warmModal('recipeImport')}
+									onfocusin={() => warmModal('recipeImport')}
+									onclick={() => importRecipe(result.url)}><Plus size={16} /> Import recipe</button
 								>
 							</div>{/each}
 					</div>
@@ -7171,6 +7565,75 @@
 	.invite-row button {
 		min-height: 40px;
 		padding-inline: 6px;
+	}
+	.butler-launcher {
+		position: fixed;
+		right: 16px;
+		bottom: max(10px, env(safe-area-inset-bottom));
+		z-index: 45;
+		display: flex;
+		align-items: center;
+		gap: 5px;
+		padding: 4px 10px 4px 4px;
+		border: 1px solid var(--control-border);
+		border-radius: 40px;
+		color: var(--surface);
+		background: var(--ink);
+		box-shadow: 0 4px 20px #0002;
+		font-size: 12px;
+		font-weight: 650;
+	}
+	.butler-launcher:focus-visible {
+		outline: 2px solid var(--focus-outer);
+		outline-offset: 2px;
+		box-shadow:
+			0 0 0 2px var(--focus-inner),
+			0 4px 20px #0002;
+	}
+	@media (forced-colors: active) {
+		.butler-launcher:focus-visible {
+			outline: 2px solid Highlight;
+			outline-offset: 2px;
+			box-shadow: none;
+		}
+	}
+	.butler-fallback-panel {
+		position: fixed;
+		right: 16px;
+		bottom: calc(60px + env(safe-area-inset-bottom));
+		z-index: 46;
+		width: min(440px, calc(100vw - 24px));
+		background: var(--surface);
+		color: var(--ink);
+		border: 1px solid var(--line);
+		border-radius: 18px;
+		box-shadow: 0 18px 70px #0003;
+	}
+	.butler-fallback-header {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 10px 12px;
+		border-bottom: 1px solid var(--line);
+	}
+	.butler-fallback-body {
+		padding: 16px;
+	}
+	@media (max-width: 640px) {
+		.butler-launcher {
+			right: 10px;
+			bottom: max(8px, env(safe-area-inset-bottom));
+		}
+		.butler-fallback-panel {
+			right: 8px;
+			bottom: calc(8px + env(safe-area-inset-bottom));
+			width: calc(100vw - 16px);
+		}
+	}
+	@media (prefers-reduced-motion: reduce) {
+		.butler-launcher :global(.spin) {
+			animation: none;
+		}
 	}
 	.staged-scan {
 		display: flex;

@@ -41,6 +41,7 @@ import * as guestMod from '../src/lib/guest-storage.ts';
 import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
+import * as modalPreloaderMod from '../src/lib/modal-preloader.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
 import * as coverMod from '../src/lib/recipe-cover.ts';
@@ -296,6 +297,7 @@ function compileServerModule(
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
 		'#lib/import-session.ts': importSessionMod,
+		'#lib/modal-preloader.ts': modalPreloaderMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/kitchen-export.ts': kitchenExportMod,
 		'#lib/discovery.ts': discoveryMod,
@@ -965,6 +967,7 @@ const pageHookCode = `
 const hookedPageSource = injectScriptHook(rawPageSource, pageHookCode);
 const pageSsrCompiled = compileServerModule('src/routes/+page.svelte', hookedPageSource, {
 	'#lib/components/FormField.svelte': formFieldMod,
+	'#lib/components/BasilAvatar.svelte': { default: noopComponent },
 	'#lib/components/ToggleButton.svelte': noopComponent,
 	'#lib/components/DisclosureButton.svelte': noopComponent,
 	'#lib/components/RecipeDetail.svelte': { default: noopComponent },
@@ -1176,6 +1179,7 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
 		'#lib/import-session.ts': importSessionMod,
+		'#lib/modal-preloader.ts': modalPreloaderMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
@@ -1192,6 +1196,8 @@ test('login flow allows non-standard non-empty emails to reach server and links 
 		'#lib/client-workflows.ts': clientWorkflowsMod,
 		'#lib/guest-storage.ts': guestMod,
 		'#lib/client-sync.ts': syncMod,
+		'#lib/components/BasilAvatar.svelte': { default: noopComponent },
+		'#lib/components/ToggleButton.svelte': { default: noopComponent },
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { default: noopComponent },

@@ -23,6 +23,7 @@ import * as guestMod from '../src/lib/guest-storage.ts';
 import * as importSessionMod from '../src/lib/import-session.ts';
 import * as kitchenExportMod from '../src/lib/kitchen-export.ts';
 import * as workflowsMod from '../src/lib/kitchen-workflows.ts';
+import * as modalPreloaderMod from '../src/lib/modal-preloader.ts';
 import * as plannerMod from '../src/lib/planner.ts';
 import { calendarDayScrollLeft, weekOffsetFromStarts } from '../src/lib/planner.ts';
 import * as recipeCollectionMod from '../src/lib/recipe-collection.ts';
@@ -101,6 +102,9 @@ function injectPlannerHook(svelteSource: string): string {
 		logout,
 		set deletePassword(value: string) { deletePassword = value; },
 		deleteAccount,
+		warmModal,
+		warmSettings,
+		applyButler,
 		exportKitchen,
 		exportPendingChanges,
 		startPantryEdit,
@@ -195,6 +199,9 @@ type PlannerHarnessApi = {
 	logout: () => Promise<void>;
 	deletePassword: string;
 	deleteAccount: (event: SubmitEvent) => Promise<void>;
+	warmModal: (key: string) => void;
+	warmSettings: () => void;
+	applyButler: (commands: unknown[], expectedSnapshot: string) => Promise<string>;
 	exportKitchen: () => Promise<void>;
 	exportPendingChanges: () => void;
 	startPantryEdit: (item: AppState['pantry'][number]) => Promise<void>;
@@ -222,7 +229,9 @@ function createModuleMap() {
 		'#lib/recipe-cover.ts': coverMod,
 		'#lib/focus.ts': { focusTrap: () => ({}) },
 		'#lib/form-validation.ts': formValidationMod,
-		'#lib/components/FormField.svelte': { default: noopComponent },
+		'#lib/components/FormField.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/ToggleButton.svelte': { __esModule: true, default: noopComponent },
+		'#lib/components/DisclosureButton.svelte': { __esModule: true, default: noopComponent },
 		'#lib/motion.ts': {
 			backdropMotion: () => ({}),
 			dialogMotion: () => ({}),
@@ -235,12 +244,13 @@ function createModuleMap() {
 		'#lib/planner.ts': plannerMod,
 		'#lib/data.ts': dataMod,
 		'#lib/domain.ts': domainMod,
-		'#lib/import-session.ts': importSessionMod,
 		'#lib/kitchen-workflows.ts': workflowsMod,
 		'#lib/discovery.ts': discoveryMod,
 		'#lib/recipe-collection.ts': recipeCollectionMod,
 		'#lib/recipe-detail.ts': recipeDetailMod,
 		'#lib/recipe-draft.ts': recipeDraftMod,
+		'#lib/import-session.ts': importSessionMod,
+		'#lib/modal-preloader.ts': modalPreloaderMod,
 		'#lib/butler.ts': butlerMod,
 		'#lib/butler-chat.ts': butlerChatMod,
 		'#lib/voice-capture.ts': { ...voiceCaptureMod, VoiceCapture: class {} },
@@ -252,6 +262,7 @@ function createModuleMap() {
 		'#lib/client-sync.ts': syncMod,
 		'#lib/recipe-scraper.ts': scraperMod,
 		'#lib/state-schema.ts': stateSchemaMod,
+		'#lib/components/BasilAvatar.svelte': { __esModule: true, default: noopComponent },
 		'#lib/components/RecipeDetail.svelte': { default: noopComponent },
 		'#lib/components/ButlerChat.svelte': { default: noopComponent },
 		'#lib/components/RecipeEditor.svelte': { default: noopComponent },
@@ -260,7 +271,7 @@ function createModuleMap() {
 		'#lib/components/VoiceSettings.svelte': { default: noopComponent },
 		'#lib/components/RecipeImport.svelte': {
 			default: noopComponent,
-			emptyImportSession: importSessionMod.emptyImportSession
+			...importSessionMod
 		}
 	} as Record<string, unknown>;
 }
@@ -1094,6 +1105,230 @@ test('calendarDayScrollLeft aligns tablet cards inside border-left and clamps at
 		calendarDayScrollLeft({ ...tabletMetrics, scrollLeft: 0, dayLeft: 219 + 6 * 164 }),
 		628
 	);
+});
+
+test('+page.svelte warmModal, warmSettings, offline idle reschedule, and applyButler chunk failure handling', async () => {
+	const modMap = createModuleMap();
+	const chunkLoads: string[] = [];
+	let failButlerChunk = true;
+	let mountCleanup: (() => void) | undefined;
+	modMap.svelte = {
+		...svelte,
+		onMount: (fn: () => (() => void) | void) => {
+			mountCleanup = fn() ?? undefined;
+		}
+	};
+
+	const trackedChunks = new Set([
+		'#lib/components/RecipeDetail.svelte',
+		'#lib/components/RecipeImport.svelte',
+		'#lib/components/ButlerChat.svelte',
+		'#lib/components/AIConnection.svelte',
+		'#lib/components/VoiceSettings.svelte',
+		'#lib/components/RecipeEditor.svelte',
+		'#lib/butler.ts',
+		'#lib/voice-capture.ts'
+	]);
+
+	const navState: {
+		onLine: boolean;
+		connection: { saveData: boolean; effectiveType?: string };
+	} = {
+		onLine: true,
+		connection: { saveData: true, effectiveType: '4g' }
+	};
+	const idleScheduled = new Map<number, () => void>();
+	const idleCancelled: number[] = [];
+	let nextIdleId = 1;
+	const windowListeners = new Map<string, Set<() => void>>();
+
+	const exports: { default?: any } = {};
+	let api!: PlannerHarnessApi;
+	let initialized = false;
+	const storage = makeMemoryStorage() as unknown as Storage;
+	storage.setItem('flavorithm-started', 'yes');
+
+	const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+	const sandbox: Record<string, unknown> = {
+		exports,
+		require: (id: string) => {
+			if (initialized && trackedChunks.has(id)) {
+				chunkLoads.push(id);
+				if (id === '#lib/butler.ts' && failButlerChunk) {
+					throw new TypeError('Failed to fetch dynamically imported module: butler.js');
+				}
+			}
+			if (id in modMap) return modMap[id];
+			throw new Error(`Unexpected planner dependency ${id}`);
+		},
+		Date,
+		Intl,
+		Map,
+		Set,
+		Number,
+		String,
+		Boolean,
+		Array,
+		Object,
+		Math,
+		JSON,
+		RegExp,
+		Error,
+		RangeError,
+		TypeError,
+		Promise,
+		URL,
+		Response,
+		Request,
+		crypto,
+		console,
+		setTimeout: (fn: () => void, ms?: number) => {
+			const handle = setTimeout(() => {
+				pendingTimers.delete(handle);
+				fn();
+			}, ms);
+			pendingTimers.add(handle);
+			return handle;
+		},
+		clearTimeout: (handle: ReturnType<typeof setTimeout>) => {
+			pendingTimers.delete(handle);
+			clearTimeout(handle);
+		},
+		setInterval,
+		clearInterval,
+		requestIdleCallback: (cb: () => void) => {
+			const id = nextIdleId++;
+			idleScheduled.set(id, cb);
+			return id;
+		},
+		cancelIdleCallback: (id: number) => {
+			idleCancelled.push(id);
+			idleScheduled.delete(id);
+		},
+		localStorage: storage,
+		navigator: navState,
+		document: {
+			documentElement: { dataset: {}, classList: { toggle: () => {} } },
+			activeElement: null,
+			getElementById: () => null
+		},
+		window: {
+			location: {
+				href: 'http://127.0.0.1:4173/',
+				assign: () => {},
+				reload: () => {}
+			},
+			history: { replaceState: () => {} },
+			scrollTo: () => {},
+			addEventListener: (type: string, fn: () => void) => {
+				if (!windowListeners.has(type)) windowListeners.set(type, new Set());
+				windowListeners.get(type)!.add(fn);
+			},
+			removeEventListener: (type: string, fn: () => void) => {
+				windowListeners.get(type)?.delete(fn);
+			}
+		},
+		fetch: async (input: unknown) => {
+			const url = String(input);
+			if (url === '/api/auth') {
+				return new Response(
+					JSON.stringify({
+						user: null,
+						authMode: 'local',
+						capabilities: { emailDelivery: false, recipeSearch: false }
+					}),
+					{ status: 200, headers: { 'content-type': 'application/json' } }
+				);
+			}
+			return new Response(JSON.stringify({ ok: true }), {
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			});
+		}
+	};
+	sandbox.globalThis = sandbox;
+	sandbox.__onPlannerInit = (instance: PlannerHarnessApi) => {
+		api = instance;
+	};
+	runInNewContext(clientScriptJs, sandbox);
+	const dispose = svelteClient.effect_root(() => {
+		exports.default(null, { data: { authMode: 'local', loginUrl: null, logoutUrl: null } });
+	});
+	initialized = true;
+
+	try {
+		// 1. With saveData = true (or effectiveType = 2g), neither initial idle nor hover/focus warms chunks.
+		assert.equal(idleScheduled.size, 0);
+		api.warmModal('recipeDetail');
+		api.warmSettings();
+		navState.connection = { saveData: false, effectiveType: '2g' };
+		api.warmModal('recipeImport');
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.deepEqual([...chunkLoads], []);
+
+		// 2. With saveData = false and 4g, hover/focus warms and deduplicates.
+		navState.connection = { saveData: false, effectiveType: '4g' };
+		api.warmModal('recipeDetail');
+		api.warmModal('recipeDetail');
+		api.warmSettings();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.deepEqual(
+			[...chunkLoads],
+			[
+				'#lib/components/RecipeDetail.svelte',
+				'#lib/components/VoiceSettings.svelte',
+				'#lib/components/AIConnection.svelte'
+			]
+		);
+
+		// 3. Online/offline window events schedule, cancel on offline, and reschedule remaining chunks on online.
+		for (const fn of windowListeners.get('online') ?? []) fn();
+		assert.equal(idleScheduled.size, 1);
+		// Run first idle slice (recipeDetail is already cached, so 0 new loads; next slice queues recipeImport).
+		const [[firstId, firstCb]] = idleScheduled.entries();
+		idleScheduled.delete(firstId);
+		firstCb();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		const [[secondId, secondCb]] = idleScheduled.entries();
+		idleScheduled.delete(secondId);
+		secondCb();
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(chunkLoads.includes('#lib/components/RecipeImport.svelte'), true);
+		assert.equal(idleScheduled.size, 1);
+
+		const pendingBeforeOffline = [...idleScheduled.keys()][0];
+		navState.onLine = false;
+		for (const fn of windowListeners.get('offline') ?? []) fn();
+		assert.equal(idleCancelled.includes(pendingBeforeOffline), true);
+		assert.equal(idleScheduled.size, 0);
+
+		navState.onLine = true;
+		for (const fn of windowListeners.get('online') ?? []) fn();
+		assert.equal(idleScheduled.size, 1);
+
+		// 4. applyButler maps dynamic butlerCommands chunk failures to a friendly message, then retries cleanly.
+		const command = {
+			type: 'shopping.upsert',
+			item: { id: 'shop-lemons', name: 'lemons', quantity: 2, unit: 'piece', checked: false }
+		};
+		const snapshot = JSON.stringify(api.kitchen);
+		await assert.rejects(() => api.applyButler([command], snapshot), {
+			message: 'Could not load Basil’s kitchen actions. Check your connection and try again.'
+		});
+		assert.equal(JSON.stringify(api.kitchen), snapshot);
+
+		failButlerChunk = false;
+		const nextSnapshot = await api.applyButler([command], snapshot);
+		assert.notEqual(nextSnapshot, snapshot);
+		assert.equal(
+			api.kitchen.shopping.some((item) => item.name.toLowerCase() === 'lemons'),
+			true
+		);
+	} finally {
+		mountCleanup?.();
+		dispose();
+		for (const handle of pendingTimers) clearTimeout(handle);
+	}
 });
 
 test('+page.svelte exportKitchen commits inline edits, merges account state, and distinguishes 401 expiry and offline modes', async () => {

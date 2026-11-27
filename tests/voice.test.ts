@@ -827,7 +827,7 @@ test('browser dictation stays active across pauses and appends multiple phrases 
 test('voice dialog context helpers preserve pantry/import across Settings and Sign-in redirects and open import for recipe dictation', () => {
 	// Pantry missing cloud key -> redirects to Settings and restores pantry on close
 	const pantryPlan = planVoiceStart({
-		forRecipe: false,
+		target: 'pantry',
 		modal: 'pantry',
 		provider: 'groq',
 		localAvailable: false,
@@ -847,7 +847,7 @@ test('voice dialog context helpers preserve pantry/import across Settings and Si
 
 	// Recipe dictation started with no dialog open -> targets and remembers import
 	const recipeNoModal = planVoiceStart({
-		forRecipe: true,
+		target: 'import',
 		modal: '',
 		provider: 'deepgram',
 		localAvailable: false,
@@ -867,7 +867,7 @@ test('voice dialog context helpers preserve pantry/import across Settings and Si
 
 	// Signed-out cloud voice redirects to auth and restores originating dialog
 	const authRedirect = planVoiceStart({
-		forRecipe: false,
+		target: 'pantry',
 		modal: 'pantry',
 		provider: 'groq',
 		localAvailable: false,
@@ -916,6 +916,7 @@ test('voice dialog context helpers preserve pantry/import across Settings and Si
 	shoppingText = appendDictatedText('shopping', shoppingText, '2 lemons.');
 	shoppingText = appendDictatedText('shopping', shoppingText, 'olive oil.');
 	assert.equal(shoppingText, '2 lemons, olive oil.');
+	assert.equal(appendVoiceTranscript('milk;', '2 avocados'), 'milk, 2 avocados');
 
 	let importText = '1 tbsp olive oil\n';
 	importText = appendDictatedText('import', importText, '2 cloves garlic');

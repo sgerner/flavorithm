@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onDestroy, tick } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import {
 		X,
 		Send,
@@ -79,7 +79,7 @@
 	let input = $state<HTMLTextAreaElement>();
 	let transcript = $state<HTMLDivElement>();
 	let launcher = $state<HTMLButtonElement>();
-	let currentOwner = '';
+	let currentOwner = untrack(() => owner);
 	const PAUSE_MOTION_STORAGE_KEY = 'flavorithm-butler-pause-motion';
 	function readPausedMotion(): boolean {
 		if (typeof localStorage === 'undefined') return false;
@@ -211,6 +211,14 @@
 					: 'smooth'
 		});
 	}
+	$effect(() => {
+		if (!open) return;
+		untrack(() => {
+			void tick().then(() => {
+				if (chat.alive && open && !input?.disabled) input?.focus();
+			});
+		});
+	});
 	export async function close() {
 		resetReaction();
 		open = false;
@@ -222,7 +230,7 @@
 		if (fallbackPrompt && !draft.trim()) draft = fallbackPrompt;
 		open = true;
 		await tick();
-		input?.focus();
+		if (chat.alive && open && !input?.disabled) input?.focus();
 	}
 	async function toggle() {
 		open = !open;
