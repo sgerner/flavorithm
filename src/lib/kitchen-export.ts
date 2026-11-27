@@ -411,65 +411,78 @@ export async function fetchAccountExportPayload(
 	let lastError: KitchenExportError | null = null;
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-		const signal = AbortSignal.timeout(timeoutMs);
-		let response: Response;
+		const controller = new AbortController();
+		const timeout = setTimeout(() => {
+			controller.abort(
+				new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+			);
+		}, timeoutMs);
+		const { signal } = controller;
 		try {
-			response = await fetcher('/api/export', {
-				headers: { Accept: 'application/json' },
-				redirect: 'manual',
-				signal
-			});
-		} catch (error) {
-			const timedOut = isTimeoutError(error, signal);
-			lastError = new KitchenExportError(
-				timedOut ? 'timeout' : 'network-error',
-				timedOut ? 'Account export request timed out' : 'Could not reach account export endpoint'
-			);
-			if (attempt < maxAttempts) continue;
-			throw lastError;
-		}
-
-		if (
-			response.status === 401 ||
-			response.status === 403 ||
-			response.type === 'opaqueredirect' ||
-			response.redirected ||
-			(response.status >= 300 && response.status < 400)
-		) {
-			throw new KitchenExportError(
-				'session-expired',
-				`Authentication required (${response.status || 401})`,
-				response.status || 401
-			);
-		}
-
-		if (response.status === 408 || response.status === 429 || response.status >= 500) {
-			lastError = new KitchenExportError(
-				response.status === 408 ? 'timeout' : 'network-error',
-				`Export endpoint returned ${response.status}`,
-				response.status
-			);
-			if (attempt < maxAttempts) continue;
-			throw lastError;
-		}
-
-		if (!response.ok) {
-			throw new KitchenExportError(
-				'network-error',
-				`Export endpoint returned ${response.status}`,
-				response.status
-			);
-		}
-
-		try {
-			return (await response.json()) as ServerExportPayload;
-		} catch (error) {
-			if (isTimeoutError(error, signal)) {
-				lastError = new KitchenExportError('timeout', 'Reading account export timed out');
+			let response: Response;
+			try {
+				response = await fetcher('/api/export', {
+					headers: { Accept: 'application/json' },
+					redirect: 'manual',
+					signal
+				});
+			} catch (error) {
+				const timedOut = isTimeoutError(error, signal);
+				lastError = new KitchenExportError(
+					timedOut ? 'timeout' : 'network-error',
+					timedOut ? 'Account export request timed out' : 'Could not reach account export endpoint'
+				);
 				if (attempt < maxAttempts) continue;
 				throw lastError;
 			}
-			throw new KitchenExportError('invalid-server-state', 'Account export returned invalid JSON');
+
+			if (
+				response.status === 401 ||
+				response.status === 403 ||
+				response.type === 'opaqueredirect' ||
+				response.redirected ||
+				(response.status >= 300 && response.status < 400)
+			) {
+				throw new KitchenExportError(
+					'session-expired',
+					`Authentication required (${response.status || 401})`,
+					response.status || 401
+				);
+			}
+
+			if (response.status === 408 || response.status === 429 || response.status >= 500) {
+				lastError = new KitchenExportError(
+					response.status === 408 ? 'timeout' : 'network-error',
+					`Export endpoint returned ${response.status}`,
+					response.status
+				);
+				if (attempt < maxAttempts) continue;
+				throw lastError;
+			}
+
+			if (!response.ok) {
+				throw new KitchenExportError(
+					'network-error',
+					`Export endpoint returned ${response.status}`,
+					response.status
+				);
+			}
+
+			try {
+				return (await response.json()) as ServerExportPayload;
+			} catch (error) {
+				if (isTimeoutError(error, signal)) {
+					lastError = new KitchenExportError('timeout', 'Reading account export timed out');
+					if (attempt < maxAttempts) continue;
+					throw lastError;
+				}
+				throw new KitchenExportError(
+					'invalid-server-state',
+					'Account export returned invalid JSON'
+				);
+			}
+		} finally {
+			clearTimeout(timeout);
 		}
 	}
 

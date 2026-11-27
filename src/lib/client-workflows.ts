@@ -3,8 +3,12 @@ import {
 	type ConnectionModel,
 	type ConnectionProvider
 } from '#lib/ai-connections.ts';
-import { defaultPreferences } from '#lib/data.ts';
+import { createNewUserState, defaultPreferences } from '#lib/data.ts';
+import { sanitizeKitchenState } from '#lib/guest-storage.ts';
+import { clearSampleData, hasSampleData } from '#lib/kitchen-workflows.ts';
 import type { AppState, Preferences, User } from '#lib/types.ts';
+
+type StarterStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 
 export type ChatGPTAccountSummary = {
 	id: string;
@@ -329,4 +333,131 @@ export async function runReconnectWorkflow<TState = { state?: AppState | null }>
 		options.adoptState(latest);
 	}
 	await options.retrySync();
+}
+
+/**
+ * Selectively clear untouched sample records in place and register a snapshot-guarded Undo
+ * callback that restores removed sample items and guest starter-banner state if unchanged.
+ */
+export function runSampleCleanupWorkflow(options: {
+	commitInlineEdits: () => void;
+	getKitchen: () => AppState;
+	setKitchen: (next: AppState) => void;
+	onCleaned: () => void;
+	onUndoRestore: (restored: AppState) => void;
+	getShowStarter: () => boolean;
+	setShowStarter: (show: boolean) => void;
+	isGuest: () => boolean;
+	storage: StarterStorage;
+	closeSettingsIfOpen: () => void;
+	notify: (message: string, undo?: () => void) => void;
+	now?: Date;
+}): boolean {
+	options.commitInlineEdits();
+	const current = options.getKitchen();
+	if (!hasSampleData(current)) {
+		options.setShowStarter(false);
+		if (options.isGuest()) options.storage.setItem('flavorithm-started', 'yes');
+		return false;
+	}
+	const previousKitchen = sanitizeKitchenState(JSON.parse(JSON.stringify(current)));
+	const wasShowingStarter = options.getShowStarter();
+	const previousStarted = options.isGuest() ? options.storage.getItem('flavorithm-started') : null;
+	const cleaned = clearSampleData(previousKitchen, options.now);
+	options.setKitchen(cleaned);
+	options.onCleaned();
+	const appliedSnapshot = JSON.stringify(options.getKitchen());
+	options.setShowStarter(false);
+	if (options.isGuest()) options.storage.setItem('flavorithm-started', 'yes');
+	options.closeSettingsIfOpen();
+	options.notify('Sample data cleared.', () => {
+		if (JSON.stringify(options.getKitchen()) === appliedSnapshot) {
+			options.onUndoRestore(previousKitchen);
+			if (wasShowingStarter && options.isGuest()) {
+				options.setShowStarter(true);
+				if (previousStarted === null) options.storage.removeItem('flavorithm-started');
+				else options.storage.setItem('flavorithm-started', previousStarted);
+			}
+			options.notify('Sample data restored.');
+		} else {
+			options.notify('Your kitchen changed again. Review the current values before editing.');
+		}
+	});
+	return true;
+}
+
+/**
+ * Sanitize and strip untouched sample records from a guest kitchen before local registration,
+ * or return null for sign-in so guest items never leak into an existing account.
+ */
+export function prepareGuestKitchenForAuth(
+	authMode: string,
+	kitchen: AppState,
+	now?: Date
+): AppState | null {
+	if (authMode !== 'register') return null;
+	return clearSampleData(sanitizeKitchenState(JSON.parse(JSON.stringify(kitchen))), now);
+}
+
+/**
+ * Execute local sign-in or registration, stripping untouched sample data on registration while
+ * leaving the live guest kitchen untouched if /api/auth fails.
+ */
+export async function runLocalAuthenticateWorkflow(options: {
+	authMode: string;
+	getKitchen: () => AppState;
+	authenticateRequest: () => Promise<{ user: User }>;
+	onAuthenticated: (user: User, initialKitchen: AppState) => void;
+	stageGuestKitchen: (guestKitchen: AppState) => void;
+	hasSyncError: () => boolean;
+	clearGuestStorage: () => void;
+	fetchState: () => Promise<{ state?: AppState | null }>;
+	createState: (state: AppState) => Promise<{ state?: AppState | null }>;
+	adoptKitchen: (state: AppState) => void;
+	hasPendingSnapshot: () => boolean;
+	syncKitchen: () => Promise<void>;
+	isOnline: () => boolean;
+	retrySync: () => Promise<void>;
+	failStateLoad: (message: string) => void;
+	now?: Date;
+}): Promise<{ user: User; guestKitchen: AppState | null; stateLoaded: boolean }> {
+	const guestKitchen = prepareGuestKitchenForAuth(
+		options.authMode,
+		options.getKitchen(),
+		options.now
+	);
+	const result = await options.authenticateRequest();
+	const authenticatedUser = result.user;
+	options.onAuthenticated(authenticatedUser, guestKitchen ?? createNewUserState());
+	if (guestKitchen) {
+		options.stageGuestKitchen(guestKitchen);
+		if (!options.hasSyncError()) {
+			options.clearGuestStorage();
+		}
+	}
+	let stateLoaded = false;
+	try {
+		const saved = await options.fetchState();
+		if (guestKitchen) {
+			options.adoptKitchen(saved.state || createNewUserState());
+			if (!saved.state && !options.hasPendingSnapshot()) {
+				const created = await options.createState(guestKitchen);
+				options.adoptKitchen(created.state || guestKitchen);
+			} else {
+				await options.syncKitchen();
+			}
+		} else if (saved.state) {
+			options.adoptKitchen(saved.state);
+			if (options.isOnline() && options.hasPendingSnapshot()) await options.retrySync();
+		} else {
+			const initial = createNewUserState();
+			const created = await options.createState(initial);
+			options.adoptKitchen(created.state || initial);
+			if (options.isOnline() && options.hasPendingSnapshot()) await options.retrySync();
+		}
+		stateLoaded = true;
+	} catch (stateError) {
+		options.failStateLoad((stateError as Error).message);
+	}
+	return { user: authenticatedUser, guestKitchen, stateLoaded };
 }
